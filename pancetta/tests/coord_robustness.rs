@@ -95,6 +95,7 @@ async fn c9_band_change_tears_down_active_qsos_and_drops_their_tx() {
             CallInitiation::Auto,
             None,
             false,
+            None,
         )
         .await
         .expect("respond_to_cq_with");
@@ -157,6 +158,7 @@ async fn c9_small_dial_wobble_does_not_tear_down() {
             CallInitiation::Auto,
             None,
             false,
+            None,
         )
         .await
         .expect("respond_to_cq_with");
@@ -268,6 +270,7 @@ async fn c9_dial_poll_band_change_tears_down_once() {
             CallInitiation::Auto,
             None,
             false,
+            None,
         )
         .await
         .expect("respond_to_cq_with");
@@ -356,6 +359,7 @@ async fn c9_autonomous_change_band_tears_down() {
             CallInitiation::Auto,
             None,
             false,
+            None,
         )
         .await
         .expect("respond_to_cq_with");

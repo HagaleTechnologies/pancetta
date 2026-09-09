@@ -195,6 +195,7 @@ async fn w5xo_double_space_continues_one_qso_and_stale_tx_does_not_key_ptt() {
             CallInitiation::Manual,
             None,
             false,
+            None,
         )
         .await
         .expect("first call");
@@ -223,6 +224,7 @@ async fn w5xo_double_space_continues_one_qso_and_stale_tx_does_not_key_ptt() {
             CallInitiation::Manual,
             None,
             false,
+            None,
         )
         .await
         .expect("second call (re-Space)");
@@ -330,6 +332,7 @@ async fn nine_a4aa_qso_start_keys_ptt_and_recall_continues_no_storm() {
             CallInitiation::Manual,
             None,
             false,
+            None,
         )
         .await
         .expect("call 9A4AA");
@@ -404,6 +407,7 @@ async fn nine_a4aa_qso_start_keys_ptt_and_recall_continues_no_storm() {
             CallInitiation::Manual,
             None,
             false,
+            None,
         )
         .await
         .expect("re-call 9A4AA");

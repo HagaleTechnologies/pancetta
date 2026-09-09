@@ -83,6 +83,11 @@ struct RecentManualCompletion {
     /// auto-73 is `TxOrigin::Remote` and armed-TX gated (fail-closed: if the
     /// arm lapsed after completion, the resend is dropped, never keyed as Local).
     remote_origin: bool,
+    /// The completed QSO's `remote_client_key_id`, inherited for the same
+    /// reason as `remote_origin` (PAN-91): the auto-73's arm-gate check must
+    /// bind to the client that originally requested the QSO, not just "some
+    /// client is currently armed".
+    remote_client_key_id: Option<String>,
 }
 
 /// Shared map of recently-completed manual QSOs. Populated by the QSO-event
@@ -142,6 +147,11 @@ struct PendingManualCall {
     /// promoted QSO is opened with `remote_origin = true` — its TX stays
     /// `TxOrigin::Remote` and armed-TX-gated. `false` for every local/TUI call.
     remote_origin: bool,
+    /// The station-agent peer (client keyId) that requested this, iff
+    /// `remote_origin`. Carried across the deferral so the promoted QSO is
+    /// bound to THIS specific client (PAN-91) — see
+    /// `QsoMetadata::remote_client_key_id`.
+    remote_client_key_id: Option<String>,
     /// Which rung of the response ladder to open at on promotion — replayed
     /// via `respond_to_caller` (see [`promote_pending_manual_calls`]).
     /// `StartQso`-originated entries always use [`pancetta_core::ResponseStep::Grid`],
@@ -514,6 +524,7 @@ async fn promote_pending_manual_calls(
                     p.their_report,
                     partner,
                     p.remote_origin,
+                    p.remote_client_key_id.clone(),
                 )
                 .await
                 .map(|_| ())
@@ -687,6 +698,7 @@ async fn maybe_auto_resend_73(
     // arrives every slot. We do NOT call into the QSO manager while holding
     // the lock.
     let entry_remote_origin;
+    let entry_remote_client_key_id;
     {
         let mut map = completions.lock().await;
         // Prune expired entries every time we look.
@@ -733,6 +745,7 @@ async fn maybe_auto_resend_73(
         // SECURITY: the auto-73 inherits the completed QSO's origin so a remote
         // QSO's resend stays `TxOrigin::Remote` and armed-TX gated.
         entry_remote_origin = entry.remote_origin;
+        entry_remote_client_key_id = entry.remote_client_key_id.clone();
     }
 
     // Don't fight a live QSO with this station: if one is active, skip the
@@ -779,6 +792,7 @@ async fn maybe_auto_resend_73(
             None,
             None,                // auto-73: always Tx=Rx, no partner offset
             entry_remote_origin, // inherit the completed QSO's origin
+            entry_remote_client_key_id,
         )
         .await
     {
@@ -1201,6 +1215,7 @@ async fn maybe_answer_caller(
             answer.their_report,
             partner_freq,
             false, // local decode-loop auto-answer, never remote
+            None,
         )
         .await
     {
@@ -1557,6 +1572,7 @@ mod pan6_diagnostic_tests {
             pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin: false,
+            remote_client_key_id: None,
         }
     }
 
@@ -2209,6 +2225,7 @@ mod ap_ranking_tests {
             pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin: false,
+            remote_client_key_id: None,
         }
     }
 
@@ -3160,6 +3177,7 @@ impl super::ApplicationCoordinator {
                                 frequency,
                                 tx_parity,
                                 remote_origin,
+                                remote_client_key_id,
                             }) => {
                                 match pancetta_qso::utils::generate_ft8_message(
                                     &message,
@@ -3200,6 +3218,7 @@ impl super::ApplicationCoordinator {
                                                 } else {
                                                     crate::message_bus::TxOrigin::Local
                                                 },
+                                                remote_client_key_id,
                                             },
                                             Instant::now(),
                                         );
@@ -3442,6 +3461,9 @@ impl super::ApplicationCoordinator {
                                             resends: 0,
                                             last_resend_at: None,
                                             remote_origin: metadata.remote_origin,
+                                            remote_client_key_id: metadata
+                                                .remote_client_key_id
+                                                .clone(),
                                         };
                                         let mut map = completions_for_events.lock().await;
                                         // Prune stale entries while we hold the lock so
@@ -3891,6 +3913,7 @@ impl super::ApplicationCoordinator {
                                             frequency,
                                             dx_parity,
                                             remote_origin,
+                                            remote_client_key_id,
                                         } => {
                                             // PAN-23 round-2 (Codex review of #283): reject the
                                             // unresolved-hash placeholder "<...>" at ADMISSION
@@ -4011,6 +4034,7 @@ impl super::ApplicationCoordinator {
                                                         held_hz: queued_held,
                                                         hold_mode: queued_hold_mode,
                                                         remote_origin,
+                                                        remote_client_key_id,
                                                         step: pancetta_core::ResponseStep::Grid,
                                                         our_snr_of_them: None,
                                                         their_report: None,
@@ -4083,6 +4107,7 @@ impl super::ApplicationCoordinator {
                                                     pancetta_qso::CallInitiation::Manual,
                                                     partner,
                                                     remote_origin,
+                                                    remote_client_key_id,
                                                 )
                                                 .await
                                             {
@@ -4220,6 +4245,7 @@ impl super::ApplicationCoordinator {
                                                             pancetta_qso::CallInitiation::Auto,
                                                             partner,
                                                             false,
+                                                            None,
                                                         )
                                                         .await
                                                 }
@@ -4261,6 +4287,7 @@ impl super::ApplicationCoordinator {
                                                                 frequency,
                                                                 parity,
                                                                 false,
+                                                                None,
                                                             )
                                                             .await
                                                     } else {
@@ -4399,6 +4426,7 @@ impl super::ApplicationCoordinator {
                                                         hold_mode: false,
                                                         // Hound (Shift+H) is a local operator action.
                                                         remote_origin: false,
+                                                        remote_client_key_id: None,
                                                         // Hound entries promote via `engage_hound`,
                                                         // not `respond_to_caller` — these fields are
                                                         // unused when `hound == true`.
@@ -4483,6 +4511,7 @@ impl super::ApplicationCoordinator {
                                             step,
                                             snr,
                                             remote_origin,
+                                            remote_client_key_id,
                                         } => {
                                             // PAN-23 round-2 (Codex review of #283): reject the
                                             // unresolved-hash placeholder "<...>" at ADMISSION
@@ -4573,6 +4602,7 @@ impl super::ApplicationCoordinator {
                                                         held_hz: queued_held,
                                                         hold_mode: queued_hold_mode,
                                                         remote_origin,
+                                                        remote_client_key_id,
                                                         step,
                                                         our_snr_of_them: snr,
                                                         // The immediate path below always passes
@@ -4639,6 +4669,7 @@ impl super::ApplicationCoordinator {
                                                     None,
                                                     partner,
                                                     remote_origin,
+                                                    remote_client_key_id,
                                                 )
                                                 .await
                                             {
@@ -4798,12 +4829,14 @@ impl super::ApplicationCoordinator {
                                             frequency,
                                             tx_parity,
                                             remote_origin,
+                                            remote_client_key_id,
                                         } => {
                                             match qso_manager
                                                 .start_cq_manual(
                                                     frequency as f64,
                                                     tx_parity,
                                                     remote_origin,
+                                                    remote_client_key_id,
                                                 )
                                                 .await
                                             {
@@ -4922,7 +4955,7 @@ impl super::ApplicationCoordinator {
                                                 // picks its own slot via the self-parity fallback).
                                                 const FOX_CQ_OFFSET_HZ: f64 = 1500.0;
                                                 match qso_manager
-                                                    .start_cq_manual(FOX_CQ_OFFSET_HZ, None, false)
+                                                    .start_cq_manual(FOX_CQ_OFFSET_HZ, None, false, None)
                                                     .await
                                                 {
                                                     Ok(qso_id) => {
@@ -5220,6 +5253,7 @@ mod secondary_decoder_hint_tests {
                 pending_freq_drift: None,
                 hound_qsyed: false,
                 remote_origin: false,
+                remote_client_key_id: None,
                 tx_parity_provisional: false,
             },
         }
@@ -5611,6 +5645,7 @@ mod pending_manual_tests {
             held_hz: 0,
             hold_mode: false,
             remote_origin: false,
+            remote_client_key_id: None,
             step: pancetta_core::ResponseStep::Grid,
             our_snr_of_them: None,
             their_report: None,
@@ -5656,6 +5691,7 @@ mod pending_manual_tests {
             held_hz: 0,
             hold_mode: false,
             remote_origin: false,
+            remote_client_key_id: None,
             step,
             our_snr_of_them: Some(-8.0),
             their_report: None,
@@ -5762,6 +5798,7 @@ mod pending_manual_tests {
             held_hz: 0,
             hold_mode: false,
             remote_origin: false,
+            remote_client_key_id: None,
             step: pancetta_core::ResponseStep::Grid,
             our_snr_of_them: None,
             their_report: None,
@@ -5842,6 +5879,7 @@ mod pending_manual_tests {
             held_hz: 1500,
             hold_mode: true,
             remote_origin: false,
+            remote_client_key_id: None,
             step: pancetta_core::ResponseStep::Grid,
             our_snr_of_them: None,
             their_report: None,
@@ -5872,6 +5910,7 @@ mod pending_manual_tests {
             held_hz: 1500,
             hold_mode: true,
             remote_origin: false,
+            remote_client_key_id: None,
             step: pancetta_core::ResponseStep::Grid,
             our_snr_of_them: None,
             their_report: None,
@@ -5910,6 +5949,7 @@ mod pending_manual_tests {
             held_hz: 0,
             hold_mode: false,
             remote_origin: false,
+            remote_client_key_id: None,
             step: pancetta_core::ResponseStep::Grid,
             our_snr_of_them: None,
             their_report: None,
@@ -6637,6 +6677,7 @@ mod snapshot_tests {
                 pending_freq_drift: None,
                 hound_qsyed: false,
                 remote_origin: false,
+                remote_client_key_id: None,
                 tx_parity_provisional: false,
             },
         }
@@ -6918,6 +6959,7 @@ mod auto_73_tests {
                 resends: 0,
                 last_resend_at: None,
                 remote_origin: false,
+                remote_client_key_id: None,
             },
         );
         Arc::new(Mutex::new(map))
@@ -7028,6 +7070,7 @@ mod auto_73_tests {
                     resends: 0,
                     last_resend_at: None,
                     remote_origin: false,
+                    remote_client_key_id: None,
                 },
             );
             Arc::new(Mutex::new(m))
@@ -7239,6 +7282,7 @@ mod auto_73_tests {
                     resends: 0,
                     last_resend_at: None,
                     remote_origin: false,
+                    remote_client_key_id: None,
                 },
             );
             Arc::new(Mutex::new(m))
@@ -7296,6 +7340,7 @@ mod auto_73_tests {
                     resends: 0,
                     last_resend_at: None,
                     remote_origin: false,
+                    remote_client_key_id: None,
                 },
             );
             Arc::new(Mutex::new(m))
@@ -8117,6 +8162,7 @@ mod cqdx_upload_tests {
             pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin: false,
+            remote_client_key_id: None,
             tx_parity_provisional: false,
         }
     }
@@ -8237,6 +8283,7 @@ mod qrz_enrichment_tests {
             pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin: false,
+            remote_client_key_id: None,
             tx_parity_provisional: false,
         }
     }
@@ -8431,7 +8478,7 @@ mod replay_local_log_tests {
     async fn complete_one_qso(manager: &pancetta_qso::QsoManager) {
         let freq = 14_074_000.0;
         manager
-            .start_cq(freq, None, false)
+            .start_cq(freq, None, false, None)
             .await
             .expect("start_cq should succeed");
 
@@ -8686,6 +8733,7 @@ mod replay_history_seed_tests {
                 pending_freq_drift: None,
                 hound_qsyed: false,
                 remote_origin: false,
+                remote_client_key_id: None,
                 tx_parity_provisional: false,
             },
         }
@@ -9066,6 +9114,7 @@ mod respond_to_caller_admission_tests {
                 step: ResponseStep::ReportAck,
                 snr: Some(-8.0),
                 remote_origin: false,
+                remote_client_key_id: None,
             }),
             Instant::now(),
         );
@@ -9144,6 +9193,7 @@ mod respond_to_caller_admission_tests {
                 frequency: 2000,
                 dx_parity: Some(SlotParity::Odd),
                 remote_origin: false,
+                remote_client_key_id: None,
             }),
             Instant::now(),
         );
@@ -9626,7 +9676,7 @@ mod respond_to_caller_admission_tests {
         const CQ_HZ: f64 = 1500.0;
         const NEW_HZ: f64 = 1900.0;
         let qso_id = manager
-            .start_cq_manual(CQ_HZ, None, false)
+            .start_cq_manual(CQ_HZ, None, false, None)
             .await
             .expect("seeding an unanswered CQ");
 

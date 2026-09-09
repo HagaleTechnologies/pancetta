@@ -234,7 +234,7 @@ async fn test_loopback_state_machine_driven_qso() {
     let mut rx_b = manager_b.subscribe();
 
     // === Step 1: Station A calls CQ via state machine ===
-    let qso_id_a = manager_a.start_cq(freq, None, false).await.unwrap();
+    let qso_id_a = manager_a.start_cq(freq, None, false, None).await.unwrap();
 
     // Receive the MessageToSend event
     let cq_message_type = loop {
@@ -1296,7 +1296,7 @@ async fn test_loopback_compound_callsign_qso_advances_state_machine() {
     let mut rx_us = manager_us.subscribe();
 
     // === Step 1: the compound-callsign DX calls CQ ===
-    let qso_id_dx = manager_dx.start_cq(freq, None, false).await.unwrap();
+    let qso_id_dx = manager_dx.start_cq(freq, None, false, None).await.unwrap();
     let cq_message_type = loop {
         match rx_dx.recv().await.unwrap() {
             QsoEvent::MessageToSend { message, .. } => break message,
@@ -1608,7 +1608,7 @@ async fn genuinely_unresolvable_caller_hash_never_resolves_but_retires_cleanly()
     let mut rx_dx = manager_dx.subscribe();
 
     // Step 1: the compound-callsign DX calls CQ.
-    let qso_id_dx = manager_dx.start_cq(freq, None, false).await.unwrap();
+    let qso_id_dx = manager_dx.start_cq(freq, None, false, None).await.unwrap();
     let cq_message_type = loop {
         match rx_dx.recv().await.unwrap() {
             QsoEvent::MessageToSend { message, .. } => break message,

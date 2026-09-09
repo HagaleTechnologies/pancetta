@@ -699,6 +699,15 @@ pub struct QsoMetadata {
     /// behavior). Defaults to `false`; MUST NEVER default `true`.
     #[serde(default)]
     pub remote_origin: bool,
+
+    /// The station-agent peer (client keyId) that requested this QSO, iff
+    /// [`Self::remote_origin`]. This is the identity the pickup/key-time arm
+    /// gate binds the QSO to: TX is permitted only while THIS client is the
+    /// one currently armed, not merely while *some* client is armed — a
+    /// different peer taking control and arming must not authorize a QSO it
+    /// never requested. `None` for every Local/TUI/autonomous QSO.
+    #[serde(default)]
+    pub remote_client_key_id: Option<String>,
 }
 
 /// Signal reports exchanged

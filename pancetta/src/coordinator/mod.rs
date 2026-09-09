@@ -42,8 +42,8 @@ mod wav_playback;
 pub(crate) mod wsjtx_udp;
 
 pub use tx::{
-    coalesce_transmit_requests, remote_tx_permitted, resolve_required_parity, schedule_tx,
-    CoalesceEntry, CoalesceOutcome, TxSchedule,
+    coalesce_transmit_requests, remote_tx_permitted, remote_tx_permitted_for,
+    resolve_required_parity, schedule_tx, CoalesceEntry, CoalesceOutcome, TxSchedule,
 };
 
 pub use qso::compute_manual_tx_offset;
@@ -2256,6 +2256,7 @@ impl ApplicationCoordinator {
                         qso_id: None,
                         tx_parity: None, // test-TX injection: no DX context
                         origin: crate::message_bus::TxOrigin::Local,
+                        remote_client_key_id: None,
                     },
                     Instant::now(),
                 );

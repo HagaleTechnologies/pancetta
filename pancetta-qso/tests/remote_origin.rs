@@ -22,9 +22,22 @@ fn config() -> QsoManagerConfig {
 async fn first_message_to_send_remote_origin(
     rx: &mut tokio::sync::broadcast::Receiver<QsoEvent>,
 ) -> bool {
+    first_message_to_send_remote_origin_and_client(rx).await.0
+}
+
+/// Like [`first_message_to_send_remote_origin`], but also returns
+/// `remote_client_key_id` (PAN-91: the QSO must carry the requesting peer's
+/// identity, not just a bare boolean).
+async fn first_message_to_send_remote_origin_and_client(
+    rx: &mut tokio::sync::broadcast::Receiver<QsoEvent>,
+) -> (bool, Option<String>) {
     loop {
         match rx.recv().await.expect("event stream closed") {
-            QsoEvent::MessageToSend { remote_origin, .. } => return remote_origin,
+            QsoEvent::MessageToSend {
+                remote_origin,
+                remote_client_key_id,
+                ..
+            } => return (remote_origin, remote_client_key_id),
             _ => continue,
         }
     }
@@ -35,7 +48,7 @@ async fn remote_origin_qso_emits_remote_message_to_send() {
     let manager = QsoManager::new(config());
     let mut rx = manager.subscribe();
 
-    // A QSO opened with remote_origin=true.
+    // A QSO opened with remote_origin=true, bound to a specific client.
     manager
         .respond_to_cq_with(
             "K9XYZ".to_string(),
@@ -44,15 +57,22 @@ async fn remote_origin_qso_emits_remote_message_to_send() {
             CallInitiation::Manual,
             None,
             true, // remote_origin
+            Some("client-a".to_string()),
         )
         .await
         .expect("respond_to_cq_with");
 
-    let origin = first_message_to_send_remote_origin(&mut rx).await;
+    let (origin, client_key_id) = first_message_to_send_remote_origin_and_client(&mut rx).await;
     assert!(
         origin,
         "a remote_origin QSO's MessageToSend MUST carry remote_origin=true \
          (else its TransmitRequest would be Local and bypass the arm)"
+    );
+    assert_eq!(
+        client_key_id.as_deref(),
+        Some("client-a"),
+        "PAN-91: the QSO must carry the requesting peer's identity so the \
+         arm gate can bind TX to THAT client, not just any armed client"
     );
 }
 
@@ -70,6 +90,7 @@ async fn normal_qso_emits_local_message_to_send_regression() {
             CallInitiation::Manual,
             None,
             false, // remote_origin
+            None,
         )
         .await
         .expect("respond_to_cq_with");
@@ -90,14 +111,24 @@ async fn remote_origin_persists_across_the_reply_ladder() {
     let mut rx = manager.subscribe();
 
     let _id = manager
-        .start_cq(1500.0, Some(SlotParity::Odd), true)
+        .start_cq(
+            1500.0,
+            Some(SlotParity::Odd),
+            true,
+            Some("client-b".to_string()),
+        )
         .await
         .expect("start_cq");
 
-    // Opening CQ MessageToSend is remote.
-    let origin = first_message_to_send_remote_origin(&mut rx).await;
+    // Opening CQ MessageToSend is remote, bound to the requesting client.
+    let (origin, client_key_id) = first_message_to_send_remote_origin_and_client(&mut rx).await;
     assert!(
         origin,
         "opening CQ of a remote QSO must be remote_origin=true"
+    );
+    assert_eq!(
+        client_key_id.as_deref(),
+        Some("client-b"),
+        "PAN-91: the manual-CQ remote_origin path must also bind client identity"
     );
 }

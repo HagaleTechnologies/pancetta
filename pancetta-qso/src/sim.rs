@@ -975,7 +975,7 @@ impl Sim {
         let parity = self.clock.parity();
         let id = self
             .manager
-            .start_cq_manual(freq_hz, Some(parity), false)
+            .start_cq_manual(freq_hz, Some(parity), false, None)
             .await
             .expect("start_cq_manual");
         id.to_string()
@@ -990,7 +990,7 @@ impl Sim {
         let parity = self.clock.parity();
         let id = self
             .manager
-            .start_cq(freq_hz, Some(parity), false)
+            .start_cq(freq_hz, Some(parity), false, None)
             .await
             .expect("start_cq");
         id.to_string()
@@ -1017,6 +1017,7 @@ impl Sim {
                 their_report,
                 None,  // sim always Tx=Rx; partner_freq not needed
                 false, // sim = local
+                None,
             )
             .await
             .expect("respond_to_caller");
@@ -1230,7 +1231,10 @@ impl Sim {
                 }
                 if is_cq_text(&message_text) {
                     // Calling CQ ourselves: open an autonomous CallingCq QSO.
-                    let _ = self.manager.start_cq(frequency_offset, None, false).await;
+                    let _ = self
+                        .manager
+                        .start_cq(frequency_offset, None, false, None)
+                        .await;
                 } else if let Some(dx) = first_callsign_of(&message_text) {
                     // Hunt/pounce: answer the DX's CQ as an autonomous QSO.
                     // The operator latched the DX's heard parity into the
@@ -1298,6 +1302,7 @@ impl Sim {
                 frequency,
                 tx_parity,
                 remote_origin: _,
+                remote_client_key_id: _,
             } => {
                 let text = self
                     .exchange

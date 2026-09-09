@@ -309,6 +309,7 @@ async fn qso_start_emits_statechanged_before_first_message() {
             CallInitiation::Auto,
             None,
             false,
+            None,
         )
         .await
         .expect("respond_to_cq_with");
@@ -372,6 +373,7 @@ async fn qso_start_populates_active_set_before_transmit_request() {
             None,
             None,
             false,
+            None,
         )
         .await
         .expect("respond_to_caller");

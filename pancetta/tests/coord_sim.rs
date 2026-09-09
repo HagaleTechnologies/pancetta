@@ -70,8 +70,9 @@ use std::time::{Duration, Instant};
 use pancetta_config::OperatingMode;
 use pancetta_hamlib::{MockRig, PttState, RigControl, Vfo};
 use pancetta_lib::coordinator::{
-    active_tx_qso_key, coalesce_transmit_requests, compute_manual_tx_offset, remote_tx_permitted,
-    try_switch_operating_mode, tx_qso_is_live, CoalesceEntry, ModeSwitchError,
+    active_tx_qso_key, coalesce_transmit_requests, compute_manual_tx_offset,
+    remote_tx_permitted_for, try_switch_operating_mode, tx_qso_is_live, CoalesceEntry,
+    ModeSwitchError,
 };
 use pancetta_lib::message_bus::{
     ComponentId, ComponentMessage, MessageBus, MessageType, RigControlMessage,
@@ -425,6 +426,12 @@ impl CoordSim {
     /// local consent + a fresh heartbeat, so `remote_tx_permitted` returns true.
     /// (Simulates a future P3 arm; in production nothing constructs the grant.)
     pub fn arm_remote_tx(&self) {
+        self.arm_remote_tx_as("sim-client-key-id");
+    }
+
+    /// Like [`Self::arm_remote_tx`], but arms with an explicit client keyId
+    /// (PAN-91: exercises the identity-bound gate, not just the boolean one).
+    pub fn arm_remote_tx_as(&self, client_key_id: &str) {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut st = self.remote_tx_arm.lock().expect("arm lock");
         st.arm(
@@ -433,7 +440,7 @@ impl CoordSim {
                 ttl_ms: 120_000,
                 scope_tx: true,
                 jti: "sim-arm-jti".to_string(),
-                client_key_id: "sim-client-key-id".to_string(),
+                client_key_id: client_key_id.to_string(),
             },
             now_ms,
         );
@@ -515,6 +522,7 @@ impl CoordSim {
                 frequency,
                 tx_parity,
                 remote_origin,
+                remote_client_key_id,
             } => {
                 // The coordinator renders the QsoMessage to FT8 text via
                 // pancetta_qso::utils::generate_ft8_message. We carry the raw
@@ -538,6 +546,7 @@ impl CoordSim {
                     } else {
                         pancetta_lib::message_bus::TxOrigin::Local
                     },
+                    remote_client_key_id,
                 });
             }
             _ => {}
@@ -563,6 +572,7 @@ impl CoordSim {
             qso_id: None,
             tx_parity: None,
             origin: pancetta_lib::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         }
     }
 
@@ -575,6 +585,16 @@ impl CoordSim {
             qso_id: None,
             tx_parity: None,
             origin: pancetta_lib::message_bus::TxOrigin::Remote,
+            remote_client_key_id: None,
+        }
+    }
+
+    /// Like [`Self::remote_tx`], but bound to an explicit client keyId
+    /// (PAN-91: exercises the identity-bound gate).
+    pub fn remote_tx_as(&self, text: &str, freq_hz: f64, client_key_id: &str) -> PendingTx {
+        PendingTx {
+            remote_client_key_id: Some(client_key_id.to_string()),
+            ..self.remote_tx(text, freq_hz)
         }
     }
 
@@ -615,7 +635,11 @@ impl CoordSim {
             .into_iter()
             .filter(|p| {
                 if p.origin == pancetta_lib::message_bus::TxOrigin::Remote
-                    && !remote_tx_permitted(&self.remote_tx_arm, now_ms)
+                    && !remote_tx_permitted_for(
+                        &self.remote_tx_arm,
+                        now_ms,
+                        p.remote_client_key_id.as_deref(),
+                    )
                 {
                     self.timeline.dropped.push(DroppedTx {
                         slot,
@@ -640,6 +664,7 @@ impl CoordSim {
                 qso_id: p.qso_id.clone(),
                 tx_parity: p.tx_parity,
                 origin: p.origin,
+                remote_client_key_id: p.remote_client_key_id.clone(),
             })
             .collect();
         let active = self.active_tx_qsos.clone();
@@ -782,6 +807,7 @@ impl CoordSim {
                 CallInitiation::Auto,
                 partner,
                 false,
+                None,
             )
             .await
             .expect("autonomous respond_to_cq_with")
@@ -825,6 +851,8 @@ pub struct PendingTx {
     /// Origin of this request. `Local` (default) skips the remote-TX arm gate;
     /// `Remote` is gated by the coordinator's `ArmState` in `drive_slot`.
     pub origin: pancetta_lib::message_bus::TxOrigin,
+    /// Client this request is bound to, iff `origin == Remote` (PAN-91).
+    pub remote_client_key_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -935,6 +963,7 @@ async fn ptt_keys_for_scheduled_qso() {
             CallInitiation::Auto,
             None,
             false,
+            None,
         )
         .await
         .expect("respond_to_cq_with");
@@ -972,6 +1001,7 @@ async fn active_tx_offsets_populated_and_depopulated_with_active_tx_qsos() {
             CallInitiation::Auto,
             None,
             false,
+            None,
         )
         .await
         .expect("respond_to_cq_with");
@@ -1025,6 +1055,7 @@ async fn stale_tx_dropped_after_supersede_no_ptt() {
             CallInitiation::Auto,
             None,
             false,
+            None,
         )
         .await
         .expect("respond_to_cq_with");
@@ -1067,6 +1098,7 @@ async fn coalesce_backlog_newest_wins_stale_not_keyed() {
             CallInitiation::Auto,
             None,
             false,
+            None,
         )
         .await
         .expect("respond_to_cq_with");
@@ -1082,6 +1114,7 @@ async fn coalesce_backlog_newest_wins_stale_not_keyed() {
             qso_id: Some(id.clone()),
             tx_parity: Some(SlotParity::Even),
             origin: pancetta_lib::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         },
         PendingTx {
             text: "KEEPCALL-OLD-2".to_string(),
@@ -1089,6 +1122,7 @@ async fn coalesce_backlog_newest_wins_stale_not_keyed() {
             qso_id: Some(id.clone()),
             tx_parity: Some(SlotParity::Even),
             origin: pancetta_lib::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         },
         PendingTx {
             text: "KEEPCALL-NEWEST".to_string(),
@@ -1096,6 +1130,7 @@ async fn coalesce_backlog_newest_wins_stale_not_keyed() {
             qso_id: Some(id.clone()),
             tx_parity: Some(SlotParity::Even),
             origin: pancetta_lib::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         },
     ];
 
@@ -1141,6 +1176,7 @@ async fn two_simultaneous_qsos_key_on_distinct_freqs() {
             CallInitiation::Auto,
             None,
             false,
+            None,
         )
         .await
         .expect("qso a");
@@ -1153,6 +1189,7 @@ async fn two_simultaneous_qsos_key_on_distinct_freqs() {
             CallInitiation::Auto,
             None,
             false,
+            None,
         )
         .await
         .expect("qso b");
@@ -1191,6 +1228,7 @@ async fn tx_policy_disabled_is_silent() {
             CallInitiation::Auto,
             None,
             false,
+            None,
         )
         .await
         .expect("respond_to_cq_with");
@@ -1235,6 +1273,7 @@ async fn tx_policy_respond_only_keeps_qso_drops_initiation() {
             None,
             None,
             false,
+            None,
         )
         .await
         .expect("respond_to_caller");
@@ -1281,6 +1320,7 @@ async fn tx_policy_full_keys_everything() {
             CallInitiation::Auto,
             None,
             false,
+            None,
         )
         .await
         .expect("respond_to_cq_with");
@@ -1324,6 +1364,7 @@ async fn requested_offset_is_used() {
             CallInitiation::Auto,
             None,
             false,
+            None,
         )
         .await
         .expect("respond_to_cq_with");
@@ -1470,6 +1511,7 @@ async fn autonomous_pounce_deconflicts_against_active_stream() {
             CallInitiation::Auto,
             None,
             false,
+            None,
         )
         .await
         .expect("first qso");
@@ -1805,6 +1847,7 @@ async fn held_offset_honored_keys_at_held_not_dx_freq() {
             CallInitiation::Manual,
             partner, // DX's decode freq (700 Hz)
             false,
+            None,
         )
         .await
         .expect("respond_to_cq_with with held offset");
@@ -1893,6 +1936,7 @@ async fn clamped_manual_qso_recovers_when_dx_replies_off_frequency() {
             CallInitiation::Manual,
             partner,
             false,
+            None,
         )
         .await
         .expect("respond_to_cq_with with clamped offset");
@@ -1983,6 +2027,7 @@ async fn multi_tx_deconfliction_offsets_are_distinct() {
             CallInitiation::Auto,
             None,
             false,
+            None,
         )
         .await
         .expect("qso A");
@@ -2024,6 +2069,7 @@ async fn multi_tx_deconfliction_offsets_are_distinct() {
             CallInitiation::Auto,
             None,
             false,
+            None,
         )
         .await
         .expect("qso B");
@@ -2114,6 +2160,7 @@ async fn auto_single_no_collision_is_tx_eq_rx() {
             CallInitiation::Auto,
             partner, // None — Tx=Rx, no partner_freq split
             false,
+            None,
         )
         .await
         .expect("respond_to_cq_with Tx=Rx");
@@ -2222,6 +2269,7 @@ async fn fox_mode_answers_two_callers_multistreamed_distinct_offsets() {
             None,
             partner_a,
             false,
+            None,
         )
         .await
         .expect("Fox must be able to answer Hound A");
@@ -2260,6 +2308,7 @@ async fn fox_mode_answers_two_callers_multistreamed_distinct_offsets() {
             None,
             partner_b,
             false,
+            None,
         )
         .await
         .expect("Fox must be able to answer Hound B");
@@ -2464,6 +2513,7 @@ async fn remote_origin_qso_tx_dropped_when_unarmed() {
             CallInitiation::Manual,
             None,
             true, // remote_origin
+            None,
         )
         .await
         .expect("respond_to_cq_with");
@@ -2503,6 +2553,7 @@ async fn remote_origin_qso_tx_keys_when_armed() {
             CallInitiation::Manual,
             None,
             true, // remote_origin
+            None,
         )
         .await
         .expect("respond_to_cq_with");
@@ -2513,6 +2564,76 @@ async fn remote_origin_qso_tx_keys_when_armed() {
     assert!(
         sim.timeline.keyed_anything(),
         "an armed remote QSO's TX must key PTT.\n{}",
+        sim.timeline
+    );
+    sim.timeline.assert_all_released();
+}
+
+/// PAN-91 end-to-end: a QSO requested by one client must NOT key TX just
+/// because a DIFFERENT client happens to be armed. This is the real
+/// vulnerability the boolean-only arm gate had — creating the QSO is never
+/// itself gated, so an unauthorized peer's request could sit queued until
+/// some other, legitimate peer armed, at which point the old gate would
+/// authorize it by proxy.
+#[tokio::test]
+async fn remote_origin_qso_tx_dropped_when_different_client_armed() {
+    let mut sim = CoordSim::new("K5ARH").await;
+    // client-b is armed...
+    sim.arm_remote_tx_as("client-b");
+    // ...but this QSO was requested by client-a.
+    sim.manager
+        .respond_to_cq_with(
+            "W1XYZ".to_string(),
+            1500.0,
+            Some(SlotParity::Even),
+            CallInitiation::Manual,
+            None,
+            true, // remote_origin
+            Some("client-a".to_string()),
+        )
+        .await
+        .expect("respond_to_cq_with");
+
+    let pending = sim.pump_qso_events();
+    sim.drive_slot(pending).await;
+
+    sim.timeline.assert_silent();
+    assert!(
+        sim.timeline
+            .dropped
+            .iter()
+            .any(|d| d.reason == DropReason::RemoteNotArmed),
+        "PAN-91: a QSO bound to client-a must be dropped while only \
+         client-b is armed — the old gate would have keyed this.\n{}",
+        sim.timeline
+    );
+}
+
+/// PAN-91 end-to-end, positive case: the SAME client that requested the QSO
+/// being armed does key TX (confirms the fix doesn't just deny everything).
+#[tokio::test]
+async fn remote_origin_qso_tx_keys_when_same_client_armed() {
+    let mut sim = CoordSim::new("K5ARH").await;
+    sim.arm_remote_tx_as("client-a");
+    sim.manager
+        .respond_to_cq_with(
+            "W1XYZ".to_string(),
+            1500.0,
+            Some(SlotParity::Even),
+            CallInitiation::Manual,
+            None,
+            true, // remote_origin
+            Some("client-a".to_string()),
+        )
+        .await
+        .expect("respond_to_cq_with");
+
+    let pending = sim.pump_qso_events();
+    sim.drive_slot(pending).await;
+
+    assert!(
+        sim.timeline.keyed_anything(),
+        "a QSO bound to client-a must key TX once client-a itself is armed.\n{}",
         sim.timeline
     );
     sim.timeline.assert_all_released();
@@ -2532,6 +2653,7 @@ async fn local_origin_qso_tx_unaffected_by_arm() {
             CallInitiation::Manual,
             None,
             false, // local
+            None,
         )
         .await
         .expect("respond_to_cq_with");
@@ -2579,6 +2701,7 @@ async fn mode_switch_refused_while_qso_active() {
             CallInitiation::Auto,
             None,
             false,
+            None,
         )
         .await
         .expect("respond_to_cq_with");
@@ -2643,6 +2766,7 @@ async fn mode_switch_succeeds_idle_and_next_qso_uses_new_mode() {
             CallInitiation::Auto,
             None,
             false,
+            None,
         )
         .await
         .expect("respond_to_cq_with");
@@ -2751,6 +2875,7 @@ async fn mode_switch_never_requested_is_byte_identical_to_today() {
             CallInitiation::Auto,
             None,
             false,
+            None,
         )
         .await
         .expect("respond_to_cq_with");
@@ -2785,6 +2910,7 @@ async fn sm_f5_timeout_retirement_emits_both_events_and_purges_active_tx_qsos_on
             CallInitiation::Auto,
             None,
             false,
+            None,
         )
         .await
         .expect("respond_to_cq_with");

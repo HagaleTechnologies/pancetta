@@ -530,6 +530,10 @@ pub enum SleepOutcome {
     /// F8 (or any other existing abort_current_tx setter) fired with no
     /// stashed replacement request.
     AbortedByOperator,
+    /// PAN-92: a Remote in-flight frame's arm gate stopped permitting TX
+    /// mid-transmission (explicit disarm, dead-man/heartbeat loss, TTL
+    /// expiry, or local-kill) — the caller must stop keying, never re-key.
+    AbortedByDisarm,
     /// A qualifying request arrived; abort_current_tx was set by this
     /// function itself. Caller should attempt to re-key with the contained
     /// message.
@@ -579,6 +583,15 @@ async fn interruptible_sleep_or_supersede(
     message_bus: &MessageBus,
     in_flight_items: &[crate::message_bus::TransmitRequestItem],
     pivoted_once: &std::collections::HashMap<String, (String, f64)>,
+    // PAN-92: the in-flight frame's own origin/identity, re-checked against
+    // the live arm on every poll tick (below) so an explicit disarm — or the
+    // dead-man/heartbeat/TTL/local-kill gates ArmState already enforces —
+    // interrupts a transmission ALREADY keyed, not just future ones. `None`
+    // for a `TxOrigin::Local` in-flight frame, which is never gated.
+    remote_tx_arm: Option<(
+        &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
+        Option<&str>,
+    )>,
 ) -> SleepOutcome {
     use std::sync::atomic::Ordering;
 
@@ -606,6 +619,7 @@ async fn interruptible_sleep_or_supersede(
                 items,
                 tx_parity,
                 origin,
+                remote_client_key_id,
             } = message_type
             else {
                 return Some(message_type);
@@ -628,6 +642,7 @@ async fn interruptible_sleep_or_supersede(
                     items: filtered,
                     tx_parity,
                     origin,
+                    remote_client_key_id,
                 })
             }
         };
@@ -650,6 +665,19 @@ async fn interruptible_sleep_or_supersede(
             }
             if abort.load(Ordering::Acquire) {
                 return Some(SleepOutcome::AbortedByOperator);
+            }
+            // PAN-92: re-check the remote-TX arm gate on every tick for a
+            // Remote in-flight frame — a disarm (explicit, dead-man,
+            // heartbeat-lost, TTL-expired, or local-kill) must stop a
+            // transmission ALREADY keyed, not just block the next one.
+            if let Some((arm, client_key_id)) = remote_tx_arm {
+                if !remote_tx_permitted_for(
+                    arm,
+                    chrono::Utc::now().timestamp_millis(),
+                    client_key_id,
+                ) {
+                    return Some(SleepOutcome::AbortedByDisarm);
+                }
             }
             let Ok(message) = tx_rx.try_recv() else {
                 return None;
@@ -846,6 +874,97 @@ mod interruptible_sleep_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            None,
+        )
+        .await;
+        assert!(matches!(outcome, super::SleepOutcome::Completed));
+    }
+
+    /// PAN-92: an already-keyed Remote transmission must be interrupted the
+    /// moment the arm stops permitting it (here: an explicit disarm fired by
+    /// a concurrent task partway through the sleep), not just have future
+    /// transmissions blocked.
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_sleep_aborts_by_disarm_when_remote_arm_disarms_mid_sleep() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let bus = crate::message_bus::MessageBus::new(16).unwrap();
+        let pivoted_once = std::collections::HashMap::new();
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut st = pancetta_agent::arm::ArmState::new();
+        st.arm(
+            pancetta_agent::arm::VerifiedArmGrant {
+                operator_callsign: "K5ARH".to_string(),
+                ttl_ms: 120_000,
+                scope_tx: true,
+                jti: "disarm-mid-sleep-jti".to_string(),
+                client_key_id: "client-a".to_string(),
+            },
+            now_ms,
+        );
+        st.set_local_consent(true, now_ms);
+        let arm = Arc::new(std::sync::Mutex::new(st));
+
+        let arm_clone = arm.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            arm_clone
+                .lock()
+                .unwrap()
+                .disarm(chrono::Utc::now().timestamp_millis());
+        });
+
+        let start = tokio::time::Instant::now();
+        let outcome = super::interruptible_sleep_or_supersede(
+            Duration::from_secs(5),
+            &shutdown,
+            &abort,
+            &rx,
+            &bus,
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "in flight text".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
+            &pivoted_once,
+            Some((&arm, Some("client-a"))),
+        )
+        .await;
+        assert!(
+            matches!(outcome, super::SleepOutcome::AbortedByDisarm),
+            "expected AbortedByDisarm, got {outcome:?}"
+        );
+        // Should wake within the ~50ms poll granularity of the disarm (fired
+        // at ~20ms), not wait out the full 5s sleep.
+        assert!(start.elapsed() < Duration::from_millis(200));
+    }
+
+    /// Sibling of the above: a Local in-flight frame (`remote_tx_arm: None`)
+    /// must never be interrupted by the remote arm, even if it would deny —
+    /// byte-identical to pre-PAN-92 behavior for every non-remote TX.
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_sleep_ignores_arm_state_for_a_local_frame() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let bus = crate::message_bus::MessageBus::new(16).unwrap();
+        let pivoted_once = std::collections::HashMap::new();
+
+        let outcome = super::interruptible_sleep_or_supersede(
+            Duration::from_millis(80),
+            &shutdown,
+            &abort,
+            &rx,
+            &bus,
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "in flight text".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
+            &pivoted_once,
+            None, // Local frame: no arm to check
         )
         .await;
         assert!(matches!(outcome, super::SleepOutcome::Completed));
@@ -865,6 +984,7 @@ mod interruptible_sleep_tests {
             qso_id: Some("qso-1".to_string()),
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
         tx.send(crate::message_bus::ComponentMessage::new(
             crate::message_bus::ComponentId::Autonomous,
@@ -886,6 +1006,7 @@ mod interruptible_sleep_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            None,
         )
         .await;
 
@@ -927,6 +1048,7 @@ mod interruptible_sleep_tests {
             qso_id: Some("qso-1".to_string()),
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
         tx.send(crate::message_bus::ComponentMessage::new(
             crate::message_bus::ComponentId::Autonomous,
@@ -948,6 +1070,7 @@ mod interruptible_sleep_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            None,
         )
         .await;
 
@@ -974,6 +1097,7 @@ mod interruptible_sleep_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            None,
         )
         .await;
         assert!(matches!(outcome, super::SleepOutcome::AbortedByShutdown));
@@ -1027,6 +1151,7 @@ mod interruptible_sleep_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            None,
         )
         .await;
 
@@ -1090,6 +1215,7 @@ mod interruptible_sleep_tests {
             qso_id: Some("qso-other1".to_string()),
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
         tx_sender
             .send(crate::message_bus::ComponentMessage::new(
@@ -1112,6 +1238,7 @@ mod interruptible_sleep_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            None,
         )
         .await;
 
@@ -1174,6 +1301,7 @@ mod interruptible_sleep_tests {
                         qso_id: Some(qso_id.to_string()),
                         tx_parity: None,
                         origin: crate::message_bus::TxOrigin::Local,
+                        remote_client_key_id: None,
                     },
                     std::time::Instant::now(),
                 ))
@@ -1196,6 +1324,7 @@ mod interruptible_sleep_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            None,
         )
         .await;
 
@@ -1251,6 +1380,7 @@ mod interruptible_sleep_tests {
             ],
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
         tx_sender
             .send(crate::message_bus::ComponentMessage::new(
@@ -1273,6 +1403,7 @@ mod interruptible_sleep_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            None,
         )
         .await;
 
@@ -1316,6 +1447,7 @@ mod interruptible_sleep_tests {
             }],
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
         tx_sender
             .send(crate::message_bus::ComponentMessage::new(
@@ -1338,6 +1470,7 @@ mod interruptible_sleep_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            None,
         )
         .await;
 
@@ -1390,6 +1523,7 @@ mod interruptible_sleep_tests {
                         qso_id: Some(qso_id.to_string()),
                         tx_parity: None,
                         origin: crate::message_bus::TxOrigin::Local,
+                        remote_client_key_id: None,
                     },
                     std::time::Instant::now(),
                 ))
@@ -1413,6 +1547,7 @@ mod interruptible_sleep_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            None,
         )
         .await;
 
@@ -2415,6 +2550,91 @@ pub fn remote_tx_permitted(
     }
 }
 
+/// Like [`remote_tx_permitted`], but additionally binds the check to a
+/// specific client (PAN-91).
+///
+/// The plain boolean arm gate above only asks "is *some* client currently
+/// armed?" — it has no way to tell whether the frame in hand is the one that
+/// specific client actually requested. Without this, a peer without TX-arm
+/// eligibility could get a `TxRequest`-originated QSO queued while the
+/// controller slot is free (creating the QSO is deliberately never gated —
+/// only transmission is), and if a DIFFERENT, legitimate peer later takes
+/// control and arms, the worker would authorize the pending frame from the
+/// FIRST peer, because the old gate only checked "is the shared `ArmState`
+/// armed", never "armed by the same client this frame is bound to".
+///
+/// `remote_client_key_id` is `None` for every producer that predates PAN-91
+/// (or has no client identity concept — e.g. the WSJT-X UDP bridge's own
+/// remote-TX path) and for those frames this degrades to exactly
+/// [`remote_tx_permitted`]'s boolean-only check, so existing non-station-agent
+/// remote-TX integrations are unaffected. `Some(id)` requires that `id` is
+/// the client `ArmState::armed_client_key_id()` currently reports — a
+/// mismatch (including "armed, but by someone else") denies fail-closed.
+pub fn remote_tx_permitted_for(
+    arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
+    now_ms: i64,
+    remote_client_key_id: Option<&str>,
+) -> bool {
+    match arm.lock() {
+        Ok(state) => {
+            if !state.tx_permitted(now_ms) {
+                return false;
+            }
+            match remote_client_key_id {
+                None => true,
+                Some(id) => state.armed_client_key_id() == Some(id),
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+/// PAN-92: shared diagnostic/audit/relay for a Remote transmission stopped
+/// mid-flight by [`SleepOutcome::AbortedByDisarm`] — mirrors the Step 0a
+/// pickup-time drop's dispensa Q-0051 Phase A/B/C signals (TUI diagnostic,
+/// `AuditKind::TxDenied`, and a client-visible `error` event) so an
+/// in-flight interruption is exactly as visible as a pickup-time one.
+#[allow(clippy::too_many_arguments)]
+async fn emit_disarm_interrupt_signals(
+    message_bus: &MessageBus,
+    audit_log: &pancetta_agent::audit::AuditLog,
+    display_feed_enabled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    remote_tx_arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
+    message_text: &str,
+    frequency_offset: f64,
+    qso_id: Option<&str>,
+) {
+    let denial_reason =
+        format!("disarmed mid-transmission: '{message_text}' at {frequency_offset:.0} Hz");
+    emit_diagnostic(
+        message_bus,
+        "agent.tx",
+        pancetta_core::DiagnosticLevel::Warn,
+        format!("Remote TX interrupted ({denial_reason})"),
+        qso_id,
+    )
+    .await;
+    audit_log.append(&pancetta_agent::audit::AuditEvent {
+        ts_unix_ms: chrono::Utc::now().timestamp_millis(),
+        kind: pancetta_agent::audit::AuditKind::TxDenied,
+        operator_callsign: remote_tx_arm
+            .lock()
+            .ok()
+            .and_then(|s| s.operator_callsign().map(str::to_string)),
+        detail: denial_reason.clone(),
+    });
+    super::remote_gateway::relay_to_gateway(
+        message_bus,
+        display_feed_enabled,
+        ComponentId::Ft8Transmitter,
+        MessageType::TxDenied {
+            reason: denial_reason,
+            qso_id: qso_id.map(str::to_string),
+        },
+    )
+    .await;
+}
+
 /// Encode a text message to transmission symbols for the active protocol.
 ///
 /// **FT8 is byte-identical to the legacy path**: `Protocol::Ft8` calls the exact
@@ -2533,6 +2753,10 @@ pub struct CoalesceEntry {
     /// `Remote`, the emitted request/bundle is `Remote` (the arm gate applies
     /// to the whole bundle; fail-safe). Defaults to `Local`.
     pub origin: crate::message_bus::TxOrigin,
+    /// The client this entry's request is bound to, iff `origin == Remote`
+    /// (PAN-91). Threaded through the coalescer alongside `origin` — see
+    /// `MessageType::TransmitRequest::remote_client_key_id`.
+    pub remote_client_key_id: Option<String>,
 }
 
 /// Result of draining + coalescing a backlog of `TransmitRequest`s.
@@ -2960,12 +3184,14 @@ async fn coalesce_backlog_into(
             qso_id,
             tx_parity,
             origin,
+            remote_client_key_id,
         } => CoalesceEntry {
             message_text,
             frequency_offset,
             qso_id,
             tx_parity,
             origin,
+            remote_client_key_id,
         },
         // Defensive: not a TransmitRequest — hand it back unchanged.
         other => return other,
@@ -2982,6 +3208,7 @@ async fn coalesce_backlog_into(
                 qso_id,
                 tx_parity,
                 origin,
+                remote_client_key_id,
             } => {
                 drained.push(CoalesceEntry {
                     message_text,
@@ -2989,6 +3216,7 @@ async fn coalesce_backlog_into(
                     qso_id,
                     tx_parity,
                     origin,
+                    remote_client_key_id,
                 });
             }
             _ => {
@@ -3023,6 +3251,7 @@ async fn coalesce_backlog_into(
             qso_id: e.qso_id,
             tx_parity: e.tx_parity,
             origin: e.origin,
+            remote_client_key_id: e.remote_client_key_id,
         };
     }
 
@@ -3093,6 +3322,7 @@ async fn coalesce_backlog_into(
             items: Vec::new(),
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
     }
 
@@ -3105,6 +3335,7 @@ async fn coalesce_backlog_into(
             qso_id: e.qso_id,
             tx_parity: e.tx_parity,
             origin: e.origin,
+            remote_client_key_id: e.remote_client_key_id,
         };
     }
 
@@ -3130,6 +3361,17 @@ async fn coalesce_backlog_into(
     } else {
         crate::message_bus::TxOrigin::Local
     };
+    // PAN-91: mirror the origin fold for client identity. Same defense-in-depth
+    // caveat as `bundle_origin` — only one client can be armed station-wide at
+    // a time, so a coalesced backlog's Remote entries should all share one
+    // `remote_client_key_id` in practice; take the first Remote entry's if
+    // several somehow disagree (the per-frame arm-gate check at key-time is
+    // the actual enforcement, not this fold).
+    let bundle_remote_client_key_id = outcome
+        .retained
+        .iter()
+        .find(|e| e.origin == crate::message_bus::TxOrigin::Remote)
+        .and_then(|e| e.remote_client_key_id.clone());
     let items = outcome
         .retained
         .into_iter()
@@ -3143,6 +3385,7 @@ async fn coalesce_backlog_into(
         items,
         tx_parity: bundle_parity,
         origin: bundle_origin,
+        remote_client_key_id: bundle_remote_client_key_id,
     }
 }
 
@@ -3235,6 +3478,11 @@ enum SupersedeOutcome {
         /// origin and skipped the key-time arm gate entirely; the reverse —
         /// `Local` superseding `Remote` — wrongly kept gating a local frame.)
         origin: crate::message_bus::TxOrigin,
+        /// The NEW superseding request's OWN `remote_client_key_id` — carried
+        /// alongside `origin` for the same reason (PAN-91): the re-keyed
+        /// frame's arm-gate check at key-time must bind to THIS request's
+        /// client, not the aborted in-flight frame's.
+        remote_client_key_id: Option<String>,
         /// PAN-38 round 4 (Codex): the NEW superseding request's OWN
         /// `qso_id` — `message_text`/`frequency_offset`/`schedule` are
         /// mutated in place to the new request, but the caller's working
@@ -3263,11 +3511,17 @@ enum SupersedeOutcome {
         /// `Remote`, so a mixed-origin fold is still gated by the bundle arm
         /// gate. Mirrors the coalescer's fail-safe origin fold.
         bundle_origin: crate::message_bus::TxOrigin,
+        /// Folded client identity mirroring `bundle_origin` (PAN-91) — see
+        /// `coalesce_backlog_into`'s `bundle_remote_client_key_id` for the
+        /// same fold logic and its defense-in-depth caveat.
+        bundle_remote_client_key_id: Option<String>,
         /// The NEW request's OWN origin — used when the caller falls back to a
         /// single-item replace on a frequency collision (that fallback drops
         /// the in-flight item and transmits ONLY the new one, so it must gate
         /// with the new request's own origin, not the folded bundle origin).
         new_origin: crate::message_bus::TxOrigin,
+        /// The NEW request's OWN `remote_client_key_id`, mirroring `new_origin`.
+        new_remote_client_key_id: Option<String>,
     },
 }
 
@@ -3287,6 +3541,7 @@ async fn supersede_and_rekey_or_bundle(
     _request_received_at: chrono::DateTime<chrono::Utc>,
     max_concurrent_qsos: u32,
     in_flight_origin: crate::message_bus::TxOrigin,
+    in_flight_remote_client_key_id: Option<String>,
     in_flight_items: &[crate::message_bus::TransmitRequestItem],
 ) -> SupersedeOutcome {
     // Deassert PTT immediately and UNCONDITIONALLY — before we even inspect the
@@ -3318,6 +3573,7 @@ async fn supersede_and_rekey_or_bundle(
         tx_parity: new_tx_parity,
         qso_id: new_qso_id,
         origin: new_origin,
+        remote_client_key_id: new_remote_client_key_id,
     } = new_request
     else {
         // A `MultiTransmitRequest` arriving as the superseding message isn't
@@ -3422,10 +3678,23 @@ async fn supersede_and_rekey_or_bundle(
             } else {
                 crate::message_bus::TxOrigin::Local
             };
+            // PAN-91: mirror the origin fold — prefer whichever side is
+            // actually Remote (same defense-in-depth caveat as elsewhere: in
+            // practice at most one side is Remote here).
+            let bundle_remote_client_key_id =
+                if in_flight_origin == crate::message_bus::TxOrigin::Remote {
+                    in_flight_remote_client_key_id.clone()
+                } else if new_origin == crate::message_bus::TxOrigin::Remote {
+                    new_remote_client_key_id.clone()
+                } else {
+                    None
+                };
             return SupersedeOutcome::Bundle {
                 items: candidate_items,
                 bundle_origin,
+                bundle_remote_client_key_id,
                 new_origin,
+                new_remote_client_key_id,
             };
         }
         info!(
@@ -3442,6 +3711,7 @@ async fn supersede_and_rekey_or_bundle(
 
     SupersedeOutcome::Replace {
         origin: new_origin,
+        remote_client_key_id: new_remote_client_key_id,
         qso_id: new_qso_id,
     }
 }
@@ -3477,6 +3747,7 @@ async fn supersede_multi_reenqueue(
     new_request: MessageType,
     in_flight_items: &[crate::message_bus::TransmitRequestItem],
     origin: crate::message_bus::TxOrigin,
+    remote_client_key_id: Option<String>,
     // The in-flight bundle's OWN `tx_parity` (from its `MultiTransmitRequest`
     // message) — threaded through so a `Replace` outcome that preserves this
     // bundle unchanged (see that arm below) carries the SAME parity forward,
@@ -3540,6 +3811,7 @@ async fn supersede_multi_reenqueue(
         request_received_at,
         max_concurrent_qsos,
         origin,
+        remote_client_key_id.clone(),
         in_flight_items,
     )
     .await
@@ -3571,7 +3843,9 @@ async fn supersede_multi_reenqueue(
         SupersedeOutcome::Bundle {
             items,
             bundle_origin,
+            bundle_remote_client_key_id,
             new_origin,
+            new_remote_client_key_id,
         } => {
             let bundle_outcome =
                 encode_and_modulate_multi_tx(encoder, active_protocol, tx_params, &items);
@@ -3593,6 +3867,7 @@ async fn supersede_multi_reenqueue(
                         // bundle's origin — otherwise a Remote item folded onto a
                         // Local in-flight bundle would re-enter ungated.
                         origin: bundle_origin,
+                        remote_client_key_id: bundle_remote_client_key_id,
                     },
                     Instant::now(),
                 )
@@ -3614,6 +3889,7 @@ async fn supersede_multi_reenqueue(
                         qso_id: new_item.qso_id,
                         tx_parity: None,
                         origin: new_origin,
+                        remote_client_key_id: new_remote_client_key_id,
                     },
                     Instant::now(),
                 )
@@ -3629,6 +3905,7 @@ async fn supersede_multi_reenqueue(
             // Round 6: no longer re-enqueued (see below), so the superseding
             // request's own origin has nothing left to gate.
             origin: _new_origin,
+            remote_client_key_id: _new_remote_client_key_id,
             qso_id: new_qso_id,
         } => {
             // PR #348 review round 2 (Codex P2): the multi-TX arm's in-flight
@@ -3651,6 +3928,7 @@ async fn supersede_multi_reenqueue(
                         items: in_flight_items.to_vec(),
                         tx_parity: bundle_tx_parity,
                         origin,
+                        remote_client_key_id: remote_client_key_id.clone(),
                     },
                     Instant::now(),
                 );
@@ -4110,6 +4388,9 @@ impl super::ApplicationCoordinator {
                                     // origin, so Step 4b-arm's key-time gate re-evaluates
                                     // against the frame actually about to transmit (C1 fix).
                                     mut origin,
+                                    // `mut`: mirrors `origin` above (PAN-91) — re-pointed
+                                    // alongside it on a `Replace` supersede.
+                                    mut remote_client_key_id,
                                 } => {
                                     info!(
                                         "Transmit request: '{}' at offset {:.0} Hz (qso: {:?})",
@@ -4227,9 +4508,10 @@ impl super::ApplicationCoordinator {
                                     // arms it and no Remote request is constructed, so
                                     // this branch is never taken.
                                     if origin == crate::message_bus::TxOrigin::Remote
-                                        && !remote_tx_permitted(
+                                        && !remote_tx_permitted_for(
                                             &remote_tx_arm,
                                             chrono::Utc::now().timestamp_millis(),
+                                            remote_client_key_id.as_deref(),
                                         )
                                     {
                                         warn!(
@@ -4635,9 +4917,10 @@ impl super::ApplicationCoordinator {
                                         // the dead-man/TTL/local-kill guarantees hold across
                                         // the pre-PTT sleep. Local requests are never gated.
                                         if origin == crate::message_bus::TxOrigin::Remote
-                                            && !remote_tx_permitted(
+                                            && !remote_tx_permitted_for(
                                                 &remote_tx_arm,
                                                 chrono::Utc::now().timestamp_millis(),
+                                                remote_client_key_id.as_deref(),
                                             )
                                         {
                                             info!(
@@ -4949,6 +5232,14 @@ impl super::ApplicationCoordinator {
                                                 },
                                             ),
                                             &pivoted_once,
+                                            if origin == crate::message_bus::TxOrigin::Remote {
+                                                Some((
+                                                    &remote_tx_arm,
+                                                    remote_client_key_id.as_deref(),
+                                                ))
+                                            } else {
+                                                None
+                                            },
                                         )
                                         .await
                                         {
@@ -4965,6 +5256,38 @@ impl super::ApplicationCoordinator {
                                                 // completion here too -- see the "aborted before
                                                 // PTT engage" comment earlier in this worker for
                                                 // the full leak this closes.
+                                                let complete_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Autonomous,
+                                                    MessageType::TransmitComplete {
+                                                        success: false,
+                                                        message_text: message_text.clone(),
+                                                        duration_ms: 0,
+                                                        qso_id: qso_id.clone(),
+                                                    },
+                                                    Instant::now(),
+                                                );
+                                                if let Err(e) =
+                                                    message_bus.send_message(complete_msg).await
+                                                {
+                                                    warn!("Failed to send TransmitComplete: {}", e);
+                                                }
+                                                continue 'worker;
+                                            }
+                                            SleepOutcome::AbortedByDisarm => {
+                                                warn!(
+                                                    "TX aborted between PTT and slot: remote arm no longer permits it"
+                                                );
+                                                emit_disarm_interrupt_signals(
+                                                    &message_bus,
+                                                    &audit_log,
+                                                    &display_feed_enabled,
+                                                    &remote_tx_arm,
+                                                    &message_text,
+                                                    frequency_offset,
+                                                    qso_id.as_deref(),
+                                                )
+                                                .await;
                                                 let complete_msg = ComponentMessage::new(
                                                     ComponentId::Ft8Transmitter,
                                                     ComponentId::Autonomous,
@@ -5015,6 +5338,7 @@ impl super::ApplicationCoordinator {
                                                         &fox_max_streams,
                                                     ),
                                                     origin,
+                                                    remote_client_key_id.clone(),
                                                     &in_flight_items,
                                                 )
                                                 .await
@@ -5034,6 +5358,8 @@ impl super::ApplicationCoordinator {
                                                     }
                                                     SupersedeOutcome::Replace {
                                                         origin: new_origin,
+                                                        remote_client_key_id:
+                                                            new_remote_client_key_id,
                                                         qso_id: new_qso_id,
                                                     } => {
                                                         // Viable single-item re-key (Task 6): carry
@@ -5091,6 +5417,8 @@ impl super::ApplicationCoordinator {
                                                             }
                                                         }
                                                         origin = new_origin;
+                                                        remote_client_key_id =
+                                                            new_remote_client_key_id;
                                                         qso_id = new_qso_id;
                                                         rekey_schedule = Some(schedule);
                                                         is_rekey = true;
@@ -5108,7 +5436,9 @@ impl super::ApplicationCoordinator {
                                                     SupersedeOutcome::Bundle {
                                                         items,
                                                         bundle_origin,
+                                                        bundle_remote_client_key_id,
                                                         new_origin,
+                                                        new_remote_client_key_id,
                                                     } => {
                                                         // Prefer a multi-TX bundle: encode the
                                                         // in-flight + new item together. On success,
@@ -5147,6 +5477,8 @@ impl super::ApplicationCoordinator {
                                                                     // Fail-safe folded origin, not
                                                                     // the aborted frame's origin.
                                                                     origin: bundle_origin,
+                                                                    remote_client_key_id:
+                                                                        bundle_remote_client_key_id,
                                                                 },
                                                                 Instant::now(),
                                                             );
@@ -5211,6 +5543,8 @@ impl super::ApplicationCoordinator {
                                                             }
                                                         }
                                                         origin = new_origin;
+                                                        remote_client_key_id =
+                                                            new_remote_client_key_id;
                                                         qso_id = items
                                                             .last()
                                                             .and_then(|item| item.qso_id.clone());
@@ -5278,6 +5612,14 @@ impl super::ApplicationCoordinator {
                                                 },
                                             ),
                                             &pivoted_once,
+                                            if origin == crate::message_bus::TxOrigin::Remote {
+                                                Some((
+                                                    &remote_tx_arm,
+                                                    remote_client_key_id.as_deref(),
+                                                ))
+                                            } else {
+                                                None
+                                            },
                                         )
                                         .await
                                         {
@@ -5293,6 +5635,38 @@ impl super::ApplicationCoordinator {
                                                 // PAN-38 round 4 (Codex): report the failed
                                                 // completion here too -- see the "aborted before
                                                 // PTT engage" comment earlier in this worker.
+                                                let complete_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Autonomous,
+                                                    MessageType::TransmitComplete {
+                                                        success: false,
+                                                        message_text: message_text.clone(),
+                                                        duration_ms: 0,
+                                                        qso_id: qso_id.clone(),
+                                                    },
+                                                    Instant::now(),
+                                                );
+                                                if let Err(e) =
+                                                    message_bus.send_message(complete_msg).await
+                                                {
+                                                    warn!("Failed to send TransmitComplete: {}", e);
+                                                }
+                                                continue 'worker;
+                                            }
+                                            SleepOutcome::AbortedByDisarm => {
+                                                warn!(
+                                                    "TX aborted during playback: remote arm no longer permits it"
+                                                );
+                                                emit_disarm_interrupt_signals(
+                                                    &message_bus,
+                                                    &audit_log,
+                                                    &display_feed_enabled,
+                                                    &remote_tx_arm,
+                                                    &message_text,
+                                                    frequency_offset,
+                                                    qso_id.as_deref(),
+                                                )
+                                                .await;
                                                 let complete_msg = ComponentMessage::new(
                                                     ComponentId::Ft8Transmitter,
                                                     ComponentId::Autonomous,
@@ -5341,6 +5715,7 @@ impl super::ApplicationCoordinator {
                                                         &fox_max_streams,
                                                     ),
                                                     origin,
+                                                    remote_client_key_id.clone(),
                                                     &in_flight_items,
                                                 )
                                                 .await
@@ -5357,6 +5732,8 @@ impl super::ApplicationCoordinator {
                                                     }
                                                     SupersedeOutcome::Replace {
                                                         origin: new_origin,
+                                                        remote_client_key_id:
+                                                            new_remote_client_key_id,
                                                         qso_id: new_qso_id,
                                                     } => {
                                                         // Re-point `origin` at the superseding
@@ -5404,6 +5781,8 @@ impl super::ApplicationCoordinator {
                                                             }
                                                         }
                                                         origin = new_origin;
+                                                        remote_client_key_id =
+                                                            new_remote_client_key_id;
                                                         qso_id = new_qso_id;
                                                         rekey_schedule = Some(schedule);
                                                         is_rekey = true;
@@ -5421,7 +5800,9 @@ impl super::ApplicationCoordinator {
                                                     SupersedeOutcome::Bundle {
                                                         items,
                                                         bundle_origin,
+                                                        bundle_remote_client_key_id,
                                                         new_origin,
+                                                        new_remote_client_key_id,
                                                     } => {
                                                         let tx_params =
                                                             pancetta_ft8::ProtocolParams::from_protocol(
@@ -5447,6 +5828,8 @@ impl super::ApplicationCoordinator {
                                                                     tx_parity,
                                                                     // Fail-safe folded origin.
                                                                     origin: bundle_origin,
+                                                                    remote_client_key_id:
+                                                                        bundle_remote_client_key_id,
                                                                 },
                                                                 Instant::now(),
                                                             );
@@ -5505,6 +5888,8 @@ impl super::ApplicationCoordinator {
                                                             }
                                                         }
                                                         origin = new_origin;
+                                                        remote_client_key_id =
+                                                            new_remote_client_key_id;
                                                         qso_id = items
                                                             .last()
                                                             .and_then(|item| item.qso_id.clone());
@@ -5617,6 +6002,7 @@ impl super::ApplicationCoordinator {
                                     mut items,
                                     tx_parity,
                                     origin,
+                                    remote_client_key_id,
                                 } => {
                                     info!("Multi-TX request: {} messages", items.len());
                                     TX_ATTEMPTS_COUNT
@@ -5759,9 +6145,10 @@ impl super::ApplicationCoordinator {
                                     // hard-mute above. Fail CLOSED on a poisoned lock.
                                     // Inert in P0–P2 (no Remote bundle is constructed).
                                     if origin == crate::message_bus::TxOrigin::Remote
-                                        && !remote_tx_permitted(
+                                        && !remote_tx_permitted_for(
                                             &remote_tx_arm,
                                             chrono::Utc::now().timestamp_millis(),
+                                            remote_client_key_id.as_deref(),
                                         )
                                     {
                                         warn!(
@@ -6639,9 +7026,10 @@ impl super::ApplicationCoordinator {
                                     // PTT if the arm went stale during the wait. Local
                                     // bundles are never gated.
                                     if origin == crate::message_bus::TxOrigin::Remote
-                                        && !remote_tx_permitted(
+                                        && !remote_tx_permitted_for(
                                             &remote_tx_arm,
                                             chrono::Utc::now().timestamp_millis(),
+                                            remote_client_key_id.as_deref(),
                                         )
                                     {
                                         info!(
@@ -6856,6 +7244,11 @@ impl super::ApplicationCoordinator {
                                         // bundle's 2nd+ QSO must match here too.
                                         &items,
                                         &pivoted_once,
+                                        if origin == crate::message_bus::TxOrigin::Remote {
+                                            Some((&remote_tx_arm, remote_client_key_id.as_deref()))
+                                        } else {
+                                            None
+                                        },
                                     )
                                     .await
                                     {
@@ -6892,11 +7285,46 @@ impl super::ApplicationCoordinator {
                                             }
                                             continue;
                                         }
+                                        SleepOutcome::AbortedByDisarm => {
+                                            warn!(
+                                                "Multi-TX aborted between PTT and slot: remote arm no longer permits it"
+                                            );
+                                            emit_disarm_interrupt_signals(
+                                                &message_bus,
+                                                &audit_log,
+                                                &display_feed_enabled,
+                                                &remote_tx_arm,
+                                                "<multi-TX bundle>",
+                                                0.0,
+                                                None,
+                                            )
+                                            .await;
+                                            for item in &items {
+                                                let complete_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Autonomous,
+                                                    MessageType::TransmitComplete {
+                                                        success: false,
+                                                        message_text: item.message_text.clone(),
+                                                        duration_ms: 0,
+                                                        qso_id: item.qso_id.clone(),
+                                                    },
+                                                    Instant::now(),
+                                                );
+                                                if let Err(e) =
+                                                    message_bus.send_message(complete_msg).await
+                                                {
+                                                    warn!("Failed to send TransmitComplete: {}", e);
+                                                }
+                                            }
+                                            continue;
+                                        }
                                         SleepOutcome::Superseded(new_request, pending) => {
                                             supersede_multi_reenqueue(
                                                 new_request,
                                                 &items,
                                                 origin,
+                                                remote_client_key_id.clone(),
                                                 tx_parity,
                                                 &mut encoder,
                                                 active_protocol,
@@ -6974,6 +7402,11 @@ impl super::ApplicationCoordinator {
                                         // bundle's 2nd+ QSO must match here too.
                                         &items,
                                         &pivoted_once,
+                                        if origin == crate::message_bus::TxOrigin::Remote {
+                                            Some((&remote_tx_arm, remote_client_key_id.as_deref()))
+                                        } else {
+                                            None
+                                        },
                                     )
                                     .await
                                     {
@@ -7010,11 +7443,46 @@ impl super::ApplicationCoordinator {
                                             }
                                             continue;
                                         }
+                                        SleepOutcome::AbortedByDisarm => {
+                                            warn!(
+                                                "Multi-TX aborted during playback: remote arm no longer permits it"
+                                            );
+                                            emit_disarm_interrupt_signals(
+                                                &message_bus,
+                                                &audit_log,
+                                                &display_feed_enabled,
+                                                &remote_tx_arm,
+                                                "<multi-TX bundle>",
+                                                0.0,
+                                                None,
+                                            )
+                                            .await;
+                                            for item in &items {
+                                                let complete_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Autonomous,
+                                                    MessageType::TransmitComplete {
+                                                        success: false,
+                                                        message_text: item.message_text.clone(),
+                                                        duration_ms: 0,
+                                                        qso_id: item.qso_id.clone(),
+                                                    },
+                                                    Instant::now(),
+                                                );
+                                                if let Err(e) =
+                                                    message_bus.send_message(complete_msg).await
+                                                {
+                                                    warn!("Failed to send TransmitComplete: {}", e);
+                                                }
+                                            }
+                                            continue;
+                                        }
                                         SleepOutcome::Superseded(new_request, pending) => {
                                             supersede_multi_reenqueue(
                                                 new_request,
                                                 &items,
                                                 origin,
+                                                remote_client_key_id.clone(),
                                                 tx_parity,
                                                 &mut encoder,
                                                 active_protocol,
@@ -7791,6 +8259,7 @@ mod schedule_tx_tests {
             qso_id: None,
             tx_parity,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         }
     }
 
@@ -7894,6 +8363,7 @@ mod schedule_tx_tests {
             items: Vec::new(),
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
         let cap = adaptive_coalesce_cap_ms(
             &head,
@@ -8129,6 +8599,7 @@ mod supersede_rekey_tests {
             qso_id: Some("qso-1".to_string()),
             tx_parity: Some(cur_parity),
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
 
         // max_concurrent_qsos == 1 → single-item replace (Task 6 behavior).
@@ -8147,6 +8618,7 @@ mod supersede_rekey_tests {
             now,
             1,
             crate::message_bus::TxOrigin::Local,
+            None,
             &[],
         )
         .await;
@@ -8241,6 +8713,7 @@ mod supersede_rekey_tests {
             qso_id: Some("qso-super".to_string()),
             tx_parity: Some(cur_parity),
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
 
         // max_concurrent_qsos == 1 → the single-TX arm's `Replace` path.
@@ -8259,6 +8732,7 @@ mod supersede_rekey_tests {
             now,
             1,
             crate::message_bus::TxOrigin::Local,
+            None,
             &[],
         )
         .await;
@@ -8382,6 +8856,7 @@ mod supersede_rekey_tests {
             qso_id: Some("qso-2".to_string()),
             tx_parity: Some(cur_parity),
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
 
         let outcome = super::supersede_and_rekey_or_bundle(
@@ -8399,6 +8874,7 @@ mod supersede_rekey_tests {
             now,
             2,
             crate::message_bus::TxOrigin::Local,
+            None,
             &in_flight,
         )
         .await;
@@ -8475,6 +8951,7 @@ mod supersede_rekey_tests {
             qso_id: Some("qso-1".to_string()),
             tx_parity: Some(cur_parity),
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
 
         let outcome = super::supersede_and_rekey_or_bundle(
@@ -8492,6 +8969,7 @@ mod supersede_rekey_tests {
             now,
             2,
             crate::message_bus::TxOrigin::Local,
+            None,
             &in_flight,
         )
         .await;
@@ -8578,6 +9056,7 @@ mod supersede_rekey_tests {
             qso_id: Some("qso-third".to_string()),
             tx_parity: Some(cur_parity),
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
 
         let outcome = super::supersede_and_rekey_or_bundle(
@@ -8595,6 +9074,7 @@ mod supersede_rekey_tests {
             now,
             2, // max_concurrent_qsos — already met by the 2 in-flight items
             crate::message_bus::TxOrigin::Local,
+            None,
             &in_flight,
         )
         .await;
@@ -8666,6 +9146,7 @@ mod supersede_rekey_tests {
             qso_id: None,
             tx_parity: Some(cur_parity),
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
 
         let outcome = super::supersede_and_rekey_or_bundle(
@@ -8683,6 +9164,7 @@ mod supersede_rekey_tests {
             now,
             2, // max_concurrent_qsos — met by qso-1 alone; the 2 manual items must not count
             crate::message_bus::TxOrigin::Local,
+            None,
             &in_flight,
         )
         .await;
@@ -8757,6 +9239,7 @@ mod supersede_rekey_tests {
                 qso_id: Some("qso-new".to_string()),
                 tx_parity: Some(cur_parity),
                 origin: new_origin,
+                remote_client_key_id: None,
             };
 
             // max_concurrent_qsos == 1 → the single-TX arm's Replace path.
@@ -8775,12 +9258,17 @@ mod supersede_rekey_tests {
                 now,
                 1,
                 in_flight_origin,
+                None,
                 &[],
             )
             .await;
 
             match outcome {
-                super::SupersedeOutcome::Replace { origin, qso_id } => {
+                super::SupersedeOutcome::Replace {
+                    origin,
+                    qso_id,
+                    remote_client_key_id: _,
+                } => {
                     assert_eq!(
                         origin, new_origin,
                         "Replace must carry the SUPERSEDING request's origin \
@@ -8879,6 +9367,7 @@ mod supersede_rekey_tests {
                 qso_id: Some("qso-2".to_string()),
                 tx_parity: Some(cur_parity),
                 origin: new_origin,
+                remote_client_key_id: None,
             };
 
             let outcome = super::supersede_and_rekey_or_bundle(
@@ -8896,6 +9385,7 @@ mod supersede_rekey_tests {
                 now,
                 2,
                 in_flight_origin,
+                None,
                 &in_flight,
             )
             .await;
@@ -8945,6 +9435,7 @@ mod supersede_rekey_tests {
             items: Vec::new(),
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
 
         let outcome = super::supersede_and_rekey_or_bundle(
@@ -8962,6 +9453,7 @@ mod supersede_rekey_tests {
             chrono::Utc::now(),
             2,
             crate::message_bus::TxOrigin::Local,
+            None,
             &[],
         )
         .await;
@@ -9026,6 +9518,7 @@ mod supersede_rekey_tests {
             ],
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
 
         let ptt_active = Arc::new(AtomicBool::new(true));
@@ -9035,6 +9528,7 @@ mod supersede_rekey_tests {
             superseding,
             &in_flight,
             crate::message_bus::TxOrigin::Local,
+            None,
             None,
             &mut encoder,
             pancetta_ft8::Protocol::Ft8,
@@ -9141,6 +9635,7 @@ mod supersede_rekey_tests {
             qso_id: Some("qso-third".to_string()),
             tx_parity: Some(cur_parity),
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
 
         let ptt_active = Arc::new(AtomicBool::new(true));
@@ -9150,6 +9645,7 @@ mod supersede_rekey_tests {
             superseding,
             &in_flight,
             crate::message_bus::TxOrigin::Local,
+            None,
             Some(cur_parity),
             &mut encoder,
             pancetta_ft8::Protocol::Ft8,
@@ -9257,6 +9753,7 @@ mod supersede_rekey_tests {
             qso_id: Some("qso-2".to_string()),
             tx_parity: Some(cur_parity),
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
 
         let ptt_active = Arc::new(AtomicBool::new(true));
@@ -9266,6 +9763,7 @@ mod supersede_rekey_tests {
             superseding,
             &in_flight,
             crate::message_bus::TxOrigin::Local,
+            None,
             Some(cur_parity), // the ESTABLISHED in-flight bundle's own parity
             &mut encoder,
             pancetta_ft8::Protocol::Ft8,
@@ -9505,6 +10003,7 @@ mod coalesce_tests {
             qso_id: qso_id.map(|s| s.to_string()),
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         }
     }
 
@@ -9521,6 +10020,7 @@ mod coalesce_tests {
             qso_id: qso_id.map(|s| s.to_string()),
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         }
     }
 
@@ -9732,6 +10232,7 @@ mod coalesce_tests {
             qso_id: qso_id.map(|s| s.to_string()),
             tx_parity,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         }
     }
 
@@ -9751,6 +10252,7 @@ mod coalesce_tests {
             qso_id: qso_id.map(|s| s.to_string()),
             tx_parity,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         }
     }
 
@@ -10002,6 +10504,7 @@ mod coalesce_tests {
             qso_id: Some("qso-a".to_string()),
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
         for (text, id, freq) in [("B", "qso-b", 1300.0), ("C", "qso-c", 1600.0)] {
             backlog_tx
@@ -10014,6 +10517,7 @@ mod coalesce_tests {
                         qso_id: Some(id.to_string()),
                         tx_parity: None,
                         origin: crate::message_bus::TxOrigin::Local,
+                        remote_client_key_id: None,
                     },
                     Instant::now(),
                 ))
@@ -10530,6 +11034,81 @@ mod remote_arm_gate_tests {
     }
 }
 
+/// Unit tests for PAN-91's client-identity-bound gate (`remote_tx_permitted_for`).
+///
+/// These lock the fix's actual invariant: a frame bound to one client must
+/// key TX only while THAT client is armed — not merely while *some* client
+/// is armed, which is exactly the gap that let a different peer's arm
+/// authorize a QSO it never requested.
+#[cfg(test)]
+mod remote_arm_gate_identity_tests {
+    use super::remote_tx_permitted_for;
+    use pancetta_agent::arm::{ArmState, VerifiedArmGrant};
+    use std::sync::{Arc, Mutex};
+
+    const NOW: i64 = 1_000_000;
+
+    fn grant_for(client_key_id: &str) -> VerifiedArmGrant {
+        VerifiedArmGrant {
+            operator_callsign: "K5ARH".to_string(),
+            ttl_ms: 120_000,
+            scope_tx: true,
+            jti: "tx-test-arm-jti".to_string(),
+            client_key_id: client_key_id.to_string(),
+        }
+    }
+
+    fn armed_and_consented(client_key_id: &str) -> Arc<Mutex<ArmState>> {
+        let mut st = ArmState::new();
+        st.arm(grant_for(client_key_id), NOW);
+        st.set_local_consent(true, NOW);
+        Arc::new(Mutex::new(st))
+    }
+
+    #[test]
+    fn matching_client_is_permitted() {
+        let arm = armed_and_consented("client-a");
+        assert!(
+            remote_tx_permitted_for(&arm, NOW, Some("client-a")),
+            "the client that is actually armed must be permitted to TX"
+        );
+    }
+
+    #[test]
+    fn different_client_is_denied_even_though_someone_is_armed() {
+        // THE regression this fix closes: client-b's frame must not be
+        // authorized just because client-a happens to be armed right now.
+        let arm = armed_and_consented("client-a");
+        assert!(
+            !remote_tx_permitted_for(&arm, NOW, Some("client-b")),
+            "PAN-91: a frame bound to a different client than the one \
+             currently armed must be denied, not authorized by proxy"
+        );
+    }
+
+    #[test]
+    fn no_bound_identity_falls_back_to_boolean_only_gate() {
+        // Pre-PAN-91 producers (no client identity concept, e.g. the WSJT-X
+        // UDP bridge) must be unaffected: None degrades to the old
+        // boolean-only check.
+        let arm = armed_and_consented("client-a");
+        assert!(
+            remote_tx_permitted_for(&arm, NOW, None),
+            "a frame with no bound client identity must fall back to the \
+             plain armed/permitted check, preserving pre-PAN-91 behavior"
+        );
+    }
+
+    #[test]
+    fn bound_identity_denied_when_nobody_armed() {
+        let arm = Arc::new(Mutex::new(ArmState::new()));
+        assert!(
+            !remote_tx_permitted_for(&arm, NOW, Some("client-a")),
+            "an unarmed station must deny regardless of the frame's bound identity"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tx_counter_tests {
     use super::*;
@@ -10575,6 +11154,7 @@ mod classifier_tests {
             qso_id: qso_id.map(|s| s.to_string()),
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         }
     }
 
@@ -10849,6 +11429,7 @@ mod classifier_tests {
             }],
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
         let outcome = super::classify_incoming_during_tx(
             &candidate,
@@ -10887,6 +11468,7 @@ mod classifier_tests {
             ],
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
         let outcome = super::classify_incoming_during_tx(
             &candidate,
@@ -10932,6 +11514,7 @@ mod classifier_tests {
             ],
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
         let outcome = super::classify_incoming_during_tx(
             &candidate,

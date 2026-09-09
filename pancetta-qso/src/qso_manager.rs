@@ -828,6 +828,12 @@ pub enum QsoEvent {
         /// forwards this as `TxOrigin::Remote` so the frame is armed-TX gated.
         /// `false` for every Local / TUI / autonomous QSO.
         remote_origin: bool,
+        /// Mirrors `QsoMetadata.remote_client_key_id` — the station-agent peer
+        /// this QSO is bound to, iff `remote_origin`. The coordinator's arm
+        /// gate compares this against the CURRENTLY-armed client so a
+        /// different peer taking control later can never authorize a frame it
+        /// never requested.
+        remote_client_key_id: Option<String>,
     },
 
     /// QSO completed
@@ -1555,9 +1561,16 @@ impl QsoManager {
         frequency: f64,
         tx_parity: Option<pancetta_core::slot::SlotParity>,
         remote_origin: bool,
+        remote_client_key_id: Option<String>,
     ) -> Result<QsoId, QsoManagerError> {
-        self.start_cq_with_id(Uuid::new_v4(), frequency, tx_parity, remote_origin)
-            .await
+        self.start_cq_with_id(
+            Uuid::new_v4(),
+            frequency,
+            tx_parity,
+            remote_origin,
+            remote_client_key_id,
+        )
+        .await
     }
 
     /// PAN-38 round 2 (Codex): same as [`Self::start_cq`], but lets the
@@ -1576,6 +1589,7 @@ impl QsoManager {
         frequency: f64,
         tx_parity: Option<pancetta_core::slot::SlotParity>,
         remote_origin: bool,
+        remote_client_key_id: Option<String>,
     ) -> Result<QsoId, QsoManagerError> {
         if self.config.our_callsign == "NOCALL" || self.config.our_callsign == "N0CALL" {
             return Err(QsoManagerError::Configuration {
@@ -1633,6 +1647,7 @@ impl QsoManager {
             pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin,
+            remote_client_key_id: remote_client_key_id.clone(),
             // CQ-path latch: resolved from our own preference, not an
             // observed DX parity — always self-consistent, never provisional.
             tx_parity_provisional: false,
@@ -1659,6 +1674,7 @@ impl QsoManager {
             frequency,
             tx_parity,
             remote_origin,
+            remote_client_key_id,
         })
         .await;
 
@@ -1703,6 +1719,7 @@ impl QsoManager {
         frequency: f64,
         tx_parity: Option<pancetta_core::slot::SlotParity>,
         remote_origin: bool,
+        remote_client_key_id: Option<String>,
     ) -> Result<QsoId, QsoManagerError> {
         if self.config.our_callsign == "NOCALL" || self.config.our_callsign == "N0CALL" {
             return Err(QsoManagerError::Configuration {
@@ -1771,6 +1788,7 @@ impl QsoManager {
             // `false` for operator-pressed `c` (local); `true` for a remote
             // operator's `startCq` routed via the station agent.
             remote_origin,
+            remote_client_key_id: remote_client_key_id.clone(),
             // CQ-path latch: resolved from our own preference, not an
             // observed DX parity — always self-consistent, never provisional.
             tx_parity_provisional: false,
@@ -1807,6 +1825,7 @@ impl QsoManager {
             frequency,
             tx_parity,
             remote_origin,
+            remote_client_key_id,
         })
         .await;
 
@@ -1838,6 +1857,7 @@ impl QsoManager {
             CallInitiation::Auto,
             None,  // auto path always Tx=Rx; partner_freq not needed
             false, // autonomous is a LOCAL initiation, never remote
+            None,
         )
         .await
     }
@@ -1861,6 +1881,7 @@ impl QsoManager {
             CallInitiation::Manual,
             None,  // partner_freq computed by coordinator (T3); None = Tx=Rx fallback
             false, // TUI/DX-hunter manual call is LOCAL, never remote
+            None,
         )
         .await
     }
@@ -1958,6 +1979,7 @@ impl QsoManager {
                 CallInitiation::Manual,
                 Some(fox_freq), // Fox's RX offset; routes the Fox's reply via partner_freq
                 false,          // Shift+H hound engage is a LOCAL operator action
+                None,
             )
             .await?;
 
@@ -2024,6 +2046,7 @@ impl QsoManager {
     /// relevance gate routes the DX's replies (which arrive at *their* audio
     /// offset) to this QSO. Pass `None` for the normal Tx=Rx case (no partner
     /// routing needed). This is the same mechanism `engage_hound` uses.
+    #[allow(clippy::too_many_arguments)]
     pub async fn respond_to_cq_with(
         &self,
         target_callsign: String,
@@ -2032,6 +2055,7 @@ impl QsoManager {
         initiated_by: CallInitiation,
         partner_freq: Option<f64>,
         remote_origin: bool,
+        remote_client_key_id: Option<String>,
     ) -> Result<QsoId, QsoManagerError> {
         if self.config.our_callsign == "NOCALL" || self.config.our_callsign == "N0CALL" {
             return Err(QsoManagerError::Configuration {
@@ -2169,6 +2193,7 @@ impl QsoManager {
             pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin,
+            remote_client_key_id: remote_client_key_id.clone(),
             tx_parity_provisional,
         };
 
@@ -2220,6 +2245,7 @@ impl QsoManager {
             frequency,
             tx_parity,
             remote_origin,
+            remote_client_key_id,
         })
         .await;
 
@@ -2277,6 +2303,7 @@ impl QsoManager {
         their_report: Option<i8>,
         partner_freq: Option<f64>,
         remote_origin: bool,
+        remote_client_key_id: Option<String>,
     ) -> Result<QsoId, QsoManagerError> {
         use pancetta_core::ResponseStep;
 
@@ -2310,6 +2337,7 @@ impl QsoManager {
                     CallInitiation::Manual,
                     partner_freq,
                     remote_origin,
+                    remote_client_key_id,
                 )
                 .await;
         }
@@ -2530,6 +2558,7 @@ impl QsoManager {
             pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin,
+            remote_client_key_id: remote_client_key_id.clone(),
             tx_parity_provisional,
         };
 
@@ -2584,6 +2613,7 @@ impl QsoManager {
             frequency,
             tx_parity,
             remote_origin,
+            remote_client_key_id,
         })
         .await;
 
@@ -3122,19 +3152,26 @@ impl QsoManager {
     /// exposed as `pub` so integration tests can drive additional
     /// MessageToSend events without going through the auto_sequencer.
     pub async fn send_message(&self, qso_id: QsoId, message: MessageType, frequency: f64) {
-        let (tx_parity, remote_origin) = self
+        let (tx_parity, remote_origin, remote_client_key_id) = self
             .qsos
             .read()
             .await
             .get(&qso_id)
-            .map(|p| (p.metadata.tx_parity, p.metadata.remote_origin))
-            .unwrap_or((None, false));
+            .map(|p| {
+                (
+                    p.metadata.tx_parity,
+                    p.metadata.remote_origin,
+                    p.metadata.remote_client_key_id.clone(),
+                )
+            })
+            .unwrap_or((None, false, None));
         self.emit_event(QsoEvent::MessageToSend {
             qso_id,
             message,
             frequency,
             tx_parity,
             remote_origin,
+            remote_client_key_id,
         })
         .await;
     }
@@ -3554,6 +3591,7 @@ impl QsoManager {
                     progress.metadata.frequency,
                     progress.metadata.tx_parity,
                     progress.metadata.remote_origin,
+                    progress.metadata.remote_client_key_id.clone(),
                 )
             })
         } else {
@@ -3576,13 +3614,16 @@ impl QsoManager {
         // The one-shot CQ retransmission (if any), also emitted after the
         // lock is released — same collect-then-emit-after-lock-drop pattern
         // `rearm_manual_calls_at`'s own `to_recall` uses.
-        if let Some((message, frequency, tx_parity, remote_origin)) = cq_retransmit {
+        if let Some((message, frequency, tx_parity, remote_origin, remote_client_key_id)) =
+            cq_retransmit
+        {
             self.emit_event(QsoEvent::MessageToSend {
                 qso_id,
                 message,
                 frequency,
                 tx_parity,
                 remote_origin,
+                remote_client_key_id,
             })
             .await;
         }
@@ -3658,6 +3699,7 @@ impl QsoManager {
         let mut qso_frequency = progress.metadata.frequency;
         let qso_tx_parity = progress.metadata.tx_parity;
         let qso_remote_origin = progress.metadata.remote_origin;
+        let qso_remote_client_key_id = progress.metadata.remote_client_key_id.clone();
         let qso_initiated_by = progress.metadata.initiated_by;
         // PR #344 round-1 Codex P2: a natively-typed ContestReply (PAN-51 --
         // ft8_message_to_qso_type classifies a ReplyWithR decode directly,
@@ -4277,6 +4319,7 @@ impl QsoManager {
                 frequency: qso_frequency,
                 tx_parity: qso_tx_parity,
                 remote_origin: qso_remote_origin,
+                remote_client_key_id: qso_remote_client_key_id,
             })
             .await;
         }
@@ -6104,6 +6147,7 @@ impl QsoManager {
             });
             let tx_parity = progress.metadata.tx_parity;
             let remote_origin = progress.metadata.remote_origin;
+            let remote_client_key_id = progress.metadata.remote_client_key_id.clone();
 
             // On completion, stamp reports/end-time and prepare the completed
             // metadata (with the real RF frequency = dial + offset) to log.
@@ -6140,13 +6184,21 @@ impl QsoManager {
                 old_state,
                 tx_parity,
                 remote_origin,
+                remote_client_key_id,
                 completed_metadata,
                 state_history,
                 messages,
             )
         };
-        let (old_state, tx_parity, remote_origin, completed_metadata, state_history, messages) =
-            emit;
+        let (
+            old_state,
+            tx_parity,
+            remote_origin,
+            remote_client_key_id,
+            completed_metadata,
+            state_history,
+            messages,
+        ) = emit;
 
         self.emit_state_change(qso_id, old_state, new_state).await;
         self.emit_event(QsoEvent::MessageToSend {
@@ -6155,6 +6207,7 @@ impl QsoManager {
             frequency,
             tx_parity,
             remote_origin,
+            remote_client_key_id,
         })
         .await;
         if let Some(metadata) = completed_metadata {
@@ -6414,13 +6467,15 @@ impl QsoManager {
         // Each entry carries the exact MessageType to re-emit so a
         // RespondingToCq QSO re-sends the call (CqResponse) while a
         // SendingReport QSO re-sends our R-report (ReportAck) — FIX 4.
-        let mut to_recall: Vec<(
+        type RecallEntry = (
             QsoId,
             MessageType,
             f64,
             Option<pancetta_core::slot::SlotParity>,
             bool,
-        )> = Vec::new();
+            Option<String>,
+        );
+        let mut to_recall: Vec<RecallEntry> = Vec::new();
 
         // PAN-72: TX-offset actions (Switch/Revert) a stall-tripped QSO
         // needs, collected here and emitted after the write lock below is
@@ -6681,11 +6736,14 @@ impl QsoManager {
                     progress.metadata.frequency,
                     progress.metadata.tx_parity,
                     progress.metadata.remote_origin,
+                    progress.metadata.remote_client_key_id.clone(),
                 ));
             }
         }
 
-        for (qso_id, message, frequency, tx_parity, remote_origin) in to_recall {
+        for (qso_id, message, frequency, tx_parity, remote_origin, remote_client_key_id) in
+            to_recall
+        {
             debug!(
                 "Manual keep-calling: re-emitting {:?} on {:.1} Hz (qso={})",
                 message, frequency, qso_id
@@ -6696,6 +6754,7 @@ impl QsoManager {
                 frequency,
                 tx_parity,
                 remote_origin,
+                remote_client_key_id,
             })
             .await;
         }
@@ -7173,7 +7232,10 @@ mod tests {
     #[tokio::test]
     async fn test_start_cq() {
         let manager = QsoManager::new(test_config());
-        let qso_id = manager.start_cq(14074000.0, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq(14074000.0, None, false, None)
+            .await
+            .unwrap();
 
         let progress = manager.get_qso(qso_id).await.unwrap();
         assert!(matches!(progress.state, QsoState::CallingCq { .. }));
@@ -7188,7 +7250,10 @@ mod tests {
     #[tokio::test]
     async fn autonomous_cq_with_no_parity_preference_latches_a_concrete_parity() {
         let manager = QsoManager::new(test_config());
-        let qso_id = manager.start_cq(14074000.0, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq(14074000.0, None, false, None)
+            .await
+            .unwrap();
         assert!(
             manager
                 .get_qso(qso_id)
@@ -7221,6 +7286,7 @@ mod tests {
                 CallInitiation::Manual,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -7250,6 +7316,7 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -7278,6 +7345,7 @@ mod tests {
                 CallInitiation::Manual,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -7307,6 +7375,7 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -7340,6 +7409,7 @@ mod tests {
                 CallInitiation::Manual,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -7422,6 +7492,7 @@ mod tests {
                 CallInitiation::Manual,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -7473,7 +7544,10 @@ mod tests {
         assert_eq!(QsoManagerConfig::default().active_mode, "FT8");
         let manager = QsoManager::new(test_config());
         // CallingCq metadata (start_cq path).
-        let cq_id = manager.start_cq(14074000.0, None, false).await.unwrap();
+        let cq_id = manager
+            .start_cq(14074000.0, None, false, None)
+            .await
+            .unwrap();
         assert_eq!(manager.get_qso(cq_id).await.unwrap().metadata.mode, "FT8");
         // RespondingToCq metadata (respond_to_cq path).
         let rx_id = manager
@@ -7492,7 +7566,10 @@ mod tests {
             ..test_config()
         };
         let manager = QsoManager::new(config);
-        let cq_id = manager.start_cq(14074000.0, None, false).await.unwrap();
+        let cq_id = manager
+            .start_cq(14074000.0, None, false, None)
+            .await
+            .unwrap();
         assert_eq!(manager.get_qso(cq_id).await.unwrap().metadata.mode, "FT4");
         let rx_id = manager
             .respond_to_cq("K1DEF".to_string(), 14074000.0, None)
@@ -8018,6 +8095,7 @@ mod tests {
                 Some(-12),
                 None, // partner_freq
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -8332,7 +8410,10 @@ mod tests {
         config.timeouts.repetitive_tx_timeout_secs = 100_000;
         let manager = QsoManager::new(config);
 
-        let qso_id = manager.start_cq(14074000.0, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq(14074000.0, None, false, None)
+            .await
+            .unwrap();
         let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
 
         // K1DEF (a standard callsign) replies to our compound CQ; their own
@@ -8455,7 +8536,10 @@ mod tests {
         let manager = QsoManager::new(config);
         let mut events = manager.subscribe();
 
-        let qso_id = manager.start_cq(14074000.0, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq(14074000.0, None, false, None)
+            .await
+            .unwrap();
         let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
 
         // A standard-callsign station replies to our compound CQ, but we
@@ -9435,7 +9519,7 @@ mod tests {
     async fn apply_tx_offset_switch_retransmits_cq_for_an_operator_forced_auto_calling_cq() {
         let manager = auto_manager(test_config());
         let mut events = manager.subscribe();
-        let qso_id = manager.start_cq(1500.0, None, false).await.unwrap();
+        let qso_id = manager.start_cq(1500.0, None, false, None).await.unwrap();
         // Drain the initial CQ MessageToSend `start_cq` itself emits.
         let _ = drain(&mut events);
 
@@ -9500,7 +9584,7 @@ mod tests {
     async fn apply_tx_offset_switch_does_not_retransmit_cq_for_a_stall_triggered_auto_calling_cq() {
         let manager = auto_manager(test_config());
         let mut events = manager.subscribe();
-        let qso_id = manager.start_cq(1500.0, None, false).await.unwrap();
+        let qso_id = manager.start_cq(1500.0, None, false, None).await.unwrap();
         let _ = drain(&mut events);
 
         let before = manager.get_qso(qso_id).await.unwrap();
@@ -10270,7 +10354,7 @@ mod tests {
         // our_callsign = W1ABC (from test_config).
         let manager = QsoManager::new(test_config());
         let freq = 14074000.0;
-        let qso_id = manager.start_cq(freq, None, false).await.unwrap();
+        let qso_id = manager.start_cq(freq, None, false, None).await.unwrap();
         assert!(matches!(
             manager.get_qso(qso_id).await.unwrap().state,
             QsoState::CallingCq { .. }
@@ -10387,6 +10471,7 @@ mod tests {
                 CallInitiation::Manual,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -10399,7 +10484,7 @@ mod tests {
         // loop, TXing at 1505.0 Hz (5 Hz from K1DEF's real frequency — well
         // within the CallingCq arm's 15 Hz gate; a routine coincidence on a
         // busy band, not an attacker-crafted collision).
-        let qso_b = manager.start_cq(1505.0, None, false).await.unwrap();
+        let qso_b = manager.start_cq(1505.0, None, false, None).await.unwrap();
         assert!(matches!(
             manager.get_qso(qso_b).await.unwrap().state,
             QsoState::CallingCq { .. }
@@ -10466,11 +10551,11 @@ mod tests {
         // Two independent, still-unpartnered CallingCq QSOs, 5 Hz apart —
         // both well within the CallingCq arm's 15 Hz gate for the same
         // incoming decode.
-        let qso_x = manager.start_cq(1500.0, None, false).await.unwrap();
+        let qso_x = manager.start_cq(1500.0, None, false, None).await.unwrap();
         // Sleep so `metadata.start_time` orders deterministically (real
         // `Utc::now()` calls back-to-back could otherwise tie).
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        let qso_y = manager.start_cq(1505.0, None, false).await.unwrap();
+        let qso_y = manager.start_cq(1505.0, None, false, None).await.unwrap();
         assert!(matches!(
             manager.get_qso(qso_x).await.unwrap().state,
             QsoState::CallingCq { .. }
@@ -10545,7 +10630,7 @@ mod tests {
 
         // Complete a full CQ exchange with K1DEF (mirrors
         // cqer_full_sequence_completes_and_logs_grid).
-        let qso_a = manager.start_cq(freq, None, false).await.unwrap();
+        let qso_a = manager.start_cq(freq, None, false, None).await.unwrap();
         manager
             .process_message(
                 MessageType::CqResponse {
@@ -10591,7 +10676,10 @@ mod tests {
 
         // Immediately start a NEW, unrelated CQ 5 Hz away — well within the
         // CallingCq arm's 15 Hz gate for a frame decoded at qso_b's offset.
-        let qso_b = manager.start_cq(freq + 5.0, None, false).await.unwrap();
+        let qso_b = manager
+            .start_cq(freq + 5.0, None, false, None)
+            .await
+            .unwrap();
 
         // K1DEF sends a stray/duplicate CqResponse-shaped frame again,
         // within the completed-QSO grace window (this test runs in
@@ -10631,7 +10719,7 @@ mod tests {
         let freq_40m = 7074000.0;
 
         // Complete a full CQ exchange with K1DEF on 20m.
-        let qso_a = manager.start_cq(freq_20m, None, false).await.unwrap();
+        let qso_a = manager.start_cq(freq_20m, None, false, None).await.unwrap();
         manager
             .process_message(
                 MessageType::CqResponse {
@@ -10677,7 +10765,10 @@ mod tests {
 
         // Start a NEW, unrelated CQ on 40m — a different band from the
         // just-completed 20m QSO.
-        let qso_b = manager.start_cq(freq_40m + 5.0, None, false).await.unwrap();
+        let qso_b = manager
+            .start_cq(freq_40m + 5.0, None, false, None)
+            .await
+            .unwrap();
 
         // K1DEF answers on 40m, well within the completed-QSO grace window.
         manager
@@ -10722,7 +10813,10 @@ mod tests {
         let audio_offset = 1500.0; // realistic small in-passband offset
 
         // Complete a full CQ exchange with K1DEF on 20m (dial 14.074 MHz).
-        let qso_a = manager.start_cq(audio_offset, None, false).await.unwrap();
+        let qso_a = manager
+            .start_cq(audio_offset, None, false, None)
+            .await
+            .unwrap();
         manager
             .process_message(
                 MessageType::CqResponse {
@@ -10782,7 +10876,7 @@ mod tests {
         // A NEW, unrelated CQ at the SAME small audio offset (plausible: the
         // new CQ just happens to land in a similar spot in the passband).
         let qso_b = manager
-            .start_cq(audio_offset + 5.0, None, false)
+            .start_cq(audio_offset + 5.0, None, false, None)
             .await
             .unwrap();
         manager
@@ -10823,7 +10917,10 @@ mod tests {
         manager.set_dial_frequency_source(std::sync::Arc::new(AtomicU64::new(14_074_000)));
         let audio_offset = 1500.0;
 
-        let qso_id = manager.start_cq(audio_offset, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq(audio_offset, None, false, None)
+            .await
+            .unwrap();
         manager
             .process_message(
                 MessageType::CqResponse {
@@ -10897,7 +10994,10 @@ mod tests {
         manager.set_dial_frequency_source(dial);
         let audio_offset = 1500.0;
 
-        let qso_a = manager.start_cq(audio_offset, None, false).await.unwrap();
+        let qso_a = manager
+            .start_cq(audio_offset, None, false, None)
+            .await
+            .unwrap();
         manager
             .process_message(
                 MessageType::CqResponse {
@@ -10942,7 +11042,7 @@ mod tests {
         ));
 
         let qso_b = manager
-            .start_cq(audio_offset + 5.0, None, false)
+            .start_cq(audio_offset + 5.0, None, false, None)
             .await
             .unwrap();
         manager
@@ -10979,7 +11079,7 @@ mod tests {
     async fn qso_completed_event_carries_full_timeline() {
         let manager = QsoManager::new(test_config());
         let freq = 14074000.0;
-        let qso_id = manager.start_cq(freq, None, false).await.unwrap();
+        let qso_id = manager.start_cq(freq, None, false, None).await.unwrap();
         let mut rx = manager.subscribe();
 
         manager
@@ -11118,6 +11218,7 @@ mod tests {
                 pending_freq_drift: None,
                 hound_qsyed: false,
                 remote_origin: false,
+                remote_client_key_id: None,
                 tx_parity_provisional: false,
             },
         };
@@ -11199,7 +11300,10 @@ mod tests {
         let freq = 14074000.0;
         let mut events = manager.subscribe();
 
-        let qso_id = manager.start_cq_manual(freq, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq_manual(freq, None, false, None)
+            .await
+            .unwrap();
 
         let p = manager.get_qso(qso_id).await.unwrap();
         assert!(
@@ -11248,7 +11352,10 @@ mod tests {
         use tokio::sync::broadcast::error::TryRecvError;
         let manager = QsoManager::new(test_config()); // our call = W1ABC
         let freq = 14074000.0;
-        let qso_id = manager.start_cq_manual(freq, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq_manual(freq, None, false, None)
+            .await
+            .unwrap();
         let mut events = manager.subscribe();
 
         // Caller answers our CQ with their grid: "W1ABC K1DEF FN31".
@@ -11335,7 +11442,10 @@ mod tests {
         use tokio::sync::broadcast::error::TryRecvError;
         let manager = QsoManager::new(test_config());
         let freq = 14074000.0;
-        let qso_id = manager.start_cq_manual(freq, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq_manual(freq, None, false, None)
+            .await
+            .unwrap();
         let mut events = manager.subscribe();
 
         let start = Utc::now();
@@ -11384,7 +11494,10 @@ mod tests {
     async fn manual_cq_with_no_parity_preference_latches_one_parity_for_life_of_qso() {
         let manager = QsoManager::new(test_config());
         let freq = 14074000.0;
-        let qso_id = manager.start_cq_manual(freq, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq_manual(freq, None, false, None)
+            .await
+            .unwrap();
 
         // The opening CQ must have latched a CONCRETE (not None) parity.
         let latched = manager
@@ -11439,6 +11552,7 @@ mod tests {
                 14074000.0,
                 Some(pancetta_core::slot::SlotParity::Odd),
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -11459,7 +11573,10 @@ mod tests {
         config.timeouts.manual_call_max_calls = 10;
         let manager = QsoManager::new(config);
         let freq = 14074000.0;
-        let qso_id = manager.start_cq_manual(freq, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq_manual(freq, None, false, None)
+            .await
+            .unwrap();
 
         // Drive enough slots to exceed manual_call_max_calls (10).
         let mut t = Utc::now();
@@ -11487,7 +11604,10 @@ mod tests {
     async fn manual_cq_cancel_stops_calling() {
         let manager = QsoManager::new(test_config());
         let freq = 14074000.0;
-        let qso_id = manager.start_cq_manual(freq, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq_manual(freq, None, false, None)
+            .await
+            .unwrap();
         assert_eq!(manager.get_active_qsos().await.len(), 1);
 
         manager.cancel_qso(qso_id).await.unwrap();
@@ -11667,6 +11787,7 @@ mod sender_verification_tests {
             pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin: false,
+            remote_client_key_id: None,
             tx_parity_provisional: false,
         }
     }
@@ -12494,6 +12615,7 @@ mod sender_verification_tests {
                 CallInitiation::Manual,
                 Some(2931.0),
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -12557,6 +12679,7 @@ mod sender_verification_tests {
                 CallInitiation::Manual,
                 Some(2931.0),
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -12614,6 +12737,7 @@ mod sender_verification_tests {
                 CallInitiation::Manual,
                 Some(2931.0),
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -12659,6 +12783,7 @@ mod sender_verification_tests {
                 CallInitiation::Manual,
                 Some(700.0),
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -12775,6 +12900,7 @@ mod sender_verification_tests {
                 CallInitiation::Manual,
                 Some(1800.0), // Fox's RX offset
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -12853,6 +12979,7 @@ mod sender_verification_tests {
                 CallInitiation::Manual,
                 Some(2931.0),
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13407,6 +13534,7 @@ mod reply_emitter_tests {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13445,6 +13573,7 @@ mod reply_emitter_tests {
                 None,
                 None, // partner_freq
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13492,6 +13621,7 @@ mod reply_emitter_tests {
                 Some(-3),
                 None, // partner_freq
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13534,6 +13664,7 @@ mod reply_emitter_tests {
                 Some(-7),
                 None, // partner_freq
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13567,6 +13698,7 @@ mod reply_emitter_tests {
                 Some(-4),
                 None, // partner_freq
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13616,6 +13748,7 @@ mod reply_emitter_tests {
                 Some(-4),
                 None, // partner_freq
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13634,6 +13767,7 @@ mod reply_emitter_tests {
                 Some(-4),
                 None, // partner_freq
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13698,6 +13832,7 @@ mod reply_emitter_tests {
                 Some(-4),
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13714,6 +13849,7 @@ mod reply_emitter_tests {
                 Some(-4),
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13730,6 +13866,7 @@ mod reply_emitter_tests {
                 Some(-4),
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13770,6 +13907,7 @@ mod reply_emitter_tests {
                 Some(-4),
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13832,6 +13970,7 @@ mod reply_emitter_tests {
                 Some(-4),
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13849,6 +13988,7 @@ mod reply_emitter_tests {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13871,6 +14011,7 @@ mod reply_emitter_tests {
                 Some(-4),
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13886,6 +14027,7 @@ mod reply_emitter_tests {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13911,6 +14053,7 @@ mod reply_emitter_tests {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13937,6 +14080,7 @@ mod reply_emitter_tests {
                 Some(-3),
                 None, // partner_freq
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -14186,6 +14330,7 @@ mod reply_emitter_tests {
                 CallInitiation::Manual,
                 Some(dx_rx), // partner_freq = DX's RX offset
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -14216,6 +14361,7 @@ mod reply_emitter_tests {
                 CallInitiation::Manual,
                 None, // Tx=Rx regression path — partner_freq must stay None
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -14245,6 +14391,7 @@ mod reply_emitter_tests {
                 None,
                 None, // Tx=Rx — partner_freq must stay None
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -14282,6 +14429,7 @@ mod reply_emitter_tests {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap_err();
@@ -14890,7 +15038,10 @@ mod sm_f4_waiting_for_report_resend_tests {
     /// grid-bearing CqResponse), returning the qso_id and the `our_report`
     /// value latched on that transition.
     async fn manual_cq_to_waiting_for_report(manager: &QsoManager, snr: f32) -> (QsoId, i8) {
-        let qso_id = manager.start_cq_manual(FREQ, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq_manual(FREQ, None, false, None)
+            .await
+            .unwrap();
         manager
             .process_message(
                 MessageType::CqResponse {
@@ -15949,6 +16100,7 @@ mod pan72_stall_detection_tests {
                 CallInitiation::Manual,
                 None,
                 true, // remote_origin
+                None,
             )
             .await
             .unwrap();
@@ -16641,7 +16793,10 @@ mod pan72_stall_detection_tests {
         let mut config = test_config();
         config.timeouts.qso_stall_switch_after = 4;
         let manager = manager_auto(config);
-        let qso_id = manager.start_cq_manual(FREQ, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq_manual(FREQ, None, false, None)
+            .await
+            .unwrap();
         let opened_at = manager
             .get_qso(qso_id)
             .await
@@ -17306,6 +17461,7 @@ mod pan72_stall_detection_tests {
                 CallInitiation::Manual,
                 Some(2400.0),
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -17375,7 +17531,10 @@ mod pan72_stall_detection_tests {
         config.timeouts.qso_stall_switch_after = 2;
         let manager = manager_auto(config);
         let mut rx = manager.subscribe();
-        let qso_id = manager.start_cq_manual(FREQ, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq_manual(FREQ, None, false, None)
+            .await
+            .unwrap();
         let opened_at = manager
             .get_qso(qso_id)
             .await
@@ -17467,7 +17626,10 @@ mod pan72_stall_detection_tests {
         config.timeouts.qso_stall_switch_after = 2;
         let manager = manager_auto(config);
         let mut rx = manager.subscribe();
-        let qso_id = manager.start_cq_manual(FREQ, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq_manual(FREQ, None, false, None)
+            .await
+            .unwrap();
         let opened_at = manager
             .get_qso(qso_id)
             .await
@@ -17562,7 +17724,10 @@ mod pan72_stall_detection_tests {
         let mut config = test_config();
         config.timeouts.qso_stall_switch_after = 2;
         let manager = manager_auto(config);
-        let qso_id = manager.start_cq_manual(FREQ, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq_manual(FREQ, None, false, None)
+            .await
+            .unwrap();
         let opened_at = manager
             .get_qso(qso_id)
             .await
@@ -17653,7 +17818,10 @@ mod pan72_stall_detection_tests {
         const CALLER: &str = "W9XYZ";
 
         let manager = manager_auto(test_config());
-        let qso_id = manager.start_cq_manual(FREQ, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq_manual(FREQ, None, false, None)
+            .await
+            .unwrap();
         let new_offset = FREQ + 400.0;
         manager
             .apply_tx_offset_switch(qso_id, new_offset, OffsetRelocationOrigin::OperatorForced)
@@ -17779,7 +17947,10 @@ mod pan72_stall_detection_tests {
         const CALLER: &str = "W9XYZ";
 
         let manager = manager_auto(test_config());
-        let qso_id = manager.start_cq_manual(FREQ, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq_manual(FREQ, None, false, None)
+            .await
+            .unwrap();
 
         // Operator `u` nudge: no triggering resend, no raised generation.
         let new_offset = FREQ + 400.0;
@@ -17855,6 +18026,7 @@ mod pan72_stall_detection_tests {
                 CallInitiation::Manual,
                 Some(DX_FREQ),
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -17932,6 +18104,7 @@ mod pan72_stall_detection_tests {
                 CallInitiation::Manual,
                 Some(DX_FREQ),
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -18183,6 +18356,7 @@ mod has_active_or_recent_qso_tests {
             pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin: false,
+            remote_client_key_id: None,
             tx_parity_provisional: false,
         }
     }
@@ -18420,6 +18594,7 @@ mod hound_tests {
             pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin: false,
+            remote_client_key_id: None,
             tx_parity_provisional: false,
         }
     }
