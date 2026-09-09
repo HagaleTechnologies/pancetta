@@ -608,6 +608,7 @@ impl AdifProcessor {
             pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin: false,
+            remote_client_key_id: None,
             tx_parity_provisional: false,
         }
     }
@@ -1249,6 +1250,7 @@ ADIF Export for Test Program
             pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin: false,
+            remote_client_key_id: None,
             tx_parity_provisional: false,
         }
     }

@@ -3442,6 +3442,7 @@ mod take_producer_mark_if_matching_tests {
     /// sequence `mark_in_flight_then_send` -> discard-as-superseded ->
     /// retire, proving the count correctly returns to 0.
     #[test]
+    #[allow(clippy::result_large_err)]
     fn a_discarded_producer_marked_message_retires_its_own_increment() {
         let stale_split = msg(0);
         let hamlib_command_in_flight = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -5355,6 +5356,7 @@ mod teardown_replay_tests {
     /// run, no scheduling luck required, and is what actually caught the
     /// round-17 -> round-18 regression class this finding describes.
     #[test]
+    #[allow(clippy::result_large_err)]
     fn mark_in_flight_then_send_observes_true_synchronously_during_the_send_call() {
         let split_msg = ComponentMessage::new(
             ComponentId::Hamlib,
@@ -5406,6 +5408,7 @@ mod teardown_replay_tests {
     /// The failure path: `send` returning `Err` must roll the marker
     /// back, and the message must come back out so it can be re-queued.
     #[test]
+    #[allow(clippy::result_large_err)]
     fn mark_in_flight_then_send_rolls_back_on_failure() {
         let split_msg = ComponentMessage::new(
             ComponentId::Hamlib,
@@ -5448,6 +5451,7 @@ mod teardown_replay_tests {
     /// it set is what lets a later consumer-side discard (superseded) or
     /// apply (adopt) find and retire the SAME increment this call made.
     #[test]
+    #[allow(clippy::result_large_err)]
     fn mark_in_flight_then_send_leaves_the_producer_mark_set_on_success() {
         let split_msg = ComponentMessage::new(
             ComponentId::Hamlib,

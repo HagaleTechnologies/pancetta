@@ -42,8 +42,8 @@ mod wav_playback;
 pub(crate) mod wsjtx_udp;
 
 pub use tx::{
-    coalesce_transmit_requests, remote_tx_permitted, resolve_required_parity, schedule_tx,
-    CoalesceEntry, CoalesceOutcome, TxSchedule,
+    coalesce_transmit_requests, remote_tx_permitted, remote_tx_permitted_for,
+    resolve_required_parity, schedule_tx, CoalesceEntry, CoalesceOutcome, TxSchedule,
 };
 
 pub use qso::compute_manual_tx_offset;
@@ -116,6 +116,20 @@ pub struct LatestTxIntent {
     pub message_text: String,
     pub frequency_offset: f64,
     pub tx_parity: Option<pancetta_core::slot::SlotParity>,
+    /// Round-4 review (Codex P1): the intent's own authorization binding,
+    /// carried alongside the payload it belongs to. A station-agent action
+    /// can rebind an existing LOCAL manual QSO to a remote client and emit
+    /// a newer `MessageToSend` while the TX worker sits in Step 4c's
+    /// pre-PTT wait for an OLDER, Local frame of the same QSO — without
+    /// this, the worker's pivot would swap in the newer REMOTE payload
+    /// while keeping the in-flight frame's stale `origin == Local` (and no
+    /// client key), skipping the arm gate entirely rather than merely
+    /// misattributing it. The TX worker's pivot must replace this
+    /// atomically with `message_text`/`frequency_offset`, never adopt the
+    /// new payload while keeping the old origin.
+    pub origin: crate::message_bus::TxOrigin,
+    /// Paired with `origin` — see its doc.
+    pub remote_client_key_id: Option<String>,
 }
 
 /// Smallest offset difference (Hz) [`tx_pivot_target`] treats as a genuine
@@ -153,10 +167,23 @@ pub const PIVOT_OFFSET_EPSILON_HZ: f64 = 0.5;
 /// freshest `MessageToSend` at key-time" invariant, and no amount of
 /// receive-side grace (`PRE_SWITCH_OFFSET_GRACE`) makes the transmitted
 /// frame itself fresh.
+/// Round-5 review (Codex P1, live on commit f1838efb): `current_authorization`,
+/// when `Some((origin, client_key_id))`, makes an authorization-ONLY change
+/// (identical text and offset, different `origin`/`remote_client_key_id`)
+/// count as a pivot too — a rebind commonly resends the EXACT same rendered
+/// frame, and a text/offset-only comparison would leave a request already
+/// sitting in the worker's pre-PTT wait keyed against its STALE
+/// authorization even though `latest_tx_intent` already holds the fresh
+/// one. `None` preserves the original text/offset-only comparison for
+/// callers with no real per-item identity to compare (the multi-TX bundle
+/// path's [`pivot_bundle_items`] — `TransmitRequestItem` carries no
+/// identity at all yet; see PAN-136) rather than manufacturing spurious
+/// pivots there.
 pub fn tx_pivot_target(
     qso_id: Option<&str>,
     current_text: &str,
     current_frequency_offset: f64,
+    current_authorization: Option<(crate::message_bus::TxOrigin, Option<&str>)>,
     latest: &HashMap<String, LatestTxIntent>,
 ) -> Option<LatestTxIntent> {
     let id = qso_id?;
@@ -164,7 +191,14 @@ pub fn tx_pivot_target(
     let same_text = intent.message_text == current_text;
     let same_offset =
         (intent.frequency_offset - current_frequency_offset).abs() < PIVOT_OFFSET_EPSILON_HZ;
-    if same_text && same_offset {
+    let same_authorization = match current_authorization {
+        Some((current_origin, current_client_key_id)) => {
+            intent.origin == current_origin
+                && intent.remote_client_key_id.as_deref() == current_client_key_id
+        }
+        None => true,
+    };
+    if same_text && same_offset && same_authorization {
         None
     } else {
         Some(intent.clone())
@@ -262,6 +296,9 @@ pub fn pivot_bundle_items(
                 item.qso_id.as_deref(),
                 &item.message_text,
                 item.frequency_offset,
+                // `TransmitRequestItem` carries no identity to compare yet
+                // (PAN-136) — preserve the original text/offset-only check.
+                None,
                 latest,
             ) {
                 // `tx_pivot_target` only returns `Some` when `qso_id` is
@@ -2256,6 +2293,7 @@ impl ApplicationCoordinator {
                         qso_id: None,
                         tx_parity: None, // test-TX injection: no DX context
                         origin: crate::message_bus::TxOrigin::Local,
+                        remote_client_key_id: None,
                     },
                     Instant::now(),
                 );
@@ -2720,6 +2758,8 @@ mod pivot_bundle_tests {
             message_text: text.to_string(),
             frequency_offset: freq,
             tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         }
     }
 

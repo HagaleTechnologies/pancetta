@@ -83,6 +83,20 @@ struct RecentManualCompletion {
     /// auto-73 is `TxOrigin::Remote` and armed-TX gated (fail-closed: if the
     /// arm lapsed after completion, the resend is dropped, never keyed as Local).
     remote_origin: bool,
+    /// The completed QSO's `remote_client_key_id`, inherited for the same
+    /// reason as `remote_origin` (PAN-91): the auto-73's arm-gate check must
+    /// bind to the client that originally requested the QSO, not just "some
+    /// client is currently armed".
+    remote_client_key_id: Option<String>,
+    /// The completed QSO's id (round-4 review, Codex P2). A repeated close
+    /// action (operator-triggered, via `respond_to_caller`'s completed-QSO
+    /// rework path) can rebind the LIVE `QsoManager` object's identity to a
+    /// new controller, but this cache entry was only ever populated once,
+    /// at `QsoCompleted` time — it never sees that later rebind. Kept so
+    /// the auto-73 resend can look up the QSO's CURRENT identity instead of
+    /// trusting this snapshot, which would otherwise rebind the QSO back to
+    /// the ORIGINAL client on every auto-resent 73.
+    qso_id: pancetta_qso::QsoId,
 }
 
 /// Shared map of recently-completed manual QSOs. Populated by the QSO-event
@@ -142,6 +156,11 @@ struct PendingManualCall {
     /// promoted QSO is opened with `remote_origin = true` — its TX stays
     /// `TxOrigin::Remote` and armed-TX-gated. `false` for every local/TUI call.
     remote_origin: bool,
+    /// The station-agent peer (client keyId) that requested this, iff
+    /// `remote_origin`. Carried across the deferral so the promoted QSO is
+    /// bound to THIS specific client (PAN-91) — see
+    /// `QsoMetadata::remote_client_key_id`.
+    remote_client_key_id: Option<String>,
     /// Which rung of the response ladder to open at on promotion — replayed
     /// via `respond_to_caller` (see [`promote_pending_manual_calls`]).
     /// `StartQso`-originated entries always use [`pancetta_core::ResponseStep::Grid`],
@@ -514,6 +533,7 @@ async fn promote_pending_manual_calls(
                     p.their_report,
                     partner,
                     p.remote_origin,
+                    p.remote_client_key_id.clone(),
                 )
                 .await
                 .map(|_| ())
@@ -658,6 +678,7 @@ async fn maybe_auto_resend_73(
     completions: &RecentManualCompletions,
     tx_policy: &std::sync::atomic::AtomicU8,
     message_bus: &MessageBus,
+    remote_tx_arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
 ) {
     use pancetta_qso::states::MessageType as Mt;
 
@@ -687,6 +708,10 @@ async fn maybe_auto_resend_73(
     // arrives every slot. We do NOT call into the QSO manager while holding
     // the lock.
     let entry_remote_origin;
+    let entry_remote_client_key_id;
+    let entry_qso_id;
+    let prev_resends;
+    let prev_last_resend_at;
     {
         let mut map = completions.lock().await;
         // Prune expired entries every time we look.
@@ -722,6 +747,13 @@ async fn maybe_auto_resend_73(
         }
         // Commit the send: increment + stamp BEFORE we drop the lock so two
         // decodes racing in the same slot can't both pass the per-slot guard.
+        // Round-14 review (Codex P1): `prev_resends`/`prev_last_resend_at`
+        // captured so this commit can be rolled back exactly (see below)
+        // if the identity-bound permission check that follows — which
+        // needs the live QSO identity, only knowable after this lock is
+        // released — finds the bound client isn't currently TX-permitted.
+        prev_resends = entry.resends;
+        prev_last_resend_at = entry.last_resend_at;
         entry.resends += 1;
         entry.last_resend_at = Some(now);
         // Prefer the freq/parity we just heard them on (fresher); fall back to
@@ -733,6 +765,52 @@ async fn maybe_auto_resend_73(
         // SECURITY: the auto-73 inherits the completed QSO's origin so a remote
         // QSO's resend stays `TxOrigin::Remote` and armed-TX gated.
         entry_remote_origin = entry.remote_origin;
+        entry_remote_client_key_id = entry.remote_client_key_id.clone();
+        entry_qso_id = entry.qso_id;
+    }
+
+    // Round-4 review (Codex P2): prefer the LIVE QSO's identity over this
+    // cache's snapshot — a repeated close action can rebind the QSO's
+    // `remote_client_key_id` to a new controller after this entry was
+    // stashed (see `RecentManualCompletion::qso_id`'s doc), and passing the
+    // stale snapshot to `respond_to_caller` below would rebind the QSO back
+    // to the ORIGINAL client on every auto-resent 73. Falls back to the
+    // cached values only if the QSO has since aged out of the manager's
+    // 1-hour retention (comfortably longer than `AUTO_73_WINDOW`, so this
+    // should be rare in practice).
+    let (entry_remote_origin, entry_remote_client_key_id) =
+        match qso_manager.get_qso(entry_qso_id).await {
+            Ok(progress) => (
+                progress.metadata.remote_origin,
+                progress.metadata.remote_client_key_id,
+            ),
+            Err(_) => (entry_remote_origin, entry_remote_client_key_id),
+        };
+
+    // Round-14 review (Codex P1): `respond_to_caller`'s idempotent-resend
+    // branch silently SKIPS the resend (round-10 fix) when the bound
+    // client isn't currently TX-permitted, but still returns `Ok` — so
+    // this function can't tell "a frame went out" from "the resend was
+    // skipped" from that return value alone. Left unchecked, the counter
+    // commit above would still burn the auto-73 budget for a resend that
+    // never actually transmitted, exhausting it and leaving no automatic
+    // resend if the original controller (or a newly-authorized one)
+    // retakes control within the window. Roll the commit back to exactly
+    // what it was before, and skip calling `respond_to_caller` entirely,
+    // when the frame would be denied anyway.
+    if entry_remote_origin
+        && !crate::coordinator::tx::remote_tx_permitted_for(
+            remote_tx_arm,
+            chrono::Utc::now().timestamp_millis(),
+            entry_remote_client_key_id.as_deref(),
+        )
+    {
+        let mut map = completions.lock().await;
+        if let Some(entry) = map.get_mut(&key) {
+            entry.resends = prev_resends;
+            entry.last_resend_at = prev_last_resend_at;
+        }
+        return;
     }
 
     // Don't fight a live QSO with this station: if one is active, skip the
@@ -779,6 +857,7 @@ async fn maybe_auto_resend_73(
             None,
             None,                // auto-73: always Tx=Rx, no partner offset
             entry_remote_origin, // inherit the completed QSO's origin
+            entry_remote_client_key_id,
         )
         .await
     {
@@ -1201,6 +1280,7 @@ async fn maybe_answer_caller(
             answer.their_report,
             partner_freq,
             false, // local decode-loop auto-answer, never remote
+            None,
         )
         .await
     {
@@ -1557,6 +1637,7 @@ mod pan6_diagnostic_tests {
             pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin: false,
+            remote_client_key_id: None,
         }
     }
 
@@ -2209,6 +2290,7 @@ mod ap_ranking_tests {
             pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin: false,
+            remote_client_key_id: None,
         }
     }
 
@@ -2513,12 +2595,15 @@ impl super::ApplicationCoordinator {
         // counting too — the conservative direction in both places.
         {
             let arm_for_stall_evidence = self.remote_tx_arm();
-            qso_manager.set_remote_tx_permitted_source(std::sync::Arc::new(move || {
-                crate::coordinator::tx::remote_tx_permitted(
-                    &arm_for_stall_evidence,
-                    chrono::Utc::now().timestamp_millis(),
-                )
-            }));
+            qso_manager.set_remote_tx_permitted_source(std::sync::Arc::new(
+                move |remote_client_key_id: Option<&str>| {
+                    crate::coordinator::tx::remote_tx_permitted_for(
+                        &arm_for_stall_evidence,
+                        chrono::Utc::now().timestamp_millis(),
+                        remote_client_key_id,
+                    )
+                },
+            ));
         }
         // PAN-72 Fix E (Codex round 10, thread on `qso_manager.rs:6335`): the
         // stall detector's combined "frame reached the air" check above
@@ -2599,6 +2684,10 @@ impl super::ApplicationCoordinator {
 
         let qso_handle = {
             let shutdown = self.shutdown_signal.clone();
+            // Round-14 review (Codex P1): `maybe_auto_resend_73` needs this
+            // to gate its own budget commit on identity-bound TX permission
+            // — see the call site and that function's doc for why.
+            let remote_tx_arm_for_auto73 = self.remote_tx_arm();
 
             tokio::spawn(async move {
                 if let Err(e) = qso_manager.start().await {
@@ -3160,6 +3249,7 @@ impl super::ApplicationCoordinator {
                                 frequency,
                                 tx_parity,
                                 remote_origin,
+                                remote_client_key_id,
                             }) => {
                                 match pancetta_qso::utils::generate_ft8_message(
                                     &message,
@@ -3170,10 +3260,24 @@ impl super::ApplicationCoordinator {
                                             "QSO auto-sequence sending: '{}' on {:.1} Hz (qso={}, tx_parity={:?})",
                                             text, frequency, qso_id, tx_parity
                                         );
+                                        // SECURITY: a remote-initiated QSO's TX MUST be
+                                        // `TxOrigin::Remote` so the armed-TX gate applies;
+                                        // a local QSO stays `Local` (byte-identical).
+                                        let tx_origin = if remote_origin {
+                                            crate::message_bus::TxOrigin::Remote
+                                        } else {
+                                            crate::message_bus::TxOrigin::Local
+                                        };
                                         // Record this as the newest intent for the QSO so the
                                         // TX worker can pivot to it at key-time if it arrives
                                         // while an earlier frame for the same QSO is still in
-                                        // the worker's pre-PTT wait.
+                                        // the worker's pre-PTT wait. Round-4 review (Codex
+                                        // P1): `origin`/`remote_client_key_id` travel WITH the
+                                        // payload here — see `LatestTxIntent`'s doc — computed
+                                        // from the SAME `remote_origin`/`remote_client_key_id`
+                                        // this exact event carries, so the intent can never
+                                        // disagree with the `TransmitRequest` sent moments
+                                        // below for the same event.
                                         if let Ok(mut m) = latest_tx_intent.write() {
                                             m.insert(
                                                 super::active_tx_qso_key(&qso_id.to_string()),
@@ -3181,6 +3285,9 @@ impl super::ApplicationCoordinator {
                                                     message_text: text.clone(),
                                                     frequency_offset: frequency,
                                                     tx_parity,
+                                                    origin: tx_origin,
+                                                    remote_client_key_id: remote_client_key_id
+                                                        .clone(),
                                                 },
                                             );
                                         }
@@ -3192,14 +3299,8 @@ impl super::ApplicationCoordinator {
                                                 frequency_offset: frequency,
                                                 qso_id: Some(qso_id.to_string()),
                                                 tx_parity,
-                                                // SECURITY: a remote-initiated QSO's TX MUST be
-                                                // `TxOrigin::Remote` so the armed-TX gate applies;
-                                                // a local QSO stays `Local` (byte-identical).
-                                                origin: if remote_origin {
-                                                    crate::message_bus::TxOrigin::Remote
-                                                } else {
-                                                    crate::message_bus::TxOrigin::Local
-                                                },
+                                                origin: tx_origin,
+                                                remote_client_key_id,
                                             },
                                             Instant::now(),
                                         );
@@ -3442,6 +3543,10 @@ impl super::ApplicationCoordinator {
                                             resends: 0,
                                             last_resend_at: None,
                                             remote_origin: metadata.remote_origin,
+                                            remote_client_key_id: metadata
+                                                .remote_client_key_id
+                                                .clone(),
+                                            qso_id,
                                         };
                                         let mut map = completions_for_events.lock().await;
                                         // Prune stale entries while we hold the lock so
@@ -3770,6 +3875,7 @@ impl super::ApplicationCoordinator {
                                             &recent_manual_completions,
                                             &tx_policy,
                                             &message_bus,
+                                            &remote_tx_arm_for_auto73,
                                         )
                                         .await;
 
@@ -3891,6 +3997,7 @@ impl super::ApplicationCoordinator {
                                             frequency,
                                             dx_parity,
                                             remote_origin,
+                                            remote_client_key_id,
                                         } => {
                                             // PAN-23 round-2 (Codex review of #283): reject the
                                             // unresolved-hash placeholder "<...>" at ADMISSION
@@ -3983,38 +4090,70 @@ impl super::ApplicationCoordinator {
                                             ) {
                                                 let mut q = pending_manual_calls.lock().await;
                                                 // Dedup by callsign; bound the queue.
-                                                let dup = q.iter().any(|p| {
+                                                let dup_pos = q.iter().position(|p| {
                                                     p.callsign.eq_ignore_ascii_case(&callsign)
                                                 });
-                                                if !dup {
-                                                    if q.len() >= MAX_PENDING_MANUAL_CALLS {
-                                                        q.pop_front();
+                                                // Capture the operator's held-offset
+                                                // intent so promote_pending_manual_calls
+                                                // can rerun compute_manual_tx_offset with
+                                                // the current active set at promotion time.
+                                                let queued_held =
+                                                    tx_offset_hold_hz.load(Ordering::Relaxed);
+                                                let queued_hold_mode =
+                                                    pancetta_core::TxFreqMode::from_u8(
+                                                        tx_freq_mode.load(Ordering::Relaxed),
+                                                    ) == pancetta_core::TxFreqMode::Hold;
+                                                match dup_pos {
+                                                    // Round-4 review (Codex P2): a repeat
+                                                    // call for the same callsign while it's
+                                                    // still deferred must REPLACE the stored
+                                                    // request — including origin/identity —
+                                                    // not be silently dropped. Before this
+                                                    // fix, if client A's call was deferred
+                                                    // and client B later repeated it, the
+                                                    // dup check discarded B's request
+                                                    // outright: promotion still admitted the
+                                                    // stale A-bound entry, which B's own
+                                                    // valid arm then rejected.
+                                                    Some(pos) => {
+                                                        q[pos] = PendingManualCall {
+                                                            callsign: callsign.clone(),
+                                                            frequency_hz: frequency as f64,
+                                                            dx_parity,
+                                                            queued_at: std::time::Instant::now(),
+                                                            hound: false,
+                                                            fox_freq_hz: None,
+                                                            fox_grid: None,
+                                                            held_hz: queued_held,
+                                                            hold_mode: queued_hold_mode,
+                                                            remote_origin,
+                                                            remote_client_key_id,
+                                                            step: pancetta_core::ResponseStep::Grid,
+                                                            our_snr_of_them: None,
+                                                            their_report: None,
+                                                        };
                                                     }
-                                                    // Capture the operator's held-offset
-                                                    // intent so promote_pending_manual_calls
-                                                    // can rerun compute_manual_tx_offset with
-                                                    // the current active set at promotion time.
-                                                    let queued_held =
-                                                        tx_offset_hold_hz.load(Ordering::Relaxed);
-                                                    let queued_hold_mode =
-                                                        pancetta_core::TxFreqMode::from_u8(
-                                                            tx_freq_mode.load(Ordering::Relaxed),
-                                                        ) == pancetta_core::TxFreqMode::Hold;
-                                                    q.push_back(PendingManualCall {
-                                                        callsign: callsign.clone(),
-                                                        frequency_hz: frequency as f64,
-                                                        dx_parity,
-                                                        queued_at: std::time::Instant::now(),
-                                                        hound: false,
-                                                        fox_freq_hz: None,
-                                                        fox_grid: None,
-                                                        held_hz: queued_held,
-                                                        hold_mode: queued_hold_mode,
-                                                        remote_origin,
-                                                        step: pancetta_core::ResponseStep::Grid,
-                                                        our_snr_of_them: None,
-                                                        their_report: None,
-                                                    });
+                                                    None => {
+                                                        if q.len() >= MAX_PENDING_MANUAL_CALLS {
+                                                            q.pop_front();
+                                                        }
+                                                        q.push_back(PendingManualCall {
+                                                            callsign: callsign.clone(),
+                                                            frequency_hz: frequency as f64,
+                                                            dx_parity,
+                                                            queued_at: std::time::Instant::now(),
+                                                            hound: false,
+                                                            fox_freq_hz: None,
+                                                            fox_grid: None,
+                                                            held_hz: queued_held,
+                                                            hold_mode: queued_hold_mode,
+                                                            remote_origin,
+                                                            remote_client_key_id,
+                                                            step: pancetta_core::ResponseStep::Grid,
+                                                            our_snr_of_them: None,
+                                                            their_report: None,
+                                                        });
+                                                    }
                                                 }
                                                 let queue_depth = q.len();
                                                 drop(q);
@@ -4083,6 +4222,7 @@ impl super::ApplicationCoordinator {
                                                     pancetta_qso::CallInitiation::Manual,
                                                     partner,
                                                     remote_origin,
+                                                    remote_client_key_id,
                                                 )
                                                 .await
                                             {
@@ -4220,6 +4360,7 @@ impl super::ApplicationCoordinator {
                                                             pancetta_qso::CallInitiation::Auto,
                                                             partner,
                                                             false,
+                                                            None,
                                                         )
                                                         .await
                                                 }
@@ -4261,6 +4402,7 @@ impl super::ApplicationCoordinator {
                                                                 frequency,
                                                                 parity,
                                                                 false,
+                                                                None,
                                                             )
                                                             .await
                                                     } else {
@@ -4399,6 +4541,7 @@ impl super::ApplicationCoordinator {
                                                         hold_mode: false,
                                                         // Hound (Shift+H) is a local operator action.
                                                         remote_origin: false,
+                                                        remote_client_key_id: None,
                                                         // Hound entries promote via `engage_hound`,
                                                         // not `respond_to_caller` — these fields are
                                                         // unused when `hound == true`.
@@ -4483,6 +4626,7 @@ impl super::ApplicationCoordinator {
                                             step,
                                             snr,
                                             remote_origin,
+                                            remote_client_key_id,
                                         } => {
                                             // PAN-23 round-2 (Codex review of #283): reject the
                                             // unresolved-hash placeholder "<...>" at ADMISSION
@@ -4549,37 +4693,63 @@ impl super::ApplicationCoordinator {
                                                 pancetta_qso::qso_manager::TxAdmission::Queue
                                             ) {
                                                 let mut q = pending_manual_calls.lock().await;
-                                                let dup = q.iter().any(|p| {
+                                                let dup_pos = q.iter().position(|p| {
                                                     p.callsign.eq_ignore_ascii_case(&callsign)
                                                 });
-                                                if !dup {
-                                                    if q.len() >= MAX_PENDING_MANUAL_CALLS {
-                                                        q.pop_front();
+                                                let queued_held =
+                                                    tx_offset_hold_hz.load(Ordering::Relaxed);
+                                                let queued_hold_mode =
+                                                    pancetta_core::TxFreqMode::from_u8(
+                                                        tx_freq_mode.load(Ordering::Relaxed),
+                                                    ) == pancetta_core::TxFreqMode::Hold;
+                                                // Round-4 review (Codex P2): same fix as the
+                                                // StartQso deferred queue above — a repeat
+                                                // caller-response for the same callsign must
+                                                // REPLACE the stored request (origin/identity
+                                                // included), not be silently dropped.
+                                                match dup_pos {
+                                                    Some(pos) => {
+                                                        q[pos] = PendingManualCall {
+                                                            callsign: callsign.clone(),
+                                                            frequency_hz: frequency as f64,
+                                                            dx_parity,
+                                                            queued_at: std::time::Instant::now(),
+                                                            hound: false,
+                                                            fox_freq_hz: None,
+                                                            fox_grid: None,
+                                                            held_hz: queued_held,
+                                                            hold_mode: queued_hold_mode,
+                                                            remote_origin,
+                                                            remote_client_key_id,
+                                                            step,
+                                                            our_snr_of_them: snr,
+                                                            their_report: None,
+                                                        };
                                                     }
-                                                    let queued_held =
-                                                        tx_offset_hold_hz.load(Ordering::Relaxed);
-                                                    let queued_hold_mode =
-                                                        pancetta_core::TxFreqMode::from_u8(
-                                                            tx_freq_mode.load(Ordering::Relaxed),
-                                                        ) == pancetta_core::TxFreqMode::Hold;
-                                                    q.push_back(PendingManualCall {
-                                                        callsign: callsign.clone(),
-                                                        frequency_hz: frequency as f64,
-                                                        dx_parity,
-                                                        queued_at: std::time::Instant::now(),
-                                                        hound: false,
-                                                        fox_freq_hz: None,
-                                                        fox_grid: None,
-                                                        held_hz: queued_held,
-                                                        hold_mode: queued_hold_mode,
-                                                        remote_origin,
-                                                        step,
-                                                        our_snr_of_them: snr,
-                                                        // The immediate path below always passes
-                                                        // `None` (the engine defaults it); match
-                                                        // that here for the deferred replay too.
-                                                        their_report: None,
-                                                    });
+                                                    None => {
+                                                        if q.len() >= MAX_PENDING_MANUAL_CALLS {
+                                                            q.pop_front();
+                                                        }
+                                                        q.push_back(PendingManualCall {
+                                                            callsign: callsign.clone(),
+                                                            frequency_hz: frequency as f64,
+                                                            dx_parity,
+                                                            queued_at: std::time::Instant::now(),
+                                                            hound: false,
+                                                            fox_freq_hz: None,
+                                                            fox_grid: None,
+                                                            held_hz: queued_held,
+                                                            hold_mode: queued_hold_mode,
+                                                            remote_origin,
+                                                            remote_client_key_id,
+                                                            step,
+                                                            our_snr_of_them: snr,
+                                                            // The immediate path below always
+                                                            // passes `None` (the engine defaults
+                                                            // it); match that here too.
+                                                            their_report: None,
+                                                        });
+                                                    }
                                                 }
                                                 let queue_depth = q.len();
                                                 drop(q);
@@ -4639,6 +4809,7 @@ impl super::ApplicationCoordinator {
                                                     None,
                                                     partner,
                                                     remote_origin,
+                                                    remote_client_key_id,
                                                 )
                                                 .await
                                             {
@@ -4798,12 +4969,14 @@ impl super::ApplicationCoordinator {
                                             frequency,
                                             tx_parity,
                                             remote_origin,
+                                            remote_client_key_id,
                                         } => {
                                             match qso_manager
                                                 .start_cq_manual(
                                                     frequency as f64,
                                                     tx_parity,
                                                     remote_origin,
+                                                    remote_client_key_id,
                                                 )
                                                 .await
                                             {
@@ -4922,7 +5095,7 @@ impl super::ApplicationCoordinator {
                                                 // picks its own slot via the self-parity fallback).
                                                 const FOX_CQ_OFFSET_HZ: f64 = 1500.0;
                                                 match qso_manager
-                                                    .start_cq_manual(FOX_CQ_OFFSET_HZ, None, false)
+                                                    .start_cq_manual(FOX_CQ_OFFSET_HZ, None, false, None)
                                                     .await
                                                 {
                                                     Ok(qso_id) => {
@@ -5220,6 +5393,7 @@ mod secondary_decoder_hint_tests {
                 pending_freq_drift: None,
                 hound_qsyed: false,
                 remote_origin: false,
+                remote_client_key_id: None,
                 tx_parity_provisional: false,
             },
         }
@@ -5611,6 +5785,7 @@ mod pending_manual_tests {
             held_hz: 0,
             hold_mode: false,
             remote_origin: false,
+            remote_client_key_id: None,
             step: pancetta_core::ResponseStep::Grid,
             our_snr_of_them: None,
             their_report: None,
@@ -5656,6 +5831,7 @@ mod pending_manual_tests {
             held_hz: 0,
             hold_mode: false,
             remote_origin: false,
+            remote_client_key_id: None,
             step,
             our_snr_of_them: Some(-8.0),
             their_report: None,
@@ -5762,6 +5938,7 @@ mod pending_manual_tests {
             held_hz: 0,
             hold_mode: false,
             remote_origin: false,
+            remote_client_key_id: None,
             step: pancetta_core::ResponseStep::Grid,
             our_snr_of_them: None,
             their_report: None,
@@ -5842,6 +6019,7 @@ mod pending_manual_tests {
             held_hz: 1500,
             hold_mode: true,
             remote_origin: false,
+            remote_client_key_id: None,
             step: pancetta_core::ResponseStep::Grid,
             our_snr_of_them: None,
             their_report: None,
@@ -5872,6 +6050,7 @@ mod pending_manual_tests {
             held_hz: 1500,
             hold_mode: true,
             remote_origin: false,
+            remote_client_key_id: None,
             step: pancetta_core::ResponseStep::Grid,
             our_snr_of_them: None,
             their_report: None,
@@ -5910,6 +6089,7 @@ mod pending_manual_tests {
             held_hz: 0,
             hold_mode: false,
             remote_origin: false,
+            remote_client_key_id: None,
             step: pancetta_core::ResponseStep::Grid,
             our_snr_of_them: None,
             their_report: None,
@@ -6637,6 +6817,7 @@ mod snapshot_tests {
                 pending_freq_drift: None,
                 hound_qsyed: false,
                 remote_origin: false,
+                remote_client_key_id: None,
                 tx_parity_provisional: false,
             },
         }
@@ -6901,6 +7082,14 @@ mod auto_73_tests {
         MessageBus::new(1000).expect("bus")
     }
 
+    /// Every test in this module uses `remote_origin: false` (see
+    /// `map_with_dx`), so round-14's identity-bound permission check is
+    /// always short-circuited regardless of this arm's state — an unarmed
+    /// placeholder is sufficient.
+    fn unarmed() -> Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>> {
+        Arc::new(std::sync::Mutex::new(pancetta_agent::arm::ArmState::new()))
+    }
+
     /// A completions map containing a single manual completion for `DX`,
     /// completed far enough in the past to clear the SM-F3/TX-F10
     /// first-resend guard (`AUTO_73_FIRST_RESEND_MIN_DELAY`) but still well
@@ -6918,6 +7107,8 @@ mod auto_73_tests {
                 resends: 0,
                 last_resend_at: None,
                 remote_origin: false,
+                remote_client_key_id: None,
+                qso_id: uuid::Uuid::new_v4(),
             },
         );
         Arc::new(Mutex::new(map))
@@ -6966,6 +7157,7 @@ mod auto_73_tests {
                 &map,
                 &policy,
                 &bus,
+                &unarmed(),
             )
             .await;
             if let Some(e) = map.lock().await.get_mut(DX) {
@@ -7001,6 +7193,7 @@ mod auto_73_tests {
                 &map,
                 &policy,
                 &bus,
+                &unarmed(),
             )
             .await;
             // Do NOT reset last_resend_at — same slot.
@@ -7028,6 +7221,8 @@ mod auto_73_tests {
                     resends: 0,
                     last_resend_at: None,
                     remote_origin: false,
+                    remote_client_key_id: None,
+                    qso_id: uuid::Uuid::new_v4(),
                 },
             );
             Arc::new(Mutex::new(m))
@@ -7045,6 +7240,7 @@ mod auto_73_tests {
             &map,
             &policy,
             &bus,
+            &unarmed(),
         )
         .await;
 
@@ -7076,6 +7272,7 @@ mod auto_73_tests {
             &map,
             &policy,
             &bus,
+            &unarmed(),
         )
         .await;
 
@@ -7101,6 +7298,7 @@ mod auto_73_tests {
             &map,
             &policy,
             &bus,
+            &unarmed(),
         )
         .await;
 
@@ -7126,6 +7324,7 @@ mod auto_73_tests {
             &map,
             &policy,
             &bus,
+            &unarmed(),
         )
         .await;
 
@@ -7155,6 +7354,7 @@ mod auto_73_tests {
             &map,
             &policy,
             &bus,
+            &unarmed(),
         )
         .await;
 
@@ -7185,6 +7385,7 @@ mod auto_73_tests {
             &map,
             &policy,
             &bus,
+            &unarmed(),
         )
         .await;
 
@@ -7213,6 +7414,7 @@ mod auto_73_tests {
             &map,
             &policy,
             &bus,
+            &unarmed(),
         )
         .await;
 
@@ -7239,6 +7441,8 @@ mod auto_73_tests {
                     resends: 0,
                     last_resend_at: None,
                     remote_origin: false,
+                    remote_client_key_id: None,
+                    qso_id: uuid::Uuid::new_v4(),
                 },
             );
             Arc::new(Mutex::new(m))
@@ -7259,6 +7463,7 @@ mod auto_73_tests {
                 &map,
                 &policy,
                 &bus,
+                &unarmed(),
             )
             .await;
         }
@@ -7296,6 +7501,8 @@ mod auto_73_tests {
                     resends: 0,
                     last_resend_at: None,
                     remote_origin: false,
+                    remote_client_key_id: None,
+                    qso_id: uuid::Uuid::new_v4(),
                 },
             );
             Arc::new(Mutex::new(m))
@@ -7313,6 +7520,7 @@ mod auto_73_tests {
             &map,
             &policy,
             &bus,
+            &unarmed(),
         )
         .await;
 
@@ -7322,6 +7530,82 @@ mod auto_73_tests {
             "a genuine later resend past the guard window must still fire"
         );
         assert_eq!(map.lock().await.get(DX).map(|e| e.resends), Some(1));
+    }
+
+    /// Round-14 review (Codex P1): a remote-origin completion bound to
+    /// client-a, while a DIFFERENT client (client-b) holds the arm, must
+    /// not consume the auto-73 budget — `respond_to_caller`'s own resend
+    /// path silently skips the doomed resend (round-10 fix) but still
+    /// returns `Ok`, so this function must independently verify permission
+    /// and roll its own commit back rather than trusting that return value.
+    #[tokio::test]
+    async fn denied_identity_rolls_back_the_resend_commit() {
+        let mgr = manager().await;
+        let map = {
+            let mut m = HashMap::new();
+            m.insert(
+                DX.to_string(),
+                RecentManualCompletion {
+                    completed_at: chrono::Utc::now() - chrono::Duration::seconds(40),
+                    frequency_hz: 1500.0,
+                    dx_parity: Some(SlotParity::Even),
+                    resends: 0,
+                    last_resend_at: None,
+                    remote_origin: true,
+                    remote_client_key_id: Some("client-a".to_string()),
+                    qso_id: uuid::Uuid::new_v4(),
+                },
+            );
+            Arc::new(Mutex::new(m))
+        };
+        let policy = AtomicU8::new(TxPolicy::Full.as_u8());
+        let bus = bus();
+        let mut rx = mgr.subscribe();
+
+        // client-b holds the arm — a mismatch against the entry's client-a.
+        let mut st = pancetta_agent::arm::ArmState::new();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        st.arm(
+            pancetta_agent::arm::VerifiedArmGrant {
+                operator_callsign: "W1AW".to_string(),
+                ttl_ms: 120_000,
+                scope_tx: true,
+                jti: "auto73-rollback-test-jti".to_string(),
+                client_key_id: "client-b".to_string(),
+            },
+            now_ms,
+        );
+        st.set_local_consent(true, now_ms);
+        let arm = Arc::new(std::sync::Mutex::new(st));
+
+        maybe_auto_resend_73(
+            &rr73_to_us(),
+            OUR,
+            1500.0,
+            Some(SlotParity::Even),
+            &mgr,
+            &map,
+            &policy,
+            &bus,
+            &arm,
+        )
+        .await;
+
+        assert_eq!(
+            drain_sends(&mut rx),
+            0,
+            "a resend denied for identity mismatch must never emit a frame"
+        );
+        let entry = map.lock().await.get(DX).cloned().expect("entry retained");
+        assert_eq!(
+            entry.resends, 0,
+            "the resend commit must be rolled back exactly, not left incremented"
+        );
+        assert_eq!(
+            entry.last_resend_at, None,
+            "last_resend_at must also be rolled back, or a genuine later RR73 \
+             could be wrongly suppressed by the per-slot guard"
+        );
     }
 
     /// Guard for the [duplicate_checking] wiring: the pancetta-config defaults
@@ -8117,6 +8401,7 @@ mod cqdx_upload_tests {
             pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin: false,
+            remote_client_key_id: None,
             tx_parity_provisional: false,
         }
     }
@@ -8237,6 +8522,7 @@ mod qrz_enrichment_tests {
             pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin: false,
+            remote_client_key_id: None,
             tx_parity_provisional: false,
         }
     }
@@ -8431,7 +8717,7 @@ mod replay_local_log_tests {
     async fn complete_one_qso(manager: &pancetta_qso::QsoManager) {
         let freq = 14_074_000.0;
         manager
-            .start_cq(freq, None, false)
+            .start_cq(freq, None, false, None)
             .await
             .expect("start_cq should succeed");
 
@@ -8686,6 +8972,7 @@ mod replay_history_seed_tests {
                 pending_freq_drift: None,
                 hound_qsyed: false,
                 remote_origin: false,
+                remote_client_key_id: None,
                 tx_parity_provisional: false,
             },
         }
@@ -9066,6 +9353,7 @@ mod respond_to_caller_admission_tests {
                 step: ResponseStep::ReportAck,
                 snr: Some(-8.0),
                 remote_origin: false,
+                remote_client_key_id: None,
             }),
             Instant::now(),
         );
@@ -9144,6 +9432,7 @@ mod respond_to_caller_admission_tests {
                 frequency: 2000,
                 dx_parity: Some(SlotParity::Odd),
                 remote_origin: false,
+                remote_client_key_id: None,
             }),
             Instant::now(),
         );
@@ -9626,7 +9915,7 @@ mod respond_to_caller_admission_tests {
         const CQ_HZ: f64 = 1500.0;
         const NEW_HZ: f64 = 1900.0;
         let qso_id = manager
-            .start_cq_manual(CQ_HZ, None, false)
+            .start_cq_manual(CQ_HZ, None, false, None)
             .await
             .expect("seeding an unanswered CQ");
 

@@ -703,7 +703,7 @@ async fn dispatch_action(
                     .and_then(|s| s.operator_callsign().map(str::to_string)),
                 detail: detail.clone(),
             });
-            let qso_msg = tx_kind_to_qso_message(kind);
+            let qso_msg = tx_kind_to_qso_message(kind, peer);
             send_qso(bus, qso_msg).await;
             info!(
                 target: "agent.tx",
@@ -1051,7 +1051,11 @@ fn parse_response_step(s: &str) -> pancetta_core::ResponseStep {
 /// that opens the corresponding QSO with `remote_origin = true`. This is the
 /// single point that stamps the remote origin, so the resulting QSO's TX is
 /// `TxOrigin::Remote` end to end.
-fn tx_kind_to_qso_message(kind: TxKind) -> crate::message_bus::QsoMessage {
+/// `peer` is the station-agent client keyId that requested this TX — stamped
+/// onto the resulting QSO as `remote_client_key_id` so the arm gate can bind
+/// TX permission to THIS specific client (PAN-91), not just "some client is
+/// currently armed".
+fn tx_kind_to_qso_message(kind: TxKind, peer: &str) -> crate::message_bus::QsoMessage {
     use crate::message_bus::QsoMessage;
     match kind {
         TxKind::CallStation {
@@ -1063,6 +1067,7 @@ fn tx_kind_to_qso_message(kind: TxKind) -> crate::message_bus::QsoMessage {
             frequency: frequency_hz.max(0.0) as u64,
             dx_parity: parse_dx_parity(dx_parity.as_deref()),
             remote_origin: true,
+            remote_client_key_id: Some(peer.to_string()),
         },
         TxKind::AnswerCaller {
             callsign,
@@ -1077,11 +1082,13 @@ fn tx_kind_to_qso_message(kind: TxKind) -> crate::message_bus::QsoMessage {
             step: parse_response_step(&step),
             snr: snr.map(|v| v as f32),
             remote_origin: true,
+            remote_client_key_id: Some(peer.to_string()),
         },
         TxKind::StartCq { offset_hz } => QsoMessage::StartCq {
             frequency: offset_hz.max(0.0) as u64,
             tx_parity: None,
             remote_origin: true,
+            remote_client_key_id: Some(peer.to_string()),
         },
     }
 }
@@ -3218,6 +3225,7 @@ mod tests {
             MessageType::QsoMessage(crate::message_bus::QsoMessage::StartQso {
                 callsign,
                 remote_origin,
+                remote_client_key_id,
                 dx_parity,
                 ..
             }) => {
@@ -3225,6 +3233,11 @@ mod tests {
                 assert!(
                     remote_origin,
                     "remote TxRequest MUST set remote_origin=true"
+                );
+                assert_eq!(
+                    remote_client_key_id.as_deref(),
+                    Some(CLIENT_KEY_ID),
+                    "remote TxRequest MUST bind the QSO to the requesting peer"
                 );
                 assert_eq!(dx_parity, Some(pancetta_core::slot::SlotParity::Odd));
             }
@@ -3235,18 +3248,22 @@ mod tests {
     // ── Each TxKind maps to the right remote-origin QsoMessage ──────────────
     #[test]
     fn tx_kind_answer_caller_maps_to_remote_respond() {
-        let msg = tx_kind_to_qso_message(TxKind::AnswerCaller {
-            callsign: "K2DEF".into(),
-            frequency_hz: 1200.0,
-            step: "reportAck".into(),
-            dx_parity: Some("even".into()),
-            snr: Some(-9.0),
-        });
+        let msg = tx_kind_to_qso_message(
+            TxKind::AnswerCaller {
+                callsign: "K2DEF".into(),
+                frequency_hz: 1200.0,
+                step: "reportAck".into(),
+                dx_parity: Some("even".into()),
+                snr: Some(-9.0),
+            },
+            CLIENT_KEY_ID,
+        );
         match msg {
             crate::message_bus::QsoMessage::RespondToCaller {
                 callsign,
                 step,
                 remote_origin,
+                remote_client_key_id,
                 dx_parity,
                 ..
             } => {
@@ -3254,6 +3271,7 @@ mod tests {
                 assert_eq!(step, pancetta_core::ResponseStep::ReportAck);
                 assert_eq!(dx_parity, Some(pancetta_core::slot::SlotParity::Even));
                 assert!(remote_origin, "answerCaller MUST be remote_origin=true");
+                assert_eq!(remote_client_key_id.as_deref(), Some(CLIENT_KEY_ID));
             }
             other => panic!("expected RespondToCaller, got {other:?}"),
         }
@@ -3261,15 +3279,17 @@ mod tests {
 
     #[test]
     fn tx_kind_start_cq_maps_to_remote_cq() {
-        let msg = tx_kind_to_qso_message(TxKind::StartCq { offset_hz: 800.0 });
+        let msg = tx_kind_to_qso_message(TxKind::StartCq { offset_hz: 800.0 }, CLIENT_KEY_ID);
         match msg {
             crate::message_bus::QsoMessage::StartCq {
                 frequency,
                 remote_origin,
+                remote_client_key_id,
                 ..
             } => {
                 assert_eq!(frequency, 800);
                 assert!(remote_origin, "startCq MUST be remote_origin=true");
+                assert_eq!(remote_client_key_id.as_deref(), Some(CLIENT_KEY_ID));
             }
             other => panic!("expected StartCq, got {other:?}"),
         }

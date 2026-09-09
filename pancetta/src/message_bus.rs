@@ -230,6 +230,12 @@ pub enum MessageType {
         /// remote-TX arm gate; `Remote` is gated by `ArmState::tx_permitted()`.
         #[allow(dead_code)]
         origin: TxOrigin,
+        /// The station-agent client this request is bound to, iff
+        /// `origin == Remote`. The arm gate compares this against the
+        /// CURRENTLY-armed client (PAN-91) — a different peer taking control
+        /// later must not authorize a frame it never requested. `None` for
+        /// every `Local` request.
+        remote_client_key_id: Option<String>,
     },
 
     /// Transmit completed notification
@@ -401,6 +407,9 @@ pub enum MessageType {
         /// bundle shares one origin (a bundle is one operator's slot).
         #[allow(dead_code)]
         origin: TxOrigin,
+        /// See `MessageType::TransmitRequest::remote_client_key_id`. The whole
+        /// bundle shares one client binding, matching `origin` above.
+        remote_client_key_id: Option<String>,
     },
 
     /// Audio output samples for transmission. `flush_first`, when true,
@@ -693,6 +702,11 @@ pub enum QsoMessage {
         /// every TX it emits is `TxOrigin::Remote` and armed-TX gated. `false`
         /// for every local/TUI `StartQso` (byte-identical to prior behavior).
         remote_origin: bool,
+        /// The station-agent peer (client keyId) that requested this, iff
+        /// `remote_origin`. Carried onto the QSO so the arm gate can bind TX
+        /// permission to THIS specific client, not just "some client is
+        /// armed" — see `QsoMetadata::remote_client_key_id`.
+        remote_client_key_id: Option<String>,
     },
     /// Respond to a station **calling us**, opening the exchange at an
     /// operator-chosen [`pancetta_core::ResponseStep`] rather than always
@@ -714,6 +728,8 @@ pub enum QsoMessage {
         /// the QSO with `remote_origin = true` (all TX `TxOrigin::Remote`,
         /// armed-TX gated). `false` for local/TUI answers.
         remote_origin: bool,
+        /// See `QsoMessage::StartQso::remote_client_key_id`.
+        remote_client_key_id: Option<String>,
     },
     /// Start a **manual** CQ call as a real `CallingCq` QSO (operator `c`).
     ///
@@ -733,6 +749,8 @@ pub enum QsoMessage {
         /// `remote_origin = true` (all TX `TxOrigin::Remote`, armed-TX gated).
         /// `false` for the local/TUI `c` key (byte-identical to prior).
         remote_origin: bool,
+        /// See `QsoMessage::StartQso::remote_client_key_id`.
+        remote_client_key_id: Option<String>,
     },
     /// Stop the manual CQ: cancel any active `CallingCq` QSO that has not yet
     /// been answered (operator `s`). A `CallingCq` QSO that already advanced
