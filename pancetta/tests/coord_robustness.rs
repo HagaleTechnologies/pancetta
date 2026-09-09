@@ -579,6 +579,53 @@ fn c20_no_new_window_is_ignored() {
     assert_eq!(m.consecutive(), 0);
 }
 
+/// Round-4 review (Codex P1): a pivot must carry the fresher intent's
+/// authorization binding, not just its text/frequency — a station-agent
+/// action can rebind an existing LOCAL manual QSO to a remote client and
+/// emit a newer `MessageToSend` while the TX worker sits in Step 4c's
+/// pre-PTT wait for an older Local frame of the same QSO. `tx_pivot_target`
+/// (this function) is the pure data source the TX worker's Step 4c reads
+/// `origin`/`remote_client_key_id` from before reassigning them atomically
+/// alongside `message_text`/`frequency_offset` — this pins that the pure
+/// function itself returns the fresher binding, not just the fresher text.
+#[test]
+fn tx_pivot_target_carries_origin_and_client_identity() {
+    use std::collections::HashMap;
+    let qid = "abc-123";
+    let mut latest: HashMap<String, LatestTxIntent> = HashMap::new();
+
+    // The worker is holding an OLDER, LOCAL frame for this QSO.
+    let current_text = "K5ARH W1AW RR73";
+    let current_freq = 1500.0;
+
+    // A station-agent action rebinds this QSO to a remote client and
+    // publishes a newer intent — text changed, so this is a genuine pivot,
+    // but the point under test is the ORIGIN/IDENTITY that travels with it.
+    latest.insert(
+        active_tx_qso_key(qid),
+        LatestTxIntent {
+            message_text: "K5ARH W1AW 73".to_string(),
+            frequency_offset: current_freq,
+            tx_parity: Some(SlotParity::Even),
+            origin: pancetta_lib::message_bus::TxOrigin::Remote,
+            remote_client_key_id: Some("client-b".to_string()),
+        },
+    );
+
+    let got = tx_pivot_target(Some(qid), current_text, current_freq, &latest)
+        .expect("should pivot to the fresher, rebound message");
+    assert_eq!(got.message_text, "K5ARH W1AW 73");
+    assert_eq!(got.origin, pancetta_lib::message_bus::TxOrigin::Remote);
+    assert_eq!(
+        got.remote_client_key_id.as_deref(),
+        Some("client-b"),
+        "the pivot's authorization binding must travel WITH the payload — \
+         adopting the newer text/frequency while silently keeping the OLD \
+         origin/identity would skip the arm gate rather than merely \
+         misattribute it"
+    );
+}
+
 #[test]
 fn tx_pivot_target_swaps_only_on_a_fresher_message() {
     use std::collections::HashMap;
@@ -595,6 +642,8 @@ fn tx_pivot_target_swaps_only_on_a_fresher_message() {
             message_text: "KF9UG K5ARH 73".to_string(),
             frequency_offset: 1353.0,
             tx_parity: Some(SlotParity::Even),
+            origin: pancetta_lib::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         },
     );
 
@@ -636,6 +685,8 @@ fn tx_pivot_target_pivots_on_an_offset_only_change() {
             message_text: "KF9UG K5ARH RR73".to_string(),
             frequency_offset: 1753.0,
             tx_parity: Some(SlotParity::Even),
+            origin: pancetta_lib::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         },
     );
 

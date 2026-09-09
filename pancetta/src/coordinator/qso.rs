@@ -88,6 +88,15 @@ struct RecentManualCompletion {
     /// bind to the client that originally requested the QSO, not just "some
     /// client is currently armed".
     remote_client_key_id: Option<String>,
+    /// The completed QSO's id (round-4 review, Codex P2). A repeated close
+    /// action (operator-triggered, via `respond_to_caller`'s completed-QSO
+    /// rework path) can rebind the LIVE `QsoManager` object's identity to a
+    /// new controller, but this cache entry was only ever populated once,
+    /// at `QsoCompleted` time — it never sees that later rebind. Kept so
+    /// the auto-73 resend can look up the QSO's CURRENT identity instead of
+    /// trusting this snapshot, which would otherwise rebind the QSO back to
+    /// the ORIGINAL client on every auto-resent 73.
+    qso_id: pancetta_qso::QsoId,
 }
 
 /// Shared map of recently-completed manual QSOs. Populated by the QSO-event
@@ -699,6 +708,7 @@ async fn maybe_auto_resend_73(
     // the lock.
     let entry_remote_origin;
     let entry_remote_client_key_id;
+    let entry_qso_id;
     {
         let mut map = completions.lock().await;
         // Prune expired entries every time we look.
@@ -746,7 +756,26 @@ async fn maybe_auto_resend_73(
         // QSO's resend stays `TxOrigin::Remote` and armed-TX gated.
         entry_remote_origin = entry.remote_origin;
         entry_remote_client_key_id = entry.remote_client_key_id.clone();
+        entry_qso_id = entry.qso_id;
     }
+
+    // Round-4 review (Codex P2): prefer the LIVE QSO's identity over this
+    // cache's snapshot — a repeated close action can rebind the QSO's
+    // `remote_client_key_id` to a new controller after this entry was
+    // stashed (see `RecentManualCompletion::qso_id`'s doc), and passing the
+    // stale snapshot to `respond_to_caller` below would rebind the QSO back
+    // to the ORIGINAL client on every auto-resent 73. Falls back to the
+    // cached values only if the QSO has since aged out of the manager's
+    // 1-hour retention (comfortably longer than `AUTO_73_WINDOW`, so this
+    // should be rare in practice).
+    let (entry_remote_origin, entry_remote_client_key_id) =
+        match qso_manager.get_qso(entry_qso_id).await {
+            Ok(progress) => (
+                progress.metadata.remote_origin,
+                progress.metadata.remote_client_key_id,
+            ),
+            Err(_) => (entry_remote_origin, entry_remote_client_key_id),
+        };
 
     // Don't fight a live QSO with this station: if one is active, skip the
     // auto-73 (the QSO state machine is handling it). The counter was already
@@ -3191,10 +3220,24 @@ impl super::ApplicationCoordinator {
                                             "QSO auto-sequence sending: '{}' on {:.1} Hz (qso={}, tx_parity={:?})",
                                             text, frequency, qso_id, tx_parity
                                         );
+                                        // SECURITY: a remote-initiated QSO's TX MUST be
+                                        // `TxOrigin::Remote` so the armed-TX gate applies;
+                                        // a local QSO stays `Local` (byte-identical).
+                                        let tx_origin = if remote_origin {
+                                            crate::message_bus::TxOrigin::Remote
+                                        } else {
+                                            crate::message_bus::TxOrigin::Local
+                                        };
                                         // Record this as the newest intent for the QSO so the
                                         // TX worker can pivot to it at key-time if it arrives
                                         // while an earlier frame for the same QSO is still in
-                                        // the worker's pre-PTT wait.
+                                        // the worker's pre-PTT wait. Round-4 review (Codex
+                                        // P1): `origin`/`remote_client_key_id` travel WITH the
+                                        // payload here — see `LatestTxIntent`'s doc — computed
+                                        // from the SAME `remote_origin`/`remote_client_key_id`
+                                        // this exact event carries, so the intent can never
+                                        // disagree with the `TransmitRequest` sent moments
+                                        // below for the same event.
                                         if let Ok(mut m) = latest_tx_intent.write() {
                                             m.insert(
                                                 super::active_tx_qso_key(&qso_id.to_string()),
@@ -3202,6 +3245,9 @@ impl super::ApplicationCoordinator {
                                                     message_text: text.clone(),
                                                     frequency_offset: frequency,
                                                     tx_parity,
+                                                    origin: tx_origin,
+                                                    remote_client_key_id: remote_client_key_id
+                                                        .clone(),
                                                 },
                                             );
                                         }
@@ -3213,14 +3259,7 @@ impl super::ApplicationCoordinator {
                                                 frequency_offset: frequency,
                                                 qso_id: Some(qso_id.to_string()),
                                                 tx_parity,
-                                                // SECURITY: a remote-initiated QSO's TX MUST be
-                                                // `TxOrigin::Remote` so the armed-TX gate applies;
-                                                // a local QSO stays `Local` (byte-identical).
-                                                origin: if remote_origin {
-                                                    crate::message_bus::TxOrigin::Remote
-                                                } else {
-                                                    crate::message_bus::TxOrigin::Local
-                                                },
+                                                origin: tx_origin,
                                                 remote_client_key_id,
                                             },
                                             Instant::now(),
@@ -3467,6 +3506,7 @@ impl super::ApplicationCoordinator {
                                             remote_client_key_id: metadata
                                                 .remote_client_key_id
                                                 .clone(),
+                                            qso_id,
                                         };
                                         let mut map = completions_for_events.lock().await;
                                         // Prune stale entries while we hold the lock so
@@ -4009,39 +4049,70 @@ impl super::ApplicationCoordinator {
                                             ) {
                                                 let mut q = pending_manual_calls.lock().await;
                                                 // Dedup by callsign; bound the queue.
-                                                let dup = q.iter().any(|p| {
+                                                let dup_pos = q.iter().position(|p| {
                                                     p.callsign.eq_ignore_ascii_case(&callsign)
                                                 });
-                                                if !dup {
-                                                    if q.len() >= MAX_PENDING_MANUAL_CALLS {
-                                                        q.pop_front();
+                                                // Capture the operator's held-offset
+                                                // intent so promote_pending_manual_calls
+                                                // can rerun compute_manual_tx_offset with
+                                                // the current active set at promotion time.
+                                                let queued_held =
+                                                    tx_offset_hold_hz.load(Ordering::Relaxed);
+                                                let queued_hold_mode =
+                                                    pancetta_core::TxFreqMode::from_u8(
+                                                        tx_freq_mode.load(Ordering::Relaxed),
+                                                    ) == pancetta_core::TxFreqMode::Hold;
+                                                match dup_pos {
+                                                    // Round-4 review (Codex P2): a repeat
+                                                    // call for the same callsign while it's
+                                                    // still deferred must REPLACE the stored
+                                                    // request — including origin/identity —
+                                                    // not be silently dropped. Before this
+                                                    // fix, if client A's call was deferred
+                                                    // and client B later repeated it, the
+                                                    // dup check discarded B's request
+                                                    // outright: promotion still admitted the
+                                                    // stale A-bound entry, which B's own
+                                                    // valid arm then rejected.
+                                                    Some(pos) => {
+                                                        q[pos] = PendingManualCall {
+                                                            callsign: callsign.clone(),
+                                                            frequency_hz: frequency as f64,
+                                                            dx_parity,
+                                                            queued_at: std::time::Instant::now(),
+                                                            hound: false,
+                                                            fox_freq_hz: None,
+                                                            fox_grid: None,
+                                                            held_hz: queued_held,
+                                                            hold_mode: queued_hold_mode,
+                                                            remote_origin,
+                                                            remote_client_key_id,
+                                                            step: pancetta_core::ResponseStep::Grid,
+                                                            our_snr_of_them: None,
+                                                            their_report: None,
+                                                        };
                                                     }
-                                                    // Capture the operator's held-offset
-                                                    // intent so promote_pending_manual_calls
-                                                    // can rerun compute_manual_tx_offset with
-                                                    // the current active set at promotion time.
-                                                    let queued_held =
-                                                        tx_offset_hold_hz.load(Ordering::Relaxed);
-                                                    let queued_hold_mode =
-                                                        pancetta_core::TxFreqMode::from_u8(
-                                                            tx_freq_mode.load(Ordering::Relaxed),
-                                                        ) == pancetta_core::TxFreqMode::Hold;
-                                                    q.push_back(PendingManualCall {
-                                                        callsign: callsign.clone(),
-                                                        frequency_hz: frequency as f64,
-                                                        dx_parity,
-                                                        queued_at: std::time::Instant::now(),
-                                                        hound: false,
-                                                        fox_freq_hz: None,
-                                                        fox_grid: None,
-                                                        held_hz: queued_held,
-                                                        hold_mode: queued_hold_mode,
-                                                        remote_origin,
-                                                        remote_client_key_id,
-                                                        step: pancetta_core::ResponseStep::Grid,
-                                                        our_snr_of_them: None,
-                                                        their_report: None,
-                                                    });
+                                                    None => {
+                                                        if q.len() >= MAX_PENDING_MANUAL_CALLS {
+                                                            q.pop_front();
+                                                        }
+                                                        q.push_back(PendingManualCall {
+                                                            callsign: callsign.clone(),
+                                                            frequency_hz: frequency as f64,
+                                                            dx_parity,
+                                                            queued_at: std::time::Instant::now(),
+                                                            hound: false,
+                                                            fox_freq_hz: None,
+                                                            fox_grid: None,
+                                                            held_hz: queued_held,
+                                                            hold_mode: queued_hold_mode,
+                                                            remote_origin,
+                                                            remote_client_key_id,
+                                                            step: pancetta_core::ResponseStep::Grid,
+                                                            our_snr_of_them: None,
+                                                            their_report: None,
+                                                        });
+                                                    }
                                                 }
                                                 let queue_depth = q.len();
                                                 drop(q);
@@ -4581,38 +4652,63 @@ impl super::ApplicationCoordinator {
                                                 pancetta_qso::qso_manager::TxAdmission::Queue
                                             ) {
                                                 let mut q = pending_manual_calls.lock().await;
-                                                let dup = q.iter().any(|p| {
+                                                let dup_pos = q.iter().position(|p| {
                                                     p.callsign.eq_ignore_ascii_case(&callsign)
                                                 });
-                                                if !dup {
-                                                    if q.len() >= MAX_PENDING_MANUAL_CALLS {
-                                                        q.pop_front();
+                                                let queued_held =
+                                                    tx_offset_hold_hz.load(Ordering::Relaxed);
+                                                let queued_hold_mode =
+                                                    pancetta_core::TxFreqMode::from_u8(
+                                                        tx_freq_mode.load(Ordering::Relaxed),
+                                                    ) == pancetta_core::TxFreqMode::Hold;
+                                                // Round-4 review (Codex P2): same fix as the
+                                                // StartQso deferred queue above — a repeat
+                                                // caller-response for the same callsign must
+                                                // REPLACE the stored request (origin/identity
+                                                // included), not be silently dropped.
+                                                match dup_pos {
+                                                    Some(pos) => {
+                                                        q[pos] = PendingManualCall {
+                                                            callsign: callsign.clone(),
+                                                            frequency_hz: frequency as f64,
+                                                            dx_parity,
+                                                            queued_at: std::time::Instant::now(),
+                                                            hound: false,
+                                                            fox_freq_hz: None,
+                                                            fox_grid: None,
+                                                            held_hz: queued_held,
+                                                            hold_mode: queued_hold_mode,
+                                                            remote_origin,
+                                                            remote_client_key_id,
+                                                            step,
+                                                            our_snr_of_them: snr,
+                                                            their_report: None,
+                                                        };
                                                     }
-                                                    let queued_held =
-                                                        tx_offset_hold_hz.load(Ordering::Relaxed);
-                                                    let queued_hold_mode =
-                                                        pancetta_core::TxFreqMode::from_u8(
-                                                            tx_freq_mode.load(Ordering::Relaxed),
-                                                        ) == pancetta_core::TxFreqMode::Hold;
-                                                    q.push_back(PendingManualCall {
-                                                        callsign: callsign.clone(),
-                                                        frequency_hz: frequency as f64,
-                                                        dx_parity,
-                                                        queued_at: std::time::Instant::now(),
-                                                        hound: false,
-                                                        fox_freq_hz: None,
-                                                        fox_grid: None,
-                                                        held_hz: queued_held,
-                                                        hold_mode: queued_hold_mode,
-                                                        remote_origin,
-                                                        remote_client_key_id,
-                                                        step,
-                                                        our_snr_of_them: snr,
-                                                        // The immediate path below always passes
-                                                        // `None` (the engine defaults it); match
-                                                        // that here for the deferred replay too.
-                                                        their_report: None,
-                                                    });
+                                                    None => {
+                                                        if q.len() >= MAX_PENDING_MANUAL_CALLS {
+                                                            q.pop_front();
+                                                        }
+                                                        q.push_back(PendingManualCall {
+                                                            callsign: callsign.clone(),
+                                                            frequency_hz: frequency as f64,
+                                                            dx_parity,
+                                                            queued_at: std::time::Instant::now(),
+                                                            hound: false,
+                                                            fox_freq_hz: None,
+                                                            fox_grid: None,
+                                                            held_hz: queued_held,
+                                                            hold_mode: queued_hold_mode,
+                                                            remote_origin,
+                                                            remote_client_key_id,
+                                                            step,
+                                                            our_snr_of_them: snr,
+                                                            // The immediate path below always
+                                                            // passes `None` (the engine defaults
+                                                            // it); match that here too.
+                                                            their_report: None,
+                                                        });
+                                                    }
                                                 }
                                                 let queue_depth = q.len();
                                                 drop(q);
@@ -6963,6 +7059,7 @@ mod auto_73_tests {
                 last_resend_at: None,
                 remote_origin: false,
                 remote_client_key_id: None,
+                qso_id: uuid::Uuid::new_v4(),
             },
         );
         Arc::new(Mutex::new(map))
@@ -7074,6 +7171,7 @@ mod auto_73_tests {
                     last_resend_at: None,
                     remote_origin: false,
                     remote_client_key_id: None,
+                    qso_id: uuid::Uuid::new_v4(),
                 },
             );
             Arc::new(Mutex::new(m))
@@ -7286,6 +7384,7 @@ mod auto_73_tests {
                     last_resend_at: None,
                     remote_origin: false,
                     remote_client_key_id: None,
+                    qso_id: uuid::Uuid::new_v4(),
                 },
             );
             Arc::new(Mutex::new(m))
@@ -7344,6 +7443,7 @@ mod auto_73_tests {
                     last_resend_at: None,
                     remote_origin: false,
                     remote_client_key_id: None,
+                    qso_id: uuid::Uuid::new_v4(),
                 },
             );
             Arc::new(Mutex::new(m))

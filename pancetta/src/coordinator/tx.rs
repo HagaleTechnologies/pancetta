@@ -5441,6 +5441,9 @@ impl super::ApplicationCoordinator {
                                         {
                                             let new_text = intent.message_text;
                                             let new_freq = intent.frequency_offset;
+                                            let new_origin = intent.origin;
+                                            let new_remote_client_key_id =
+                                                intent.remote_client_key_id;
                                             // TX-F4: protocol-aware re-encode/re-modulate
                                             // (mirrors Step 1's `encode_for_protocol` /
                                             // `modulate_for_protocol` call above) — the
@@ -5498,6 +5501,17 @@ impl super::ApplicationCoordinator {
                                                     message_text = new_text;
                                                     frequency_offset = new_freq;
                                                     audio_out = rebuilt;
+                                                    // Round-4 review (Codex P1): the
+                                                    // authorization binding is replaced
+                                                    // ATOMICALLY with the payload above — never
+                                                    // partially, e.g. adopting a newer REMOTE
+                                                    // payload while leaving `origin` at its
+                                                    // stale `Local` value, which would skip the
+                                                    // arm gate entirely rather than merely
+                                                    // misattribute it. See `LatestTxIntent`'s
+                                                    // doc.
+                                                    origin = new_origin;
+                                                    remote_client_key_id = new_remote_client_key_id;
                                                     // Double-PTT fix: record this pivot so the
                                                     // newer request that PRODUCED `message_text`
                                                     // — still queued behind this one — is
@@ -6127,6 +6141,35 @@ impl super::ApplicationCoordinator {
                                                 }
                                                 ptt_active.store(false, Ordering::Release);
                                                 ptt_guard.disarm();
+                                                // Round-4 review (Codex P1): flush the
+                                                // already-queued remote waveform BEFORE
+                                                // reenqueuing pending work — a pending local
+                                                // TuneRequest or a fresh TX both queue with
+                                                // `flush_first: false`, so without this the
+                                                // disarmed client's remaining audio could
+                                                // still reach the air riding behind the next
+                                                // request's samples. Reuses the same
+                                                // `AudioOutput{flush_first: true}` mechanism
+                                                // the re-key/supersede path already relies on
+                                                // to clear a superseded transmission's buffer.
+                                                let flush_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Audio,
+                                                    MessageType::AudioOutput {
+                                                        samples: Vec::new(),
+                                                        sample_rate,
+                                                        flush_first: true,
+                                                    },
+                                                    Instant::now(),
+                                                );
+                                                if let Err(e) =
+                                                    message_bus.send_message(flush_msg).await
+                                                {
+                                                    debug!(
+                                                        "Flushing aborted remote audio after disarm: {}",
+                                                        e
+                                                    );
+                                                }
                                                 reenqueue_pending(&message_bus, pending).await;
                                                 emit_disarm_interrupt_signals(
                                                     &message_bus,
@@ -8038,6 +8081,28 @@ impl super::ApplicationCoordinator {
                                             }
                                             ptt_active.store(false, Ordering::Release);
                                             ptt_guard.disarm();
+                                            // Round-4 review (Codex P1): flush the
+                                            // already-queued remote bundle waveform BEFORE
+                                            // reenqueuing pending work — see the single-TX
+                                            // arm's identical fix for why.
+                                            let flush_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Audio,
+                                                MessageType::AudioOutput {
+                                                    samples: Vec::new(),
+                                                    sample_rate,
+                                                    flush_first: true,
+                                                },
+                                                Instant::now(),
+                                            );
+                                            if let Err(e) =
+                                                message_bus.send_message(flush_msg).await
+                                            {
+                                                debug!(
+                                                    "Flushing aborted remote audio after disarm: {}",
+                                                    e
+                                                );
+                                            }
                                             reenqueue_pending(&message_bus, pending).await;
                                             emit_disarm_interrupt_signals(
                                                 &message_bus,

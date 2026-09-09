@@ -116,6 +116,20 @@ pub struct LatestTxIntent {
     pub message_text: String,
     pub frequency_offset: f64,
     pub tx_parity: Option<pancetta_core::slot::SlotParity>,
+    /// Round-4 review (Codex P1): the intent's own authorization binding,
+    /// carried alongside the payload it belongs to. A station-agent action
+    /// can rebind an existing LOCAL manual QSO to a remote client and emit
+    /// a newer `MessageToSend` while the TX worker sits in Step 4c's
+    /// pre-PTT wait for an OLDER, Local frame of the same QSO — without
+    /// this, the worker's pivot would swap in the newer REMOTE payload
+    /// while keeping the in-flight frame's stale `origin == Local` (and no
+    /// client key), skipping the arm gate entirely rather than merely
+    /// misattributing it. The TX worker's pivot must replace this
+    /// atomically with `message_text`/`frequency_offset`, never adopt the
+    /// new payload while keeping the old origin.
+    pub origin: crate::message_bus::TxOrigin,
+    /// Paired with `origin` — see its doc.
+    pub remote_client_key_id: Option<String>,
 }
 
 /// Smallest offset difference (Hz) [`tx_pivot_target`] treats as a genuine
@@ -2721,6 +2735,8 @@ mod pivot_bundle_tests {
             message_text: text.to_string(),
             frequency_offset: freq,
             tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         }
     }
 
