@@ -5411,6 +5411,12 @@ impl super::ApplicationCoordinator {
                                             (audio_out.len() as f64 / sample_rate as f64 * 1000.0)
                                                 as u64;
 
+                                        // Round-6 review (Codex P2): tracks the
+                                        // `pivoted_once` key Step 4c inserts below (if it
+                                        // pivots this cycle) so Step 4d-arm's denial branch
+                                        // can remove it — see that branch for why.
+                                        let mut pivoted_this_key: Option<String> = None;
+
                                         // --- Step 4c: late pivot to the freshest message ---
                                         // Our decoder finishes ~1.8s BEFORE the slot
                                         // boundary, but a fresher decode for THIS QSO can
@@ -5531,13 +5537,15 @@ impl super::ApplicationCoordinator {
                                                     // pivoted), so this `if let` always matches
                                                     // for a `None` id; guarded defensively anyway.
                                                     if let Some(id) = qso_id.as_deref() {
+                                                        let key = super::active_tx_qso_key(id);
                                                         pivoted_once.insert(
-                                                            super::active_tx_qso_key(id),
+                                                            key.clone(),
                                                             (
                                                                 message_text.clone(),
                                                                 frequency_offset,
                                                             ),
                                                         );
+                                                        pivoted_this_key = Some(key);
                                                     }
                                                 }
                                                 _ => {
@@ -5595,6 +5603,16 @@ impl super::ApplicationCoordinator {
                                         {
                                             ptt_active.store(false, Ordering::Release);
                                             ptt_guard.disarm();
+                                            // Round-6 review (Codex P2): if Step 4c pivoted
+                                            // this cycle, remove the tombstone it inserted —
+                                            // nothing actually reached the air, so the
+                                            // genuinely fresh request still queued behind
+                                            // this one must NOT be discarded by Step 0-dup as
+                                            // an already-sent duplicate of a pivot that never
+                                            // transmitted.
+                                            if let Some(key) = pivoted_this_key.take() {
+                                                pivoted_once.remove(&key);
+                                            }
                                             let denial_reason = format!(
                                                 "arm went stale in the pre-PTT gap: '{message_text}' at {frequency_offset:.0} Hz"
                                             );
@@ -7637,6 +7655,12 @@ impl super::ApplicationCoordinator {
                                     // already-sent duplicate (Step 0-dup (bundle) above)
                                     // instead of keying PTT a second time for the same
                                     // text.
+                                    // Round-6 review (Codex P2): tracked so Step 4d-arm's
+                                    // denial branch below can remove these — see that
+                                    // branch, and the single-TX arm's identical fix, for
+                                    // why.
+                                    let pivoted_this_bundle_keys: Vec<String> =
+                                        pivots.iter().map(|(k, _, _)| k.clone()).collect();
                                     for (qso_key, new_text, new_freq) in pivots {
                                         pivoted_once.insert(qso_key, (new_text, new_freq));
                                     }
@@ -7764,6 +7788,14 @@ impl super::ApplicationCoordinator {
                                     {
                                         ptt_active.store(false, Ordering::Release);
                                         ptt_guard.disarm();
+                                        // Round-6 review (Codex P2): nothing reached the
+                                        // air — remove any tombstone this bundle's Step
+                                        // 4b-pivot just inserted, so the genuinely fresh
+                                        // request still queued behind it isn't discarded by
+                                        // Step 0-dup as an already-sent duplicate.
+                                        for key in &pivoted_this_bundle_keys {
+                                            pivoted_once.remove(key);
+                                        }
                                         for item in &items {
                                             let denial_reason = format!(
                                                 "arm went stale in the pre-PTT gap: '{}' at {:.0} Hz",
