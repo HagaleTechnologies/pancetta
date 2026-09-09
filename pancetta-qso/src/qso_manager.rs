@@ -2515,6 +2515,28 @@ impl QsoManager {
         // lingering terminal record), so it should rarely trigger now.
         self.supersede_active_qsos_for(&target, frequency).await;
 
+        // Round-15 review (Codex P1): unlike the EXISTING-QSO ladder-advance
+        // fix (round 13), a brand-new QSO opened directly at a close step
+        // (`SeventyThree`) is created ALREADY `Completed` — the state-build
+        // match below sets that unconditionally, and completing immediately
+        // emits `QsoCompleted` (ADIF/logbook entry) further down. Doing that
+        // for a client the TX layer will deny is worse than the existing-QSO
+        // case: the resulting QSO is already terminal, so it can never be
+        // retried once that client becomes authorized, and the false log
+        // entry cannot be un-logged. Refuse outright rather than create
+        // anything — a later, actually-authorized call creates it fresh.
+        if step == pancetta_core::ResponseStep::SeventyThree
+            && remote_origin
+            && !(self.remote_tx_permitted)(remote_client_key_id.as_deref())
+        {
+            return Err(QsoManagerError::Internal {
+                message: format!(
+                    "refusing to open-and-complete a new QSO with {target} at SeventyThree: \
+                     the bound remote client is not currently TX-permitted"
+                ),
+            });
+        }
+
         let qso_id = Uuid::new_v4();
         let now = Utc::now();
         // See the matching comment in `respond_to_cq_with`: a `None`

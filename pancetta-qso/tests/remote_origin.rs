@@ -301,6 +301,45 @@ async fn denied_rebound_advance_does_not_complete_or_mutate_the_qso() {
     );
 }
 
+/// Round-15 review (Codex P1): opening a BRAND-NEW QSO directly at a close
+/// step (`SeventyThree`, no existing/recent QSO for this callsign/band)
+/// immediately marks it `Completed` and logs it — worse than the
+/// existing-QSO advance case (round 13), since the resulting QSO is
+/// already terminal and can never be retried once the client becomes
+/// authorized, and the false ADIF log entry can't be un-logged. Must
+/// refuse outright rather than create anything for a denied client.
+#[tokio::test]
+async fn denied_new_close_step_open_creates_no_qso_and_no_false_completion() {
+    let mut manager = QsoManager::new(config());
+    manager.set_remote_tx_permitted_source(std::sync::Arc::new(|_: Option<&str>| false));
+    let mut rx = manager.subscribe();
+
+    let result = manager
+        .respond_to_caller(
+            "K9XYZ".to_string(),
+            1500.0,
+            Some(SlotParity::Even),
+            pancetta_core::ResponseStep::SeventyThree,
+            None,
+            None,
+            None,
+            true,
+            Some("client-a".to_string()),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "a denied client's direct close-step open must be refused, not silently \
+         create-and-complete a QSO"
+    );
+
+    let drained = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+    assert!(
+        drained.is_err(),
+        "no MessageToSend/QsoCompleted event may be emitted for a refused open"
+    );
+}
+
 #[tokio::test]
 async fn remote_origin_persists_across_the_reply_ladder() {
     // The flag is latched in QsoMetadata at open, so EVERY subsequent
