@@ -3040,8 +3040,16 @@ async fn emit_disarm_interrupt_signals(
     message_bus: &MessageBus,
     audit_log: &pancetta_agent::audit::AuditLog,
     display_feed_enabled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    remote_tx_arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
-    remote_client_key_id: Option<&str>,
+    // Round-12 review (Codex P2): the CALLER captures this at the denial
+    // check itself — before this function's own `emit_diagnostic` await —
+    // rather than this function re-locking the live `ArmState` after that
+    // await. If the arm is absent/expired at the denial point and a
+    // client then arms (or takes control) while `emit_diagnostic` is
+    // pending, re-locking here would attribute the durable `TxDenied`
+    // record to that LATER arm state, not the one that actually rejected
+    // the frame. Mirrors `ArmSnapshot::operator_callsign`'s identical
+    // reasoning for the coalescer's own (already detached) denial path.
+    operator_callsign: Option<String>,
     diagnostic_verb: &str,
     denial_reason: String,
     qso_id: Option<&str>,
@@ -3057,7 +3065,7 @@ async fn emit_disarm_interrupt_signals(
     audit_log.append(&pancetta_agent::audit::AuditEvent {
         ts_unix_ms: chrono::Utc::now().timestamp_millis(),
         kind: pancetta_agent::audit::AuditKind::TxDenied,
-        operator_callsign: tx_denied_operator_attribution(remote_tx_arm, remote_client_key_id),
+        operator_callsign,
         detail: denial_reason.clone(),
     });
     super::remote_gateway::relay_to_gateway(
@@ -5550,12 +5558,15 @@ impl super::ApplicationCoordinator {
                                             let denial_reason = format!(
                                                 "arm went stale during slot wait: '{message_text}' at {frequency_offset:.0} Hz"
                                             );
+                                            let operator_callsign = tx_denied_operator_attribution(
+                                                &remote_tx_arm,
+                                                remote_client_key_id.as_deref(),
+                                            );
                                             emit_disarm_interrupt_signals(
                                                 &message_bus,
                                                 &audit_log,
                                                 &display_feed_enabled,
-                                                &remote_tx_arm,
-                                                remote_client_key_id.as_deref(),
+                                                operator_callsign,
                                                 "denied",
                                                 denial_reason,
                                                 qso_id.as_deref(),
@@ -5883,12 +5894,15 @@ impl super::ApplicationCoordinator {
                                             let denial_reason = format!(
                                                 "arm went stale in the pre-PTT gap: '{message_text}' at {frequency_offset:.0} Hz"
                                             );
+                                            let operator_callsign = tx_denied_operator_attribution(
+                                                &remote_tx_arm,
+                                                remote_client_key_id.as_deref(),
+                                            );
                                             emit_disarm_interrupt_signals(
                                                 &message_bus,
                                                 &audit_log,
                                                 &display_feed_enabled,
-                                                &remote_tx_arm,
-                                                remote_client_key_id.as_deref(),
+                                                operator_callsign,
                                                 "denied",
                                                 denial_reason,
                                                 qso_id.as_deref(),
@@ -6047,12 +6061,16 @@ impl super::ApplicationCoordinator {
                                                 let pending =
                                                     drain_and_merge_pending(&tx_rx, pending);
                                                 reenqueue_pending(&message_bus, pending).await;
+                                                let operator_callsign =
+                                                    tx_denied_operator_attribution(
+                                                        &remote_tx_arm,
+                                                        remote_client_key_id.as_deref(),
+                                                    );
                                                 emit_disarm_interrupt_signals(
                                                     &message_bus,
                                                     &audit_log,
                                                     &display_feed_enabled,
-                                                    &remote_tx_arm,
-                                                    remote_client_key_id.as_deref(),
+                                                    operator_callsign,
                                                     "interrupted",
                                                     format!("disarmed mid-transmission: '{message_text}' at {frequency_offset:.0} Hz"),
                                                     qso_id.as_deref(),
@@ -6382,12 +6400,15 @@ impl super::ApplicationCoordinator {
                                             let denial_reason = format!(
                                                 "arm went stale before audio delivery: '{message_text}' at {frequency_offset:.0} Hz"
                                             );
+                                            let operator_callsign = tx_denied_operator_attribution(
+                                                &remote_tx_arm,
+                                                remote_client_key_id.as_deref(),
+                                            );
                                             emit_disarm_interrupt_signals(
                                                 &message_bus,
                                                 &audit_log,
                                                 &display_feed_enabled,
-                                                &remote_tx_arm,
-                                                remote_client_key_id.as_deref(),
+                                                operator_callsign,
                                                 "denied",
                                                 denial_reason,
                                                 qso_id.as_deref(),
@@ -6565,12 +6586,16 @@ impl super::ApplicationCoordinator {
                                                 let pending =
                                                     drain_and_merge_pending(&tx_rx, pending);
                                                 reenqueue_pending(&message_bus, pending).await;
+                                                let operator_callsign =
+                                                    tx_denied_operator_attribution(
+                                                        &remote_tx_arm,
+                                                        remote_client_key_id.as_deref(),
+                                                    );
                                                 emit_disarm_interrupt_signals(
                                                     &message_bus,
                                                     &audit_log,
                                                     &display_feed_enabled,
-                                                    &remote_tx_arm,
-                                                    remote_client_key_id.as_deref(),
+                                                    operator_callsign,
                                                     "interrupted",
                                                     format!("disarmed mid-transmission: '{message_text}' at {frequency_offset:.0} Hz"),
                                                     qso_id.as_deref(),
@@ -7945,6 +7970,10 @@ impl super::ApplicationCoordinator {
                                         // Round-3 review (Codex P2): route through the
                                         // shared denial-signaling helper — mirrors the
                                         // single-TX fix above.
+                                        let operator_callsign = tx_denied_operator_attribution(
+                                            &remote_tx_arm,
+                                            remote_client_key_id.as_deref(),
+                                        );
                                         for item in &items {
                                             let denial_reason = format!(
                                                 "arm went stale during slot wait: '{}' at {:.0} Hz",
@@ -7954,8 +7983,7 @@ impl super::ApplicationCoordinator {
                                                 &message_bus,
                                                 &audit_log,
                                                 &display_feed_enabled,
-                                                &remote_tx_arm,
-                                                remote_client_key_id.as_deref(),
+                                                operator_callsign.clone(),
                                                 "denied",
                                                 denial_reason,
                                                 item.qso_id.as_deref(),
@@ -8166,6 +8194,10 @@ impl super::ApplicationCoordinator {
                                         for key in &pivoted_this_bundle_keys {
                                             pivoted_once.remove(key);
                                         }
+                                        let operator_callsign = tx_denied_operator_attribution(
+                                            &remote_tx_arm,
+                                            remote_client_key_id.as_deref(),
+                                        );
                                         for item in &items {
                                             let denial_reason = format!(
                                                 "arm went stale in the pre-PTT gap: '{}' at {:.0} Hz",
@@ -8175,8 +8207,7 @@ impl super::ApplicationCoordinator {
                                                 &message_bus,
                                                 &audit_log,
                                                 &display_feed_enabled,
-                                                &remote_tx_arm,
-                                                remote_client_key_id.as_deref(),
+                                                operator_callsign.clone(),
                                                 "denied",
                                                 denial_reason,
                                                 item.qso_id.as_deref(),
@@ -8318,12 +8349,15 @@ impl super::ApplicationCoordinator {
                                             // `drain_and_merge_pending`'s doc for why.
                                             let pending = drain_and_merge_pending(&tx_rx, pending);
                                             reenqueue_pending(&message_bus, pending).await;
+                                            let operator_callsign = tx_denied_operator_attribution(
+                                                &remote_tx_arm,
+                                                remote_client_key_id.as_deref(),
+                                            );
                                             emit_disarm_interrupt_signals(
                                                 &message_bus,
                                                 &audit_log,
                                                 &display_feed_enabled,
-                                                &remote_tx_arm,
-                                                remote_client_key_id.as_deref(),
+                                                operator_callsign,
                                                 "interrupted",
                                                 "disarmed mid-transmission: '<multi-TX bundle>' at 0 Hz".to_string(),
                                                 None,
@@ -8428,6 +8462,10 @@ impl super::ApplicationCoordinator {
                                         for key in &pivoted_this_bundle_keys {
                                             pivoted_once.remove(key);
                                         }
+                                        let operator_callsign = tx_denied_operator_attribution(
+                                            &remote_tx_arm,
+                                            remote_client_key_id.as_deref(),
+                                        );
                                         for item in &items {
                                             let denial_reason = format!(
                                                 "arm went stale before audio delivery: '{}' at {:.0} Hz",
@@ -8437,8 +8475,7 @@ impl super::ApplicationCoordinator {
                                                 &message_bus,
                                                 &audit_log,
                                                 &display_feed_enabled,
-                                                &remote_tx_arm,
-                                                remote_client_key_id.as_deref(),
+                                                operator_callsign.clone(),
                                                 "denied",
                                                 denial_reason,
                                                 item.qso_id.as_deref(),
@@ -8604,12 +8641,15 @@ impl super::ApplicationCoordinator {
                                             // `drain_and_merge_pending`'s doc for why.
                                             let pending = drain_and_merge_pending(&tx_rx, pending);
                                             reenqueue_pending(&message_bus, pending).await;
+                                            let operator_callsign = tx_denied_operator_attribution(
+                                                &remote_tx_arm,
+                                                remote_client_key_id.as_deref(),
+                                            );
                                             emit_disarm_interrupt_signals(
                                                 &message_bus,
                                                 &audit_log,
                                                 &display_feed_enabled,
-                                                &remote_tx_arm,
-                                                remote_client_key_id.as_deref(),
+                                                operator_callsign,
                                                 "interrupted",
                                                 "disarmed mid-transmission: '<multi-TX bundle>' at 0 Hz".to_string(),
                                                 None,
@@ -9781,12 +9821,12 @@ mod disarm_interrupt_signal_tests {
 
         let denial_reason =
             "arm went stale in the pre-PTT gap: 'CQ K5ARH EM12' at 1500 Hz".to_string();
+        let operator_callsign = tx_denied_operator_attribution(&arm, Some("client-b"));
         emit_disarm_interrupt_signals(
             &bus,
             &audit_log,
             &display_feed_enabled,
-            &arm,
-            Some("client-b"),
+            operator_callsign,
             "denied",
             denial_reason.clone(),
             Some("qso-1"),
@@ -9844,12 +9884,12 @@ mod disarm_interrupt_signal_tests {
         let display_feed_enabled = Arc::new(AtomicBool::new(false));
         let arm = Arc::new(std::sync::Mutex::new(pancetta_agent::arm::ArmState::new()));
 
+        let operator_callsign = tx_denied_operator_attribution(&arm, None);
         emit_disarm_interrupt_signals(
             &bus,
             &audit_log,
             &display_feed_enabled,
-            &arm,
-            None,
+            operator_callsign,
             "interrupted",
             "disarmed mid-transmission: 'CQ K5ARH EM12' at 1500 Hz".to_string(),
             Some("qso-1"),
