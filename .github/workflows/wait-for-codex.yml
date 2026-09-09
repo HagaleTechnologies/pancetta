@@ -413,6 +413,18 @@ jobs:
           # before it needed its own separate finding); opened/ready_for_review
           # join them for the identical reason.
           IS_SYNC: ${{ github.event.action == 'synchronize' || github.event.action == 'reopened' || github.event.action == 'opened' || github.event.action == 'ready_for_review' || github.run_attempt > 1 }}
+          # Whether this event carries stale-prior-head risk: a response to
+          # a PREVIOUS head can land after THIS run's own cutoff and satisfy
+          # an untied loose-branch signal with nothing ever tied to the new
+          # HEAD_SHA. True for synchronize/reopened, AND for
+          # ready_for_review -- a draft PR can accumulate its own commits/
+          # comments/thumbsups before ever going ready, so ready_for_review
+          # does NOT guarantee no prior head exists to be confused with,
+          # unlike a genuine first-ever `opened` (Codex P1, pancetta#364,
+          # extending manta#156's original finding). Only `opened` (and any
+          # rerun of it, since a rerun replays the original action
+          # unchanged) is actually risk-free.
+          IS_REMEDIATION_RISK: ${{ github.event.action == 'synchronize' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' }}
           # Narrower than IS_SYNC on purpose: a reopened event or a rerun of
           # opened/ready_for_review has no new commit, so a clean re-review
           # of the SAME code must not auto-resolve baseline threads still
@@ -590,7 +602,16 @@ jobs:
             # PREVIOUS head can land after the new push's own cutoff and
             # satisfy the loose branch's untied comment/thumbsup checks with
             # no signal ever tied to the new HEAD_SHA.
-            if [ "$IS_SYNC" = "true" ]; then
+            # Falls through to the loose branch when CODEX_REVIEW_PAT is
+            # unset (no COMMENT_ID) AND this event has no stale-prior-head
+            # risk (IS_REMEDIATION_RISK above) -- a genuine bare-thumbsup
+            # clean-pass on a no-PAT opened/ready_for_review run has no way
+            # to satisfy the strict branch otherwise (Codex P2, coppa#102),
+            # but synchronize/reopened must stay strict regardless of
+            # COMMENT_ID (Codex P1, manta#156) -- reviews/comment_head_tied
+            # still work fine without one; only comment_thumbsup degrades to
+            # 0, which is the correct fail-safe behavior for those events.
+            if [ "$IS_SYNC" = "true" ] && { [ -n "$COMMENT_ID" ] || [ "$IS_REMEDIATION_RISK" = "true" ]; }; then
               # On a re-push specifically, a bare new issue comment or a
               # generic issue-level thumbsup is NOT proof Codex looked at
               # THIS head — either could be a stale signal from an unrelated
