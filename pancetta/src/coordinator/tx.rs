@@ -268,6 +268,19 @@ pub fn classify_incoming_during_tx(
     candidate: &MessageType,
     in_flight_items: &[crate::message_bus::TransmitRequestItem],
     pivoted_once: &std::collections::HashMap<String, (String, f64)>,
+    // Codex P1, PR #362 round 21: the in-flight side's own authorization —
+    // mirrors `tx_pivot_target`'s `current_authorization` (round 5) and
+    // `supersede_and_rekey_or_bundle`'s `in_flight_origin`/
+    // `in_flight_remote_client_key_id`. Without this, a same-QSO candidate
+    // whose rendered text/frequency happen to be byte-identical to the
+    // in-flight item (e.g. a local operator takes over an A-bound remote QSO
+    // and repeats its current text) was classified as an exact duplicate and
+    // dropped — even though it carries a DIFFERENT authorization that has
+    // never been checked against this slot's arm. A disarm of the OLD
+    // (in-flight) client then aborts the transmission while the dropped
+    // candidate — the one actually entitled to transmit — is gone for good.
+    in_flight_origin: crate::message_bus::TxOrigin,
+    in_flight_remote_client_key_id: Option<&str>,
 ) -> IncomingDuringTx {
     // M1: normalize through `active_tx_qso_key` before comparing, matching
     // every sibling qso_id comparison (`tx_pivot_target`, `is_pivot_duplicate`,
@@ -280,13 +293,26 @@ pub fn classify_incoming_during_tx(
         })
     };
 
+    // Codex P1, round 21: a candidate whose rendered content matches the
+    // in-flight item byte-for-byte but carries DIFFERENT authorization is
+    // not a duplicate — it's a fresh, differently-authorized request that
+    // just happens to render the same text (e.g. a local takeover repeating
+    // an in-flight remote QSO's current closing frame). Only an
+    // authorization match (same origin, same client) plus matching content
+    // is a genuine no-op.
+    let authorization_differs = |cand_origin: crate::message_bus::TxOrigin,
+                                 cand_client: Option<&str>| {
+        cand_origin != in_flight_origin || cand_client != in_flight_remote_client_key_id
+    };
+
     match candidate {
         MessageType::TransmitRequest {
             message_text,
             frequency_offset,
             qso_id,
             tx_parity,
-            ..
+            origin,
+            remote_client_key_id,
         } => {
             if super::is_pivot_duplicate(
                 qso_id.as_deref(),
@@ -307,11 +333,12 @@ pub fn classify_incoming_during_tx(
             // comparing text alone would also match a deliberate same-text
             // frequency hop.
             if qso_id.is_none() {
-                let is_untracked_duplicate = in_flight_items.iter().any(|it| {
-                    it.qso_id.is_none()
-                        && it.message_text == *message_text
-                        && it.frequency_offset == *frequency_offset
-                });
+                let is_untracked_duplicate =
+                    in_flight_items.iter().any(|it| {
+                        it.qso_id.is_none()
+                            && it.message_text == *message_text
+                            && it.frequency_offset == *frequency_offset
+                    }) && !authorization_differs(*origin, remote_client_key_id.as_deref());
                 if is_untracked_duplicate {
                     return IncomingDuringTx::Drop;
                 }
@@ -329,9 +356,13 @@ pub fn classify_incoming_during_tx(
                 // (qso_manager.rs's stuck-DX offset hop). Matching on text
                 // alone would drop that hop and leave the old-offset signal
                 // transmitting into the collision it was trying to avoid.
+                // Round 21: authorization must ALSO match, or this is a
+                // fresh (differently-authorized) request wearing the
+                // in-flight item's own content.
                 Some(item)
                     if item.message_text == *message_text
-                        && item.frequency_offset == *frequency_offset =>
+                        && item.frequency_offset == *frequency_offset
+                        && !authorization_differs(*origin, remote_client_key_id.as_deref()) =>
                 {
                     IncomingDuringTx::Drop
                 }
@@ -361,7 +392,19 @@ pub fn classify_incoming_during_tx(
         // instead of a single `TransmitRequest`. A bundle with NO changed
         // overlap (including no overlap at all) gets the same Requeue
         // treatment as a single-item candidate (PAN-73 round 2).
-        MessageType::MultiTransmitRequest { items, .. } => {
+        MessageType::MultiTransmitRequest {
+            items,
+            origin,
+            remote_client_key_id,
+            ..
+        } => {
+            // Round 21: same authorization-aware duplicate check as the
+            // single-`TransmitRequest` arm above — a bundle re-carrying an
+            // in-flight item's exact content under DIFFERENT authorization
+            // is a fresh, differently-authorized request, not the unchanged
+            // repeat this overlap check exists to filter out.
+            let authorization_changed =
+                authorization_differs(*origin, remote_client_key_id.as_deref());
             let has_changed_overlap =
                 items
                     .iter()
@@ -369,6 +412,7 @@ pub fn classify_incoming_during_tx(
                         Some(in_flight_item) => {
                             in_flight_item.message_text != it.message_text
                                 || in_flight_item.frequency_offset != it.frequency_offset
+                                || authorization_changed
                         }
                         None => false,
                     });
@@ -700,10 +744,22 @@ async fn interruptible_sleep_or_supersede(
                 MessageType::TransmitRequest { .. } | MessageType::MultiTransmitRequest { .. }
             );
             if is_supersede_candidate {
+                // The in-flight side's own authorization: `remote_tx_arm`
+                // being `Some` means the in-flight frame is Remote (with
+                // this client_key_id); `None` means Local (see this
+                // function's own param doc above).
+                let (in_flight_origin, in_flight_remote_client_key_id) = match remote_tx_arm {
+                    Some((_, client_key_id)) => {
+                        (crate::message_bus::TxOrigin::Remote, client_key_id)
+                    }
+                    None => (crate::message_bus::TxOrigin::Local, None),
+                };
                 match classify_incoming_during_tx(
                     &message.message_type,
                     in_flight_items,
                     pivoted_once,
+                    in_flight_origin,
+                    in_flight_remote_client_key_id,
                 ) {
                     IncomingDuringTx::Drop => {}
                     // PAN-73 round 2: not a match for any in-flight QSO —
@@ -13138,6 +13194,8 @@ mod classifier_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            crate::message_bus::TxOrigin::Local,
+            None,
         );
         match outcome {
             super::IncomingDuringTx::Supersede { text, qso_id, .. } => {
@@ -13163,6 +13221,8 @@ mod classifier_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            crate::message_bus::TxOrigin::Local,
+            None,
         );
         assert!(matches!(outcome, super::IncomingDuringTx::Supersede { .. }));
     }
@@ -13184,6 +13244,8 @@ mod classifier_tests {
                 qso_id: None,
             }],
             &pivoted_once,
+            crate::message_bus::TxOrigin::Local,
+            None,
         );
         assert!(
             matches!(outcome, super::IncomingDuringTx::Drop),
@@ -13205,6 +13267,8 @@ mod classifier_tests {
                 qso_id: None,
             }],
             &pivoted_once,
+            crate::message_bus::TxOrigin::Local,
+            None,
         );
         assert!(matches!(outcome, super::IncomingDuringTx::Supersede { .. }));
     }
@@ -13233,6 +13297,8 @@ mod classifier_tests {
                 qso_id: Some("qso-vp2maa".to_string()),
             }],
             &pivoted_once,
+            crate::message_bus::TxOrigin::Local,
+            None,
         );
         assert!(
             matches!(outcome, super::IncomingDuringTx::Requeue),
@@ -13262,7 +13328,13 @@ mod classifier_tests {
                 qso_id: Some("qso-second".to_string()),
             },
         ];
-        let outcome = super::classify_incoming_during_tx(&candidate, &in_flight, &pivoted_once);
+        let outcome = super::classify_incoming_during_tx(
+            &candidate,
+            &in_flight,
+            &pivoted_once,
+            crate::message_bus::TxOrigin::Local,
+            None,
+        );
         match outcome {
             super::IncomingDuringTx::Supersede { text, qso_id, .. } => {
                 assert_eq!(text, "SECOND W5AU RR73");
@@ -13286,8 +13358,84 @@ mod classifier_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            crate::message_bus::TxOrigin::Local,
+            None,
         );
         assert!(matches!(outcome, super::IncomingDuringTx::Drop));
+    }
+
+    /// Codex P1, round 21 (PR #362): byte-identical content is NOT a safe
+    /// duplicate when the CANDIDATE's own authorization differs from the
+    /// in-flight frame's — e.g. a local operator takes over an A-bound
+    /// remote QSO and repeats its current text. Dropping this would let a
+    /// later disarm of A abort the in-flight frame while the differently-
+    /// authorized replacement (the one actually entitled to transmit) is
+    /// gone for good, with no normal rearm to recover a completed QSO.
+    #[test]
+    fn classify_supersedes_identical_content_when_authorization_differs() {
+        let pivoted_once = std::collections::HashMap::new();
+        let candidate = MessageType::TransmitRequest {
+            message_text: "KA1ABC K5ARH R-15".to_string(),
+            frequency_offset: 1500.0,
+            qso_id: Some("qso-1".to_string()),
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
+        };
+        let outcome = super::classify_incoming_during_tx(
+            &candidate,
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH R-15".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
+            &pivoted_once,
+            // In-flight side is bound to a Remote client — candidate above
+            // is Local, so authorization differs despite identical content.
+            crate::message_bus::TxOrigin::Remote,
+            Some("client-a"),
+        );
+        assert!(
+            matches!(outcome, super::IncomingDuringTx::Supersede { .. }),
+            "identical content under DIFFERENT authorization must supersede, not Drop — \
+             got {outcome:?}"
+        );
+    }
+
+    /// Codex P1, round 21 (PR #362): same authorization-aware check for a
+    /// `MultiTransmitRequest` bundle whose overlapping item's content is
+    /// unchanged but the bundle's own authorization differs from the
+    /// in-flight frame's.
+    #[test]
+    fn classify_supersedes_multi_transmit_request_with_unchanged_overlap_when_authorization_differs(
+    ) {
+        let pivoted_once = std::collections::HashMap::new();
+        let candidate = MessageType::MultiTransmitRequest {
+            items: vec![crate::message_bus::TransmitRequestItem {
+                message_text: "IN-FLIGHT W5AU R-01".to_string(),
+                frequency_offset: 1000.0,
+                qso_id: Some("qso-in-flight".to_string()),
+            }],
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Remote,
+            remote_client_key_id: Some("client-b".to_string()),
+        };
+        let outcome = super::classify_incoming_during_tx(
+            &candidate,
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "IN-FLIGHT W5AU R-01".to_string(),
+                frequency_offset: 1000.0,
+                qso_id: Some("qso-in-flight".to_string()),
+            }],
+            &pivoted_once,
+            crate::message_bus::TxOrigin::Remote,
+            Some("client-a"),
+        );
+        assert!(
+            matches!(outcome, super::IncomingDuringTx::Supersede { .. }),
+            "an unchanged overlap under DIFFERENT authorization must supersede, not Requeue \
+             — got {outcome:?}"
+        );
     }
 
     /// Codex round 3 (PR #346): a stuck-DX QSO can re-render the SAME text
@@ -13314,6 +13462,8 @@ mod classifier_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            crate::message_bus::TxOrigin::Local,
+            None,
         );
         assert!(
             matches!(outcome, super::IncomingDuringTx::Supersede { .. }),
@@ -13339,6 +13489,8 @@ mod classifier_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            crate::message_bus::TxOrigin::Local,
+            None,
         );
         assert!(matches!(outcome, super::IncomingDuringTx::Drop));
     }
@@ -13373,6 +13525,8 @@ mod classifier_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            crate::message_bus::TxOrigin::Local,
+            None,
         );
         assert!(
             matches!(outcome, super::IncomingDuringTx::Supersede { .. }),
@@ -13407,6 +13561,8 @@ mod classifier_tests {
                 qso_id: Some("qso-in-flight".to_string()),
             }],
             &pivoted_once,
+            crate::message_bus::TxOrigin::Local,
+            None,
         );
         assert!(
             matches!(outcome, super::IncomingDuringTx::Requeue),
@@ -13446,6 +13602,8 @@ mod classifier_tests {
                 qso_id: Some("qso-in-flight".to_string()),
             }],
             &pivoted_once,
+            crate::message_bus::TxOrigin::Local,
+            None,
         );
         assert!(
             matches!(outcome, super::IncomingDuringTx::Supersede { .. }),
@@ -13492,6 +13650,8 @@ mod classifier_tests {
                 qso_id: Some("qso-in-flight".to_string()),
             }],
             &pivoted_once,
+            crate::message_bus::TxOrigin::Local,
+            None,
         );
         assert!(
             matches!(outcome, super::IncomingDuringTx::Requeue),
