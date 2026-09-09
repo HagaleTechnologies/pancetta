@@ -233,6 +233,74 @@ async fn denied_rebound_resend_does_not_charge_the_call_budget() {
     );
 }
 
+/// Round-13 review (Codex P1): unlike the resend branches, advancing an
+/// existing QSO to an AHEAD step (`respond_to_caller`'s ladder-advance
+/// branch) MUTATES the exchange — records a `Sent` message, changes state,
+/// and at `SeventyThree` completes the QSO and logs the ADIF contact. Doing
+/// that unconditionally for a client the TX layer would deny is worse than
+/// the resend branches' wasted budget charge: it can permanently corrupt
+/// the exchange state or produce a false completed-QSO log entry for a
+/// contact that never actually transmitted.
+#[tokio::test]
+async fn denied_rebound_advance_does_not_complete_or_mutate_the_qso() {
+    let mut manager = QsoManager::new(config());
+    manager.set_remote_tx_permitted_source(std::sync::Arc::new(|_: Option<&str>| false));
+    let mut rx = manager.subscribe();
+
+    // Client A opens at Report (SendingReport state) — creates a fresh QSO
+    // since none exists yet for this callsign/band.
+    let id_a = manager
+        .respond_to_caller(
+            "K9XYZ".to_string(),
+            1500.0,
+            Some(SlotParity::Even),
+            pancetta_core::ResponseStep::Report,
+            None,
+            None,
+            None,
+            true,
+            Some("client-a".to_string()),
+        )
+        .await
+        .expect("respond_to_caller (client-a, Report)");
+    let _ = first_message_to_send_remote_origin_and_client(&mut rx).await;
+
+    // Client B repeats at SeventyThree — ranked AHEAD of SendingReport, so
+    // this hits the ladder-advance branch, not the idempotent resend one.
+    // B is not TX-permitted (set above), so this must be denied downstream.
+    let id_b = manager
+        .respond_to_caller(
+            "K9XYZ".to_string(),
+            1500.0,
+            Some(SlotParity::Even),
+            pancetta_core::ResponseStep::SeventyThree,
+            None,
+            None,
+            None,
+            true,
+            Some("client-b".to_string()),
+        )
+        .await
+        .expect("respond_to_caller (client-b, SeventyThree)");
+    assert_eq!(
+        id_a, id_b,
+        "must resolve to the same QSO, never spawn a sibling"
+    );
+
+    // No MessageToSend for the denied advance.
+    let drained = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+    assert!(
+        drained.is_err(),
+        "an advance the TX layer would deny anyway must not even be attempted"
+    );
+
+    let progress = manager.get_qso(id_a).await.expect("qso must exist");
+    assert!(
+        !matches!(progress.state, pancetta_qso::QsoState::Completed { .. }),
+        "a denied advance must never complete the QSO (would log a false ADIF contact)"
+    );
+}
+
 #[tokio::test]
 async fn remote_origin_persists_across_the_reply_ladder() {
     // The flag is latched in QsoMetadata at open, so EVERY subsequent

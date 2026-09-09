@@ -2413,19 +2413,33 @@ impl QsoManager {
                          (ahead of its current stage)",
                         target, step, existing_id
                     );
+                    // Round-13 review (Codex P1): unlike the resend
+                    // branches, advancing MUTATES the QSO's ladder state —
+                    // records a `Sent` message, changes state, and at
+                    // `SeventyThree` completes the QSO and logs the ADIF
+                    // contact. Doing that unconditionally for a client the
+                    // TX layer will deny anyway would leave a permanently
+                    // wrong exchange state (or a false log entry) even
+                    // though nothing ever transmitted — worse than the
+                    // resend branches' merely-wasted budget charge. Decide
+                    // BEFORE rebinding/advancing, same as those branches.
+                    let should_advance = !remote_origin
+                        || (self.remote_tx_permitted)(remote_client_key_id.as_deref());
                     // Round-3 review (Codex P2): rebind before advancing —
                     // see `rebind_remote_identity`'s doc.
                     self.rebind_remote_identity(existing_id, remote_origin, remote_client_key_id)
                         .await;
-                    self.advance_existing_qso_to_step(
-                        existing_id,
-                        &target,
-                        frequency,
-                        step,
-                        our_report,
-                        their_report_val,
-                    )
-                    .await?;
+                    if should_advance {
+                        self.advance_existing_qso_to_step(
+                            existing_id,
+                            &target,
+                            frequency,
+                            step,
+                            our_report,
+                            their_report_val,
+                        )
+                        .await?;
+                    }
                     return Ok(existing_id);
                 }
                 _ => {

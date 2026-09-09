@@ -2982,8 +2982,22 @@ impl ArmSnapshot {
     /// logic against this frozen snapshot instead of a fresh lock — see
     /// this struct's `operator_callsign` field doc for why that matters
     /// for detached denial reporting.
+    ///
+    /// Round-13 review (Codex P1): deliberately does NOT reuse
+    /// `is_identity_mismatch` — that predicate is gated on `tx_permitted`
+    /// (it exists to pick DENIAL-REASON WORDING: don't say "bound to a
+    /// different client" when the real cause is heartbeat/TTL/kill).
+    /// Attribution is a different question — "did A's frame get denied
+    /// while it's actually B who is bound here" — and must hold
+    /// independent of WHY the frame was denied: if nobody is currently
+    /// armed AND the frame is bound to a specific client, that client's
+    /// identity still differs from "nobody", so this must still refuse to
+    /// attribute the denial to whoever the (unrelated) armed_client_key_id
+    /// happens to be.
     fn operator_attribution(&self, remote_client_key_id: Option<&str>) -> Option<String> {
-        if self.is_identity_mismatch(remote_client_key_id) {
+        let identity_differs =
+            remote_client_key_id.is_some_and(|id| self.armed_client_key_id.as_deref() != Some(id));
+        if identity_differs {
             None
         } else {
             self.operator_callsign.clone()
@@ -12767,6 +12781,37 @@ mod arm_snapshot_attribution_tests {
             Some("K5ARH"),
             "a frame with no bound identity falls back to whoever is armed, \
              preserving pre-PAN-91 attribution"
+        );
+    }
+
+    /// Round-13 review (Codex P1): `is_identity_mismatch` is gated on
+    /// `tx_permitted` (it exists to pick DENIAL-REASON WORDING), so reusing
+    /// it for attribution let a mismatched-AND-otherwise-denied frame (here:
+    /// local consent off, so `tx_permitted` is false) fall through to
+    /// attributing B's callsign on A's denied frame — the gate suppressed
+    /// the identity check instead of the identity check standing on its
+    /// own. Attribution must refuse whenever the identity genuinely
+    /// differs, independent of why `tx_permitted` is false.
+    #[test]
+    fn identity_mismatch_refuses_attribution_even_when_tx_is_not_permitted_for_another_reason() {
+        let mut st = ArmState::new();
+        st.arm(grant_for("K5ARH", "client-b"), NOW);
+        // Local consent OFF: tx_permitted is false for an UNRELATED reason,
+        // not because of the identity mismatch below.
+        st.set_local_consent(false, NOW);
+        let arm = Arc::new(Mutex::new(st));
+        let snapshot = ArmSnapshot::take(&arm, NOW);
+        assert!(
+            !snapshot.tx_permitted,
+            "test setup: tx must not be permitted here"
+        );
+
+        assert_eq!(
+            snapshot.operator_attribution(Some("client-a")),
+            None,
+            "a frame bound to client-a must never be attributed to client-b's \
+             operator, even when the denial's proximate cause is something \
+             else entirely (local consent off)"
         );
     }
 }
