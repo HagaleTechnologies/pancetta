@@ -4107,6 +4107,25 @@ enum SupersedeOutcome {
         /// caller must overwrite its `qso_id` local with this value
         /// alongside `origin`.
         qso_id: Option<String>,
+        /// Codex P1, PR #362 round 18: `Replace` is returned for TWO
+        /// unrelated reasons — a genuine over-capacity/frequency-collision
+        /// fallback (single-TX callers and the multi-TX over-cap path both
+        /// correctly abandon the in-flight side and key only the new
+        /// request), and a multi-TX identity conflict (the in-flight bundle
+        /// and the new request are both Remote but bound to DIFFERENT
+        /// clients, so folding them would authorize one client's frame via
+        /// the other's bundle-level check). The multi-TX caller
+        /// (`supersede_multi_reenqueue`) previously treated every `Replace`
+        /// as over-capacity and PRESERVED the in-flight bundle while
+        /// dropping the new request — correct for over-capacity (the new
+        /// request's own cadence retries later), but wrong for an identity
+        /// conflict caused by a legitimate control transfer: the stale
+        /// bundle is re-enqueued only to be rejected later against the new
+        /// arm anyway, while the fresher, currently-authorized new request
+        /// (e.g. a closing frame) is discarded and never retried. This flag
+        /// lets that caller tell the two cases apart; single-TX callers
+        /// ignore it since they always key the new request either way.
+        identity_conflict: bool,
     },
     /// Bundle-add is viable. The caller encodes `items` via
     /// `encode_and_modulate_multi_tx`; on success it re-enqueues a
@@ -4236,6 +4255,7 @@ async fn supersede_and_rekey_or_bundle(
     // frequency-separation check (>= ~75 Hz for FT8) lives inside
     // `encode_and_modulate_multi_tx`; the caller runs it and falls back to the
     // single-item `Replace` mutation above on a collision.
+    let mut replace_is_identity_conflict = false;
     if max_concurrent_qsos > 1 {
         // PAN-73 round 5 (Codex): REPLACE the matching in-flight item, don't
         // append alongside it. A same-QSO, different-frequency candidate
@@ -4305,6 +4325,7 @@ async fn supersede_and_rekey_or_bundle(
                  in-flight transmission with just the new request instead",
                 in_flight_remote_client_key_id, new_remote_client_key_id
             );
+            replace_is_identity_conflict = true;
         } else if qso_count <= max_concurrent_qsos as usize
             && candidate_items.len() <= MAX_RETAINED_TX_STREAMS
         {
@@ -4349,6 +4370,7 @@ async fn supersede_and_rekey_or_bundle(
         origin: new_origin,
         remote_client_key_id: new_remote_client_key_id,
         qso_id: new_qso_id,
+        identity_conflict: replace_is_identity_conflict,
     }
 }
 
@@ -4538,24 +4560,77 @@ async fn supersede_multi_reenqueue(
             }
         }
         SupersedeOutcome::Replace {
-            // Round 6: no longer re-enqueued (see below), so the superseding
-            // request's own origin has nothing left to gate.
-            origin: _new_origin,
-            remote_client_key_id: _new_remote_client_key_id,
+            origin: new_origin,
+            remote_client_key_id: new_remote_client_key_id,
             qso_id: new_qso_id,
+            identity_conflict,
         } => {
+            // Codex P1, PR #362 round 18: an `identity_conflict` Replace
+            // means control legitimately transferred (the in-flight bundle
+            // and the new request are both Remote but bound to DIFFERENT
+            // clients) — NOT over-capacity. Re-enqueuing the stale in-flight
+            // bundle here is actively harmful in that case: it will only be
+            // rejected later against the NEW client's arm anyway, and
+            // meanwhile the fresher, currently-authorized new request (e.g.
+            // a closing frame from the client that now legitimately holds
+            // the arm) would be the one silently discarded. Treat this
+            // exactly like the single-TX arm's ordinary Replace: abandon the
+            // in-flight side and key only the new request. This can't
+            // recreate the round-6 livelock (below) — nothing gets
+            // re-enqueued for the worker's next dequeue to immediately
+            // collide with.
+            if identity_conflict {
+                for item in in_flight_items {
+                    let complete_msg = ComponentMessage::new(
+                        ComponentId::Ft8Transmitter,
+                        ComponentId::Autonomous,
+                        MessageType::TransmitComplete {
+                            success: false,
+                            message_text: item.message_text.clone(),
+                            duration_ms: 0,
+                            qso_id: item.qso_id.clone(),
+                        },
+                        Instant::now(),
+                    );
+                    if let Err(e) = message_bus.send_message(complete_msg).await {
+                        warn!("Failed to send TransmitComplete: {}", e);
+                    }
+                }
+                let reenqueue = ComponentMessage::new(
+                    ComponentId::Ft8Transmitter,
+                    ComponentId::Ft8Transmitter,
+                    MessageType::TransmitRequest {
+                        message_text: scratch_text,
+                        frequency_offset: scratch_freq,
+                        qso_id: new_qso_id,
+                        tx_parity: None,
+                        origin: new_origin,
+                        remote_client_key_id: new_remote_client_key_id,
+                    },
+                    Instant::now(),
+                );
+                if let Err(e) = message_bus.send_message(reenqueue).await {
+                    warn!(
+                        "supersede (multi-TX): failed to re-enqueue the identity-conflict \
+                         replacement request: {}",
+                        e
+                    );
+                }
+                return;
+            }
+
             // PR #348 review round 2 (Codex P2): the multi-TX arm's in-flight
             // item is ALWAYS a real bundle (`in_flight_items.len() >= 2` —
             // this function is only reached from the multi-TX arm), so a
-            // `Replace` outcome here can only mean the candidate bundle
-            // would have exceeded `max_concurrent_qsos` (a frequency
-            // collision instead produces a `Bundle` whose caller falls back
-            // to a single-item re-enqueue in the arm above, never `Replace`).
-            // Silently dropping every previously-admitted bundle item to
-            // make room for one new request would burn all of their recorded
-            // attempts for nothing. Preserve the in-flight bundle unchanged
-            // (re-encoding happens fresh at pickup time, so there's no
-            // staleness concern).
+            // non-identity-conflict `Replace` outcome here can only mean the
+            // candidate bundle would have exceeded `max_concurrent_qsos` (a
+            // frequency collision instead produces a `Bundle` whose caller
+            // falls back to a single-item re-enqueue in the arm above, never
+            // `Replace`). Silently dropping every previously-admitted bundle
+            // item to make room for one new request would burn all of their
+            // recorded attempts for nothing. Preserve the in-flight bundle
+            // unchanged (re-encoding happens fresh at pickup time, so
+            // there's no staleness concern).
             if !in_flight_items.is_empty() {
                 let preserve = ComponentMessage::new(
                     ComponentId::Ft8Transmitter,
@@ -6163,6 +6238,7 @@ impl super::ApplicationCoordinator {
                                                         remote_client_key_id:
                                                             new_remote_client_key_id,
                                                         qso_id: new_qso_id,
+                                                        identity_conflict: _,
                                                     } => {
                                                         // Viable single-item re-key (Task 6): carry
                                                         // the recomputed schedule into the retry,
@@ -6683,6 +6759,7 @@ impl super::ApplicationCoordinator {
                                                         remote_client_key_id:
                                                             new_remote_client_key_id,
                                                         qso_id: new_qso_id,
+                                                        identity_conflict: _,
                                                     } => {
                                                         // Re-point `origin` at the superseding
                                                         // request's origin so the retry's Step 4b-arm
@@ -10333,6 +10410,7 @@ mod supersede_rekey_tests {
                 origin,
                 remote_client_key_id,
                 qso_id,
+                identity_conflict,
             } => {
                 assert_eq!(origin, crate::message_bus::TxOrigin::Remote);
                 assert_eq!(
@@ -10342,6 +10420,12 @@ mod supersede_rekey_tests {
                      abandoned in-flight stream's"
                 );
                 assert_eq!(qso_id.as_deref(), Some("qso-2"));
+                assert!(
+                    identity_conflict,
+                    "a mismatched-remote-client Replace must be flagged as an \
+                     identity conflict, not treated as an ordinary over-capacity \
+                     fallback"
+                );
             }
             other => panic!(
                 "mismatched-client in-flight/new streams must never fold into a \
@@ -10535,11 +10619,20 @@ mod supersede_rekey_tests {
         .await;
 
         match outcome {
-            super::SupersedeOutcome::Replace { qso_id, .. } => {
+            super::SupersedeOutcome::Replace {
+                qso_id,
+                identity_conflict,
+                ..
+            } => {
                 assert_eq!(
                     qso_id.as_deref(),
                     Some("qso-third"),
                     "the Replace must carry the NEW request's own qso_id"
+                );
+                assert!(
+                    !identity_conflict,
+                    "an over-capacity Replace (same client on both sides) must not be \
+                     flagged as an identity conflict"
                 );
             }
             other => panic!(
@@ -10723,6 +10816,7 @@ mod supersede_rekey_tests {
                     origin,
                     qso_id,
                     remote_client_key_id: _,
+                    identity_conflict: _,
                 } => {
                     assert_eq!(
                         origin, new_origin,
@@ -11169,6 +11263,141 @@ mod supersede_rekey_tests {
             }
             other => panic!("expected TransmitComplete, got {other:?}"),
         }
+    }
+
+    /// Codex P1, PR #362 round 18: an in-flight bundle bound to one remote
+    /// client and a superseding request bound to a DIFFERENT remote client
+    /// (a legitimate control transfer, not over-capacity) must NOT be
+    /// treated like the over-cap case above — the new request must be
+    /// enqueued (not dropped), and the stale in-flight bundle must NOT be
+    /// re-enqueued (it would only be rejected later against the new arm
+    /// anyway, and re-enqueuing it would recreate the round-6 livelock).
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_reenqueue_keys_the_new_request_on_identity_conflict_instead_of_preserving_the_stale_bundle(
+    ) {
+        let bus = MessageBus::new(16).unwrap();
+        let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let (_tx_tx, tx_rx) = bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        let (_autonomous_tx, autonomous_rx) =
+            bus.create_channel(ComponentId::Autonomous).await.unwrap();
+
+        let mut encoder = super::Ft8Encoder::new();
+        let tx_params = pancetta_ft8::ProtocolParams::from_protocol(pancetta_ft8::Protocol::Ft8);
+
+        // A 2-item bundle in flight, bound to client-a.
+        let in_flight = [
+            crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH R-15".to_string(),
+                frequency_offset: 1000.0,
+                qso_id: Some("qso-1".to_string()),
+            },
+            crate::message_bus::TransmitRequestItem {
+                message_text: "OTHER W5AU R-08".to_string(),
+                frequency_offset: 1400.0,
+                qso_id: Some("qso-other".to_string()),
+            },
+        ];
+
+        // Control has transferred to client-b, whose request supersedes.
+        let now = chrono::Utc::now();
+        let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
+            pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
+            pancetta_core::slot::SLOT_NS,
+        );
+        let superseding = MessageType::TransmitRequest {
+            message_text: "K5ARH KA1ABC 73".to_string(),
+            frequency_offset: 1500.0,
+            qso_id: Some("qso-1".to_string()),
+            tx_parity: Some(cur_parity),
+            origin: crate::message_bus::TxOrigin::Remote,
+            remote_client_key_id: Some("client-b".to_string()),
+        };
+
+        let ptt_active = Arc::new(AtomicBool::new(true));
+        let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+
+        super::supersede_multi_reenqueue(
+            superseding,
+            &in_flight,
+            crate::message_bus::TxOrigin::Remote,
+            Some("client-a".to_string()),
+            Some(cur_parity),
+            &mut encoder,
+            pancetta_ft8::Protocol::Ft8,
+            &tx_params,
+            &bus,
+            &ptt_active,
+            &last_ptt_on_ms,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+            pancetta_config::station::TxSelfParity::Auto,
+            now,
+            2,
+        )
+        .await;
+
+        // The stale client-a bundle must NOT be re-enqueued as a
+        // MultiTransmitRequest — it's abandoned, not preserved.
+        // The NEW client-b request must be the only thing sent to the
+        // transmitter channel, as a single TransmitRequest carrying its OWN
+        // identity.
+        let reenqueued = tx_rx
+            .try_recv()
+            .expect("the new request must be enqueued, not silently dropped");
+        match reenqueued.message_type {
+            MessageType::TransmitRequest {
+                message_text,
+                qso_id,
+                origin,
+                remote_client_key_id,
+                ..
+            } => {
+                assert_eq!(message_text, "K5ARH KA1ABC 73");
+                assert_eq!(qso_id.as_deref(), Some("qso-1"));
+                assert_eq!(origin, crate::message_bus::TxOrigin::Remote);
+                assert_eq!(remote_client_key_id.as_deref(), Some("client-b"));
+            }
+            other => panic!("expected the new request as a single TransmitRequest, got {other:?}"),
+        }
+        assert!(
+            tx_rx.try_recv().is_err(),
+            "the stale in-flight bundle must not also be re-enqueued"
+        );
+
+        // Both abandoned in-flight items are reported as failed, exactly
+        // like the existing single-item-abandon precedent (PAN-38 round 5)
+        // extended to every item in the bundle.
+        let mut reported: Vec<(bool, String, Option<String>)> = Vec::new();
+        while let Ok(msg) = autonomous_rx.try_recv() {
+            if let MessageType::TransmitComplete {
+                success,
+                message_text,
+                qso_id,
+                ..
+            } = msg.message_type
+            {
+                reported.push((success, message_text, qso_id));
+            }
+        }
+        assert_eq!(
+            reported.len(),
+            2,
+            "both abandoned in-flight items must get a failed TransmitComplete"
+        );
+        assert!(reported.iter().all(|(success, ..)| !success));
+        assert!(reported
+            .iter()
+            .any(|(_, text, qso)| text == "KA1ABC K5ARH R-15" && qso.as_deref() == Some("qso-1")));
+        assert!(
+            reported
+                .iter()
+                .any(|(_, text, qso)| text == "OTHER W5AU R-08"
+                    && qso.as_deref() == Some("qso-other"))
+        );
     }
 
     /// PR #348 review round 4 (Codex P1): a raised effective cap (e.g. Fox
