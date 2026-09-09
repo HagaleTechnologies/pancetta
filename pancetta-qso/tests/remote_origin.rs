@@ -103,6 +103,67 @@ async fn normal_qso_emits_local_message_to_send_regression() {
     );
 }
 
+/// Round-3 review (Codex P2): when client A creates a manual QSO and client
+/// B later takes control and repeats the same accepted action (here:
+/// `respond_to_cq_with` for the same callsign/band — the idempotent
+/// keep-call path), the EXISTING QSO's bound identity must rebind to B, not
+/// stay latched to A. Before this fix `resend_last_tx` re-emitted the QSO's
+/// `MessageToSend` with A's stale `remote_client_key_id`, so B's own valid
+/// arm would reject every resend and B could never recover control of an
+/// in-progress QSO short of it terminating on its own.
+#[tokio::test]
+async fn repeated_manual_call_rebinds_the_existing_qso_to_the_new_controller() {
+    let manager = QsoManager::new(config());
+    let mut rx = manager.subscribe();
+
+    let id_a = manager
+        .respond_to_cq_with(
+            "K9XYZ".to_string(),
+            1500.0,
+            Some(SlotParity::Even),
+            CallInitiation::Manual,
+            None,
+            true, // remote_origin
+            Some("client-a".to_string()),
+        )
+        .await
+        .expect("respond_to_cq_with (client-a)");
+
+    // Drain client-a's opening MessageToSend.
+    let (_origin, client_key_id) = first_message_to_send_remote_origin_and_client(&mut rx).await;
+    assert_eq!(client_key_id.as_deref(), Some("client-a"));
+
+    // Client B takes control and repeats the same accepted action for the
+    // SAME callsign/band — this must resolve to the SAME QSO (never spawn a
+    // sibling) via the idempotent keep-call path, and that resend must now
+    // carry B's identity.
+    let id_b = manager
+        .respond_to_cq_with(
+            "K9XYZ".to_string(),
+            1500.0,
+            Some(SlotParity::Even),
+            CallInitiation::Manual,
+            None,
+            true,
+            Some("client-b".to_string()),
+        )
+        .await
+        .expect("respond_to_cq_with (client-b)");
+    assert_eq!(
+        id_a, id_b,
+        "a repeated manual call for the same callsign/band must resolve to \
+         the same QSO, never spawn a sibling"
+    );
+
+    let (_origin, client_key_id) = first_message_to_send_remote_origin_and_client(&mut rx).await;
+    assert_eq!(
+        client_key_id.as_deref(),
+        Some("client-b"),
+        "the existing QSO must rebind to the new controller's identity \
+         before resending, not stay latched to whoever created it"
+    );
+}
+
 #[tokio::test]
 async fn remote_origin_persists_across_the_reply_ladder() {
     // The flag is latched in QsoMetadata at open, so EVERY subsequent

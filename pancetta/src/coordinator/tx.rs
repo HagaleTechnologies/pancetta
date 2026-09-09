@@ -533,7 +533,20 @@ pub enum SleepOutcome {
     /// PAN-92: a Remote in-flight frame's arm gate stopped permitting TX
     /// mid-transmission (explicit disarm, dead-man/heartbeat loss, TTL
     /// expiry, or local-kill) — the caller must stop keying, never re-key.
-    AbortedByDisarm,
+    ///
+    /// The contained `Vec<ComponentMessage>` (round-3 review, Codex P2) is
+    /// whatever this wait had already siphoned before the disarm was
+    /// detected — an unrelated local/autonomous `TransmitRequest` or a TUI
+    /// `TuneRequest`, say. It is NOT drained from `tx_rx` further (that
+    /// would cost an extra channel operation on the safety-critical path)
+    /// and it is NOT re-enqueued by this function — the caller MUST
+    /// re-enqueue it itself via [`reenqueue_pending`], but only AFTER
+    /// sending PTT off and disarming its `PttGuard`, mirroring
+    /// `Superseded`'s ordering rule. Silently dropping it (this function's
+    /// round-2 behavior) could lose a local QSO frame or operator command
+    /// for no reason other than an unrelated remote transmission being
+    /// disarmed.
+    AbortedByDisarm(Vec<ComponentMessage>),
     /// A qualifying request arrived; abort_current_tx was set by this
     /// function itself. Caller should attempt to re-key with the contained
     /// message.
@@ -676,7 +689,7 @@ async fn interruptible_sleep_or_supersede(
                     chrono::Utc::now().timestamp_millis(),
                     client_key_id,
                 ) {
-                    return Some(SleepOutcome::AbortedByDisarm);
+                    return Some(SleepOutcome::AbortedByDisarm(std::mem::take(siphoned)));
                 }
             }
             let Ok(message) = tx_rx.try_recv() else {
@@ -742,11 +755,10 @@ async fn interruptible_sleep_or_supersede(
     // a detected disarm, before even the remainder-drain below, let alone
     // the reenqueue-await loop further down — the caller's very first
     // action is sending PTT off, and nothing in this function may delay
-    // that. Any already-siphoned message is deliberately dropped rather
-    // than reenqueued here: this is a rare, abnormal event, and safety
-    // (fastest possible PTT release) outweighs preserving a few queued
-    // messages that likely no longer matter once the station is disarmed.
-    if matches!(outcome, SleepOutcome::AbortedByDisarm) {
+    // that. Round-3 review (Codex P2): the already-siphoned messages
+    // travel WITH this outcome (see the variant's doc) rather than being
+    // dropped — the caller re-enqueues them itself once PTT is safely off.
+    if matches!(outcome, SleepOutcome::AbortedByDisarm(_)) {
         return outcome;
     }
 
@@ -892,6 +904,91 @@ mod interruptible_sleep_tests {
         assert!(matches!(outcome, super::SleepOutcome::Completed));
     }
 
+    /// Round-3 review (Codex P2): a message already siphoned into this
+    /// wait's local queue (an unrelated local `TuneRequest`, here) before a
+    /// later-arriving disarm is detected must travel WITH the
+    /// `AbortedByDisarm` outcome, not be silently dropped. The disarm's own
+    /// caller-side reenqueue-after-PTT-off is exercised in
+    /// `pancetta/tests/coord_sim.rs`'s end-to-end tests; this pins the
+    /// lower-level contract this function itself is now responsible for.
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_sleep_carries_siphoned_messages_on_abort_by_disarm() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let bus = crate::message_bus::MessageBus::new(16).unwrap();
+        let pivoted_once = std::collections::HashMap::new();
+
+        // An unrelated, non-supersede-candidate message (a TUI TuneRequest)
+        // is already queued BEFORE the wait starts — it will be siphoned on
+        // the very first poll tick, before the disarm below has a chance to
+        // fire.
+        tx.send(crate::message_bus::ComponentMessage::new(
+            crate::message_bus::ComponentId::Tui,
+            crate::message_bus::ComponentId::Ft8Transmitter,
+            MessageType::TuneRequest {
+                duration_secs: 5,
+                tone_offset_hz: 1000.0,
+            },
+            Instant::now(),
+        ))
+        .unwrap();
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut st = pancetta_agent::arm::ArmState::new();
+        st.arm(
+            pancetta_agent::arm::VerifiedArmGrant {
+                operator_callsign: "K5ARH".to_string(),
+                ttl_ms: 120_000,
+                scope_tx: true,
+                jti: "disarm-preserves-siphoned-jti".to_string(),
+                client_key_id: "client-a".to_string(),
+            },
+            now_ms,
+        );
+        st.set_local_consent(true, now_ms);
+        let arm = Arc::new(std::sync::Mutex::new(st));
+
+        let arm_clone = arm.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            arm_clone
+                .lock()
+                .unwrap()
+                .disarm(chrono::Utc::now().timestamp_millis());
+        });
+
+        let outcome = super::interruptible_sleep_or_supersede(
+            Duration::from_secs(5),
+            &shutdown,
+            &abort,
+            &rx,
+            &bus,
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "in flight text".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
+            &pivoted_once,
+            Some((&arm, Some("client-a"))),
+        )
+        .await;
+        match outcome {
+            super::SleepOutcome::AbortedByDisarm(pending) => {
+                assert_eq!(
+                    pending.len(),
+                    1,
+                    "the already-siphoned TuneRequest must travel with the outcome, not be dropped"
+                );
+                assert!(matches!(
+                    pending[0].message_type,
+                    MessageType::TuneRequest { .. }
+                ));
+            }
+            other => panic!("expected AbortedByDisarm, got {other:?}"),
+        }
+    }
+
     /// PAN-92: an already-keyed Remote transmission must be interrupted the
     /// moment the arm stops permitting it (here: an explicit disarm fired by
     /// a concurrent task partway through the sleep), not just have future
@@ -945,7 +1042,7 @@ mod interruptible_sleep_tests {
         )
         .await;
         assert!(
-            matches!(outcome, super::SleepOutcome::AbortedByDisarm),
+            matches!(outcome, super::SleepOutcome::AbortedByDisarm(_)),
             "expected AbortedByDisarm, got {outcome:?}"
         );
         // Should wake within the ~50ms poll granularity of the disarm (fired
@@ -2601,6 +2698,62 @@ pub fn remote_tx_permitted_for(
     }
 }
 
+/// One-time snapshot of the remote-TX arm's permission state, taken under a
+/// single lock acquisition, so a BATCH of entries (e.g. a coalesced
+/// backlog) can be evaluated against one consistent view instead of each
+/// entry re-locking `ArmState` separately (round-3 review, Codex P1).
+/// Per-entry re-locking left a TOCTOU window: if control transfers A→B→A
+/// between two entries' individual lock acquisitions within the same
+/// batch, both entries can pass their own check yet the batch's later
+/// single-identity fold only ever records one of them, silently
+/// authorizing the other under a mismatched identity.
+struct ArmSnapshot {
+    tx_permitted: bool,
+    armed_client_key_id: Option<String>,
+}
+
+impl ArmSnapshot {
+    fn take(
+        arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
+        now_ms: i64,
+    ) -> Self {
+        match arm.lock() {
+            Ok(state) => Self {
+                tx_permitted: state.tx_permitted(now_ms),
+                armed_client_key_id: state.armed_client_key_id().map(str::to_string),
+            },
+            Err(_) => Self {
+                tx_permitted: false,
+                armed_client_key_id: None,
+            },
+        }
+    }
+
+    /// Mirrors [`remote_tx_permitted_for`]'s logic against this frozen
+    /// snapshot instead of a fresh lock.
+    fn permits(&self, remote_client_key_id: Option<&str>) -> bool {
+        if !self.tx_permitted {
+            return false;
+        }
+        match remote_client_key_id {
+            None => true,
+            Some(id) => self.armed_client_key_id.as_deref() == Some(id),
+        }
+    }
+
+    /// Round-3 review (Codex P2): true only when the frame would otherwise
+    /// be permitted (arm is up, heartbeat/TTL/consent/kill all clear) but
+    /// is bound to a DIFFERENT client than the one currently armed — as
+    /// opposed to every other denial cause (nobody armed, heartbeat lost,
+    /// TTL expired, local consent/kill), which is not an identity problem
+    /// at all and must not be reported as one.
+    fn is_identity_mismatch(&self, remote_client_key_id: Option<&str>) -> bool {
+        self.tx_permitted
+            && remote_client_key_id
+                .is_some_and(|id| self.armed_client_key_id.as_deref() != Some(id))
+    }
+}
+
 /// Attribute a `TxDenied` audit record's `operator_callsign`, never to the
 /// CURRENTLY-armed operator when the denied frame is bound to a DIFFERENT
 /// client (PAN-91 identity mismatch) — that would misattribute an
@@ -3313,10 +3466,14 @@ async fn coalesce_backlog_into(
     // would silently authorize A's frame too. Filtering per-entry here —
     // using each entry's OWN bound identity, exactly like the TX worker's
     // real per-frame gate — closes that gap.
+    // Round-3 review (Codex P1): ONE arm snapshot for the WHOLE partition,
+    // not a fresh lock per entry — see [`ArmSnapshot`]'s doc for the TOCTOU
+    // this closes.
     let now_ms = chrono::Utc::now().timestamp_millis();
+    let arm_snapshot = ArmSnapshot::take(remote_tx_arm, now_ms);
     let (admitted, identity_denied): (Vec<_>, Vec<_>) = drained.into_iter().partition(|e| {
         e.origin != crate::message_bus::TxOrigin::Remote
-            || remote_tx_permitted_for(remote_tx_arm, now_ms, e.remote_client_key_id.as_deref())
+            || arm_snapshot.permits(e.remote_client_key_id.as_deref())
     });
     // (round 2, Codex P2): route through the SAME diagnostic + durable
     // audit + client-visible relay every other arm-gate rejection uses
@@ -3324,10 +3481,24 @@ async fn coalesce_backlog_into(
     // attempted cross-client transmission must stay visible in the
     // security audit trail exactly like a pickup-time or mid-flight one.
     for entry in &identity_denied {
-        let denial_reason = format!(
-            "bound to a different client than the one currently armed: '{}' at {:.0} Hz",
-            entry.message_text, entry.frequency_offset
-        );
+        // Round-3 review (Codex P2): only say "bound to a different
+        // client" when that's actually why this entry was denied — every
+        // other gate failure (nobody armed, heartbeat lost, TTL expired,
+        // local consent/kill) is a real safety event but not an identity
+        // problem, and reporting it as one obscures what actually happened
+        // in a durable security audit record.
+        let denial_reason =
+            if arm_snapshot.is_identity_mismatch(entry.remote_client_key_id.as_deref()) {
+                format!(
+                    "bound to a different client than the one currently armed: '{}' at {:.0} Hz",
+                    entry.message_text, entry.frequency_offset
+                )
+            } else {
+                format!(
+                    "remote TX not currently permitted: '{}' at {:.0} Hz",
+                    entry.message_text, entry.frequency_offset
+                )
+            };
         emit_diagnostic(
             message_bus,
             "agent.tx",
@@ -5103,11 +5274,26 @@ impl super::ApplicationCoordinator {
                                                 remote_client_key_id.as_deref(),
                                             )
                                         {
-                                            info!(
-                                                target: "agent.tx",
-                                                "dropping remote TX at key-time — arm went stale during slot wait: '{}' (qso: {:?})",
-                                                message_text, qso_id
+                                            // Round-3 review (Codex P2): route through the
+                                            // shared denial-signaling helper — a log line +
+                                            // TransmitComplete alone left this key-time
+                                            // cross-client rejection with no TxDenied audit
+                                            // record, diagnostic, or client relay, unlike
+                                            // every other arm-gate denial.
+                                            let denial_reason = format!(
+                                                "arm went stale during slot wait: '{message_text}' at {frequency_offset:.0} Hz"
                                             );
+                                            emit_disarm_interrupt_signals(
+                                                &message_bus,
+                                                &audit_log,
+                                                &display_feed_enabled,
+                                                &remote_tx_arm,
+                                                remote_client_key_id.as_deref(),
+                                                "denied",
+                                                denial_reason,
+                                                qso_id.as_deref(),
+                                            )
+                                            .await;
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
                                             let complete_msg = ComponentMessage::new(
@@ -5343,16 +5529,43 @@ impl super::ApplicationCoordinator {
                                             }
                                         }
 
+                                        // --- Step 5: Assert PTT ---
+                                        let mut ptt_guard = PttGuard::new(
+                                            message_bus.clone(),
+                                            ptt_active.clone(),
+                                            &last_ptt_on_ms,
+                                        );
+                                        // TX badge on; guard drop clears it on every
+                                        // exit path (complete / abort / shutdown).
+                                        let _tx_status_guard =
+                                            TxStatusGuard::new(message_bus.clone());
+                                        send_tx_status(&message_bus, true).await;
+                                        // NOW-SENDING: this message is keyed and on the air.
+                                        send_tx_queue_status(
+                                            &message_bus,
+                                            Some(crate::message_bus::TxItem {
+                                                text: message_text.clone(),
+                                                freq_hz: frequency_offset,
+                                                qso_id: qso_id.clone(),
+                                                deferred: false,
+                                            }),
+                                            Vec::new(),
+                                        )
+                                        .await;
+
                                         // --- Step 4d-arm: last-instant pre-PTT arm recheck
-                                        // (round-2 review, Codex P1) --- Step 4b-arm above
-                                        // already re-checked the arm after the slot wait, but
-                                        // the hard-mute check, the Step 3 audio-buffer build,
-                                        // and the Step 4c late-pivot re-encode all await in
-                                        // between — enough time for A's client to disarm (or
-                                        // for B to arm) in that gap and leave Step 4b-arm's
-                                        // now-stale success keying PTT anyway. This is the
-                                        // genuine last instant: nothing but the PTT-on send
-                                        // itself follows.
+                                        // (round-3 review, Codex P1) — round-2's placement
+                                        // here (before the two awaits above) still left the
+                                        // `send_tx_status`/`send_tx_queue_status` awaits
+                                        // between the check and the actual PTT-on send below,
+                                        // which is exactly the gap this check exists to close.
+                                        // This is the genuine last instant: nothing but the
+                                        // PTT-on send itself follows. PTT hardware was never
+                                        // asserted on this path — `ptt_guard` only flipped the
+                                        // in-process `ptt_active` flag on construction — so
+                                        // denying here needs no PTT-off send, just unwinding
+                                        // that flag and the TX-badge/queue status the two
+                                        // awaits above just (prematurely) announced.
                                         if origin == crate::message_bus::TxOrigin::Remote
                                             && !remote_tx_permitted_for(
                                                 &remote_tx_arm,
@@ -5360,6 +5573,8 @@ impl super::ApplicationCoordinator {
                                                 remote_client_key_id.as_deref(),
                                             )
                                         {
+                                            ptt_active.store(false, Ordering::Release);
+                                            ptt_guard.disarm();
                                             let denial_reason = format!(
                                                 "arm went stale in the pre-PTT gap: '{message_text}' at {frequency_offset:.0} Hz"
                                             );
@@ -5391,29 +5606,6 @@ impl super::ApplicationCoordinator {
                                             continue 'worker;
                                         }
 
-                                        // --- Step 5: Assert PTT ---
-                                        let mut ptt_guard = PttGuard::new(
-                                            message_bus.clone(),
-                                            ptt_active.clone(),
-                                            &last_ptt_on_ms,
-                                        );
-                                        // TX badge on; guard drop clears it on every
-                                        // exit path (complete / abort / shutdown).
-                                        let _tx_status_guard =
-                                            TxStatusGuard::new(message_bus.clone());
-                                        send_tx_status(&message_bus, true).await;
-                                        // NOW-SENDING: this message is keyed and on the air.
-                                        send_tx_queue_status(
-                                            &message_bus,
-                                            Some(crate::message_bus::TxItem {
-                                                text: message_text.clone(),
-                                                freq_hz: frequency_offset,
-                                                qso_id: qso_id.clone(),
-                                                deferred: false,
-                                            }),
-                                            Vec::new(),
-                                        )
-                                        .await;
                                         let ptt_msg = ComponentMessage::new(
                                             ComponentId::Ft8Transmitter,
                                             ComponentId::Hamlib,
@@ -5502,7 +5694,7 @@ impl super::ApplicationCoordinator {
                                                 }
                                                 continue 'worker;
                                             }
-                                            SleepOutcome::AbortedByDisarm => {
+                                            SleepOutcome::AbortedByDisarm(pending) => {
                                                 warn!(
                                                     "TX aborted between PTT and slot: remote arm no longer permits it"
                                                 );
@@ -5530,6 +5722,7 @@ impl super::ApplicationCoordinator {
                                                 }
                                                 ptt_active.store(false, Ordering::Release);
                                                 ptt_guard.disarm();
+                                                reenqueue_pending(&message_bus, pending).await;
                                                 emit_disarm_interrupt_signals(
                                                     &message_bus,
                                                     &audit_log,
@@ -5906,7 +6099,7 @@ impl super::ApplicationCoordinator {
                                                 }
                                                 continue 'worker;
                                             }
-                                            SleepOutcome::AbortedByDisarm => {
+                                            SleepOutcome::AbortedByDisarm(pending) => {
                                                 warn!(
                                                     "TX aborted during playback: remote arm no longer permits it"
                                                 );
@@ -5934,6 +6127,7 @@ impl super::ApplicationCoordinator {
                                                 }
                                                 ptt_active.store(false, Ordering::Release);
                                                 ptt_guard.disarm();
+                                                reenqueue_pending(&message_bus, pending).await;
                                                 emit_disarm_interrupt_signals(
                                                     &message_bus,
                                                     &audit_log,
@@ -7311,11 +7505,26 @@ impl super::ApplicationCoordinator {
                                             remote_client_key_id.as_deref(),
                                         )
                                     {
-                                        info!(
-                                            target: "agent.tx",
-                                            "dropping remote multi-TX at key-time — arm went stale during slot wait: {} item(s)",
-                                            items.len()
-                                        );
+                                        // Round-3 review (Codex P2): route through the
+                                        // shared denial-signaling helper — mirrors the
+                                        // single-TX fix above.
+                                        for item in &items {
+                                            let denial_reason = format!(
+                                                "arm went stale during slot wait: '{}' at {:.0} Hz",
+                                                item.message_text, item.frequency_offset
+                                            );
+                                            emit_disarm_interrupt_signals(
+                                                &message_bus,
+                                                &audit_log,
+                                                &display_feed_enabled,
+                                                &remote_tx_arm,
+                                                remote_client_key_id.as_deref(),
+                                                "denied",
+                                                denial_reason,
+                                                item.qso_id.as_deref(),
+                                            )
+                                            .await;
+                                        }
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
                                             let complete_msg = ComponentMessage::new(
@@ -7452,16 +7661,51 @@ impl super::ApplicationCoordinator {
                                         (audio_out.len() as f64 / sample_rate as f64 * 1000.0)
                                             as u64;
 
+                                    // --- Step 5: Assert PTT ---
+                                    let mut ptt_guard = PttGuard::new(
+                                        message_bus.clone(),
+                                        ptt_active.clone(),
+                                        &last_ptt_on_ms,
+                                    );
+                                    // TX badge on; guard drop clears it on every
+                                    // exit path (complete / abort / shutdown).
+                                    let _tx_status_guard = TxStatusGuard::new(message_bus.clone());
+                                    send_tx_status(&message_bus, true).await;
+                                    // NOW-SENDING: the whole bundle is keyed and on the
+                                    // air CONCURRENTLY in this one slot. Show the first
+                                    // item as the headline "now" and the rest as
+                                    // non-deferred companions — the strip renders these as
+                                    // concurrent ("NOW ×N"), not as future-slot queue.
+                                    {
+                                        let mut bundle: Vec<crate::message_bus::TxItem> = items
+                                            .iter()
+                                            .map(|it| crate::message_bus::TxItem {
+                                                text: it.message_text.clone(),
+                                                freq_hz: it.frequency_offset,
+                                                qso_id: it.qso_id.clone(),
+                                                deferred: false,
+                                            })
+                                            .collect();
+                                        let head = if bundle.is_empty() {
+                                            None
+                                        } else {
+                                            Some(bundle.remove(0))
+                                        };
+                                        send_tx_queue_status(&message_bus, head, bundle).await;
+                                    }
+
                                     // --- Step 4d-arm: last-instant pre-PTT arm recheck
-                                    // (round-2 review, Codex P1) — mirrors the single-TX
-                                    // Step 4d-arm. Step 4b-arm above already re-checked
-                                    // the arm after the slot wait, but the hard-mute
-                                    // check and the Step 3 audio-buffer build both await
-                                    // in between — enough time for A's client to disarm
-                                    // (or for B to arm) in that gap and leave Step
-                                    // 4b-arm's now-stale success keying PTT anyway. This
-                                    // is the genuine last instant: nothing but the
-                                    // PTT-on send itself follows.
+                                    // (round-3 review, Codex P1) — mirrors the single-TX
+                                    // Step 4d-arm; round-2's placement here (before the
+                                    // status-send awaits above) left exactly the gap this
+                                    // check exists to close. This is the genuine last
+                                    // instant: nothing but the PTT-on send itself follows.
+                                    // PTT hardware was never asserted on this path —
+                                    // `ptt_guard` only flipped the in-process `ptt_active`
+                                    // flag on construction — so denying here needs no
+                                    // PTT-off send, just unwinding that flag and the
+                                    // TX-badge/queue status the awaits above just
+                                    // (prematurely) announced.
                                     if origin == crate::message_bus::TxOrigin::Remote
                                         && !remote_tx_permitted_for(
                                             &remote_tx_arm,
@@ -7469,6 +7713,8 @@ impl super::ApplicationCoordinator {
                                             remote_client_key_id.as_deref(),
                                         )
                                     {
+                                        ptt_active.store(false, Ordering::Release);
+                                        ptt_guard.disarm();
                                         for item in &items {
                                             let denial_reason = format!(
                                                 "arm went stale in the pre-PTT gap: '{}' at {:.0} Hz",
@@ -7504,38 +7750,6 @@ impl super::ApplicationCoordinator {
                                         continue;
                                     }
 
-                                    // --- Step 5: Assert PTT ---
-                                    let mut ptt_guard = PttGuard::new(
-                                        message_bus.clone(),
-                                        ptt_active.clone(),
-                                        &last_ptt_on_ms,
-                                    );
-                                    // TX badge on; guard drop clears it on every
-                                    // exit path (complete / abort / shutdown).
-                                    let _tx_status_guard = TxStatusGuard::new(message_bus.clone());
-                                    send_tx_status(&message_bus, true).await;
-                                    // NOW-SENDING: the whole bundle is keyed and on the
-                                    // air CONCURRENTLY in this one slot. Show the first
-                                    // item as the headline "now" and the rest as
-                                    // non-deferred companions — the strip renders these as
-                                    // concurrent ("NOW ×N"), not as future-slot queue.
-                                    {
-                                        let mut bundle: Vec<crate::message_bus::TxItem> = items
-                                            .iter()
-                                            .map(|it| crate::message_bus::TxItem {
-                                                text: it.message_text.clone(),
-                                                freq_hz: it.frequency_offset,
-                                                qso_id: it.qso_id.clone(),
-                                                deferred: false,
-                                            })
-                                            .collect();
-                                        let head = if bundle.is_empty() {
-                                            None
-                                        } else {
-                                            Some(bundle.remove(0))
-                                        };
-                                        send_tx_queue_status(&message_bus, head, bundle).await;
-                                    }
                                     let ptt_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Hamlib,
@@ -7616,7 +7830,7 @@ impl super::ApplicationCoordinator {
                                             }
                                             continue;
                                         }
-                                        SleepOutcome::AbortedByDisarm => {
+                                        SleepOutcome::AbortedByDisarm(pending) => {
                                             warn!(
                                                 "Multi-TX aborted between PTT and slot: remote arm no longer permits it"
                                             );
@@ -7642,6 +7856,7 @@ impl super::ApplicationCoordinator {
                                             }
                                             ptt_active.store(false, Ordering::Release);
                                             ptt_guard.disarm();
+                                            reenqueue_pending(&message_bus, pending).await;
                                             emit_disarm_interrupt_signals(
                                                 &message_bus,
                                                 &audit_log,
@@ -7797,7 +8012,7 @@ impl super::ApplicationCoordinator {
                                             }
                                             continue;
                                         }
-                                        SleepOutcome::AbortedByDisarm => {
+                                        SleepOutcome::AbortedByDisarm(pending) => {
                                             warn!(
                                                 "Multi-TX aborted during playback: remote arm no longer permits it"
                                             );
@@ -7823,6 +8038,7 @@ impl super::ApplicationCoordinator {
                                             }
                                             ptt_active.store(false, Ordering::Release);
                                             ptt_guard.disarm();
+                                            reenqueue_pending(&message_bus, pending).await;
                                             emit_disarm_interrupt_signals(
                                                 &message_bus,
                                                 &audit_log,

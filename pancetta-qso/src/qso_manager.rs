@@ -2124,6 +2124,11 @@ impl QsoManager {
                     "Re-call of {} on {:.1} Hz — continuing existing QSO {} (idempotent keep-call, no new QSO)",
                     target_callsign, frequency, existing_id
                 );
+                // Round-3 review (Codex P2): rebind to whichever client's
+                // action was just accepted, BEFORE resending — see
+                // `rebind_remote_identity`'s doc.
+                self.rebind_remote_identity(existing_id, remote_origin, remote_client_key_id)
+                    .await;
                 // Re-emit the QSO's most-recent outbound as a keep-call. This
                 // is a benign no-op if it somehow has no prior Sent message.
                 let _ = self.resend_last_tx(existing_id).await;
@@ -2397,6 +2402,10 @@ impl QsoManager {
                          (ahead of its current stage)",
                         target, step, existing_id
                     );
+                    // Round-3 review (Codex P2): rebind before advancing —
+                    // see `rebind_remote_identity`'s doc.
+                    self.rebind_remote_identity(existing_id, remote_origin, remote_client_key_id)
+                        .await;
                     self.advance_existing_qso_to_step(
                         existing_id,
                         &target,
@@ -2414,6 +2423,10 @@ impl QsoManager {
                          current outbound (idempotent keep-call)",
                         target, step, existing_id
                     );
+                    // Round-3 review (Codex P2): rebind before resending —
+                    // see `rebind_remote_identity`'s doc.
+                    self.rebind_remote_identity(existing_id, remote_origin, remote_client_key_id)
+                        .await;
                     let _ = self.resend_last_tx(existing_id).await;
                     return Ok(existing_id);
                 }
@@ -2448,6 +2461,10 @@ impl QsoManager {
                      grace window, re-sending existing QSO {}'s last frame",
                     target, step, existing_id
                 );
+                // Round-3 review (Codex P2): rebind before resending — see
+                // `rebind_remote_identity`'s doc.
+                self.rebind_remote_identity(existing_id, remote_origin, remote_client_key_id)
+                    .await;
                 let _ = self.resend_last_tx(existing_id).await;
                 return Ok(existing_id);
             }
@@ -3186,6 +3203,38 @@ impl QsoManager {
             remote_client_key_id,
         })
         .await;
+    }
+
+    /// Rebind an existing QSO's remote-origin identity to whoever's action
+    /// was just accepted for it (round-3 review, Codex P2).
+    ///
+    /// `respond_to_cq_with`/`respond_to_caller`'s idempotent-keep-call and
+    /// advance-existing-QSO branches resend or advance an ALREADY-EXISTING
+    /// QSO object rather than creating a new one — but until this fix they
+    /// left that QSO's `metadata.remote_client_key_id` bound to whichever
+    /// client originally created it. If client A created the QSO and client
+    /// B later takes control (arms) and repeats the same accepted action
+    /// (e.g. `callStation` for the same callsign/band), the resend/advance
+    /// still carries A's stale identity, so B's own valid arm rejects it —
+    /// every repeated action from the new controller keeps resolving to the
+    /// same still-A-bound QSO until it terminates. `send_message` (used by
+    /// both `resend_last_tx` and `advance_existing_qso_to_step`) reads
+    /// `metadata.remote_client_key_id`/`remote_origin` fresh at call time,
+    /// so rebinding here before either of those runs is sufficient — no
+    /// change needed to how the actual `MessageToSend` is emitted.
+    ///
+    /// A no-op if the QSO no longer exists (defensive; the caller always
+    /// just looked it up).
+    async fn rebind_remote_identity(
+        &self,
+        qso_id: QsoId,
+        remote_origin: bool,
+        remote_client_key_id: Option<String>,
+    ) {
+        if let Some(progress) = self.qsos.write().await.get_mut(&qso_id) {
+            progress.metadata.remote_origin = remote_origin;
+            progress.metadata.remote_client_key_id = remote_client_key_id;
+        }
     }
 
     /// Re-send the most recent outbound message for a QSO.
@@ -6642,32 +6691,27 @@ impl QsoManager {
                     continue;
                 }
 
-                progress.metadata.call_count += 1;
-                progress.metadata.last_call_at = Some(now);
-
-                // PAN-72: this real per-slot re-send IS the silence signal —
-                // the DX did not advance the QSO since the last slot, so we
-                // count it against the stall streak. A forward advance
-                // (`process_message_for_qso`) resets this to 0 elsewhere;
-                // this is now the sole increment site (see
-                // `QsoMetadata::stall_cycles`'s doc comment).
-                //
-                // ...unless the frame never actually reached the air. A
-                // re-send that never leaves the rig is not a silent on-air
-                // cycle, and counting it would move the QSO off a known-good
-                // offset on the strength of silence we ourselves caused. The
-                // existing count is left INTACT rather than reset: whatever
-                // was accumulated came from real transmissions and is still
-                // valid evidence once TX resumes.
-                //
-                // THREE independent gates can swallow it, and the frame has
-                // to clear ALL of them before its silence means anything:
+                // Round-3 review (Codex P2): decide whether this frame will
+                // actually reach the air BEFORE touching any attempt
+                // bookkeeping (`call_count`/`last_call_at`), not after. The
+                // manual-call budget (`max_calls` above) and the on-air
+                // timeline (`progress.messages`, below) both exist to bound
+                // and record REAL transmission attempts — spending either on
+                // a frame the TX-layer arm gate will deny anyway (a
+                // `remote_origin` QSO left bound to a client that is no
+                // longer the one armed) silently exhausts
+                // `manual_call_max_calls` without ever having transmitted,
+                // and records a `Sent` timeline entry for something that
+                // never went out. THREE independent gates can swallow a
+                // frame, and it has to clear ALL of them before an attempt
+                // is real:
                 //   - the global TX policy hard mute (round 2, finding 5);
                 //   - for a `remote_origin` QSO only, the station-agent
                 //     armed-TX gate the TX worker applies to every
                 //     `TxOrigin::Remote` frame (round 7, finding 3). An arm
-                //     expiry or explicit disarm leaves `TxPolicy` untouched,
-                //     so the first check alone cannot see it;
+                //     expiry, explicit disarm, or a rebind to a different
+                //     client leaves `TxPolicy` untouched, so the first check
+                //     alone cannot see it;
                 //   - the TX worker's own pre-PTT Hamlib hard mute (round 10,
                 //     Fix E) — a Hamlib restart, the command loop not ready,
                 //     an undelivered pending frequency/split command, or an
@@ -6677,18 +6721,29 @@ impl QsoManager {
                     && !hamlib_hard_muted
                     && (!progress.metadata.remote_origin
                         || remote_tx_permitted(progress.metadata.remote_client_key_id.as_deref()));
-                if frame_reaches_the_air {
-                    progress.metadata.stall_cycles =
-                        progress.metadata.stall_cycles.saturating_add(1);
+                if !frame_reaches_the_air {
+                    continue;
                 }
+
+                progress.metadata.call_count += 1;
+                progress.metadata.last_call_at = Some(now);
+
+                // PAN-72: this real per-slot re-send IS the silence signal —
+                // the DX did not advance the QSO since the last slot, so we
+                // count it against the stall streak. A forward advance
+                // (`process_message_for_qso`) resets this to 0 elsewhere;
+                // this is now the sole increment site (see
+                // `QsoMetadata::stall_cycles`'s doc comment). Reached only
+                // when `frame_reaches_the_air` (above), so the existing
+                // count-intact-on-mute behavior is preserved by construction.
+                progress.metadata.stall_cycles = progress.metadata.stall_cycles.saturating_add(1);
 
                 let tx_auto = pancetta_core::TxFreqMode::from_u8(
                     self.tx_freq_mode.load(std::sync::atomic::Ordering::Relaxed),
                 )
                 .allows_auto_change();
 
-                if frame_reaches_the_air
-                    && tx_auto
+                if tx_auto
                     && progress.metadata.stall_cycles >= self.config.timeouts.qso_stall_switch_after
                 {
                     let current = progress.metadata.frequency;
