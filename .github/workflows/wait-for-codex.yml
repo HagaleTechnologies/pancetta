@@ -416,12 +416,15 @@ jobs:
           # Whether this event carries stale-prior-head risk: a response to
           # a PREVIOUS head can land after THIS run's own cutoff and satisfy
           # an untied loose-branch signal with nothing ever tied to the new
-          # HEAD_SHA. True only for synchronize/reopened -- opened/
-          # ready_for_review/a same-head rerun (run_attempt>1 alone) have no
-          # prior head to be confused with. Used below to decide whether a
-          # missing COMMENT_ID is safe to loosen on (Codex P1, manta#156 --
-          # see that line's own comment for the two-round history).
-          IS_REMEDIATION_RISK: ${{ github.event.action == 'synchronize' || github.event.action == 'reopened' }}
+          # HEAD_SHA. True for synchronize/reopened, AND for
+          # ready_for_review -- a draft PR can accumulate its own commits/
+          # comments/thumbsups before ever going ready, so ready_for_review
+          # does NOT guarantee no prior head exists to be confused with,
+          # unlike a genuine first-ever `opened` (Codex P1, pancetta#364,
+          # extending manta#156's original finding). Only `opened` (and any
+          # rerun of it, since a rerun replays the original action
+          # unchanged) is actually risk-free.
+          IS_REMEDIATION_RISK: ${{ github.event.action == 'synchronize' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' }}
           # Narrower than IS_SYNC on purpose: a reopened event or a rerun of
           # opened/ready_for_review has no new commit, so a clean re-review
           # of the SAME code must not auto-resolve baseline threads still
