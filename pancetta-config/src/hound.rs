@@ -53,8 +53,23 @@ impl Default for HoundConfig {
 
 impl ConfigSection for HoundConfig {
     fn validate_section(&self) -> ConfigResult<()> {
+        // PAN-72 (Codex round 6 on PR #350, finding 3): these bounds are the
+        // station's real transmittable audio envelope, not a round number.
+        // They mirror `pancetta_qso::qso_manager::ACTIVE_QSO_TX_OFFSET_MIN_HZ`
+        // / `..._MAX_HZ`, which every committed TX offset is clamped to —
+        // duplicated as literals only because `pancetta-config` sits BELOW
+        // `pancetta-qso` in the dependency graph and cannot import them.
+        //
+        // The old ceiling of 3000 admitted a Hound region (2900, 3000] that no
+        // relocation could ever land in: the allocator would happily rank an
+        // offset there, `apply_tx_offset_switch` would clamp it down to 2900,
+        // and the commit-time Hound-region guard would then refuse its own
+        // clamped value — a silent, permanent no-op. `hound_offset_for`'s QSY
+        // is worse still: it writes the region offset into `metadata.frequency`
+        // with no clamp at all, putting our R+report outside the modulator's
+        // range. Rejecting the config at load is the honest failure.
         const AUDIO_MIN: f64 = 200.0;
-        const AUDIO_MAX: f64 = 3000.0;
+        const AUDIO_MAX: f64 = 2900.0;
 
         for (name, val) in [
             ("hound.call_min_hz", self.call_min_hz),
@@ -158,14 +173,41 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_value_outside_200_3000() {
+    fn validate_rejects_value_outside_the_transmittable_envelope() {
         let mut cfg = HoundConfig::default();
         cfg.call_min_hz = 100.0; // below 200
         assert!(cfg.validate_section().is_err());
 
         cfg = HoundConfig::default();
-        cfg.response_max_hz = 3100.0; // above 3000
+        cfg.response_max_hz = 3100.0; // above the transmittable ceiling
         assert!(cfg.validate_section().is_err());
+    }
+
+    /// PAN-72 (Codex round 6 on PR #350, finding 3): the ceiling is the real
+    /// TX envelope (`ACTIVE_QSO_TX_OFFSET_MAX_HZ` = 2900), not a round 3000. A
+    /// region above it can never be reached: `apply_tx_offset_switch` clamps
+    /// every commit to 2900 and its Hound-region guard then refuses the clamped
+    /// value, so the Hound would silently never relocate at all.
+    #[test]
+    fn validate_rejects_a_response_region_above_the_tx_ceiling() {
+        let mut cfg = HoundConfig::default();
+        cfg.response_min_hz = 2910.0;
+        cfg.response_max_hz = 2990.0;
+        assert!(
+            cfg.validate_section().is_err(),
+            "a Hound response region entirely above the 2900 Hz TX ceiling is \
+             unreachable and must be rejected at load, not silently no-op"
+        );
+
+        // ...and the top of the envelope itself stays valid.
+        cfg = HoundConfig::default();
+        cfg.response_min_hz = 2850.0;
+        cfg.response_max_hz = 2900.0;
+        assert!(
+            cfg.validate_section().is_ok(),
+            "2850-2900 Hz is inside the transmittable envelope and must remain \
+             a legal Hound response region"
+        );
     }
 
     #[test]

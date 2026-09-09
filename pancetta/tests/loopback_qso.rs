@@ -198,6 +198,7 @@ async fn test_loopback_state_machine_driven_qso() {
             // Non-binding here: the loopback exercises a full exchange, not the
             // stuck-state watchdog.
             repetitive_tx_timeout_secs: 100_000,
+            qso_stall_switch_after: 4,
         },
         contest_mode: None,
         auto_sequence: AutoSequenceConfig {
@@ -1260,6 +1261,7 @@ async fn test_loopback_compound_callsign_qso_advances_state_machine() {
             manual_call_watchdog_minutes: 5,
             manual_call_max_calls: 10,
             repetitive_tx_timeout_secs: 100_000,
+            qso_stall_switch_after: 4,
         },
         contest_mode: None,
         auto_sequence: AutoSequenceConfig {
@@ -1451,6 +1453,7 @@ async fn test_loopback_pan_49_contest_r_grid_ack_advances_qso() {
             manual_call_watchdog_minutes: 5,
             manual_call_max_calls: 10,
             repetitive_tx_timeout_secs: 100_000,
+            qso_stall_switch_after: 4,
         },
         contest_mode: None,
         auto_sequence: AutoSequenceConfig {
@@ -1583,6 +1586,7 @@ async fn genuinely_unresolvable_caller_hash_never_resolves_but_retires_cleanly()
             manual_call_watchdog_minutes: 5,
             manual_call_max_calls: 10,
             repetitive_tx_timeout_secs: 100_000,
+            qso_stall_switch_after: 4,
         },
         contest_mode: None,
         auto_sequence: AutoSequenceConfig {

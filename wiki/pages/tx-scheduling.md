@@ -46,7 +46,10 @@ fixes, including the open double-PTT-for-73 bug — see that doc and
   recheck was missing until 2026-07-18); this gate **fails open** on a
   poisoned lock (contrast the safety gate in [[fail-closed-arm-gate]]).
 - **Offset hold** — a QSO's TX audio offset is latched at open and held for the
-  whole exchange; the only mid-QSO mover is the operator/stuck-DX escape hop.
+  whole exchange; the only mid-QSO mover is the adaptive stall escape (PAN-72):
+  `stall_cycles` counts slots the DX failed to advance, and at the threshold the
+  QSO switches to an allocator-picked offset or reverts to the last known-good
+  one. Auto mode only; `u` forces the same move on demand.
   The frequency allocator itself had 4 independent scoring bugs (mislabeled
   spectral axis, wall-clock-vs-decode parity stamping, a scoring floor that
   clamped the wrong way, and a dead own-frequency registry) fixed 2026-07-18.
