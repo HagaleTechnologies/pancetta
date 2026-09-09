@@ -757,22 +757,21 @@ async fn interruptible_sleep_or_supersede(
     // work in this function may delay that. Round-3 review (Codex P2): the
     // already-siphoned messages travel WITH this outcome (see the
     // variant's doc) rather than being dropped — the caller re-enqueues
-    // them itself once PTT is safely off. Round-8 review (Codex P2): the
-    // remainder drain just below IS still safe to do here — it's a
-    // bounded, synchronous `try_recv()` loop, not an await — and skipping
-    // it (as this fix originally did) broke FIFO order: `siphoned`
-    // (strictly older) would otherwise be re-enqueued by the caller AFTER
-    // whatever arrived later and was left untouched in `tx_rx`, inverting
-    // true arrival order for `coalesce_backlog_into` and the bundle arms
-    // to observe.
-    if let SleepOutcome::AbortedByDisarm(already_siphoned) = outcome {
-        let mut remainder: Vec<ComponentMessage> = Vec::new();
-        while let Ok(message) = tx_rx.try_recv() {
-            remainder.push(message);
-        }
-        let pending: Vec<ComponentMessage> =
-            already_siphoned.into_iter().chain(remainder).collect();
-        return SleepOutcome::AbortedByDisarm(pending);
+    // them itself once PTT is safely off.
+    //
+    // Round-8 review found that skipping the remainder drain broke FIFO
+    // order (a later `tx_rx` arrival left untouched would be observed
+    // before the earlier, already-siphoned one). Round-9 review then found
+    // that draining it HERE, before returning, reintroduced the round-2
+    // problem: with concurrent producers continually refilling the
+    // channel, this `while let Ok(...) = tx_rx.try_recv()` loop has no
+    // iteration bound, so the caller's first PTT-off send could be
+    // delayed indefinitely under sustained traffic. Squaring both means
+    // draining CANNOT happen here — it happens in the caller, AFTER PTT
+    // is already off, using the exact same `drain_and_merge_pending`
+    // helper this match arm no longer calls.
+    if matches!(outcome, SleepOutcome::AbortedByDisarm(_)) {
+        return outcome;
     }
 
     // PAN-73 round 3 (Codex): whatever the loop stopped for (shutdown,
@@ -842,6 +841,33 @@ async fn reenqueue_pending(message_bus: &MessageBus, pending: Vec<ComponentMessa
             );
         }
     }
+}
+
+/// Drain whatever is CURRENTLY sitting in `tx_rx` (a bounded, synchronous
+/// scan — never awaits) and append it after `already_siphoned`, preserving
+/// true arrival order (round-8 review, Codex P2): anything still in the
+/// channel was queued at or after anything already siphoned, so appending
+/// it after — never re-ordering — keeps `coalesce_backlog_into` and the
+/// bundle arms seeing requests in the order they actually arrived.
+///
+/// The CALLER invokes this only AFTER sending PTT off on a detected disarm
+/// (round-9 review, Codex P1): draining *before* returning from
+/// `interruptible_sleep_or_supersede` reintroduced round-2's original
+/// problem — with concurrent producers continually refilling the channel,
+/// an unbounded `try_recv()` loop there could delay the caller's first
+/// (safety-critical) PTT-off send indefinitely. Calling it here instead,
+/// after PTT is already off, keeps the drain's unboundedness from ever
+/// touching PTT-release latency — it can only delay the lower-priority
+/// reenqueue/audit/completion bookkeeping that follows.
+fn drain_and_merge_pending(
+    tx_rx: &crossbeam_channel::Receiver<ComponentMessage>,
+    already_siphoned: Vec<ComponentMessage>,
+) -> Vec<ComponentMessage> {
+    let mut remainder: Vec<ComponentMessage> = Vec::new();
+    while let Ok(message) = tx_rx.try_recv() {
+        remainder.push(message);
+    }
+    already_siphoned.into_iter().chain(remainder).collect()
 }
 
 #[cfg(test)]
@@ -1006,16 +1032,22 @@ mod interruptible_sleep_tests {
     /// an earlier message was already siphoned, but BEFORE the disarm is
     /// detected, is left untouched in the channel — `check_once` checks
     /// disarm before it ever calls `try_recv()` again, so it returns
-    /// immediately without draining that later arrival. The round-6 fix
-    /// (previous test) only proved the EARLIER, already-siphoned message
-    /// survives; it did nothing for this later, untouched one, and worse:
-    /// the caller re-enqueues `pending` at the channel TAIL, so if this
-    /// later message is left in `tx_rx` at its original (head) position, it
-    /// would be observed BEFORE the older, siphoned one on the next drain —
-    /// inverting true arrival order. This pins that both travel together,
-    /// siphoned-then-remainder, in the outcome's `pending`.
+    /// immediately without draining that later arrival.
+    ///
+    /// Round-9 review (Codex P1) moved the remainder-drain-and-merge OUT of
+    /// this function and into the CALLER (see `drain_and_merge_pending`,
+    /// exercised directly in `drain_and_merge_pending_preserves_arrival_order`
+    /// below) — draining here, before returning, reintroduced round-2's
+    /// original problem: under concurrent producers continually refilling
+    /// the channel, an unbounded `try_recv()` loop here could delay the
+    /// caller's first (safety-critical) PTT-off send indefinitely. So this
+    /// function's OWN contract is now narrower: `AbortedByDisarm` carries
+    /// only what was ALREADY siphoned before the disarm was detected —
+    /// nothing more — and this test pins exactly that (a later,
+    /// untouched-in-`tx_rx` arrival is correctly NOT included here; the
+    /// caller's own drain is responsible for merging it in afterward).
     #[tokio::test(flavor = "current_thread")]
-    async fn supersede_sleep_preserves_fifo_order_of_siphoned_and_remainder_on_abort_by_disarm() {
+    async fn supersede_sleep_returns_only_already_siphoned_messages_on_abort_by_disarm() {
         let shutdown = Arc::new(AtomicBool::new(false));
         let abort = Arc::new(AtomicBool::new(false));
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -1097,25 +1129,75 @@ mod interruptible_sleep_tests {
             super::SleepOutcome::AbortedByDisarm(pending) => {
                 assert_eq!(
                     pending.len(),
-                    2,
-                    "both the siphoned and the untouched-remainder message must travel with the outcome"
+                    1,
+                    "only the already-siphoned message travels with this function's own \
+                     outcome — the untouched remainder is the caller's responsibility \
+                     (drain_and_merge_pending), not this function's"
                 );
-                let freqs: Vec<f64> = pending
-                    .iter()
-                    .map(|m| match &m.message_type {
-                        MessageType::TuneRequest { tone_offset_hz, .. } => *tone_offset_hz,
-                        other => panic!("expected TuneRequest, got {other:?}"),
-                    })
-                    .collect();
-                assert_eq!(
-                    freqs,
-                    vec![1000.0, 2000.0],
-                    "the older (siphoned) message must precede the newer (remainder) \
-                     one — true arrival order, not siphoned-after-remainder"
-                );
+                match &pending[0].message_type {
+                    MessageType::TuneRequest { tone_offset_hz, .. } => {
+                        assert_eq!(*tone_offset_hz, 1000.0)
+                    }
+                    other => panic!("expected TuneRequest, got {other:?}"),
+                }
             }
             other => panic!("expected AbortedByDisarm, got {other:?}"),
         }
+    }
+
+    /// Round-9 review (Codex P1/P2): pins `drain_and_merge_pending`'s own
+    /// ordering contract directly — a pure, synchronous function, so no
+    /// timing games are needed. The caller invokes this AFTER sending
+    /// PTT off, appending whatever is currently sitting in `tx_rx` after
+    /// the already-siphoned prefix, preserving true arrival order.
+    #[test]
+    fn drain_and_merge_pending_preserves_arrival_order() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(crate::message_bus::ComponentMessage::new(
+            crate::message_bus::ComponentId::Tui,
+            crate::message_bus::ComponentId::Ft8Transmitter,
+            MessageType::TuneRequest {
+                duration_secs: 5,
+                tone_offset_hz: 2000.0,
+            },
+            Instant::now(),
+        ))
+        .unwrap();
+        tx.send(crate::message_bus::ComponentMessage::new(
+            crate::message_bus::ComponentId::Tui,
+            crate::message_bus::ComponentId::Ft8Transmitter,
+            MessageType::TuneRequest {
+                duration_secs: 5,
+                tone_offset_hz: 3000.0,
+            },
+            Instant::now(),
+        ))
+        .unwrap();
+
+        let already_siphoned = vec![ComponentMessage::new(
+            crate::message_bus::ComponentId::Tui,
+            crate::message_bus::ComponentId::Ft8Transmitter,
+            MessageType::TuneRequest {
+                duration_secs: 5,
+                tone_offset_hz: 1000.0,
+            },
+            Instant::now(),
+        )];
+
+        let pending = super::drain_and_merge_pending(&rx, already_siphoned);
+        let freqs: Vec<f64> = pending
+            .iter()
+            .map(|m| match &m.message_type {
+                MessageType::TuneRequest { tone_offset_hz, .. } => *tone_offset_hz,
+                other => panic!("expected TuneRequest, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            freqs,
+            vec![1000.0, 2000.0, 3000.0],
+            "already-siphoned content must precede whatever was still in tx_rx, \
+             in the channel's own FIFO order"
+        );
     }
 
     /// PAN-92: an already-keyed Remote transmission must be interrupted the
@@ -2836,6 +2918,7 @@ pub fn remote_tx_permitted_for(
 /// batch, both entries can pass their own check yet the batch's later
 /// single-identity fold only ever records one of them, silently
 /// authorizing the other under a mismatched identity.
+#[derive(Clone)]
 struct ArmSnapshot {
     tx_permitted: bool,
     armed_client_key_id: Option<String>,
@@ -3609,69 +3692,90 @@ async fn coalesce_backlog_into(
     // (dispensa Q-0051), not just a log line + TransmitComplete — an
     // attempted cross-client transmission must stay visible in the
     // security audit trail exactly like a pickup-time or mid-flight one.
-    for entry in &identity_denied {
-        // Round-3 review (Codex P2): only say "bound to a different
-        // client" when that's actually why this entry was denied — every
-        // other gate failure (nobody armed, heartbeat lost, TTL expired,
-        // local consent/kill) is a real safety event but not an identity
-        // problem, and reporting it as one obscures what actually happened
-        // in a durable security audit record.
-        let denial_reason =
-            if arm_snapshot.is_identity_mismatch(entry.remote_client_key_id.as_deref()) {
-                format!(
-                    "bound to a different client than the one currently armed: '{}' at {:.0} Hz",
-                    entry.message_text, entry.frequency_offset
+    //
+    // Round-9 review (Codex P2): this reporting is now DETACHED
+    // (`tokio::spawn`), not awaited inline — a large backlog left behind
+    // by a since-disarmed controller could otherwise force this function
+    // to await a diagnostic + synchronous audit-file write + relay + bus
+    // send PER denied entry before ever returning the admitted frame to
+    // its caller, delaying that frame's own key-time gates by however
+    // long the stale backlog happened to be. The admitted result no
+    // longer waits on how much (or how slowly) denied traffic there is to
+    // report.
+    if !identity_denied.is_empty() {
+        let message_bus = message_bus.clone();
+        let audit_log = audit_log.clone();
+        let display_feed_enabled = display_feed_enabled.clone();
+        let remote_tx_arm = remote_tx_arm.clone();
+        let arm_snapshot = arm_snapshot.clone();
+        tokio::spawn(async move {
+            for entry in &identity_denied {
+                // Round-3 review (Codex P2): only say "bound to a
+                // different client" when that's actually why this entry
+                // was denied — every other gate failure (nobody armed,
+                // heartbeat lost, TTL expired, local consent/kill) is a
+                // real safety event but not an identity problem, and
+                // reporting it as one obscures what actually happened in
+                // a durable security audit record.
+                let denial_reason = if arm_snapshot
+                    .is_identity_mismatch(entry.remote_client_key_id.as_deref())
+                {
+                    format!(
+                            "bound to a different client than the one currently armed: '{}' at {:.0} Hz",
+                            entry.message_text, entry.frequency_offset
+                        )
+                } else {
+                    format!(
+                        "remote TX not currently permitted: '{}' at {:.0} Hz",
+                        entry.message_text, entry.frequency_offset
+                    )
+                };
+                emit_diagnostic(
+                    &message_bus,
+                    "agent.tx",
+                    pancetta_core::DiagnosticLevel::Warn,
+                    format!("Remote TX denied ({denial_reason})"),
+                    entry.qso_id.as_deref(),
                 )
-            } else {
-                format!(
-                    "remote TX not currently permitted: '{}' at {:.0} Hz",
-                    entry.message_text, entry.frequency_offset
+                .await;
+                audit_log.append(&pancetta_agent::audit::AuditEvent {
+                    ts_unix_ms: chrono::Utc::now().timestamp_millis(),
+                    kind: pancetta_agent::audit::AuditKind::TxDenied,
+                    operator_callsign: tx_denied_operator_attribution(
+                        &remote_tx_arm,
+                        entry.remote_client_key_id.as_deref(),
+                    ),
+                    detail: denial_reason.clone(),
+                });
+                super::remote_gateway::relay_to_gateway(
+                    &message_bus,
+                    &display_feed_enabled,
+                    ComponentId::Ft8Transmitter,
+                    MessageType::TxDenied {
+                        reason: denial_reason,
+                        qso_id: entry.qso_id.clone(),
+                    },
                 )
-            };
-        emit_diagnostic(
-            message_bus,
-            "agent.tx",
-            pancetta_core::DiagnosticLevel::Warn,
-            format!("Remote TX denied ({denial_reason})"),
-            entry.qso_id.as_deref(),
-        )
-        .await;
-        audit_log.append(&pancetta_agent::audit::AuditEvent {
-            ts_unix_ms: chrono::Utc::now().timestamp_millis(),
-            kind: pancetta_agent::audit::AuditKind::TxDenied,
-            operator_callsign: tx_denied_operator_attribution(
-                remote_tx_arm,
-                entry.remote_client_key_id.as_deref(),
-            ),
-            detail: denial_reason.clone(),
+                .await;
+                let complete_msg = ComponentMessage::new(
+                    ComponentId::Ft8Transmitter,
+                    ComponentId::Autonomous,
+                    MessageType::TransmitComplete {
+                        success: false,
+                        message_text: entry.message_text.clone(),
+                        duration_ms: 0,
+                        qso_id: entry.qso_id.clone(),
+                    },
+                    Instant::now(),
+                );
+                if let Err(e) = message_bus.send_message(complete_msg).await {
+                    warn!(
+                        "Failed to send TransmitComplete for an identity-denied stream: {}",
+                        e
+                    );
+                }
+            }
         });
-        super::remote_gateway::relay_to_gateway(
-            message_bus,
-            display_feed_enabled,
-            ComponentId::Ft8Transmitter,
-            MessageType::TxDenied {
-                reason: denial_reason,
-                qso_id: entry.qso_id.clone(),
-            },
-        )
-        .await;
-        let complete_msg = ComponentMessage::new(
-            ComponentId::Ft8Transmitter,
-            ComponentId::Autonomous,
-            MessageType::TransmitComplete {
-                success: false,
-                message_text: entry.message_text.clone(),
-                duration_ms: 0,
-                qso_id: entry.qso_id.clone(),
-            },
-            Instant::now(),
-        );
-        if let Err(e) = message_bus.send_message(complete_msg).await {
-            warn!(
-                "Failed to send TransmitComplete for an identity-denied stream: {}",
-                e
-            );
-        }
     }
 
     // Every drained entry was identity-denied. Hand back an empty
@@ -5901,6 +6005,13 @@ impl super::ApplicationCoordinator {
                                                 if let Some(key) = pivoted_this_key.take() {
                                                     pivoted_once.remove(&key);
                                                 }
+                                                // Round-9 review (Codex P1): drain HERE,
+                                                // after PTT is already off, not inside
+                                                // `interruptible_sleep_or_supersede` before
+                                                // returning — see `drain_and_merge_pending`'s
+                                                // doc for why.
+                                                let pending =
+                                                    drain_and_merge_pending(&tx_rx, pending);
                                                 reenqueue_pending(&message_bus, pending).await;
                                                 emit_disarm_interrupt_signals(
                                                     &message_bus,
@@ -6190,27 +6301,20 @@ impl super::ApplicationCoordinator {
                                         }
 
                                         // --- Step 7: Route audio to output ---
-                                        // Band Activity's own-TX history logs the actual
-                                        // audio-start instant here, not Step 5's PTT-key
-                                        // time — see `log_tx_frame`'s doc comment.
-                                        log_tx_frame(
-                                            &message_bus,
-                                            message_text.clone(),
-                                            frequency_offset,
-                                            qso_id.clone(),
-                                            chrono::Utc::now(),
-                                        )
-                                        .await;
-
                                         // Round-7 review (Codex P1): Step 6's sleep can
                                         // return `Completed` (nothing to interrupt it) even
                                         // though the bound client disarmed during an
-                                        // intervening await this function's own poll never
-                                        // covers — e.g. `log_tx_frame`'s await just above.
-                                        // PTT is already asserted (Step 5) but no audio has
+                                        // intervening await elsewhere in this iteration
+                                        // that this function's own poll never covers. PTT
+                                        // is already asserted (Step 5) but no audio has
                                         // gone out yet, so this is the last chance to catch
-                                        // a stale authorization before the waveform actually
-                                        // reaches the air.
+                                        // a stale authorization before the waveform
+                                        // actually reaches the air. Round-9 review (Codex
+                                        // P2): this check must run BEFORE `log_tx_frame`
+                                        // below, not after — logging first recorded a
+                                        // denied frame as a genuine own-transmission in the
+                                        // TUI's Band Activity panel even though no waveform
+                                        // ever reached the air.
                                         if origin == crate::message_bus::TxOrigin::Remote
                                             && !remote_tx_permitted_for(
                                                 &remote_tx_arm,
@@ -6271,6 +6375,21 @@ impl super::ApplicationCoordinator {
                                             let _ = message_bus.send_message(complete_msg).await;
                                             continue 'worker;
                                         }
+
+                                        // Band Activity's own-TX history logs the actual
+                                        // audio-start instant here, not Step 5's PTT-key
+                                        // time — see `log_tx_frame`'s doc comment. Runs
+                                        // AFTER the arm recheck above (round-9 review): a
+                                        // denied frame must never appear in Band Activity
+                                        // as a genuine own-transmission.
+                                        log_tx_frame(
+                                            &message_bus,
+                                            message_text.clone(),
+                                            frequency_offset,
+                                            qso_id.clone(),
+                                            chrono::Utc::now(),
+                                        )
+                                        .await;
 
                                         let audio_msg = ComponentMessage::new(
                                             ComponentId::Ft8Transmitter,
@@ -6406,6 +6525,11 @@ impl super::ApplicationCoordinator {
                                                         e
                                                     );
                                                 }
+                                                // Round-9 review (Codex P1): drain HERE,
+                                                // after PTT is already off — see
+                                                // `drain_and_merge_pending`'s doc for why.
+                                                let pending =
+                                                    drain_and_merge_pending(&tx_rx, pending);
                                                 reenqueue_pending(&message_bus, pending).await;
                                                 emit_disarm_interrupt_signals(
                                                     &message_bus,
@@ -8155,6 +8279,10 @@ impl super::ApplicationCoordinator {
                                             for key in &pivoted_this_bundle_keys {
                                                 pivoted_once.remove(key);
                                             }
+                                            // Round-9 review (Codex P1): drain HERE, after
+                                            // PTT is already off — see
+                                            // `drain_and_merge_pending`'s doc for why.
+                                            let pending = drain_and_merge_pending(&tx_rx, pending);
                                             reenqueue_pending(&message_bus, pending).await;
                                             emit_disarm_interrupt_signals(
                                                 &message_bus,
@@ -8225,29 +8353,18 @@ impl super::ApplicationCoordinator {
                                     }
 
                                     // --- Step 7: Route audio to output ---
-                                    // Band Activity's own-TX history logs the actual
-                                    // audio-start instant here, not Step 5's PTT-key
-                                    // time — see `log_tx_frame`'s doc comment. Every
-                                    // bundle item is keyed concurrently in this same
-                                    // slot, so all of them share this one timestamp.
-                                    let tx_logged_at = chrono::Utc::now();
-                                    for item in &items {
-                                        log_tx_frame(
-                                            &message_bus,
-                                            item.message_text.clone(),
-                                            item.frequency_offset,
-                                            item.qso_id.clone(),
-                                            tx_logged_at,
-                                        )
-                                        .await;
-                                    }
-
                                     // Round-7 review (Codex P1): mirrors the single-TX
                                     // arm's identical fix — Step 6's sleep can return
                                     // `Completed` even though the bound client disarmed
-                                    // during the `log_tx_frame` awaits just above, which
-                                    // this function's own poll never covers. PTT is
-                                    // already asserted but no audio has gone out yet.
+                                    // during an intervening await elsewhere in this
+                                    // iteration that this function's own poll never
+                                    // covers. PTT is already asserted but no audio has
+                                    // gone out yet. Round-9 review (Codex P2): this check
+                                    // must run BEFORE the `log_tx_frame` loop below, not
+                                    // after — logging first recorded denied frames as
+                                    // genuine own-transmissions in the TUI's Band
+                                    // Activity panel even though no waveform ever reached
+                                    // the air.
                                     if origin == crate::message_bus::TxOrigin::Remote
                                         && !remote_tx_permitted_for(
                                             &remote_tx_arm,
@@ -8310,6 +8427,24 @@ impl super::ApplicationCoordinator {
                                             let _ = message_bus.send_message(complete_msg).await;
                                         }
                                         continue;
+                                    }
+
+                                    // Band Activity's own-TX history logs the actual
+                                    // audio-start instant here, not Step 5's PTT-key
+                                    // time — see `log_tx_frame`'s doc comment. Every
+                                    // bundle item is keyed concurrently in this same
+                                    // slot, so all of them share this one timestamp.
+                                    // Runs AFTER the arm recheck above (round-9 review).
+                                    let tx_logged_at = chrono::Utc::now();
+                                    for item in &items {
+                                        log_tx_frame(
+                                            &message_bus,
+                                            item.message_text.clone(),
+                                            item.frequency_offset,
+                                            item.qso_id.clone(),
+                                            tx_logged_at,
+                                        )
+                                        .await;
                                     }
 
                                     let audio_msg = ComponentMessage::new(
@@ -8430,6 +8565,10 @@ impl super::ApplicationCoordinator {
                                                     e
                                                 );
                                             }
+                                            // Round-9 review (Codex P1): drain HERE, after
+                                            // PTT is already off — see
+                                            // `drain_and_merge_pending`'s doc for why.
+                                            let pending = drain_and_merge_pending(&tx_rx, pending);
                                             reenqueue_pending(&message_bus, pending).await;
                                             emit_disarm_interrupt_signals(
                                                 &message_bus,
@@ -11892,6 +12031,13 @@ mod coalesce_tests {
                 "expected a single TransmitRequest for client-a's surviving entry, got {other:?}"
             ),
         }
+
+        // Round-9 review (Codex P2): the identity-denied reporting loop is
+        // now a DETACHED `tokio::spawn`'d task (so a large stale backlog
+        // can't delay returning the admitted frame above) — give the
+        // current-thread runtime a chance to actually run it before
+        // asserting on its output.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         let mut got = Vec::new();
         while let Ok(msg) = autonomous_rx.try_recv() {
