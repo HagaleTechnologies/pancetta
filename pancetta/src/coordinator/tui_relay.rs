@@ -1124,6 +1124,7 @@ impl super::ApplicationCoordinator {
                                     qso_id: None,
                                     tx_parity: None, // TUI manual send: no DX context
                                     origin: crate::message_bus::TxOrigin::Local,
+                                    remote_client_key_id: None,
                                 },
                                 Instant::now(),
                             );
@@ -1202,6 +1203,7 @@ impl super::ApplicationCoordinator {
                                     dx_parity,
                                     // TUI-initiated call is LOCAL (byte-identical to prior).
                                     remote_origin: false,
+                                    remote_client_key_id: None,
                                 }),
                                 Instant::now(),
                             );
@@ -1323,6 +1325,7 @@ impl super::ApplicationCoordinator {
                                         snr,
                                         // TUI-initiated answer is LOCAL.
                                         remote_origin: false,
+                                        remote_client_key_id: None,
                                     },
                                 ),
                                 Instant::now(),
@@ -1510,6 +1513,7 @@ impl super::ApplicationCoordinator {
                                     tx_parity: None,
                                     // TUI `c` key CQ is LOCAL.
                                     remote_origin: false,
+                                    remote_client_key_id: None,
                                 }),
                                 Instant::now(),
                             );

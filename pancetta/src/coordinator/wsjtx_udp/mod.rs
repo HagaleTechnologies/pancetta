@@ -507,6 +507,15 @@ impl super::ApplicationCoordinator {
                                                             frequency: intent.frequency_hz,
                                                             dx_parity: intent.dx_parity,
                                                             remote_origin: true,
+                                                            // WSJT-X UDP is a different remote-TX
+                                                            // producer than the station-agent's
+                                                            // multi-client path and has no client
+                                                            // identity to bind (PAN-91 only adds
+                                                            // the stricter identity check when
+                                                            // `Some` is present) — `None` here
+                                                            // preserves this path's pre-existing
+                                                            // boolean-only arm-gate behavior.
+                                                            remote_client_key_id: None,
                                                         },
                                                     ),
                                                     Instant::now(),
@@ -1961,6 +1970,7 @@ mod qso_logged_tests {
             pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin: false,
+            remote_client_key_id: None,
             tx_parity_provisional: false,
         }
     }

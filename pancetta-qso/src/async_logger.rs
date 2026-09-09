@@ -979,6 +979,7 @@ impl QsoLogger {
                 pending_freq_drift: None,
                 hound_qsyed: false,
                 remote_origin: false,
+                remote_client_key_id: None,
                 tx_parity_provisional: false,
             },
         }
@@ -1077,6 +1078,7 @@ mod tests {
             pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin: false,
+            remote_client_key_id: None,
             tx_parity_provisional: false,
         }
     }

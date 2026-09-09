@@ -49,7 +49,7 @@ async fn fox_engage_creates_calling_cq_qso() {
 
     // Mimic SetFoxMode{on:true}: start_cq_manual at Fox default 1500 Hz.
     let qso_id = manager
-        .start_cq_manual(1500.0, None, false)
+        .start_cq_manual(1500.0, None, false, None)
         .await
         .expect("start_cq_manual should succeed for Fox CQ");
 
@@ -80,7 +80,7 @@ async fn fox_disengage_cancels_calling_cq_qso() {
 
     // Engage: create the CallingCq QSO.
     let qso_id = manager
-        .start_cq_manual(1500.0, None, false)
+        .start_cq_manual(1500.0, None, false, None)
         .await
         .expect("start_cq_manual");
 
@@ -264,6 +264,7 @@ async fn fox_cap_admits_n_and_rejects_n_plus_1() {
             None,
             None,
             false,
+            None,
         )
         .await
         .expect("caller 1 admitted");
@@ -279,6 +280,7 @@ async fn fox_cap_admits_n_and_rejects_n_plus_1() {
             None,
             None,
             false,
+            None,
         )
         .await
         .expect("caller 2 admitted");
@@ -314,7 +316,7 @@ async fn active_caller_qso_count_excludes_calling_cq() {
 
     // Open the Fox's own CQ (CallingCq state).
     let _cq_id = manager
-        .start_cq_manual(1500.0, None, false)
+        .start_cq_manual(1500.0, None, false, None)
         .await
         .expect("start_cq_manual");
 
@@ -329,6 +331,7 @@ async fn active_caller_qso_count_excludes_calling_cq() {
             None,
             None,
             false,
+            None,
         )
         .await
         .expect("caller 1 admitted");
@@ -363,7 +366,7 @@ async fn fox_cap_with_cq_active_admits_max_streams_answers() {
 
     // Start the Fox CQ — this must NOT count against the Hound-answer cap.
     let _cq_id = manager
-        .start_cq_manual(1500.0, None, false)
+        .start_cq_manual(1500.0, None, false, None)
         .await
         .expect("start_cq_manual (Fox CQ)");
 
@@ -378,6 +381,7 @@ async fn fox_cap_with_cq_active_admits_max_streams_answers() {
             None,
             None,
             false,
+            None,
         )
         .await
         .expect("Hound 1 must be admitted");
@@ -393,6 +397,7 @@ async fn fox_cap_with_cq_active_admits_max_streams_answers() {
             None,
             None,
             false,
+            None,
         )
         .await
         .expect("Hound 2 must be admitted");
@@ -447,6 +452,7 @@ async fn fox_slot_freed_after_qso_completes() {
             None,
             None,
             false,
+            None,
         )
         .await
         .expect("caller 1 admitted");

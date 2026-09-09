@@ -268,6 +268,19 @@ pub fn classify_incoming_during_tx(
     candidate: &MessageType,
     in_flight_items: &[crate::message_bus::TransmitRequestItem],
     pivoted_once: &std::collections::HashMap<String, (String, f64)>,
+    // Codex P1, PR #362 round 21: the in-flight side's own authorization —
+    // mirrors `tx_pivot_target`'s `current_authorization` (round 5) and
+    // `supersede_and_rekey_or_bundle`'s `in_flight_origin`/
+    // `in_flight_remote_client_key_id`. Without this, a same-QSO candidate
+    // whose rendered text/frequency happen to be byte-identical to the
+    // in-flight item (e.g. a local operator takes over an A-bound remote QSO
+    // and repeats its current text) was classified as an exact duplicate and
+    // dropped — even though it carries a DIFFERENT authorization that has
+    // never been checked against this slot's arm. A disarm of the OLD
+    // (in-flight) client then aborts the transmission while the dropped
+    // candidate — the one actually entitled to transmit — is gone for good.
+    in_flight_origin: crate::message_bus::TxOrigin,
+    in_flight_remote_client_key_id: Option<&str>,
 ) -> IncomingDuringTx {
     // M1: normalize through `active_tx_qso_key` before comparing, matching
     // every sibling qso_id comparison (`tx_pivot_target`, `is_pivot_duplicate`,
@@ -280,20 +293,42 @@ pub fn classify_incoming_during_tx(
         })
     };
 
+    // Codex P1, round 21: a candidate whose rendered content matches the
+    // in-flight item byte-for-byte but carries DIFFERENT authorization is
+    // not a duplicate — it's a fresh, differently-authorized request that
+    // just happens to render the same text (e.g. a local takeover repeating
+    // an in-flight remote QSO's current closing frame). Only an
+    // authorization match (same origin, same client) plus matching content
+    // is a genuine no-op.
+    let authorization_differs = |cand_origin: crate::message_bus::TxOrigin,
+                                 cand_client: Option<&str>| {
+        cand_origin != in_flight_origin || cand_client != in_flight_remote_client_key_id
+    };
+
     match candidate {
         MessageType::TransmitRequest {
             message_text,
             frequency_offset,
             qso_id,
             tx_parity,
-            ..
+            origin,
+            remote_client_key_id,
         } => {
+            // Codex P1, round 22: the tombstone match alone isn't enough —
+            // it's keyed only on qso_id/text/frequency, with no authorization
+            // in it. If control has since transferred (this candidate's
+            // authorization differs from the in-flight frame's), it's not
+            // the stale second copy of the pivot; it's a fresh, differently-
+            // authorized request that happens to render the pivoted text.
+            // Fall through to the normal per-QSO comparison below rather
+            // than trusting the tombstone.
             if super::is_pivot_duplicate(
                 qso_id.as_deref(),
                 message_text,
                 *frequency_offset,
                 pivoted_once,
-            ) {
+            ) && !authorization_differs(*origin, remote_client_key_id.as_deref())
+            {
                 return IncomingDuringTx::Drop;
             }
             // Genuine manual/free-text/tune/test-TX (no qso_id at all) is the
@@ -307,11 +342,12 @@ pub fn classify_incoming_during_tx(
             // comparing text alone would also match a deliberate same-text
             // frequency hop.
             if qso_id.is_none() {
-                let is_untracked_duplicate = in_flight_items.iter().any(|it| {
-                    it.qso_id.is_none()
-                        && it.message_text == *message_text
-                        && it.frequency_offset == *frequency_offset
-                });
+                let is_untracked_duplicate =
+                    in_flight_items.iter().any(|it| {
+                        it.qso_id.is_none()
+                            && it.message_text == *message_text
+                            && it.frequency_offset == *frequency_offset
+                    }) && !authorization_differs(*origin, remote_client_key_id.as_deref());
                 if is_untracked_duplicate {
                     return IncomingDuringTx::Drop;
                 }
@@ -329,9 +365,13 @@ pub fn classify_incoming_during_tx(
                 // (qso_manager.rs's stuck-DX offset hop). Matching on text
                 // alone would drop that hop and leave the old-offset signal
                 // transmitting into the collision it was trying to avoid.
+                // Round 21: authorization must ALSO match, or this is a
+                // fresh (differently-authorized) request wearing the
+                // in-flight item's own content.
                 Some(item)
                     if item.message_text == *message_text
-                        && item.frequency_offset == *frequency_offset =>
+                        && item.frequency_offset == *frequency_offset
+                        && !authorization_differs(*origin, remote_client_key_id.as_deref()) =>
                 {
                     IncomingDuringTx::Drop
                 }
@@ -361,7 +401,19 @@ pub fn classify_incoming_during_tx(
         // instead of a single `TransmitRequest`. A bundle with NO changed
         // overlap (including no overlap at all) gets the same Requeue
         // treatment as a single-item candidate (PAN-73 round 2).
-        MessageType::MultiTransmitRequest { items, .. } => {
+        MessageType::MultiTransmitRequest {
+            items,
+            origin,
+            remote_client_key_id,
+            ..
+        } => {
+            // Round 21: same authorization-aware duplicate check as the
+            // single-`TransmitRequest` arm above — a bundle re-carrying an
+            // in-flight item's exact content under DIFFERENT authorization
+            // is a fresh, differently-authorized request, not the unchanged
+            // repeat this overlap check exists to filter out.
+            let authorization_changed =
+                authorization_differs(*origin, remote_client_key_id.as_deref());
             let has_changed_overlap =
                 items
                     .iter()
@@ -369,6 +421,7 @@ pub fn classify_incoming_during_tx(
                         Some(in_flight_item) => {
                             in_flight_item.message_text != it.message_text
                                 || in_flight_item.frequency_offset != it.frequency_offset
+                                || authorization_changed
                         }
                         None => false,
                     });
@@ -530,6 +583,23 @@ pub enum SleepOutcome {
     /// F8 (or any other existing abort_current_tx setter) fired with no
     /// stashed replacement request.
     AbortedByOperator,
+    /// PAN-92: a Remote in-flight frame's arm gate stopped permitting TX
+    /// mid-transmission (explicit disarm, dead-man/heartbeat loss, TTL
+    /// expiry, or local-kill) — the caller must stop keying, never re-key.
+    ///
+    /// The contained `Vec<ComponentMessage>` (round-3 review, Codex P2) is
+    /// whatever this wait had already siphoned before the disarm was
+    /// detected — an unrelated local/autonomous `TransmitRequest` or a TUI
+    /// `TuneRequest`, say. It is NOT drained from `tx_rx` further (that
+    /// would cost an extra channel operation on the safety-critical path)
+    /// and it is NOT re-enqueued by this function — the caller MUST
+    /// re-enqueue it itself via [`reenqueue_pending`], but only AFTER
+    /// sending PTT off and disarming its `PttGuard`, mirroring
+    /// `Superseded`'s ordering rule. Silently dropping it (this function's
+    /// round-2 behavior) could lose a local QSO frame or operator command
+    /// for no reason other than an unrelated remote transmission being
+    /// disarmed.
+    AbortedByDisarm(Vec<ComponentMessage>),
     /// A qualifying request arrived; abort_current_tx was set by this
     /// function itself. Caller should attempt to re-key with the contained
     /// message.
@@ -579,6 +649,15 @@ async fn interruptible_sleep_or_supersede(
     message_bus: &MessageBus,
     in_flight_items: &[crate::message_bus::TransmitRequestItem],
     pivoted_once: &std::collections::HashMap<String, (String, f64)>,
+    // PAN-92: the in-flight frame's own origin/identity, re-checked against
+    // the live arm on every poll tick (below) so an explicit disarm — or the
+    // dead-man/heartbeat/TTL/local-kill gates ArmState already enforces —
+    // interrupts a transmission ALREADY keyed, not just future ones. `None`
+    // for a `TxOrigin::Local` in-flight frame, which is never gated.
+    remote_tx_arm: Option<(
+        &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
+        Option<&str>,
+    )>,
 ) -> SleepOutcome {
     use std::sync::atomic::Ordering;
 
@@ -606,6 +685,7 @@ async fn interruptible_sleep_or_supersede(
                 items,
                 tx_parity,
                 origin,
+                remote_client_key_id,
             } = message_type
             else {
                 return Some(message_type);
@@ -628,6 +708,7 @@ async fn interruptible_sleep_or_supersede(
                     items: filtered,
                     tx_parity,
                     origin,
+                    remote_client_key_id,
                 })
             }
         };
@@ -651,6 +732,19 @@ async fn interruptible_sleep_or_supersede(
             if abort.load(Ordering::Acquire) {
                 return Some(SleepOutcome::AbortedByOperator);
             }
+            // PAN-92: re-check the remote-TX arm gate on every tick for a
+            // Remote in-flight frame — a disarm (explicit, dead-man,
+            // heartbeat-lost, TTL-expired, or local-kill) must stop a
+            // transmission ALREADY keyed, not just block the next one.
+            if let Some((arm, client_key_id)) = remote_tx_arm {
+                if !remote_tx_permitted_for(
+                    arm,
+                    chrono::Utc::now().timestamp_millis(),
+                    client_key_id,
+                ) {
+                    return Some(SleepOutcome::AbortedByDisarm(std::mem::take(siphoned)));
+                }
+            }
             let Ok(message) = tx_rx.try_recv() else {
                 return None;
             };
@@ -659,10 +753,22 @@ async fn interruptible_sleep_or_supersede(
                 MessageType::TransmitRequest { .. } | MessageType::MultiTransmitRequest { .. }
             );
             if is_supersede_candidate {
+                // The in-flight side's own authorization: `remote_tx_arm`
+                // being `Some` means the in-flight frame is Remote (with
+                // this client_key_id); `None` means Local (see this
+                // function's own param doc above).
+                let (in_flight_origin, in_flight_remote_client_key_id) = match remote_tx_arm {
+                    Some((_, client_key_id)) => {
+                        (crate::message_bus::TxOrigin::Remote, client_key_id)
+                    }
+                    None => (crate::message_bus::TxOrigin::Local, None),
+                };
                 match classify_incoming_during_tx(
                     &message.message_type,
                     in_flight_items,
                     pivoted_once,
+                    in_flight_origin,
+                    in_flight_remote_client_key_id,
                 ) {
                     IncomingDuringTx::Drop => {}
                     // PAN-73 round 2: not a match for any in-flight QSO —
@@ -709,6 +815,29 @@ async fn interruptible_sleep_or_supersede(
         }
         SleepOutcome::Completed
     };
+
+    // PAN-92 review round 2 (Codex P1): return to the caller IMMEDIATELY on
+    // a detected disarm, WITHOUT the AWAITED reenqueue loop further down —
+    // the caller's very first action is sending PTT off, and no awaited
+    // work in this function may delay that. Round-3 review (Codex P2): the
+    // already-siphoned messages travel WITH this outcome (see the
+    // variant's doc) rather than being dropped — the caller re-enqueues
+    // them itself once PTT is safely off.
+    //
+    // Round-8 review found that skipping the remainder drain broke FIFO
+    // order (a later `tx_rx` arrival left untouched would be observed
+    // before the earlier, already-siphoned one). Round-9 review then found
+    // that draining it HERE, before returning, reintroduced the round-2
+    // problem: with concurrent producers continually refilling the
+    // channel, this `while let Ok(...) = tx_rx.try_recv()` loop has no
+    // iteration bound, so the caller's first PTT-off send could be
+    // delayed indefinitely under sustained traffic. Squaring both means
+    // draining CANNOT happen here — it happens in the caller, AFTER PTT
+    // is already off, using the exact same `drain_and_merge_pending`
+    // helper this match arm no longer calls.
+    if matches!(outcome, SleepOutcome::AbortedByDisarm(_)) {
+        return outcome;
+    }
 
     // PAN-73 round 3 (Codex): whatever the loop stopped for (shutdown,
     // operator abort, or a same-QSO supersede that returns immediately
@@ -779,6 +908,33 @@ async fn reenqueue_pending(message_bus: &MessageBus, pending: Vec<ComponentMessa
     }
 }
 
+/// Drain whatever is CURRENTLY sitting in `tx_rx` (a bounded, synchronous
+/// scan — never awaits) and append it after `already_siphoned`, preserving
+/// true arrival order (round-8 review, Codex P2): anything still in the
+/// channel was queued at or after anything already siphoned, so appending
+/// it after — never re-ordering — keeps `coalesce_backlog_into` and the
+/// bundle arms seeing requests in the order they actually arrived.
+///
+/// The CALLER invokes this only AFTER sending PTT off on a detected disarm
+/// (round-9 review, Codex P1): draining *before* returning from
+/// `interruptible_sleep_or_supersede` reintroduced round-2's original
+/// problem — with concurrent producers continually refilling the channel,
+/// an unbounded `try_recv()` loop there could delay the caller's first
+/// (safety-critical) PTT-off send indefinitely. Calling it here instead,
+/// after PTT is already off, keeps the drain's unboundedness from ever
+/// touching PTT-release latency — it can only delay the lower-priority
+/// reenqueue/audit/completion bookkeeping that follows.
+fn drain_and_merge_pending(
+    tx_rx: &crossbeam_channel::Receiver<ComponentMessage>,
+    already_siphoned: Vec<ComponentMessage>,
+) -> Vec<ComponentMessage> {
+    let mut remainder: Vec<ComponentMessage> = Vec::new();
+    while let Ok(message) = tx_rx.try_recv() {
+        remainder.push(message);
+    }
+    already_siphoned.into_iter().chain(remainder).collect()
+}
+
 #[cfg(test)]
 mod interruptible_sleep_tests {
     use super::*;
@@ -846,6 +1002,354 @@ mod interruptible_sleep_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            None,
+        )
+        .await;
+        assert!(matches!(outcome, super::SleepOutcome::Completed));
+    }
+
+    /// Round-3 review (Codex P2): a message already siphoned into this
+    /// wait's local queue (an unrelated local `TuneRequest`, here) before a
+    /// later-arriving disarm is detected must travel WITH the
+    /// `AbortedByDisarm` outcome, not be silently dropped. The disarm's own
+    /// caller-side reenqueue-after-PTT-off is exercised in
+    /// `pancetta/tests/coord_sim.rs`'s end-to-end tests; this pins the
+    /// lower-level contract this function itself is now responsible for.
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_sleep_carries_siphoned_messages_on_abort_by_disarm() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let bus = crate::message_bus::MessageBus::new(16).unwrap();
+        let pivoted_once = std::collections::HashMap::new();
+
+        // An unrelated, non-supersede-candidate message (a TUI TuneRequest)
+        // is already queued BEFORE the wait starts — it will be siphoned on
+        // the very first poll tick, before the disarm below has a chance to
+        // fire.
+        tx.send(crate::message_bus::ComponentMessage::new(
+            crate::message_bus::ComponentId::Tui,
+            crate::message_bus::ComponentId::Ft8Transmitter,
+            MessageType::TuneRequest {
+                duration_secs: 5,
+                tone_offset_hz: 1000.0,
+            },
+            Instant::now(),
+        ))
+        .unwrap();
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut st = pancetta_agent::arm::ArmState::new();
+        st.arm(
+            pancetta_agent::arm::VerifiedArmGrant {
+                operator_callsign: "K5ARH".to_string(),
+                ttl_ms: 120_000,
+                scope_tx: true,
+                jti: "disarm-preserves-siphoned-jti".to_string(),
+                client_key_id: "client-a".to_string(),
+            },
+            now_ms,
+        );
+        st.set_local_consent(true, now_ms);
+        let arm = Arc::new(std::sync::Mutex::new(st));
+
+        let arm_clone = arm.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            arm_clone
+                .lock()
+                .unwrap()
+                .disarm(chrono::Utc::now().timestamp_millis());
+        });
+
+        let outcome = super::interruptible_sleep_or_supersede(
+            Duration::from_secs(5),
+            &shutdown,
+            &abort,
+            &rx,
+            &bus,
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "in flight text".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
+            &pivoted_once,
+            Some((&arm, Some("client-a"))),
+        )
+        .await;
+        match outcome {
+            super::SleepOutcome::AbortedByDisarm(pending) => {
+                assert_eq!(
+                    pending.len(),
+                    1,
+                    "the already-siphoned TuneRequest must travel with the outcome, not be dropped"
+                );
+                assert!(matches!(
+                    pending[0].message_type,
+                    MessageType::TuneRequest { .. }
+                ));
+            }
+            other => panic!("expected AbortedByDisarm, got {other:?}"),
+        }
+    }
+
+    /// Round-8 review (Codex P2): a message that arrives in `tx_rx` AFTER
+    /// an earlier message was already siphoned, but BEFORE the disarm is
+    /// detected, is left untouched in the channel — `check_once` checks
+    /// disarm before it ever calls `try_recv()` again, so it returns
+    /// immediately without draining that later arrival.
+    ///
+    /// Round-9 review (Codex P1) moved the remainder-drain-and-merge OUT of
+    /// this function and into the CALLER (see `drain_and_merge_pending`,
+    /// exercised directly in `drain_and_merge_pending_preserves_arrival_order`
+    /// below) — draining here, before returning, reintroduced round-2's
+    /// original problem: under concurrent producers continually refilling
+    /// the channel, an unbounded `try_recv()` loop here could delay the
+    /// caller's first (safety-critical) PTT-off send indefinitely. So this
+    /// function's OWN contract is now narrower: `AbortedByDisarm` carries
+    /// only what was ALREADY siphoned before the disarm was detected —
+    /// nothing more — and this test pins exactly that (a later,
+    /// untouched-in-`tx_rx` arrival is correctly NOT included here; the
+    /// caller's own drain is responsible for merging it in afterward).
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_sleep_returns_only_already_siphoned_messages_on_abort_by_disarm() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let bus = crate::message_bus::MessageBus::new(16).unwrap();
+        let pivoted_once = std::collections::HashMap::new();
+
+        // Older message: siphoned on the very first (pre-sleep) poll tick.
+        tx.send(crate::message_bus::ComponentMessage::new(
+            crate::message_bus::ComponentId::Tui,
+            crate::message_bus::ComponentId::Ft8Transmitter,
+            MessageType::TuneRequest {
+                duration_secs: 5,
+                tone_offset_hz: 1000.0,
+            },
+            Instant::now(),
+        ))
+        .unwrap();
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut st = pancetta_agent::arm::ArmState::new();
+        st.arm(
+            pancetta_agent::arm::VerifiedArmGrant {
+                operator_callsign: "K5ARH".to_string(),
+                ttl_ms: 120_000,
+                scope_tx: true,
+                jti: "disarm-preserves-fifo-jti".to_string(),
+                client_key_id: "client-a".to_string(),
+            },
+            now_ms,
+        );
+        st.set_local_consent(true, now_ms);
+        let arm = Arc::new(std::sync::Mutex::new(st));
+
+        // Newer message: arrives at ~10ms, after the pre-sleep poll already
+        // ran (so it's NOT siphoned yet) but before the disarm at ~20ms —
+        // it sits untouched in `tx_rx` until the poll tick that discovers
+        // the disarm, which returns before ever draining it.
+        let tx_clone = tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            tx_clone
+                .send(crate::message_bus::ComponentMessage::new(
+                    crate::message_bus::ComponentId::Tui,
+                    crate::message_bus::ComponentId::Ft8Transmitter,
+                    MessageType::TuneRequest {
+                        duration_secs: 5,
+                        tone_offset_hz: 2000.0,
+                    },
+                    Instant::now(),
+                ))
+                .unwrap();
+        });
+
+        let arm_clone = arm.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            arm_clone
+                .lock()
+                .unwrap()
+                .disarm(chrono::Utc::now().timestamp_millis());
+        });
+
+        let outcome = super::interruptible_sleep_or_supersede(
+            Duration::from_secs(5),
+            &shutdown,
+            &abort,
+            &rx,
+            &bus,
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "in flight text".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
+            &pivoted_once,
+            Some((&arm, Some("client-a"))),
+        )
+        .await;
+        match outcome {
+            super::SleepOutcome::AbortedByDisarm(pending) => {
+                assert_eq!(
+                    pending.len(),
+                    1,
+                    "only the already-siphoned message travels with this function's own \
+                     outcome — the untouched remainder is the caller's responsibility \
+                     (drain_and_merge_pending), not this function's"
+                );
+                match &pending[0].message_type {
+                    MessageType::TuneRequest { tone_offset_hz, .. } => {
+                        assert_eq!(*tone_offset_hz, 1000.0)
+                    }
+                    other => panic!("expected TuneRequest, got {other:?}"),
+                }
+            }
+            other => panic!("expected AbortedByDisarm, got {other:?}"),
+        }
+    }
+
+    /// Round-9 review (Codex P1/P2): pins `drain_and_merge_pending`'s own
+    /// ordering contract directly — a pure, synchronous function, so no
+    /// timing games are needed. The caller invokes this AFTER sending
+    /// PTT off, appending whatever is currently sitting in `tx_rx` after
+    /// the already-siphoned prefix, preserving true arrival order.
+    #[test]
+    fn drain_and_merge_pending_preserves_arrival_order() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(crate::message_bus::ComponentMessage::new(
+            crate::message_bus::ComponentId::Tui,
+            crate::message_bus::ComponentId::Ft8Transmitter,
+            MessageType::TuneRequest {
+                duration_secs: 5,
+                tone_offset_hz: 2000.0,
+            },
+            Instant::now(),
+        ))
+        .unwrap();
+        tx.send(crate::message_bus::ComponentMessage::new(
+            crate::message_bus::ComponentId::Tui,
+            crate::message_bus::ComponentId::Ft8Transmitter,
+            MessageType::TuneRequest {
+                duration_secs: 5,
+                tone_offset_hz: 3000.0,
+            },
+            Instant::now(),
+        ))
+        .unwrap();
+
+        let already_siphoned = vec![ComponentMessage::new(
+            crate::message_bus::ComponentId::Tui,
+            crate::message_bus::ComponentId::Ft8Transmitter,
+            MessageType::TuneRequest {
+                duration_secs: 5,
+                tone_offset_hz: 1000.0,
+            },
+            Instant::now(),
+        )];
+
+        let pending = super::drain_and_merge_pending(&rx, already_siphoned);
+        let freqs: Vec<f64> = pending
+            .iter()
+            .map(|m| match &m.message_type {
+                MessageType::TuneRequest { tone_offset_hz, .. } => *tone_offset_hz,
+                other => panic!("expected TuneRequest, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            freqs,
+            vec![1000.0, 2000.0, 3000.0],
+            "already-siphoned content must precede whatever was still in tx_rx, \
+             in the channel's own FIFO order"
+        );
+    }
+
+    /// PAN-92: an already-keyed Remote transmission must be interrupted the
+    /// moment the arm stops permitting it (here: an explicit disarm fired by
+    /// a concurrent task partway through the sleep), not just have future
+    /// transmissions blocked.
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_sleep_aborts_by_disarm_when_remote_arm_disarms_mid_sleep() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let bus = crate::message_bus::MessageBus::new(16).unwrap();
+        let pivoted_once = std::collections::HashMap::new();
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut st = pancetta_agent::arm::ArmState::new();
+        st.arm(
+            pancetta_agent::arm::VerifiedArmGrant {
+                operator_callsign: "K5ARH".to_string(),
+                ttl_ms: 120_000,
+                scope_tx: true,
+                jti: "disarm-mid-sleep-jti".to_string(),
+                client_key_id: "client-a".to_string(),
+            },
+            now_ms,
+        );
+        st.set_local_consent(true, now_ms);
+        let arm = Arc::new(std::sync::Mutex::new(st));
+
+        let arm_clone = arm.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            arm_clone
+                .lock()
+                .unwrap()
+                .disarm(chrono::Utc::now().timestamp_millis());
+        });
+
+        let start = tokio::time::Instant::now();
+        let outcome = super::interruptible_sleep_or_supersede(
+            Duration::from_secs(5),
+            &shutdown,
+            &abort,
+            &rx,
+            &bus,
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "in flight text".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
+            &pivoted_once,
+            Some((&arm, Some("client-a"))),
+        )
+        .await;
+        assert!(
+            matches!(outcome, super::SleepOutcome::AbortedByDisarm(_)),
+            "expected AbortedByDisarm, got {outcome:?}"
+        );
+        // Should wake within the ~50ms poll granularity of the disarm (fired
+        // at ~20ms), not wait out the full 5s sleep.
+        assert!(start.elapsed() < Duration::from_millis(200));
+    }
+
+    /// Sibling of the above: a Local in-flight frame (`remote_tx_arm: None`)
+    /// must never be interrupted by the remote arm, even if it would deny —
+    /// byte-identical to pre-PAN-92 behavior for every non-remote TX.
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_sleep_ignores_arm_state_for_a_local_frame() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let bus = crate::message_bus::MessageBus::new(16).unwrap();
+        let pivoted_once = std::collections::HashMap::new();
+
+        let outcome = super::interruptible_sleep_or_supersede(
+            Duration::from_millis(80),
+            &shutdown,
+            &abort,
+            &rx,
+            &bus,
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "in flight text".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
+            &pivoted_once,
+            None, // Local frame: no arm to check
         )
         .await;
         assert!(matches!(outcome, super::SleepOutcome::Completed));
@@ -865,6 +1369,7 @@ mod interruptible_sleep_tests {
             qso_id: Some("qso-1".to_string()),
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
         tx.send(crate::message_bus::ComponentMessage::new(
             crate::message_bus::ComponentId::Autonomous,
@@ -886,6 +1391,7 @@ mod interruptible_sleep_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            None,
         )
         .await;
 
@@ -927,6 +1433,7 @@ mod interruptible_sleep_tests {
             qso_id: Some("qso-1".to_string()),
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
         tx.send(crate::message_bus::ComponentMessage::new(
             crate::message_bus::ComponentId::Autonomous,
@@ -948,6 +1455,7 @@ mod interruptible_sleep_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            None,
         )
         .await;
 
@@ -974,6 +1482,7 @@ mod interruptible_sleep_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            None,
         )
         .await;
         assert!(matches!(outcome, super::SleepOutcome::AbortedByShutdown));
@@ -1027,6 +1536,7 @@ mod interruptible_sleep_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            None,
         )
         .await;
 
@@ -1090,6 +1600,7 @@ mod interruptible_sleep_tests {
             qso_id: Some("qso-other1".to_string()),
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
         tx_sender
             .send(crate::message_bus::ComponentMessage::new(
@@ -1112,6 +1623,7 @@ mod interruptible_sleep_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            None,
         )
         .await;
 
@@ -1174,6 +1686,7 @@ mod interruptible_sleep_tests {
                         qso_id: Some(qso_id.to_string()),
                         tx_parity: None,
                         origin: crate::message_bus::TxOrigin::Local,
+                        remote_client_key_id: None,
                     },
                     std::time::Instant::now(),
                 ))
@@ -1196,6 +1709,7 @@ mod interruptible_sleep_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            None,
         )
         .await;
 
@@ -1251,6 +1765,7 @@ mod interruptible_sleep_tests {
             ],
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
         tx_sender
             .send(crate::message_bus::ComponentMessage::new(
@@ -1273,6 +1788,7 @@ mod interruptible_sleep_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            None,
         )
         .await;
 
@@ -1316,6 +1832,7 @@ mod interruptible_sleep_tests {
             }],
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
         tx_sender
             .send(crate::message_bus::ComponentMessage::new(
@@ -1338,6 +1855,7 @@ mod interruptible_sleep_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            None,
         )
         .await;
 
@@ -1390,6 +1908,7 @@ mod interruptible_sleep_tests {
                         qso_id: Some(qso_id.to_string()),
                         tx_parity: None,
                         origin: crate::message_bus::TxOrigin::Local,
+                        remote_client_key_id: None,
                     },
                     std::time::Instant::now(),
                 ))
@@ -1413,6 +1932,7 @@ mod interruptible_sleep_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            None,
         )
         .await;
 
@@ -2415,6 +2935,230 @@ pub fn remote_tx_permitted(
     }
 }
 
+/// Like [`remote_tx_permitted`], but additionally binds the check to a
+/// specific client (PAN-91).
+///
+/// The plain boolean arm gate above only asks "is *some* client currently
+/// armed?" — it has no way to tell whether the frame in hand is the one that
+/// specific client actually requested. Without this, a peer without TX-arm
+/// eligibility could get a `TxRequest`-originated QSO queued while the
+/// controller slot is free (creating the QSO is deliberately never gated —
+/// only transmission is), and if a DIFFERENT, legitimate peer later takes
+/// control and arms, the worker would authorize the pending frame from the
+/// FIRST peer, because the old gate only checked "is the shared `ArmState`
+/// armed", never "armed by the same client this frame is bound to".
+///
+/// `remote_client_key_id` is `None` for every producer that predates PAN-91
+/// (or has no client identity concept — e.g. the WSJT-X UDP bridge's own
+/// remote-TX path) and for those frames this degrades to exactly
+/// [`remote_tx_permitted`]'s boolean-only check, so existing non-station-agent
+/// remote-TX integrations are unaffected. `Some(id)` requires that `id` is
+/// the client `ArmState::armed_client_key_id()` currently reports — a
+/// mismatch (including "armed, but by someone else") denies fail-closed.
+pub fn remote_tx_permitted_for(
+    arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
+    now_ms: i64,
+    remote_client_key_id: Option<&str>,
+) -> bool {
+    match arm.lock() {
+        Ok(state) => {
+            if !state.tx_permitted(now_ms) {
+                return false;
+            }
+            match remote_client_key_id {
+                None => true,
+                Some(id) => state.armed_client_key_id() == Some(id),
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+/// One-time snapshot of the remote-TX arm's permission state, taken under a
+/// single lock acquisition, so a BATCH of entries (e.g. a coalesced
+/// backlog) can be evaluated against one consistent view instead of each
+/// entry re-locking `ArmState` separately (round-3 review, Codex P1).
+/// Per-entry re-locking left a TOCTOU window: if control transfers A→B→A
+/// between two entries' individual lock acquisitions within the same
+/// batch, both entries can pass their own check yet the batch's later
+/// single-identity fold only ever records one of them, silently
+/// authorizing the other under a mismatched identity.
+#[derive(Clone)]
+struct ArmSnapshot {
+    tx_permitted: bool,
+    armed_client_key_id: Option<String>,
+    /// Round-10 review (Codex P2): captured under the SAME lock as the
+    /// other two fields, so audit attribution for a denial this snapshot
+    /// decided can use this frozen value instead of re-locking the LIVE
+    /// `ArmState` later — the denial reporting this snapshot feeds is now
+    /// a detached `tokio::spawn`'d task, which can run arbitrarily later,
+    /// by which point a different operator (or the same one re-arming)
+    /// may have taken the arm. Re-locking at that point would attribute a
+    /// durable `TxDenied` record to whoever happens to be armed when the
+    /// task finally runs, not whoever was (or wasn't) armed when the
+    /// denial was actually decided.
+    operator_callsign: Option<String>,
+}
+
+impl ArmSnapshot {
+    fn take(
+        arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
+        now_ms: i64,
+    ) -> Self {
+        match arm.lock() {
+            Ok(state) => Self {
+                tx_permitted: state.tx_permitted(now_ms),
+                armed_client_key_id: state.armed_client_key_id().map(str::to_string),
+                operator_callsign: state.operator_callsign().map(str::to_string),
+            },
+            Err(_) => Self {
+                tx_permitted: false,
+                armed_client_key_id: None,
+                operator_callsign: None,
+            },
+        }
+    }
+
+    /// Mirrors [`remote_tx_permitted_for`]'s logic against this frozen
+    /// snapshot instead of a fresh lock.
+    fn permits(&self, remote_client_key_id: Option<&str>) -> bool {
+        if !self.tx_permitted {
+            return false;
+        }
+        match remote_client_key_id {
+            None => true,
+            Some(id) => self.armed_client_key_id.as_deref() == Some(id),
+        }
+    }
+
+    /// Round-3 review (Codex P2): true only when the frame would otherwise
+    /// be permitted (arm is up, heartbeat/TTL/consent/kill all clear) but
+    /// is bound to a DIFFERENT client than the one currently armed — as
+    /// opposed to every other denial cause (nobody armed, heartbeat lost,
+    /// TTL expired, local consent/kill), which is not an identity problem
+    /// at all and must not be reported as one.
+    fn is_identity_mismatch(&self, remote_client_key_id: Option<&str>) -> bool {
+        self.tx_permitted
+            && remote_client_key_id
+                .is_some_and(|id| self.armed_client_key_id.as_deref() != Some(id))
+    }
+
+    /// Round-10 review (Codex P2): mirrors [`tx_denied_operator_attribution`]'s
+    /// logic against this frozen snapshot instead of a fresh lock — see
+    /// this struct's `operator_callsign` field doc for why that matters
+    /// for detached denial reporting.
+    ///
+    /// Round-13 review (Codex P1): deliberately does NOT reuse
+    /// `is_identity_mismatch` — that predicate is gated on `tx_permitted`
+    /// (it exists to pick DENIAL-REASON WORDING: don't say "bound to a
+    /// different client" when the real cause is heartbeat/TTL/kill).
+    /// Attribution is a different question — "did A's frame get denied
+    /// while it's actually B who is bound here" — and must hold
+    /// independent of WHY the frame was denied: if nobody is currently
+    /// armed AND the frame is bound to a specific client, that client's
+    /// identity still differs from "nobody", so this must still refuse to
+    /// attribute the denial to whoever the (unrelated) armed_client_key_id
+    /// happens to be.
+    fn operator_attribution(&self, remote_client_key_id: Option<&str>) -> Option<String> {
+        let identity_differs =
+            remote_client_key_id.is_some_and(|id| self.armed_client_key_id.as_deref() != Some(id));
+        if identity_differs {
+            None
+        } else {
+            self.operator_callsign.clone()
+        }
+    }
+}
+
+/// Attribute a `TxDenied` audit record's `operator_callsign`, never to the
+/// CURRENTLY-armed operator when the denied frame is bound to a DIFFERENT
+/// client (PAN-91 identity mismatch) — that would misattribute an
+/// unauthorized request as if it came from whoever else happens to be
+/// armed, which is actively misleading in a durable security audit record.
+/// Falls back to the pre-PAN-91 attribution (whoever is armed, if anyone)
+/// for every other denial reason (not armed, heartbeat lost, TTL expired,
+/// local consent/kill) and for every frame with no bound identity at all.
+fn tx_denied_operator_attribution(
+    remote_tx_arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
+    remote_client_key_id: Option<&str>,
+) -> Option<String> {
+    remote_tx_arm.lock().ok().and_then(|s| {
+        let mismatched_identity =
+            remote_client_key_id.is_some_and(|id| s.armed_client_key_id() != Some(id));
+        if mismatched_identity {
+            None
+        } else {
+            s.operator_callsign().map(str::to_string)
+        }
+    })
+}
+
+/// PAN-92: shared diagnostic/audit/relay for a Remote transmission stopped
+/// by an arm re-check — mirrors the Step 0a pickup-time drop's dispensa
+/// Q-0051 Phase A/B/C signals (TUI diagnostic, `AuditKind::TxDenied`, and a
+/// client-visible `error` event) so the interruption is exactly as visible
+/// as a pickup-time one, whether it happens mid-flight
+/// ([`SleepOutcome::AbortedByDisarm`]) or at the last-instant pre-PTT
+/// recheck (round-2 review: the arm can go stale in the gap between
+/// Step 4b-arm and the actual `SetPtt` send).
+///
+/// `diagnostic_verb` and `denial_reason` are caller-supplied rather than
+/// built in here, since the wording differs by call site ("interrupted" for
+/// a transmission already on the air vs. "denied" for one PTT hasn't
+/// asserted for yet — reusing "disarmed mid-transmission" verbatim for the
+/// latter would be factually wrong).
+///
+/// PAN-91 review follow-up: for an in-flight interruption, the CALLER must
+/// send PTT off and disarm its `PttGuard` BEFORE calling this — every step
+/// here awaits (diagnostic, synchronous audit-log I/O, relay), and delaying
+/// PTT release behind that work leaves a disarmed remote transmission keyed
+/// longer than necessary. Not applicable to a pre-PTT denial (PTT was never
+/// asserted).
+#[allow(clippy::too_many_arguments)]
+async fn emit_disarm_interrupt_signals(
+    message_bus: &MessageBus,
+    audit_log: &pancetta_agent::audit::AuditLog,
+    display_feed_enabled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    // Round-12 review (Codex P2): the CALLER captures this at the denial
+    // check itself — before this function's own `emit_diagnostic` await —
+    // rather than this function re-locking the live `ArmState` after that
+    // await. If the arm is absent/expired at the denial point and a
+    // client then arms (or takes control) while `emit_diagnostic` is
+    // pending, re-locking here would attribute the durable `TxDenied`
+    // record to that LATER arm state, not the one that actually rejected
+    // the frame. Mirrors `ArmSnapshot::operator_callsign`'s identical
+    // reasoning for the coalescer's own (already detached) denial path.
+    operator_callsign: Option<String>,
+    diagnostic_verb: &str,
+    denial_reason: String,
+    qso_id: Option<&str>,
+) {
+    emit_diagnostic(
+        message_bus,
+        "agent.tx",
+        pancetta_core::DiagnosticLevel::Warn,
+        format!("Remote TX {diagnostic_verb} ({denial_reason})"),
+        qso_id,
+    )
+    .await;
+    audit_log.append(&pancetta_agent::audit::AuditEvent {
+        ts_unix_ms: chrono::Utc::now().timestamp_millis(),
+        kind: pancetta_agent::audit::AuditKind::TxDenied,
+        operator_callsign,
+        detail: denial_reason.clone(),
+    });
+    super::remote_gateway::relay_to_gateway(
+        message_bus,
+        display_feed_enabled,
+        ComponentId::Ft8Transmitter,
+        MessageType::TxDenied {
+            reason: denial_reason,
+            qso_id: qso_id.map(str::to_string),
+        },
+    )
+    .await;
+}
+
 /// Encode a text message to transmission symbols for the active protocol.
 ///
 /// **FT8 is byte-identical to the legacy path**: `Protocol::Ft8` calls the exact
@@ -2533,6 +3277,10 @@ pub struct CoalesceEntry {
     /// `Remote`, the emitted request/bundle is `Remote` (the arm gate applies
     /// to the whole bundle; fail-safe). Defaults to `Local`.
     pub origin: crate::message_bus::TxOrigin,
+    /// The client this entry's request is bound to, iff `origin == Remote`
+    /// (PAN-91). Threaded through the coalescer alongside `origin` — see
+    /// `MessageType::TransmitRequest::remote_client_key_id`.
+    pub remote_client_key_id: Option<String>,
 }
 
 /// Result of draining + coalescing a backlog of `TransmitRequest`s.
@@ -2945,12 +3693,16 @@ pub fn coalesce_transmit_requests(
 ///
 /// A `tx.policy` warning is logged whenever anything was coalesced, dropped, or
 /// truncated, so silent backlog reduction is always operator-visible.
+#[allow(clippy::too_many_arguments)]
 async fn coalesce_backlog_into(
     head: MessageType,
     tx_rx: &crossbeam_channel::Receiver<ComponentMessage>,
     message_bus: &MessageBus,
     active_tx_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
     max_concurrent_qsos: u32,
+    remote_tx_arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
+    audit_log: &pancetta_agent::audit::AuditLog,
+    display_feed_enabled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> MessageType {
     // Decompose the head into a CoalesceEntry. (Caller guarantees the variant.)
     let head_entry = match head {
@@ -2960,12 +3712,14 @@ async fn coalesce_backlog_into(
             qso_id,
             tx_parity,
             origin,
+            remote_client_key_id,
         } => CoalesceEntry {
             message_text,
             frequency_offset,
             qso_id,
             tx_parity,
             origin,
+            remote_client_key_id,
         },
         // Defensive: not a TransmitRequest — hand it back unchanged.
         other => return other,
@@ -2982,6 +3736,7 @@ async fn coalesce_backlog_into(
                 qso_id,
                 tx_parity,
                 origin,
+                remote_client_key_id,
             } => {
                 drained.push(CoalesceEntry {
                     message_text,
@@ -2989,6 +3744,7 @@ async fn coalesce_backlog_into(
                     qso_id,
                     tx_parity,
                     origin,
+                    remote_client_key_id,
                 });
             }
             _ => {
@@ -3014,20 +3770,163 @@ async fn coalesce_backlog_into(
         }
     }
 
-    // Fast path: only the head was present — nothing to coalesce.
-    if drained.len() == 1 {
-        let e = drained.into_iter().next().expect("len == 1");
+    // PAN-91 review follow-up: filter out any drained entry that is
+    // Remote-origin and bound to a DIFFERENT client than the one currently
+    // armed, BEFORE `coalesce_transmit_requests` applies its cap/dedup
+    // selection — NOT after (round 2, Codex P2). Filtering after allowed a
+    // stale, no-longer-authorized entry (e.g. from a controller that has
+    // since been disarmed) to occupy a cap slot ahead of the currently
+    // -authorized entry in FIFO order, only for the identity filter to
+    // remove it afterward — discarding the authorized entry for no reason,
+    // since the capacity it needed was never really unavailable to it.
+    // Filtering here, on the raw drained list, means `coalesce_transmit_requests`
+    // only ever competes authorized entries against each other.
+    //
+    // Without this filter at all, control transferring from client A to
+    // client B mid-session (A's still-active QSO keeps rearming while B
+    // starts new ones) could put both A-bound and B-bound entries in the
+    // same backlog; the bundle fold picks ONE representative identity for
+    // the whole bundle, so a B-bound entry landing first while B is armed
+    // would silently authorize A's frame too. Filtering per-entry here —
+    // using each entry's OWN bound identity, exactly like the TX worker's
+    // real per-frame gate — closes that gap.
+    // Round-3 review (Codex P1): ONE arm snapshot for the WHOLE partition,
+    // not a fresh lock per entry — see [`ArmSnapshot`]'s doc for the TOCTOU
+    // this closes.
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let arm_snapshot = ArmSnapshot::take(remote_tx_arm, now_ms);
+    let (admitted, identity_denied): (Vec<_>, Vec<_>) = drained.into_iter().partition(|e| {
+        e.origin != crate::message_bus::TxOrigin::Remote
+            || arm_snapshot.permits(e.remote_client_key_id.as_deref())
+    });
+    // (round 2, Codex P2): route through the SAME diagnostic + durable
+    // audit + client-visible relay every other arm-gate rejection uses
+    // (dispensa Q-0051), not just a log line + TransmitComplete — an
+    // attempted cross-client transmission must stay visible in the
+    // security audit trail exactly like a pickup-time or mid-flight one.
+    //
+    // Round-9 review (Codex P2): this reporting is now DETACHED
+    // (`tokio::spawn`), not awaited inline — a large backlog left behind
+    // by a since-disarmed controller could otherwise force this function
+    // to await a diagnostic + synchronous audit-file write + relay + bus
+    // send PER denied entry before ever returning the admitted frame to
+    // its caller, delaying that frame's own key-time gates by however
+    // long the stale backlog happened to be. The admitted result no
+    // longer waits on how much (or how slowly) denied traffic there is to
+    // report.
+    if !identity_denied.is_empty() {
+        let message_bus = message_bus.clone();
+        let audit_log = audit_log.clone();
+        let display_feed_enabled = display_feed_enabled.clone();
+        let arm_snapshot = arm_snapshot.clone();
+        tokio::spawn(async move {
+            for entry in &identity_denied {
+                // Round-3 review (Codex P2): only say "bound to a
+                // different client" when that's actually why this entry
+                // was denied — every other gate failure (nobody armed,
+                // heartbeat lost, TTL expired, local consent/kill) is a
+                // real safety event but not an identity problem, and
+                // reporting it as one obscures what actually happened in
+                // a durable security audit record.
+                let denial_reason = if arm_snapshot
+                    .is_identity_mismatch(entry.remote_client_key_id.as_deref())
+                {
+                    format!(
+                            "bound to a different client than the one currently armed: '{}' at {:.0} Hz",
+                            entry.message_text, entry.frequency_offset
+                        )
+                } else {
+                    format!(
+                        "remote TX not currently permitted: '{}' at {:.0} Hz",
+                        entry.message_text, entry.frequency_offset
+                    )
+                };
+                emit_diagnostic(
+                    &message_bus,
+                    "agent.tx",
+                    pancetta_core::DiagnosticLevel::Warn,
+                    format!("Remote TX denied ({denial_reason})"),
+                    entry.qso_id.as_deref(),
+                )
+                .await;
+                audit_log.append(&pancetta_agent::audit::AuditEvent {
+                    // Round-11 review (Codex P2): the denial-time instant
+                    // (the SAME `now_ms` `arm_snapshot` was taken under),
+                    // not a fresh timestamp read whenever this detached
+                    // task happens to actually run — a task delayed behind
+                    // executor load or a large earlier backlog would
+                    // otherwise timestamp entries AFTER later, unrelated
+                    // arm/disarm events actually occurred, corrupting the
+                    // audit trail's own chronological order.
+                    ts_unix_ms: now_ms,
+                    kind: pancetta_agent::audit::AuditKind::TxDenied,
+                    // Round-10 review (Codex P2): attribute from the
+                    // FROZEN snapshot, not a fresh lock — see
+                    // `ArmSnapshot::operator_callsign`'s doc for why this
+                    // detached task must not re-lock the live `ArmState`.
+                    operator_callsign: arm_snapshot
+                        .operator_attribution(entry.remote_client_key_id.as_deref()),
+                    detail: denial_reason.clone(),
+                });
+                super::remote_gateway::relay_to_gateway(
+                    &message_bus,
+                    &display_feed_enabled,
+                    ComponentId::Ft8Transmitter,
+                    MessageType::TxDenied {
+                        reason: denial_reason,
+                        qso_id: entry.qso_id.clone(),
+                    },
+                )
+                .await;
+                let complete_msg = ComponentMessage::new(
+                    ComponentId::Ft8Transmitter,
+                    ComponentId::Autonomous,
+                    MessageType::TransmitComplete {
+                        success: false,
+                        message_text: entry.message_text.clone(),
+                        duration_ms: 0,
+                        qso_id: entry.qso_id.clone(),
+                    },
+                    Instant::now(),
+                );
+                if let Err(e) = message_bus.send_message(complete_msg).await {
+                    warn!(
+                        "Failed to send TransmitComplete for an identity-denied stream: {}",
+                        e
+                    );
+                }
+            }
+        });
+    }
+
+    // Every drained entry was identity-denied. Hand back an empty
+    // MultiTransmitRequest, matching the existing "every drained request
+    // belonged to an ended QSO" empty-backlog outcome below.
+    if admitted.is_empty() {
+        return MessageType::MultiTransmitRequest {
+            items: Vec::new(),
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
+        };
+    }
+
+    // Fast path: only one entry survived identity filtering — nothing left
+    // to coalesce.
+    if admitted.len() == 1 {
+        let e = admitted.into_iter().next().expect("len == 1");
         return MessageType::TransmitRequest {
             message_text: e.message_text,
             frequency_offset: e.frequency_offset,
             qso_id: e.qso_id,
             tx_parity: e.tx_parity,
             origin: e.origin,
+            remote_client_key_id: e.remote_client_key_id,
         };
     }
 
-    let backlog_total = drained.len();
-    let outcome = coalesce_transmit_requests(drained, max_concurrent_qsos, |id| {
+    let backlog_total = admitted.len();
+    let outcome = coalesce_transmit_requests(admitted, max_concurrent_qsos, |id| {
         tx_qso_is_live(id, active_tx_qsos)
     });
 
@@ -3093,6 +3992,7 @@ async fn coalesce_backlog_into(
             items: Vec::new(),
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
     }
 
@@ -3105,6 +4005,7 @@ async fn coalesce_backlog_into(
             qso_id: e.qso_id,
             tx_parity: e.tx_parity,
             origin: e.origin,
+            remote_client_key_id: e.remote_client_key_id,
         };
     }
 
@@ -3130,6 +4031,23 @@ async fn coalesce_backlog_into(
     } else {
         crate::message_bus::TxOrigin::Local
     };
+    // PAN-91: mirror the origin fold for client identity. `find_map`, NOT
+    // `find().and_then()` (round 2, Codex P1): a `None`-bound legacy Remote
+    // entry (the WSJT-X UDP bridge's own path, which has no client identity
+    // concept) can legitimately sit alongside a bound entry in the same
+    // retained set — by this point every bound entry has already been
+    // filtered to agree with the currently-armed client (see the identity
+    // filter above), so ANY `Some` found here is safe to use for the whole
+    // bundle. `find().and_then()` instead stops at the FIRST Remote entry
+    // regardless of whether it's bound, so an unbound entry appearing
+    // before a bound one would erase the bound identity and fold the whole
+    // bundle down to the boolean-only `None` check — silently re-opening
+    // the PAN-91 gap for whichever entry actually needed the identity bind.
+    let bundle_remote_client_key_id = outcome
+        .retained
+        .iter()
+        .filter(|e| e.origin == crate::message_bus::TxOrigin::Remote)
+        .find_map(|e| e.remote_client_key_id.clone());
     let items = outcome
         .retained
         .into_iter()
@@ -3143,6 +4061,7 @@ async fn coalesce_backlog_into(
         items,
         tx_parity: bundle_parity,
         origin: bundle_origin,
+        remote_client_key_id: bundle_remote_client_key_id,
     }
 }
 
@@ -3235,6 +4154,11 @@ enum SupersedeOutcome {
         /// origin and skipped the key-time arm gate entirely; the reverse —
         /// `Local` superseding `Remote` — wrongly kept gating a local frame.)
         origin: crate::message_bus::TxOrigin,
+        /// The NEW superseding request's OWN `remote_client_key_id` — carried
+        /// alongside `origin` for the same reason (PAN-91): the re-keyed
+        /// frame's arm-gate check at key-time must bind to THIS request's
+        /// client, not the aborted in-flight frame's.
+        remote_client_key_id: Option<String>,
         /// PAN-38 round 4 (Codex): the NEW superseding request's OWN
         /// `qso_id` — `message_text`/`frequency_offset`/`schedule` are
         /// mutated in place to the new request, but the caller's working
@@ -3248,6 +4172,37 @@ enum SupersedeOutcome {
         /// caller must overwrite its `qso_id` local with this value
         /// alongside `origin`.
         qso_id: Option<String>,
+        /// Codex P1, PR #362 round 18: `Replace` is returned for TWO
+        /// unrelated reasons — a genuine over-capacity/frequency-collision
+        /// fallback (single-TX callers and the multi-TX over-cap path both
+        /// correctly abandon the in-flight side and key only the new
+        /// request), and a multi-TX identity conflict (the in-flight bundle
+        /// and the new request are both Remote but bound to DIFFERENT
+        /// clients, so folding them would authorize one client's frame via
+        /// the other's bundle-level check). The multi-TX caller
+        /// (`supersede_multi_reenqueue`) previously treated every `Replace`
+        /// as over-capacity and PRESERVED the in-flight bundle while
+        /// dropping the new request — correct for over-capacity (the new
+        /// request's own cadence retries later), but wrong for an identity
+        /// conflict caused by a legitimate control transfer: the stale
+        /// bundle is re-enqueued only to be rejected later against the new
+        /// arm anyway, while the fresher, currently-authorized new request
+        /// (e.g. a closing frame) is discarded and never retried. This flag
+        /// lets that caller tell the two cases apart; single-TX callers
+        /// ignore it since they always key the new request either way.
+        identity_conflict: bool,
+        /// Codex P1, PR #362 round 19: the NEW superseding request's OWN
+        /// `tx_parity`. Single-TX callers re-key via the already-mutated
+        /// `schedule` (resolved from this same value earlier in this
+        /// function) and don't need it separately, but the multi-TX arm's
+        /// identity-conflict path builds a fresh `TransmitRequest` from
+        /// scratch to re-enqueue — hardcoding `None` there let the next
+        /// dequeue's `TxSelfParity::Auto` recompute the nearest slot instead
+        /// (normally the opposite slot, since this fires mid-playback inside
+        /// the abandoned bundle's own slot), transmitting in sequential
+        /// windows over the DX's expected reply instead of the QSO's own
+        /// latched parity.
+        tx_parity: Option<pancetta_core::slot::SlotParity>,
     },
     /// Bundle-add is viable. The caller encodes `items` via
     /// `encode_and_modulate_multi_tx`; on success it re-enqueues a
@@ -3263,11 +4218,17 @@ enum SupersedeOutcome {
         /// `Remote`, so a mixed-origin fold is still gated by the bundle arm
         /// gate. Mirrors the coalescer's fail-safe origin fold.
         bundle_origin: crate::message_bus::TxOrigin,
+        /// Folded client identity mirroring `bundle_origin` (PAN-91) — see
+        /// `coalesce_backlog_into`'s `bundle_remote_client_key_id` for the
+        /// same fold logic and its defense-in-depth caveat.
+        bundle_remote_client_key_id: Option<String>,
         /// The NEW request's OWN origin — used when the caller falls back to a
         /// single-item replace on a frequency collision (that fallback drops
         /// the in-flight item and transmits ONLY the new one, so it must gate
         /// with the new request's own origin, not the folded bundle origin).
         new_origin: crate::message_bus::TxOrigin,
+        /// The NEW request's OWN `remote_client_key_id`, mirroring `new_origin`.
+        new_remote_client_key_id: Option<String>,
     },
 }
 
@@ -3287,6 +4248,7 @@ async fn supersede_and_rekey_or_bundle(
     _request_received_at: chrono::DateTime<chrono::Utc>,
     max_concurrent_qsos: u32,
     in_flight_origin: crate::message_bus::TxOrigin,
+    in_flight_remote_client_key_id: Option<String>,
     in_flight_items: &[crate::message_bus::TransmitRequestItem],
 ) -> SupersedeOutcome {
     // Deassert PTT immediately and UNCONDITIONALLY — before we even inspect the
@@ -3318,6 +4280,7 @@ async fn supersede_and_rekey_or_bundle(
         tx_parity: new_tx_parity,
         qso_id: new_qso_id,
         origin: new_origin,
+        remote_client_key_id: new_remote_client_key_id,
     } = new_request
     else {
         // A `MultiTransmitRequest` arriving as the superseding message isn't
@@ -3369,6 +4332,7 @@ async fn supersede_and_rekey_or_bundle(
     // frequency-separation check (>= ~75 Hz for FT8) lives inside
     // `encode_and_modulate_multi_tx`; the caller runs it and falls back to the
     // single-item `Replace` mutation above on a collision.
+    let mut replace_is_identity_conflict = false;
     if max_concurrent_qsos > 1 {
         // PAN-73 round 5 (Codex): REPLACE the matching in-flight item, don't
         // append alongside it. A same-QSO, different-frequency candidate
@@ -3410,7 +4374,36 @@ async fn supersede_and_rekey_or_bundle(
             .iter()
             .filter(|it| it.qso_id.is_some())
             .count();
-        if qso_count <= max_concurrent_qsos as usize
+        // PAN-91 review follow-up: if BOTH sides are Remote and bound to
+        // DIFFERENT clients, folding them into one bundle would let a
+        // single bundle-level identity check authorize the other side's
+        // frame by proxy — exactly the gap the coalescer's own per-entry
+        // filter closes for a drained backlog. This function only ever
+        // sees TWO identities (the whole in-flight side's, and the new
+        // item's own), so a genuine conflict is a straight inequality
+        // check: `None` on either side means "no bound identity" (a
+        // pre-PAN-91 producer, degrades to the boolean-only gate) and is
+        // never itself a conflict. On a real conflict, refuse to bundle —
+        // fall through to the existing over-capacity path below, which
+        // abandons the in-flight side and replaces it with just the new
+        // request; the retry loop's own key-time gate re-verifies the new
+        // request's identity independently before it actually keys.
+        let identity_conflict = in_flight_origin == crate::message_bus::TxOrigin::Remote
+            && new_origin == crate::message_bus::TxOrigin::Remote
+            && matches!(
+                (&in_flight_remote_client_key_id, &new_remote_client_key_id),
+                (Some(a), Some(b)) if a != b
+            );
+        if identity_conflict {
+            warn!(
+                target: "pancetta::tx.policy",
+                "supersede: not bundling — in-flight stream is bound to a different \
+                 remote client ({:?}) than the new request ({:?}); replacing the \
+                 in-flight transmission with just the new request instead",
+                in_flight_remote_client_key_id, new_remote_client_key_id
+            );
+            replace_is_identity_conflict = true;
+        } else if qso_count <= max_concurrent_qsos as usize
             && candidate_items.len() <= MAX_RETAINED_TX_STREAMS
         {
             // Fail-safe origin fold: the bundle carries BOTH the in-flight
@@ -3422,27 +4415,40 @@ async fn supersede_and_rekey_or_bundle(
             } else {
                 crate::message_bus::TxOrigin::Local
             };
+            // PAN-91: mirror the origin fold — prefer whichever side is
+            // actually Remote. Safe to pick either non-`None` identity now
+            // that `identity_conflict` above has already ruled out the two
+            // sides disagreeing.
+            let bundle_remote_client_key_id = in_flight_remote_client_key_id
+                .clone()
+                .or_else(|| new_remote_client_key_id.clone());
             return SupersedeOutcome::Bundle {
                 items: candidate_items,
                 bundle_origin,
+                bundle_remote_client_key_id,
                 new_origin,
+                new_remote_client_key_id,
             };
+        } else {
+            info!(
+                target: "pancetta::tx.policy",
+                "supersede: not bundling — {} QSO-keyed stream(s) of {} total would exceed \
+                 max_concurrent_qsos={} (hard cap {}); replacing the in-flight transmission \
+                 with just the new request instead",
+                qso_count,
+                candidate_items.len(),
+                max_concurrent_qsos,
+                MAX_RETAINED_TX_STREAMS
+            );
         }
-        info!(
-            target: "pancetta::tx.policy",
-            "supersede: not bundling — {} QSO-keyed stream(s) of {} total would exceed \
-             max_concurrent_qsos={} (hard cap {}); replacing the in-flight transmission \
-             with just the new request instead",
-            qso_count,
-            candidate_items.len(),
-            max_concurrent_qsos,
-            MAX_RETAINED_TX_STREAMS
-        );
     }
 
     SupersedeOutcome::Replace {
         origin: new_origin,
+        remote_client_key_id: new_remote_client_key_id,
         qso_id: new_qso_id,
+        identity_conflict: replace_is_identity_conflict,
+        tx_parity: new_tx_parity,
     }
 }
 
@@ -3477,6 +4483,7 @@ async fn supersede_multi_reenqueue(
     new_request: MessageType,
     in_flight_items: &[crate::message_bus::TransmitRequestItem],
     origin: crate::message_bus::TxOrigin,
+    remote_client_key_id: Option<String>,
     // The in-flight bundle's OWN `tx_parity` (from its `MultiTransmitRequest`
     // message) — threaded through so a `Replace` outcome that preserves this
     // bundle unchanged (see that arm below) carries the SAME parity forward,
@@ -3540,6 +4547,7 @@ async fn supersede_multi_reenqueue(
         request_received_at,
         max_concurrent_qsos,
         origin,
+        remote_client_key_id.clone(),
         in_flight_items,
     )
     .await
@@ -3571,7 +4579,9 @@ async fn supersede_multi_reenqueue(
         SupersedeOutcome::Bundle {
             items,
             bundle_origin,
+            bundle_remote_client_key_id,
             new_origin,
+            new_remote_client_key_id,
         } => {
             let bundle_outcome =
                 encode_and_modulate_multi_tx(encoder, active_protocol, tx_params, &items);
@@ -3593,6 +4603,7 @@ async fn supersede_multi_reenqueue(
                         // bundle's origin — otherwise a Remote item folded onto a
                         // Local in-flight bundle would re-enter ungated.
                         origin: bundle_origin,
+                        remote_client_key_id: bundle_remote_client_key_id,
                     },
                     Instant::now(),
                 )
@@ -3614,6 +4625,7 @@ async fn supersede_multi_reenqueue(
                         qso_id: new_item.qso_id,
                         tx_parity: None,
                         origin: new_origin,
+                        remote_client_key_id: new_remote_client_key_id,
                     },
                     Instant::now(),
                 )
@@ -3626,23 +4638,78 @@ async fn supersede_multi_reenqueue(
             }
         }
         SupersedeOutcome::Replace {
-            // Round 6: no longer re-enqueued (see below), so the superseding
-            // request's own origin has nothing left to gate.
-            origin: _new_origin,
+            origin: new_origin,
+            remote_client_key_id: new_remote_client_key_id,
             qso_id: new_qso_id,
+            identity_conflict,
+            tx_parity: new_tx_parity,
         } => {
+            // Codex P1, PR #362 round 18: an `identity_conflict` Replace
+            // means control legitimately transferred (the in-flight bundle
+            // and the new request are both Remote but bound to DIFFERENT
+            // clients) — NOT over-capacity. Re-enqueuing the stale in-flight
+            // bundle here is actively harmful in that case: it will only be
+            // rejected later against the NEW client's arm anyway, and
+            // meanwhile the fresher, currently-authorized new request (e.g.
+            // a closing frame from the client that now legitimately holds
+            // the arm) would be the one silently discarded. Treat this
+            // exactly like the single-TX arm's ordinary Replace: abandon the
+            // in-flight side and key only the new request. This can't
+            // recreate the round-6 livelock (below) — nothing gets
+            // re-enqueued for the worker's next dequeue to immediately
+            // collide with.
+            if identity_conflict {
+                for item in in_flight_items {
+                    let complete_msg = ComponentMessage::new(
+                        ComponentId::Ft8Transmitter,
+                        ComponentId::Autonomous,
+                        MessageType::TransmitComplete {
+                            success: false,
+                            message_text: item.message_text.clone(),
+                            duration_ms: 0,
+                            qso_id: item.qso_id.clone(),
+                        },
+                        Instant::now(),
+                    );
+                    if let Err(e) = message_bus.send_message(complete_msg).await {
+                        warn!("Failed to send TransmitComplete: {}", e);
+                    }
+                }
+                let reenqueue = ComponentMessage::new(
+                    ComponentId::Ft8Transmitter,
+                    ComponentId::Ft8Transmitter,
+                    MessageType::TransmitRequest {
+                        message_text: scratch_text,
+                        frequency_offset: scratch_freq,
+                        qso_id: new_qso_id,
+                        tx_parity: new_tx_parity,
+                        origin: new_origin,
+                        remote_client_key_id: new_remote_client_key_id,
+                    },
+                    Instant::now(),
+                );
+                if let Err(e) = message_bus.send_message(reenqueue).await {
+                    warn!(
+                        "supersede (multi-TX): failed to re-enqueue the identity-conflict \
+                         replacement request: {}",
+                        e
+                    );
+                }
+                return;
+            }
+
             // PR #348 review round 2 (Codex P2): the multi-TX arm's in-flight
             // item is ALWAYS a real bundle (`in_flight_items.len() >= 2` —
             // this function is only reached from the multi-TX arm), so a
-            // `Replace` outcome here can only mean the candidate bundle
-            // would have exceeded `max_concurrent_qsos` (a frequency
-            // collision instead produces a `Bundle` whose caller falls back
-            // to a single-item re-enqueue in the arm above, never `Replace`).
-            // Silently dropping every previously-admitted bundle item to
-            // make room for one new request would burn all of their recorded
-            // attempts for nothing. Preserve the in-flight bundle unchanged
-            // (re-encoding happens fresh at pickup time, so there's no
-            // staleness concern).
+            // non-identity-conflict `Replace` outcome here can only mean the
+            // candidate bundle would have exceeded `max_concurrent_qsos` (a
+            // frequency collision instead produces a `Bundle` whose caller
+            // falls back to a single-item re-enqueue in the arm above, never
+            // `Replace`). Silently dropping every previously-admitted bundle
+            // item to make room for one new request would burn all of their
+            // recorded attempts for nothing. Preserve the in-flight bundle
+            // unchanged (re-encoding happens fresh at pickup time, so
+            // there's no staleness concern).
             if !in_flight_items.is_empty() {
                 let preserve = ComponentMessage::new(
                     ComponentId::Ft8Transmitter,
@@ -3651,6 +4718,7 @@ async fn supersede_multi_reenqueue(
                         items: in_flight_items.to_vec(),
                         tx_parity: bundle_tx_parity,
                         origin,
+                        remote_client_key_id: remote_client_key_id.clone(),
                     },
                     Instant::now(),
                 );
@@ -4064,6 +5132,9 @@ impl super::ApplicationCoordinator {
                                         &fox_mode,
                                         &fox_max_streams,
                                     ),
+                                    &remote_tx_arm,
+                                    &audit_log,
+                                    &display_feed_enabled,
                                 )
                                 .await;
 
@@ -4110,6 +5181,9 @@ impl super::ApplicationCoordinator {
                                     // origin, so Step 4b-arm's key-time gate re-evaluates
                                     // against the frame actually about to transmit (C1 fix).
                                     mut origin,
+                                    // `mut`: mirrors `origin` above (PAN-91) — re-pointed
+                                    // alongside it on a `Replace` supersede.
+                                    mut remote_client_key_id,
                                 } => {
                                     info!(
                                         "Transmit request: '{}' at offset {:.0} Hz (qso: {:?})",
@@ -4227,9 +5301,10 @@ impl super::ApplicationCoordinator {
                                     // arms it and no Remote request is constructed, so
                                     // this branch is never taken.
                                     if origin == crate::message_bus::TxOrigin::Remote
-                                        && !remote_tx_permitted(
+                                        && !remote_tx_permitted_for(
                                             &remote_tx_arm,
                                             chrono::Utc::now().timestamp_millis(),
+                                            remote_client_key_id.as_deref(),
                                         )
                                     {
                                         warn!(
@@ -4258,8 +5333,9 @@ impl super::ApplicationCoordinator {
                                         audit_log.append(&pancetta_agent::audit::AuditEvent {
                                             ts_unix_ms: chrono::Utc::now().timestamp_millis(),
                                             kind: pancetta_agent::audit::AuditKind::TxDenied,
-                                            operator_callsign: remote_tx_arm.lock().ok().and_then(
-                                                |s| s.operator_callsign().map(str::to_string),
+                                            operator_callsign: tx_denied_operator_attribution(
+                                                &remote_tx_arm,
+                                                remote_client_key_id.as_deref(),
                                             ),
                                             detail: denial_reason.clone(),
                                         });
@@ -4635,16 +5711,35 @@ impl super::ApplicationCoordinator {
                                         // the dead-man/TTL/local-kill guarantees hold across
                                         // the pre-PTT sleep. Local requests are never gated.
                                         if origin == crate::message_bus::TxOrigin::Remote
-                                            && !remote_tx_permitted(
+                                            && !remote_tx_permitted_for(
                                                 &remote_tx_arm,
                                                 chrono::Utc::now().timestamp_millis(),
+                                                remote_client_key_id.as_deref(),
                                             )
                                         {
-                                            info!(
-                                                target: "agent.tx",
-                                                "dropping remote TX at key-time — arm went stale during slot wait: '{}' (qso: {:?})",
-                                                message_text, qso_id
+                                            // Round-3 review (Codex P2): route through the
+                                            // shared denial-signaling helper — a log line +
+                                            // TransmitComplete alone left this key-time
+                                            // cross-client rejection with no TxDenied audit
+                                            // record, diagnostic, or client relay, unlike
+                                            // every other arm-gate denial.
+                                            let denial_reason = format!(
+                                                "arm went stale during slot wait: '{message_text}' at {frequency_offset:.0} Hz"
                                             );
+                                            let operator_callsign = tx_denied_operator_attribution(
+                                                &remote_tx_arm,
+                                                remote_client_key_id.as_deref(),
+                                            );
+                                            emit_disarm_interrupt_signals(
+                                                &message_bus,
+                                                &audit_log,
+                                                &display_feed_enabled,
+                                                operator_callsign,
+                                                "denied",
+                                                denial_reason,
+                                                qso_id.as_deref(),
+                                            )
+                                            .await;
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
                                             let complete_msg = ComponentMessage::new(
@@ -4762,6 +5857,12 @@ impl super::ApplicationCoordinator {
                                             (audio_out.len() as f64 / sample_rate as f64 * 1000.0)
                                                 as u64;
 
+                                        // Round-6 review (Codex P2): tracks the
+                                        // `pivoted_once` key Step 4c inserts below (if it
+                                        // pivots this cycle) so Step 4d-arm's denial branch
+                                        // can remove it — see that branch for why.
+                                        let mut pivoted_this_key: Option<String> = None;
+
                                         // --- Step 4c: late pivot to the freshest message ---
                                         // Our decoder finishes ~1.8s BEFORE the slot
                                         // boundary, but a fresher decode for THIS QSO can
@@ -4786,12 +5887,21 @@ impl super::ApplicationCoordinator {
                                                     qso_id.as_deref(),
                                                     &message_text,
                                                     frequency_offset,
+                                                    // Round-5 review (Codex P1): an
+                                                    // authorization-only rebind (identical
+                                                    // resend text/offset, different
+                                                    // origin/client) must count as a pivot
+                                                    // too — see `tx_pivot_target`'s doc.
+                                                    Some((origin, remote_client_key_id.as_deref())),
                                                     &m,
                                                 )
                                             })
                                         {
                                             let new_text = intent.message_text;
                                             let new_freq = intent.frequency_offset;
+                                            let new_origin = intent.origin;
+                                            let new_remote_client_key_id =
+                                                intent.remote_client_key_id;
                                             // TX-F4: protocol-aware re-encode/re-modulate
                                             // (mirrors Step 1's `encode_for_protocol` /
                                             // `modulate_for_protocol` call above) — the
@@ -4849,6 +5959,17 @@ impl super::ApplicationCoordinator {
                                                     message_text = new_text;
                                                     frequency_offset = new_freq;
                                                     audio_out = rebuilt;
+                                                    // Round-4 review (Codex P1): the
+                                                    // authorization binding is replaced
+                                                    // ATOMICALLY with the payload above — never
+                                                    // partially, e.g. adopting a newer REMOTE
+                                                    // payload while leaving `origin` at its
+                                                    // stale `Local` value, which would skip the
+                                                    // arm gate entirely rather than merely
+                                                    // misattribute it. See `LatestTxIntent`'s
+                                                    // doc.
+                                                    origin = new_origin;
+                                                    remote_client_key_id = new_remote_client_key_id;
                                                     // Double-PTT fix: record this pivot so the
                                                     // newer request that PRODUCED `message_text`
                                                     // — still queued behind this one — is
@@ -4862,13 +5983,15 @@ impl super::ApplicationCoordinator {
                                                     // pivoted), so this `if let` always matches
                                                     // for a `None` id; guarded defensively anyway.
                                                     if let Some(id) = qso_id.as_deref() {
+                                                        let key = super::active_tx_qso_key(id);
                                                         pivoted_once.insert(
-                                                            super::active_tx_qso_key(id),
+                                                            key.clone(),
                                                             (
                                                                 message_text.clone(),
                                                                 frequency_offset,
                                                             ),
                                                         );
+                                                        pivoted_this_key = Some(key);
                                                     }
                                                 }
                                                 _ => {
@@ -4903,6 +6026,73 @@ impl super::ApplicationCoordinator {
                                             Vec::new(),
                                         )
                                         .await;
+
+                                        // --- Step 4d-arm: last-instant pre-PTT arm recheck
+                                        // (round-3 review, Codex P1) — round-2's placement
+                                        // here (before the two awaits above) still left the
+                                        // `send_tx_status`/`send_tx_queue_status` awaits
+                                        // between the check and the actual PTT-on send below,
+                                        // which is exactly the gap this check exists to close.
+                                        // This is the genuine last instant: nothing but the
+                                        // PTT-on send itself follows. PTT hardware was never
+                                        // asserted on this path — `ptt_guard` only flipped the
+                                        // in-process `ptt_active` flag on construction — so
+                                        // denying here needs no PTT-off send, just unwinding
+                                        // that flag and the TX-badge/queue status the two
+                                        // awaits above just (prematurely) announced.
+                                        if origin == crate::message_bus::TxOrigin::Remote
+                                            && !remote_tx_permitted_for(
+                                                &remote_tx_arm,
+                                                chrono::Utc::now().timestamp_millis(),
+                                                remote_client_key_id.as_deref(),
+                                            )
+                                        {
+                                            ptt_active.store(false, Ordering::Release);
+                                            ptt_guard.disarm();
+                                            // Round-6 review (Codex P2): if Step 4c pivoted
+                                            // this cycle, remove the tombstone it inserted —
+                                            // nothing actually reached the air, so the
+                                            // genuinely fresh request still queued behind
+                                            // this one must NOT be discarded by Step 0-dup as
+                                            // an already-sent duplicate of a pivot that never
+                                            // transmitted.
+                                            if let Some(key) = pivoted_this_key.take() {
+                                                pivoted_once.remove(&key);
+                                            }
+                                            let denial_reason = format!(
+                                                "arm went stale in the pre-PTT gap: '{message_text}' at {frequency_offset:.0} Hz"
+                                            );
+                                            let operator_callsign = tx_denied_operator_attribution(
+                                                &remote_tx_arm,
+                                                remote_client_key_id.as_deref(),
+                                            );
+                                            emit_disarm_interrupt_signals(
+                                                &message_bus,
+                                                &audit_log,
+                                                &display_feed_enabled,
+                                                operator_callsign,
+                                                "denied",
+                                                denial_reason,
+                                                qso_id.as_deref(),
+                                            )
+                                            .await;
+                                            send_tx_queue_status(&message_bus, None, Vec::new())
+                                                .await;
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text,
+                                                    duration_ms: 0,
+                                                    qso_id: qso_id.clone(),
+                                                },
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(complete_msg).await;
+                                            continue 'worker;
+                                        }
+
                                         let ptt_msg = ComponentMessage::new(
                                             ComponentId::Ft8Transmitter,
                                             ComponentId::Hamlib,
@@ -4949,6 +6139,14 @@ impl super::ApplicationCoordinator {
                                                 },
                                             ),
                                             &pivoted_once,
+                                            if origin == crate::message_bus::TxOrigin::Remote {
+                                                Some((
+                                                    &remote_tx_arm,
+                                                    remote_client_key_id.as_deref(),
+                                                ))
+                                            } else {
+                                                None
+                                            },
                                         )
                                         .await
                                         {
@@ -4965,6 +6163,87 @@ impl super::ApplicationCoordinator {
                                                 // completion here too -- see the "aborted before
                                                 // PTT engage" comment earlier in this worker for
                                                 // the full leak this closes.
+                                                let complete_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Autonomous,
+                                                    MessageType::TransmitComplete {
+                                                        success: false,
+                                                        message_text: message_text.clone(),
+                                                        duration_ms: 0,
+                                                        qso_id: qso_id.clone(),
+                                                    },
+                                                    Instant::now(),
+                                                );
+                                                if let Err(e) =
+                                                    message_bus.send_message(complete_msg).await
+                                                {
+                                                    warn!("Failed to send TransmitComplete: {}", e);
+                                                }
+                                                continue 'worker;
+                                            }
+                                            SleepOutcome::AbortedByDisarm(pending) => {
+                                                warn!(
+                                                    "TX aborted between PTT and slot: remote arm no longer permits it"
+                                                );
+                                                // PAN-91 review: release PTT FIRST, before any
+                                                // of this helper's awaits (diagnostic, audit-log
+                                                // I/O, relay) — a disarmed transmission must not
+                                                // stay keyed a moment longer than necessary.
+                                                let ptt_off_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Hamlib,
+                                                    MessageType::RigControl(
+                                                        crate::message_bus::RigControlMessage::SetPtt {
+                                                            state: false,
+                                                        },
+                                                    ),
+                                                    Instant::now(),
+                                                );
+                                                if let Err(e) =
+                                                    message_bus.send_message(ptt_off_msg).await
+                                                {
+                                                    warn!(
+                                                        "Remote disarm mid-TX: PTT OFF failed: {}",
+                                                        e
+                                                    );
+                                                }
+                                                ptt_active.store(false, Ordering::Release);
+                                                ptt_guard.disarm();
+                                                // Round-7 review (Codex P2): this is a
+                                                // PRE-SLOT abort — PTT was keyed but Step 7
+                                                // never routed any audio, so nothing actually
+                                                // reached the air. If Step 4c pivoted this
+                                                // cycle, its tombstone must go too, exactly
+                                                // like the pre-PTT Step 4d-arm denial — else
+                                                // the genuinely fresh, still-queued request is
+                                                // wrongly discarded as an already-sent pivot
+                                                // duplicate.
+                                                if let Some(key) = pivoted_this_key.take() {
+                                                    pivoted_once.remove(&key);
+                                                }
+                                                // Round-9 review (Codex P1): drain HERE,
+                                                // after PTT is already off, not inside
+                                                // `interruptible_sleep_or_supersede` before
+                                                // returning — see `drain_and_merge_pending`'s
+                                                // doc for why.
+                                                let pending =
+                                                    drain_and_merge_pending(&tx_rx, pending);
+                                                reenqueue_pending(&message_bus, pending).await;
+                                                let operator_callsign =
+                                                    tx_denied_operator_attribution(
+                                                        &remote_tx_arm,
+                                                        remote_client_key_id.as_deref(),
+                                                    );
+                                                emit_disarm_interrupt_signals(
+                                                    &message_bus,
+                                                    &audit_log,
+                                                    &display_feed_enabled,
+                                                    operator_callsign,
+                                                    "interrupted",
+                                                    format!("disarmed mid-transmission: '{message_text}' at {frequency_offset:.0} Hz"),
+                                                    qso_id.as_deref(),
+                                                )
+                                                .await;
                                                 let complete_msg = ComponentMessage::new(
                                                     ComponentId::Ft8Transmitter,
                                                     ComponentId::Autonomous,
@@ -5015,6 +6294,7 @@ impl super::ApplicationCoordinator {
                                                         &fox_max_streams,
                                                     ),
                                                     origin,
+                                                    remote_client_key_id.clone(),
                                                     &in_flight_items,
                                                 )
                                                 .await
@@ -5034,7 +6314,11 @@ impl super::ApplicationCoordinator {
                                                     }
                                                     SupersedeOutcome::Replace {
                                                         origin: new_origin,
+                                                        remote_client_key_id:
+                                                            new_remote_client_key_id,
                                                         qso_id: new_qso_id,
+                                                        identity_conflict: _,
+                                                        tx_parity: _,
                                                     } => {
                                                         // Viable single-item re-key (Task 6): carry
                                                         // the recomputed schedule into the retry,
@@ -5091,6 +6375,8 @@ impl super::ApplicationCoordinator {
                                                             }
                                                         }
                                                         origin = new_origin;
+                                                        remote_client_key_id =
+                                                            new_remote_client_key_id;
                                                         qso_id = new_qso_id;
                                                         rekey_schedule = Some(schedule);
                                                         is_rekey = true;
@@ -5108,7 +6394,9 @@ impl super::ApplicationCoordinator {
                                                     SupersedeOutcome::Bundle {
                                                         items,
                                                         bundle_origin,
+                                                        bundle_remote_client_key_id,
                                                         new_origin,
+                                                        new_remote_client_key_id,
                                                     } => {
                                                         // Prefer a multi-TX bundle: encode the
                                                         // in-flight + new item together. On success,
@@ -5147,6 +6435,8 @@ impl super::ApplicationCoordinator {
                                                                     // Fail-safe folded origin, not
                                                                     // the aborted frame's origin.
                                                                     origin: bundle_origin,
+                                                                    remote_client_key_id:
+                                                                        bundle_remote_client_key_id,
                                                                 },
                                                                 Instant::now(),
                                                             );
@@ -5211,6 +6501,8 @@ impl super::ApplicationCoordinator {
                                                             }
                                                         }
                                                         origin = new_origin;
+                                                        remote_client_key_id =
+                                                            new_remote_client_key_id;
                                                         qso_id = items
                                                             .last()
                                                             .and_then(|item| item.qso_id.clone());
@@ -5231,9 +6523,90 @@ impl super::ApplicationCoordinator {
                                         }
 
                                         // --- Step 7: Route audio to output ---
+                                        // Round-7 review (Codex P1): Step 6's sleep can
+                                        // return `Completed` (nothing to interrupt it) even
+                                        // though the bound client disarmed during an
+                                        // intervening await elsewhere in this iteration
+                                        // that this function's own poll never covers. PTT
+                                        // is already asserted (Step 5) but no audio has
+                                        // gone out yet, so this is the last chance to catch
+                                        // a stale authorization before the waveform
+                                        // actually reaches the air. Round-9 review (Codex
+                                        // P2): this check must run BEFORE `log_tx_frame`
+                                        // below, not after — logging first recorded a
+                                        // denied frame as a genuine own-transmission in the
+                                        // TUI's Band Activity panel even though no waveform
+                                        // ever reached the air.
+                                        if origin == crate::message_bus::TxOrigin::Remote
+                                            && !remote_tx_permitted_for(
+                                                &remote_tx_arm,
+                                                chrono::Utc::now().timestamp_millis(),
+                                                remote_client_key_id.as_deref(),
+                                            )
+                                        {
+                                            let ptt_off_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Hamlib,
+                                                MessageType::RigControl(
+                                                    crate::message_bus::RigControlMessage::SetPtt {
+                                                        state: false,
+                                                    },
+                                                ),
+                                                Instant::now(),
+                                            );
+                                            if let Err(e) =
+                                                message_bus.send_message(ptt_off_msg).await
+                                            {
+                                                warn!(
+                                                    "Remote disarm before audio delivery: PTT OFF failed: {}",
+                                                    e
+                                                );
+                                            }
+                                            ptt_active.store(false, Ordering::Release);
+                                            ptt_guard.disarm();
+                                            if let Some(key) = pivoted_this_key.take() {
+                                                pivoted_once.remove(&key);
+                                            }
+                                            let denial_reason = format!(
+                                                "arm went stale before audio delivery: '{message_text}' at {frequency_offset:.0} Hz"
+                                            );
+                                            let operator_callsign = tx_denied_operator_attribution(
+                                                &remote_tx_arm,
+                                                remote_client_key_id.as_deref(),
+                                            );
+                                            emit_disarm_interrupt_signals(
+                                                &message_bus,
+                                                &audit_log,
+                                                &display_feed_enabled,
+                                                operator_callsign,
+                                                "denied",
+                                                denial_reason,
+                                                qso_id.as_deref(),
+                                            )
+                                            .await;
+                                            send_tx_queue_status(&message_bus, None, Vec::new())
+                                                .await;
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text,
+                                                    duration_ms: 0,
+                                                    qso_id: qso_id.clone(),
+                                                },
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(complete_msg).await;
+                                            continue 'worker;
+                                        }
+
                                         // Band Activity's own-TX history logs the actual
                                         // audio-start instant here, not Step 5's PTT-key
-                                        // time — see `log_tx_frame`'s doc comment.
+                                        // time — see `log_tx_frame`'s doc comment. Runs
+                                        // AFTER the arm recheck above (round-9 review): a
+                                        // denied frame must never appear in Band Activity
+                                        // as a genuine own-transmission.
                                         log_tx_frame(
                                             &message_bus,
                                             message_text.clone(),
@@ -5242,6 +6615,7 @@ impl super::ApplicationCoordinator {
                                             chrono::Utc::now(),
                                         )
                                         .await;
+
                                         let audio_msg = ComponentMessage::new(
                                             ComponentId::Ft8Transmitter,
                                             ComponentId::Audio,
@@ -5278,6 +6652,14 @@ impl super::ApplicationCoordinator {
                                                 },
                                             ),
                                             &pivoted_once,
+                                            if origin == crate::message_bus::TxOrigin::Remote {
+                                                Some((
+                                                    &remote_tx_arm,
+                                                    remote_client_key_id.as_deref(),
+                                                ))
+                                            } else {
+                                                None
+                                            },
                                         )
                                         .await
                                         {
@@ -5293,6 +6675,102 @@ impl super::ApplicationCoordinator {
                                                 // PAN-38 round 4 (Codex): report the failed
                                                 // completion here too -- see the "aborted before
                                                 // PTT engage" comment earlier in this worker.
+                                                let complete_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Autonomous,
+                                                    MessageType::TransmitComplete {
+                                                        success: false,
+                                                        message_text: message_text.clone(),
+                                                        duration_ms: 0,
+                                                        qso_id: qso_id.clone(),
+                                                    },
+                                                    Instant::now(),
+                                                );
+                                                if let Err(e) =
+                                                    message_bus.send_message(complete_msg).await
+                                                {
+                                                    warn!("Failed to send TransmitComplete: {}", e);
+                                                }
+                                                continue 'worker;
+                                            }
+                                            SleepOutcome::AbortedByDisarm(pending) => {
+                                                warn!(
+                                                    "TX aborted during playback: remote arm no longer permits it"
+                                                );
+                                                // PAN-91 review: release PTT FIRST, before any
+                                                // of this helper's awaits (diagnostic, audit-log
+                                                // I/O, relay) — a disarmed transmission must not
+                                                // stay keyed a moment longer than necessary.
+                                                let ptt_off_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Hamlib,
+                                                    MessageType::RigControl(
+                                                        crate::message_bus::RigControlMessage::SetPtt {
+                                                            state: false,
+                                                        },
+                                                    ),
+                                                    Instant::now(),
+                                                );
+                                                if let Err(e) =
+                                                    message_bus.send_message(ptt_off_msg).await
+                                                {
+                                                    warn!(
+                                                        "Remote disarm mid-TX: PTT OFF failed: {}",
+                                                        e
+                                                    );
+                                                }
+                                                ptt_active.store(false, Ordering::Release);
+                                                ptt_guard.disarm();
+                                                // Round-4 review (Codex P1): flush the
+                                                // already-queued remote waveform BEFORE
+                                                // reenqueuing pending work — a pending local
+                                                // TuneRequest or a fresh TX both queue with
+                                                // `flush_first: false`, so without this the
+                                                // disarmed client's remaining audio could
+                                                // still reach the air riding behind the next
+                                                // request's samples. Reuses the same
+                                                // `AudioOutput{flush_first: true}` mechanism
+                                                // the re-key/supersede path already relies on
+                                                // to clear a superseded transmission's buffer.
+                                                let flush_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Audio,
+                                                    MessageType::AudioOutput {
+                                                        samples: Vec::new(),
+                                                        sample_rate,
+                                                        flush_first: true,
+                                                    },
+                                                    Instant::now(),
+                                                );
+                                                if let Err(e) =
+                                                    message_bus.send_message(flush_msg).await
+                                                {
+                                                    debug!(
+                                                        "Flushing aborted remote audio after disarm: {}",
+                                                        e
+                                                    );
+                                                }
+                                                // Round-9 review (Codex P1): drain HERE,
+                                                // after PTT is already off — see
+                                                // `drain_and_merge_pending`'s doc for why.
+                                                let pending =
+                                                    drain_and_merge_pending(&tx_rx, pending);
+                                                reenqueue_pending(&message_bus, pending).await;
+                                                let operator_callsign =
+                                                    tx_denied_operator_attribution(
+                                                        &remote_tx_arm,
+                                                        remote_client_key_id.as_deref(),
+                                                    );
+                                                emit_disarm_interrupt_signals(
+                                                    &message_bus,
+                                                    &audit_log,
+                                                    &display_feed_enabled,
+                                                    operator_callsign,
+                                                    "interrupted",
+                                                    format!("disarmed mid-transmission: '{message_text}' at {frequency_offset:.0} Hz"),
+                                                    qso_id.as_deref(),
+                                                )
+                                                .await;
                                                 let complete_msg = ComponentMessage::new(
                                                     ComponentId::Ft8Transmitter,
                                                     ComponentId::Autonomous,
@@ -5341,6 +6819,7 @@ impl super::ApplicationCoordinator {
                                                         &fox_max_streams,
                                                     ),
                                                     origin,
+                                                    remote_client_key_id.clone(),
                                                     &in_flight_items,
                                                 )
                                                 .await
@@ -5357,7 +6836,11 @@ impl super::ApplicationCoordinator {
                                                     }
                                                     SupersedeOutcome::Replace {
                                                         origin: new_origin,
+                                                        remote_client_key_id:
+                                                            new_remote_client_key_id,
                                                         qso_id: new_qso_id,
+                                                        identity_conflict: _,
+                                                        tx_parity: _,
                                                     } => {
                                                         // Re-point `origin` at the superseding
                                                         // request's origin so the retry's Step 4b-arm
@@ -5404,6 +6887,8 @@ impl super::ApplicationCoordinator {
                                                             }
                                                         }
                                                         origin = new_origin;
+                                                        remote_client_key_id =
+                                                            new_remote_client_key_id;
                                                         qso_id = new_qso_id;
                                                         rekey_schedule = Some(schedule);
                                                         is_rekey = true;
@@ -5421,7 +6906,9 @@ impl super::ApplicationCoordinator {
                                                     SupersedeOutcome::Bundle {
                                                         items,
                                                         bundle_origin,
+                                                        bundle_remote_client_key_id,
                                                         new_origin,
+                                                        new_remote_client_key_id,
                                                     } => {
                                                         let tx_params =
                                                             pancetta_ft8::ProtocolParams::from_protocol(
@@ -5447,6 +6934,8 @@ impl super::ApplicationCoordinator {
                                                                     tx_parity,
                                                                     // Fail-safe folded origin.
                                                                     origin: bundle_origin,
+                                                                    remote_client_key_id:
+                                                                        bundle_remote_client_key_id,
                                                                 },
                                                                 Instant::now(),
                                                             );
@@ -5505,6 +6994,8 @@ impl super::ApplicationCoordinator {
                                                             }
                                                         }
                                                         origin = new_origin;
+                                                        remote_client_key_id =
+                                                            new_remote_client_key_id;
                                                         qso_id = items
                                                             .last()
                                                             .and_then(|item| item.qso_id.clone());
@@ -5617,6 +7108,7 @@ impl super::ApplicationCoordinator {
                                     mut items,
                                     tx_parity,
                                     origin,
+                                    remote_client_key_id,
                                 } => {
                                     info!("Multi-TX request: {} messages", items.len());
                                     TX_ATTEMPTS_COUNT
@@ -5759,9 +7251,10 @@ impl super::ApplicationCoordinator {
                                     // hard-mute above. Fail CLOSED on a poisoned lock.
                                     // Inert in P0–P2 (no Remote bundle is constructed).
                                     if origin == crate::message_bus::TxOrigin::Remote
-                                        && !remote_tx_permitted(
+                                        && !remote_tx_permitted_for(
                                             &remote_tx_arm,
                                             chrono::Utc::now().timestamp_millis(),
+                                            remote_client_key_id.as_deref(),
                                         )
                                     {
                                         warn!(
@@ -5792,8 +7285,9 @@ impl super::ApplicationCoordinator {
                                         audit_log.append(&pancetta_agent::audit::AuditEvent {
                                             ts_unix_ms: chrono::Utc::now().timestamp_millis(),
                                             kind: pancetta_agent::audit::AuditKind::TxDenied,
-                                            operator_callsign: remote_tx_arm.lock().ok().and_then(
-                                                |s| s.operator_callsign().map(str::to_string),
+                                            operator_callsign: tx_denied_operator_attribution(
+                                                &remote_tx_arm,
+                                                remote_client_key_id.as_deref(),
                                             ),
                                             detail: denial_reason.clone(),
                                         });
@@ -6639,16 +8133,35 @@ impl super::ApplicationCoordinator {
                                     // PTT if the arm went stale during the wait. Local
                                     // bundles are never gated.
                                     if origin == crate::message_bus::TxOrigin::Remote
-                                        && !remote_tx_permitted(
+                                        && !remote_tx_permitted_for(
                                             &remote_tx_arm,
                                             chrono::Utc::now().timestamp_millis(),
+                                            remote_client_key_id.as_deref(),
                                         )
                                     {
-                                        info!(
-                                            target: "agent.tx",
-                                            "dropping remote multi-TX at key-time — arm went stale during slot wait: {} item(s)",
-                                            items.len()
+                                        // Round-3 review (Codex P2): route through the
+                                        // shared denial-signaling helper — mirrors the
+                                        // single-TX fix above.
+                                        let operator_callsign = tx_denied_operator_attribution(
+                                            &remote_tx_arm,
+                                            remote_client_key_id.as_deref(),
                                         );
+                                        for item in &items {
+                                            let denial_reason = format!(
+                                                "arm went stale during slot wait: '{}' at {:.0} Hz",
+                                                item.message_text, item.frequency_offset
+                                            );
+                                            emit_disarm_interrupt_signals(
+                                                &message_bus,
+                                                &audit_log,
+                                                &display_feed_enabled,
+                                                operator_callsign.clone(),
+                                                "denied",
+                                                denial_reason,
+                                                item.qso_id.as_deref(),
+                                            )
+                                            .await;
+                                        }
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
                                             let complete_msg = ComponentMessage::new(
@@ -6712,6 +8225,12 @@ impl super::ApplicationCoordinator {
                                     // already-sent duplicate (Step 0-dup (bundle) above)
                                     // instead of keying PTT a second time for the same
                                     // text.
+                                    // Round-6 review (Codex P2): tracked so Step 4d-arm's
+                                    // denial branch below can remove these — see that
+                                    // branch, and the single-TX arm's identical fix, for
+                                    // why.
+                                    let pivoted_this_bundle_keys: Vec<String> =
+                                        pivots.iter().map(|(k, _, _)| k.clone()).collect();
                                     for (qso_key, new_text, new_freq) in pivots {
                                         pivoted_once.insert(qso_key, (new_text, new_freq));
                                     }
@@ -6817,6 +8336,74 @@ impl super::ApplicationCoordinator {
                                         };
                                         send_tx_queue_status(&message_bus, head, bundle).await;
                                     }
+
+                                    // --- Step 4d-arm: last-instant pre-PTT arm recheck
+                                    // (round-3 review, Codex P1) — mirrors the single-TX
+                                    // Step 4d-arm; round-2's placement here (before the
+                                    // status-send awaits above) left exactly the gap this
+                                    // check exists to close. This is the genuine last
+                                    // instant: nothing but the PTT-on send itself follows.
+                                    // PTT hardware was never asserted on this path —
+                                    // `ptt_guard` only flipped the in-process `ptt_active`
+                                    // flag on construction — so denying here needs no
+                                    // PTT-off send, just unwinding that flag and the
+                                    // TX-badge/queue status the awaits above just
+                                    // (prematurely) announced.
+                                    if origin == crate::message_bus::TxOrigin::Remote
+                                        && !remote_tx_permitted_for(
+                                            &remote_tx_arm,
+                                            chrono::Utc::now().timestamp_millis(),
+                                            remote_client_key_id.as_deref(),
+                                        )
+                                    {
+                                        ptt_active.store(false, Ordering::Release);
+                                        ptt_guard.disarm();
+                                        // Round-6 review (Codex P2): nothing reached the
+                                        // air — remove any tombstone this bundle's Step
+                                        // 4b-pivot just inserted, so the genuinely fresh
+                                        // request still queued behind it isn't discarded by
+                                        // Step 0-dup as an already-sent duplicate.
+                                        for key in &pivoted_this_bundle_keys {
+                                            pivoted_once.remove(key);
+                                        }
+                                        let operator_callsign = tx_denied_operator_attribution(
+                                            &remote_tx_arm,
+                                            remote_client_key_id.as_deref(),
+                                        );
+                                        for item in &items {
+                                            let denial_reason = format!(
+                                                "arm went stale in the pre-PTT gap: '{}' at {:.0} Hz",
+                                                item.message_text, item.frequency_offset
+                                            );
+                                            emit_disarm_interrupt_signals(
+                                                &message_bus,
+                                                &audit_log,
+                                                &display_feed_enabled,
+                                                operator_callsign.clone(),
+                                                "denied",
+                                                denial_reason,
+                                                item.qso_id.as_deref(),
+                                            )
+                                            .await;
+                                        }
+                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                        for item in &items {
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text: item.message_text.clone(),
+                                                    duration_ms: 0,
+                                                    qso_id: item.qso_id.clone(),
+                                                },
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(complete_msg).await;
+                                        }
+                                        continue;
+                                    }
+
                                     let ptt_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Hamlib,
@@ -6856,6 +8443,11 @@ impl super::ApplicationCoordinator {
                                         // bundle's 2nd+ QSO must match here too.
                                         &items,
                                         &pivoted_once,
+                                        if origin == crate::message_bus::TxOrigin::Remote {
+                                            Some((&remote_tx_arm, remote_client_key_id.as_deref()))
+                                        } else {
+                                            None
+                                        },
                                     )
                                     .await
                                     {
@@ -6892,11 +8484,83 @@ impl super::ApplicationCoordinator {
                                             }
                                             continue;
                                         }
+                                        SleepOutcome::AbortedByDisarm(pending) => {
+                                            warn!(
+                                                "Multi-TX aborted between PTT and slot: remote arm no longer permits it"
+                                            );
+                                            // PAN-91 review: release PTT FIRST — see the
+                                            // single-TX arm's identical fix for why.
+                                            let ptt_off_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Hamlib,
+                                                MessageType::RigControl(
+                                                    crate::message_bus::RigControlMessage::SetPtt {
+                                                        state: false,
+                                                    },
+                                                ),
+                                                Instant::now(),
+                                            );
+                                            if let Err(e) =
+                                                message_bus.send_message(ptt_off_msg).await
+                                            {
+                                                warn!(
+                                                    "Remote disarm mid-TX: PTT OFF failed: {}",
+                                                    e
+                                                );
+                                            }
+                                            ptt_active.store(false, Ordering::Release);
+                                            ptt_guard.disarm();
+                                            // Round-7 review (Codex P2): pre-slot abort —
+                                            // nothing reached the air yet (Step 7 never ran)
+                                            // — see the single-TX arm's identical fix.
+                                            for key in &pivoted_this_bundle_keys {
+                                                pivoted_once.remove(key);
+                                            }
+                                            // Round-9 review (Codex P1): drain HERE, after
+                                            // PTT is already off — see
+                                            // `drain_and_merge_pending`'s doc for why.
+                                            let pending = drain_and_merge_pending(&tx_rx, pending);
+                                            reenqueue_pending(&message_bus, pending).await;
+                                            let operator_callsign = tx_denied_operator_attribution(
+                                                &remote_tx_arm,
+                                                remote_client_key_id.as_deref(),
+                                            );
+                                            emit_disarm_interrupt_signals(
+                                                &message_bus,
+                                                &audit_log,
+                                                &display_feed_enabled,
+                                                operator_callsign,
+                                                "interrupted",
+                                                "disarmed mid-transmission: '<multi-TX bundle>' at 0 Hz".to_string(),
+                                                None,
+                                            )
+                                            .await;
+                                            for item in &items {
+                                                let complete_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Autonomous,
+                                                    MessageType::TransmitComplete {
+                                                        success: false,
+                                                        message_text: item.message_text.clone(),
+                                                        duration_ms: 0,
+                                                        qso_id: item.qso_id.clone(),
+                                                    },
+                                                    Instant::now(),
+                                                );
+                                                if let Err(e) =
+                                                    message_bus.send_message(complete_msg).await
+                                                {
+                                                    warn!("Failed to send TransmitComplete: {}", e);
+                                                }
+                                            }
+                                            continue;
+                                        }
                                         SleepOutcome::Superseded(new_request, pending) => {
                                             supersede_multi_reenqueue(
                                                 new_request,
                                                 &items,
                                                 origin,
+                                                remote_client_key_id.clone(),
                                                 tx_parity,
                                                 &mut encoder,
                                                 active_protocol,
@@ -6929,11 +8593,91 @@ impl super::ApplicationCoordinator {
                                     }
 
                                     // --- Step 7: Route audio to output ---
+                                    // Round-7 review (Codex P1): mirrors the single-TX
+                                    // arm's identical fix — Step 6's sleep can return
+                                    // `Completed` even though the bound client disarmed
+                                    // during an intervening await elsewhere in this
+                                    // iteration that this function's own poll never
+                                    // covers. PTT is already asserted but no audio has
+                                    // gone out yet. Round-9 review (Codex P2): this check
+                                    // must run BEFORE the `log_tx_frame` loop below, not
+                                    // after — logging first recorded denied frames as
+                                    // genuine own-transmissions in the TUI's Band
+                                    // Activity panel even though no waveform ever reached
+                                    // the air.
+                                    if origin == crate::message_bus::TxOrigin::Remote
+                                        && !remote_tx_permitted_for(
+                                            &remote_tx_arm,
+                                            chrono::Utc::now().timestamp_millis(),
+                                            remote_client_key_id.as_deref(),
+                                        )
+                                    {
+                                        let ptt_off_msg = ComponentMessage::new(
+                                            ComponentId::Ft8Transmitter,
+                                            ComponentId::Hamlib,
+                                            MessageType::RigControl(
+                                                crate::message_bus::RigControlMessage::SetPtt {
+                                                    state: false,
+                                                },
+                                            ),
+                                            Instant::now(),
+                                        );
+                                        if let Err(e) = message_bus.send_message(ptt_off_msg).await
+                                        {
+                                            warn!(
+                                                "Remote disarm before audio delivery: PTT OFF failed: {}",
+                                                e
+                                            );
+                                        }
+                                        ptt_active.store(false, Ordering::Release);
+                                        ptt_guard.disarm();
+                                        for key in &pivoted_this_bundle_keys {
+                                            pivoted_once.remove(key);
+                                        }
+                                        let operator_callsign = tx_denied_operator_attribution(
+                                            &remote_tx_arm,
+                                            remote_client_key_id.as_deref(),
+                                        );
+                                        for item in &items {
+                                            let denial_reason = format!(
+                                                "arm went stale before audio delivery: '{}' at {:.0} Hz",
+                                                item.message_text, item.frequency_offset
+                                            );
+                                            emit_disarm_interrupt_signals(
+                                                &message_bus,
+                                                &audit_log,
+                                                &display_feed_enabled,
+                                                operator_callsign.clone(),
+                                                "denied",
+                                                denial_reason,
+                                                item.qso_id.as_deref(),
+                                            )
+                                            .await;
+                                        }
+                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                        for item in &items {
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text: item.message_text.clone(),
+                                                    duration_ms: 0,
+                                                    qso_id: item.qso_id.clone(),
+                                                },
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(complete_msg).await;
+                                        }
+                                        continue;
+                                    }
+
                                     // Band Activity's own-TX history logs the actual
                                     // audio-start instant here, not Step 5's PTT-key
                                     // time — see `log_tx_frame`'s doc comment. Every
                                     // bundle item is keyed concurrently in this same
                                     // slot, so all of them share this one timestamp.
+                                    // Runs AFTER the arm recheck above (round-9 review).
                                     let tx_logged_at = chrono::Utc::now();
                                     for item in &items {
                                         log_tx_frame(
@@ -6945,6 +8689,7 @@ impl super::ApplicationCoordinator {
                                         )
                                         .await;
                                     }
+
                                     let audio_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Audio,
@@ -6974,6 +8719,11 @@ impl super::ApplicationCoordinator {
                                         // bundle's 2nd+ QSO must match here too.
                                         &items,
                                         &pivoted_once,
+                                        if origin == crate::message_bus::TxOrigin::Remote {
+                                            Some((&remote_tx_arm, remote_client_key_id.as_deref()))
+                                        } else {
+                                            None
+                                        },
                                     )
                                     .await
                                     {
@@ -7010,11 +8760,99 @@ impl super::ApplicationCoordinator {
                                             }
                                             continue;
                                         }
+                                        SleepOutcome::AbortedByDisarm(pending) => {
+                                            warn!(
+                                                "Multi-TX aborted during playback: remote arm no longer permits it"
+                                            );
+                                            // PAN-91 review: release PTT FIRST — see the
+                                            // single-TX arm's identical fix for why.
+                                            let ptt_off_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Hamlib,
+                                                MessageType::RigControl(
+                                                    crate::message_bus::RigControlMessage::SetPtt {
+                                                        state: false,
+                                                    },
+                                                ),
+                                                Instant::now(),
+                                            );
+                                            if let Err(e) =
+                                                message_bus.send_message(ptt_off_msg).await
+                                            {
+                                                warn!(
+                                                    "Remote disarm mid-TX: PTT OFF failed: {}",
+                                                    e
+                                                );
+                                            }
+                                            ptt_active.store(false, Ordering::Release);
+                                            ptt_guard.disarm();
+                                            // Round-4 review (Codex P1): flush the
+                                            // already-queued remote bundle waveform BEFORE
+                                            // reenqueuing pending work — see the single-TX
+                                            // arm's identical fix for why.
+                                            let flush_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Audio,
+                                                MessageType::AudioOutput {
+                                                    samples: Vec::new(),
+                                                    sample_rate,
+                                                    flush_first: true,
+                                                },
+                                                Instant::now(),
+                                            );
+                                            if let Err(e) =
+                                                message_bus.send_message(flush_msg).await
+                                            {
+                                                debug!(
+                                                    "Flushing aborted remote audio after disarm: {}",
+                                                    e
+                                                );
+                                            }
+                                            // Round-9 review (Codex P1): drain HERE, after
+                                            // PTT is already off — see
+                                            // `drain_and_merge_pending`'s doc for why.
+                                            let pending = drain_and_merge_pending(&tx_rx, pending);
+                                            reenqueue_pending(&message_bus, pending).await;
+                                            let operator_callsign = tx_denied_operator_attribution(
+                                                &remote_tx_arm,
+                                                remote_client_key_id.as_deref(),
+                                            );
+                                            emit_disarm_interrupt_signals(
+                                                &message_bus,
+                                                &audit_log,
+                                                &display_feed_enabled,
+                                                operator_callsign,
+                                                "interrupted",
+                                                "disarmed mid-transmission: '<multi-TX bundle>' at 0 Hz".to_string(),
+                                                None,
+                                            )
+                                            .await;
+                                            for item in &items {
+                                                let complete_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Autonomous,
+                                                    MessageType::TransmitComplete {
+                                                        success: false,
+                                                        message_text: item.message_text.clone(),
+                                                        duration_ms: 0,
+                                                        qso_id: item.qso_id.clone(),
+                                                    },
+                                                    Instant::now(),
+                                                );
+                                                if let Err(e) =
+                                                    message_bus.send_message(complete_msg).await
+                                                {
+                                                    warn!("Failed to send TransmitComplete: {}", e);
+                                                }
+                                            }
+                                            continue;
+                                        }
                                         SleepOutcome::Superseded(new_request, pending) => {
                                             supersede_multi_reenqueue(
                                                 new_request,
                                                 &items,
                                                 origin,
+                                                remote_client_key_id.clone(),
                                                 tx_parity,
                                                 &mut encoder,
                                                 active_protocol,
@@ -7791,6 +9629,7 @@ mod schedule_tx_tests {
             qso_id: None,
             tx_parity,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         }
     }
 
@@ -7894,6 +9733,7 @@ mod schedule_tx_tests {
             items: Vec::new(),
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
         let cap = adaptive_coalesce_cap_ms(
             &head,
@@ -8087,6 +9927,159 @@ mod tx_failure_diagnostic_tests {
 }
 
 #[cfg(test)]
+mod disarm_interrupt_signal_tests {
+    //! Round-2 review (Codex P1): the identity-bound arm gate must be
+    //! rechecked immediately before PTT, not only at Step 4b-arm (before
+    //! the audio-buffer build / late-pivot re-encode). The new Step 4d-arm
+    //! recheck (single-TX and multi-TX) reuses [`emit_disarm_interrupt_signals`]
+    //! — generalized here to take a caller-supplied `diagnostic_verb` and
+    //! `denial_reason` so a pre-PTT denial doesn't misreport "disarmed
+    //! mid-transmission" for a frame that was never keyed. These tests pin
+    //! that generalization: the "denied" wording flows through to the TUI
+    //! diagnostic, the audit record, and the client-visible relay exactly
+    //! as given, and operator attribution still degrades to `None` on an
+    //! identity mismatch (not to whoever else happens to be armed).
+    use super::*;
+    use crate::message_bus::MessageBus;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    fn audit_tmp() -> std::path::PathBuf {
+        use std::sync::atomic::AtomicU64;
+        static C: AtomicU64 = AtomicU64::new(0);
+        let n = C.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "pancetta-tx-disarm-signal-test-{}-{n}.log",
+            std::process::id()
+        ))
+    }
+
+    fn read_audit_lines(path: &std::path::Path) -> Vec<pancetta_agent::audit::AuditEvent> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("audit line must be valid JSON"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn pre_ptt_denial_uses_denied_wording_not_mid_transmission_wording() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_tui_tx, tui_rx) = bus.create_channel(ComponentId::Tui).await.unwrap();
+        let (_gw_tx, gw_rx) = bus
+            .create_channel(ComponentId::RemoteGateway)
+            .await
+            .unwrap();
+        let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp());
+        let display_feed_enabled = Arc::new(AtomicBool::new(true));
+
+        // client-a is armed; the frame is bound to client-b — an identity
+        // mismatch, exactly like a stale Step 4b-arm success gone bad in the
+        // pre-PTT gap.
+        let mut st = pancetta_agent::arm::ArmState::new();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        st.arm(
+            pancetta_agent::arm::VerifiedArmGrant {
+                operator_callsign: "K5ARH".to_string(),
+                ttl_ms: 120_000,
+                scope_tx: true,
+                jti: "pre-ptt-recheck-jti".to_string(),
+                client_key_id: "client-a".to_string(),
+            },
+            now_ms,
+        );
+        st.set_local_consent(true, now_ms);
+        let arm = Arc::new(std::sync::Mutex::new(st));
+
+        let denial_reason =
+            "arm went stale in the pre-PTT gap: 'CQ K5ARH EM12' at 1500 Hz".to_string();
+        let operator_callsign = tx_denied_operator_attribution(&arm, Some("client-b"));
+        emit_disarm_interrupt_signals(
+            &bus,
+            &audit_log,
+            &display_feed_enabled,
+            operator_callsign,
+            "denied",
+            denial_reason.clone(),
+            Some("qso-1"),
+        )
+        .await;
+
+        let tui_msg = tui_rx
+            .try_recv()
+            .expect("a DiagnosticEvent should have been sent to the Tui channel");
+        match tui_msg.message_type {
+            MessageType::DiagnosticEvent { text, qso_id, .. } => {
+                assert!(
+                    text.starts_with("Remote TX denied ("),
+                    "pre-PTT denial must say 'denied', not 'interrupted': {text}"
+                );
+                assert!(!text.contains("disarmed mid-transmission"));
+                assert_eq!(qso_id.as_deref(), Some("qso-1"));
+            }
+            other => panic!("expected DiagnosticEvent, got {other:?}"),
+        }
+
+        let gw_msg = gw_rx
+            .try_recv()
+            .expect("a TxDenied relay should have been sent to the gateway channel");
+        match gw_msg.message_type {
+            MessageType::TxDenied { reason, qso_id } => {
+                assert_eq!(reason, denial_reason);
+                assert_eq!(qso_id.as_deref(), Some("qso-1"));
+            }
+            other => panic!("expected TxDenied, got {other:?}"),
+        }
+
+        let events = read_audit_lines(audit_log.path());
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one TxDenied record must be appended"
+        );
+        assert_eq!(events[0].kind, pancetta_agent::audit::AuditKind::TxDenied);
+        assert_eq!(events[0].detail, denial_reason);
+        assert_eq!(
+            events[0].operator_callsign, None,
+            "an identity-mismatched pre-PTT denial must never attribute to whoever else is armed"
+        );
+    }
+
+    #[tokio::test]
+    async fn mid_flight_interruption_still_uses_interrupted_wording() {
+        // Regression guard for the existing AbortedByDisarm call sites:
+        // generalizing the helper for the new pre-PTT case must not change
+        // the wording an already-on-the-air interruption reports.
+        let bus = MessageBus::new(16).unwrap();
+        let (_tui_tx, tui_rx) = bus.create_channel(ComponentId::Tui).await.unwrap();
+        let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp());
+        let display_feed_enabled = Arc::new(AtomicBool::new(false));
+        let arm = Arc::new(std::sync::Mutex::new(pancetta_agent::arm::ArmState::new()));
+
+        let operator_callsign = tx_denied_operator_attribution(&arm, None);
+        emit_disarm_interrupt_signals(
+            &bus,
+            &audit_log,
+            &display_feed_enabled,
+            operator_callsign,
+            "interrupted",
+            "disarmed mid-transmission: 'CQ K5ARH EM12' at 1500 Hz".to_string(),
+            Some("qso-1"),
+        )
+        .await;
+
+        let tui_msg = tui_rx.try_recv().expect("diagnostic should send");
+        match tui_msg.message_type {
+            MessageType::DiagnosticEvent { text, .. } => {
+                assert!(text.starts_with("Remote TX interrupted ("));
+                assert!(text.contains("disarmed mid-transmission"));
+            }
+            other => panic!("expected DiagnosticEvent, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
 mod supersede_rekey_tests {
     use super::*;
     use crate::message_bus::MessageBus;
@@ -8129,6 +10122,7 @@ mod supersede_rekey_tests {
             qso_id: Some("qso-1".to_string()),
             tx_parity: Some(cur_parity),
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
 
         // max_concurrent_qsos == 1 → single-item replace (Task 6 behavior).
@@ -8147,6 +10141,7 @@ mod supersede_rekey_tests {
             now,
             1,
             crate::message_bus::TxOrigin::Local,
+            None,
             &[],
         )
         .await;
@@ -8241,6 +10236,7 @@ mod supersede_rekey_tests {
             qso_id: Some("qso-super".to_string()),
             tx_parity: Some(cur_parity),
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
 
         // max_concurrent_qsos == 1 → the single-TX arm's `Replace` path.
@@ -8259,6 +10255,7 @@ mod supersede_rekey_tests {
             now,
             1,
             crate::message_bus::TxOrigin::Local,
+            None,
             &[],
         )
         .await;
@@ -8382,6 +10379,7 @@ mod supersede_rekey_tests {
             qso_id: Some("qso-2".to_string()),
             tx_parity: Some(cur_parity),
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
 
         let outcome = super::supersede_and_rekey_or_bundle(
@@ -8399,6 +10397,7 @@ mod supersede_rekey_tests {
             now,
             2,
             crate::message_bus::TxOrigin::Local,
+            None,
             &in_flight,
         )
         .await;
@@ -8419,6 +10418,109 @@ mod supersede_rekey_tests {
             "PTT must be deasserted"
         );
         // Working state also mutated to the new item (collision fallback).
+        assert_eq!(message_text, "CQ K5ARH EM12");
+        assert_eq!(frequency_offset, 1400.0);
+    }
+
+    /// PAN-91 review follow-up: an in-flight stream bound to one remote
+    /// client and a superseding request bound to a DIFFERENT remote client
+    /// must NEVER fold into one bundle — a single bundle-level identity
+    /// check would then authorize the OTHER client's frame by proxy. This
+    /// must produce `Replace` (abandon the in-flight side, key only the new
+    /// request under its OWN identity), never `Bundle`.
+    #[tokio::test]
+    async fn supersede_refuses_to_bundle_mismatched_remote_clients() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+
+        let now = chrono::Utc::now();
+        let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
+            pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
+            pancetta_core::slot::SLOT_NS,
+        );
+
+        let mut message_text = "OLD TEXT".to_string();
+        let mut frequency_offset = 1000.0;
+        let mut schedule = super::schedule_tx(
+            now,
+            cur_parity,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+        );
+        let ptt_active = Arc::new(AtomicBool::new(true));
+        let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+
+        let in_flight = [crate::message_bus::TransmitRequestItem {
+            message_text: "KA1ABC K5ARH R-15".to_string(),
+            frequency_offset: 1000.0,
+            qso_id: Some("qso-1".to_string()),
+        }];
+
+        let new_request = MessageType::TransmitRequest {
+            message_text: "CQ K5ARH EM12".to_string(),
+            frequency_offset: 1400.0,
+            qso_id: Some("qso-2".to_string()),
+            tx_parity: Some(cur_parity),
+            origin: crate::message_bus::TxOrigin::Remote,
+            remote_client_key_id: Some("client-b".to_string()),
+        };
+
+        let outcome = super::supersede_and_rekey_or_bundle(
+            new_request,
+            &mut message_text,
+            &mut frequency_offset,
+            &mut schedule,
+            &bus,
+            &ptt_active,
+            &last_ptt_on_ms,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+            pancetta_config::station::TxSelfParity::Auto,
+            now,
+            2,
+            crate::message_bus::TxOrigin::Remote,
+            Some("client-a".to_string()),
+            &in_flight,
+        )
+        .await;
+
+        match outcome {
+            super::SupersedeOutcome::Replace {
+                origin,
+                remote_client_key_id,
+                qso_id,
+                identity_conflict,
+                tx_parity,
+            } => {
+                assert_eq!(origin, crate::message_bus::TxOrigin::Remote);
+                assert_eq!(
+                    remote_client_key_id.as_deref(),
+                    Some("client-b"),
+                    "Replace must carry the NEW request's own identity, not the \
+                     abandoned in-flight stream's"
+                );
+                assert_eq!(qso_id.as_deref(), Some("qso-2"));
+                assert!(
+                    identity_conflict,
+                    "a mismatched-remote-client Replace must be flagged as an \
+                     identity conflict, not treated as an ordinary over-capacity \
+                     fallback"
+                );
+                assert_eq!(
+                    tx_parity,
+                    Some(cur_parity),
+                    "Replace must carry the NEW request's own tx_parity"
+                );
+            }
+            other => panic!(
+                "mismatched-client in-flight/new streams must never fold into a \
+                 Bundle, got {other:?}"
+            ),
+        }
+        // Working state mutated to the new item, exactly like the ordinary
+        // collision-fallback Replace path.
         assert_eq!(message_text, "CQ K5ARH EM12");
         assert_eq!(frequency_offset, 1400.0);
     }
@@ -8475,6 +10577,7 @@ mod supersede_rekey_tests {
             qso_id: Some("qso-1".to_string()),
             tx_parity: Some(cur_parity),
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
 
         let outcome = super::supersede_and_rekey_or_bundle(
@@ -8492,6 +10595,7 @@ mod supersede_rekey_tests {
             now,
             2,
             crate::message_bus::TxOrigin::Local,
+            None,
             &in_flight,
         )
         .await;
@@ -8578,6 +10682,7 @@ mod supersede_rekey_tests {
             qso_id: Some("qso-third".to_string()),
             tx_parity: Some(cur_parity),
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
 
         let outcome = super::supersede_and_rekey_or_bundle(
@@ -8595,16 +10700,26 @@ mod supersede_rekey_tests {
             now,
             2, // max_concurrent_qsos — already met by the 2 in-flight items
             crate::message_bus::TxOrigin::Local,
+            None,
             &in_flight,
         )
         .await;
 
         match outcome {
-            super::SupersedeOutcome::Replace { qso_id, .. } => {
+            super::SupersedeOutcome::Replace {
+                qso_id,
+                identity_conflict,
+                ..
+            } => {
                 assert_eq!(
                     qso_id.as_deref(),
                     Some("qso-third"),
                     "the Replace must carry the NEW request's own qso_id"
+                );
+                assert!(
+                    !identity_conflict,
+                    "an over-capacity Replace (same client on both sides) must not be \
+                     flagged as an identity conflict"
                 );
             }
             other => panic!(
@@ -8666,6 +10781,7 @@ mod supersede_rekey_tests {
             qso_id: None,
             tx_parity: Some(cur_parity),
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
 
         let outcome = super::supersede_and_rekey_or_bundle(
@@ -8683,6 +10799,7 @@ mod supersede_rekey_tests {
             now,
             2, // max_concurrent_qsos — met by qso-1 alone; the 2 manual items must not count
             crate::message_bus::TxOrigin::Local,
+            None,
             &in_flight,
         )
         .await;
@@ -8757,6 +10874,7 @@ mod supersede_rekey_tests {
                 qso_id: Some("qso-new".to_string()),
                 tx_parity: Some(cur_parity),
                 origin: new_origin,
+                remote_client_key_id: None,
             };
 
             // max_concurrent_qsos == 1 → the single-TX arm's Replace path.
@@ -8775,12 +10893,19 @@ mod supersede_rekey_tests {
                 now,
                 1,
                 in_flight_origin,
+                None,
                 &[],
             )
             .await;
 
             match outcome {
-                super::SupersedeOutcome::Replace { origin, qso_id } => {
+                super::SupersedeOutcome::Replace {
+                    origin,
+                    qso_id,
+                    remote_client_key_id: _,
+                    identity_conflict: _,
+                    tx_parity: _,
+                } => {
                     assert_eq!(
                         origin, new_origin,
                         "Replace must carry the SUPERSEDING request's origin \
@@ -8879,6 +11004,7 @@ mod supersede_rekey_tests {
                 qso_id: Some("qso-2".to_string()),
                 tx_parity: Some(cur_parity),
                 origin: new_origin,
+                remote_client_key_id: None,
             };
 
             let outcome = super::supersede_and_rekey_or_bundle(
@@ -8896,6 +11022,7 @@ mod supersede_rekey_tests {
                 now,
                 2,
                 in_flight_origin,
+                None,
                 &in_flight,
             )
             .await;
@@ -8945,6 +11072,7 @@ mod supersede_rekey_tests {
             items: Vec::new(),
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
 
         let outcome = super::supersede_and_rekey_or_bundle(
@@ -8962,6 +11090,7 @@ mod supersede_rekey_tests {
             chrono::Utc::now(),
             2,
             crate::message_bus::TxOrigin::Local,
+            None,
             &[],
         )
         .await;
@@ -9026,6 +11155,7 @@ mod supersede_rekey_tests {
             ],
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
 
         let ptt_active = Arc::new(AtomicBool::new(true));
@@ -9035,6 +11165,7 @@ mod supersede_rekey_tests {
             superseding,
             &in_flight,
             crate::message_bus::TxOrigin::Local,
+            None,
             None,
             &mut encoder,
             pancetta_ft8::Protocol::Ft8,
@@ -9141,6 +11272,7 @@ mod supersede_rekey_tests {
             qso_id: Some("qso-third".to_string()),
             tx_parity: Some(cur_parity),
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
 
         let ptt_active = Arc::new(AtomicBool::new(true));
@@ -9150,6 +11282,7 @@ mod supersede_rekey_tests {
             superseding,
             &in_flight,
             crate::message_bus::TxOrigin::Local,
+            None,
             Some(cur_parity),
             &mut encoder,
             pancetta_ft8::Protocol::Ft8,
@@ -9220,6 +11353,150 @@ mod supersede_rekey_tests {
         }
     }
 
+    /// Codex P1, PR #362 round 18: an in-flight bundle bound to one remote
+    /// client and a superseding request bound to a DIFFERENT remote client
+    /// (a legitimate control transfer, not over-capacity) must NOT be
+    /// treated like the over-cap case above — the new request must be
+    /// enqueued (not dropped), and the stale in-flight bundle must NOT be
+    /// re-enqueued (it would only be rejected later against the new arm
+    /// anyway, and re-enqueuing it would recreate the round-6 livelock).
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_reenqueue_keys_the_new_request_on_identity_conflict_instead_of_preserving_the_stale_bundle(
+    ) {
+        let bus = MessageBus::new(16).unwrap();
+        let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let (_tx_tx, tx_rx) = bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        let (_autonomous_tx, autonomous_rx) =
+            bus.create_channel(ComponentId::Autonomous).await.unwrap();
+
+        let mut encoder = super::Ft8Encoder::new();
+        let tx_params = pancetta_ft8::ProtocolParams::from_protocol(pancetta_ft8::Protocol::Ft8);
+
+        // A 2-item bundle in flight, bound to client-a.
+        let in_flight = [
+            crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH R-15".to_string(),
+                frequency_offset: 1000.0,
+                qso_id: Some("qso-1".to_string()),
+            },
+            crate::message_bus::TransmitRequestItem {
+                message_text: "OTHER W5AU R-08".to_string(),
+                frequency_offset: 1400.0,
+                qso_id: Some("qso-other".to_string()),
+            },
+        ];
+
+        // Control has transferred to client-b, whose request supersedes.
+        let now = chrono::Utc::now();
+        let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
+            pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
+            pancetta_core::slot::SLOT_NS,
+        );
+        let superseding = MessageType::TransmitRequest {
+            message_text: "K5ARH KA1ABC 73".to_string(),
+            frequency_offset: 1500.0,
+            qso_id: Some("qso-1".to_string()),
+            tx_parity: Some(cur_parity),
+            origin: crate::message_bus::TxOrigin::Remote,
+            remote_client_key_id: Some("client-b".to_string()),
+        };
+
+        let ptt_active = Arc::new(AtomicBool::new(true));
+        let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+
+        super::supersede_multi_reenqueue(
+            superseding,
+            &in_flight,
+            crate::message_bus::TxOrigin::Remote,
+            Some("client-a".to_string()),
+            Some(cur_parity),
+            &mut encoder,
+            pancetta_ft8::Protocol::Ft8,
+            &tx_params,
+            &bus,
+            &ptt_active,
+            &last_ptt_on_ms,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+            pancetta_config::station::TxSelfParity::Auto,
+            now,
+            2,
+        )
+        .await;
+
+        // The stale client-a bundle must NOT be re-enqueued as a
+        // MultiTransmitRequest — it's abandoned, not preserved.
+        // The NEW client-b request must be the only thing sent to the
+        // transmitter channel, as a single TransmitRequest carrying its OWN
+        // identity.
+        let reenqueued = tx_rx
+            .try_recv()
+            .expect("the new request must be enqueued, not silently dropped");
+        match reenqueued.message_type {
+            MessageType::TransmitRequest {
+                message_text,
+                qso_id,
+                origin,
+                remote_client_key_id,
+                tx_parity,
+                ..
+            } => {
+                assert_eq!(message_text, "K5ARH KA1ABC 73");
+                assert_eq!(qso_id.as_deref(), Some("qso-1"));
+                assert_eq!(origin, crate::message_bus::TxOrigin::Remote);
+                assert_eq!(remote_client_key_id.as_deref(), Some("client-b"));
+                assert_eq!(
+                    tx_parity,
+                    Some(cur_parity),
+                    "Codex P1, round 19: the re-enqueued identity-conflict replacement \
+                     must carry the NEW request's own latched tx_parity, not None — \
+                     otherwise TxSelfParity::Auto recomputes the nearest slot on the \
+                     next dequeue, which can pick a sequential (colliding) slot instead"
+                );
+            }
+            other => panic!("expected the new request as a single TransmitRequest, got {other:?}"),
+        }
+        assert!(
+            tx_rx.try_recv().is_err(),
+            "the stale in-flight bundle must not also be re-enqueued"
+        );
+
+        // Both abandoned in-flight items are reported as failed, exactly
+        // like the existing single-item-abandon precedent (PAN-38 round 5)
+        // extended to every item in the bundle.
+        let mut reported: Vec<(bool, String, Option<String>)> = Vec::new();
+        while let Ok(msg) = autonomous_rx.try_recv() {
+            if let MessageType::TransmitComplete {
+                success,
+                message_text,
+                qso_id,
+                ..
+            } = msg.message_type
+            {
+                reported.push((success, message_text, qso_id));
+            }
+        }
+        assert_eq!(
+            reported.len(),
+            2,
+            "both abandoned in-flight items must get a failed TransmitComplete"
+        );
+        assert!(reported.iter().all(|(success, ..)| !success));
+        assert!(reported
+            .iter()
+            .any(|(_, text, qso)| text == "KA1ABC K5ARH R-15" && qso.as_deref() == Some("qso-1")));
+        assert!(
+            reported
+                .iter()
+                .any(|(_, text, qso)| text == "OTHER W5AU R-08"
+                    && qso.as_deref() == Some("qso-other"))
+        );
+    }
+
     /// PR #348 review round 4 (Codex P1): a raised effective cap (e.g. Fox
     /// mode) makes `SupersedeOutcome::Bundle` newly reachable through
     /// `supersede_multi_reenqueue` for an explicit-parity in-flight bundle.
@@ -9257,6 +11534,7 @@ mod supersede_rekey_tests {
             qso_id: Some("qso-2".to_string()),
             tx_parity: Some(cur_parity),
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
 
         let ptt_active = Arc::new(AtomicBool::new(true));
@@ -9266,6 +11544,7 @@ mod supersede_rekey_tests {
             superseding,
             &in_flight,
             crate::message_bus::TxOrigin::Local,
+            None,
             Some(cur_parity), // the ESTABLISHED in-flight bundle's own parity
             &mut encoder,
             pancetta_ft8::Protocol::Ft8,
@@ -9492,6 +11771,16 @@ mod coalesce_tests {
     use super::*;
     use std::collections::HashSet;
 
+    fn audit_tmp() -> std::path::PathBuf {
+        use std::sync::atomic::AtomicU64;
+        static C: AtomicU64 = AtomicU64::new(0);
+        let n = C.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "pancetta-tx-coalesce-test-{}-{n}.log",
+            std::process::id()
+        ))
+    }
+
     /// `max_concurrent_qsos` for tests that aren't about the concurrent-QSO
     /// cap itself — large enough that it never becomes the limiting factor,
     /// leaving `MAX_RETAINED_TX_STREAMS` as the only cap in play (unchanged
@@ -9505,6 +11794,7 @@ mod coalesce_tests {
             qso_id: qso_id.map(|s| s.to_string()),
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         }
     }
 
@@ -9521,6 +11811,7 @@ mod coalesce_tests {
             qso_id: qso_id.map(|s| s.to_string()),
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         }
     }
 
@@ -9732,6 +12023,7 @@ mod coalesce_tests {
             qso_id: qso_id.map(|s| s.to_string()),
             tx_parity,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         }
     }
 
@@ -9751,6 +12043,7 @@ mod coalesce_tests {
             qso_id: qso_id.map(|s| s.to_string()),
             tx_parity,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         }
     }
 
@@ -10002,6 +12295,7 @@ mod coalesce_tests {
             qso_id: Some("qso-a".to_string()),
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
         for (text, id, freq) in [("B", "qso-b", 1300.0), ("C", "qso-c", 1600.0)] {
             backlog_tx
@@ -10014,6 +12308,7 @@ mod coalesce_tests {
                         qso_id: Some(id.to_string()),
                         tx_parity: None,
                         origin: crate::message_bus::TxOrigin::Local,
+                        remote_client_key_id: None,
                     },
                     Instant::now(),
                 ))
@@ -10021,7 +12316,22 @@ mod coalesce_tests {
         }
 
         // max_concurrent_qsos = 1: only "A" survives, "B" and "C" are cap-truncated.
-        let _ = coalesce_backlog_into(head, &backlog_rx, &bus, &active_tx_qsos, 1).await;
+        // Every entry here is Local, so the identity-bound arm gate never
+        // consults this — an unarmed ArmState is the neutral choice.
+        let arm = Arc::new(std::sync::Mutex::new(pancetta_agent::arm::ArmState::new()));
+        let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp());
+        let display_feed_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _ = coalesce_backlog_into(
+            head,
+            &backlog_rx,
+            &bus,
+            &active_tx_qsos,
+            1,
+            &arm,
+            &audit_log,
+            &display_feed_enabled,
+        )
+        .await;
 
         let mut got = Vec::new();
         while let Ok(msg) = autonomous_rx.try_recv() {
@@ -10042,6 +12352,124 @@ mod coalesce_tests {
                 }
                 other => panic!("expected TransmitComplete, got {other:?}"),
             }
+        }
+    }
+
+    /// PAN-91 review follow-up: a backlog containing entries bound to TWO
+    /// different remote clients must never fold into one bundle authorized
+    /// under a single client's identity — the entry bound to whichever
+    /// client is NOT currently armed must be filtered out (and reported as
+    /// a failed `TransmitComplete`) before folding, not silently carried
+    /// along under the other entry's identity.
+    #[tokio::test(flavor = "current_thread")]
+    async fn backlog_into_drops_entries_bound_to_a_different_client_than_the_one_armed() {
+        use crate::message_bus::MessageBus;
+        use std::sync::Arc;
+
+        let bus = MessageBus::new(16).unwrap();
+        let (_autonomous_tx, autonomous_rx) =
+            bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (backlog_tx, backlog_rx) = crossbeam_channel::unbounded();
+        let active_tx_qsos = Arc::new(std::sync::RwLock::new(liveset(&["qso-a", "qso-b"])));
+
+        // client-a is armed; client-b is not.
+        let mut st = pancetta_agent::arm::ArmState::new();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        st.arm(
+            pancetta_agent::arm::VerifiedArmGrant {
+                operator_callsign: "K5ARH".to_string(),
+                ttl_ms: 120_000,
+                scope_tx: true,
+                jti: "mixed-bundle-jti".to_string(),
+                client_key_id: "client-a".to_string(),
+            },
+            now_ms,
+        );
+        st.set_local_consent(true, now_ms);
+        let arm = Arc::new(std::sync::Mutex::new(st));
+
+        // Head entry: bound to client-a (armed) — must survive.
+        let head = MessageType::TransmitRequest {
+            message_text: "A".to_string(),
+            frequency_offset: 1000.0,
+            qso_id: Some("qso-a".to_string()),
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Remote,
+            remote_client_key_id: Some("client-a".to_string()),
+        };
+        // Backlogged entry: bound to client-b (NOT armed) — must be dropped,
+        // never folded into a bundle that client-a's arm would authorize.
+        backlog_tx
+            .send(ComponentMessage::new(
+                ComponentId::Ft8Transmitter,
+                ComponentId::Ft8Transmitter,
+                MessageType::TransmitRequest {
+                    message_text: "B".to_string(),
+                    frequency_offset: 1300.0,
+                    qso_id: Some("qso-b".to_string()),
+                    tx_parity: None,
+                    origin: crate::message_bus::TxOrigin::Remote,
+                    remote_client_key_id: Some("client-b".to_string()),
+                },
+                Instant::now(),
+            ))
+            .unwrap();
+
+        let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp());
+        let display_feed_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let result = coalesce_backlog_into(
+            head,
+            &backlog_rx,
+            &bus,
+            &active_tx_qsos,
+            2,
+            &arm,
+            &audit_log,
+            &display_feed_enabled,
+        )
+        .await;
+
+        match result {
+            MessageType::TransmitRequest {
+                message_text,
+                remote_client_key_id,
+                ..
+            } => {
+                assert_eq!(
+                    message_text, "A",
+                    "only client-a's (armed) entry may survive"
+                );
+                assert_eq!(remote_client_key_id.as_deref(), Some("client-a"));
+            }
+            other => panic!(
+                "expected a single TransmitRequest for client-a's surviving entry, got {other:?}"
+            ),
+        }
+
+        // Round-9 review (Codex P2): the identity-denied reporting loop is
+        // now a DETACHED `tokio::spawn`'d task (so a large stale backlog
+        // can't delay returning the admitted frame above) — give the
+        // current-thread runtime a chance to actually run it before
+        // asserting on its output.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let mut got = Vec::new();
+        while let Ok(msg) = autonomous_rx.try_recv() {
+            got.push(msg);
+        }
+        assert_eq!(
+            got.len(),
+            1,
+            "client-b's identity-denied entry must be reported as a failed TransmitComplete"
+        );
+        match &got[0].message_type {
+            MessageType::TransmitComplete {
+                success, qso_id, ..
+            } => {
+                assert!(!success);
+                assert_eq!(qso_id.as_deref(), Some("qso-b"));
+            }
+            other => panic!("expected TransmitComplete, got {other:?}"),
         }
     }
 }
@@ -10530,6 +12958,190 @@ mod remote_arm_gate_tests {
     }
 }
 
+/// Unit tests for PAN-91's client-identity-bound gate (`remote_tx_permitted_for`).
+///
+/// These lock the fix's actual invariant: a frame bound to one client must
+/// key TX only while THAT client is armed — not merely while *some* client
+/// is armed, which is exactly the gap that let a different peer's arm
+/// authorize a QSO it never requested.
+#[cfg(test)]
+mod remote_arm_gate_identity_tests {
+    use super::remote_tx_permitted_for;
+    use pancetta_agent::arm::{ArmState, VerifiedArmGrant};
+    use std::sync::{Arc, Mutex};
+
+    const NOW: i64 = 1_000_000;
+
+    fn grant_for(client_key_id: &str) -> VerifiedArmGrant {
+        VerifiedArmGrant {
+            operator_callsign: "K5ARH".to_string(),
+            ttl_ms: 120_000,
+            scope_tx: true,
+            jti: "tx-test-arm-jti".to_string(),
+            client_key_id: client_key_id.to_string(),
+        }
+    }
+
+    fn armed_and_consented(client_key_id: &str) -> Arc<Mutex<ArmState>> {
+        let mut st = ArmState::new();
+        st.arm(grant_for(client_key_id), NOW);
+        st.set_local_consent(true, NOW);
+        Arc::new(Mutex::new(st))
+    }
+
+    #[test]
+    fn matching_client_is_permitted() {
+        let arm = armed_and_consented("client-a");
+        assert!(
+            remote_tx_permitted_for(&arm, NOW, Some("client-a")),
+            "the client that is actually armed must be permitted to TX"
+        );
+    }
+
+    #[test]
+    fn different_client_is_denied_even_though_someone_is_armed() {
+        // THE regression this fix closes: client-b's frame must not be
+        // authorized just because client-a happens to be armed right now.
+        let arm = armed_and_consented("client-a");
+        assert!(
+            !remote_tx_permitted_for(&arm, NOW, Some("client-b")),
+            "PAN-91: a frame bound to a different client than the one \
+             currently armed must be denied, not authorized by proxy"
+        );
+    }
+
+    #[test]
+    fn no_bound_identity_falls_back_to_boolean_only_gate() {
+        // Pre-PAN-91 producers (no client identity concept, e.g. the WSJT-X
+        // UDP bridge) must be unaffected: None degrades to the old
+        // boolean-only check.
+        let arm = armed_and_consented("client-a");
+        assert!(
+            remote_tx_permitted_for(&arm, NOW, None),
+            "a frame with no bound client identity must fall back to the \
+             plain armed/permitted check, preserving pre-PAN-91 behavior"
+        );
+    }
+
+    #[test]
+    fn bound_identity_denied_when_nobody_armed() {
+        let arm = Arc::new(Mutex::new(ArmState::new()));
+        assert!(
+            !remote_tx_permitted_for(&arm, NOW, Some("client-a")),
+            "an unarmed station must deny regardless of the frame's bound identity"
+        );
+    }
+}
+
+#[cfg(test)]
+mod arm_snapshot_attribution_tests {
+    use super::ArmSnapshot;
+    use pancetta_agent::arm::{ArmState, VerifiedArmGrant};
+    use std::sync::{Arc, Mutex};
+
+    const NOW: i64 = 1_000_000;
+
+    fn grant_for(operator_callsign: &str, client_key_id: &str) -> VerifiedArmGrant {
+        VerifiedArmGrant {
+            operator_callsign: operator_callsign.to_string(),
+            ttl_ms: 120_000,
+            scope_tx: true,
+            jti: "tx-snapshot-test-jti".to_string(),
+            client_key_id: client_key_id.to_string(),
+        }
+    }
+
+    /// Round-10 review (Codex P2): a detached denial-reporting task must
+    /// attribute using the arm state AS IT WAS when the snapshot was taken,
+    /// not whoever happens to be armed by the time the task actually runs.
+    #[test]
+    fn attribution_reflects_the_snapshot_instant_not_a_later_live_lock() {
+        let mut st = ArmState::new();
+        st.arm(grant_for("K5ARH", "client-a"), NOW);
+        st.set_local_consent(true, NOW);
+        let arm = Arc::new(Mutex::new(st));
+
+        let snapshot = ArmSnapshot::take(&arm, NOW);
+
+        // A DIFFERENT operator arms the live state AFTER the snapshot was
+        // taken — simulating the race a detached spawn's later re-lock
+        // would be vulnerable to.
+        arm.lock()
+            .unwrap()
+            .arm(grant_for("W1AW", "client-b"), NOW + 10);
+
+        assert_eq!(
+            snapshot.operator_attribution(Some("client-a")).as_deref(),
+            Some("K5ARH"),
+            "attribution must reflect who was armed AT THE SNAPSHOT INSTANT, \
+             not whoever armed later"
+        );
+    }
+
+    #[test]
+    fn identity_mismatch_never_attributes_to_the_armed_operator() {
+        let mut st = ArmState::new();
+        st.arm(grant_for("K5ARH", "client-a"), NOW);
+        st.set_local_consent(true, NOW);
+        let arm = Arc::new(Mutex::new(st));
+        let snapshot = ArmSnapshot::take(&arm, NOW);
+
+        assert_eq!(
+            snapshot.operator_attribution(Some("client-b")),
+            None,
+            "a frame bound to a DIFFERENT client than the one armed must \
+             never be attributed to the armed operator"
+        );
+    }
+
+    #[test]
+    fn unbound_frame_attributes_to_whoever_is_armed() {
+        let mut st = ArmState::new();
+        st.arm(grant_for("K5ARH", "client-a"), NOW);
+        st.set_local_consent(true, NOW);
+        let arm = Arc::new(Mutex::new(st));
+        let snapshot = ArmSnapshot::take(&arm, NOW);
+
+        assert_eq!(
+            snapshot.operator_attribution(None).as_deref(),
+            Some("K5ARH"),
+            "a frame with no bound identity falls back to whoever is armed, \
+             preserving pre-PAN-91 attribution"
+        );
+    }
+
+    /// Round-13 review (Codex P1): `is_identity_mismatch` is gated on
+    /// `tx_permitted` (it exists to pick DENIAL-REASON WORDING), so reusing
+    /// it for attribution let a mismatched-AND-otherwise-denied frame (here:
+    /// local consent off, so `tx_permitted` is false) fall through to
+    /// attributing B's callsign on A's denied frame — the gate suppressed
+    /// the identity check instead of the identity check standing on its
+    /// own. Attribution must refuse whenever the identity genuinely
+    /// differs, independent of why `tx_permitted` is false.
+    #[test]
+    fn identity_mismatch_refuses_attribution_even_when_tx_is_not_permitted_for_another_reason() {
+        let mut st = ArmState::new();
+        st.arm(grant_for("K5ARH", "client-b"), NOW);
+        // Local consent OFF: tx_permitted is false for an UNRELATED reason,
+        // not because of the identity mismatch below.
+        st.set_local_consent(false, NOW);
+        let arm = Arc::new(Mutex::new(st));
+        let snapshot = ArmSnapshot::take(&arm, NOW);
+        assert!(
+            !snapshot.tx_permitted,
+            "test setup: tx must not be permitted here"
+        );
+
+        assert_eq!(
+            snapshot.operator_attribution(Some("client-a")),
+            None,
+            "a frame bound to client-a must never be attributed to client-b's \
+             operator, even when the denial's proximate cause is something \
+             else entirely (local consent off)"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tx_counter_tests {
     use super::*;
@@ -10575,6 +13187,7 @@ mod classifier_tests {
             qso_id: qso_id.map(|s| s.to_string()),
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         }
     }
 
@@ -10590,6 +13203,8 @@ mod classifier_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            crate::message_bus::TxOrigin::Local,
+            None,
         );
         match outcome {
             super::IncomingDuringTx::Supersede { text, qso_id, .. } => {
@@ -10615,6 +13230,8 @@ mod classifier_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            crate::message_bus::TxOrigin::Local,
+            None,
         );
         assert!(matches!(outcome, super::IncomingDuringTx::Supersede { .. }));
     }
@@ -10636,6 +13253,8 @@ mod classifier_tests {
                 qso_id: None,
             }],
             &pivoted_once,
+            crate::message_bus::TxOrigin::Local,
+            None,
         );
         assert!(
             matches!(outcome, super::IncomingDuringTx::Drop),
@@ -10657,6 +13276,8 @@ mod classifier_tests {
                 qso_id: None,
             }],
             &pivoted_once,
+            crate::message_bus::TxOrigin::Local,
+            None,
         );
         assert!(matches!(outcome, super::IncomingDuringTx::Supersede { .. }));
     }
@@ -10685,6 +13306,8 @@ mod classifier_tests {
                 qso_id: Some("qso-vp2maa".to_string()),
             }],
             &pivoted_once,
+            crate::message_bus::TxOrigin::Local,
+            None,
         );
         assert!(
             matches!(outcome, super::IncomingDuringTx::Requeue),
@@ -10714,7 +13337,13 @@ mod classifier_tests {
                 qso_id: Some("qso-second".to_string()),
             },
         ];
-        let outcome = super::classify_incoming_during_tx(&candidate, &in_flight, &pivoted_once);
+        let outcome = super::classify_incoming_during_tx(
+            &candidate,
+            &in_flight,
+            &pivoted_once,
+            crate::message_bus::TxOrigin::Local,
+            None,
+        );
         match outcome {
             super::IncomingDuringTx::Supersede { text, qso_id, .. } => {
                 assert_eq!(text, "SECOND W5AU RR73");
@@ -10738,8 +13367,84 @@ mod classifier_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            crate::message_bus::TxOrigin::Local,
+            None,
         );
         assert!(matches!(outcome, super::IncomingDuringTx::Drop));
+    }
+
+    /// Codex P1, round 21 (PR #362): byte-identical content is NOT a safe
+    /// duplicate when the CANDIDATE's own authorization differs from the
+    /// in-flight frame's — e.g. a local operator takes over an A-bound
+    /// remote QSO and repeats its current text. Dropping this would let a
+    /// later disarm of A abort the in-flight frame while the differently-
+    /// authorized replacement (the one actually entitled to transmit) is
+    /// gone for good, with no normal rearm to recover a completed QSO.
+    #[test]
+    fn classify_supersedes_identical_content_when_authorization_differs() {
+        let pivoted_once = std::collections::HashMap::new();
+        let candidate = MessageType::TransmitRequest {
+            message_text: "KA1ABC K5ARH R-15".to_string(),
+            frequency_offset: 1500.0,
+            qso_id: Some("qso-1".to_string()),
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
+        };
+        let outcome = super::classify_incoming_during_tx(
+            &candidate,
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH R-15".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
+            &pivoted_once,
+            // In-flight side is bound to a Remote client — candidate above
+            // is Local, so authorization differs despite identical content.
+            crate::message_bus::TxOrigin::Remote,
+            Some("client-a"),
+        );
+        assert!(
+            matches!(outcome, super::IncomingDuringTx::Supersede { .. }),
+            "identical content under DIFFERENT authorization must supersede, not Drop — \
+             got {outcome:?}"
+        );
+    }
+
+    /// Codex P1, round 21 (PR #362): same authorization-aware check for a
+    /// `MultiTransmitRequest` bundle whose overlapping item's content is
+    /// unchanged but the bundle's own authorization differs from the
+    /// in-flight frame's.
+    #[test]
+    fn classify_supersedes_multi_transmit_request_with_unchanged_overlap_when_authorization_differs(
+    ) {
+        let pivoted_once = std::collections::HashMap::new();
+        let candidate = MessageType::MultiTransmitRequest {
+            items: vec![crate::message_bus::TransmitRequestItem {
+                message_text: "IN-FLIGHT W5AU R-01".to_string(),
+                frequency_offset: 1000.0,
+                qso_id: Some("qso-in-flight".to_string()),
+            }],
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Remote,
+            remote_client_key_id: Some("client-b".to_string()),
+        };
+        let outcome = super::classify_incoming_during_tx(
+            &candidate,
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "IN-FLIGHT W5AU R-01".to_string(),
+                frequency_offset: 1000.0,
+                qso_id: Some("qso-in-flight".to_string()),
+            }],
+            &pivoted_once,
+            crate::message_bus::TxOrigin::Remote,
+            Some("client-a"),
+        );
+        assert!(
+            matches!(outcome, super::IncomingDuringTx::Supersede { .. }),
+            "an unchanged overlap under DIFFERENT authorization must supersede, not Requeue \
+             — got {outcome:?}"
+        );
     }
 
     /// Codex round 3 (PR #346): a stuck-DX QSO can re-render the SAME text
@@ -10766,6 +13471,8 @@ mod classifier_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            crate::message_bus::TxOrigin::Local,
+            None,
         );
         assert!(
             matches!(outcome, super::IncomingDuringTx::Supersede { .. }),
@@ -10791,8 +13498,52 @@ mod classifier_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            crate::message_bus::TxOrigin::Local,
+            None,
         );
         assert!(matches!(outcome, super::IncomingDuringTx::Drop));
+    }
+
+    /// Codex P1, round 22 (PR #362): a pivot tombstone match (same qso_id,
+    /// text, frequency) is not a safe duplicate when the CANDIDATE's own
+    /// authorization differs from the in-flight frame's — round 21's
+    /// authorization check ran only AFTER this tombstone check, so control
+    /// transferring from client A to client B while B resends the exact
+    /// pivoted text still got swallowed as A's stale tombstone duplicate.
+    #[test]
+    fn classify_does_not_drop_pivot_tombstone_when_authorization_differs() {
+        let mut pivoted_once = std::collections::HashMap::new();
+        pivoted_once.insert(
+            active_tx_qso_key("qso-1"),
+            ("KA1ABC K5ARH RR73".to_string(), 1500.0),
+        );
+        let candidate = MessageType::TransmitRequest {
+            message_text: "KA1ABC K5ARH RR73".to_string(),
+            frequency_offset: 1500.0,
+            qso_id: Some("qso-1".to_string()),
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Remote,
+            remote_client_key_id: Some("client-b".to_string()),
+        };
+        let outcome = super::classify_incoming_during_tx(
+            &candidate,
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH RR73".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
+            &pivoted_once,
+            // In-flight side is bound to client-a — candidate above is
+            // client-b, so authorization differs despite an exact tombstone
+            // match.
+            crate::message_bus::TxOrigin::Remote,
+            Some("client-a"),
+        );
+        assert!(
+            matches!(outcome, super::IncomingDuringTx::Supersede { .. }),
+            "a tombstone match under DIFFERENT authorization must supersede, not Drop — \
+             got {outcome:?}"
+        );
     }
 
     /// Codex round 6 (PR #346): a pivot tombstone for the same QSO and text
@@ -10825,6 +13576,8 @@ mod classifier_tests {
                 qso_id: Some("qso-1".to_string()),
             }],
             &pivoted_once,
+            crate::message_bus::TxOrigin::Local,
+            None,
         );
         assert!(
             matches!(outcome, super::IncomingDuringTx::Supersede { .. }),
@@ -10849,6 +13602,7 @@ mod classifier_tests {
             }],
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
         let outcome = super::classify_incoming_during_tx(
             &candidate,
@@ -10858,6 +13612,8 @@ mod classifier_tests {
                 qso_id: Some("qso-in-flight".to_string()),
             }],
             &pivoted_once,
+            crate::message_bus::TxOrigin::Local,
+            None,
         );
         assert!(
             matches!(outcome, super::IncomingDuringTx::Requeue),
@@ -10887,6 +13643,7 @@ mod classifier_tests {
             ],
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
         let outcome = super::classify_incoming_during_tx(
             &candidate,
@@ -10896,6 +13653,8 @@ mod classifier_tests {
                 qso_id: Some("qso-in-flight".to_string()),
             }],
             &pivoted_once,
+            crate::message_bus::TxOrigin::Local,
+            None,
         );
         assert!(
             matches!(outcome, super::IncomingDuringTx::Supersede { .. }),
@@ -10932,6 +13691,7 @@ mod classifier_tests {
             ],
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
         let outcome = super::classify_incoming_during_tx(
             &candidate,
@@ -10941,6 +13701,8 @@ mod classifier_tests {
                 qso_id: Some("qso-in-flight".to_string()),
             }],
             &pivoted_once,
+            crate::message_bus::TxOrigin::Local,
+            None,
         );
         assert!(
             matches!(outcome, super::IncomingDuringTx::Requeue),

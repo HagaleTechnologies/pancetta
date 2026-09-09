@@ -49,7 +49,7 @@
 //!     qso_manager.start().await?;
 //!     
 //!     // Start a CQ call (remote_origin = false — local operator)
-//!     let qso_id = qso_manager.start_cq(14074000.0, None, false).await?;
+//!     let qso_id = qso_manager.start_cq(14074000.0, None, false, None).await?;
 //!     println!("Started CQ: {}", qso_id);
 //!     
 //!     // Get QSO status
@@ -391,7 +391,10 @@ impl QsoSystem {
 
     /// Start a CQ call
     pub async fn start_cq(&self, frequency: f64) -> QsoResult<QsoId> {
-        Ok(self.qso_manager.start_cq(frequency, None, false).await?)
+        Ok(self
+            .qso_manager
+            .start_cq(frequency, None, false, None)
+            .await?)
     }
 
     /// Respond to a CQ call

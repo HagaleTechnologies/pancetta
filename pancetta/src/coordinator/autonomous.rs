@@ -2716,6 +2716,7 @@ impl super::ApplicationCoordinator {
                                             qso_id: item.qso_id,
                                             tx_parity,
                                             origin: crate::message_bus::TxOrigin::Local,
+                                            remote_client_key_id: None,
                                         },
                                         Instant::now(),
                                     );
@@ -2825,6 +2826,7 @@ impl super::ApplicationCoordinator {
                                                 qso_id: item.qso_id,
                                                 tx_parity: p,
                                                 origin: crate::message_bus::TxOrigin::Local,
+                                                remote_client_key_id: None,
                                             },
                                             Instant::now(),
                                         );
@@ -2863,6 +2865,7 @@ impl super::ApplicationCoordinator {
                                             items,
                                             tx_parity: bundle_parity,
                                             origin: crate::message_bus::TxOrigin::Local,
+                                            remote_client_key_id: None,
                                         },
                                         Instant::now(),
                                     );
@@ -4113,7 +4116,7 @@ mod drain_pending_qso_offset_requests_tests {
         let mut op = operator_with_live_allocator();
         let qso_manager = manager();
         let qso_id = qso_manager
-            .start_cq(1500.0, None, false)
+            .start_cq(1500.0, None, false, None)
             .await
             .expect("start_cq should succeed");
         let pending = std::sync::Mutex::new(vec![
@@ -4224,7 +4227,7 @@ mod drain_pending_qso_offset_requests_tests {
 
         let qso_manager = manager();
         let qso_id = qso_manager
-            .start_cq(AVOID_HZ, Some(SlotParity::Even), false)
+            .start_cq(AVOID_HZ, Some(SlotParity::Even), false, None)
             .await
             .expect("start_cq should succeed");
         assert_eq!(
@@ -4280,7 +4283,7 @@ mod drain_pending_qso_offset_requests_tests {
         );
         let qso_manager = manager();
         let qso_id = qso_manager
-            .start_cq(1500.0, None, false)
+            .start_cq(1500.0, None, false, None)
             .await
             .expect("start_cq should succeed");
         let pending = std::sync::Mutex::new(vec![
@@ -4348,7 +4351,7 @@ mod drain_pending_qso_offset_requests_tests {
         let mut op = operator_with_live_allocator();
         let qso_manager = manager();
         let qso_id = qso_manager
-            .start_cq(1500.0, None, false)
+            .start_cq(1500.0, None, false, None)
             .await
             .expect("start_cq should succeed");
         let key = crate::coordinator::active_tx_qso_key(&qso_id.to_string());
@@ -4387,7 +4390,7 @@ mod drain_pending_qso_offset_requests_tests {
         let mut op = operator_with_live_allocator();
         let qso_manager = manager();
         let qso_id = qso_manager
-            .start_cq(1500.0, None, false)
+            .start_cq(1500.0, None, false, None)
             .await
             .expect("start_cq should succeed");
         let active_tx_offsets = no_offsets();
@@ -4422,7 +4425,7 @@ mod drain_pending_qso_offset_requests_tests {
         let mut op = operator_with_live_allocator();
         let qso_manager = manager();
         let qso_id = qso_manager
-            .start_cq(1500.0, None, false)
+            .start_cq(1500.0, None, false, None)
             .await
             .expect("start_cq should succeed");
         let key = crate::coordinator::active_tx_qso_key(&qso_id.to_string());
@@ -4470,8 +4473,14 @@ mod drain_pending_qso_offset_requests_tests {
     async fn hold_mode_at_drain_time_discards_every_queued_action() {
         let mut op = operator_with_live_allocator();
         let qso_manager = manager();
-        let switching = qso_manager.start_cq(1500.0, None, false).await.unwrap();
-        let reverting = qso_manager.start_cq(1800.0, None, false).await.unwrap();
+        let switching = qso_manager
+            .start_cq(1500.0, None, false, None)
+            .await
+            .unwrap();
+        let reverting = qso_manager
+            .start_cq(1800.0, None, false, None)
+            .await
+            .unwrap();
         let pending = std::sync::Mutex::new(vec![
             pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
                 switching,
@@ -4541,8 +4550,14 @@ mod drain_pending_qso_offset_requests_tests {
     async fn hold_entered_mid_batch_stops_the_requests_still_to_commit() {
         let mut op = operator_with_live_allocator();
         let qso_manager = manager();
-        let first = qso_manager.start_cq(1500.0, None, false).await.unwrap();
-        let second = qso_manager.start_cq(1800.0, None, false).await.unwrap();
+        let first = qso_manager
+            .start_cq(1500.0, None, false, None)
+            .await
+            .unwrap();
+        let second = qso_manager
+            .start_cq(1800.0, None, false, None)
+            .await
+            .unwrap();
         let first_key = crate::coordinator::active_tx_qso_key(&first.to_string());
         let second_key = crate::coordinator::active_tx_qso_key(&second.to_string());
         let active_tx_offsets =
@@ -4659,7 +4674,10 @@ mod drain_pending_qso_offset_requests_tests {
     async fn two_requests_for_one_qso_commit_at_most_one_relocation() {
         let mut op = operator_with_live_allocator();
         let qso_manager = manager();
-        let qso_id = qso_manager.start_cq(1500.0, None, false).await.unwrap();
+        let qso_id = qso_manager
+            .start_cq(1500.0, None, false, None)
+            .await
+            .unwrap();
         // Two `u` presses inside one slot: the second still reads the QSO's
         // un-moved offset, because nothing has committed yet.
         let pending = std::sync::Mutex::new(vec![
@@ -4713,7 +4731,10 @@ mod drain_pending_qso_offset_requests_tests {
         for nudge_first in [false, true] {
             let mut op = operator_with_live_allocator();
             let qso_manager = manager();
-            let qso_id = qso_manager.start_cq(1500.0, None, false).await.unwrap();
+            let qso_id = qso_manager
+                .start_cq(1500.0, None, false, None)
+                .await
+                .unwrap();
             let generation = qso_manager
                 .get_qso(qso_id)
                 .await
@@ -4793,8 +4814,14 @@ mod drain_pending_qso_offset_requests_tests {
     async fn concurrent_switches_in_one_batch_never_collapse_onto_one_offset() {
         let mut op = operator_with_live_allocator();
         let qso_manager = manager();
-        let first = qso_manager.start_cq(1500.0, None, false).await.unwrap();
-        let second = qso_manager.start_cq(1520.0, None, false).await.unwrap();
+        let first = qso_manager
+            .start_cq(1500.0, None, false, None)
+            .await
+            .unwrap();
+        let second = qso_manager
+            .start_cq(1520.0, None, false, None)
+            .await
+            .unwrap();
         let pending = std::sync::Mutex::new(vec![
             pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
                 first,
@@ -4868,9 +4895,12 @@ mod drain_pending_qso_offset_requests_tests {
         });
 
         let qso_manager = manager();
-        let switching = qso_manager.start_cq(1500.0, None, false).await.unwrap();
+        let switching = qso_manager
+            .start_cq(1500.0, None, false, None)
+            .await
+            .unwrap();
         let bystander = qso_manager
-            .start_cq(OCCUPIED_HZ, None, false)
+            .start_cq(OCCUPIED_HZ, None, false, None)
             .await
             .unwrap();
         // The occupancy view the coordinator holds at drain time: BOTH QSOs are
@@ -4962,13 +4992,16 @@ mod drain_pending_qso_offset_requests_tests {
         });
 
         let qso_manager = manager();
-        let stalled = qso_manager.start_cq(1500.0, None, false).await.unwrap();
+        let stalled = qso_manager
+            .start_cq(1500.0, None, false, None)
+            .await
+            .unwrap();
         let on_target = qso_manager
-            .start_cq(TAKEN_TARGET_HZ, None, false)
+            .start_cq(TAKEN_TARGET_HZ, None, false, None)
             .await
             .unwrap();
         let bystander = qso_manager
-            .start_cq(OCCUPIED_HZ, None, false)
+            .start_cq(OCCUPIED_HZ, None, false, None)
             .await
             .unwrap();
         let active_tx_offsets = std::sync::RwLock::new(std::collections::HashMap::from([
@@ -5042,8 +5075,14 @@ mod drain_pending_qso_offset_requests_tests {
         const A_NEW_TARGET_HZ: f64 = 1200.0;
         let mut op = operator_with_live_allocator();
         let qso_manager = manager();
-        let a = qso_manager.start_cq(VACATED_HZ, None, false).await.unwrap();
-        let b = qso_manager.start_cq(1900.0, None, false).await.unwrap();
+        let a = qso_manager
+            .start_cq(VACATED_HZ, None, false, None)
+            .await
+            .unwrap();
+        let b = qso_manager
+            .start_cq(1900.0, None, false, None)
+            .await
+            .unwrap();
         let active_tx_offsets = std::sync::RwLock::new(std::collections::HashMap::from([
             (
                 crate::coordinator::active_tx_qso_key(&a.to_string()),
@@ -5263,8 +5302,14 @@ mod drain_pending_qso_offset_requests_tests {
     async fn a_revert_onto_an_offset_another_qso_now_holds_reallocates_instead() {
         let mut op = operator_with_live_allocator();
         let qso_manager = manager();
-        let stalled = qso_manager.start_cq(1500.0, None, false).await.unwrap();
-        let occupier = qso_manager.start_cq(1200.0, None, false).await.unwrap();
+        let stalled = qso_manager
+            .start_cq(1500.0, None, false, None)
+            .await
+            .unwrap();
+        let occupier = qso_manager
+            .start_cq(1200.0, None, false, None)
+            .await
+            .unwrap();
         let stalled_key = crate::coordinator::active_tx_qso_key(&stalled.to_string());
         let occupier_key = crate::coordinator::active_tx_qso_key(&occupier.to_string());
         let active_tx_offsets = std::sync::RwLock::new(std::collections::HashMap::from([
@@ -5313,8 +5358,14 @@ mod drain_pending_qso_offset_requests_tests {
     async fn a_revert_onto_a_free_offset_still_commits_verbatim() {
         let mut op = operator_with_live_allocator();
         let qso_manager = manager();
-        let stalled = qso_manager.start_cq(1500.0, None, false).await.unwrap();
-        let other = qso_manager.start_cq(2400.0, None, false).await.unwrap();
+        let stalled = qso_manager
+            .start_cq(1500.0, None, false, None)
+            .await
+            .unwrap();
+        let other = qso_manager
+            .start_cq(2400.0, None, false, None)
+            .await
+            .unwrap();
         let active_tx_offsets = std::sync::RwLock::new(std::collections::HashMap::from([
             (
                 crate::coordinator::active_tx_qso_key(&stalled.to_string()),
@@ -5534,7 +5585,7 @@ mod qso_manager_watch_refresh_tests {
         // what the QSO event-forwarder (which IS respawned together with
         // the new manager) would push a request for.
         let qso_id = manager_after_restart
-            .start_cq(1500.0, None, false)
+            .start_cq(1500.0, None, false, None)
             .await
             .expect("start_cq should succeed on the new manager");
         assert!(
@@ -5601,7 +5652,7 @@ mod qso_manager_watch_refresh_tests {
         let manager_before_restart = manager();
         let manager_after_restart = manager();
         let qso_id = manager_after_restart
-            .start_cq(1500.0, None, false)
+            .start_cq(1500.0, None, false, None)
             .await
             .expect("start_cq should succeed on the new manager");
 

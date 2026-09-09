@@ -828,6 +828,12 @@ pub enum QsoEvent {
         /// forwards this as `TxOrigin::Remote` so the frame is armed-TX gated.
         /// `false` for every Local / TUI / autonomous QSO.
         remote_origin: bool,
+        /// Mirrors `QsoMetadata.remote_client_key_id` — the station-agent peer
+        /// this QSO is bound to, iff `remote_origin`. The coordinator's arm
+        /// gate compares this against the CURRENTLY-armed client so a
+        /// different peer taking control later can never authorize a frame it
+        /// never requested.
+        remote_client_key_id: Option<String>,
     },
 
     /// QSO completed
@@ -963,6 +969,11 @@ impl Default for DuplicateCheckConfig {
     }
 }
 
+/// Predicate for "would a Remote frame bound to this client (if any) be
+/// permitted to key PTT right now?" — see [`QsoManager::remote_tx_permitted`]'s
+/// doc comment.
+type RemoteTxPermittedSource = Arc<dyn Fn(Option<&str>) -> bool + Send + Sync>;
+
 /// QSO manager implementation
 pub struct QsoManager {
     /// Configuration
@@ -1059,7 +1070,14 @@ pub struct QsoManager {
     /// `true` ("assume the frame went out"), so unit tests and any caller that
     /// never injects a source keep the pre-existing behavior — the same
     /// convention `tx_policy`'s private `Full` default uses.
-    remote_tx_permitted: Arc<dyn Fn() -> bool + Send + Sync>,
+    ///
+    /// PAN-91 review follow-up: takes the QSO's own `remote_client_key_id` so
+    /// the evidence predicate matches the TX worker's actual identity-bound
+    /// gate (`remote_tx_permitted_for`) — a QSO bound to client A must not
+    /// read as "reached the air" just because client B happens to be armed.
+    /// `None` (a pre-PAN-91 remote_origin QSO with no bound identity) falls
+    /// back to the boolean-only check, exactly like the TX worker's own gate.
+    remote_tx_permitted: RemoteTxPermittedSource,
 
     /// "Is a rearmed frame currently blocked by a Hamlib-specific hard mute?"
     /// — `pancetta::coordinator::tx::tx_hard_mute_reason(...).is_some()`, read
@@ -1328,7 +1346,7 @@ impl QsoManager {
             // Default "permitted": with no injected source, assume a remote
             // frame reached the air — the pre-existing behavior (see the
             // field's doc comment).
-            remote_tx_permitted: Arc::new(|| true),
+            remote_tx_permitted: Arc::new(|_| true),
             // Default "not muted": with no injected source, assume no
             // Hamlib-specific hard mute is in effect — the pre-existing
             // behavior (see the field's doc comment).
@@ -1390,7 +1408,7 @@ impl QsoManager {
     /// arm also stops the silence being counted — the conservative direction).
     /// If never called, the manager keeps its private "permitted" default and
     /// behaves exactly as before.
-    pub fn set_remote_tx_permitted_source(&mut self, source: Arc<dyn Fn() -> bool + Send + Sync>) {
+    pub fn set_remote_tx_permitted_source(&mut self, source: RemoteTxPermittedSource) {
         self.remote_tx_permitted = source;
     }
 
@@ -1555,9 +1573,16 @@ impl QsoManager {
         frequency: f64,
         tx_parity: Option<pancetta_core::slot::SlotParity>,
         remote_origin: bool,
+        remote_client_key_id: Option<String>,
     ) -> Result<QsoId, QsoManagerError> {
-        self.start_cq_with_id(Uuid::new_v4(), frequency, tx_parity, remote_origin)
-            .await
+        self.start_cq_with_id(
+            Uuid::new_v4(),
+            frequency,
+            tx_parity,
+            remote_origin,
+            remote_client_key_id,
+        )
+        .await
     }
 
     /// PAN-38 round 2 (Codex): same as [`Self::start_cq`], but lets the
@@ -1576,6 +1601,7 @@ impl QsoManager {
         frequency: f64,
         tx_parity: Option<pancetta_core::slot::SlotParity>,
         remote_origin: bool,
+        remote_client_key_id: Option<String>,
     ) -> Result<QsoId, QsoManagerError> {
         if self.config.our_callsign == "NOCALL" || self.config.our_callsign == "N0CALL" {
             return Err(QsoManagerError::Configuration {
@@ -1633,6 +1659,7 @@ impl QsoManager {
             pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin,
+            remote_client_key_id: remote_client_key_id.clone(),
             // CQ-path latch: resolved from our own preference, not an
             // observed DX parity — always self-consistent, never provisional.
             tx_parity_provisional: false,
@@ -1659,6 +1686,7 @@ impl QsoManager {
             frequency,
             tx_parity,
             remote_origin,
+            remote_client_key_id,
         })
         .await;
 
@@ -1703,6 +1731,7 @@ impl QsoManager {
         frequency: f64,
         tx_parity: Option<pancetta_core::slot::SlotParity>,
         remote_origin: bool,
+        remote_client_key_id: Option<String>,
     ) -> Result<QsoId, QsoManagerError> {
         if self.config.our_callsign == "NOCALL" || self.config.our_callsign == "N0CALL" {
             return Err(QsoManagerError::Configuration {
@@ -1771,6 +1800,7 @@ impl QsoManager {
             // `false` for operator-pressed `c` (local); `true` for a remote
             // operator's `startCq` routed via the station agent.
             remote_origin,
+            remote_client_key_id: remote_client_key_id.clone(),
             // CQ-path latch: resolved from our own preference, not an
             // observed DX parity — always self-consistent, never provisional.
             tx_parity_provisional: false,
@@ -1807,6 +1837,7 @@ impl QsoManager {
             frequency,
             tx_parity,
             remote_origin,
+            remote_client_key_id,
         })
         .await;
 
@@ -1838,6 +1869,7 @@ impl QsoManager {
             CallInitiation::Auto,
             None,  // auto path always Tx=Rx; partner_freq not needed
             false, // autonomous is a LOCAL initiation, never remote
+            None,
         )
         .await
     }
@@ -1861,6 +1893,7 @@ impl QsoManager {
             CallInitiation::Manual,
             None,  // partner_freq computed by coordinator (T3); None = Tx=Rx fallback
             false, // TUI/DX-hunter manual call is LOCAL, never remote
+            None,
         )
         .await
     }
@@ -1958,6 +1991,7 @@ impl QsoManager {
                 CallInitiation::Manual,
                 Some(fox_freq), // Fox's RX offset; routes the Fox's reply via partner_freq
                 false,          // Shift+H hound engage is a LOCAL operator action
+                None,
             )
             .await?;
 
@@ -2024,6 +2058,7 @@ impl QsoManager {
     /// relevance gate routes the DX's replies (which arrive at *their* audio
     /// offset) to this QSO. Pass `None` for the normal Tx=Rx case (no partner
     /// routing needed). This is the same mechanism `engage_hound` uses.
+    #[allow(clippy::too_many_arguments)]
     pub async fn respond_to_cq_with(
         &self,
         target_callsign: String,
@@ -2032,6 +2067,7 @@ impl QsoManager {
         initiated_by: CallInitiation,
         partner_freq: Option<f64>,
         remote_origin: bool,
+        remote_client_key_id: Option<String>,
     ) -> Result<QsoId, QsoManagerError> {
         if self.config.our_callsign == "NOCALL" || self.config.our_callsign == "N0CALL" {
             return Err(QsoManagerError::Configuration {
@@ -2088,9 +2124,38 @@ impl QsoManager {
                     "Re-call of {} on {:.1} Hz — continuing existing QSO {} (idempotent keep-call, no new QSO)",
                     target_callsign, frequency, existing_id
                 );
-                // Re-emit the QSO's most-recent outbound as a keep-call. This
-                // is a benign no-op if it somehow has no prior Sent message.
-                let _ = self.resend_last_tx(existing_id).await;
+                // Round-10 review (Codex P2): decide whether this resend
+                // would even be attempted BEFORE rebinding/resending —
+                // checked here, not after, so a resend the TX layer would
+                // reject anyway never charges the manual-call budget.
+                // Mirrors the periodic rearm loop's `frame_reaches_the_air`
+                // gate (`rearm_manual_calls_at`) for the identical reason.
+                let should_resend =
+                    !remote_origin || (self.remote_tx_permitted)(remote_client_key_id.as_deref());
+                if should_resend {
+                    // Codex P1, round 20: only rebind when the action is
+                    // actually permitted — rebinding unconditionally left the
+                    // QSO's metadata claiming a DENIED client's identity even
+                    // though no fresh `MessageToSend` was emitted to publish
+                    // that change, so the coordinator's `latest_tx_intent`
+                    // stayed stale (still the prior owner's) and a later
+                    // key-time comparison could see matching stale
+                    // authorization without ever checking the new client's
+                    // arm. Deferring the rebind here (rather than publishing
+                    // the change on the denied path) keeps the QSO's identity
+                    // metadata meaning what every other call site already
+                    // assumes: "the last ACCEPTED client's action."
+                    //
+                    // Round-3 review (Codex P2): rebind to whichever client's
+                    // action was just accepted, BEFORE resending — see
+                    // `rebind_remote_identity`'s doc.
+                    self.rebind_remote_identity(existing_id, remote_origin, remote_client_key_id)
+                        .await;
+                    // Re-emit the QSO's most-recent outbound as a keep-call.
+                    // This is a benign no-op if it somehow has no prior Sent
+                    // message.
+                    let _ = self.resend_last_tx(existing_id).await;
+                }
                 return Ok(existing_id);
             }
         }
@@ -2169,6 +2234,7 @@ impl QsoManager {
             pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin,
+            remote_client_key_id: remote_client_key_id.clone(),
             tx_parity_provisional,
         };
 
@@ -2220,6 +2286,7 @@ impl QsoManager {
             frequency,
             tx_parity,
             remote_origin,
+            remote_client_key_id,
         })
         .await;
 
@@ -2277,6 +2344,7 @@ impl QsoManager {
         their_report: Option<i8>,
         partner_freq: Option<f64>,
         remote_origin: bool,
+        remote_client_key_id: Option<String>,
     ) -> Result<QsoId, QsoManagerError> {
         use pancetta_core::ResponseStep;
 
@@ -2310,6 +2378,7 @@ impl QsoManager {
                     CallInitiation::Manual,
                     partner_freq,
                     remote_origin,
+                    remote_client_key_id,
                 )
                 .await;
         }
@@ -2357,15 +2426,45 @@ impl QsoManager {
                          (ahead of its current stage)",
                         target, step, existing_id
                     );
-                    self.advance_existing_qso_to_step(
-                        existing_id,
-                        &target,
-                        frequency,
-                        step,
-                        our_report,
-                        their_report_val,
-                    )
-                    .await?;
+                    // Round-13 review (Codex P1): unlike the resend
+                    // branches, advancing MUTATES the QSO's ladder state —
+                    // records a `Sent` message, changes state, and at
+                    // `SeventyThree` completes the QSO and logs the ADIF
+                    // contact. Doing that unconditionally for a client the
+                    // TX layer will deny anyway would leave a permanently
+                    // wrong exchange state (or a false log entry) even
+                    // though nothing ever transmitted — worse than the
+                    // resend branches' merely-wasted budget charge. Decide
+                    // BEFORE rebinding/advancing, same as those branches.
+                    let should_advance = !remote_origin
+                        || (self.remote_tx_permitted)(remote_client_key_id.as_deref());
+                    if should_advance {
+                        // Codex P1, round 20: only rebind once the action is
+                        // permitted — see the identical fix in the
+                        // idempotent keep-call branch above for the full
+                        // rationale (an unconditional rebind on a DENIED
+                        // action leaves stale-looking-legitimate identity
+                        // metadata behind with no fresh intent published to
+                        // correct it).
+                        //
+                        // Round-3 review (Codex P2): rebind before advancing
+                        // — see `rebind_remote_identity`'s doc.
+                        self.rebind_remote_identity(
+                            existing_id,
+                            remote_origin,
+                            remote_client_key_id,
+                        )
+                        .await;
+                        self.advance_existing_qso_to_step(
+                            existing_id,
+                            &target,
+                            frequency,
+                            step,
+                            our_report,
+                            their_report_val,
+                        )
+                        .await?;
+                    }
                     return Ok(existing_id);
                 }
                 _ => {
@@ -2374,7 +2473,26 @@ impl QsoManager {
                          current outbound (idempotent keep-call)",
                         target, step, existing_id
                     );
-                    let _ = self.resend_last_tx(existing_id).await;
+                    // Round-10 review (Codex P2): decide before
+                    // rebinding/resending — see the analogous fix in
+                    // `respond_to_cq_with`'s idempotent keep-call branch.
+                    let should_resend = !remote_origin
+                        || (self.remote_tx_permitted)(remote_client_key_id.as_deref());
+                    if should_resend {
+                        // Codex P1, round 20: only rebind once permitted —
+                        // see the identical fix above for the full
+                        // rationale.
+                        //
+                        // Round-3 review (Codex P2): rebind before resending
+                        // — see `rebind_remote_identity`'s doc.
+                        self.rebind_remote_identity(
+                            existing_id,
+                            remote_origin,
+                            remote_client_key_id,
+                        )
+                        .await;
+                        let _ = self.resend_last_tx(existing_id).await;
+                    }
                     return Ok(existing_id);
                 }
             }
@@ -2408,9 +2526,53 @@ impl QsoManager {
                      grace window, re-sending existing QSO {}'s last frame",
                     target, step, existing_id
                 );
-                let _ = self.resend_last_tx(existing_id).await;
+                // Round-10 review (Codex P2): decide before
+                // rebinding/resending — see the analogous fix in
+                // `respond_to_cq_with`'s idempotent keep-call branch.
+                let should_resend =
+                    !remote_origin || (self.remote_tx_permitted)(remote_client_key_id.as_deref());
+                if should_resend {
+                    // Codex P1, round 20: only rebind once permitted — see
+                    // the identical fix above for the full rationale.
+                    //
+                    // Round-3 review (Codex P2): rebind before resending —
+                    // see `rebind_remote_identity`'s doc.
+                    self.rebind_remote_identity(existing_id, remote_origin, remote_client_key_id)
+                        .await;
+                    let _ = self.resend_last_tx(existing_id).await;
+                }
                 return Ok(existing_id);
             }
+        }
+
+        // Round-16 review (Codex P1): this identity-bound permission check
+        // (round-15's fix) MUST run before `supersede_active_qsos_for`
+        // below, not after — an autonomous same-call/band QSO is invisible
+        // to the manual-QSO lookups above (FIX 1), so a denied close-step
+        // request could otherwise reach here, supersede (cancel) that
+        // ongoing autonomous exchange, and ONLY THEN get refused itself —
+        // destroying a real QSO in progress and replacing it with nothing.
+        //
+        // Round-15 review (Codex P1): unlike the EXISTING-QSO ladder-advance
+        // fix (round 13), a brand-new QSO opened directly at a close step
+        // (`SeventyThree`) is created ALREADY `Completed` — the state-build
+        // match below sets that unconditionally, and completing immediately
+        // emits `QsoCompleted` (ADIF/logbook entry) further down. Doing that
+        // for a client the TX layer will deny is worse than the existing-QSO
+        // case: the resulting QSO is already terminal, so it can never be
+        // retried once that client becomes authorized, and the false log
+        // entry cannot be un-logged. Refuse outright rather than create
+        // anything — a later, actually-authorized call creates it fresh.
+        if step == pancetta_core::ResponseStep::SeventyThree
+            && remote_origin
+            && !(self.remote_tx_permitted)(remote_client_key_id.as_deref())
+        {
+            return Err(QsoManagerError::Internal {
+                message: format!(
+                    "refusing to open-and-complete a new QSO with {target} at SeventyThree: \
+                     the bound remote client is not currently TX-permitted"
+                ),
+            });
         }
 
         // Manual: supersede any same-call QSO on this band, then build the new
@@ -2530,6 +2692,7 @@ impl QsoManager {
             pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin,
+            remote_client_key_id: remote_client_key_id.clone(),
             tx_parity_provisional,
         };
 
@@ -2584,6 +2747,7 @@ impl QsoManager {
             frequency,
             tx_parity,
             remote_origin,
+            remote_client_key_id,
         })
         .await;
 
@@ -3122,21 +3286,85 @@ impl QsoManager {
     /// exposed as `pub` so integration tests can drive additional
     /// MessageToSend events without going through the auto_sequencer.
     pub async fn send_message(&self, qso_id: QsoId, message: MessageType, frequency: f64) {
-        let (tx_parity, remote_origin) = self
+        let (tx_parity, remote_origin, remote_client_key_id) = self
             .qsos
             .read()
             .await
             .get(&qso_id)
-            .map(|p| (p.metadata.tx_parity, p.metadata.remote_origin))
-            .unwrap_or((None, false));
+            .map(|p| {
+                (
+                    p.metadata.tx_parity,
+                    p.metadata.remote_origin,
+                    p.metadata.remote_client_key_id.clone(),
+                )
+            })
+            .unwrap_or((None, false, None));
         self.emit_event(QsoEvent::MessageToSend {
             qso_id,
             message,
             frequency,
             tx_parity,
             remote_origin,
+            remote_client_key_id,
         })
         .await;
+    }
+
+    /// Rebind an existing QSO's remote-origin identity to whoever's action
+    /// was just accepted for it (round-3 review, Codex P2).
+    ///
+    /// `respond_to_cq_with`/`respond_to_caller`'s idempotent-keep-call and
+    /// advance-existing-QSO branches resend or advance an ALREADY-EXISTING
+    /// QSO object rather than creating a new one — but until this fix they
+    /// left that QSO's `metadata.remote_client_key_id` bound to whichever
+    /// client originally created it. If client A created the QSO and client
+    /// B later takes control (arms) and repeats the same accepted action
+    /// (e.g. `callStation` for the same callsign/band), the resend/advance
+    /// still carries A's stale identity, so B's own valid arm rejects it —
+    /// every repeated action from the new controller keeps resolving to the
+    /// same still-A-bound QSO until it terminates. `send_message` (used by
+    /// both `resend_last_tx` and `advance_existing_qso_to_step`) reads
+    /// `metadata.remote_client_key_id`/`remote_origin` fresh at call time,
+    /// so rebinding here before either of those runs is sufficient — no
+    /// change needed to how the actual `MessageToSend` is emitted.
+    ///
+    /// A no-op if the QSO no longer exists (defensive; the caller always
+    /// just looked it up).
+    async fn rebind_remote_identity(
+        &self,
+        qso_id: QsoId,
+        remote_origin: bool,
+        remote_client_key_id: Option<String>,
+    ) {
+        if let Some(progress) = self.qsos.write().await.get_mut(&qso_id) {
+            progress.metadata.remote_origin = remote_origin;
+            progress.metadata.remote_client_key_id = remote_client_key_id;
+        }
+    }
+
+    /// Read `qso_id`'s CURRENT remote-identity binding rather than trusting a
+    /// value captured before the caller released the `qsos` write lock — a
+    /// concurrent [`Self::rebind_remote_identity`] can change it in that
+    /// window, and acting on a stale snapshot afterward can misattribute a
+    /// reply's origin/client to the wrong controller (Codex P1, PR #362
+    /// round 17). Falls back to `snapshot` only if the QSO itself is gone by
+    /// the time this runs.
+    async fn current_remote_binding(
+        &self,
+        qso_id: QsoId,
+        snapshot: (bool, Option<String>),
+    ) -> (bool, Option<String>) {
+        self.qsos
+            .read()
+            .await
+            .get(&qso_id)
+            .map(|p| {
+                (
+                    p.metadata.remote_origin,
+                    p.metadata.remote_client_key_id.clone(),
+                )
+            })
+            .unwrap_or(snapshot)
     }
 
     /// Re-send the most recent outbound message for a QSO.
@@ -3554,6 +3782,7 @@ impl QsoManager {
                     progress.metadata.frequency,
                     progress.metadata.tx_parity,
                     progress.metadata.remote_origin,
+                    progress.metadata.remote_client_key_id.clone(),
                 )
             })
         } else {
@@ -3576,13 +3805,16 @@ impl QsoManager {
         // The one-shot CQ retransmission (if any), also emitted after the
         // lock is released — same collect-then-emit-after-lock-drop pattern
         // `rearm_manual_calls_at`'s own `to_recall` uses.
-        if let Some((message, frequency, tx_parity, remote_origin)) = cq_retransmit {
+        if let Some((message, frequency, tx_parity, remote_origin, remote_client_key_id)) =
+            cq_retransmit
+        {
             self.emit_event(QsoEvent::MessageToSend {
                 qso_id,
                 message,
                 frequency,
                 tx_parity,
                 remote_origin,
+                remote_client_key_id,
             })
             .await;
         }
@@ -3658,6 +3890,7 @@ impl QsoManager {
         let mut qso_frequency = progress.metadata.frequency;
         let qso_tx_parity = progress.metadata.tx_parity;
         let qso_remote_origin = progress.metadata.remote_origin;
+        let qso_remote_client_key_id = progress.metadata.remote_client_key_id.clone();
         let qso_initiated_by = progress.metadata.initiated_by;
         // PR #344 round-1 Codex P2: a natively-typed ContestReply (PAN-51 --
         // ft8_message_to_qso_type classifies a ReplyWithR decode directly,
@@ -4271,12 +4504,24 @@ impl QsoManager {
         // QSO's own frequency and reuse the tx_parity latched at QSO start,
         // exactly as the initial-call MessageToSend does.
         if let Some(reply) = reply_to_emit {
+            // Re-read the remote binding here rather than trusting the
+            // pre-drop snapshot: a concurrent takeover can rebind this QSO's
+            // remote identity (`rebind_remote_identity`) and publish its own
+            // Remote resend in the window since the write lock was released
+            // above. Emitting the stale origin/client-id would misattribute
+            // this reply (e.g. advertise it as Local) and could let a later
+            // pivot/coalesce bypass the new client's arm gate (Codex P1,
+            // round 17).
+            let (remote_origin, remote_client_key_id) = self
+                .current_remote_binding(qso_id, (qso_remote_origin, qso_remote_client_key_id))
+                .await;
             self.emit_event(QsoEvent::MessageToSend {
                 qso_id,
                 message: reply,
                 frequency: qso_frequency,
                 tx_parity: qso_tx_parity,
-                remote_origin: qso_remote_origin,
+                remote_origin,
+                remote_client_key_id,
             })
             .await;
         }
@@ -6104,6 +6349,7 @@ impl QsoManager {
             });
             let tx_parity = progress.metadata.tx_parity;
             let remote_origin = progress.metadata.remote_origin;
+            let remote_client_key_id = progress.metadata.remote_client_key_id.clone();
 
             // On completion, stamp reports/end-time and prepare the completed
             // metadata (with the real RF frequency = dial + offset) to log.
@@ -6140,13 +6386,21 @@ impl QsoManager {
                 old_state,
                 tx_parity,
                 remote_origin,
+                remote_client_key_id,
                 completed_metadata,
                 state_history,
                 messages,
             )
         };
-        let (old_state, tx_parity, remote_origin, completed_metadata, state_history, messages) =
-            emit;
+        let (
+            old_state,
+            tx_parity,
+            remote_origin,
+            remote_client_key_id,
+            completed_metadata,
+            state_history,
+            messages,
+        ) = emit;
 
         self.emit_state_change(qso_id, old_state, new_state).await;
         self.emit_event(QsoEvent::MessageToSend {
@@ -6155,6 +6409,7 @@ impl QsoManager {
             frequency,
             tx_parity,
             remote_origin,
+            remote_client_key_id,
         })
         .await;
         if let Some(metadata) = completed_metadata {
@@ -6414,13 +6669,15 @@ impl QsoManager {
         // Each entry carries the exact MessageType to re-emit so a
         // RespondingToCq QSO re-sends the call (CqResponse) while a
         // SendingReport QSO re-sends our R-report (ReportAck) — FIX 4.
-        let mut to_recall: Vec<(
+        type RecallEntry = (
             QsoId,
             MessageType,
             f64,
             Option<pancetta_core::slot::SlotParity>,
             bool,
-        )> = Vec::new();
+            Option<String>,
+        );
+        let mut to_recall: Vec<RecallEntry> = Vec::new();
 
         // PAN-72: TX-offset actions (Switch/Revert) a stall-tripped QSO
         // needs, collected here and emitted after the write lock below is
@@ -6446,8 +6703,11 @@ impl QsoManager {
         // reads "TX allowed". Read ONCE per pass, like `tx_policy`, and
         // consulted below only for QSOs that are actually remote-origin. See
         // the `remote_tx_permitted` field's doc comment — read-only evidence,
-        // never a TX gate.
-        let remote_tx_permitted = (self.remote_tx_permitted)();
+        // never a TX gate. PAN-91 review follow-up: evaluated PER-QSO below
+        // (not once per pass) since it now takes the QSO's own bound client
+        // identity — a QSO bound to client A must not read as reached-the-air
+        // just because client B happens to be armed.
+        let remote_tx_permitted = &self.remote_tx_permitted;
 
         // PAN-72 Fix E (Codex round 10, thread on `qso_manager.rs:6335`): the
         // THIRD independent "did this frame actually reach the air" check —
@@ -6572,6 +6832,40 @@ impl QsoManager {
                     continue;
                 }
 
+                // Round-3 review (Codex P2): decide whether this frame will
+                // actually reach the air BEFORE touching any attempt
+                // bookkeeping (`call_count`/`last_call_at`), not after. The
+                // manual-call budget (`max_calls` above) and the on-air
+                // timeline (`progress.messages`, below) both exist to bound
+                // and record REAL transmission attempts — spending either on
+                // a frame the TX-layer arm gate will deny anyway (a
+                // `remote_origin` QSO left bound to a client that is no
+                // longer the one armed) silently exhausts
+                // `manual_call_max_calls` without ever having transmitted,
+                // and records a `Sent` timeline entry for something that
+                // never went out. THREE independent gates can swallow a
+                // frame, and it has to clear ALL of them before an attempt
+                // is real:
+                //   - the global TX policy hard mute (round 2, finding 5);
+                //   - for a `remote_origin` QSO only, the station-agent
+                //     armed-TX gate the TX worker applies to every
+                //     `TxOrigin::Remote` frame (round 7, finding 3). An arm
+                //     expiry, explicit disarm, or a rebind to a different
+                //     client leaves `TxPolicy` untouched, so the first check
+                //     alone cannot see it;
+                //   - the TX worker's own pre-PTT Hamlib hard mute (round 10,
+                //     Fix E) — a Hamlib restart, the command loop not ready,
+                //     an undelivered pending frequency/split command, or an
+                //     in-flight Hamlib command. Neither of the first two
+                //     checks can see this either.
+                let frame_reaches_the_air = !tx_muted
+                    && !hamlib_hard_muted
+                    && (!progress.metadata.remote_origin
+                        || remote_tx_permitted(progress.metadata.remote_client_key_id.as_deref()));
+                if !frame_reaches_the_air {
+                    continue;
+                }
+
                 progress.metadata.call_count += 1;
                 progress.metadata.last_call_at = Some(now);
 
@@ -6580,44 +6874,17 @@ impl QsoManager {
                 // count it against the stall streak. A forward advance
                 // (`process_message_for_qso`) resets this to 0 elsewhere;
                 // this is now the sole increment site (see
-                // `QsoMetadata::stall_cycles`'s doc comment).
-                //
-                // ...unless the frame never actually reached the air. A
-                // re-send that never leaves the rig is not a silent on-air
-                // cycle, and counting it would move the QSO off a known-good
-                // offset on the strength of silence we ourselves caused. The
-                // existing count is left INTACT rather than reset: whatever
-                // was accumulated came from real transmissions and is still
-                // valid evidence once TX resumes.
-                //
-                // THREE independent gates can swallow it, and the frame has
-                // to clear ALL of them before its silence means anything:
-                //   - the global TX policy hard mute (round 2, finding 5);
-                //   - for a `remote_origin` QSO only, the station-agent
-                //     armed-TX gate the TX worker applies to every
-                //     `TxOrigin::Remote` frame (round 7, finding 3). An arm
-                //     expiry or explicit disarm leaves `TxPolicy` untouched,
-                //     so the first check alone cannot see it;
-                //   - the TX worker's own pre-PTT Hamlib hard mute (round 10,
-                //     Fix E) — a Hamlib restart, the command loop not ready,
-                //     an undelivered pending frequency/split command, or an
-                //     in-flight Hamlib command. Neither of the first two
-                //     checks can see this either.
-                let frame_reaches_the_air = !tx_muted
-                    && !hamlib_hard_muted
-                    && (!progress.metadata.remote_origin || remote_tx_permitted);
-                if frame_reaches_the_air {
-                    progress.metadata.stall_cycles =
-                        progress.metadata.stall_cycles.saturating_add(1);
-                }
+                // `QsoMetadata::stall_cycles`'s doc comment). Reached only
+                // when `frame_reaches_the_air` (above), so the existing
+                // count-intact-on-mute behavior is preserved by construction.
+                progress.metadata.stall_cycles = progress.metadata.stall_cycles.saturating_add(1);
 
                 let tx_auto = pancetta_core::TxFreqMode::from_u8(
                     self.tx_freq_mode.load(std::sync::atomic::Ordering::Relaxed),
                 )
                 .allows_auto_change();
 
-                if frame_reaches_the_air
-                    && tx_auto
+                if tx_auto
                     && progress.metadata.stall_cycles >= self.config.timeouts.qso_stall_switch_after
                 {
                     let current = progress.metadata.frequency;
@@ -6681,21 +6948,51 @@ impl QsoManager {
                     progress.metadata.frequency,
                     progress.metadata.tx_parity,
                     progress.metadata.remote_origin,
+                    progress.metadata.remote_client_key_id.clone(),
                 ));
             }
         }
 
-        for (qso_id, message, frequency, tx_parity, remote_origin) in to_recall {
+        for (
+            qso_id,
+            message,
+            frequency,
+            tx_parity,
+            snapshot_remote_origin,
+            snapshot_remote_client_key_id,
+        ) in to_recall
+        {
             debug!(
                 "Manual keep-calling: re-emitting {:?} on {:.1} Hz (qso={})",
                 message, frequency, qso_id
             );
+            // Round-16 review (Codex P1): re-read the LIVE binding
+            // immediately before emitting, rather than trusting the
+            // snapshot taken under the write lock above (released before
+            // this loop runs) — a concurrent rebind (a remote client
+            // taking over this QSO between the snapshot and this emission)
+            // would otherwise let a stale `Local`/wrong-identity
+            // `MessageToSend` reach `LatestTxIntent`, which the TX worker's
+            // pivot mechanism can prefer over the correctly-bound request,
+            // bypassing the arm check entirely rather than merely
+            // misattributing it. Falls back to the snapshot only if the
+            // QSO has since left the active map (shouldn't happen here —
+            // `to_recall` was built from this same set moments ago — kept
+            // defensive rather than unwrapping).
+            let (remote_origin, remote_client_key_id) = match self.qsos.read().await.get(&qso_id) {
+                Some(live) => (
+                    live.metadata.remote_origin,
+                    live.metadata.remote_client_key_id.clone(),
+                ),
+                None => (snapshot_remote_origin, snapshot_remote_client_key_id),
+            };
             self.emit_event(QsoEvent::MessageToSend {
                 qso_id,
                 message,
                 frequency,
                 tx_parity,
                 remote_origin,
+                remote_client_key_id,
             })
             .await;
         }
@@ -7173,7 +7470,10 @@ mod tests {
     #[tokio::test]
     async fn test_start_cq() {
         let manager = QsoManager::new(test_config());
-        let qso_id = manager.start_cq(14074000.0, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq(14074000.0, None, false, None)
+            .await
+            .unwrap();
 
         let progress = manager.get_qso(qso_id).await.unwrap();
         assert!(matches!(progress.state, QsoState::CallingCq { .. }));
@@ -7188,7 +7488,10 @@ mod tests {
     #[tokio::test]
     async fn autonomous_cq_with_no_parity_preference_latches_a_concrete_parity() {
         let manager = QsoManager::new(test_config());
-        let qso_id = manager.start_cq(14074000.0, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq(14074000.0, None, false, None)
+            .await
+            .unwrap();
         assert!(
             manager
                 .get_qso(qso_id)
@@ -7221,6 +7524,7 @@ mod tests {
                 CallInitiation::Manual,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -7250,6 +7554,7 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -7278,6 +7583,7 @@ mod tests {
                 CallInitiation::Manual,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -7307,6 +7613,7 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -7340,6 +7647,7 @@ mod tests {
                 CallInitiation::Manual,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -7422,6 +7730,7 @@ mod tests {
                 CallInitiation::Manual,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -7473,7 +7782,10 @@ mod tests {
         assert_eq!(QsoManagerConfig::default().active_mode, "FT8");
         let manager = QsoManager::new(test_config());
         // CallingCq metadata (start_cq path).
-        let cq_id = manager.start_cq(14074000.0, None, false).await.unwrap();
+        let cq_id = manager
+            .start_cq(14074000.0, None, false, None)
+            .await
+            .unwrap();
         assert_eq!(manager.get_qso(cq_id).await.unwrap().metadata.mode, "FT8");
         // RespondingToCq metadata (respond_to_cq path).
         let rx_id = manager
@@ -7492,7 +7804,10 @@ mod tests {
             ..test_config()
         };
         let manager = QsoManager::new(config);
-        let cq_id = manager.start_cq(14074000.0, None, false).await.unwrap();
+        let cq_id = manager
+            .start_cq(14074000.0, None, false, None)
+            .await
+            .unwrap();
         assert_eq!(manager.get_qso(cq_id).await.unwrap().metadata.mode, "FT4");
         let rx_id = manager
             .respond_to_cq("K1DEF".to_string(), 14074000.0, None)
@@ -8018,6 +8333,7 @@ mod tests {
                 Some(-12),
                 None, // partner_freq
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -8332,7 +8648,10 @@ mod tests {
         config.timeouts.repetitive_tx_timeout_secs = 100_000;
         let manager = QsoManager::new(config);
 
-        let qso_id = manager.start_cq(14074000.0, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq(14074000.0, None, false, None)
+            .await
+            .unwrap();
         let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
 
         // K1DEF (a standard callsign) replies to our compound CQ; their own
@@ -8455,7 +8774,10 @@ mod tests {
         let manager = QsoManager::new(config);
         let mut events = manager.subscribe();
 
-        let qso_id = manager.start_cq(14074000.0, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq(14074000.0, None, false, None)
+            .await
+            .unwrap();
         let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
 
         // A standard-callsign station replies to our compound CQ, but we
@@ -9435,7 +9757,7 @@ mod tests {
     async fn apply_tx_offset_switch_retransmits_cq_for_an_operator_forced_auto_calling_cq() {
         let manager = auto_manager(test_config());
         let mut events = manager.subscribe();
-        let qso_id = manager.start_cq(1500.0, None, false).await.unwrap();
+        let qso_id = manager.start_cq(1500.0, None, false, None).await.unwrap();
         // Drain the initial CQ MessageToSend `start_cq` itself emits.
         let _ = drain(&mut events);
 
@@ -9500,7 +9822,7 @@ mod tests {
     async fn apply_tx_offset_switch_does_not_retransmit_cq_for_a_stall_triggered_auto_calling_cq() {
         let manager = auto_manager(test_config());
         let mut events = manager.subscribe();
-        let qso_id = manager.start_cq(1500.0, None, false).await.unwrap();
+        let qso_id = manager.start_cq(1500.0, None, false, None).await.unwrap();
         let _ = drain(&mut events);
 
         let before = manager.get_qso(qso_id).await.unwrap();
@@ -10270,7 +10592,7 @@ mod tests {
         // our_callsign = W1ABC (from test_config).
         let manager = QsoManager::new(test_config());
         let freq = 14074000.0;
-        let qso_id = manager.start_cq(freq, None, false).await.unwrap();
+        let qso_id = manager.start_cq(freq, None, false, None).await.unwrap();
         assert!(matches!(
             manager.get_qso(qso_id).await.unwrap().state,
             QsoState::CallingCq { .. }
@@ -10387,6 +10709,7 @@ mod tests {
                 CallInitiation::Manual,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -10399,7 +10722,7 @@ mod tests {
         // loop, TXing at 1505.0 Hz (5 Hz from K1DEF's real frequency — well
         // within the CallingCq arm's 15 Hz gate; a routine coincidence on a
         // busy band, not an attacker-crafted collision).
-        let qso_b = manager.start_cq(1505.0, None, false).await.unwrap();
+        let qso_b = manager.start_cq(1505.0, None, false, None).await.unwrap();
         assert!(matches!(
             manager.get_qso(qso_b).await.unwrap().state,
             QsoState::CallingCq { .. }
@@ -10466,11 +10789,11 @@ mod tests {
         // Two independent, still-unpartnered CallingCq QSOs, 5 Hz apart —
         // both well within the CallingCq arm's 15 Hz gate for the same
         // incoming decode.
-        let qso_x = manager.start_cq(1500.0, None, false).await.unwrap();
+        let qso_x = manager.start_cq(1500.0, None, false, None).await.unwrap();
         // Sleep so `metadata.start_time` orders deterministically (real
         // `Utc::now()` calls back-to-back could otherwise tie).
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        let qso_y = manager.start_cq(1505.0, None, false).await.unwrap();
+        let qso_y = manager.start_cq(1505.0, None, false, None).await.unwrap();
         assert!(matches!(
             manager.get_qso(qso_x).await.unwrap().state,
             QsoState::CallingCq { .. }
@@ -10545,7 +10868,7 @@ mod tests {
 
         // Complete a full CQ exchange with K1DEF (mirrors
         // cqer_full_sequence_completes_and_logs_grid).
-        let qso_a = manager.start_cq(freq, None, false).await.unwrap();
+        let qso_a = manager.start_cq(freq, None, false, None).await.unwrap();
         manager
             .process_message(
                 MessageType::CqResponse {
@@ -10591,7 +10914,10 @@ mod tests {
 
         // Immediately start a NEW, unrelated CQ 5 Hz away — well within the
         // CallingCq arm's 15 Hz gate for a frame decoded at qso_b's offset.
-        let qso_b = manager.start_cq(freq + 5.0, None, false).await.unwrap();
+        let qso_b = manager
+            .start_cq(freq + 5.0, None, false, None)
+            .await
+            .unwrap();
 
         // K1DEF sends a stray/duplicate CqResponse-shaped frame again,
         // within the completed-QSO grace window (this test runs in
@@ -10631,7 +10957,7 @@ mod tests {
         let freq_40m = 7074000.0;
 
         // Complete a full CQ exchange with K1DEF on 20m.
-        let qso_a = manager.start_cq(freq_20m, None, false).await.unwrap();
+        let qso_a = manager.start_cq(freq_20m, None, false, None).await.unwrap();
         manager
             .process_message(
                 MessageType::CqResponse {
@@ -10677,7 +11003,10 @@ mod tests {
 
         // Start a NEW, unrelated CQ on 40m — a different band from the
         // just-completed 20m QSO.
-        let qso_b = manager.start_cq(freq_40m + 5.0, None, false).await.unwrap();
+        let qso_b = manager
+            .start_cq(freq_40m + 5.0, None, false, None)
+            .await
+            .unwrap();
 
         // K1DEF answers on 40m, well within the completed-QSO grace window.
         manager
@@ -10722,7 +11051,10 @@ mod tests {
         let audio_offset = 1500.0; // realistic small in-passband offset
 
         // Complete a full CQ exchange with K1DEF on 20m (dial 14.074 MHz).
-        let qso_a = manager.start_cq(audio_offset, None, false).await.unwrap();
+        let qso_a = manager
+            .start_cq(audio_offset, None, false, None)
+            .await
+            .unwrap();
         manager
             .process_message(
                 MessageType::CqResponse {
@@ -10782,7 +11114,7 @@ mod tests {
         // A NEW, unrelated CQ at the SAME small audio offset (plausible: the
         // new CQ just happens to land in a similar spot in the passband).
         let qso_b = manager
-            .start_cq(audio_offset + 5.0, None, false)
+            .start_cq(audio_offset + 5.0, None, false, None)
             .await
             .unwrap();
         manager
@@ -10823,7 +11155,10 @@ mod tests {
         manager.set_dial_frequency_source(std::sync::Arc::new(AtomicU64::new(14_074_000)));
         let audio_offset = 1500.0;
 
-        let qso_id = manager.start_cq(audio_offset, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq(audio_offset, None, false, None)
+            .await
+            .unwrap();
         manager
             .process_message(
                 MessageType::CqResponse {
@@ -10897,7 +11232,10 @@ mod tests {
         manager.set_dial_frequency_source(dial);
         let audio_offset = 1500.0;
 
-        let qso_a = manager.start_cq(audio_offset, None, false).await.unwrap();
+        let qso_a = manager
+            .start_cq(audio_offset, None, false, None)
+            .await
+            .unwrap();
         manager
             .process_message(
                 MessageType::CqResponse {
@@ -10942,7 +11280,7 @@ mod tests {
         ));
 
         let qso_b = manager
-            .start_cq(audio_offset + 5.0, None, false)
+            .start_cq(audio_offset + 5.0, None, false, None)
             .await
             .unwrap();
         manager
@@ -10979,7 +11317,7 @@ mod tests {
     async fn qso_completed_event_carries_full_timeline() {
         let manager = QsoManager::new(test_config());
         let freq = 14074000.0;
-        let qso_id = manager.start_cq(freq, None, false).await.unwrap();
+        let qso_id = manager.start_cq(freq, None, false, None).await.unwrap();
         let mut rx = manager.subscribe();
 
         manager
@@ -11118,6 +11456,7 @@ mod tests {
                 pending_freq_drift: None,
                 hound_qsyed: false,
                 remote_origin: false,
+                remote_client_key_id: None,
                 tx_parity_provisional: false,
             },
         };
@@ -11199,7 +11538,10 @@ mod tests {
         let freq = 14074000.0;
         let mut events = manager.subscribe();
 
-        let qso_id = manager.start_cq_manual(freq, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq_manual(freq, None, false, None)
+            .await
+            .unwrap();
 
         let p = manager.get_qso(qso_id).await.unwrap();
         assert!(
@@ -11248,7 +11590,10 @@ mod tests {
         use tokio::sync::broadcast::error::TryRecvError;
         let manager = QsoManager::new(test_config()); // our call = W1ABC
         let freq = 14074000.0;
-        let qso_id = manager.start_cq_manual(freq, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq_manual(freq, None, false, None)
+            .await
+            .unwrap();
         let mut events = manager.subscribe();
 
         // Caller answers our CQ with their grid: "W1ABC K1DEF FN31".
@@ -11335,7 +11680,10 @@ mod tests {
         use tokio::sync::broadcast::error::TryRecvError;
         let manager = QsoManager::new(test_config());
         let freq = 14074000.0;
-        let qso_id = manager.start_cq_manual(freq, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq_manual(freq, None, false, None)
+            .await
+            .unwrap();
         let mut events = manager.subscribe();
 
         let start = Utc::now();
@@ -11384,7 +11732,10 @@ mod tests {
     async fn manual_cq_with_no_parity_preference_latches_one_parity_for_life_of_qso() {
         let manager = QsoManager::new(test_config());
         let freq = 14074000.0;
-        let qso_id = manager.start_cq_manual(freq, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq_manual(freq, None, false, None)
+            .await
+            .unwrap();
 
         // The opening CQ must have latched a CONCRETE (not None) parity.
         let latched = manager
@@ -11439,6 +11790,7 @@ mod tests {
                 14074000.0,
                 Some(pancetta_core::slot::SlotParity::Odd),
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -11459,7 +11811,10 @@ mod tests {
         config.timeouts.manual_call_max_calls = 10;
         let manager = QsoManager::new(config);
         let freq = 14074000.0;
-        let qso_id = manager.start_cq_manual(freq, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq_manual(freq, None, false, None)
+            .await
+            .unwrap();
 
         // Drive enough slots to exceed manual_call_max_calls (10).
         let mut t = Utc::now();
@@ -11487,7 +11842,10 @@ mod tests {
     async fn manual_cq_cancel_stops_calling() {
         let manager = QsoManager::new(test_config());
         let freq = 14074000.0;
-        let qso_id = manager.start_cq_manual(freq, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq_manual(freq, None, false, None)
+            .await
+            .unwrap();
         assert_eq!(manager.get_active_qsos().await.len(), 1);
 
         manager.cancel_qso(qso_id).await.unwrap();
@@ -11667,6 +12025,7 @@ mod sender_verification_tests {
             pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin: false,
+            remote_client_key_id: None,
             tx_parity_provisional: false,
         }
     }
@@ -12494,6 +12853,7 @@ mod sender_verification_tests {
                 CallInitiation::Manual,
                 Some(2931.0),
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -12557,6 +12917,7 @@ mod sender_verification_tests {
                 CallInitiation::Manual,
                 Some(2931.0),
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -12614,6 +12975,7 @@ mod sender_verification_tests {
                 CallInitiation::Manual,
                 Some(2931.0),
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -12659,6 +13021,7 @@ mod sender_verification_tests {
                 CallInitiation::Manual,
                 Some(700.0),
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -12775,6 +13138,7 @@ mod sender_verification_tests {
                 CallInitiation::Manual,
                 Some(1800.0), // Fox's RX offset
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -12853,6 +13217,7 @@ mod sender_verification_tests {
                 CallInitiation::Manual,
                 Some(2931.0),
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13407,6 +13772,7 @@ mod reply_emitter_tests {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13445,6 +13811,7 @@ mod reply_emitter_tests {
                 None,
                 None, // partner_freq
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13492,6 +13859,7 @@ mod reply_emitter_tests {
                 Some(-3),
                 None, // partner_freq
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13534,6 +13902,7 @@ mod reply_emitter_tests {
                 Some(-7),
                 None, // partner_freq
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13567,6 +13936,7 @@ mod reply_emitter_tests {
                 Some(-4),
                 None, // partner_freq
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13616,6 +13986,7 @@ mod reply_emitter_tests {
                 Some(-4),
                 None, // partner_freq
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13634,6 +14005,7 @@ mod reply_emitter_tests {
                 Some(-4),
                 None, // partner_freq
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13698,6 +14070,7 @@ mod reply_emitter_tests {
                 Some(-4),
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13714,6 +14087,7 @@ mod reply_emitter_tests {
                 Some(-4),
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13730,6 +14104,7 @@ mod reply_emitter_tests {
                 Some(-4),
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13770,6 +14145,7 @@ mod reply_emitter_tests {
                 Some(-4),
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13832,6 +14208,7 @@ mod reply_emitter_tests {
                 Some(-4),
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13849,6 +14226,7 @@ mod reply_emitter_tests {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13871,6 +14249,7 @@ mod reply_emitter_tests {
                 Some(-4),
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13886,6 +14265,7 @@ mod reply_emitter_tests {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13911,6 +14291,7 @@ mod reply_emitter_tests {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -13937,6 +14318,7 @@ mod reply_emitter_tests {
                 Some(-3),
                 None, // partner_freq
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -14186,6 +14568,7 @@ mod reply_emitter_tests {
                 CallInitiation::Manual,
                 Some(dx_rx), // partner_freq = DX's RX offset
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -14216,6 +14599,7 @@ mod reply_emitter_tests {
                 CallInitiation::Manual,
                 None, // Tx=Rx regression path — partner_freq must stay None
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -14245,6 +14629,7 @@ mod reply_emitter_tests {
                 None,
                 None, // Tx=Rx — partner_freq must stay None
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -14282,6 +14667,7 @@ mod reply_emitter_tests {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap_err();
@@ -14890,7 +15276,10 @@ mod sm_f4_waiting_for_report_resend_tests {
     /// grid-bearing CqResponse), returning the qso_id and the `our_report`
     /// value latched on that transition.
     async fn manual_cq_to_waiting_for_report(manager: &QsoManager, snr: f32) -> (QsoId, i8) {
-        let qso_id = manager.start_cq_manual(FREQ, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq_manual(FREQ, None, false, None)
+            .await
+            .unwrap();
         manager
             .process_message(
                 MessageType::CqResponse {
@@ -15949,10 +16338,68 @@ mod pan72_stall_detection_tests {
                 CallInitiation::Manual,
                 None,
                 true, // remote_origin
+                None,
             )
             .await
             .unwrap();
         (qso_id, armed)
+    }
+
+    /// Like [`remote_qso_with_arm`], but the QSO is bound to an explicit
+    /// client keyId (PAN-91 review follow-up: exercises the identity-bound
+    /// stall-evidence predicate, not just the boolean one).
+    async fn remote_qso_bound_to(manager: &QsoManager, client_key_id: &str) -> QsoId {
+        manager
+            .respond_to_cq_with(
+                DX.into(),
+                FREQ,
+                None,
+                CallInitiation::Manual,
+                None,
+                true, // remote_origin
+                Some(client_key_id.to_string()),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// PAN-91 review follow-up: a QSO bound to client-a must not count a
+    /// rearm cycle as reaching the air just because client-b is currently
+    /// armed — the stall-evidence predicate must check the SAME client
+    /// identity the TX worker's actual gate binds to, not just "is anyone
+    /// armed".
+    #[tokio::test]
+    async fn a_qso_bound_to_a_different_client_than_the_one_armed_does_not_count_as_reaching_the_air(
+    ) {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        let mut manager = manager_auto(config);
+        let qso_id = remote_qso_bound_to(&manager, "client-a").await;
+        // Simulate the real gate: only "client-b" is armed.
+        manager.set_remote_tx_permitted_source(Arc::new(|client_key_id: Option<&str>| {
+            client_key_id == Some("client-b")
+        }));
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        for slot in 1..=4 {
+            manager
+                .rearm_manual_calls_at(opened_at + Duration::seconds(15 * slot))
+                .await;
+        }
+
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            0,
+            "client-a's frame is denied by the identity-bound gate even \
+             though client-b is armed — it never reaches the air, so this \
+             must not count as stall evidence"
+        );
     }
 
     #[tokio::test]
@@ -15964,7 +16411,7 @@ mod pan72_stall_detection_tests {
         // 2's `tx_policy` check cannot see.
         let (qso_id, armed) = remote_qso_with_arm(&manager).await;
         let armed_for_source = Arc::clone(&armed);
-        manager.set_remote_tx_permitted_source(Arc::new(move || {
+        manager.set_remote_tx_permitted_source(Arc::new(move |_| {
             armed_for_source.load(std::sync::atomic::Ordering::Relaxed)
         }));
         let mut rx = manager.subscribe();
@@ -16028,7 +16475,7 @@ mod pan72_stall_detection_tests {
         let mut config = test_config();
         config.timeouts.qso_stall_switch_after = 2;
         let mut manager = manager_auto(config);
-        manager.set_remote_tx_permitted_source(Arc::new(|| false));
+        manager.set_remote_tx_permitted_source(Arc::new(|_| false));
         let qso_id = manager
             .respond_to_cq_manual(DX.into(), FREQ, None)
             .await
@@ -16641,7 +17088,10 @@ mod pan72_stall_detection_tests {
         let mut config = test_config();
         config.timeouts.qso_stall_switch_after = 4;
         let manager = manager_auto(config);
-        let qso_id = manager.start_cq_manual(FREQ, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq_manual(FREQ, None, false, None)
+            .await
+            .unwrap();
         let opened_at = manager
             .get_qso(qso_id)
             .await
@@ -17306,6 +17756,7 @@ mod pan72_stall_detection_tests {
                 CallInitiation::Manual,
                 Some(2400.0),
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -17375,7 +17826,10 @@ mod pan72_stall_detection_tests {
         config.timeouts.qso_stall_switch_after = 2;
         let manager = manager_auto(config);
         let mut rx = manager.subscribe();
-        let qso_id = manager.start_cq_manual(FREQ, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq_manual(FREQ, None, false, None)
+            .await
+            .unwrap();
         let opened_at = manager
             .get_qso(qso_id)
             .await
@@ -17467,7 +17921,10 @@ mod pan72_stall_detection_tests {
         config.timeouts.qso_stall_switch_after = 2;
         let manager = manager_auto(config);
         let mut rx = manager.subscribe();
-        let qso_id = manager.start_cq_manual(FREQ, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq_manual(FREQ, None, false, None)
+            .await
+            .unwrap();
         let opened_at = manager
             .get_qso(qso_id)
             .await
@@ -17562,7 +18019,10 @@ mod pan72_stall_detection_tests {
         let mut config = test_config();
         config.timeouts.qso_stall_switch_after = 2;
         let manager = manager_auto(config);
-        let qso_id = manager.start_cq_manual(FREQ, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq_manual(FREQ, None, false, None)
+            .await
+            .unwrap();
         let opened_at = manager
             .get_qso(qso_id)
             .await
@@ -17653,7 +18113,10 @@ mod pan72_stall_detection_tests {
         const CALLER: &str = "W9XYZ";
 
         let manager = manager_auto(test_config());
-        let qso_id = manager.start_cq_manual(FREQ, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq_manual(FREQ, None, false, None)
+            .await
+            .unwrap();
         let new_offset = FREQ + 400.0;
         manager
             .apply_tx_offset_switch(qso_id, new_offset, OffsetRelocationOrigin::OperatorForced)
@@ -17779,7 +18242,10 @@ mod pan72_stall_detection_tests {
         const CALLER: &str = "W9XYZ";
 
         let manager = manager_auto(test_config());
-        let qso_id = manager.start_cq_manual(FREQ, None, false).await.unwrap();
+        let qso_id = manager
+            .start_cq_manual(FREQ, None, false, None)
+            .await
+            .unwrap();
 
         // Operator `u` nudge: no triggering resend, no raised generation.
         let new_offset = FREQ + 400.0;
@@ -17855,6 +18321,7 @@ mod pan72_stall_detection_tests {
                 CallInitiation::Manual,
                 Some(DX_FREQ),
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -17932,6 +18399,7 @@ mod pan72_stall_detection_tests {
                 CallInitiation::Manual,
                 Some(DX_FREQ),
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -18183,6 +18651,7 @@ mod has_active_or_recent_qso_tests {
             pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin: false,
+            remote_client_key_id: None,
             tx_parity_provisional: false,
         }
     }
@@ -18420,6 +18889,7 @@ mod hound_tests {
             pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin: false,
+            remote_client_key_id: None,
             tx_parity_provisional: false,
         }
     }
@@ -19089,5 +19559,81 @@ mod timeout_config_tests {
     fn timeout_config_default_qso_stall_switch_after_is_4() {
         let config = TimeoutConfig::default();
         assert_eq!(config.qso_stall_switch_after, 4);
+    }
+}
+
+#[cfg(test)]
+mod current_remote_binding_tests {
+    //! Codex P1, PR #362 round 17: an auto-reply's origin/client-id used to
+    //! be captured from the `qsos` map before releasing the write lock, so a
+    //! takeover that rebinds the QSO's remote identity in the window before
+    //! the reply is actually emitted got silently overridden by that stale
+    //! snapshot. `current_remote_binding` re-reads live state at emission
+    //! time instead — these tests cover its two contracts directly (live
+    //! value wins; a vanished QSO falls back to the snapshot) rather than
+    //! trying to race the real async window, which isn't reproducible
+    //! deterministically.
+    use super::{
+        default_active_mode, AutoSequenceConfig, DuplicateCheckConfig, HoundRegions, QsoId,
+        QsoManager, QsoManagerConfig, TimeoutConfig,
+    };
+    use pancetta_core::slot::SlotParity;
+
+    fn test_config() -> QsoManagerConfig {
+        QsoManagerConfig {
+            our_callsign: "W1ABC".to_string(),
+            our_grid: Some("FN42".to_string()),
+            timeouts: TimeoutConfig::default(),
+            contest_mode: None,
+            auto_sequence: AutoSequenceConfig::default(),
+            duplicate_checking: DuplicateCheckConfig::default(),
+            hound: HoundRegions::default(),
+            active_mode: default_active_mode(),
+        }
+    }
+
+    #[tokio::test]
+    async fn live_binding_overrides_a_stale_snapshot() {
+        let manager = QsoManager::new(test_config());
+        let qso_id = manager
+            .respond_to_cq("K9XYZ".to_string(), 14074000.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+
+        // A locally-originated QSO starts with no remote binding at all.
+        let stale_snapshot = (false, None);
+        assert_eq!(
+            manager
+                .current_remote_binding(qso_id, stale_snapshot.clone())
+                .await,
+            (false, None)
+        );
+
+        // A concurrent takeover rebinds it to a new remote controller —
+        // simulating exactly the race the round-17 finding described.
+        manager
+            .rebind_remote_identity(qso_id, true, Some("newclient".to_string()))
+            .await;
+
+        // Reading with the OLD (pre-rebind) snapshot must still return the
+        // LIVE binding, not the stale value passed in.
+        assert_eq!(
+            manager.current_remote_binding(qso_id, stale_snapshot).await,
+            (true, Some("newclient".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn vanished_qso_falls_back_to_the_snapshot() {
+        let manager = QsoManager::new(test_config());
+        let bogus_id = QsoId::new_v4();
+        let snapshot = (true, Some("fallback-client".to_string()));
+
+        assert_eq!(
+            manager
+                .current_remote_binding(bogus_id, snapshot.clone())
+                .await,
+            snapshot
+        );
     }
 }
