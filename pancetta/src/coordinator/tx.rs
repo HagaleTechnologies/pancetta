@@ -752,14 +752,27 @@ async fn interruptible_sleep_or_supersede(
     };
 
     // PAN-92 review round 2 (Codex P1): return to the caller IMMEDIATELY on
-    // a detected disarm, before even the remainder-drain below, let alone
-    // the reenqueue-await loop further down — the caller's very first
-    // action is sending PTT off, and nothing in this function may delay
-    // that. Round-3 review (Codex P2): the already-siphoned messages
-    // travel WITH this outcome (see the variant's doc) rather than being
-    // dropped — the caller re-enqueues them itself once PTT is safely off.
-    if matches!(outcome, SleepOutcome::AbortedByDisarm(_)) {
-        return outcome;
+    // a detected disarm, WITHOUT the AWAITED reenqueue loop further down —
+    // the caller's very first action is sending PTT off, and no awaited
+    // work in this function may delay that. Round-3 review (Codex P2): the
+    // already-siphoned messages travel WITH this outcome (see the
+    // variant's doc) rather than being dropped — the caller re-enqueues
+    // them itself once PTT is safely off. Round-8 review (Codex P2): the
+    // remainder drain just below IS still safe to do here — it's a
+    // bounded, synchronous `try_recv()` loop, not an await — and skipping
+    // it (as this fix originally did) broke FIFO order: `siphoned`
+    // (strictly older) would otherwise be re-enqueued by the caller AFTER
+    // whatever arrived later and was left untouched in `tx_rx`, inverting
+    // true arrival order for `coalesce_backlog_into` and the bundle arms
+    // to observe.
+    if let SleepOutcome::AbortedByDisarm(already_siphoned) = outcome {
+        let mut remainder: Vec<ComponentMessage> = Vec::new();
+        while let Ok(message) = tx_rx.try_recv() {
+            remainder.push(message);
+        }
+        let pending: Vec<ComponentMessage> =
+            already_siphoned.into_iter().chain(remainder).collect();
+        return SleepOutcome::AbortedByDisarm(pending);
     }
 
     // PAN-73 round 3 (Codex): whatever the loop stopped for (shutdown,
@@ -984,6 +997,122 @@ mod interruptible_sleep_tests {
                     pending[0].message_type,
                     MessageType::TuneRequest { .. }
                 ));
+            }
+            other => panic!("expected AbortedByDisarm, got {other:?}"),
+        }
+    }
+
+    /// Round-8 review (Codex P2): a message that arrives in `tx_rx` AFTER
+    /// an earlier message was already siphoned, but BEFORE the disarm is
+    /// detected, is left untouched in the channel — `check_once` checks
+    /// disarm before it ever calls `try_recv()` again, so it returns
+    /// immediately without draining that later arrival. The round-6 fix
+    /// (previous test) only proved the EARLIER, already-siphoned message
+    /// survives; it did nothing for this later, untouched one, and worse:
+    /// the caller re-enqueues `pending` at the channel TAIL, so if this
+    /// later message is left in `tx_rx` at its original (head) position, it
+    /// would be observed BEFORE the older, siphoned one on the next drain —
+    /// inverting true arrival order. This pins that both travel together,
+    /// siphoned-then-remainder, in the outcome's `pending`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_sleep_preserves_fifo_order_of_siphoned_and_remainder_on_abort_by_disarm() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let bus = crate::message_bus::MessageBus::new(16).unwrap();
+        let pivoted_once = std::collections::HashMap::new();
+
+        // Older message: siphoned on the very first (pre-sleep) poll tick.
+        tx.send(crate::message_bus::ComponentMessage::new(
+            crate::message_bus::ComponentId::Tui,
+            crate::message_bus::ComponentId::Ft8Transmitter,
+            MessageType::TuneRequest {
+                duration_secs: 5,
+                tone_offset_hz: 1000.0,
+            },
+            Instant::now(),
+        ))
+        .unwrap();
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut st = pancetta_agent::arm::ArmState::new();
+        st.arm(
+            pancetta_agent::arm::VerifiedArmGrant {
+                operator_callsign: "K5ARH".to_string(),
+                ttl_ms: 120_000,
+                scope_tx: true,
+                jti: "disarm-preserves-fifo-jti".to_string(),
+                client_key_id: "client-a".to_string(),
+            },
+            now_ms,
+        );
+        st.set_local_consent(true, now_ms);
+        let arm = Arc::new(std::sync::Mutex::new(st));
+
+        // Newer message: arrives at ~10ms, after the pre-sleep poll already
+        // ran (so it's NOT siphoned yet) but before the disarm at ~20ms —
+        // it sits untouched in `tx_rx` until the poll tick that discovers
+        // the disarm, which returns before ever draining it.
+        let tx_clone = tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            tx_clone
+                .send(crate::message_bus::ComponentMessage::new(
+                    crate::message_bus::ComponentId::Tui,
+                    crate::message_bus::ComponentId::Ft8Transmitter,
+                    MessageType::TuneRequest {
+                        duration_secs: 5,
+                        tone_offset_hz: 2000.0,
+                    },
+                    Instant::now(),
+                ))
+                .unwrap();
+        });
+
+        let arm_clone = arm.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            arm_clone
+                .lock()
+                .unwrap()
+                .disarm(chrono::Utc::now().timestamp_millis());
+        });
+
+        let outcome = super::interruptible_sleep_or_supersede(
+            Duration::from_secs(5),
+            &shutdown,
+            &abort,
+            &rx,
+            &bus,
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "in flight text".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
+            &pivoted_once,
+            Some((&arm, Some("client-a"))),
+        )
+        .await;
+        match outcome {
+            super::SleepOutcome::AbortedByDisarm(pending) => {
+                assert_eq!(
+                    pending.len(),
+                    2,
+                    "both the siphoned and the untouched-remainder message must travel with the outcome"
+                );
+                let freqs: Vec<f64> = pending
+                    .iter()
+                    .map(|m| match &m.message_type {
+                        MessageType::TuneRequest { tone_offset_hz, .. } => *tone_offset_hz,
+                        other => panic!("expected TuneRequest, got {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(
+                    freqs,
+                    vec![1000.0, 2000.0],
+                    "the older (siphoned) message must precede the newer (remainder) \
+                     one — true arrival order, not siphoned-after-remainder"
+                );
             }
             other => panic!("expected AbortedByDisarm, got {other:?}"),
         }
