@@ -55,6 +55,27 @@ pub const ACTIVE_QSO_TX_OFFSET_MAX_HZ: f64 = 2900.0;
 /// so it can never reject a genuine relocation.
 const TX_OFFSET_NOOP_TOLERANCE_HZ: f64 = 1.0;
 
+/// SM-F6: bounded resend cap for AUTONOMOUS QSOs re-armed by
+/// [`QsoManager::rearm_manual_calls_at`] (`RespondingToCq`/`SendingReport`
+/// only). This is deliberately NOT `manual_call_max_calls` (25 calls, an
+/// operator-supervised, long-running bound) -- an Auto QSO is unattended TX
+/// and must stay conservative. `call_count` starts at 1 (the opening send),
+/// so a cap of 2 allows exactly ONE resend. Combined with the one-slot
+/// (`rearm_slot_millis`, 15s in FT8) cadence, that resend lands around the
+/// ~15s mark under FT8 -- and earlier still under the shorter FT4/FT2 slots --
+/// safely inside the existing 30s `report_timeout` (see `check_timeouts_at`'s
+/// "Phase 5" Auto branch) -- we are NOT extending that 30s outer bound, only
+/// making use of the window with an actual mid-window resend instead of dead
+/// silence. No new config surface.
+///
+/// PAN-72 round 14 (Codex round 14 on PR #350, thread on `tui_relay.rs:3116`):
+/// hoisted out of `rearm_manual_calls_at`'s local scope so
+/// `QsoManager::apply_tx_offset_switch`'s own one-shot retransmission path
+/// (the `cq_retransmit` block) can reference the SAME value when deciding
+/// whether an Auto QSO in `RespondingToCq`/`SendingReport` is actually AT or
+/// PAST the cap -- see that block's doc comment.
+const AUTO_RESEND_MAX_CALLS: u32 = 2;
+
 /// Hound calling region (low): Hounds call the Fox in 300–900 Hz.
 const HOUND_CALL_MIN_HZ: f64 = 300.0;
 const HOUND_CALL_MAX_HZ: f64 = 900.0;
@@ -3437,26 +3458,86 @@ impl QsoManager {
         // `CallInitiation`: for a MANUAL `CallingCq` this is a harmless
         // redundant resend layered on top of the existing periodic cadence
         // (the double-send guard below keeps it harmless).
+        //
+        // PAN-72 round 14 (Codex round 14 on PR #350, thread on
+        // `tui_relay.rs:3116`): the SAME gap, one state later. An
+        // Auto-initiated QSO in `RespondingToCq`/`SendingReport` that has
+        // ALREADY exhausted `AUTO_RESEND_MAX_CALLS` still passes
+        // `resolve_nudge_tx_offset`'s eligibility check (state + initiation
+        // only, no cap awareness) — the relay queues the nudge and reports
+        // success, but `rearm_manual_calls_at`'s own
+        // `if progress.metadata.call_count >= max_calls { continue; }` cap
+        // gate then skips re-arming it forever, so the metadata updates and
+        // nothing is ever retransmitted. Extending the SAME one-shot
+        // mechanism (not a second one) to those two states closes it —
+        // narrower than the CallingCq arm above: this only fires for an
+        // Auto QSO ACTUALLY at/past the cap (below the cap, the very next
+        // periodic rearm pass already retransmits on its own, so firing
+        // here too would be a harmless but redundant double-send) and never
+        // for a Manual QSO in these states (Manual's own
+        // `manual_call_max_calls`-bounded watchdog handling here is
+        // untouched — hitting IT is expected watchdog-retirement territory,
+        // not a "should retry" scenario).
         let cq_retransmit = if origin.is_operator_forced() {
-            if matches!(progress.state, QsoState::CallingCq { .. }) {
-                // Reuse EXACTLY the same construction
-                // `rearm_manual_calls_at`'s own `QsoState::CallingCq { .. }
-                // if is_manual` arm uses — see that match block.
-                let message = MessageType::Cq {
+            let is_auto_past_resend_cap = progress.metadata.initiated_by == CallInitiation::Auto
+                && progress.metadata.call_count >= AUTO_RESEND_MAX_CALLS;
+            let message = match &progress.state {
+                QsoState::CallingCq { .. } => Some(MessageType::Cq {
                     callsign: self.config.our_callsign.clone(),
                     grid: self.config.our_grid.clone(),
-                };
+                }),
+                // Reuse EXACTLY the same construction
+                // `rearm_manual_calls_at`'s own
+                // `QsoState::RespondingToCq { target_callsign, .. }` arm uses
+                // — see that match block.
+                QsoState::RespondingToCq {
+                    target_callsign, ..
+                } if is_auto_past_resend_cap => Some(MessageType::CqResponse {
+                    calling_station: target_callsign.clone(),
+                    responding_station: self.config.our_callsign.clone(),
+                    grid: self.config.our_grid.clone(),
+                }),
+                // Reuse EXACTLY the same construction
+                // `rearm_manual_calls_at`'s own
+                // `QsoState::SendingReport { their_report: None, .. }` arm
+                // uses — see that match block.
+                QsoState::SendingReport {
+                    their_callsign,
+                    their_report: None,
+                    our_report,
+                    ..
+                } if is_auto_past_resend_cap => Some(MessageType::SignalReport {
+                    to_station: their_callsign.clone(),
+                    from_station: self.config.our_callsign.clone(),
+                    report: *our_report,
+                }),
+                // Reuse EXACTLY the same construction
+                // `rearm_manual_calls_at`'s own
+                // `QsoState::SendingReport { their_report: Some(_), .. }` arm
+                // uses — see that match block.
+                QsoState::SendingReport {
+                    their_callsign,
+                    their_report: Some(_),
+                    our_report,
+                    ..
+                } if is_auto_past_resend_cap => Some(MessageType::ReportAck {
+                    to_station: their_callsign.clone(),
+                    from_station: self.config.our_callsign.clone(),
+                    report: *our_report,
+                }),
+                _ => None,
+            };
+            message.map(|message| {
                 let now = Utc::now();
-                // Double-send guard (Fix A, step 4): bump
-                // call_count/last_call_at exactly as `rearm_manual_calls_at`
-                // would after a normal resend, so the VERY NEXT rearm pass
-                // sees "at least one slot hasn't elapsed yet" and does not
-                // immediately re-fire a second resend on top of this one.
-                // This matters for a Manual `CallingCq` (which DOES get a
-                // periodic rearm); an Auto `CallingCq` never gets one
-                // regardless, so this bookkeeping is a no-op safety measure
-                // there — done unconditionally for consistency, so the two
-                // code paths can never silently diverge in behavior.
+                // Double-send guard (Fix A, step 4; extended round 14):
+                // bump call_count/last_call_at exactly as
+                // `rearm_manual_calls_at` would after a normal resend, so
+                // the VERY NEXT rearm pass sees "at least one slot hasn't
+                // elapsed yet" and does not immediately re-fire a second
+                // resend on top of this one. This matters for a Manual
+                // `CallingCq` (which DOES get a periodic rearm); it applies
+                // uniformly to whichever arm above fired — no separate
+                // bookkeeping needed per state.
                 progress.metadata.call_count += 1;
                 progress.metadata.last_call_at = Some(now);
                 let raw_text = self.render_sent_text(&message);
@@ -3468,15 +3549,13 @@ impl QsoManager {
                     signal_strength: None,
                     frequency: progress.metadata.frequency,
                 });
-                Some((
+                (
                     message,
                     progress.metadata.frequency,
                     progress.metadata.tx_parity,
                     progress.metadata.remote_origin,
-                ))
-            } else {
-                None
-            }
+                )
+            })
         } else {
             None
         };
@@ -6327,19 +6406,10 @@ impl QsoManager {
         // [`QsoManager::set_active_slot_ns_source`].
         let slot_millis = self.rearm_slot_millis();
 
-        // SM-F6: bounded resend cap for AUTONOMOUS QSOs. This is deliberately
-        // NOT `manual_call_max_calls` (25 calls, an operator-supervised,
-        // long-running bound) — an Auto QSO is unattended TX and must stay
-        // conservative. `call_count` starts at 1 (the opening send), so a cap
-        // of 2 allows exactly ONE resend. Combined with the one-slot
-        // (`slot_millis`, 15s in FT8) cadence below, that resend lands
-        // around the ~15s mark under FT8 — and earlier still under the
-        // shorter FT4/FT2 slots — safely
-        // inside the existing 30s `report_timeout` (see check_timeouts_at's
-        // "Phase 5" Auto branch) — we are NOT extending that 30s outer bound,
-        // only making use of the window with an actual mid-window resend
-        // instead of dead silence. No new config surface.
-        const AUTO_RESEND_MAX_CALLS: u32 = 2;
+        // SM-F6: bounded resend cap for AUTONOMOUS QSOs -- see the
+        // module-level [`AUTO_RESEND_MAX_CALLS`] const's doc comment (hoisted
+        // there in PAN-72 round 14 so `apply_tx_offset_switch` can reference
+        // the SAME value).
 
         // Each entry carries the exact MessageType to re-emit so a
         // RespondingToCq QSO re-sends the call (CqResponse) while a
@@ -9466,6 +9536,333 @@ mod tests {
         assert_eq!(
             after.metadata.last_call_at, last_call_at_before,
             "last_call_at must be untouched by a non-operator-forced relocation"
+        );
+    }
+
+    /// PAN-72 round 14: an Auto-initiated QSO in `RespondingToCq` that has
+    /// ALREADY exhausted its resend cap (`call_count >= AUTO_RESEND_MAX_CALLS`)
+    /// still passes `resolve_nudge_tx_offset`'s eligibility check (state +
+    /// initiation only, no cap awareness), so an operator-forced `u` nudge
+    /// must not silently relocate it with nothing ever retransmitted --
+    /// `rearm_manual_calls_at`'s own cap gate would otherwise skip it forever.
+    #[tokio::test]
+    async fn apply_tx_offset_switch_retransmits_cq_response_for_auto_responding_to_cq_past_cap() {
+        let manager = auto_manager(test_config());
+        let mut events = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq("K1DEF".to_string(), 1500.0, None)
+            .await
+            .unwrap();
+        let _ = drain(&mut events);
+
+        // Drive call_count to (at least) the cap directly, exactly like the
+        // sibling `apply_tx_offset_switch_updates_frequency_and_resets_stall_cycles`
+        // test manipulates metadata directly for setup.
+        {
+            let mut qsos = manager.qsos.write().await;
+            let qso = qsos.get_mut(&qso_id).unwrap();
+            assert_eq!(qso.metadata.initiated_by, CallInitiation::Auto);
+            assert!(matches!(qso.state, QsoState::RespondingToCq { .. }));
+            qso.metadata.call_count = AUTO_RESEND_MAX_CALLS;
+        }
+        let last_call_at_before = manager.get_qso(qso_id).await.unwrap().metadata.last_call_at;
+
+        let applied = manager
+            .apply_tx_offset_switch(qso_id, 1900.0, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .expect("committing the operator-forced nudge");
+        assert_eq!(applied, 1900.0);
+
+        let events = drain(&mut events);
+        let mut saw_cq_response_at_new_offset = false;
+        for event in &events {
+            if let QsoEvent::MessageToSend {
+                message:
+                    MessageType::CqResponse {
+                        calling_station, ..
+                    },
+                frequency,
+                ..
+            } = event
+            {
+                assert_eq!(calling_station, "K1DEF");
+                assert_eq!(*frequency, 1900.0, "must retransmit at the NEW offset");
+                saw_cq_response_at_new_offset = true;
+            }
+        }
+        assert!(
+            saw_cq_response_at_new_offset,
+            "expected an immediate CqResponse retransmission at the new offset, got {events:?}"
+        );
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.call_count,
+            AUTO_RESEND_MAX_CALLS + 1,
+            "call_count must be bumped exactly like a normal rearm resend (double-send guard)"
+        );
+        assert_ne!(
+            after.metadata.last_call_at, last_call_at_before,
+            "last_call_at must actually be updated, not left stale"
+        );
+    }
+
+    /// Same gap, the `SendingReport` (plain-report rung, `their_report ==
+    /// None`) side: re-sends the SAME `SignalReport` `rearm_manual_calls_at`
+    /// would, never escalating to R-report on its own.
+    #[tokio::test]
+    async fn apply_tx_offset_switch_retransmits_signal_report_for_auto_sending_report_past_cap() {
+        let manager = auto_manager(test_config());
+        let mut events = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq("K1DEF".to_string(), 1500.0, None)
+            .await
+            .unwrap();
+        // DX sends its grid-rung reply; we advance RespondingToCq -> stuck at
+        // plain-report rung of SendingReport (their_report == None).
+        manager
+            .process_message(
+                MessageType::CqResponse {
+                    calling_station: "W1ABC".to_string(),
+                    responding_station: "K1DEF".to_string(),
+                    grid: Some("EM12".to_string()),
+                },
+                "K1DEF W1ABC EM12".to_string(),
+                1500.0,
+                Some(-10.0),
+            )
+            .await
+            .unwrap();
+        let _ = drain(&mut events);
+        {
+            let mut qsos = manager.qsos.write().await;
+            let qso = qsos.get_mut(&qso_id).unwrap();
+            assert_eq!(qso.metadata.initiated_by, CallInitiation::Auto);
+            assert!(matches!(
+                qso.state,
+                QsoState::SendingReport {
+                    their_report: None,
+                    ..
+                }
+            ));
+            qso.metadata.call_count = AUTO_RESEND_MAX_CALLS;
+        }
+
+        manager
+            .apply_tx_offset_switch(qso_id, 1900.0, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .expect("committing the operator-forced nudge");
+
+        let events = drain(&mut events);
+        let mut saw_signal_report_at_new_offset = false;
+        for event in &events {
+            if let QsoEvent::MessageToSend {
+                message: MessageType::SignalReport { to_station, .. },
+                frequency,
+                ..
+            } = event
+            {
+                assert_eq!(to_station, "K1DEF");
+                assert_eq!(*frequency, 1900.0);
+                saw_signal_report_at_new_offset = true;
+            }
+        }
+        assert!(
+            saw_signal_report_at_new_offset,
+            "expected an immediate SignalReport retransmission at the new offset, got {events:?}"
+        );
+    }
+
+    /// Same gap, the `SendingReport` (R-report rung, `their_report ==
+    /// Some(_)`) side: re-sends `ReportAck`, never regressing to a plain
+    /// report.
+    #[tokio::test]
+    async fn apply_tx_offset_switch_retransmits_report_ack_for_auto_sending_report_with_their_report_past_cap(
+    ) {
+        let manager = auto_manager(test_config());
+        let mut events = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq("K1DEF".to_string(), 1500.0, None)
+            .await
+            .unwrap();
+        // DX sends its report -> RespondingToCq -> SendingReport (their_report
+        // still None); then DX re-sends its report (didn't copy our R) ->
+        // their_report becomes Some.
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                    report: -9,
+                },
+                "W1ABC K1DEF -09".to_string(),
+                1500.0,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                    report: -9,
+                },
+                "W1ABC K1DEF -09".to_string(),
+                1500.0,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+        let _ = drain(&mut events);
+        {
+            let mut qsos = manager.qsos.write().await;
+            let qso = qsos.get_mut(&qso_id).unwrap();
+            assert_eq!(qso.metadata.initiated_by, CallInitiation::Auto);
+            assert!(matches!(
+                qso.state,
+                QsoState::SendingReport {
+                    their_report: Some(_),
+                    ..
+                }
+            ));
+            qso.metadata.call_count = AUTO_RESEND_MAX_CALLS;
+        }
+
+        manager
+            .apply_tx_offset_switch(qso_id, 1900.0, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .expect("committing the operator-forced nudge");
+
+        let events = drain(&mut events);
+        let mut saw_report_ack_at_new_offset = false;
+        for event in &events {
+            if let QsoEvent::MessageToSend {
+                message: MessageType::ReportAck { to_station, .. },
+                frequency,
+                ..
+            } = event
+            {
+                assert_eq!(to_station, "K1DEF");
+                assert_eq!(*frequency, 1900.0);
+                saw_report_ack_at_new_offset = true;
+            }
+        }
+        assert!(
+            saw_report_ack_at_new_offset,
+            "expected an immediate ReportAck retransmission at the new offset, got {events:?}"
+        );
+    }
+
+    /// Regression: an Auto QSO in `RespondingToCq` BELOW the cap
+    /// (`call_count < AUTO_RESEND_MAX_CALLS`) must NOT get the one-shot
+    /// retransmission -- the normal periodic `rearm_manual_calls_at` pass
+    /// will already retransmit on its own very next slot, so firing here too
+    /// would be a redundant double-send.
+    #[tokio::test]
+    async fn apply_tx_offset_switch_does_not_retransmit_for_auto_responding_to_cq_below_cap() {
+        let manager = auto_manager(test_config());
+        let mut events = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq("K1DEF".to_string(), 1500.0, None)
+            .await
+            .unwrap();
+        let _ = drain(&mut events);
+        let before = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(before.metadata.initiated_by, CallInitiation::Auto);
+        assert!(before.metadata.call_count < AUTO_RESEND_MAX_CALLS);
+
+        manager
+            .apply_tx_offset_switch(qso_id, 1900.0, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .expect("committing the operator-forced nudge");
+
+        let events = drain(&mut events);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, QsoEvent::MessageToSend { .. })),
+            "an Auto QSO below the resend cap must not get the one-shot path \
+             (periodic rearm already covers it), got {events:?}"
+        );
+    }
+
+    /// Regression: a MANUAL-initiated QSO in `RespondingToCq` past ITS OWN
+    /// cap (`manual_call_max_calls`) must NOT get this Auto-scoped one-shot
+    /// path -- Manual's own watchdog-retirement handling in
+    /// `rearm_manual_calls_at` is untouched by this fix.
+    #[tokio::test]
+    async fn apply_tx_offset_switch_does_not_retransmit_for_manual_responding_to_cq_past_its_cap() {
+        let mut config = test_config();
+        config.timeouts.manual_call_max_calls = 2;
+        let manager = auto_manager(config);
+        let mut events = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 1500.0, None)
+            .await
+            .unwrap();
+        let _ = drain(&mut events);
+        {
+            let mut qsos = manager.qsos.write().await;
+            let qso = qsos.get_mut(&qso_id).unwrap();
+            assert_eq!(qso.metadata.initiated_by, CallInitiation::Manual);
+            assert!(matches!(qso.state, QsoState::RespondingToCq { .. }));
+            qso.metadata.call_count = 2; // == manual_call_max_calls
+        }
+
+        manager
+            .apply_tx_offset_switch(qso_id, 1900.0, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .expect("committing the operator-forced nudge");
+
+        let events = drain(&mut events);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, QsoEvent::MessageToSend { .. })),
+            "a Manual QSO past its own cap must not get the Auto-scoped \
+             one-shot path, got {events:?}"
+        );
+    }
+
+    /// Regression: a STALL-triggered (not operator-forced) origin on an Auto
+    /// QSO past the resend cap in `RespondingToCq` must NOT retransmit --
+    /// proves this fix doesn't loosen the stall detector's own conservatism
+    /// for Auto QSOs past their resend cap.
+    #[tokio::test]
+    async fn apply_tx_offset_switch_does_not_retransmit_for_stall_triggered_auto_past_cap() {
+        let manager = auto_manager(test_config());
+        let mut events = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq("K1DEF".to_string(), 1500.0, None)
+            .await
+            .unwrap();
+        let _ = drain(&mut events);
+        let advance_generation;
+        {
+            let mut qsos = manager.qsos.write().await;
+            let qso = qsos.get_mut(&qso_id).unwrap();
+            assert_eq!(qso.metadata.initiated_by, CallInitiation::Auto);
+            assert!(matches!(qso.state, QsoState::RespondingToCq { .. }));
+            qso.metadata.call_count = AUTO_RESEND_MAX_CALLS;
+            advance_generation = qso.metadata.advance_generation;
+        }
+
+        let origin = OffsetRelocationOrigin::StallDetected {
+            raised_at_generation: advance_generation,
+        };
+        manager
+            .apply_tx_offset_switch(qso_id, 1900.0, origin)
+            .await
+            .expect("committing the stall-triggered switch");
+
+        let events = drain(&mut events);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, QsoEvent::MessageToSend { .. })),
+            "a STALL-triggered relocation on an Auto QSO past the resend cap \
+             must not emit any retransmission, got {events:?}"
         );
     }
 
