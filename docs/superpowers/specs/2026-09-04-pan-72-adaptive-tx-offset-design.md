@@ -134,8 +134,15 @@ tested.
   }
   ```
   Emitted once `stall_cycles >= config.qso_stall_switch_after` (new field, default 4), gated to
-  `tx_freq_mode == Auto` exactly like today's hop gate. Emitting resets `stall_cycles` to 0
-  immediately so the same stall doesn't re-fire every subsequent tick.
+  `tx_freq_mode == Auto` exactly like today's hop gate. **Amended by later Codex rounds on PR
+  #350:** emission does NOT reset `stall_cycles` — an early implementation that cleared the
+  counter at emission time caused the request to silently vanish into a crowded band (the
+  drain's own no-op refusal, `OffsetActionNoOp`, would discard the request and the QSO would
+  then sit with a freshly-zeroed streak, unable to re-raise for another full
+  `qso_stall_switch_after` window). The counter is preserved and the request re-emitted every
+  slot until it is either resolved by a real commit (`apply_tx_offset_switch`'s own reset,
+  `qso_manager.rs:~3360`) or superseded by genuine DX progress (the forward-advance reset,
+  `qso_manager.rs:~4026`).
 - Decision rule at emission time: if `last_known_good_offset_hz` is `None`, or
   `(metadata.frequency - last_known_good_offset_hz.unwrap()).abs() < f64::EPSILON` (float
   equality via epsilon, matching the existing style in `autonomous.rs`'s own switch-result
@@ -171,10 +178,19 @@ tested.
   resets `stall_cycles` to 0, and logs at `target: "tx.freq"` — at `info!`, since the
   silence-based detector fires far more often than the identical-repeat hop it replaced. Returns
   the applied (post-clamp) offset so the coordinator's `active_tx_offsets` mirror stores what
-  actually landed. Does **not** force an
-  immediate retransmission — the next naturally-scheduled send (the next `rearm_manual_calls_at`
-  resend, or whatever event next constructs a message for this QSO) picks up the new value
-  because message construction reads `metadata.frequency` fresh each time, same as today.
+  actually landed. For a **stall-triggered** relocation, does not force an immediate
+  retransmission — the next naturally-scheduled send (the next `rearm_manual_calls_at` resend,
+  or whatever event next constructs a message for this QSO) picks up the new value because
+  message construction reads `metadata.frequency` fresh each time. **Amended by later Codex
+  rounds on PR #350:** for an **operator-forced** relocation (`u`), this is no longer true.
+  `apply_tx_offset_switch` now immediately emits a one-shot `MessageToSend` at commit time for
+  a nudged `CallingCq` (any `CallInitiation`), and for an Auto-initiated `RespondingToCq`/
+  `SendingReport` that has already exhausted its resend cap (`AUTO_RESEND_MAX_CALLS`) — both
+  cases where the periodic `rearm_manual_calls_at` cadence would otherwise never retransmit at
+  all (an Auto `CallingCq` is permanently outside that cadence by design; a resend-capped Auto
+  QSO is skipped by it). This one-shot path also bumps `call_count`/`last_call_at` exactly as a
+  normal rearm would, so the very next periodic pass does not double-send
+  (`qso_manager.rs:~3481-3587`).
 
 ## Coordinator wiring — `pancetta` binary
 
