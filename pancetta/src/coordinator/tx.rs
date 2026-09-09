@@ -5760,6 +5760,18 @@ impl super::ApplicationCoordinator {
                                                 }
                                                 ptt_active.store(false, Ordering::Release);
                                                 ptt_guard.disarm();
+                                                // Round-7 review (Codex P2): this is a
+                                                // PRE-SLOT abort — PTT was keyed but Step 7
+                                                // never routed any audio, so nothing actually
+                                                // reached the air. If Step 4c pivoted this
+                                                // cycle, its tombstone must go too, exactly
+                                                // like the pre-PTT Step 4d-arm denial — else
+                                                // the genuinely fresh, still-queued request is
+                                                // wrongly discarded as an already-sent pivot
+                                                // duplicate.
+                                                if let Some(key) = pivoted_this_key.take() {
+                                                    pivoted_once.remove(&key);
+                                                }
                                                 reenqueue_pending(&message_bus, pending).await;
                                                 emit_disarm_interrupt_signals(
                                                     &message_bus,
@@ -6060,6 +6072,77 @@ impl super::ApplicationCoordinator {
                                             chrono::Utc::now(),
                                         )
                                         .await;
+
+                                        // Round-7 review (Codex P1): Step 6's sleep can
+                                        // return `Completed` (nothing to interrupt it) even
+                                        // though the bound client disarmed during an
+                                        // intervening await this function's own poll never
+                                        // covers — e.g. `log_tx_frame`'s await just above.
+                                        // PTT is already asserted (Step 5) but no audio has
+                                        // gone out yet, so this is the last chance to catch
+                                        // a stale authorization before the waveform actually
+                                        // reaches the air.
+                                        if origin == crate::message_bus::TxOrigin::Remote
+                                            && !remote_tx_permitted_for(
+                                                &remote_tx_arm,
+                                                chrono::Utc::now().timestamp_millis(),
+                                                remote_client_key_id.as_deref(),
+                                            )
+                                        {
+                                            let ptt_off_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Hamlib,
+                                                MessageType::RigControl(
+                                                    crate::message_bus::RigControlMessage::SetPtt {
+                                                        state: false,
+                                                    },
+                                                ),
+                                                Instant::now(),
+                                            );
+                                            if let Err(e) =
+                                                message_bus.send_message(ptt_off_msg).await
+                                            {
+                                                warn!(
+                                                    "Remote disarm before audio delivery: PTT OFF failed: {}",
+                                                    e
+                                                );
+                                            }
+                                            ptt_active.store(false, Ordering::Release);
+                                            ptt_guard.disarm();
+                                            if let Some(key) = pivoted_this_key.take() {
+                                                pivoted_once.remove(&key);
+                                            }
+                                            let denial_reason = format!(
+                                                "arm went stale before audio delivery: '{message_text}' at {frequency_offset:.0} Hz"
+                                            );
+                                            emit_disarm_interrupt_signals(
+                                                &message_bus,
+                                                &audit_log,
+                                                &display_feed_enabled,
+                                                &remote_tx_arm,
+                                                remote_client_key_id.as_deref(),
+                                                "denied",
+                                                denial_reason,
+                                                qso_id.as_deref(),
+                                            )
+                                            .await;
+                                            send_tx_queue_status(&message_bus, None, Vec::new())
+                                                .await;
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text,
+                                                    duration_ms: 0,
+                                                    qso_id: qso_id.clone(),
+                                                },
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(complete_msg).await;
+                                            continue 'worker;
+                                        }
+
                                         let audio_msg = ComponentMessage::new(
                                             ComponentId::Ft8Transmitter,
                                             ComponentId::Audio,
@@ -7937,6 +8020,12 @@ impl super::ApplicationCoordinator {
                                             }
                                             ptt_active.store(false, Ordering::Release);
                                             ptt_guard.disarm();
+                                            // Round-7 review (Codex P2): pre-slot abort —
+                                            // nothing reached the air yet (Step 7 never ran)
+                                            // — see the single-TX arm's identical fix.
+                                            for key in &pivoted_this_bundle_keys {
+                                                pivoted_once.remove(key);
+                                            }
                                             reenqueue_pending(&message_bus, pending).await;
                                             emit_disarm_interrupt_signals(
                                                 &message_bus,
@@ -8023,6 +8112,77 @@ impl super::ApplicationCoordinator {
                                         )
                                         .await;
                                     }
+
+                                    // Round-7 review (Codex P1): mirrors the single-TX
+                                    // arm's identical fix — Step 6's sleep can return
+                                    // `Completed` even though the bound client disarmed
+                                    // during the `log_tx_frame` awaits just above, which
+                                    // this function's own poll never covers. PTT is
+                                    // already asserted but no audio has gone out yet.
+                                    if origin == crate::message_bus::TxOrigin::Remote
+                                        && !remote_tx_permitted_for(
+                                            &remote_tx_arm,
+                                            chrono::Utc::now().timestamp_millis(),
+                                            remote_client_key_id.as_deref(),
+                                        )
+                                    {
+                                        let ptt_off_msg = ComponentMessage::new(
+                                            ComponentId::Ft8Transmitter,
+                                            ComponentId::Hamlib,
+                                            MessageType::RigControl(
+                                                crate::message_bus::RigControlMessage::SetPtt {
+                                                    state: false,
+                                                },
+                                            ),
+                                            Instant::now(),
+                                        );
+                                        if let Err(e) = message_bus.send_message(ptt_off_msg).await
+                                        {
+                                            warn!(
+                                                "Remote disarm before audio delivery: PTT OFF failed: {}",
+                                                e
+                                            );
+                                        }
+                                        ptt_active.store(false, Ordering::Release);
+                                        ptt_guard.disarm();
+                                        for key in &pivoted_this_bundle_keys {
+                                            pivoted_once.remove(key);
+                                        }
+                                        for item in &items {
+                                            let denial_reason = format!(
+                                                "arm went stale before audio delivery: '{}' at {:.0} Hz",
+                                                item.message_text, item.frequency_offset
+                                            );
+                                            emit_disarm_interrupt_signals(
+                                                &message_bus,
+                                                &audit_log,
+                                                &display_feed_enabled,
+                                                &remote_tx_arm,
+                                                remote_client_key_id.as_deref(),
+                                                "denied",
+                                                denial_reason,
+                                                item.qso_id.as_deref(),
+                                            )
+                                            .await;
+                                        }
+                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                        for item in &items {
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text: item.message_text.clone(),
+                                                    duration_ms: 0,
+                                                    qso_id: item.qso_id.clone(),
+                                                },
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(complete_msg).await;
+                                        }
+                                        continue;
+                                    }
+
                                     let audio_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Audio,
