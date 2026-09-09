@@ -5435,6 +5435,12 @@ impl super::ApplicationCoordinator {
                                                     qso_id.as_deref(),
                                                     &message_text,
                                                     frequency_offset,
+                                                    // Round-5 review (Codex P1): an
+                                                    // authorization-only rebind (identical
+                                                    // resend text/offset, different
+                                                    // origin/client) must count as a pivot
+                                                    // too — see `tx_pivot_target`'s doc.
+                                                    Some((origin, remote_client_key_id.as_deref())),
                                                     &m,
                                                 )
                                             })

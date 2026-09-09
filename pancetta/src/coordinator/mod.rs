@@ -167,10 +167,23 @@ pub const PIVOT_OFFSET_EPSILON_HZ: f64 = 0.5;
 /// freshest `MessageToSend` at key-time" invariant, and no amount of
 /// receive-side grace (`PRE_SWITCH_OFFSET_GRACE`) makes the transmitted
 /// frame itself fresh.
+/// Round-5 review (Codex P1, live on commit f1838efb): `current_authorization`,
+/// when `Some((origin, client_key_id))`, makes an authorization-ONLY change
+/// (identical text and offset, different `origin`/`remote_client_key_id`)
+/// count as a pivot too — a rebind commonly resends the EXACT same rendered
+/// frame, and a text/offset-only comparison would leave a request already
+/// sitting in the worker's pre-PTT wait keyed against its STALE
+/// authorization even though `latest_tx_intent` already holds the fresh
+/// one. `None` preserves the original text/offset-only comparison for
+/// callers with no real per-item identity to compare (the multi-TX bundle
+/// path's [`pivot_bundle_items`] — `TransmitRequestItem` carries no
+/// identity at all yet; see PAN-136) rather than manufacturing spurious
+/// pivots there.
 pub fn tx_pivot_target(
     qso_id: Option<&str>,
     current_text: &str,
     current_frequency_offset: f64,
+    current_authorization: Option<(crate::message_bus::TxOrigin, Option<&str>)>,
     latest: &HashMap<String, LatestTxIntent>,
 ) -> Option<LatestTxIntent> {
     let id = qso_id?;
@@ -178,7 +191,14 @@ pub fn tx_pivot_target(
     let same_text = intent.message_text == current_text;
     let same_offset =
         (intent.frequency_offset - current_frequency_offset).abs() < PIVOT_OFFSET_EPSILON_HZ;
-    if same_text && same_offset {
+    let same_authorization = match current_authorization {
+        Some((current_origin, current_client_key_id)) => {
+            intent.origin == current_origin
+                && intent.remote_client_key_id.as_deref() == current_client_key_id
+        }
+        None => true,
+    };
+    if same_text && same_offset && same_authorization {
         None
     } else {
         Some(intent.clone())
@@ -276,6 +296,9 @@ pub fn pivot_bundle_items(
                 item.qso_id.as_deref(),
                 &item.message_text,
                 item.frequency_offset,
+                // `TransmitRequestItem` carries no identity to compare yet
+                // (PAN-136) — preserve the original text/offset-only check.
+                None,
                 latest,
             ) {
                 // `tx_pivot_target` only returns `Some` when `qso_id` is

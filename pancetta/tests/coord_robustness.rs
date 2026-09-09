@@ -612,8 +612,14 @@ fn tx_pivot_target_carries_origin_and_client_identity() {
         },
     );
 
-    let got = tx_pivot_target(Some(qid), current_text, current_freq, &latest)
-        .expect("should pivot to the fresher, rebound message");
+    let got = tx_pivot_target(
+        Some(qid),
+        current_text,
+        current_freq,
+        Some((pancetta_lib::message_bus::TxOrigin::Local, None)),
+        &latest,
+    )
+    .expect("should pivot to the fresher, rebound message");
     assert_eq!(got.message_text, "K5ARH W1AW 73");
     assert_eq!(got.origin, pancetta_lib::message_bus::TxOrigin::Remote);
     assert_eq!(
@@ -626,6 +632,69 @@ fn tx_pivot_target_carries_origin_and_client_identity() {
     );
 }
 
+/// Round-5 review (Codex P1, live on commit f1838efb): an authorization-ONLY
+/// change — the rebind resends the EXACT same rendered text at the same
+/// offset — must still count as a pivot. Round 4's fix (above) only proved
+/// that origin/identity travel WITH a text/offset change; it left the
+/// text-and-offset-only comparison in place, so a rebind that happens to
+/// resend identical content would leave `tx_pivot_target` reporting no
+/// pivot at all, and the worker would key on the STALE authorization it
+/// already held — either denying B's valid resend under A's identity, or
+/// transmitting it as `TxOrigin::Local` with no arm check whatsoever.
+#[test]
+fn tx_pivot_target_pivots_on_an_authorization_only_change() {
+    use std::collections::HashMap;
+    let qid = "abc-123";
+    let mut latest: HashMap<String, LatestTxIntent> = HashMap::new();
+
+    let text = "K5ARH W1AW RR73";
+    let freq = 1500.0;
+
+    // Same rendered text and offset the worker is holding — only the
+    // controlling client changed (A -> B).
+    latest.insert(
+        active_tx_qso_key(qid),
+        LatestTxIntent {
+            message_text: text.to_string(),
+            frequency_offset: freq,
+            tx_parity: Some(SlotParity::Even),
+            origin: pancetta_lib::message_bus::TxOrigin::Remote,
+            remote_client_key_id: Some("client-b".to_string()),
+        },
+    );
+
+    let got = tx_pivot_target(
+        Some(qid),
+        text,
+        freq,
+        Some((
+            pancetta_lib::message_bus::TxOrigin::Remote,
+            Some("client-a"),
+        )),
+        &latest,
+    )
+    .expect(
+        "an authorization-only change (identical text/offset, different \
+         client) must still be reported as a pivot",
+    );
+    assert_eq!(got.remote_client_key_id.as_deref(), Some("client-b"));
+
+    // Sibling: nothing changed at all (same text, offset, AND
+    // authorization) — must NOT pivot, preserving the original
+    // keep-call-resend no-op behavior.
+    assert!(tx_pivot_target(
+        Some(qid),
+        text,
+        freq,
+        Some((
+            pancetta_lib::message_bus::TxOrigin::Remote,
+            Some("client-b"),
+        )),
+        &latest,
+    )
+    .is_none());
+}
+
 #[test]
 fn tx_pivot_target_swaps_only_on_a_fresher_message() {
     use std::collections::HashMap;
@@ -633,7 +702,7 @@ fn tx_pivot_target_swaps_only_on_a_fresher_message() {
     let mut latest: HashMap<String, LatestTxIntent> = HashMap::new();
 
     // No intent recorded yet → no pivot.
-    assert!(tx_pivot_target(Some(qid), "KF9UG K5ARH RR73", 1353.0, &latest).is_none());
+    assert!(tx_pivot_target(Some(qid), "KF9UG K5ARH RR73", 1353.0, None, &latest).is_none());
 
     // Record a fresher intent (DX advanced → we should now send 73).
     latest.insert(
@@ -648,19 +717,19 @@ fn tx_pivot_target_swaps_only_on_a_fresher_message() {
     );
 
     // Worker still holds RR73 → pivot to the fresher 73.
-    let got = tx_pivot_target(Some(qid), "KF9UG K5ARH RR73", 1353.0, &latest)
+    let got = tx_pivot_target(Some(qid), "KF9UG K5ARH RR73", 1353.0, None, &latest)
         .expect("should pivot to fresher message");
     assert_eq!(got.message_text, "KF9UG K5ARH 73");
     assert_eq!(got.frequency_offset, 1353.0);
 
     // Identical text AND identical offset (keep-call re-send) → no pivot.
-    assert!(tx_pivot_target(Some(qid), "KF9UG K5ARH 73", 1353.0, &latest).is_none());
+    assert!(tx_pivot_target(Some(qid), "KF9UG K5ARH 73", 1353.0, None, &latest).is_none());
 
     // Manual / tune (qso_id == None) is never pivoted.
-    assert!(tx_pivot_target(None, "CQ K5ARH EM10", 1353.0, &latest).is_none());
+    assert!(tx_pivot_target(None, "CQ K5ARH EM10", 1353.0, None, &latest).is_none());
 
     // Unknown qso_id → no pivot.
-    assert!(tx_pivot_target(Some("other"), "X Y RR73", 1353.0, &latest).is_none());
+    assert!(tx_pivot_target(Some("other"), "X Y RR73", 1353.0, None, &latest).is_none());
 }
 
 /// PAN-72 (Codex round 5 on PR #350, finding 1): an OFFSET-only change is a
@@ -690,7 +759,7 @@ fn tx_pivot_target_pivots_on_an_offset_only_change() {
         },
     );
 
-    let got = tx_pivot_target(Some(qid), "KF9UG K5ARH RR73", 1353.0, &latest)
+    let got = tx_pivot_target(Some(qid), "KF9UG K5ARH RR73", 1353.0, None, &latest)
         .expect("an offset-only advance must still pivot");
     assert_eq!(got.message_text, "KF9UG K5ARH RR73");
     assert_eq!(
@@ -702,7 +771,7 @@ fn tx_pivot_target_pivots_on_an_offset_only_change() {
     // spacing is 6.25 Hz and offsets are allocated in whole Hz), so it must
     // not manufacture a pivot out of an unchanged keep-call re-send.
     assert!(
-        tx_pivot_target(Some(qid), "KF9UG K5ARH RR73", 1753.0 - 1e-9, &latest).is_none(),
+        tx_pivot_target(Some(qid), "KF9UG K5ARH RR73", 1753.0 - 1e-9, None, &latest).is_none(),
         "float noise must not read as a fresher offset"
     );
 }
