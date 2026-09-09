@@ -2132,12 +2132,25 @@ impl QsoManager {
                 // gate (`rearm_manual_calls_at`) for the identical reason.
                 let should_resend =
                     !remote_origin || (self.remote_tx_permitted)(remote_client_key_id.as_deref());
-                // Round-3 review (Codex P2): rebind to whichever client's
-                // action was just accepted, BEFORE resending — see
-                // `rebind_remote_identity`'s doc.
-                self.rebind_remote_identity(existing_id, remote_origin, remote_client_key_id)
-                    .await;
                 if should_resend {
+                    // Codex P1, round 20: only rebind when the action is
+                    // actually permitted — rebinding unconditionally left the
+                    // QSO's metadata claiming a DENIED client's identity even
+                    // though no fresh `MessageToSend` was emitted to publish
+                    // that change, so the coordinator's `latest_tx_intent`
+                    // stayed stale (still the prior owner's) and a later
+                    // key-time comparison could see matching stale
+                    // authorization without ever checking the new client's
+                    // arm. Deferring the rebind here (rather than publishing
+                    // the change on the denied path) keeps the QSO's identity
+                    // metadata meaning what every other call site already
+                    // assumes: "the last ACCEPTED client's action."
+                    //
+                    // Round-3 review (Codex P2): rebind to whichever client's
+                    // action was just accepted, BEFORE resending — see
+                    // `rebind_remote_identity`'s doc.
+                    self.rebind_remote_identity(existing_id, remote_origin, remote_client_key_id)
+                        .await;
                     // Re-emit the QSO's most-recent outbound as a keep-call.
                     // This is a benign no-op if it somehow has no prior Sent
                     // message.
@@ -2425,11 +2438,23 @@ impl QsoManager {
                     // BEFORE rebinding/advancing, same as those branches.
                     let should_advance = !remote_origin
                         || (self.remote_tx_permitted)(remote_client_key_id.as_deref());
-                    // Round-3 review (Codex P2): rebind before advancing —
-                    // see `rebind_remote_identity`'s doc.
-                    self.rebind_remote_identity(existing_id, remote_origin, remote_client_key_id)
-                        .await;
                     if should_advance {
+                        // Codex P1, round 20: only rebind once the action is
+                        // permitted — see the identical fix in the
+                        // idempotent keep-call branch above for the full
+                        // rationale (an unconditional rebind on a DENIED
+                        // action leaves stale-looking-legitimate identity
+                        // metadata behind with no fresh intent published to
+                        // correct it).
+                        //
+                        // Round-3 review (Codex P2): rebind before advancing
+                        // — see `rebind_remote_identity`'s doc.
+                        self.rebind_remote_identity(
+                            existing_id,
+                            remote_origin,
+                            remote_client_key_id,
+                        )
+                        .await;
                         self.advance_existing_qso_to_step(
                             existing_id,
                             &target,
@@ -2453,11 +2478,19 @@ impl QsoManager {
                     // `respond_to_cq_with`'s idempotent keep-call branch.
                     let should_resend = !remote_origin
                         || (self.remote_tx_permitted)(remote_client_key_id.as_deref());
-                    // Round-3 review (Codex P2): rebind before resending —
-                    // see `rebind_remote_identity`'s doc.
-                    self.rebind_remote_identity(existing_id, remote_origin, remote_client_key_id)
-                        .await;
                     if should_resend {
+                        // Codex P1, round 20: only rebind once permitted —
+                        // see the identical fix above for the full
+                        // rationale.
+                        //
+                        // Round-3 review (Codex P2): rebind before resending
+                        // — see `rebind_remote_identity`'s doc.
+                        self.rebind_remote_identity(
+                            existing_id,
+                            remote_origin,
+                            remote_client_key_id,
+                        )
+                        .await;
                         let _ = self.resend_last_tx(existing_id).await;
                     }
                     return Ok(existing_id);
@@ -2498,11 +2531,14 @@ impl QsoManager {
                 // `respond_to_cq_with`'s idempotent keep-call branch.
                 let should_resend =
                     !remote_origin || (self.remote_tx_permitted)(remote_client_key_id.as_deref());
-                // Round-3 review (Codex P2): rebind before resending — see
-                // `rebind_remote_identity`'s doc.
-                self.rebind_remote_identity(existing_id, remote_origin, remote_client_key_id)
-                    .await;
                 if should_resend {
+                    // Codex P1, round 20: only rebind once permitted — see
+                    // the identical fix above for the full rationale.
+                    //
+                    // Round-3 review (Codex P2): rebind before resending —
+                    // see `rebind_remote_identity`'s doc.
+                    self.rebind_remote_identity(existing_id, remote_origin, remote_client_key_id)
+                        .await;
                     let _ = self.resend_last_tx(existing_id).await;
                 }
                 return Ok(existing_id);

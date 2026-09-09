@@ -231,6 +231,22 @@ async fn denied_rebound_resend_does_not_charge_the_call_budget() {
         call_count_before, call_count_after,
         "a denied rebound resend must not charge the manual-call budget"
     );
+
+    // Codex P1, round 20 (PR #362): a denied action must not rebind the
+    // QSO's identity metadata either — client-a must still be the bound
+    // client, not client-b. No fresh MessageToSend was emitted above (the
+    // resend was correctly suppressed), so if the rebind had gone through
+    // anyway, the coordinator's own latest-intent tracking would still
+    // reflect the OLD authorization while the QSO's own metadata silently
+    // claimed the NEW (denied) client — a stale-vs-live split that could let
+    // a later key-time check skip re-verifying the new client's arm.
+    let after = manager.get_qso(id_a).await.expect("qso must exist");
+    assert_eq!(
+        after.metadata.remote_client_key_id.as_deref(),
+        Some("client-a"),
+        "a denied rebound must leave the QSO's identity metadata bound to the \
+         PRIOR (accepted) client, not silently rebind to the denied one"
+    );
 }
 
 /// Round-13 review (Codex P1): unlike the resend branches, advancing an
@@ -298,6 +314,14 @@ async fn denied_rebound_advance_does_not_complete_or_mutate_the_qso() {
     assert!(
         !matches!(progress.state, pancetta_qso::QsoState::Completed { .. }),
         "a denied advance must never complete the QSO (would log a false ADIF contact)"
+    );
+    // Codex P1, round 20 (PR #362): same identity-metadata leak as the
+    // resend branch — a denied advance must not rebind either.
+    assert_eq!(
+        progress.metadata.remote_client_key_id.as_deref(),
+        Some("client-a"),
+        "a denied advance must leave the QSO's identity metadata bound to the \
+         PRIOR (accepted) client, not silently rebind to the denied one"
     );
 }
 
