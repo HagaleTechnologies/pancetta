@@ -18,7 +18,9 @@ pub enum OperatingMode {
     Ft8,
     /// FT4 — 7.5-second slots.
     Ft4,
-    /// FT2 — 2-second slots (experimental).
+    /// FT2 — 3.2-second slots (experimental). The value comes from
+    /// `pancetta_ft8::ProtocolParams::ft2().cycle_duration`; "FT2" names the
+    /// mode, not its slot length.
     Ft2,
 }
 

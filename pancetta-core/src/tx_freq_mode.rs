@@ -4,19 +4,22 @@
 //! on its own, or must hold the offset the operator picked.
 //!
 //! 1. [`TxFreqMode::Hold`] — the DEFAULT. Once the operator picks a TX offset
-//!    it stays put: pancetta never moves it autonomously. The stuck-DX hop,
-//!    the autonomous collision-listen jitter, the no-response CQ-streak
-//!    frequency switch, and the autonomous smart-frequency allocator are all
-//!    suppressed; autonomous QSOs transmit on the operator's pinned offset.
-//!    The operator changes the offset only by explicit action (`[` / `]` /
-//!    arrows, or the `t` auto-picker, which chooses a clear offset once and
+//!    it stays put: pancetta never moves it autonomously. The adaptive
+//!    stall switch/revert, the autonomous collision-listen jitter, the
+//!    no-response CQ-streak frequency switch, and the autonomous
+//!    smart-frequency allocator are all suppressed; autonomous QSOs transmit
+//!    on the operator's pinned offset. The `u` nudge is a declared no-op here
+//!    too. The operator changes the offset only by explicit action (`[` / `]`
+//!    / arrows, or the `t` auto-picker, which chooses a clear offset once and
 //!    pins it).
 //! 2. [`TxFreqMode::Auto`] — pancetta is free to choose and adjust the TX
 //!    offset: the smart-frequency allocator picks per QSO, the collision-listen
-//!    jitter moves off interferers when idle, the stuck-DX detector hops the
-//!    offset when a QSO's DX repeats without advancing (likely collision),
-//!    and repeated self-CQs with zero responses trigger a switch to a
-//!    different frequency.
+//!    jitter moves off interferers when idle, the adaptive stall detector
+//!    switches an in-progress QSO to an allocator-picked offset (or reverts it
+//!    to the last known-good one) after `qso_stall_switch_after` slots with no
+//!    advance from the DX — silence included, likely a collision — the `u`
+//!    keystroke forces that same move on demand, and repeated self-CQs with
+//!    zero responses trigger a switch to a different frequency.
 //!
 //! The coordinator stores this in an [`std::sync::atomic::AtomicU8`] so the QSO
 //! engine and the autonomous decision loop can read it cheaply. Use
@@ -33,8 +36,8 @@ pub enum TxFreqMode {
     #[default]
     Hold,
     /// Pancetta is free to choose and adjust the TX offset (smart allocator +
-    /// collision-jitter + stuck-DX hop + no-response CQ-streak switch all
-    /// active).
+    /// collision-jitter + adaptive stall switch/revert + the `u` nudge +
+    /// no-response CQ-streak switch all active).
     Auto,
 }
 

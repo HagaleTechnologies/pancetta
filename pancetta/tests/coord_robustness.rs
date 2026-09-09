@@ -582,7 +582,7 @@ fn tx_pivot_target_swaps_only_on_a_fresher_message() {
     let mut latest: HashMap<String, LatestTxIntent> = HashMap::new();
 
     // No intent recorded yet → no pivot.
-    assert!(tx_pivot_target(Some(qid), "KF9UG K5ARH RR73", &latest).is_none());
+    assert!(tx_pivot_target(Some(qid), "KF9UG K5ARH RR73", 1353.0, &latest).is_none());
 
     // Record a fresher intent (DX advanced → we should now send 73).
     latest.insert(
@@ -595,19 +595,61 @@ fn tx_pivot_target_swaps_only_on_a_fresher_message() {
     );
 
     // Worker still holds RR73 → pivot to the fresher 73.
-    let got = tx_pivot_target(Some(qid), "KF9UG K5ARH RR73", &latest)
+    let got = tx_pivot_target(Some(qid), "KF9UG K5ARH RR73", 1353.0, &latest)
         .expect("should pivot to fresher message");
     assert_eq!(got.message_text, "KF9UG K5ARH 73");
     assert_eq!(got.frequency_offset, 1353.0);
 
-    // Identical text (keep-call re-send) → no pivot.
-    assert!(tx_pivot_target(Some(qid), "KF9UG K5ARH 73", &latest).is_none());
+    // Identical text AND identical offset (keep-call re-send) → no pivot.
+    assert!(tx_pivot_target(Some(qid), "KF9UG K5ARH 73", 1353.0, &latest).is_none());
 
     // Manual / tune (qso_id == None) is never pivoted.
-    assert!(tx_pivot_target(None, "CQ K5ARH EM10", &latest).is_none());
+    assert!(tx_pivot_target(None, "CQ K5ARH EM10", 1353.0, &latest).is_none());
 
     // Unknown qso_id → no pivot.
-    assert!(tx_pivot_target(Some("other"), "X Y RR73", &latest).is_none());
+    assert!(tx_pivot_target(Some("other"), "X Y RR73", 1353.0, &latest).is_none());
+}
+
+/// PAN-72 (Codex round 5 on PR #350, finding 1): an OFFSET-only change is a
+/// genuine freshness difference too. An adaptive TX-offset switch
+/// (`QsoManager::apply_tx_offset_switch`) moves the QSO without changing what
+/// the rendered frame says, so the next rearm publishes the SAME text at the
+/// new offset. If an earlier request for the same QSO is still in the TX
+/// worker's pre-PTT wait, a text-only comparison returns `None` and that
+/// older request keys on the offset the switch existed to leave — even though
+/// `latest_tx_intent` already holds the new frequency. The invariant is
+/// "every transmitted frame reflects the freshest `MessageToSend` at
+/// key-time", and the frequency is part of that message.
+#[test]
+fn tx_pivot_target_pivots_on_an_offset_only_change() {
+    use std::collections::HashMap;
+    let qid = "abc-123";
+    let mut latest: HashMap<String, LatestTxIntent> = HashMap::new();
+    latest.insert(
+        active_tx_qso_key(qid),
+        LatestTxIntent {
+            // Same rendered text the worker is holding — only the offset moved.
+            message_text: "KF9UG K5ARH RR73".to_string(),
+            frequency_offset: 1753.0,
+            tx_parity: Some(SlotParity::Even),
+        },
+    );
+
+    let got = tx_pivot_target(Some(qid), "KF9UG K5ARH RR73", 1353.0, &latest)
+        .expect("an offset-only advance must still pivot");
+    assert_eq!(got.message_text, "KF9UG K5ARH RR73");
+    assert_eq!(
+        got.frequency_offset, 1753.0,
+        "the deferred frame must key on the post-switch offset"
+    );
+
+    // Sub-Hz float noise between the two is NOT a relocation (FT8 tone
+    // spacing is 6.25 Hz and offsets are allocated in whole Hz), so it must
+    // not manufacture a pivot out of an unchanged keep-call re-send.
+    assert!(
+        tx_pivot_target(Some(qid), "KF9UG K5ARH RR73", 1753.0 - 1e-9, &latest).is_none(),
+        "float noise must not read as a fresher offset"
+    );
 }
 
 /// Double-PTT fix regression: a `TransmitRequest` whose qso_id + text

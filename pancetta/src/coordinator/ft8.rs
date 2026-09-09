@@ -1785,12 +1785,50 @@ impl super::ApplicationCoordinator {
                         let scoped_fast_path_enabled = scoped_fast_path.load(Ordering::Relaxed);
                         let scoped_decodes: Vec<pancetta_ft8::DecodedMessage> =
                             if scoped_fast_path_enabled {
-                                let partner_freq_hz =
-                                    active_qso_freq_hz.read().ok().and_then(|g| *g);
-                                if let Some(freq_hz) = partner_freq_hz {
+                                // PAN-72 round-8 redesign (fix 2): `.0` is the
+                                // primary hint (this scoped path's original
+                                // single-frequency meaning, unchanged); `.1`
+                                // is the still-in-grace SECONDARY hint — the
+                                // offset an unanswered `CallingCq` relocated
+                                // away from. Union both windows so a caller
+                                // answering EITHER offset is decoded by this
+                                // fast path too, not just the slower
+                                // authoritative main decode below.
+                                //
+                                // PAN-72 round-9 fix (Codex round 9, finding
+                                // 1): the secondary now carries its own
+                                // `expires_at`, re-checked HERE against
+                                // `Utc::now()` on every read -- the old code
+                                // trusted whatever was last written, so a
+                                // secondary whose grace had genuinely lapsed
+                                // (with no further StateChanged/
+                                // TxOffsetApplied event to refresh it) kept
+                                // widening this scoped window forever.
+                                #[allow(clippy::type_complexity)]
+                                let partner_freq_pair: Option<(
+                                    f64,
+                                    Option<(f64, chrono::DateTime<chrono::Utc>)>,
+                                )> = active_qso_freq_hz.read().ok().and_then(|g| *g);
+                                if let Some((freq_hz, secondary_freq_pair)) = partner_freq_pair {
                                     let center = (freq_hz / 6.25).round() as usize;
-                                    let lo = center.saturating_sub(SCOPED_HALF_WIDTH);
-                                    let hi = center.saturating_add(SCOPED_HALF_WIDTH);
+                                    let mut lo = center.saturating_sub(SCOPED_HALF_WIDTH);
+                                    let mut hi = center.saturating_add(SCOPED_HALF_WIDTH);
+                                    let live_secondary_hz = secondary_freq_pair.and_then(
+                                        |(secondary_hz, expires_at)| {
+                                            (chrono::Utc::now() < expires_at)
+                                                .then_some(secondary_hz)
+                                        },
+                                    );
+                                    if let Some(secondary_hz) = live_secondary_hz {
+                                        let secondary_center =
+                                            (secondary_hz / 6.25).round() as usize;
+                                        lo = lo.min(
+                                            secondary_center.saturating_sub(SCOPED_HALF_WIDTH),
+                                        );
+                                        hi = hi.max(
+                                            secondary_center.saturating_add(SCOPED_HALF_WIDTH),
+                                        );
+                                    }
                                     let scoped_call_start = Instant::now();
                                     let (messages, report) = decoder
                                         .decode_window_with_ap_scoped_partner_budgeted(
@@ -1943,10 +1981,40 @@ impl super::ApplicationCoordinator {
                         // both signals (the two mechanisms compose; an
                         // operator who wants wide decode also wants the
                         // standard sync threshold).
-                        let partner_freq_for_main = active_qso_freq_hz.read().ok().and_then(|g| *g);
+                        // PAN-72 round-8 redesign (fix 2): `.0` is the
+                        // primary hint (this site's original single-frequency
+                        // meaning, unchanged); `.1` is the still-in-grace
+                        // SECONDARY hint. `compute_narrow_filter_bins_default_dual`
+                        // is byte-identical to `compute_narrow_filter_bins_default`
+                        // when the secondary is `None` (every case except an
+                        // unanswered `CallingCq` still inside its relocation
+                        // grace) — see `secondary_decoder_hint_freq_for` in
+                        // `coordinator::qso`.
+                        //
+                        // PAN-72 round-9 fix (Codex round 9, finding 1): the
+                        // secondary now carries its own `expires_at`
+                        // alongside the frequency, so
+                        // `compute_narrow_filter_bins_default_dual_with_expiry`
+                        // re-evaluates freshness against `Utc::now()` on
+                        // EVERY read (this decode loop runs every slot
+                        // regardless of events) instead of trusting a value
+                        // latched once at the last `StateChanged`/
+                        // `TxOffsetApplied` write -- the bug being fixed is
+                        // exactly that a secondary whose grace lapsed with
+                        // no further event kept widening this filter
+                        // forever.
+                        #[allow(clippy::type_complexity)]
+                        let qso_freq_pair: Option<(
+                            f64,
+                            Option<(f64, chrono::DateTime<chrono::Utc>)>,
+                        )> = active_qso_freq_hz.read().ok().and_then(|g| *g);
+                        let partner_freq_for_main = qso_freq_pair.map(|(primary, _)| primary);
+                        let secondary_for_main = qso_freq_pair.and_then(|(_, secondary)| secondary);
                         let narrow_filter_bins =
-                            super::qso_filter::compute_narrow_filter_bins_default(
+                            super::qso_filter::compute_narrow_filter_bins_default_dual_with_expiry(
                                 partner_freq_for_main,
+                                secondary_for_main,
+                                chrono::Utc::now(),
                                 qso_filter_override_off,
                             );
                         let partner_freq_for_relaxed_sync =

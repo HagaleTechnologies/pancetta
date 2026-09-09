@@ -1377,6 +1377,15 @@ impl Sim {
                 // Security rejections are observability-only and cause no state
                 // change, so the simulated timeline is unaffected.
             }
+            QsoEvent::TxOffsetActionNeeded { .. } | QsoEvent::TxOffsetApplied { .. } => {
+                // PAN-72: the coordinator's Autonomous-task drain — not this
+                // sim harness — resolves the action and commits it via
+                // `QsoManager::apply_tx_offset_switch`. Neither the request
+                // nor the applied-offset announcement carries a QSO state
+                // change, so there is no timeline effect to record here. Any
+                // resulting offset move shows up through the ordinary
+                // state/metadata channels instead.
+            }
         }
     }
 

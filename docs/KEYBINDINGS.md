@@ -38,6 +38,7 @@ Press `?` inside the TUI for the same list as an overlay.
 | `t` | Find clear TX offset (auto-pick + pin) |
 | `f` | TX freq mode: HOLD (pin offset) / AUTO (pancetta picks) |
 | `o` | Set TX audio offset Hz (blank=Auto) — implies Hold |
+| `u` | Nudge TX offset now: active QSO or CQ (Auto mode only) |
 | `Shift+F` | Set dial / split freq (RX MHz + optional TX MHz) |
 | `Shift+T` | Tune (12 s tone; blocked while TX DISABLED) |
 | `h` | Halt current TX |

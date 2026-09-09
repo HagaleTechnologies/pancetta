@@ -124,6 +124,127 @@ pub fn compute_narrow_filter_bins_default(
     )
 }
 
+/// PAN-72 round-8 redesign (fix 2): dual-center variant of
+/// [`compute_narrow_filter_bins`]. Takes a PRIMARY center frequency (today's
+/// single hint) plus an optional SECONDARY center frequency — the offset a
+/// `CallingCq` QSO recently vacated, while a reply to the last frame
+/// transmitted there is still credible (see
+/// `pancetta_qso::qso_manager::pre_switch_offset_grace_from_slot_ns`).
+///
+/// Computes each present frequency's own `±half_window_hz` range via
+/// [`partner_freq_to_bin_range`] and returns their UNION (the smallest
+/// inclusive range covering both), not their intersection — a caller
+/// answering EITHER offset must decode. With only one frequency present
+/// (the other `None`), this is byte-identical to
+/// [`compute_narrow_filter_bins`] called with that single frequency — the
+/// existing single-frequency callers and tests are unaffected.
+pub fn compute_narrow_filter_bins_dual(
+    primary_freq_hz: Option<f64>,
+    secondary_freq_hz: Option<f64>,
+    half_window_hz: f64,
+    bin_spacing_hz: f64,
+    override_off: bool,
+) -> Option<RangeInclusive<usize>> {
+    if override_off {
+        return None;
+    }
+    let primary =
+        primary_freq_hz.and_then(|f| partner_freq_to_bin_range(f, bin_spacing_hz, half_window_hz));
+    let secondary = secondary_freq_hz
+        .and_then(|f| partner_freq_to_bin_range(f, bin_spacing_hz, half_window_hz));
+    match (primary, secondary) {
+        (Some(a), Some(b)) => {
+            let lo = *a.start().min(b.start());
+            let hi = *a.end().max(b.end());
+            Some(lo..=hi)
+        }
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+/// Convenience wrapper for [`compute_narrow_filter_bins_dual`] using
+/// pancetta-ft8's `TONE_SPACING` and the default 60 Hz half-window — the
+/// dual-center sibling of [`compute_narrow_filter_bins_default`].
+pub fn compute_narrow_filter_bins_default_dual(
+    primary_freq_hz: Option<f64>,
+    secondary_freq_hz: Option<f64>,
+    override_off: bool,
+) -> Option<RangeInclusive<usize>> {
+    compute_narrow_filter_bins_dual(
+        primary_freq_hz,
+        secondary_freq_hz,
+        DEFAULT_HALF_WINDOW_HZ,
+        TONE_SPACING,
+        override_off,
+    )
+}
+
+/// PAN-72 round-9 fix (Codex round 9, finding 1): expiry-aware sibling of
+/// [`compute_narrow_filter_bins_dual`].
+///
+/// The bug this closes: the secondary hint's grace expiry used to be
+/// evaluated ONLY at the moment it was written into shared state (a
+/// `StateChanged`/`TxOffsetApplied` event in `coordinator::qso`). If no
+/// further such event ever arrived, a secondary that had genuinely gone
+/// stale kept widening the decode filter indefinitely. The FT8 decode loop
+/// runs every slot regardless of events, so re-checking freshness at every
+/// READ (here) rather than trusting a value latched once at the last write
+/// closes the gap without any new polling mechanism.
+///
+/// `secondary` now carries its own `expires_at` alongside the frequency
+/// (see `coordinator::qso`'s `secondary_decoder_hint_freq_for`). `now` is
+/// taken as a plain parameter rather than read internally via
+/// `chrono::Utc::now()` so this stays a pure, deterministically testable
+/// function — the caller (the FT8 decode loop, which already has a `now`
+/// for this window) supplies it.
+///
+/// A `secondary` at or past its `expires_at` (`now >= expires_at`) is
+/// treated as absent — falls back to primary-only union behavior, matching
+/// [`compute_narrow_filter_bins_dual`] called with `secondary_freq_hz:
+/// None`. This performs no write-back to clear the stale stored value (no
+/// lock upgrade, no extra write contention); the next real event
+/// eventually overwrites it, and re-deriving "expired" at every read until
+/// then is sufficient and correct.
+pub fn compute_narrow_filter_bins_dual_with_expiry(
+    primary_freq_hz: Option<f64>,
+    secondary: Option<(f64, chrono::DateTime<chrono::Utc>)>,
+    now: chrono::DateTime<chrono::Utc>,
+    half_window_hz: f64,
+    bin_spacing_hz: f64,
+    override_off: bool,
+) -> Option<RangeInclusive<usize>> {
+    let secondary_freq_hz =
+        secondary.and_then(|(freq_hz, expires_at)| (now < expires_at).then_some(freq_hz));
+    compute_narrow_filter_bins_dual(
+        primary_freq_hz,
+        secondary_freq_hz,
+        half_window_hz,
+        bin_spacing_hz,
+        override_off,
+    )
+}
+
+/// Convenience wrapper for [`compute_narrow_filter_bins_dual_with_expiry`]
+/// using pancetta-ft8's `TONE_SPACING` and the default 60 Hz half-window —
+/// the expiry-aware sibling of [`compute_narrow_filter_bins_default_dual`].
+pub fn compute_narrow_filter_bins_default_dual_with_expiry(
+    primary_freq_hz: Option<f64>,
+    secondary: Option<(f64, chrono::DateTime<chrono::Utc>)>,
+    now: chrono::DateTime<chrono::Utc>,
+    override_off: bool,
+) -> Option<RangeInclusive<usize>> {
+    compute_narrow_filter_bins_dual_with_expiry(
+        primary_freq_hz,
+        secondary,
+        now,
+        DEFAULT_HALF_WINDOW_HZ,
+        TONE_SPACING,
+        override_off,
+    )
+}
+
 /// hb-230 — partner-aware observer for the decoder's relaxed-sync window.
 ///
 /// Returns `Some(partner_freq_hz)` when a QSO is active AND the operator
@@ -271,6 +392,212 @@ mod tests {
     fn observer_default_helper_respects_override() {
         let default = compute_narrow_filter_bins_default(Some(1500.0), true);
         assert!(default.is_none());
+    }
+
+    // ---------- compute_narrow_filter_bins_dual (PAN-72 fix 2) --------
+
+    #[test]
+    fn dual_with_only_primary_matches_single_frequency_behavior() {
+        let single = compute_narrow_filter_bins(Some(1500.0), 60.0, 6.25, false);
+        let dual = compute_narrow_filter_bins_dual(Some(1500.0), None, 60.0, 6.25, false);
+        assert_eq!(single, dual);
+    }
+
+    #[test]
+    fn dual_with_only_secondary_matches_single_frequency_behavior() {
+        let single = compute_narrow_filter_bins(Some(1500.0), 60.0, 6.25, false);
+        let dual = compute_narrow_filter_bins_dual(None, Some(1500.0), 60.0, 6.25, false);
+        assert_eq!(single, dual);
+    }
+
+    #[test]
+    fn dual_with_neither_frequency_is_none() {
+        let dual = compute_narrow_filter_bins_dual(None, None, 60.0, 6.25, false);
+        assert!(dual.is_none());
+    }
+
+    #[test]
+    fn dual_unions_two_adjacent_frequencies() {
+        // Primary 1500 Hz -> 230..=250; secondary 1500+400=1900 Hz ->
+        // center = round(1900/6.25) = 304, half_bins = 10 -> 294..=314.
+        // Union must span the low end of the primary through the high end
+        // of the secondary.
+        let dual =
+            compute_narrow_filter_bins_dual(Some(1500.0), Some(1900.0), 60.0, 6.25, false).unwrap();
+        assert_eq!(*dual.start(), 230);
+        assert_eq!(*dual.end(), 314);
+    }
+
+    #[test]
+    fn dual_unions_two_far_apart_frequencies_without_bridging_the_gap() {
+        // Two disjoint windows far apart: the union is still a single
+        // inclusive range spanning both (the caller narrows the decoder to
+        // one contiguous band, not two disjoint ones) but must not include
+        // anything closer than each side's own window.
+        let dual =
+            compute_narrow_filter_bins_dual(Some(500.0), Some(3000.0), 60.0, 6.25, false).unwrap();
+        let expected_low = partner_freq_to_bin_range(500.0, 6.25, 60.0).unwrap();
+        let expected_high = partner_freq_to_bin_range(3000.0, 6.25, 60.0).unwrap();
+        assert_eq!(*dual.start(), *expected_low.start());
+        assert_eq!(*dual.end(), *expected_high.end());
+    }
+
+    #[test]
+    fn dual_respects_override() {
+        let dual = compute_narrow_filter_bins_dual(Some(1500.0), Some(1900.0), 60.0, 6.25, true);
+        assert!(dual.is_none());
+    }
+
+    #[test]
+    fn default_dual_matches_explicit_dual_with_tone_spacing_and_default_window() {
+        let explicit =
+            compute_narrow_filter_bins_dual(Some(1500.0), Some(1900.0), 60.0, TONE_SPACING, false);
+        let default = compute_narrow_filter_bins_default_dual(Some(1500.0), Some(1900.0), false);
+        assert_eq!(explicit, default);
+    }
+
+    #[test]
+    fn default_dual_with_no_secondary_matches_default_single() {
+        let single = compute_narrow_filter_bins_default(Some(1500.0), false);
+        let dual = compute_narrow_filter_bins_default_dual(Some(1500.0), None, false);
+        assert_eq!(single, dual);
+    }
+
+    // ---- compute_narrow_filter_bins_dual_with_expiry (PAN-72 round 9, fix 2) ----
+    //
+    // Codex round 9 finding 1: the secondary decoder hint was only ever
+    // re-evaluated for expiry at WRITE time (a `StateChanged`/
+    // `TxOffsetApplied` event); if no further event arrived after the grace
+    // window genuinely lapsed, the stale secondary kept widening the decode
+    // filter forever. These prove the expiry is now re-checked at every
+    // READ, using the caller-supplied `now` (not `chrono::Utc::now()`
+    // internally) so the tests are deterministic.
+
+    fn t(offset_secs: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap()
+            + chrono::Duration::seconds(offset_secs)
+    }
+
+    #[test]
+    fn expiry_excludes_a_secondary_past_its_expires_at() {
+        let now = t(100);
+        let secondary = Some((1900.0, t(99))); // expired 1s ago
+        let result = compute_narrow_filter_bins_dual_with_expiry(
+            Some(1500.0),
+            secondary,
+            now,
+            60.0,
+            6.25,
+            false,
+        );
+        // Must fall back to primary-only union behavior.
+        let primary_only = compute_narrow_filter_bins(Some(1500.0), 60.0, 6.25, false);
+        assert_eq!(result, primary_only);
+    }
+
+    #[test]
+    fn expiry_includes_a_secondary_still_within_its_window() {
+        let now = t(100);
+        let secondary = Some((1900.0, t(101))); // expires 1s from now
+        let result = compute_narrow_filter_bins_dual_with_expiry(
+            Some(1500.0),
+            secondary,
+            now,
+            60.0,
+            6.25,
+            false,
+        );
+        let dual = compute_narrow_filter_bins_dual(Some(1500.0), Some(1900.0), 60.0, 6.25, false);
+        assert_eq!(result, dual);
+        // Sanity: this is a real union, not just the primary window.
+        assert_ne!(
+            result,
+            compute_narrow_filter_bins(Some(1500.0), 60.0, 6.25, false)
+        );
+    }
+
+    #[test]
+    fn expiry_at_exactly_now_is_treated_as_expired() {
+        // `now < expires_at` (strict) — a secondary whose expiry is exactly
+        // `now` no longer has any remaining window.
+        let now = t(100);
+        let secondary = Some((1900.0, t(100)));
+        let result = compute_narrow_filter_bins_dual_with_expiry(
+            Some(1500.0),
+            secondary,
+            now,
+            60.0,
+            6.25,
+            false,
+        );
+        let primary_only = compute_narrow_filter_bins(Some(1500.0), 60.0, 6.25, false);
+        assert_eq!(result, primary_only);
+    }
+
+    #[test]
+    fn expiry_with_no_secondary_matches_primary_only() {
+        let result = compute_narrow_filter_bins_dual_with_expiry(
+            Some(1500.0),
+            None,
+            t(100),
+            60.0,
+            6.25,
+            false,
+        );
+        let primary_only = compute_narrow_filter_bins(Some(1500.0), 60.0, 6.25, false);
+        assert_eq!(result, primary_only);
+    }
+
+    #[test]
+    fn expiry_still_unions_two_far_apart_frequencies_when_unexpired() {
+        let now = t(100);
+        let secondary = Some((3000.0, t(200)));
+        let result = compute_narrow_filter_bins_dual_with_expiry(
+            Some(500.0),
+            secondary,
+            now,
+            60.0,
+            6.25,
+            false,
+        );
+        let dual = compute_narrow_filter_bins_dual(Some(500.0), Some(3000.0), 60.0, 6.25, false);
+        assert_eq!(result, dual);
+    }
+
+    #[test]
+    fn expiry_respects_override() {
+        let now = t(100);
+        let secondary = Some((1900.0, t(200)));
+        let result = compute_narrow_filter_bins_dual_with_expiry(
+            Some(1500.0),
+            secondary,
+            now,
+            60.0,
+            6.25,
+            true,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn default_expiry_matches_explicit_expiry_with_tone_spacing_and_default_window() {
+        let now = t(100);
+        let secondary = Some((1900.0, t(200)));
+        let explicit = compute_narrow_filter_bins_dual_with_expiry(
+            Some(1500.0),
+            secondary,
+            now,
+            60.0,
+            TONE_SPACING,
+            false,
+        );
+        let default = compute_narrow_filter_bins_default_dual_with_expiry(
+            Some(1500.0),
+            secondary,
+            now,
+            false,
+        );
+        assert_eq!(explicit, default);
     }
 
     // ---------- partner_freq_for_relaxed_sync (hb-230) ----------------

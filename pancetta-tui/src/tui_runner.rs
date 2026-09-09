@@ -481,7 +481,8 @@ pub enum TuiCommand {
     /// Operator pressed `f`: toggle the TX-frequency mode Hold ↔ Auto. The
     /// coordinator flips the shared `tx_freq_mode` atomic. Hold (default) keeps
     /// the operator's picked offset sticky; Auto lets pancetta choose/adjust it
-    /// (smart allocator, collision jitter, stuck-DX hop).
+    /// (smart allocator, collision jitter, adaptive stall switch/revert, and
+    /// the `u` nudge).
     ToggleTxFreqMode,
     /// Operator used the `o` modal to set (or clear) the held TX audio offset.
     /// `Some(hz)` → store `hz` into `tx_offset_hold_hz` AND flip
@@ -523,6 +524,13 @@ pub enum TuiCommand {
     /// chip feedback; the coordinator echoes the authoritative state via the
     /// standard `StatusUpdate` path.
     ToggleFoxMode,
+    /// Operator pressed `u`: force an immediate TX-offset nudge (PAN-72) on
+    /// whatever is currently active — an in-progress QSO, or the CQ-hunting
+    /// offset if none — without leaving Auto TX-freq mode. No fields: unlike
+    /// `t`, the target isn't known client-side (the coordinator decides
+    /// based on `active_tx_qsos`), so there's no local optimistic state to
+    /// flip.
+    NudgeTxOffset,
 }
 
 /// TUI performance metrics
@@ -1959,6 +1967,12 @@ impl TuiRunner {
                         app.status_message = "No TX offset available".to_string();
                     }
                 }
+            }
+            KeyCode::Char('u') => {
+                // PAN-72: "un-stick" — force a nudge without leaving Auto.
+                // The coordinator resolves the target (active QSO vs.
+                // CQ-hunting) since App doesn't track that state locally.
+                self.message_tx.send(TuiCommand::NudgeTxOffset)?;
             }
 
             // === Autonomous controls ===
@@ -3479,6 +3493,19 @@ mod key_tests {
         assert!(
             matches!(cmd_rx.try_recv(), Ok(TuiCommand::ToggleAutonomous)),
             "a must emit ToggleAutonomous after an emergency stop"
+        );
+    }
+
+    /// `u` must emit NudgeTxOffset with no local optimistic state — unlike
+    /// `t`, the target (active QSO vs. CQ-hunting offset) isn't known
+    /// client-side, so there's nothing for App to flip locally (PAN-72).
+    #[tokio::test]
+    async fn u_key_sends_nudge_tx_offset() {
+        let (mut r, cmd_rx, _app) = make_runner().await;
+        r.handle_key_event(key('u')).await.unwrap();
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(TuiCommand::NudgeTxOffset)),
+            "u key must emit NudgeTxOffset"
         );
     }
 

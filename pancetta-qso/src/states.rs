@@ -383,6 +383,38 @@ pub enum MessageDirection {
     Received,
 }
 
+/// The TX offset a QSO most recently moved away from, and what moved it.
+///
+/// PAN-72. See [`QsoMetadata::pre_switch_offset`], which owns the narrative;
+/// this type exists so the *provenance* of the relocation travels with the
+/// vacated offset rather than being re-derived (or guessed) at crediting time.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PreSwitchOffset {
+    /// The offset we left, in Hz.
+    pub offset_hz: f64,
+    /// When we left it.
+    pub left_at: DateTime<Utc>,
+    /// `true` when the operator's `u` nudge forced the move, `false` when the
+    /// silence-driven stall detector did.
+    ///
+    /// PAN-72 (Codex round 6 on PR #350, finding 2). This is the ONLY thing
+    /// that can separate the two cases on a pre-existing split, where the DX
+    /// transmits at `partner_freq` no matter where we key and its reply
+    /// frequency therefore cannot discriminate our vacated offset from our new
+    /// one. The two provenances warrant opposite conclusions there:
+    ///
+    /// - a STALL-triggered switch only happens BECAUSE the old offset
+    ///   demonstrably stopped working, and the frame that triggered it went out
+    ///   on that old offset one slot before the commit — so the vacated offset
+    ///   is the one with a proven history and gets the credit;
+    /// - an OPERATOR-forced nudge indicts nothing. The operator chose to move;
+    ///   our very next frame goes out on the NEW offset, and an advancing reply
+    ///   after it is better evidence for that new offset than for the one we
+    ///   left of our own accord.
+    #[serde(default)]
+    pub operator_forced: bool,
+}
+
 /// QSO metadata and additional information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QsoMetadata {
@@ -510,23 +542,64 @@ pub struct QsoMetadata {
     #[serde(default)]
     pub progressed_this_cycle: bool,
 
-    /// The last DX frame text received on this QSO (uppercased, trimmed).
-    /// Paired with [`Self::dx_repeat_count`] to detect a DX that keeps sending
-    /// the *same* message because it isn't copying our replies — the cue to
-    /// move our TX frequency off a possible collision (the only on-air reason
-    /// a held TX frequency would stop "working" mid-QSO; FT8 receivers decode
-    /// the whole passband, so our offset only matters when something is
-    /// stepping on it). `None` until the first DX frame.
+    /// Consecutive silent per-slot rearm cycles since this QSO last made
+    /// forward progress (a genuinely new/advancing DX message). Incremented
+    /// solely by `QsoManager::rearm_manual_calls_at` — each real per-slot
+    /// re-send (the DX did not respond that slot) counts once; incoming
+    /// frame content is no longer inspected for this (the old
+    /// identical/differing-frame counting in `process_message` was replaced
+    /// by PAN-72). Reset to 0 in exactly two places — `process_message_for_qso`
+    /// on any forward state advance, and `QsoManager::apply_tx_offset_switch`
+    /// when a relocation actually COMMITS. See
+    /// [`Self::last_known_good_offset_hz`] for what happens once this trips a
+    /// switch (PAN-72).
+    ///
+    /// Raising `QsoEvent::TxOffsetActionNeeded` deliberately does NOT reset it
+    /// (Codex round 7 on PR #350, finding 2). The coordinator drains that
+    /// mailbox once per slot and the commit can still be refused — notably
+    /// `OffsetActionNoOp` when a crowded band left the allocator no valid
+    /// candidate — so clearing at emission time destroyed the evidence before
+    /// anything acted on it and delayed the next attempt by another full
+    /// `qso_stall_switch_after` window. The streak instead stays at/above the
+    /// threshold and re-raises once per slot until a commit succeeds.
+    ///
+    /// A rearm cycle whose re-send cannot reach the air does NOT count, and
+    /// two independent gates can swallow it: `TxPolicy::Disabled`, the
+    /// coordinator's hard TX mute (Codex round 2, finding 5), and — for a
+    /// [`Self::remote_origin`] QSO only — the station-agent armed-TX gate the
+    /// TX worker applies to every `TxOrigin::Remote` frame (Codex round 7,
+    /// finding 3). Silence we caused ourselves is not evidence about the DX.
+    /// Whatever was already accumulated from real transmissions is kept, not
+    /// reset.
     #[serde(default)]
-    pub last_rx_text: Option<String>,
+    pub stall_cycles: u32,
 
-    /// Consecutive count of identical DX frames that did NOT advance the QSO.
-    /// Reset to 0 on any forward state advance, and to 1 when a *different*
-    /// non-advancing frame arrives. When it reaches the stuck-repeat threshold
-    /// the QSO performs a one-time TX-frequency hop (then resets to 0). See
-    /// [`Self::last_rx_text`].
+    /// The TX audio offset this QSO was on the last time it made forward
+    /// progress (a genuinely new/advancing DX message). `None` until the
+    /// first advance. Used to decide, when [`Self::stall_cycles`] trips a
+    /// switch: if we're currently ON this offset (or it's `None`), search for
+    /// a new one; if we're currently on some OTHER (previously-switched)
+    /// offset, revert to this one instead of searching again (PAN-72).
     #[serde(default)]
-    pub dx_repeat_count: u32,
+    pub last_known_good_offset_hz: Option<f64>,
+
+    /// PAN-72 (Codex round 1 on PR #350, finding 8): monotonic count of
+    /// forward advances this QSO has made. Incremented at the same single
+    /// site that resets [`Self::stall_cycles`] and records
+    /// [`Self::last_known_good_offset_hz`], so all three always move together.
+    ///
+    /// This is the staleness token for a queued TX-offset action. A
+    /// `QsoEvent::TxOffsetActionNeeded` is drained by the coordinator's
+    /// autonomous task only once per 15-second slot, so the DX can send an
+    /// advancing frame in between — which resets the stall counter and marks
+    /// the CURRENT offset known-good, while the already-queued request would
+    /// still move us off the offset that just demonstrably worked. The
+    /// request carries the generation it was raised at;
+    /// `QsoManager::apply_tx_offset_switch` discards it if this counter has
+    /// moved since. An operator-forced nudge (`u`) carries no generation and
+    /// is therefore never treated as stale.
+    #[serde(default)]
+    pub advance_generation: u32,
 
     /// Hound (DXpedition chaser) mode: this QSO calls a Fox low and QSYs up on
     /// the Fox's report. `false` for every normal QSO. This flag, rather than
@@ -563,6 +636,55 @@ pub struct QsoMetadata {
     /// satisfy the "two strikes" requirement.
     #[serde(default)]
     pub pending_freq_drift: Option<(f64, DateTime<Utc>)>,
+
+    /// The TX offset this QSO most recently moved AWAY from, together with the
+    /// instant it left — `None` normally, set by
+    /// `QsoManager::apply_tx_offset_switch` on every committed relocation and
+    /// cleared on the next forward advance (or once the grace below lapses).
+    ///
+    /// PAN-72 (Codex round 4 on PR #350, finding 3). A relocation is decided
+    /// and committed AFTER the frame that triggered it has already been emitted
+    /// on the old offset: `QsoManager::rearm_manual_calls_at` re-sends at
+    /// `metadata.frequency` and trips the stall threshold in the same pass, and
+    /// the coordinator's once-per-slot drain only commits the switch afterwards.
+    /// Whoever answers that transmission answers the offset we have just left,
+    /// and their reply lands after the move. Without this field:
+    ///
+    /// - an unanswered manual CQ rejects the answer outright — `CallingCq` now
+    ///   carries the new offset, [`Self::partner_freq`] is deliberately `None`
+    ///   pre-establishment (there is no DX at the abandoned offset to aim the
+    ///   RX gates at), and the pre-establishment gate is only 15 Hz wide — and
+    ///   `maybe_answer_caller` then spawns a duplicate QSO in its place;
+    /// - an established QSO's reply routes (the switch latches `partner_freq`)
+    ///   but credits [`Self::last_known_good_offset_hz`] to an offset that has
+    ///   never been transmitted on, poisoning the Revert target.
+    ///
+    /// So the vacated offset stays a valid RX baseline, and stays a CANDIDATE
+    /// for the offset an advance is credited to, for `PRE_SWITCH_OFFSET_GRACE`
+    /// — two FT8 slots, long enough for the reply to the last pre-switch frame
+    /// to be decoded and processed.
+    ///
+    /// Round 5, finding 2: a candidate, not a foregone conclusion. The grace
+    /// bounds how long the vacated offset is worth considering; it does not
+    /// establish that a reply inside it was answering the pre-switch frame.
+    /// That reasoning is specific to a STALL-triggered switch, whose trigger is
+    /// the old-offset resend itself. An operator-forced `u` nudge has no such
+    /// coupling — the next rearm transmits on the NEW offset and can be
+    /// answered well inside the same window — so the crediting site picks
+    /// between the two baselines by the frequency the reply actually decoded
+    /// at, and only falls back to the vacated offset when the frame matches it.
+    /// Crediting it blindly would record an offset that had just failed as
+    /// known-good and aim a later `Revert` straight back at it.
+    ///
+    /// Round 6, finding 2: the decode-frequency comparison round 5 added is
+    /// evidence only on a Tx=Rx QSO. On a PRE-EXISTING split (Hound, an `o`
+    /// hold, a de-conflict nudge, a passband clamp) the DX's frequency does not
+    /// move when OUR TX offset moves, so it can never say which of our two
+    /// offsets was answered — which is exactly why
+    /// [`PreSwitchOffset::operator_forced`] is carried alongside the offset. See
+    /// its doc comment.
+    #[serde(default)]
+    pub pre_switch_offset: Option<PreSwitchOffset>,
 
     /// Hound: whether we have already QSY'd up to the response region after the
     /// Fox answered us (so the QSY fires exactly once).
@@ -712,6 +834,40 @@ impl QsoState {
             QsoState::Contest(ContestState::ExchangingInfo { frequency, .. }) => Some(*frequency),
             QsoState::Contest(ContestState::ContestCompleted { frequency, .. }) => Some(*frequency),
             _ => None,
+        }
+    }
+
+    /// Overwrite the frequency embedded in an **active** state, returning
+    /// `true` when a field was actually written.
+    ///
+    /// The mutable sibling of [`QsoState::frequency`], for the same reason
+    /// the Hound QSY block in `qso_manager.rs` hand-writes
+    /// `SendingReport.frequency` after a QSY: several later transitions
+    /// (notably `Completed`, built from the preceding state's `frequency`)
+    /// inherit this field, so a TX-offset move that updates only
+    /// `QsoMetadata::frequency` would log the pre-move offset.
+    ///
+    /// Terminal states (`Completed`, `ContestCompleted`, `Failed`) are
+    /// deliberately **not** writable here even though `frequency()` reads
+    /// `Completed`: their frequency is the historical record of where the
+    /// QSO actually happened, and a late offset action arriving after
+    /// completion must never rewrite it. `Idle` carries no frequency.
+    pub fn set_frequency(&mut self, hz: f64) -> bool {
+        match self {
+            QsoState::CallingCq { frequency, .. }
+            | QsoState::RespondingToCq { frequency, .. }
+            | QsoState::WaitingForReport { frequency, .. }
+            | QsoState::SendingReport { frequency, .. }
+            | QsoState::WaitingForConfirmation { frequency, .. }
+            | QsoState::SendingConfirmation { frequency, .. } => {
+                *frequency = hz;
+                true
+            }
+            QsoState::Contest(ContestState::ExchangingInfo { frequency, .. }) => {
+                *frequency = hz;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -951,6 +1107,44 @@ impl MessageType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PAN-72 final review (finding 4): `set_frequency` is the mutable
+    /// sibling of `frequency()` for ACTIVE states only. Terminal states hold
+    /// the historical record of where the QSO actually happened and must not
+    /// be rewritten by a late TX-offset action.
+    #[test]
+    fn set_frequency_writes_active_states_and_refuses_terminal_ones() {
+        let mut calling = QsoState::CallingCq {
+            frequency: 1000.0,
+            started_at: chrono::Utc::now(),
+            call_count: 1,
+        };
+        assert!(calling.set_frequency(1750.0));
+        assert_eq!(calling.frequency(), Some(1750.0));
+
+        // `Completed` is readable through `frequency()` but deliberately not
+        // writable -- rewriting it would falsify the logged QSO.
+        let mut completed = QsoState::Completed {
+            their_callsign: "K1DEF".to_string(),
+            frequency: 1000.0,
+            completed_at: chrono::Utc::now(),
+            our_report: -10,
+            their_report: -12,
+            grid_square: None,
+            duration_seconds: 60,
+        };
+        assert!(!completed.set_frequency(1750.0));
+        assert_eq!(
+            completed.frequency(),
+            Some(1000.0),
+            "a completed QSO's logged frequency must be immutable here"
+        );
+
+        // `Idle` carries no frequency at all.
+        let mut idle = QsoState::Idle;
+        assert!(!idle.set_frequency(1750.0));
+        assert_eq!(idle.frequency(), None);
+    }
 
     #[test]
     fn rejection_reason_classify_maps_each_verification_outcome() {

@@ -844,6 +844,28 @@ impl super::ApplicationCoordinator {
         // `active_protocol_mode`/`active_slot_ns`/`active_decode_phase_ns` go
         // through their `pub(crate) fn` accessors.
         let cmd_active_tx_qsos = self.active_tx_qsos.clone();
+        // PAN-72: `u` "nudge" keystroke. `cmd_active_tx_offsets` supplies the
+        // current offset (the `avoid_hz` to switch away from) for the
+        // active-QSO branch; the other two feed the SAME mailbox/flag
+        // Task 8/9 built (`pending_qso_offset_requests` is drained by the
+        // Autonomous task via `apply_tx_offset_switch`, same as a stall-
+        // detected switch; `pending_cq_offset_nudge` is drained into
+        // `AutonomousOperator::request_manual_switch` for the CQ-hunting
+        // fallback when no QSO is active) — this relay never MUTATES
+        // `QsoManager` itself, matching the established AbortQso/ResendQso
+        // pattern of forwarding rather than mutating QsoManager directly from
+        // this task.
+        //
+        // Round 2 finding 4 does add a READ-ONLY handle (via the same
+        // restart-safe watch channel the Autonomous task's drain re-borrows
+        // every tick) purely to ask which QSOs are genuinely non-terminal:
+        // `active_tx_qsos` alone cannot answer that, since it retains a
+        // completed QSO for its 45s trailing-73 grace window. Commits still
+        // happen only in the Autonomous drain.
+        let cmd_active_tx_offsets = self.active_tx_offsets.clone();
+        let cmd_qso_manager_watch = self.qso_manager_watch.subscribe();
+        let cmd_pending_qso_offset_requests = self.pending_qso_offset_requests.clone();
+        let cmd_pending_cq_offset_nudge = self.pending_cq_offset_nudge.clone();
         let cmd_ft8_config = self.ft8_config.clone();
         let cmd_active_protocol_mode = self.active_protocol_mode();
         let cmd_active_slot_ns = self.active_slot_ns();
@@ -1767,7 +1789,8 @@ impl super::ApplicationCoordinator {
                             // Hold ↔ Auto. Hold (default) keeps the operator's
                             // picked offset sticky; Auto lets pancetta choose and
                             // adjust it (smart allocator + collision jitter +
-                            // stuck-DX hop). Update the shared atomic; the TUI
+                            // adaptive stall switch/revert + the `u` nudge).
+                            // Update the shared atomic; the TUI
                             // chip is driven optimistically on the key side.
                             let prev = pancetta_core::TxFreqMode::from_u8(
                                 cmd_tx_freq_mode.load(Ordering::Acquire),
@@ -1846,6 +1869,169 @@ impl super::ApplicationCoordinator {
                                         pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                             component: "TX".to_string(),
                                             status: "TX offset auto (Tx=Rx)".to_string(),
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::NudgeTxOffset => {
+                            // PAN-72: prefer an active QSO (force a Switch,
+                            // bypassing stall_cycles -- operator-forced);
+                            // fall back to the CQ-hunting one-shot flag if
+                            // none is active. Does not touch
+                            // tx_freq_mode/tx_offset_hold_hz -- this must
+                            // not leave Auto mode. Actual decision logic
+                            // lives in `resolve_nudge_tx_offset` (directly
+                            // unit-tested); this arm just snapshots
+                            // `active_tx_qsos` and echoes a status line.
+                            let active: std::collections::HashSet<String> = cmd_active_tx_qsos
+                                .read()
+                                .map(|s| s.clone())
+                                .unwrap_or_default();
+                            // Round 2 finding 4: `active` still contains a
+                            // completed QSO for its 45s trailing-73 grace
+                            // window, so it cannot be trusted to answer
+                            // "is there a QSO to nudge?". Ask the QSO
+                            // engine itself. Clone the handle out of the
+                            // watch `Ref` and drop it BEFORE the `.await`
+                            // (same reason as the autonomous drain's own
+                            // borrow), and re-borrow fresh each press so a
+                            // Qso-component restart is picked up. `None`
+                            // (component not up) preserves the pre-filter
+                            // behavior -- see `resolve_nudge_tx_offset`.
+                            // PAN-72 round-8 redesign (fix 3): derive
+                            // `auto_calling_cq_ids` from the SAME
+                            // `get_active_qsos()` result as `live_qso_ids` —
+                            // no extra `QsoManager` call needed. These are
+                            // the QSOs an ordinary `u` nudge must NOT route
+                            // through `pending_qso_offset_requests`: an
+                            // autonomous self-CQ's `CallingCq` retransmit is
+                            // deliberately dormant for `CallInitiation::Auto`
+                            // (`rearm_manual_calls_at` only re-keys Manual),
+                            // so that path would silently update metadata
+                            // with no frame ever re-sent. See
+                            // `resolve_nudge_tx_offset`'s doc comment.
+                            // PAN-72 round-9 fix (Codex round 9, finding 2):
+                            // `rearm_eligible_ids` derived from the SAME
+                            // `get_active_qsos()` result as the two sets
+                            // above -- the live QSOs whose CURRENT state
+                            // `QsoManager::rearm_manual_calls_at` will
+                            // actually retransmit a frame for. See
+                            // `qso_state_is_rearm_eligible` and
+                            // `resolve_nudge_tx_offset`'s doc comment.
+                            let (live_qso_ids, auto_calling_cq_ids, rearm_eligible_ids) = {
+                                let manager = cmd_qso_manager_watch.borrow().clone();
+                                match manager {
+                                    Some(m) => {
+                                        let active_qsos = m.get_active_qsos().await;
+                                        let live: std::collections::HashSet<_> =
+                                            active_qsos.iter().map(|(id, _)| *id).collect();
+                                        let auto_calling_cq: std::collections::HashSet<_> =
+                                            active_qsos
+                                                .iter()
+                                                .filter(|(_, progress)| {
+                                                    progress.metadata.initiated_by
+                                                        == pancetta_qso::states::CallInitiation::Auto
+                                                        && matches!(
+                                                            progress.state,
+                                                            pancetta_qso::states::QsoState::CallingCq { .. }
+                                                        )
+                                                })
+                                                .map(|(id, _)| *id)
+                                                .collect();
+                                        let rearm_eligible: std::collections::HashSet<_> =
+                                            active_qsos
+                                                .iter()
+                                                .filter(|(_, progress)| {
+                                                    qso_state_is_rearm_eligible(progress)
+                                                })
+                                                .map(|(id, _)| *id)
+                                                .collect();
+                                        (Some(live), Some(auto_calling_cq), Some(rearm_eligible))
+                                    }
+                                    None => (None, None, None),
+                                }
+                            };
+                            let switched = resolve_nudge_tx_offset(
+                                &cmd_tx_freq_mode,
+                                &active,
+                                live_qso_ids.as_ref(),
+                                auto_calling_cq_ids.as_ref(),
+                                rearm_eligible_ids.as_ref(),
+                                &cmd_active_tx_offsets,
+                                &cmd_pending_qso_offset_requests,
+                                &cmd_pending_cq_offset_nudge,
+                            );
+                            match switched {
+                                NudgeOutcome::ActiveQso(qso_id) => {
+                                    info!(
+                                        target: "tx.freq",
+                                        "TUI NudgeTxOffset: forcing offset switch for active QSO {}",
+                                        qso_id
+                                    );
+                                    let _ = cmd_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                            component: "TX".to_string(),
+                                            status: "Nudging active QSO to a new offset"
+                                                .to_string(),
+                                        },
+                                    );
+                                }
+                                NudgeOutcome::CqNudgeArmed => {
+                                    info!(
+                                        target: "tx.freq",
+                                        "TUI NudgeTxOffset: no active QSO — armed a CQ-offset nudge \
+                                         (takes effect only if the next autonomous cycle is CQ-hunting)"
+                                    );
+                                    let _ = cmd_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                            component: "TX".to_string(),
+                                            status:
+                                                "CQ-offset nudge armed — takes effect only if the \
+                                                      next autonomous cycle is CQ-hunting"
+                                                    .to_string(),
+                                        },
+                                    );
+                                }
+                                NudgeOutcome::HeldNoOp => {
+                                    // Hold mode, with or without an active QSO:
+                                    // for a QSO the downstream allocator would
+                                    // ignore `avoid_hz` and hand back the parked
+                                    // offset (a no-op at best, an unwanted move
+                                    // onto the park offset at worst); for the CQ
+                                    // fallback `decide_at`'s `tx_freq_auto()`
+                                    // gate consumes and discards the flag. Say so
+                                    // instead of claiming a nudge happened.
+                                    info!(
+                                        target: "tx.freq",
+                                        "TUI NudgeTxOffset ignored: TX-frequency mode is Hold"
+                                    );
+                                    let _ = cmd_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                            component: "TX".to_string(),
+                                            status: "TX offset is Hold — press `f` for Auto to \
+                                                     enable nudging"
+                                                .to_string(),
+                                        },
+                                    );
+                                }
+                                NudgeOutcome::NoEligibleTarget => {
+                                    // PAN-72 round-9 fix (Codex round 9,
+                                    // finding 2): a live QSO exists but its
+                                    // current state cannot retransmit a
+                                    // frame -- say so instead of claiming a
+                                    // nudge happened.
+                                    info!(
+                                        target: "tx.freq",
+                                        "TUI NudgeTxOffset ignored: the active QSO's current \
+                                         state cannot retransmit a frame"
+                                    );
+                                    let _ = cmd_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                            component: "TX".to_string(),
+                                            status: "Nudge ignored — the active QSO's current \
+                                                     state can't retransmit a frame"
+                                                .to_string(),
                                         },
                                     );
                                 }
@@ -2774,6 +2960,290 @@ fn map_recent_qso_outcome(
     }
 }
 
+/// PAN-72: resolves and applies one `TuiCommand::NudgeTxOffset` dispatch.
+/// Prefers forcing a `Switch` for whatever QSO is in `active` (feeding the
+/// SAME `pending_qso_offset_requests` mailbox Task 8/9 built — this is NOT
+/// a new commit path, and this relay task never holds a `QsoManager` handle
+/// of its own; the Autonomous task's already-restart-safe `qso_manager_watch`
+/// is what eventually calls `apply_tx_offset_switch`, same as a stall-
+/// detected switch). Falls back to setting `pending_cq_offset_nudge` — a
+/// one-shot flag the Autonomous task forwards into
+/// `AutonomousOperator::request_manual_switch` — when no QSO is active.
+///
+/// Extracted to a plain, synchronously-testable function (mirroring
+/// `tx_qso_is_live`/`should_repark`'s extraction out of the giant spawned
+/// relay/tick-loop task) rather than only being exercised end-to-end through
+/// a live `start_tui_pipeline` task — no such harness exists in this test
+/// module for any existing `TuiCommand` arm (`SetTxOffset`/`ToggleAutonomous`
+/// included), so this keeps the new match arm's actual decision logic
+/// directly unit-testable.
+///
+/// `active_tx_qsos` keys are built via `active_tx_qso_key(&qso_id.to_string())`
+/// (`coordinator/mod.rs`) -- `qso_id.to_string()` on a `QsoId` (`= Uuid`)
+/// followed by `.trim().to_uppercase()`. `Uuid`'s `FromStr`/`parse_str` are
+/// case-insensitive, so `key.parse::<pancetta_qso::QsoId>()` round-trips
+/// this correctly with no separate inverse helper needed -- confirmed by
+/// reading `active_tx_qso_key`'s real definition and its one call site
+/// (`coordinator/qso.rs`), not assumed.
+///
+/// Auto-gating (PAN-72 final review, finding 2): the active-QSO branch is
+/// gated on `TxFreqMode::allows_auto_change()`, exactly like the CQ-hunting
+/// branch it falls back to (`AutonomousOperator`'s `should_switch =
+/// self.tx_freq_auto() && (streak_hit || manual_switch_requested)`). Without
+/// the gate, a Hold-mode nudge queues a `Switch` whose eventual
+/// `allocate_smart_frequency` call takes the Hold early-return — which
+/// ignores `avoid_hz` entirely and yields the *parked* offset
+/// (`tx_offset_hold_hz`, else `config.tx_offset_hz`). That either does
+/// nothing visible or drags an intentionally-held QSO onto the park offset,
+/// while the status line claims a real nudge happened; both violate Hold's
+/// stickiness invariant.
+///
+/// In Hold with an active QSO the CQ fallback is deliberately NOT armed
+/// either: there *is* an active QSO, so the CQ-hunting path is simply the
+/// wrong target, and arming it would be a second silent false-success.
+///
+/// Hold gating covers the CQ fallback too (Codex round 1 on PR #350, finding
+/// 4): the mode check is hoisted ABOVE the active-QSO branch so a Hold-mode
+/// `u` with no active QSO also reports [`NudgeOutcome::HeldNoOp`] instead of
+/// claiming a CQ nudge. `decide_at` computes `should_switch =
+/// self.tx_freq_auto() && (...)`, so a flag armed in Hold is consumed and
+/// discarded with nothing to show for it — a guaranteed silent no-op that the
+/// status line used to report as a successful nudge.
+///
+/// The *second* half of that finding — "in Auto but not currently CQ-hunting,
+/// `decide_at` also consumes and discards the request" — is NOT gated here,
+/// deliberately. Nothing in the coordinator or this relay task has any view of
+/// `AutonomousOperator::state`: it is a private field of an operator owned
+/// exclusively by the autonomous task, and unlike `active_tx_qsos` /
+/// `active_tx_offsets` / `tx_freq_mode` there is no shared snapshot or atomic
+/// carrying it. Adding one would be new cross-task state-visibility plumbing
+/// for a check that still could not be authoritative: `decide_at` only enters
+/// its CQ branch after re-evaluating `idle_cycles >=
+/// cq_after_idle_cycles` for THAT cycle, so any state this relay could read at
+/// keypress time is a prediction, not a guarantee. Worse, `decide_at`
+/// unconditionally `mem::take`s `manual_switch_requested` at the very top of
+/// every call, so the flag survives exactly one `decide_at` invocation and
+/// only actually fires if THAT SPECIFIC call reaches the CQ-hunting branch —
+/// if it lands on `NotOurSlot`/`Listen`/paused/anything else instead, the
+/// request is silently discarded, not deferred to a later cycle. Instead the
+/// returned outcome — and the operator-facing status line — is worded as an
+/// *armed request that takes effect only if the very next autonomous cycle
+/// happens to be CQ-hunting*, which is exactly what it is. (Finding 9's fix
+/// additionally stops such a request being lost when that cycle arrives with
+/// thin decode history.)
+///
+/// Terminal-QSO filtering (Codex round 2 on PR #350, finding 4): `active` is
+/// the coordinator's `active_tx_qsos` snapshot, which deliberately RETAINS a
+/// completed QSO for 45 seconds so its trailing 73 can still transmit. Picking
+/// out of it blind means the `u` key can name a QSO that is already terminal —
+/// either the only entry, or one chosen ahead of a genuinely live concurrent
+/// QSO — and the operator is told "Nudging active QSO" while the drain's
+/// `apply_tx_offset_switch` later refuses it with `QsoNotActive` and nothing
+/// moves. `live_qso_ids` is the authoritative set (from
+/// `QsoManager::get_active_qsos`, i.e. `QsoState::is_active`) that the caller
+/// reads at keypress time; only keys present in it are eligible, so a
+/// grace-window-only snapshot correctly falls through to the CQ fallback.
+///
+/// `None` means the caller could not consult a `QsoManager` at all (the Qso
+/// component is not up), which is exactly the situation where nothing could
+/// commit anyway — it preserves the pre-filter behavior rather than inventing
+/// a different one for a state the operator cannot act in.
+///
+/// This is deliberately a SELECTION-time filter, complementing (not replacing)
+/// the drain's commit-time refusal: the commit-time check is what keeps the
+/// engine correct, this one is what keeps the status line honest.
+///
+/// PAN-72 round-8 redesign (fix 3, Codex round 8 finding 3), SUPERSEDED by
+/// round 10's Fix A below: an autonomous self-CQ (`CallInitiation::Auto`,
+/// `QsoState::CallingCq`) is live and present in `active`/`live_qso_ids`, so
+/// without `auto_calling_cq_ids` it would be picked as an ordinary
+/// active-QSO target and routed through `pending_qso_offset_requests` (the
+/// `operator_forced` `Switch` path). But `QsoManager::rearm_manual_calls_at`
+/// only retransmits `CallingCq` for `CallInitiation::Manual` — Auto stays
+/// deliberately dormant there (a separate, intentional design decision this
+/// fix does NOT touch) — so that request used to silently update metadata
+/// with no frame ever re-sent, while `AutonomousOperator::current_cq_offset_
+/// hz` stayed on the old offset and got reused by the next autonomous CQ
+/// attempt: the `u` key did nothing visible for this state, while the status
+/// line and drain both reported success.
+///
+/// Round 8's fix routed AROUND that gate by falling through to
+/// `pending_cq_offset_nudge` instead — the same one-shot flag the "no active
+/// QSO" fallback below sets. Round 10's Fix A (Codex round 10, thread on
+/// `autonomous.rs:1829`) found that mechanism structurally could never fire
+/// for the exact case it existed for: `AutonomousOperator::decide_at` only
+/// consumes `manual_switch_requested` from its CQ-hunting branch, gated on
+/// `active_qso_count == 0` — and the `CallingCq` being nudged IS that one
+/// active QSO, so the count is never 0 while it's open. The flag was
+/// silently discarded by `decide_at`'s unconditional `mem::take` every time.
+///
+/// Fix A routes an auto-CQ target through `pending_qso_offset_requests`
+/// instead — the SAME path an ordinary target uses — relying on
+/// `QsoManager::apply_tx_offset_switch` (round 10) to supply the missing
+/// piece: when it commits an `OperatorForced` switch for a `CallingCq` QSO,
+/// it now ALSO emits a one-shot CQ retransmission at the new offset,
+/// independent of (and without touching) `rearm_manual_calls_at`'s own
+/// Manual-only periodic cadence. This is a narrow, project-owner-approved
+/// exception for a deliberate, one-shot, operator-supervised action — NOT a
+/// loosening of the protected `is_manual` gate, which stays exactly as it
+/// was for unsupervised, cadence-driven keep-calling.
+///
+/// PAN-72 round-9 fix (Codex round 9, finding 2): does `progress`'s CURRENT
+/// state belong to the exact set `QsoManager::rearm_manual_calls_at`
+/// actually retransmits a frame for? Mirrors that function's `match
+/// &progress.state` block (`pancetta-qso/src/qso_manager.rs`) — including
+/// its Manual/Auto conditioning for `CallingCq`/`WaitingForReport` — rather
+/// than re-deriving the list independently, so the two can never drift
+/// apart silently.
+///
+/// `RespondingToCq` and `SendingReport` are eligible for EITHER initiation
+/// (`rearm_manual_calls_at` re-sends an autonomous pounce's call/report
+/// too, per SM-F6); `CallingCq` and `WaitingForReport` are Manual-only in
+/// THIS predicate — `rearm_manual_calls_at`'s own periodic cadence still
+/// never re-sends an Auto `CallingCq`/`WaitingForReport`, unchanged. An Auto
+/// `CallingCq` is still selectable as a nudge target, just through the
+/// separate `auto_calling_cq_ids` set (Fix A, above), not through this
+/// predicate. Every other state (`WaitingForConfirmation`,
+/// `SendingConfirmation`, a contest-exchange state, `Idle`, terminal states,
+/// etc.) falls to `rearm_manual_calls_at`'s own `_ => continue` and is
+/// therefore NOT eligible here either.
+fn qso_state_is_rearm_eligible(progress: &pancetta_qso::QsoProgress) -> bool {
+    let is_manual = progress.metadata.initiated_by == pancetta_qso::states::CallInitiation::Manual;
+    match &progress.state {
+        pancetta_qso::states::QsoState::CallingCq { .. } => is_manual,
+        pancetta_qso::states::QsoState::WaitingForReport { .. } => is_manual,
+        pancetta_qso::states::QsoState::RespondingToCq { .. } => true,
+        pancetta_qso::states::QsoState::SendingReport { .. } => true,
+        _ => false,
+    }
+}
+
+/// Returns [`NudgeOutcome`] for the caller's status echo/logging.
+#[allow(clippy::too_many_arguments)]
+fn resolve_nudge_tx_offset(
+    tx_freq_mode: &std::sync::atomic::AtomicU8,
+    active: &std::collections::HashSet<String>,
+    live_qso_ids: Option<&std::collections::HashSet<pancetta_qso::QsoId>>,
+    auto_calling_cq_ids: Option<&std::collections::HashSet<pancetta_qso::QsoId>>,
+    rearm_eligible_ids: Option<&std::collections::HashSet<pancetta_qso::QsoId>>,
+    active_tx_offsets: &std::sync::RwLock<std::collections::HashMap<String, f64>>,
+    pending_qso_offset_requests: &std::sync::Mutex<
+        Vec<pancetta_qso::qso_manager::OffsetActionRequest>,
+    >,
+    pending_cq_offset_nudge: &std::sync::atomic::AtomicBool,
+) -> NudgeOutcome {
+    if !pancetta_core::TxFreqMode::from_u8(tx_freq_mode.load(Ordering::Acquire))
+        .allows_auto_change()
+    {
+        return NudgeOutcome::HeldNoOp;
+    }
+    // PAN-72 Fix D (Codex round 10, thread on `tui_relay.rs:3134`): fold
+    // eligibility (round-9's rearm-eligible check, and round-8's auto-CQ
+    // check) into the SAME predicate the search uses for liveness, so it
+    // naturally continues past an ineligible live QSO to one that
+    // qualifies. The OLD code did `.find()` on liveness ALONE, then checked
+    // eligibility only on whatever arbitrary (`HashSet` iteration order)
+    // first live match came back — with two concurrent QSOs, one
+    // live-but-ineligible and one live-and-eligible, that could return
+    // `NoEligibleTarget` even though a perfectly good target existed,
+    // purely based on which key the set happened to visit first.
+    let target = active.iter().find(|key| {
+        key.parse::<pancetta_qso::QsoId>().is_ok_and(|id| {
+            live_qso_ids.is_none_or(|live| live.contains(&id))
+                && (rearm_eligible_ids.is_none_or(|ids| ids.contains(&id))
+                    || auto_calling_cq_ids.is_some_and(|ids| ids.contains(&id)))
+        })
+    });
+    if let Some(key) = target {
+        if let Ok(qso_id) = key.parse::<pancetta_qso::QsoId>() {
+            // PAN-72 Fix A (Codex round 10, thread on `autonomous.rs:1829`):
+            // an autonomous self-CQ (`auto_calling_cq_ids`) is routed through
+            // this SAME `pending_qso_offset_requests` path now too, exactly
+            // like any other rearm-eligible target — see this function's doc
+            // comment for why round 8's CQ-nudge-fallback routing could never
+            // actually fire for the case it existed for, and how
+            // `QsoManager::apply_tx_offset_switch` now supplies the missing
+            // one-shot retransmission `rearm_manual_calls_at`'s Manual-only
+            // cadence deliberately never does for an Auto `CallingCq`. The
+            // combined predicate above already guarantees this branch is
+            // reached only when `rearm_eligible_ids` or `auto_calling_cq_ids`
+            // says so (or `rearm_eligible_ids` is `None`, preserving the
+            // pre-round-9 behavior) — no separate eligibility re-check
+            // needed here.
+            let current = active_tx_offsets
+                .read()
+                .ok()
+                .and_then(|m| m.get(key).copied())
+                .unwrap_or(1500.0);
+            if let Ok(mut pending) = pending_qso_offset_requests.lock() {
+                // Operator-forced: no staleness token (PAN-72 finding 8).
+                // The operator pressed `u` for the QSO as it stands right
+                // now, so there is nothing for a later advance to supersede.
+                pending.push(
+                    pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                        qso_id,
+                        pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: current },
+                    ),
+                );
+            }
+            return NudgeOutcome::ActiveQso(qso_id);
+        }
+    }
+    // PAN-72 round-9 fix (Codex round 9, finding 2), preserved by Fix D:
+    // the combined predicate above conflates "no live QSO at all" with
+    // "live QSOs exist but none are eligible" — both simply fail to match.
+    // Check `live_qso_ids` alone, separately, to tell them apart: only the
+    // former may fall through to the CQ-hunting fallback below.
+    let any_live = active.iter().any(|key| {
+        key.parse::<pancetta_qso::QsoId>()
+            .is_ok_and(|id| live_qso_ids.is_none_or(|live| live.contains(&id)))
+    });
+    if any_live {
+        // Deliberately NOT falling through to the CQ-nudge fallback: that
+        // flag is for CQ-hunting, and arming it here would silently consume
+        // `pending_cq_offset_nudge` against an unrelated future CQ-hunting
+        // cycle while implying something was armed for THIS QSO.
+        return NudgeOutcome::NoEligibleTarget;
+    }
+    pending_cq_offset_nudge.store(true, Ordering::Relaxed);
+    NudgeOutcome::CqNudgeArmed
+}
+
+/// What one `TuiCommand::NudgeTxOffset` dispatch actually did — see
+/// [`resolve_nudge_tx_offset`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NudgeOutcome {
+    /// Forced a `Switch` onto `pending_qso_offset_requests` for this QSO.
+    /// The autonomous drain commits it on the next slot tick.
+    ActiveQso(pancetta_qso::states::QsoId),
+    /// No active QSO — ARMED the one-shot CQ-offset nudge flag. Deliberately
+    /// not called "CqNudge": whether it produces a real offset move depends
+    /// on the autonomous operator's very next `decide_at` call happening to
+    /// reach its CQ-hunting branch — the flag is consumed unconditionally on
+    /// that next call regardless of which branch it reaches, so it does NOT
+    /// wait around for a later CQ cycle, which nothing here can see or
+    /// promise (see `resolve_nudge_tx_offset`'s doc comment). The status line
+    /// says "armed", not "nudged".
+    CqNudgeArmed,
+    /// TX-frequency mode is Hold: nothing queued, nothing armed, for an
+    /// active QSO or the CQ fallback alike. A flag armed in Hold is consumed
+    /// and discarded by `decide_at`'s `tx_freq_auto()` gate, so claiming a
+    /// nudge would be a silent false success. The operator is told to press
+    /// `f` for Auto.
+    HeldNoOp,
+    /// PAN-72 round-9 fix (Codex round 9, finding 2): there IS a live QSO,
+    /// but its CURRENT state is not one `QsoManager::rearm_manual_calls_at`
+    /// will ever retransmit a frame for (e.g. `WaitingForConfirmation`) —
+    /// nothing queued, nothing armed. The old code queued a `Switch` anyway,
+    /// silently updating offset metadata while reporting success with
+    /// nothing ever transmitted at the new offset. Deliberately does NOT
+    /// fall through to the CQ-nudge fallback either — that flag is for
+    /// CQ-hunting, and arming it here would silently consume it against an
+    /// unrelated future CQ-hunting cycle while implying something was armed
+    /// for this QSO. The status line explains why, mirroring `HeldNoOp`.
+    NoEligibleTarget,
+}
+
 /// The dial frequency (MHz) to stamp on this decode's `DecodedMessageView`.
 ///
 /// PAN-67: this MUST come from the frequency the decode's own audio window
@@ -3178,6 +3648,606 @@ fn spawn_bookmark_mutation_worker(
 mod tui_relay_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8};
+
+    /// Shared fixture for the `resolve_nudge_tx_offset` cases: an empty
+    /// mailbox and an unset CQ flag.
+    #[allow(clippy::type_complexity)]
+    fn nudge_fixture() -> (
+        std::sync::Mutex<Vec<pancetta_qso::qso_manager::OffsetActionRequest>>,
+        AtomicBool,
+    ) {
+        (std::sync::Mutex::new(Vec::new()), AtomicBool::new(false))
+    }
+
+    fn tx_freq_mode_atomic(mode: pancetta_core::TxFreqMode) -> AtomicU8 {
+        AtomicU8::new(mode.as_u8())
+    }
+
+    /// PAN-72: `NudgeTxOffset` with an active QSO must force a `Switch`
+    /// onto the EXISTING `pending_qso_offset_requests` mailbox (Task 8/9's
+    /// pipeline) -- not a new commit path -- and must NOT also set the
+    /// CQ-hunting fallback flag.
+    #[test]
+    fn nudge_forces_switch_for_active_qso() {
+        let qso_id = pancetta_qso::QsoId::new_v4();
+        let key = crate::coordinator::active_tx_qso_key(&qso_id.to_string());
+        let active: std::collections::HashSet<String> =
+            std::collections::HashSet::from([key.clone()]);
+        let active_tx_offsets =
+            std::sync::RwLock::new(std::collections::HashMap::from([(key.clone(), 920.0)]));
+        let (pending_qso_offset_requests, pending_cq_offset_nudge) = nudge_fixture();
+
+        let result = resolve_nudge_tx_offset(
+            &tx_freq_mode_atomic(pancetta_core::TxFreqMode::Auto),
+            &active,
+            Some(&std::collections::HashSet::from([qso_id])),
+            None,
+            None,
+            &active_tx_offsets,
+            &pending_qso_offset_requests,
+            &pending_cq_offset_nudge,
+        );
+
+        assert_eq!(
+            result,
+            NudgeOutcome::ActiveQso(qso_id),
+            "must resolve to the active QSO's id"
+        );
+        let pending = pending_qso_offset_requests.lock().unwrap();
+        assert_eq!(pending.len(), 1, "exactly one offset request queued");
+        assert_eq!(pending[0].qso_id, qso_id);
+        assert!(
+            matches!(
+                pending[0].action,
+                pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz } if avoid_hz == 920.0
+            ),
+            "must be a Switch{{avoid_hz}} keyed off the QSO's CURRENT offset, got {:?}",
+            pending[0].action
+        );
+        assert_eq!(
+            pending[0].origin.raised_at_generation(),
+            None,
+            "an operator-forced `u` nudge carries no staleness token — it is \
+             current by construction and must never be discarded as stale \
+             (PAN-72 finding 8)"
+        );
+        assert!(
+            !pending_cq_offset_nudge.load(Ordering::Relaxed),
+            "the CQ-hunting fallback flag must NOT be set when an active QSO was nudged"
+        );
+    }
+
+    /// PAN-72 final review (finding 2): in Hold mode the active-QSO nudge
+    /// must be a declared no-op. Queueing a `Switch` would route through
+    /// `allocate_smart_frequency`, whose Hold early-return ignores `avoid_hz`
+    /// and yields the parked offset -- silently doing nothing, or worse,
+    /// yanking an intentionally-held QSO onto the park offset, while the
+    /// status line claimed a real nudge. The CQ fallback must NOT be armed
+    /// as a consolation prize either: an active QSO exists, so CQ hunting is
+    /// simply the wrong target.
+    #[test]
+    fn nudge_is_a_declared_no_op_for_an_active_qso_in_hold_mode() {
+        let qso_id = pancetta_qso::QsoId::new_v4();
+        let key = crate::coordinator::active_tx_qso_key(&qso_id.to_string());
+        let active: std::collections::HashSet<String> =
+            std::collections::HashSet::from([key.clone()]);
+        let active_tx_offsets =
+            std::sync::RwLock::new(std::collections::HashMap::from([(key.clone(), 920.0)]));
+        let (pending_qso_offset_requests, pending_cq_offset_nudge) = nudge_fixture();
+
+        let result = resolve_nudge_tx_offset(
+            &tx_freq_mode_atomic(pancetta_core::TxFreqMode::Hold),
+            &active,
+            Some(&std::collections::HashSet::from([qso_id])),
+            None,
+            None,
+            &active_tx_offsets,
+            &pending_qso_offset_requests,
+            &pending_cq_offset_nudge,
+        );
+
+        assert_eq!(
+            result,
+            NudgeOutcome::HeldNoOp,
+            "Hold mode must report a no-op, not a phantom nudge"
+        );
+        assert!(
+            pending_qso_offset_requests.lock().unwrap().is_empty(),
+            "Hold mode must not queue an offset request -- the allocator's \
+             Hold branch ignores avoid_hz and returns the parked offset"
+        );
+        assert!(
+            !pending_cq_offset_nudge.load(Ordering::Relaxed),
+            "Hold mode must not arm the CQ fallback either -- there IS an \
+             active QSO, so CQ hunting is the wrong target"
+        );
+    }
+
+    /// PAN-72 (Codex round 2 on PR #350, finding 4): `active_tx_qsos` retains
+    /// a COMPLETED QSO for 45 seconds so its trailing 73 can transmit. Nudging
+    /// that entry told the operator "Nudging active QSO" while the drain later
+    /// refused it with `QsoNotActive` and nothing moved. With the QSO engine
+    /// reporting no live QSOs, `u` must fall through to the CQ fallback.
+    #[test]
+    fn nudge_ignores_a_completed_qso_still_inside_its_trailing_73_grace() {
+        let qso_id = pancetta_qso::QsoId::new_v4();
+        let key = crate::coordinator::active_tx_qso_key(&qso_id.to_string());
+        let active: std::collections::HashSet<String> =
+            std::collections::HashSet::from([key.clone()]);
+        let active_tx_offsets =
+            std::sync::RwLock::new(std::collections::HashMap::from([(key.clone(), 920.0)]));
+        let (pending_qso_offset_requests, pending_cq_offset_nudge) = nudge_fixture();
+        // The QSO engine says nothing is active: the snapshot entry is
+        // grace-window-only.
+        let live: std::collections::HashSet<pancetta_qso::QsoId> = std::collections::HashSet::new();
+
+        let result = resolve_nudge_tx_offset(
+            &tx_freq_mode_atomic(pancetta_core::TxFreqMode::Auto),
+            &active,
+            Some(&live),
+            None,
+            None,
+            &active_tx_offsets,
+            &pending_qso_offset_requests,
+            &pending_cq_offset_nudge,
+        );
+
+        assert_eq!(
+            result,
+            NudgeOutcome::CqNudgeArmed,
+            "a terminal grace-window entry must not be reported as an active QSO"
+        );
+        assert!(
+            pending_qso_offset_requests.lock().unwrap().is_empty(),
+            "no offset request may be queued for a QSO the drain will refuse"
+        );
+    }
+
+    /// The concurrent-QSO half of the same finding: a completed entry must not
+    /// SHADOW a genuinely live one just because it happens to come first out
+    /// of the snapshot set.
+    #[test]
+    fn nudge_picks_the_live_qso_over_a_completed_one() {
+        let dead = pancetta_qso::QsoId::new_v4();
+        let alive = pancetta_qso::QsoId::new_v4();
+        let dead_key = crate::coordinator::active_tx_qso_key(&dead.to_string());
+        let alive_key = crate::coordinator::active_tx_qso_key(&alive.to_string());
+        let active: std::collections::HashSet<String> =
+            std::collections::HashSet::from([dead_key.clone(), alive_key.clone()]);
+        let active_tx_offsets = std::sync::RwLock::new(std::collections::HashMap::from([
+            (dead_key, 920.0),
+            (alive_key, 1650.0),
+        ]));
+        let (pending_qso_offset_requests, pending_cq_offset_nudge) = nudge_fixture();
+        let live: std::collections::HashSet<pancetta_qso::QsoId> =
+            std::collections::HashSet::from([alive]);
+
+        let result = resolve_nudge_tx_offset(
+            &tx_freq_mode_atomic(pancetta_core::TxFreqMode::Auto),
+            &active,
+            Some(&live),
+            None,
+            None,
+            &active_tx_offsets,
+            &pending_qso_offset_requests,
+            &pending_cq_offset_nudge,
+        );
+
+        assert_eq!(
+            result,
+            NudgeOutcome::ActiveQso(alive),
+            "the live QSO must be selected regardless of set iteration order"
+        );
+        let pending = pending_qso_offset_requests.lock().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].qso_id, alive);
+        assert!(
+            matches!(
+                pending[0].action,
+                pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz } if avoid_hz == 1650.0
+            ),
+            "avoid_hz must be the LIVE QSO's own offset, got {:?}",
+            pending[0].action
+        );
+        assert!(!pending_cq_offset_nudge.load(Ordering::Relaxed));
+    }
+
+    /// PAN-72 (Codex round 1 on PR #350, finding 4): with NO active QSO and
+    /// the mode on Hold, `u` must report a declared no-op too -- not a
+    /// phantom CQ nudge.
+    ///
+    /// `decide_at` computes `should_switch = self.tx_freq_auto() && (...)`,
+    /// so a flag armed in Hold is consumed and discarded with nothing to show
+    /// for it. Reporting `CqNudgeArmed` there told the operator a nudge was
+    /// under way when it provably could not be.
+    #[test]
+    fn nudge_is_a_declared_no_op_with_no_active_qso_in_hold_mode() {
+        let active: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let active_tx_offsets = std::sync::RwLock::new(std::collections::HashMap::new());
+        let (pending_qso_offset_requests, pending_cq_offset_nudge) = nudge_fixture();
+
+        let result = resolve_nudge_tx_offset(
+            &tx_freq_mode_atomic(pancetta_core::TxFreqMode::Hold),
+            &active,
+            None,
+            None,
+            None,
+            &active_tx_offsets,
+            &pending_qso_offset_requests,
+            &pending_cq_offset_nudge,
+        );
+
+        assert_eq!(
+            result,
+            NudgeOutcome::HeldNoOp,
+            "Hold with no active QSO must report a no-op, not a CQ nudge the \
+             downstream tx_freq_auto() gate will silently discard"
+        );
+        assert!(
+            !pending_cq_offset_nudge.load(Ordering::Relaxed),
+            "Hold must not arm the CQ fallback flag at all"
+        );
+        assert!(pending_qso_offset_requests.lock().unwrap().is_empty());
+    }
+
+    /// PAN-72: `NudgeTxOffset` in Auto with no active QSO ARMS the one-shot
+    /// `pending_cq_offset_nudge` flag (the CQ-hunting fallback) and must NOT
+    /// touch `pending_qso_offset_requests`. Whether it produces a real move
+    /// still depends on the autonomous operator entering its CQ branch on a
+    /// later cycle -- nothing here can see or promise that, which is why the
+    /// outcome is named `CqNudgeArmed` (see `resolve_nudge_tx_offset`'s doc
+    /// comment).
+    #[test]
+    fn nudge_sets_cq_flag_when_no_active_qso() {
+        let active: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let active_tx_offsets = std::sync::RwLock::new(std::collections::HashMap::new());
+        let (pending_qso_offset_requests, pending_cq_offset_nudge) = nudge_fixture();
+
+        let result = resolve_nudge_tx_offset(
+            &tx_freq_mode_atomic(pancetta_core::TxFreqMode::Auto),
+            &active,
+            None,
+            None,
+            None,
+            &active_tx_offsets,
+            &pending_qso_offset_requests,
+            &pending_cq_offset_nudge,
+        );
+
+        assert_eq!(
+            result,
+            NudgeOutcome::CqNudgeArmed,
+            "no active QSO to resolve to"
+        );
+        assert!(
+            pending_cq_offset_nudge.load(Ordering::Relaxed),
+            "the CQ-hunting fallback flag must be set when no QSO is active"
+        );
+        assert!(
+            pending_qso_offset_requests.lock().unwrap().is_empty(),
+            "must not queue an offset request when there's no active QSO"
+        );
+    }
+
+    /// PAN-72 Fix A (Codex round 10, thread on `autonomous.rs:1829`),
+    /// superseding round 8's redesign: the target is a live, active QSO AND
+    /// an autonomous self-CQ (`CallInitiation::Auto`, `QsoState::CallingCq`).
+    /// Round 8 routed this through `pending_cq_offset_nudge` instead of
+    /// `pending_qso_offset_requests`, reasoning that
+    /// `rearm_manual_calls_at` only retransmits `CallingCq` for
+    /// `CallInitiation::Manual` — but round 10 found `pending_cq_offset_
+    /// nudge` structurally can never fire for this exact case (`decide_at`'s
+    /// CQ-hunting branch is gated on `active_qso_count == 0`, and the
+    /// `CallingCq` being nudged IS that one active QSO). Fix A routes an
+    /// auto-CQ target through the SAME `pending_qso_offset_requests` path as
+    /// any other target instead, relying on `QsoManager::
+    /// apply_tx_offset_switch`'s new one-shot retransmission (independent of
+    /// `rearm_manual_calls_at`'s own Manual-only cadence, which this fix does
+    /// NOT touch) to actually resend the CQ at the new offset.
+    ///
+    /// `rearm_eligible_ids: Some(empty)` isolates this: the only way this
+    /// target can match is through `auto_calling_cq_ids`, proving Fix A's
+    /// routing specifically, not the unrelated `rearm_eligible_ids: None`
+    /// pass-through convention another test covers.
+    #[test]
+    fn nudge_forces_switch_for_an_autonomous_self_cq_too() {
+        let qso_id = pancetta_qso::QsoId::new_v4();
+        let key = crate::coordinator::active_tx_qso_key(&qso_id.to_string());
+        let active: std::collections::HashSet<String> =
+            std::collections::HashSet::from([key.clone()]);
+        let active_tx_offsets =
+            std::sync::RwLock::new(std::collections::HashMap::from([(key, 920.0)]));
+        let (pending_qso_offset_requests, pending_cq_offset_nudge) = nudge_fixture();
+        let live: std::collections::HashSet<pancetta_qso::QsoId> =
+            std::collections::HashSet::from([qso_id]);
+        let auto_calling_cq: std::collections::HashSet<pancetta_qso::QsoId> =
+            std::collections::HashSet::from([qso_id]);
+        let rearm_eligible: std::collections::HashSet<pancetta_qso::QsoId> =
+            std::collections::HashSet::new();
+
+        let result = resolve_nudge_tx_offset(
+            &tx_freq_mode_atomic(pancetta_core::TxFreqMode::Auto),
+            &active,
+            Some(&live),
+            Some(&auto_calling_cq),
+            Some(&rearm_eligible),
+            &active_tx_offsets,
+            &pending_qso_offset_requests,
+            &pending_cq_offset_nudge,
+        );
+
+        assert_eq!(
+            result,
+            NudgeOutcome::ActiveQso(qso_id),
+            "an autonomous self-CQ must now be nudged like an ordinary \
+             active QSO -- the CQ-nudge fallback could never actually fire \
+             for this case"
+        );
+        let pending = pending_qso_offset_requests.lock().unwrap();
+        assert_eq!(pending.len(), 1, "exactly one offset request queued");
+        assert_eq!(pending[0].qso_id, qso_id);
+        assert!(
+            matches!(
+                pending[0].action,
+                pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz } if avoid_hz == 920.0
+            ),
+            "must be a Switch{{avoid_hz}} keyed off the QSO's CURRENT offset, got {:?}",
+            pending[0].action
+        );
+        assert!(
+            !pending_cq_offset_nudge.load(Ordering::Relaxed),
+            "the CQ-hunting fallback flag must NOT be set -- this QSO IS \
+             the active QSO being nudged, not a CQ-hunting cycle"
+        );
+    }
+
+    /// The control case for the fix above: a MANUAL-initiated `CallingCq` is
+    /// present in `live_qso_ids` but NOT `auto_calling_cq_ids` (only
+    /// `CallInitiation::Auto` QSOs go in that set) -- it DOES retransmit via
+    /// `rearm_manual_calls_at`, so it must keep today's `ActiveQso` behavior
+    /// unchanged.
+    #[test]
+    fn nudge_still_forces_switch_for_a_manual_calling_cq() {
+        let qso_id = pancetta_qso::QsoId::new_v4();
+        let key = crate::coordinator::active_tx_qso_key(&qso_id.to_string());
+        let active: std::collections::HashSet<String> =
+            std::collections::HashSet::from([key.clone()]);
+        let active_tx_offsets =
+            std::sync::RwLock::new(std::collections::HashMap::from([(key, 920.0)]));
+        let (pending_qso_offset_requests, pending_cq_offset_nudge) = nudge_fixture();
+        let live: std::collections::HashSet<pancetta_qso::QsoId> =
+            std::collections::HashSet::from([qso_id]);
+        // Present in live_qso_ids but this QSO is Manual-initiated, so it is
+        // NOT in auto_calling_cq_ids.
+        let auto_calling_cq: std::collections::HashSet<pancetta_qso::QsoId> =
+            std::collections::HashSet::new();
+        // A Manual-initiated CallingCq IS one of `rearm_manual_calls_at`'s
+        // eligible states.
+        let rearm_eligible: std::collections::HashSet<pancetta_qso::QsoId> =
+            std::collections::HashSet::from([qso_id]);
+
+        let result = resolve_nudge_tx_offset(
+            &tx_freq_mode_atomic(pancetta_core::TxFreqMode::Auto),
+            &active,
+            Some(&live),
+            Some(&auto_calling_cq),
+            Some(&rearm_eligible),
+            &active_tx_offsets,
+            &pending_qso_offset_requests,
+            &pending_cq_offset_nudge,
+        );
+
+        assert_eq!(
+            result,
+            NudgeOutcome::ActiveQso(qso_id),
+            "a Manual-initiated CallingCq must keep the existing ActiveQso \
+             behavior -- it DOES retransmit, unlike an autonomous self-CQ"
+        );
+        let pending = pending_qso_offset_requests.lock().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].qso_id, qso_id);
+        assert!(!pending_cq_offset_nudge.load(Ordering::Relaxed));
+    }
+
+    /// PAN-72 round-9 fix (Codex round 9, finding 2): the only live QSO is in
+    /// `WaitingForConfirmation` -- present in `live_qso_ids` (it IS active)
+    /// but NOT in `rearm_eligible_ids`, because
+    /// `QsoManager::rearm_manual_calls_at`'s `match &progress.state` block
+    /// falls to `_ => continue` for this state -- no frame would ever be
+    /// re-sent. The old code selected it as an ordinary `ActiveQso` target
+    /// anyway, silently updating offset metadata while reporting success
+    /// with nothing ever transmitted at the new offset. Must report
+    /// `NoEligibleTarget` and touch NEITHER mailbox -- not
+    /// `pending_qso_offset_requests` (there is nothing to commit), and not
+    /// the CQ-nudge fallback either (there IS a live QSO; CQ-hunting is
+    /// simply the wrong target for it, same reasoning as the Hold-mode
+    /// no-op).
+    #[test]
+    fn nudge_reports_no_eligible_target_for_a_non_rearmable_state() {
+        let qso_id = pancetta_qso::QsoId::new_v4();
+        let key = crate::coordinator::active_tx_qso_key(&qso_id.to_string());
+        let active: std::collections::HashSet<String> =
+            std::collections::HashSet::from([key.clone()]);
+        let active_tx_offsets =
+            std::sync::RwLock::new(std::collections::HashMap::from([(key, 920.0)]));
+        let (pending_qso_offset_requests, pending_cq_offset_nudge) = nudge_fixture();
+        let live: std::collections::HashSet<pancetta_qso::QsoId> =
+            std::collections::HashSet::from([qso_id]);
+        // Live, but WaitingForConfirmation is not one of
+        // `rearm_manual_calls_at`'s eligible states -- the set built at the
+        // call site would never include it.
+        let rearm_eligible: std::collections::HashSet<pancetta_qso::QsoId> =
+            std::collections::HashSet::new();
+
+        let result = resolve_nudge_tx_offset(
+            &tx_freq_mode_atomic(pancetta_core::TxFreqMode::Auto),
+            &active,
+            Some(&live),
+            None,
+            Some(&rearm_eligible),
+            &active_tx_offsets,
+            &pending_qso_offset_requests,
+            &pending_cq_offset_nudge,
+        );
+
+        assert_eq!(
+            result,
+            NudgeOutcome::NoEligibleTarget,
+            "a live QSO whose current state cannot retransmit must not be \
+             reported as a successful nudge"
+        );
+        assert!(
+            pending_qso_offset_requests.lock().unwrap().is_empty(),
+            "nothing to commit -- rearm_manual_calls_at would never re-send \
+             a frame for this state"
+        );
+        assert!(
+            !pending_cq_offset_nudge.load(Ordering::Relaxed),
+            "must not consume the CQ-hunting fallback either -- there IS a \
+             live QSO, so CQ hunting is the wrong target for it"
+        );
+    }
+
+    /// Regression companion: `RespondingToCq` and `SendingReport` ARE in
+    /// `rearm_manual_calls_at`'s eligible-state list for any initiation, so
+    /// they must keep resolving to `ActiveQso` exactly as before -- the
+    /// round-9 restriction must not become an over-broad `None`-by-default
+    /// that blocks every state.
+    #[test]
+    fn nudge_still_resolves_active_qso_for_rearm_eligible_states() {
+        let qso_id = pancetta_qso::QsoId::new_v4();
+        let key = crate::coordinator::active_tx_qso_key(&qso_id.to_string());
+        let active: std::collections::HashSet<String> =
+            std::collections::HashSet::from([key.clone()]);
+        let active_tx_offsets =
+            std::sync::RwLock::new(std::collections::HashMap::from([(key, 1650.0)]));
+        let (pending_qso_offset_requests, pending_cq_offset_nudge) = nudge_fixture();
+        let live: std::collections::HashSet<pancetta_qso::QsoId> =
+            std::collections::HashSet::from([qso_id]);
+        let rearm_eligible: std::collections::HashSet<pancetta_qso::QsoId> =
+            std::collections::HashSet::from([qso_id]);
+
+        let result = resolve_nudge_tx_offset(
+            &tx_freq_mode_atomic(pancetta_core::TxFreqMode::Auto),
+            &active,
+            Some(&live),
+            None,
+            Some(&rearm_eligible),
+            &active_tx_offsets,
+            &pending_qso_offset_requests,
+            &pending_cq_offset_nudge,
+        );
+
+        assert_eq!(
+            result,
+            NudgeOutcome::ActiveQso(qso_id),
+            "RespondingToCq/SendingReport (or any other rearm-eligible \
+             state) must still nudge normally"
+        );
+        let pending = pending_qso_offset_requests.lock().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].qso_id, qso_id);
+        assert!(!pending_cq_offset_nudge.load(Ordering::Relaxed));
+    }
+
+    /// `rearm_eligible_ids: None` (the Qso component wasn't up to build the
+    /// set) must preserve pre-round-9 behavior -- same convention as
+    /// `live_qso_ids: None` above -- not retroactively block every nudge.
+    #[test]
+    fn nudge_with_no_rearm_eligibility_info_preserves_prior_behavior() {
+        let qso_id = pancetta_qso::QsoId::new_v4();
+        let key = crate::coordinator::active_tx_qso_key(&qso_id.to_string());
+        let active: std::collections::HashSet<String> =
+            std::collections::HashSet::from([key.clone()]);
+        let active_tx_offsets =
+            std::sync::RwLock::new(std::collections::HashMap::from([(key, 920.0)]));
+        let (pending_qso_offset_requests, pending_cq_offset_nudge) = nudge_fixture();
+
+        let result = resolve_nudge_tx_offset(
+            &tx_freq_mode_atomic(pancetta_core::TxFreqMode::Auto),
+            &active,
+            Some(&std::collections::HashSet::from([qso_id])),
+            None,
+            None,
+            &active_tx_offsets,
+            &pending_qso_offset_requests,
+            &pending_cq_offset_nudge,
+        );
+
+        assert_eq!(result, NudgeOutcome::ActiveQso(qso_id));
+    }
+
+    /// PAN-72 Fix D (Codex round 10, thread on `tui_relay.rs:3134`): round
+    /// 9's Fix C added the eligibility check, but target SELECTION still did
+    /// `.find()` on liveness alone, checking eligibility only on whatever
+    /// arbitrary (`HashSet` iteration order) first live match came back. With
+    /// two concurrent live QSOs -- one ineligible
+    /// (`WaitingForConfirmation`-shaped: live, not rearm-eligible, not an
+    /// auto-CQ), one eligible (`SendingReport`-shaped) -- the function could
+    /// return `NoEligibleTarget` even though a perfectly good target exists,
+    /// purely based on which key the `HashSet` visited first.
+    ///
+    /// The fix folds eligibility into the SAME predicate the search uses, so
+    /// it naturally continues past an ineligible live QSO to one that
+    /// qualifies. This is deterministic BY CONSTRUCTION regardless of which
+    /// key `HashSet` iteration visits first -- exactly one of the two ids
+    /// satisfies the combined predicate, so `.find()` returns it no matter
+    /// which order the set is walked in.
+    #[test]
+    fn nudge_finds_the_eligible_qso_even_when_an_ineligible_one_shares_the_snapshot() {
+        let ineligible = pancetta_qso::QsoId::new_v4();
+        let eligible = pancetta_qso::QsoId::new_v4();
+        let ineligible_key = crate::coordinator::active_tx_qso_key(&ineligible.to_string());
+        let eligible_key = crate::coordinator::active_tx_qso_key(&eligible.to_string());
+        let active: std::collections::HashSet<String> =
+            std::collections::HashSet::from([ineligible_key.clone(), eligible_key.clone()]);
+        let active_tx_offsets = std::sync::RwLock::new(std::collections::HashMap::from([
+            (ineligible_key, 920.0),
+            (eligible_key, 1650.0),
+        ]));
+        let (pending_qso_offset_requests, pending_cq_offset_nudge) = nudge_fixture();
+        let live: std::collections::HashSet<pancetta_qso::QsoId> =
+            std::collections::HashSet::from([ineligible, eligible]);
+        // Neither is an autonomous self-CQ.
+        let auto_calling_cq: std::collections::HashSet<pancetta_qso::QsoId> =
+            std::collections::HashSet::new();
+        // Only `eligible` is one of `rearm_manual_calls_at`'s eligible states
+        // (e.g. `SendingReport`); `ineligible` (e.g. `WaitingForConfirmation`)
+        // is live but not rearm-eligible.
+        let rearm_eligible: std::collections::HashSet<pancetta_qso::QsoId> =
+            std::collections::HashSet::from([eligible]);
+
+        let result = resolve_nudge_tx_offset(
+            &tx_freq_mode_atomic(pancetta_core::TxFreqMode::Auto),
+            &active,
+            Some(&live),
+            Some(&auto_calling_cq),
+            Some(&rearm_eligible),
+            &active_tx_offsets,
+            &pending_qso_offset_requests,
+            &pending_cq_offset_nudge,
+        );
+
+        assert_eq!(
+            result,
+            NudgeOutcome::ActiveQso(eligible),
+            "must select the eligible QSO regardless of HashSet iteration \
+             order, never report NoEligibleTarget just because the \
+             ineligible one might be visited first"
+        );
+        let pending = pending_qso_offset_requests.lock().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].qso_id, eligible);
+        assert!(
+            matches!(
+                pending[0].action,
+                pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz } if avoid_hz == 1650.0
+            ),
+            "avoid_hz must be the ELIGIBLE QSO's own offset, got {:?}",
+            pending[0].action
+        );
+        assert!(!pending_cq_offset_nudge.load(Ordering::Relaxed));
+    }
 
     /// An empty pending slot -- the common case (nothing carried over from
     /// a prior failed teardown replay).

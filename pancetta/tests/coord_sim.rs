@@ -369,6 +369,13 @@ impl CoordSim {
         manager.set_dial_frequency_source(Arc::clone(&dial_frequency_hz));
         manager.set_split_tx_frequency_source(Arc::clone(&split_tx_frequency_hz));
 
+        // PAN-72 (PR #350 round-7 re-review): wire the SHARED active-slot-length
+        // atomic exactly as `start_qso_component` does, so a scenario that runs
+        // `try_switch_operating_mode` sees the manager's rearm/stall cadence
+        // follow the switch (the real coupling, not a config-string copy).
+        let active_slot_ns = Arc::new(std::sync::atomic::AtomicI64::new(15_000_000_000));
+        manager.set_active_slot_ns_source(Arc::clone(&active_slot_ns));
+
         let shutdown = Arc::new(AtomicBool::new(false));
         let rig = spawn_hamlib_consumer(&bus, shutdown.clone()).await;
 
@@ -382,7 +389,7 @@ impl CoordSim {
             tx_policy: Arc::new(AtomicU8::new(TxPolicy::Full.as_u8())),
             ft8_config: Arc::new(tokio::sync::RwLock::new(pancetta_ft8::Ft8Config::default())),
             active_protocol_mode: Arc::new(AtomicU8::new(OperatingMode::Ft8.as_u8())),
-            active_slot_ns: Arc::new(std::sync::atomic::AtomicI64::new(15_000_000_000)),
+            active_slot_ns,
             active_decode_phase_ns: Arc::new(std::sync::atomic::AtomicI64::new(13_000_000_000)),
             shutdown,
             our_callsign: our_callsign.to_string(),
@@ -2644,6 +2651,80 @@ async fn mode_switch_succeeds_idle_and_next_qso_uses_new_mode() {
     let active = sim.manager.get_active_qsos().await;
     assert_eq!(active.len(), 1);
     assert_eq!(active[0].1.metadata.mode, "FT4");
+}
+
+/// PAN-72 (PR #350 round-7 re-review), end-to-end: a runtime Shift+M switch
+/// must reach the QSO engine's keep-calling rearm / `stall_cycles` cadence,
+/// and must reach it through the SHARED `active_slot_ns` atomic rather than
+/// the `active_mode` string `set_active_mode` copies into the manager's
+/// (cloned-by-value) config.
+///
+/// The manager here is deliberately NOT re-fetched or re-injected after the
+/// switch — it is the same handle wired in `CoordSim::new`, standing in for
+/// the clone `QsoManager::start()` spawns `timeout_check_loop` on.
+#[tokio::test]
+async fn mode_switch_retunes_the_qso_engines_rearm_cadence() {
+    let sim = CoordSim::new("K5ARH").await;
+
+    let qso_id = sim
+        .manager
+        .respond_to_cq_manual("W1AW".to_string(), 1500.0, None)
+        .await
+        .expect("respond_to_cq_manual");
+    let opened_at = sim
+        .manager
+        .get_qso(qso_id)
+        .await
+        .unwrap()
+        .metadata
+        .last_call_at
+        .unwrap();
+
+    // Before the switch: one FT4 slot is a SUB-slot rearm under FT8.
+    sim.manager
+        .rearm_manual_calls_at(opened_at + chrono::Duration::milliseconds(7_500))
+        .await;
+    assert_eq!(
+        sim.manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .stall_cycles,
+        0,
+        "FT8 must still count on its historical 15 s slot"
+    );
+
+    // Operator presses Shift+M -> FT4. No QSO is in `active_tx_qsos` here
+    // (this sim never populated it), so the switch is admitted.
+    try_switch_operating_mode(
+        OperatingMode::Ft4,
+        &sim.active_tx_qsos,
+        &sim.ft8_config,
+        &sim.active_protocol_mode,
+        &sim.active_slot_ns,
+        &sim.active_decode_phase_ns,
+    )
+    .expect("idle mode switch");
+    assert_eq!(sim.active_slot_ns.load(Ordering::Relaxed), 7_500_000_000);
+
+    // The very same manager handle now counts on FT4's 7.5 s slot. 7.6 s since
+    // the opening call is deliberately BETWEEN the two slot lengths: it counts
+    // under FT4 and does not under FT8, so this assertion fails outright if the
+    // switch never reaches the QSO engine.
+    sim.manager
+        .rearm_manual_calls_at(opened_at + chrono::Duration::milliseconds(7_600))
+        .await;
+    assert_eq!(
+        sim.manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .stall_cycles,
+        1,
+        "the live switch must retune the rearm cadence with no re-injection"
+    );
 }
 
 /// Regression invariant: an operator who never touches Shift+M sees the

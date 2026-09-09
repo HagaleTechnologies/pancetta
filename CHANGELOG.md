@@ -9,6 +9,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Adaptive TX-offset switching (PAN-72): in `AUTO` TX-frequency mode, an
+  in-progress QSO that goes `[autonomous] qso_stall_switch_after` slots (default
+  4) without the DX advancing — **silence now counts, not just a repeated
+  frame** — moves to a fresh offset picked by the smart frequency allocator. If
+  it stalls again on that new offset it reverts to the last offset the QSO was
+  known to work on, ping-ponging rather than wandering. New `u` keystroke forces
+  the same move on demand without leaving `AUTO`: it nudges the active QSO, or
+  the CQ-hunting offset when no QSO is running. In `HOLD` the nudge reports a
+  no-op instead of breaking your pinned offset. Replaces the old blind
+  identical-repeat `+300 Hz` hop, which never noticed silence and ignored both
+  the spectrum and our other active streams. `[autonomous]
+  cq_no_response_switch_after` default lowered 5 → 4 to match.
+  Safeguards on the switch decision: concurrent QSOs resolved in the same
+  slot are reserved against each other so two streams can never collapse onto
+  one offset; a queued action is discarded if you switch to `HOLD`, if the QSO
+  finished, or if the DX answered before it could be committed; a Hound's
+  procedure-mandated QSY becomes the offset a later revert returns to (never
+  one it moves away from); a caller answering an unanswered CQ counts as
+  progress, so the CQ's stall streak does not carry into the exchange; a `u`
+  nudge pressed before enough decode history has accumulated is retried rather
+  than dropped; and an applied move refreshes the QSO banner immediately
+  instead of waiting for the next state change.
+  Further safeguards: a Hound's switch stays inside the Hound region it is
+  currently pinned to (the low calling region before the QSY, the response
+  region after), never wandering somewhere the Fox is not listening; a revert
+  whose known-good offset another QSO has since taken allocates a fresh offset
+  instead of stacking two streams; every switch is decided against the current
+  slot's own waterfall and decodes rather than the previous slot's; `u` only
+  reports "nudging active QSO" for a QSO the engine still has running, not one
+  inside its trailing-73 grace window; and while TX is `DISABLED` the stall
+  counter no longer advances, so a muted station never drifts off a working
+  offset it never transmitted on.
+  Final safeguards: a switching QSO now hard-avoids every other live QSO's
+  offset — not only the ones relocating in the same slot — instead of relying
+  on a scoring penalty that a crowded band can outvote; a Hound's region is
+  re-checked at the instant the move is applied, so a Fox answering mid-decision
+  can no longer have its mandatory QSY undone; and the offset a QSO just left
+  keeps accepting replies (and stays the offset credited as "known good") for
+  two slots, so the caller who answers the very transmission that triggered the
+  move is no longer rejected — or answered with a duplicate QSO.
+  Last pass: a frame already queued for transmission now follows the QSO to its
+  new offset instead of going out on the one it just left, and an answer that
+  arrives after a move credits whichever offset it actually came back on — so a
+  hand-forced `u` nudge that immediately works is no longer "reverted" away
+  moments later.
+  Final pass: the DX's first signal report now counts as forward progress (it
+  could previously be mistaken for a stall and the QSO moved away just as the DX
+  answered), an operator-forced nudge on a split QSO credits the offset it moved
+  TO rather than the one it left, a Hound response region above 2800 Hz is now
+  actually searched instead of silently refusing every move, and a switch is
+  scored against the slot the QSO really transmits in rather than slot-blind.
+  Last hardening pass: after moving an unanswered CQ the receiver is now
+  re-centred on the new frequency — it previously stayed listening on the
+  abandoned one, so an answer to the CQ could never be heard and nothing ever
+  corrected it. Alongside that: repeated `u` presses in one slot no longer
+  corrupt the record of where a reply is expected, switching to Hold mid-move
+  now stops the move, a recovery attempt that finds no free slot keeps its
+  evidence instead of waiting out another full threshold, silence caused by an
+  expired remote-TX arm no longer counts against the DX, and FT4/FT2 count
+  stalls on their own (shorter) slot instead of FT8's 15 seconds.
+
 - Saved rig-config bookmarks (PAN-61): the `i` rig picker can now save the current model/port/baud/PTT as a named bookmark (`F3`) and load one back into the form later (`F2`), without retyping. Builds on PAN-59's live rig-config switch.
 
 ## [0.9.6] - 2026-09-02
