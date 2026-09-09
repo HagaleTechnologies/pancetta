@@ -3763,7 +3763,15 @@ async fn coalesce_backlog_into(
                 )
                 .await;
                 audit_log.append(&pancetta_agent::audit::AuditEvent {
-                    ts_unix_ms: chrono::Utc::now().timestamp_millis(),
+                    // Round-11 review (Codex P2): the denial-time instant
+                    // (the SAME `now_ms` `arm_snapshot` was taken under),
+                    // not a fresh timestamp read whenever this detached
+                    // task happens to actually run — a task delayed behind
+                    // executor load or a large earlier backlog would
+                    // otherwise timestamp entries AFTER later, unrelated
+                    // arm/disarm events actually occurred, corrupting the
+                    // audit trail's own chronological order.
+                    ts_unix_ms: now_ms,
                     kind: pancetta_agent::audit::AuditKind::TxDenied,
                     // Round-10 review (Codex P2): attribute from the
                     // FROZEN snapshot, not a fresh lock — see
