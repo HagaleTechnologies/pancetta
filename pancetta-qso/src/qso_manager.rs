@@ -3322,7 +3322,12 @@ impl QsoManager {
             .read()
             .await
             .get(&qso_id)
-            .map(|p| (p.metadata.remote_origin, p.metadata.remote_client_key_id.clone()))
+            .map(|p| {
+                (
+                    p.metadata.remote_origin,
+                    p.metadata.remote_client_key_id.clone(),
+                )
+            })
             .unwrap_or(snapshot)
     }
 
@@ -19533,8 +19538,8 @@ mod current_remote_binding_tests {
     //! trying to race the real async window, which isn't reproducible
     //! deterministically.
     use super::{
-        AutoSequenceConfig, DuplicateCheckConfig, HoundRegions, QsoId, QsoManager,
-        QsoManagerConfig, TimeoutConfig, default_active_mode,
+        default_active_mode, AutoSequenceConfig, DuplicateCheckConfig, HoundRegions, QsoId,
+        QsoManager, QsoManagerConfig, TimeoutConfig,
     };
     use pancetta_core::slot::SlotParity;
 
@@ -19589,7 +19594,9 @@ mod current_remote_binding_tests {
         let snapshot = (true, Some("fallback-client".to_string()));
 
         assert_eq!(
-            manager.current_remote_binding(bogus_id, snapshot.clone()).await,
+            manager
+                .current_remote_binding(bogus_id, snapshot.clone())
+                .await,
             snapshot
         );
     }
