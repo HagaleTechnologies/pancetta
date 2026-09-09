@@ -314,12 +314,21 @@ pub fn classify_incoming_during_tx(
             origin,
             remote_client_key_id,
         } => {
+            // Codex P1, round 22: the tombstone match alone isn't enough —
+            // it's keyed only on qso_id/text/frequency, with no authorization
+            // in it. If control has since transferred (this candidate's
+            // authorization differs from the in-flight frame's), it's not
+            // the stale second copy of the pivot; it's a fresh, differently-
+            // authorized request that happens to render the pivoted text.
+            // Fall through to the normal per-QSO comparison below rather
+            // than trusting the tombstone.
             if super::is_pivot_duplicate(
                 qso_id.as_deref(),
                 message_text,
                 *frequency_offset,
                 pivoted_once,
-            ) {
+            ) && !authorization_differs(*origin, remote_client_key_id.as_deref())
+            {
                 return IncomingDuringTx::Drop;
             }
             // Genuine manual/free-text/tune/test-TX (no qso_id at all) is the
@@ -13493,6 +13502,48 @@ mod classifier_tests {
             None,
         );
         assert!(matches!(outcome, super::IncomingDuringTx::Drop));
+    }
+
+    /// Codex P1, round 22 (PR #362): a pivot tombstone match (same qso_id,
+    /// text, frequency) is not a safe duplicate when the CANDIDATE's own
+    /// authorization differs from the in-flight frame's — round 21's
+    /// authorization check ran only AFTER this tombstone check, so control
+    /// transferring from client A to client B while B resends the exact
+    /// pivoted text still got swallowed as A's stale tombstone duplicate.
+    #[test]
+    fn classify_does_not_drop_pivot_tombstone_when_authorization_differs() {
+        let mut pivoted_once = std::collections::HashMap::new();
+        pivoted_once.insert(
+            active_tx_qso_key("qso-1"),
+            ("KA1ABC K5ARH RR73".to_string(), 1500.0),
+        );
+        let candidate = MessageType::TransmitRequest {
+            message_text: "KA1ABC K5ARH RR73".to_string(),
+            frequency_offset: 1500.0,
+            qso_id: Some("qso-1".to_string()),
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Remote,
+            remote_client_key_id: Some("client-b".to_string()),
+        };
+        let outcome = super::classify_incoming_during_tx(
+            &candidate,
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH RR73".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
+            &pivoted_once,
+            // In-flight side is bound to client-a — candidate above is
+            // client-b, so authorization differs despite an exact tombstone
+            // match.
+            crate::message_bus::TxOrigin::Remote,
+            Some("client-a"),
+        );
+        assert!(
+            matches!(outcome, super::IncomingDuringTx::Supersede { .. }),
+            "a tombstone match under DIFFERENT authorization must supersede, not Drop — \
+             got {outcome:?}"
+        );
     }
 
     /// Codex round 6 (PR #346): a pivot tombstone for the same QSO and text
