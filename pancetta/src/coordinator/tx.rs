@@ -2754,6 +2754,101 @@ fn multi_tx_bundle_still_fully_live(
         .all(|id| tx_qso_is_live(id.as_deref(), active_tx_qsos))
 }
 
+/// PAN-141: the freshness window for [`dx_parity_conflict`] — self-scaling
+/// with the live protocol (`2 × active_slot_ns`: FT8 30s, FT4 15s, FT2
+/// 6.4s), matching the incident-measured ~20-30s gap between a manual call's
+/// parity latch and its actual key-up. Deliberately independent of
+/// `CrossTimeState::a7_recent_calls`'s own 30s `max_age` — that value is
+/// tuned for hb-048's decoder-correlation purpose, not TX-collision
+/// avoidance, and `get()` doesn't filter by age on read (eviction is lazy,
+/// on the next `record()`), so a caller must apply its own window regardless.
+fn dx_parity_freshness_window(slot_ns: i64) -> std::time::Duration {
+    std::time::Duration::from_nanos(slot_ns.max(0) as u64 * 2)
+}
+
+/// PAN-141: does the DX's most recently observed OWN-TX slot parity (from
+/// [`pancetta_qso::CrossTimeState::a7_recent_calls`] — populated from every
+/// decode this station makes, regardless of QSO relevance) conflict with
+/// `required_parity`, the parity we are about to key into?
+///
+/// A "conflict" means: within the last `freshness_window`, `their_callsign`
+/// was observed transmitting on `required_parity` itself. Since two stations
+/// in QSO must transmit on OPPOSITE parities, a DX transmitting on the exact
+/// slot we're about to use means they're mid-exchange with someone else in
+/// that window — keying now would collide with that exchange, not reach
+/// them. Returns `false` (proceed) on anything short of that positive fresh
+/// signal: no entry for this callsign, an entry older than the freshness
+/// window, or an unreadable (poisoned) table — this gate only ever blocks a
+/// TX on POSITIVE fresh evidence of a collision, never on missing data,
+/// mirroring `tx_qso_is_live`'s own fail-open posture on a poisoned lock.
+fn dx_parity_conflict(
+    their_callsign: &str,
+    required_parity: pancetta_core::slot::SlotParity,
+    cross_time_state: &pancetta_qso::CrossTimeState,
+    now: std::time::SystemTime,
+    freshness_window: std::time::Duration,
+) -> bool {
+    let Ok(a7) = cross_time_state.a7_recent_calls.read() else {
+        return false;
+    };
+    let Some(entry) = a7.get(their_callsign) else {
+        return false;
+    };
+    let Ok(age) = now.duration_since(entry.decoded_at) else {
+        return false;
+    };
+    if age > freshness_window {
+        return false;
+    }
+    let observed = match entry.slot_parity {
+        0 => pancetta_core::slot::SlotParity::Even,
+        _ => pancetta_core::slot::SlotParity::Odd,
+    };
+    observed == required_parity
+}
+
+/// PAN-141: resolves `qso_id` to its established DX callsign via the
+/// restart-safe `qso_manager_watch` handle (re-borrowed fresh here, never
+/// cached across the pre-PTT wait — see PAN-72's `qso_manager_watch` amendment
+/// for why a spawn-time-captured clone would go stale across a supervised Qso
+/// restart), then applies [`dx_parity_conflict`]. Fails open (`false`,
+/// "proceed") at every step short of a resolved, established partner: no
+/// `qso_id` (manual/tune sends never carry a target to check), the Qso
+/// component not up yet, an unparseable id, the QSO not found, or a QSO with
+/// no established `their_callsign` yet (e.g. a still-unpartnered
+/// `CallingCq`) — this only ever gates a TX aimed at a specific, currently-
+/// known station.
+async fn dx_parity_conflict_for_qso(
+    qso_id: Option<&str>,
+    required_parity: pancetta_core::slot::SlotParity,
+    qso_manager_watch: &tokio::sync::watch::Receiver<Option<pancetta_qso::QsoManager>>,
+    cross_time_state: &pancetta_qso::CrossTimeState,
+    freshness_window: std::time::Duration,
+) -> bool {
+    let Some(id_str) = qso_id else {
+        return false;
+    };
+    let Ok(id) = id_str.parse::<pancetta_qso::QsoId>() else {
+        return false;
+    };
+    let Some(manager) = qso_manager_watch.borrow().clone() else {
+        return false;
+    };
+    let Ok(progress) = manager.get_qso(id).await else {
+        return false;
+    };
+    let Some(their_callsign) = progress.metadata.their_callsign else {
+        return false;
+    };
+    dx_parity_conflict(
+        &their_callsign,
+        required_parity,
+        cross_time_state,
+        std::time::SystemTime::now(),
+        freshness_window,
+    )
+}
+
 /// Build the TX-strip status items for a multi-TX bundle, tagging every item
 /// with the SAME `deferred` flag — a bundle either defers as a whole or
 /// doesn't (all its items share one parity/slot, per the bundling logic).
@@ -4825,6 +4920,19 @@ impl super::ApplicationCoordinator {
             // the worker refuses to key PTT for a request whose `qso_id` is no
             // longer present (superseded / cancelled / completed-past-grace).
             let active_tx_qsos = self.active_tx_qsos.clone();
+            // PAN-141: DX-parity freshness check (Step 4b-adjacent, see
+            // `dx_parity_conflict_for_qso`). `cross_time_state` is coordinator-
+            // owned and outlives a supervised Qso-component restart, so a plain
+            // `Arc` clone is safe here (unlike `qso_manager_watch` below).
+            let cross_time_state = self.cross_time_state.clone();
+            // PAN-141: restart-safe `QsoManager` handle, re-subscribed here and
+            // re-borrowed fresh at each Step 4b check (never cached across the
+            // pre-PTT wait) — the same pattern PAN-72 introduced for the
+            // Autonomous task, for the identical reason: this closure's other
+            // captures are spawn-time snapshots, but `Qso` is independently
+            // supervised-restarted, so a spawn-time `QsoManager` clone would
+            // silently point at a dead manager's QSO map after a restart.
+            let qso_manager_watch = self.qso_manager_watch.subscribe();
             // Newest-TX-intent map: at key-time the worker pivots to the
             // freshest message for this QSO if a later decode advanced the
             // exchange while this frame waited out the pre-PTT sleep.
@@ -5685,6 +5793,66 @@ impl super::ApplicationCoordinator {
                                             if let Some(id) = qso_id.as_deref() {
                                                 pivoted_once.remove(&super::active_tx_qso_key(id));
                                             }
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text,
+                                                    duration_ms: 0,
+                                                    qso_id: qso_id.clone(),
+                                                },
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(complete_msg).await;
+                                            continue 'worker;
+                                        }
+
+                                        // --- Step 4b-parity: DX-parity freshness gate (PAN-141) ---
+                                        // Same choke point as Step 4b above (post-sleep,
+                                        // pre-PTT — never against an already-keyed
+                                        // transmission). A manually-latched `tx_parity`
+                                        // reflects the DX's LAST-observed decode at
+                                        // QSO-open time; the ~20-30s wait for the next
+                                        // opposite-parity slot is long enough for a
+                                        // fast-cycling pileup DX to have moved to a
+                                        // different caller on the exact parity we're
+                                        // about to key into. Hold this cycle rather than
+                                        // transmit into a probable collision — never
+                                        // mutates `tx_parity` (the half-duplex single-
+                                        // shared-TX-side invariant across concurrent
+                                        // QSOs stays intact) and never touches QSO state;
+                                        // the QSO's own existing retry/watchdog cadence
+                                        // (`rearm_manual_calls_at`, `manual_call_max_calls`,
+                                        // `report_timeout`) decides what happens next.
+                                        if dx_parity_conflict_for_qso(
+                                            qso_id.as_deref(),
+                                            required_parity,
+                                            &qso_manager_watch,
+                                            &cross_time_state,
+                                            dx_parity_freshness_window(slot_ns),
+                                        )
+                                        .await
+                                        {
+                                            info!(
+                                                target: "pancetta::tx.policy",
+                                                "holding TX for QSO {}: DX observed transmitting on the colliding parity {:?} within the freshness window: '{}'",
+                                                qso_id.as_deref().unwrap_or("?"),
+                                                required_parity,
+                                                message_text
+                                            );
+                                            emit_diagnostic(
+                                                &message_bus,
+                                                "tx.policy",
+                                                pancetta_core::DiagnosticLevel::Info,
+                                                format!(
+                                                "holding TX: DX observed transmitting on the colliding parity {required_parity:?} within the freshness window: '{message_text}'"
+                                            ),
+                                                qso_id.as_deref(),
+                                            )
+                                            .await;
+                                            send_tx_queue_status(&message_bus, None, Vec::new())
+                                                .await;
                                             let complete_msg = ComponentMessage::new(
                                                 ComponentId::Ft8Transmitter,
                                                 ComponentId::Autonomous,
@@ -7860,15 +8028,40 @@ impl super::ApplicationCoordinator {
                                     // Checked against `encoded_qso_ids` (what
                                     // actually made it into the summed waveform),
                                     // not the pre-encode `items` list.
-                                    let live_mask: Vec<bool> = encoded_qso_ids
-                                        .iter()
-                                        .map(|id| tx_qso_is_live(id.as_deref(), &active_tx_qsos))
-                                        .collect();
+                                    // PAN-141: alongside plain liveness, hold any item
+                                    // whose DX was freshly observed transmitting on the
+                                    // exact parity this bundle is about to key into (see
+                                    // `dx_parity_conflict_for_qso`). All items in a bundle
+                                    // share one parity (bundling invariant), so
+                                    // `required_parity` applies uniformly. `parity_hold_mask`
+                                    // is tracked only so the per-item log below can name
+                                    // the right reason; `live_mask` itself keeps its
+                                    // existing "should this item transmit" meaning so
+                                    // every downstream consumer needs no further changes.
+                                    let mut live_mask: Vec<bool> =
+                                        Vec::with_capacity(encoded_qso_ids.len());
+                                    let mut parity_hold_mask: Vec<bool> =
+                                        Vec::with_capacity(encoded_qso_ids.len());
+                                    for id in &encoded_qso_ids {
+                                        let is_live =
+                                            tx_qso_is_live(id.as_deref(), &active_tx_qsos);
+                                        let parity_conflict = is_live
+                                            && dx_parity_conflict_for_qso(
+                                                id.as_deref(),
+                                                required_parity,
+                                                &qso_manager_watch,
+                                                &cross_time_state,
+                                                dx_parity_freshness_window(slot_ns),
+                                            )
+                                            .await;
+                                        parity_hold_mask.push(parity_conflict);
+                                        live_mask.push(is_live && !parity_conflict);
+                                    }
 
                                     if !live_mask.iter().any(|&live| live) {
                                         info!(
                                             target: "pancetta::tx.policy",
-                                            "dropping stale multi-TX bundle: all {} item(s) ended during the pre-PTT wait",
+                                            "dropping stale multi-TX bundle: all {} item(s) ended or held (colliding DX parity) during the pre-PTT wait",
                                             encoded_qso_ids.len()
                                         );
                                         emit_diagnostic(
@@ -7876,7 +8069,7 @@ impl super::ApplicationCoordinator {
                                             "tx.policy",
                                             pancetta_core::DiagnosticLevel::Info,
                                             format!(
-                                                "dropping stale multi-TX bundle: all {} item(s) ended during the pre-PTT wait",
+                                                "dropping stale multi-TX bundle: all {} item(s) ended or held (colliding DX parity) during the pre-PTT wait",
                                                 encoded_qso_ids.len()
                                             ),
                                             None,
@@ -7974,26 +8167,55 @@ impl super::ApplicationCoordinator {
                                         } else {
                                             // Partial staleness: report the dropped item(s), then
                                             // re-encode just the still-live subset.
-                                            for (item, &live) in items.iter().zip(live_mask.iter())
+                                            for ((item, &live), &parity_held) in items
+                                                .iter()
+                                                .zip(live_mask.iter())
+                                                .zip(parity_hold_mask.iter())
                                             {
                                                 if !live {
-                                                    info!(
-                                                        target: "pancetta::tx.policy",
-                                                        "dropping stale multi-TX item at key-time for ended QSO {}: '{}'",
-                                                        item.qso_id.as_deref().unwrap_or("?"),
-                                                        item.message_text
-                                                    );
-                                                    emit_diagnostic(
-                                                        &message_bus,
-                                                        "tx.policy",
-                                                        pancetta_core::DiagnosticLevel::Info,
-                                                        format!(
-                                                            "dropping stale multi-TX item at key-time for ended QSO: '{}'",
+                                                    // PAN-141: distinguish a genuine
+                                                    // stale/ended QSO from a live one held
+                                                    // this cycle for a fresh DX-parity
+                                                    // conflict — same drop mechanics
+                                                    // either way, different reason.
+                                                    if parity_held {
+                                                        info!(
+                                                            target: "pancetta::tx.policy",
+                                                            "holding multi-TX item at key-time for QSO {}: DX observed transmitting on the colliding parity {:?} within the freshness window: '{}'",
+                                                            item.qso_id.as_deref().unwrap_or("?"),
+                                                            required_parity,
                                                             item.message_text
-                                                        ),
-                                                        item.qso_id.as_deref(),
-                                                    )
-                                                    .await;
+                                                        );
+                                                        emit_diagnostic(
+                                                            &message_bus,
+                                                            "tx.policy",
+                                                            pancetta_core::DiagnosticLevel::Info,
+                                                            format!(
+                                                                "holding multi-TX item: DX observed transmitting on the colliding parity {required_parity:?} within the freshness window: '{}'",
+                                                                item.message_text
+                                                            ),
+                                                            item.qso_id.as_deref(),
+                                                        )
+                                                        .await;
+                                                    } else {
+                                                        info!(
+                                                            target: "pancetta::tx.policy",
+                                                            "dropping stale multi-TX item at key-time for ended QSO {}: '{}'",
+                                                            item.qso_id.as_deref().unwrap_or("?"),
+                                                            item.message_text
+                                                        );
+                                                        emit_diagnostic(
+                                                            &message_bus,
+                                                            "tx.policy",
+                                                            pancetta_core::DiagnosticLevel::Info,
+                                                            format!(
+                                                                "dropping stale multi-TX item at key-time for ended QSO: '{}'",
+                                                                item.message_text
+                                                            ),
+                                                            item.qso_id.as_deref(),
+                                                        )
+                                                        .await;
+                                                    }
                                                     let complete_msg = ComponentMessage::new(
                                                         ComponentId::Ft8Transmitter,
                                                         ComponentId::Autonomous,
@@ -9576,6 +9798,230 @@ mod schedule_tx_tests {
             &[None, Some("qso-kenya".to_string())],
             &set
         ));
+    }
+
+    // --- PAN-141: DX-parity freshness gate ---
+
+    fn a7_call(
+        callsign: &str,
+        slot_parity: u8,
+        decoded_at: std::time::SystemTime,
+    ) -> pancetta_qso::A7ExpectedCall {
+        pancetta_qso::A7ExpectedCall {
+            callsign: callsign.to_string(),
+            freq_hz: 1500.0,
+            slot_parity,
+            decoded_at,
+        }
+    }
+
+    #[test]
+    fn dx_parity_conflict_true_when_fresh_and_same_parity() {
+        let cts = pancetta_qso::CrossTimeState::empty();
+        let now = std::time::SystemTime::now();
+        cts.a7_recent_calls
+            .write()
+            .unwrap()
+            .record(a7_call("5Z4VJ", 1 /* Odd */, now));
+
+        // 5Z4VJ was just observed transmitting on Odd — the exact parity we
+        // are about to key into (the PAN-141 collision shape).
+        assert!(super::dx_parity_conflict(
+            "5Z4VJ",
+            SlotParity::Odd,
+            &cts,
+            now,
+            std::time::Duration::from_secs(30),
+        ));
+    }
+
+    #[test]
+    fn dx_parity_conflict_false_when_fresh_and_opposite_parity() {
+        let cts = pancetta_qso::CrossTimeState::empty();
+        let now = std::time::SystemTime::now();
+        cts.a7_recent_calls
+            .write()
+            .unwrap()
+            .record(a7_call("5Z4VJ", 0 /* Even */, now));
+
+        // Still consistent with our latched assumption — proceed.
+        assert!(!super::dx_parity_conflict(
+            "5Z4VJ",
+            SlotParity::Odd,
+            &cts,
+            now,
+            std::time::Duration::from_secs(30),
+        ));
+    }
+
+    #[test]
+    fn dx_parity_conflict_false_when_entry_older_than_freshness_window() {
+        let cts = pancetta_qso::CrossTimeState::empty();
+        let decoded_at = std::time::SystemTime::now() - std::time::Duration::from_secs(45);
+        cts.a7_recent_calls
+            .write()
+            .unwrap()
+            .record(a7_call("5Z4VJ", 1, decoded_at));
+
+        // Same-parity evidence exists but it's stale relative to OUR
+        // freshness window — must not block a genuinely fine transmission.
+        assert!(!super::dx_parity_conflict(
+            "5Z4VJ",
+            SlotParity::Odd,
+            &cts,
+            std::time::SystemTime::now(),
+            std::time::Duration::from_secs(30),
+        ));
+    }
+
+    #[test]
+    fn dx_parity_conflict_false_when_no_entry() {
+        let cts = pancetta_qso::CrossTimeState::empty();
+        assert!(!super::dx_parity_conflict(
+            "UNKNOWN",
+            SlotParity::Odd,
+            &cts,
+            std::time::SystemTime::now(),
+            std::time::Duration::from_secs(30),
+        ));
+    }
+
+    #[test]
+    fn dx_parity_conflict_fails_open_on_poisoned_lock() {
+        let cts = pancetta_qso::CrossTimeState::empty();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = cts.a7_recent_calls.write().unwrap();
+            panic!("poison");
+        }));
+        assert!(cts.a7_recent_calls.is_poisoned());
+        assert!(!super::dx_parity_conflict(
+            "5Z4VJ",
+            SlotParity::Odd,
+            &cts,
+            std::time::SystemTime::now(),
+            std::time::Duration::from_secs(30),
+        ));
+    }
+
+    #[test]
+    fn dx_parity_freshness_window_scales_with_slot_period() {
+        assert_eq!(
+            super::dx_parity_freshness_window(SLOT_NS),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            super::dx_parity_freshness_window(FT4_SLOT_NS),
+            std::time::Duration::from_millis(15_000)
+        );
+    }
+
+    fn test_qso_manager_config() -> pancetta_qso::QsoManagerConfig {
+        pancetta_qso::QsoManagerConfig {
+            our_callsign: "W5AU".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// End-to-end reproduction of the PAN-141 pileup-collision scenario at
+    /// the async resolver level: a DX (5Z4VJ) is decoded working N3UL on
+    /// Even, we manually call them (latching `tx_parity = Odd`), then 5Z4VJ
+    /// is decoded switching to a DIFFERENT caller (NV1U) on Odd — the exact
+    /// parity we're about to key into — inside the freshness window. The
+    /// resolver must report a conflict without ever touching `tx_parity`.
+    #[tokio::test]
+    async fn dx_parity_conflict_for_qso_reproduces_pan_141_pileup_collision() {
+        let manager = pancetta_qso::QsoManager::new(test_qso_manager_config());
+        let qso_id = manager
+            .respond_to_cq_manual("5Z4VJ".to_string(), 1500.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        let before = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(before.metadata.tx_parity, Some(SlotParity::Odd));
+
+        let cts = pancetta_qso::CrossTimeState::empty();
+        let now = std::time::SystemTime::now();
+        // 5Z4VJ decoded moving on to NV1U, now on Odd — our exact target slot.
+        cts.a7_recent_calls
+            .write()
+            .unwrap()
+            .record(a7_call("5Z4VJ", 1, now));
+
+        let (_tx, rx) = tokio::sync::watch::channel(Some(manager.clone()));
+        assert!(
+            super::dx_parity_conflict_for_qso(
+                Some(&qso_id.to_string()),
+                SlotParity::Odd,
+                &rx,
+                &cts,
+                std::time::Duration::from_secs(30),
+            )
+            .await,
+            "must detect the collision: DX just observed on the exact parity we're about to key"
+        );
+
+        // tx_parity must be completely untouched by the check.
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(after.metadata.tx_parity, Some(SlotParity::Odd));
+    }
+
+    /// Control case: the same setup, but 5Z4VJ's second decode has aged past
+    /// the freshness window — must NOT hold (this must not become a blanket
+    /// "never call a pileup DX" gate).
+    #[tokio::test]
+    async fn dx_parity_conflict_for_qso_proceeds_when_second_decode_is_stale() {
+        let manager = pancetta_qso::QsoManager::new(test_qso_manager_config());
+        let qso_id = manager
+            .respond_to_cq_manual("5Z4VJ".to_string(), 1500.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+
+        let cts = pancetta_qso::CrossTimeState::empty();
+        let decoded_at = std::time::SystemTime::now() - std::time::Duration::from_secs(45);
+        cts.a7_recent_calls
+            .write()
+            .unwrap()
+            .record(a7_call("5Z4VJ", 1, decoded_at));
+
+        let (_tx, rx) = tokio::sync::watch::channel(Some(manager));
+        assert!(
+            !super::dx_parity_conflict_for_qso(
+                Some(&qso_id.to_string()),
+                SlotParity::Odd,
+                &rx,
+                &cts,
+                std::time::Duration::from_secs(30),
+            )
+            .await
+        );
+    }
+
+    /// No `qso_id` (manual/tune send) and no live `QsoManager` (Qso component
+    /// not up) both fail open — this gate only ever fires for a specific,
+    /// currently-resolvable target.
+    #[tokio::test]
+    async fn dx_parity_conflict_for_qso_fails_open_without_target_or_manager() {
+        let cts = pancetta_qso::CrossTimeState::empty();
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        assert!(
+            !super::dx_parity_conflict_for_qso(
+                None,
+                SlotParity::Odd,
+                &rx,
+                &cts,
+                std::time::Duration::from_secs(30),
+            )
+            .await
+        );
+        assert!(
+            !super::dx_parity_conflict_for_qso(
+                Some("00000000-0000-0000-0000-000000000000"),
+                SlotParity::Odd,
+                &rx,
+                &cts,
+                std::time::Duration::from_secs(30),
+            )
+            .await
+        );
     }
 
     #[test]

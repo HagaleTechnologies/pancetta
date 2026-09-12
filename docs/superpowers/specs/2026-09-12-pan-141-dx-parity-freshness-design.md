@@ -179,16 +179,14 @@ a new termination path.
   if on-air experience shows operators want a persistent visual cue distinguishing this hold from
   other drop reasons.
 
-## Open questions for sign-off
+## Decisions (signed off by Tony, 2026-09-12)
 
-1. Freshness window: hardcoded `2 × active_slot_ns` (recommended, no new config surface) vs. a new
-   `[qso]`/`[autonomous]` TOML knob. Recommend hardcode — the incident-measured gap (~20-30s at
-   FT8's 15s slot) is exactly `2×`, and PAN-72 established the self-scaling-by-protocol precedent.
-2. Multi-TX bundle scope: include the per-item gate in this same PR (recommended, for symmetry
-   with `tx_qso_is_live`'s own single+multi coverage) vs. defer to a fast-follow scoped to just the
-   single-TX manual-call path the incident actually hit.
-3. Anything beyond the diagnostic-feed log line for operator visibility in v1, or is that
-   sufficient pending on-air validation?
+1. **Freshness window:** hardcoded `2 × active_slot_ns`, no new config surface.
+2. **Multi-TX bundle scope:** include the per-item gate in this same PR, symmetric with
+   `tx_qso_is_live`'s own single+multi coverage.
+3. **Operator visibility:** diagnostic-feed log line only for v1 — no new TUI indicator.
+
+All three per the recommended options above.
 
 ## Testing plan
 
