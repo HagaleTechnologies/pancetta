@@ -473,6 +473,20 @@ pub enum QsoManagerError {
     /// could guarantee.
     #[error("TX-offset action for QSO {qso_id} refused — TX-frequency mode is Hold")]
     OffsetActionHeld { qso_id: QsoId },
+
+    /// PAN-140 (Codex P1 on PR #369): a PTT keyed for the current slot
+    /// AFTER the caller's own pre-commit check (`drain_pending_qso_offset_requests`'s
+    /// top-of-loop guard) but BEFORE this method's write lock was acquired —
+    /// the exact same shape of window `OffsetActionHeld` above closes for
+    /// Hold mode, here closed for PTT. Re-checked here, inside the same
+    /// locked section that would otherwise commit, so a frequency move can
+    /// never land mid-transmission regardless of how the caller's own check
+    /// raced. Expected, not a fault — the caller re-queues the action for
+    /// its next drain tick rather than discarding it.
+    #[error(
+        "TX-offset action for QSO {qso_id} refused — a PTT is already keyed for the current slot"
+    )]
+    OffsetActionPttInFlight { qso_id: QsoId },
 }
 
 impl QsoManagerError {
@@ -490,6 +504,7 @@ impl QsoManagerError {
                 | QsoManagerError::OffsetActionNoOp { .. }
                 | QsoManagerError::OffsetActionOutsideHoundRegion { .. }
                 | QsoManagerError::OffsetActionHeld { .. }
+                | QsoManagerError::OffsetActionPttInFlight { .. }
         )
     }
 }
@@ -1020,6 +1035,17 @@ pub struct QsoManager {
     /// hold-the-frequency behavior.
     tx_freq_mode: Arc<std::sync::atomic::AtomicU8>,
 
+    /// PAN-140 (Codex P1 on PR #369): whether a PTT is currently keyed,
+    /// shared from the coordinator. `apply_tx_offset_switch` re-checks this
+    /// immediately before committing a frequency move — the same
+    /// closest-to-the-mutation pattern as `tx_freq_mode` above — so a stall/
+    /// nudge action can never commit a mid-flight frequency change out from
+    /// under a transmission that keyed between the caller's own check and
+    /// this method's write-lock acquisition. Defaults to `false` (matches
+    /// this method's behavior before PAN-140 existed) so unit tests and any
+    /// caller that never injects a source are unaffected.
+    ptt_active: Arc<std::sync::atomic::AtomicBool>,
+
     /// Global operator TX policy (`pancetta_core::TxPolicy` as `u8`), shared
     /// from the coordinator.
     ///
@@ -1338,6 +1364,9 @@ impl QsoManager {
             tx_freq_mode: Arc::new(std::sync::atomic::AtomicU8::new(
                 pancetta_core::TxFreqMode::Hold.as_u8(),
             )),
+            // Default false: with no injected source, behave exactly as this
+            // method did before PAN-140 existed (see the field's doc comment).
+            ptt_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // Default Full: with no injected source, assume TX is live — the
             // pre-existing behavior (see the field's doc comment).
             tx_policy: Arc::new(std::sync::atomic::AtomicU8::new(
@@ -1381,6 +1410,16 @@ impl QsoManager {
     /// its private `Hold` default (no autonomous frequency changes).
     pub fn set_tx_freq_mode_source(&mut self, source: Arc<std::sync::atomic::AtomicU8>) {
         self.tx_freq_mode = source;
+    }
+
+    /// Share the coordinator's PTT-active atomic (PAN-140) so
+    /// `apply_tx_offset_switch` can refuse to commit a frequency move while a
+    /// PTT is already keyed for the current slot. Pass the same
+    /// `Arc<AtomicBool>` the TX worker sets true/false around each key. If
+    /// never called, the manager keeps its private `false` default (see the
+    /// field's doc comment — matches pre-PAN-140 behavior).
+    pub fn set_ptt_active_source(&mut self, source: Arc<std::sync::atomic::AtomicBool>) {
+        self.ptt_active = source;
     }
 
     /// Share the coordinator's global TX-policy atomic (encoded via
@@ -3582,6 +3621,20 @@ impl QsoManager {
         .allows_auto_change()
         {
             return Err(QsoManagerError::OffsetActionHeld { qso_id });
+        }
+        // 6. **PTT already keyed, re-validated inside this commit** (PAN-140,
+        //    Codex P1 on PR #369). The caller's own pre-commit check
+        //    (`drain_pending_qso_offset_requests`'s top-of-loop guard) runs
+        //    BEFORE the `.await` for this method's write lock — a contended
+        //    lock leaves a real window in which the TX worker keys PTT for
+        //    this exact QSO's rearm after the caller's last check but before
+        //    this commit runs, reopening the same mid-flight collision this
+        //    fix exists to prevent. Re-checking here, inside the SAME locked
+        //    section that is about to mutate `progress`, narrows that window
+        //    to the smallest one achievable without a lock shared with the
+        //    TX worker itself.
+        if self.ptt_active.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(QsoManagerError::OffsetActionPttInFlight { qso_id });
         }
         progress.metadata.frequency = applied_hz;
         progress.metadata.pending_freq_drift = None;
@@ -7358,6 +7411,7 @@ impl Clone for QsoManager {
             dial_frequency_hz: Arc::clone(&self.dial_frequency_hz),
             split_tx_frequency_hz: Arc::clone(&self.split_tx_frequency_hz),
             tx_freq_mode: Arc::clone(&self.tx_freq_mode),
+            ptt_active: Arc::clone(&self.ptt_active),
             tx_policy: Arc::clone(&self.tx_policy),
             remote_tx_permitted: Arc::clone(&self.remote_tx_permitted),
             hamlib_hard_muted: Arc::clone(&self.hamlib_hard_muted),
@@ -9742,6 +9796,57 @@ mod tests {
         assert_eq!(
             after.metadata.pre_switch_offset, before.metadata.pre_switch_offset,
             "no pre-switch-offset bookkeeping may be written for a refused switch"
+        );
+    }
+
+    /// PAN-140 (Codex P1 on PR #369): a PTT that keys AFTER the drain's own
+    /// top-of-loop pre-check but BEFORE this method's write lock is acquired
+    /// must still be caught — the exact same race shape as the Hold test
+    /// above, closed the same way (re-check inside the commit).
+    #[tokio::test]
+    async fn apply_tx_offset_switch_refuses_when_ptt_keys_after_the_request_was_queued() {
+        let mut manager = QsoManager::new(test_config());
+        manager.set_tx_freq_mode_source(Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        let ptt_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        manager.set_ptt_active_source(Arc::clone(&ptt_active));
+
+        let qso_id = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        // The request was raised (queued) while PTT was still idle --
+        // simulated here by keying PTT only AFTER the request was raised,
+        // exactly the race: the queueing decision and this commit are
+        // separated by an `.await` (the write-lock acquisition) the TX
+        // worker can key inside.
+        ptt_active.store(true, std::sync::atomic::Ordering::Release);
+
+        let before = manager.get_qso(qso_id).await.unwrap();
+
+        let err = manager
+            .apply_tx_offset_switch(
+                qso_id,
+                14074000.0 + 500.0,
+                OffsetRelocationOrigin::OperatorForced,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, QsoManagerError::OffsetActionPttInFlight { qso_id: id } if *id == qso_id),
+            "expected OffsetActionPttInFlight, got {err:?}"
+        );
+        assert!(
+            err.is_expected_offset_action_refusal(),
+            "a PTT-in-flight race is an expected refusal, not a fault"
+        );
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.frequency, before.metadata.frequency,
+            "frequency must be completely unchanged"
         );
     }
 

@@ -932,6 +932,7 @@ async fn drain_pending_qso_offset_requests(
     >,
     active_tx_offsets: &std::sync::RwLock<std::collections::HashMap<String, f64>>,
     tx_freq_mode: &std::sync::atomic::AtomicU8,
+    ptt_active: &std::sync::atomic::AtomicBool,
 ) {
     let requests: Vec<_> = std::mem::take(
         &mut *pending_qso_offset_requests
@@ -964,6 +965,10 @@ async fn drain_pending_qso_offset_requests(
             action,
             origin,
         } = request;
+        // PAN-140: `action` below is consumed by-value resolving
+        // `resolved_hz`; keep a clone in case the in-flight-PTT guard further
+        // down needs to re-queue this exact request unresolved.
+        let action_for_requeue = action.clone();
         // Round 2, findings 1 + 2: one authoritative read of the QSO before
         // anything is resolved. It answers two questions the queued action
         // itself cannot: is this a Hound (⇒ the pick is confined to the Hound
@@ -1067,6 +1072,31 @@ async fn drain_pending_qso_offset_requests(
             );
             continue;
         }
+        // PAN-140: a PTT already keyed for the current slot must never be
+        // aborted/re-keyed by a stall/nudge commit that resolves mid-flight —
+        // observed live 2026-09-12 working W6M: a stall-switch committed
+        // 2.8s into an already-in-flight 12.64s transmission, and the
+        // supersede path aborted it and re-keyed at the new frequency
+        // starting 2.8s late into the slot, so neither frame was
+        // slot-aligned. Re-queue rather than discard: this is a real,
+        // still-valid action, just untimely — it will apply cleanly once
+        // this slot's PTT clears, well before the next drain tick.
+        if ptt_active.load(Ordering::Acquire) {
+            info!(
+                target: "tx.freq",
+                qso_id = %qso_id,
+                "PAN-140: deferring TX-offset action — a PTT is already keyed \
+                 for the current slot"
+            );
+            if let Ok(mut pending) = pending_qso_offset_requests.lock() {
+                pending.push(pancetta_qso::qso_manager::OffsetActionRequest {
+                    qso_id,
+                    action: action_for_requeue,
+                    origin,
+                });
+            }
+            continue;
+        }
         match qso_manager
             .apply_tx_offset_switch(qso_id, resolved_hz, origin)
             .await
@@ -1130,6 +1160,28 @@ async fn drain_pending_qso_offset_requests(
                     offset_hz,
                     "PAN-72: no relocation available — QSO stays on its current offset"
                 );
+            }
+            Err(pancetta_qso::QsoManagerError::OffsetActionPttInFlight { .. }) => {
+                // PAN-140 (Codex P1 on PR #369): the caller's own top-of-loop
+                // guard already checks this, but the write lock inside
+                // `apply_tx_offset_switch` can be contended long enough for
+                // PTT to key in between — this is that same race, closed a
+                // moment later. Re-queue exactly like the top-of-loop guard
+                // does, so the action still applies once this slot's PTT
+                // clears, rather than being silently discarded.
+                info!(
+                    target: "tx.freq",
+                    qso_id = %qso_id,
+                    "PAN-140: deferring TX-offset action — a PTT keyed for the \
+                     current slot between this drain's own pre-check and its commit"
+                );
+                if let Ok(mut pending) = pending_qso_offset_requests.lock() {
+                    pending.push(pancetta_qso::qso_manager::OffsetActionRequest {
+                        qso_id,
+                        action: action_for_requeue,
+                        origin,
+                    });
+                }
             }
             Err(err) if err.is_expected_offset_action_refusal() => {
                 // The QSO completed, went terminal, or advanced between the
@@ -1742,6 +1794,15 @@ impl super::ApplicationCoordinator {
         // push-mailbox shape as `pending_autonomous_cq_dispatch_failures`
         // above.
         let pending_qso_offset_requests = self.pending_qso_offset_requests.clone();
+        // PAN-140: the shared PTT-active flag, re-read INSIDE the drain
+        // immediately before commit. A stall/nudge action can be raised while
+        // this QSO's own per-slot rearm has ALREADY keyed PTT for the current
+        // slot (the rearm's regeneration and this drain's commit are two
+        // independent async tasks); committing the frequency change in that
+        // window makes the supersede path abort the in-flight audio and
+        // re-key mid-slot, transmitting neither frame slot-aligned. See
+        // `apply_tx_offset_switch`'s call site below.
+        let ptt_active_for_drain = self.ptt_active.clone();
         // PAN-72 (Codex round 1 on PR #350, finding 6): the shared Hold/Auto
         // atomic, re-read INSIDE the drain at commit time. The operator can
         // press `f` for Hold after an action was queued but before this
@@ -2055,6 +2116,7 @@ impl super::ApplicationCoordinator {
                                     &pending_qso_offset_requests,
                                     &active_tx_offsets,
                                     &tx_freq_mode_for_drain,
+                                    &ptt_active_for_drain,
                                 )
                                 .await;
                             }
@@ -4132,6 +4194,7 @@ mod drain_pending_qso_offset_requests_tests {
             &pending,
             &no_offsets(),
             &auto_mode(),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await;
 
@@ -4149,6 +4212,85 @@ mod drain_pending_qso_offset_requests_tests {
             (progress.metadata.frequency - 1500.0).abs() > f64::EPSILON,
             "Switch must resolve to something other than the avoided 1500 Hz via the allocator, \
              got {}",
+            progress.metadata.frequency
+        );
+    }
+
+    /// PAN-140: observed live 2026-09-12 working W6M — a stall-switch
+    /// committed 2.8s into an already-in-flight 12.64s transmission, and the
+    /// supersede path aborted it and re-keyed at the new frequency starting
+    /// 2.8s late into the slot, so neither frame was slot-aligned. A PTT
+    /// already keyed for the current slot must defer the action (re-queue
+    /// it) rather than let it commit and collide with the in-flight frame.
+    #[tokio::test]
+    async fn an_in_flight_ptt_defers_the_action_instead_of_committing() {
+        let mut op = operator_with_live_allocator();
+        let qso_manager = manager();
+        let qso_id = qso_manager
+            .start_cq(1500.0, None, false, None)
+            .await
+            .expect("start_cq should succeed");
+        let pending = std::sync::Mutex::new(vec![
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                qso_id,
+                pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: 1500.0 },
+            ),
+        ]);
+        let ptt_active = std::sync::atomic::AtomicBool::new(true);
+
+        drain_pending_qso_offset_requests(
+            &mut op,
+            &qso_manager,
+            &pending,
+            &no_offsets(),
+            &auto_mode(),
+            &ptt_active,
+        )
+        .await;
+
+        assert_eq!(
+            pending.lock().unwrap().len(),
+            1,
+            "a request must be re-queued, not dropped, while a PTT is already \
+             in flight for the current slot"
+        );
+        let (_, progress) = qso_manager
+            .get_active_qsos()
+            .await
+            .into_iter()
+            .find(|(id, _)| *id == qso_id)
+            .unwrap();
+        assert!(
+            (progress.metadata.frequency - 1500.0).abs() < f64::EPSILON,
+            "the QSO's frequency must NOT change while a PTT is in flight, got {}",
+            progress.metadata.frequency
+        );
+
+        // Once PTT clears, the re-queued request commits normally on the
+        // next drain — proving this is a defer, not a silent drop.
+        ptt_active.store(false, Ordering::Release);
+        drain_pending_qso_offset_requests(
+            &mut op,
+            &qso_manager,
+            &pending,
+            &no_offsets(),
+            &auto_mode(),
+            &ptt_active,
+        )
+        .await;
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "the re-queued request must drain normally once PTT clears"
+        );
+        let (_, progress) = qso_manager
+            .get_active_qsos()
+            .await
+            .into_iter()
+            .find(|(id, _)| *id == qso_id)
+            .unwrap();
+        assert!(
+            (progress.metadata.frequency - 1500.0).abs() > f64::EPSILON,
+            "the deferred Switch must still resolve once it is allowed to commit, got {}",
             progress.metadata.frequency
         );
     }
@@ -4253,6 +4395,7 @@ mod drain_pending_qso_offset_requests_tests {
             &pending,
             &no_offsets(),
             &auto_mode(),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await;
 
@@ -4299,6 +4442,7 @@ mod drain_pending_qso_offset_requests_tests {
             &pending,
             &no_offsets(),
             &auto_mode(),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await;
 
@@ -4327,6 +4471,7 @@ mod drain_pending_qso_offset_requests_tests {
             &pending,
             &no_offsets(),
             &auto_mode(),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await;
 
@@ -4371,6 +4516,7 @@ mod drain_pending_qso_offset_requests_tests {
             &pending,
             &active_tx_offsets,
             &auto_mode(),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await;
 
@@ -4407,6 +4553,7 @@ mod drain_pending_qso_offset_requests_tests {
             &pending,
             &active_tx_offsets,
             &auto_mode(),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await;
 
@@ -4444,6 +4591,7 @@ mod drain_pending_qso_offset_requests_tests {
             &pending,
             &active_tx_offsets,
             &auto_mode(),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await;
 
@@ -4500,6 +4648,7 @@ mod drain_pending_qso_offset_requests_tests {
             &pending,
             &no_offsets(),
             &hold_mode(),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await;
 
@@ -4608,6 +4757,7 @@ mod drain_pending_qso_offset_requests_tests {
                 &drain_pending,
                 &drain_offsets,
                 &drain_mode,
+                &std::sync::atomic::AtomicBool::new(false),
             )
             .await;
         });
@@ -4697,6 +4847,7 @@ mod drain_pending_qso_offset_requests_tests {
             &pending,
             &no_offsets(),
             &auto_mode(),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await;
 
@@ -4762,6 +4913,7 @@ mod drain_pending_qso_offset_requests_tests {
                 &pending,
                 &no_offsets(),
                 &auto_mode(),
+                &std::sync::atomic::AtomicBool::new(false),
             )
             .await;
 
@@ -4839,6 +4991,7 @@ mod drain_pending_qso_offset_requests_tests {
             &pending,
             &no_offsets(),
             &auto_mode(),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await;
 
@@ -4935,6 +5088,7 @@ mod drain_pending_qso_offset_requests_tests {
             &pending,
             &active_tx_offsets,
             &auto_mode(),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await;
 
@@ -5033,6 +5187,7 @@ mod drain_pending_qso_offset_requests_tests {
             &pending,
             &active_tx_offsets,
             &auto_mode(),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await;
 
@@ -5117,6 +5272,7 @@ mod drain_pending_qso_offset_requests_tests {
             &pending,
             &active_tx_offsets,
             &auto_mode(),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await;
 
@@ -5219,6 +5375,7 @@ mod drain_pending_qso_offset_requests_tests {
             &pending,
             &no_offsets(),
             &auto_mode(),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await;
 
@@ -5275,6 +5432,7 @@ mod drain_pending_qso_offset_requests_tests {
             &pending,
             &no_offsets(),
             &auto_mode(),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await;
 
@@ -5331,6 +5489,7 @@ mod drain_pending_qso_offset_requests_tests {
             &pending,
             &active_tx_offsets,
             &auto_mode(),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await;
 
@@ -5389,6 +5548,7 @@ mod drain_pending_qso_offset_requests_tests {
             &pending,
             &active_tx_offsets,
             &auto_mode(),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await;
 
@@ -5468,6 +5628,7 @@ mod drain_pending_qso_offset_requests_tests {
             &pending,
             &active_tx_offsets,
             &auto_mode(),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await;
 
@@ -5505,6 +5666,7 @@ mod drain_pending_qso_offset_requests_tests {
             &pending,
             &no_offsets(),
             &auto_mode(),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await;
 
@@ -5617,6 +5779,7 @@ mod qso_manager_watch_refresh_tests {
             &pending,
             &no_offsets(),
             &drain_auto_mode(),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await;
 
@@ -5673,6 +5836,7 @@ mod qso_manager_watch_refresh_tests {
             &pending,
             &no_offsets(),
             &drain_auto_mode(),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await;
 
