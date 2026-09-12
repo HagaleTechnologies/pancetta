@@ -1,0 +1,39 @@
+Operate-80x24.txt: UTC visible in header=false
+Hunt-80x24.txt: UTC visible in header=false
+Run-80x24.txt: UTC visible in header=false
+Monitor-80x24.txt: UTC visible in header=false
+Operate-100x30.txt: UTC visible in header=false
+Hunt-100x30.txt: UTC visible in header=false
+Run-100x30.txt: UTC visible in header=false
+Monitor-100x30.txt: UTC visible in header=false
+Operate-132x40.txt: UTC visible in header=true
+Hunt-132x40.txt: UTC visible in header=true
+Run-132x40.txt: UTC visible in header=true
+Monitor-132x40.txt: UTC visible in header=true
+CONFIG minimal station: parsed
+CONFIG documented autonomous toggle: ERROR TOML parse error at line 1, column 1
+  |
+1 | [autonomous]
+  | ^^^^^^^^^^^^
+missing field `slot_parity`
+
+CONFIG minimal UDP toggle: ERROR TOML parse error at line 1, column 1
+  |
+1 | [network.wsjtx_udp]
+  | ^^^^^^^^^^^^^^^^^^^
+missing field `destination`
+
+CONFIG GUIDE same-host UDP recipe: ERROR TOML parse error at line 1, column 1
+  |
+1 | [network.wsjtx_udp]
+  | ^^^^^^^^^^^^^^^^^^^
+missing field `multicast_interface`
+
+CONFIG GUIDE cross-machine UDP recipe: ERROR TOML parse error at line 1, column 1
+  |
+1 | [network.wsjtx_udp]
+  | ^^^^^^^^^^^^^^^^^^^
+missing field `instance_id`
+
+DEFAULT CONFIG: 962 lines
+HELP: 41 keybinding entries
