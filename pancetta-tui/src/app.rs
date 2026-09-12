@@ -264,6 +264,14 @@ pub struct ActiveQsoBanner {
     /// Drives a "HOUND" badge in the QSO-status panel. `false` for all
     /// non-Hound QSOs (additive, no change to existing rendering).
     pub hound: bool,
+    /// PAN-142: candidate frequency (Hz) of a pending, not-yet-confirmed
+    /// DX-frequency-drift relatch. `Some` while the QSO engine has seen the
+    /// DX once at a new frequency but is waiting on a second confirming
+    /// sighting before trusting it (see
+    /// `ActiveQsoSnapshotItem::pending_freq_drift_hz`).
+    pub pending_freq_drift_hz: Option<f64>,
+    /// When the pending drift candidate above was first noted.
+    pub pending_freq_drift_since: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// One entry in the cross-parity manual-call queue, pushed to the TUI as
@@ -375,6 +383,11 @@ pub struct QsoStatus {
     /// `true` when this QSO is using the FT8 DXpedition Hound procedure.
     /// Drives the "HOUND" badge in the QSO-status detail panel.
     pub hound: bool,
+    /// PAN-142: candidate frequency (Hz) of a pending, unconfirmed
+    /// DX-frequency-drift relatch. `None` when no drift candidate pending.
+    pub pending_freq_drift_hz: Option<f64>,
+    /// When the pending drift candidate above was first noted.
+    pub pending_freq_drift_since: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2748,6 +2761,8 @@ impl App {
                 watchdog_deadline: q.watchdog_deadline,
                 dx_last_activity: q.dx_last_activity.clone(),
                 hound: q.hound,
+                pending_freq_drift_hz: q.pending_freq_drift_hz,
+                pending_freq_drift_since: q.pending_freq_drift_since,
             })
             .collect();
         self.active_qsos = qsos;
@@ -5018,6 +5033,8 @@ mod tests {
             watchdog_deadline: None,
             dx_last_activity: None,
             hound: false,
+            pending_freq_drift_hz: None,
+            pending_freq_drift_since: None,
         }
     }
 

@@ -282,6 +282,8 @@ mod tests {
             dx_last_activity: Some("\u{2192} us -12".into()),
             started_at: Utc::now(),
             hound: false,
+            pending_freq_drift_hz: None,
+            pending_freq_drift_since: None,
         }
     }
 

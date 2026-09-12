@@ -621,6 +621,17 @@ pub struct ActiveQsoSnapshotItem {
     /// call low (300–900 Hz), QSY up (>1000 Hz) on the Fox's report,
     /// complete on RR73. Additive — `false` for all normal QSOs.
     pub hound: bool,
+    /// PAN-142: candidate frequency (Hz) of a pending, not-yet-confirmed
+    /// DX-frequency-drift relatch (`QsoMetadata::pending_freq_drift`,
+    /// `maybe_confirm_frequency_drift_at`'s two-strike anti-spoof
+    /// mechanism). `Some` only while a single off-frequency sighting is
+    /// waiting on a second, >=5s-later confirming sighting at the same
+    /// frequency before the QSO engine will trust and relatch to it.
+    /// `None` when no drift candidate is pending.
+    pub pending_freq_drift_hz: Option<f64>,
+    /// When the pending drift candidate above was first noted. Paired with
+    /// `pending_freq_drift_hz`; always `Some` exactly when that is.
+    pub pending_freq_drift_since: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// One entry in the cross-parity manual-call queue (#40), included in

@@ -2936,6 +2936,8 @@ fn map_qso_snapshot_item(
         watchdog_deadline: q.watchdog_deadline,
         dx_last_activity: q.dx_last_activity.clone(),
         hound: q.hound,
+        pending_freq_drift_hz: q.pending_freq_drift_hz,
+        pending_freq_drift_since: q.pending_freq_drift_since,
     }
 }
 
@@ -4678,9 +4680,13 @@ mod tui_relay_tests {
             watchdog_deadline: Some(started + chrono::Duration::minutes(5)),
             dx_last_activity: None,
             hound: false,
+            pending_freq_drift_hz: Some(937.5),
+            pending_freq_drift_since: Some(started),
         };
         let banner = map_qso_snapshot_item(&item);
         assert_eq!(banner.qso_id, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(banner.pending_freq_drift_hz, Some(937.5));
+        assert_eq!(banner.pending_freq_drift_since, Some(started));
         assert_eq!(banner.initiated_by, "Manual");
         assert_eq!(banner.ladder_index, 1);
         assert_eq!(banner.now_line, "waiting");
@@ -4736,6 +4742,8 @@ mod tui_relay_tests {
             watchdog_deadline: None,
             dx_last_activity: None,
             hound: false,
+            pending_freq_drift_hz: None,
+            pending_freq_drift_since: None,
         };
         let banner = map_qso_snapshot_item(&item);
         assert!(banner.last_tx_text.is_none());

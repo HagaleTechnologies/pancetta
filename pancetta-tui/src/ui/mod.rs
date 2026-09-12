@@ -2104,6 +2104,8 @@ mod view_render_tests {
             watchdog_deadline: None,
             dx_last_activity: None,
             hound: false,
+            pending_freq_drift_hz: None,
+            pending_freq_drift_since: None,
         }
     }
 

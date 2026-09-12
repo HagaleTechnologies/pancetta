@@ -595,6 +595,22 @@ fn render_tx_rx_status(f: &mut Frame<'_>, area: Rect, app: &App) {
         )));
     }
 
+    // PAN-142: a pending frequency-drift candidate is otherwise invisible —
+    // the auto-sequence keeps silently re-sending the same message either
+    // way, whether this is about to self-heal in the next slot or two, or
+    // is genuinely stuck. Surfacing it lets the operator make an informed
+    // choice instead of guessing whether to intervene.
+    if let Some(hz) = qso.pending_freq_drift_hz {
+        let since = qso
+            .pending_freq_drift_since
+            .map(|t| format!(", {}", format_time_ago(t)))
+            .unwrap_or_default();
+        lines.push(Line::from(Span::styled(
+            format!("Drift candidate: {hz:.0} Hz, confirming{since}"),
+            Style::default().fg(app.theme.warning_color()),
+        )));
+    }
+
     let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, area);
 }
