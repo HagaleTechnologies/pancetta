@@ -151,17 +151,16 @@ fn render_multi_qso_table(f: &mut Frame<'_>, area: Rect, app: &App) {
                 Style::default().fg(app.theme.foreground_color()),
             ),
         ];
-        // Batch 2 #1: keep-calling watchdog ("Call 4/10 · stops 3:12") so a
-        // keep-calling QSO never reads as an infinite loop in the table.
-        if let Some(text) = watchdog_line(qso.call_count, qso.max_calls, qso.watchdog_deadline) {
-            row.push(Span::styled(
-                format!("  {}", text),
-                Style::default()
-                    .fg(app.theme.warning_color())
-                    .add_modifier(Modifier::BOLD),
-            ));
-        }
-        // Hound-mode badge in the table row.
+        // PAN-142 (Codex P1 on PR #371, round 4): fixed-width status badges
+        // (Hound, drift candidate) go BEFORE the variable-width watchdog
+        // text, not after — in the default 120-column layout this table's
+        // fixed columns already consume ~51 of its ~70 inner columns, and a
+        // normal "Call 4/25 · stops 3:12" watchdog suffix pushes anything
+        // appended after it past the right edge. A manual RespondingToCq/
+        // SendingReport QSO can carry BOTH a watchdog and a drift candidate
+        // at once, so a badge placed after it would stay invisible during
+        // exactly the supported multi-stream operation this indicator exists
+        // for. Hound-mode badge in the table row.
         if qso.hound {
             row.push(Span::styled(
                 " [HOUND]",
@@ -171,18 +170,26 @@ fn render_multi_qso_table(f: &mut Frame<'_>, area: Rect, app: &App) {
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        // PAN-142 (Codex P1 on PR #371): the multi-QSO table is a wholly
-        // separate render path from the single-QSO detail view above, so the
-        // drift-candidate indicator added there is invisible here — during
-        // concurrent/multi-stream operation (this project's supported mode
-        // for `max_concurrent_qsos > 1`), the feature would never be seen at
-        // all. Compact badge, same visual family as [HOUND].
+        // Drift-candidate badge — see the module-level PAN-142 doc comment
+        // above for why this must precede, not follow, the watchdog text.
         if let Some(hz) = qso.pending_freq_drift_hz {
             row.push(Span::styled(
                 format!(" [DRIFT {hz:.0}Hz]"),
                 Style::default()
                     .fg(Color::Black)
                     .bg(app.theme.warning_color())
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        // Batch 2 #1: keep-calling watchdog ("Call 4/10 · stops 3:12") so a
+        // keep-calling QSO never reads as an infinite loop in the table.
+        // Variable-width and can run long, so it goes last — after both
+        // fixed-width badges above, not before.
+        if let Some(text) = watchdog_line(qso.call_count, qso.max_calls, qso.watchdog_deadline) {
+            row.push(Span::styled(
+                format!("  {}", text),
+                Style::default()
+                    .fg(app.theme.warning_color())
                     .add_modifier(Modifier::BOLD),
             ));
         }
