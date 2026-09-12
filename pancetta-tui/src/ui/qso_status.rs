@@ -169,6 +169,21 @@ fn render_multi_qso_table(f: &mut Frame<'_>, area: Rect, app: &App) {
                     .add_modifier(Modifier::BOLD),
             ));
         }
+        // PAN-142 (Codex P1 on PR #371): the multi-QSO table is a wholly
+        // separate render path from the single-QSO detail view above, so the
+        // drift-candidate indicator added there is invisible here — during
+        // concurrent/multi-stream operation (this project's supported mode
+        // for `max_concurrent_qsos > 1`), the feature would never be seen at
+        // all. Compact badge, same visual family as [HOUND].
+        if let Some(hz) = qso.pending_freq_drift_hz {
+            row.push(Span::styled(
+                format!(" [DRIFT {hz:.0}Hz]"),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(app.theme.warning_color())
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         lines.push(Line::from(row));
     }
 
