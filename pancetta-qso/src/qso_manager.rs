@@ -1056,20 +1056,27 @@ pub struct QsoManager {
     /// writers share a lock with this method's own `qsos` write lock. This
     /// gate is that shared lock: `apply_tx_offset_switch` takes it (after
     /// already holding `qsos.write()`, never before — see the design spec
-    /// for the lock-ordering argument) around its guard-5/guard-6 recheck
-    /// and the frequency mutation itself, and the three writers above take
-    /// it around their own store. No `.await` ever occurs while held, so a
-    /// blocking `std::sync::Mutex` is correct and needs no async plumbing
-    /// through `PttGuard::new` or the TUI-relay handlers. The guarded type
-    /// is `()` — there is no data invariant a poisoning panic could
-    /// corrupt, only the mutual-exclusion property, which recovery via
-    /// `into_inner()` preserves — so every acquisition site recovers from
-    /// poison rather than propagating it. Defaults to a private, fresh
-    /// mutex so unit tests and any caller that never injects a source are
-    /// unaffected (uncontended lock, same behavior as before this field
-    /// existed). See `docs/superpowers/specs/
+    /// for the lock-ordering argument) and holds it from the guard-5/
+    /// guard-6 recheck through the frequency mutation AND the resulting
+    /// `TxOffsetApplied`/one-shot-retransmit `MessageToSend` emission —
+    /// releasing it any earlier (round 3, Codex P1) would let the TX
+    /// worker key PTT for an already-queued, now-stale request in the gap
+    /// between "frequency committed" and "new intent published",
+    /// reopening the exact class of race this exists to close, just moved
+    /// later in the function. The three writers above take it around
+    /// their own store. Because the critical section now spans this
+    /// method's own `.await` points (the event emissions), this MUST be
+    /// an async-aware `tokio::sync::Mutex`, not a blocking
+    /// `std::sync::Mutex` — holding a blocking lock across an `.await`
+    /// would be a real hazard, not just a lint. `PttGuard::new` and the
+    /// TUI-relay handlers become `async fn`/`.await` this store
+    /// accordingly. `tokio::sync::Mutex::lock` is infallible (no
+    /// poisoning to recover from, unlike `std::sync::Mutex`). Defaults to
+    /// a private, fresh mutex so unit tests and any caller that never
+    /// injects a source are unaffected (uncontended lock, same behavior
+    /// as before this field existed). See `docs/superpowers/specs/
     /// 2026-09-12-pan-143-ptt-shared-synchronization-design.md`.
-    ptt_sync_gate: Arc<std::sync::Mutex<()>>,
+    ptt_sync_gate: Arc<tokio::sync::Mutex<()>>,
 
     /// Global operator TX policy (`pancetta_core::TxPolicy` as `u8`), shared
     /// from the coordinator.
@@ -1395,7 +1402,7 @@ impl QsoManager {
             // Default a fresh, private, uncontended mutex: with no injected
             // source, behave exactly as this method did before PAN-143
             // existed (see the field's doc comment).
-            ptt_sync_gate: Arc::new(std::sync::Mutex::new(())),
+            ptt_sync_gate: Arc::new(tokio::sync::Mutex::new(())),
             // Default Full: with no injected source, assume TX is live — the
             // pre-existing behavior (see the field's doc comment).
             tx_policy: Arc::new(std::sync::atomic::AtomicU8::new(
@@ -1452,15 +1459,16 @@ impl QsoManager {
     }
 
     /// Share the coordinator's PTT/offset-switch synchronization gate
-    /// (PAN-143) so `apply_tx_offset_switch`'s recheck-then-commit is
-    /// genuinely atomic against the TX worker's `ptt_active` store and the
-    /// TUI-relay task's `tx_freq_mode` stores, instead of merely narrowing
-    /// the race between them. Pass the same `Arc<Mutex<()>>` those sites
-    /// take. If never called, the manager keeps its own private, always-
-    /// uncontended mutex (see the field's doc comment — matches pre-PAN-143
-    /// behavior, since nothing else could be racing a lock nobody else
-    /// holds a reference to).
-    pub fn set_ptt_sync_gate_source(&mut self, source: Arc<std::sync::Mutex<()>>) {
+    /// (PAN-143) so `apply_tx_offset_switch`'s recheck-through-publish
+    /// span is genuinely atomic against the TX worker's `ptt_active`
+    /// store and the TUI-relay task's `tx_freq_mode` stores, instead of
+    /// merely narrowing the race between them. Pass the same
+    /// `Arc<tokio::sync::Mutex<()>>` those sites take. If never called,
+    /// the manager keeps its own private, always-uncontended mutex (see
+    /// the field's doc comment — matches pre-PAN-143 behavior, since
+    /// nothing else could be racing a lock nobody else holds a reference
+    /// to).
+    pub fn set_ptt_sync_gate_source(&mut self, source: Arc<tokio::sync::Mutex<()>>) {
         self.ptt_sync_gate = source;
     }
 
@@ -3704,29 +3712,35 @@ impl QsoManager {
         //    can only narrow, not close, the window against the TX worker's
         //    `PttGuard::new` store. `ptt_sync_gate` closes it.
         //
-        // Both guards, and the mutation they gate, run inside one
-        // acquisition of `ptt_sync_gate` — acquired AFTER `self.qsos.write()`
-        // above (never before: see the design spec's lock-ordering
-        // argument), held only across synchronous statements (no `.await`
-        // anywhere in this block), and dropped via normal scope exit on
-        // every path (including the two early returns) before this
-        // function's own later `.await` points.
+        // Both guards, the mutation they gate, AND the resulting
+        // `TxOffsetApplied`/one-shot-retransmit `MessageToSend` emission
+        // near the end of this function all run under one acquisition of
+        // `ptt_sync_gate` — acquired AFTER `self.qsos.write()` above
+        // (never before: see the design spec's lock-ordering argument),
+        // held all the way to the end of the function (including across
+        // this method's own `.await` emit points — an async-aware
+        // `tokio::sync::Mutex`, not a blocking one, exists precisely so
+        // this is safe), and dropped only on function return (every early
+        // return above this point releases it too, via normal scope
+        // exit). Round 3 (Codex P1): releasing it right after the
+        // mutation, before the resulting intent was published, left a
+        // gap in which the TX worker could key PTT for an already-queued,
+        // now-stale request — reopening the exact race this exists to
+        // close, just moved later in the function.
+        let _ptt_sync = self.ptt_sync_gate.lock().await;
+        if !pancetta_core::TxFreqMode::from_u8(
+            self.tx_freq_mode.load(std::sync::atomic::Ordering::Relaxed),
+        )
+        .allows_auto_change()
         {
-            let _ptt_sync = self.ptt_sync_gate.lock().unwrap_or_else(|p| p.into_inner());
-            if !pancetta_core::TxFreqMode::from_u8(
-                self.tx_freq_mode.load(std::sync::atomic::Ordering::Relaxed),
-            )
-            .allows_auto_change()
-            {
-                return Err(QsoManagerError::OffsetActionHeld { qso_id });
-            }
-            if self.ptt_active.load(std::sync::atomic::Ordering::Acquire) {
-                return Err(QsoManagerError::OffsetActionPttInFlight { qso_id });
-            }
-            progress.metadata.frequency = applied_hz;
-            progress.metadata.pending_freq_drift = None;
-            progress.metadata.stall_cycles = 0;
+            return Err(QsoManagerError::OffsetActionHeld { qso_id });
         }
+        if self.ptt_active.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(QsoManagerError::OffsetActionPttInFlight { qso_id });
+        }
+        progress.metadata.frequency = applied_hz;
+        progress.metadata.pending_freq_drift = None;
+        progress.metadata.stall_cycles = 0;
         // PAN-72 (Codex round 4 on PR #350, finding 3): remember the offset we
         // are vacating, and when. The frame that triggered this move went out
         // on it — `rearm_manual_calls_at` re-sends and trips the stall
@@ -9945,29 +9959,29 @@ mod tests {
     /// test proves the gate is real mutual exclusion, not just another
     /// atomic.
     ///
-    /// Uses an explicit two-channel handshake, not a sleep-based head
-    /// start (Codex round 1 on this PR, P2: a fixed delay can't
-    /// distinguish "the gate genuinely serializes" from "the scheduler
-    /// happened to run things in the lucky order" — a 10ms sleep either
-    /// side of the real timing could flip the outcome either way,
-    /// independent of whether the gate exists at all). `ptt_task` proves
-    /// (via `gate_held_rx`) that it holds `ptt_sync_gate` BEFORE storing
-    /// `ptt_active`, and does not store/release until told to (via
-    /// `proceed_tx`) — so for the entire window between those two
-    /// channel operations, `apply_tx_offset_switch`'s own
-    /// `ptt_sync_gate.lock()` is *structurally* unable to succeed,
-    /// regardless of how the scheduler interleaves the two tasks. Once
-    /// `proceed_tx` fires, `ptt_task` stores `true` and only then drops
-    /// the guard — so whenever `apply_tx_offset_switch`'s lock attempt
-    /// does succeed (before or after that point), it is guaranteed by the
-    /// mutex's own happens-before semantics to observe the post-store
-    /// value, not a stale one. `#[tokio::test(flavor = "multi_thread")]`
-    /// is required: `apply_tx_offset_switch` is spawned as its own task
-    /// so it can sit genuinely blocked in a synchronous
-    /// `std::sync::Mutex::lock()` call while the main test task is still
-    /// running — a single-worker-thread runtime would deadlock here
-    /// instead.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// Uses an explicit handshake via `tokio::sync::oneshot`, not a
+    /// sleep-based head start (Codex round 1 on this PR, P2: a fixed
+    /// delay can't distinguish "the gate genuinely serializes" from "the
+    /// scheduler happened to run things in the lucky order"). `ptt_task`
+    /// proves (via `gate_held_tx`) that it holds `ptt_sync_gate` BEFORE
+    /// storing `ptt_active`, and does not store/release until told to
+    /// (via `proceed_tx`) — so for the entire window between those two
+    /// signals, `apply_tx_offset_switch`'s own `ptt_sync_gate.lock()`
+    /// (now `tokio::sync::Mutex`, matching production since round 3 needs
+    /// the gate held across this method's own `.await` emit points) is
+    /// *structurally* unable to succeed, regardless of scheduling. The
+    /// `!apply_handle.is_finished()` assertion (Codex round 2, P2) proves
+    /// `apply_handle` actually reached and is blocked on that lock attempt,
+    /// not merely that it hasn't been scheduled yet — a regression that
+    /// removed the gate would let it run to completion almost immediately
+    /// once polled, well before `proceed_tx` fires, since a bare atomic
+    /// check has nothing to block on.
+    ///
+    /// Purely `.await`-based (no OS-thread blocking anywhere), so the
+    /// default single-threaded `#[tokio::test]` runtime suffices — tokio's
+    /// scheduler interleaves separately spawned tasks at their own await
+    /// points regardless of worker-thread count.
+    #[tokio::test]
     async fn apply_tx_offset_switch_blocks_on_the_sync_gate_until_a_concurrent_ptt_assert_completes(
     ) {
         let mut manager = QsoManager::new(test_config());
@@ -9976,7 +9990,7 @@ mod tests {
         )));
         let ptt_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
         manager.set_ptt_active_source(Arc::clone(&ptt_active));
-        let ptt_sync_gate = Arc::new(std::sync::Mutex::new(()));
+        let ptt_sync_gate = Arc::new(tokio::sync::Mutex::new(()));
         manager.set_ptt_sync_gate_source(Arc::clone(&ptt_sync_gate));
 
         let qso_id = manager
@@ -9984,21 +9998,21 @@ mod tests {
             .await
             .unwrap();
 
-        let (gate_held_tx, gate_held_rx) = std::sync::mpsc::channel::<()>();
-        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel::<()>();
+        let (gate_held_tx, gate_held_rx) = tokio::sync::oneshot::channel::<()>();
+        let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel::<()>();
 
         // Simulate `PttGuard::new`'s critical section directly: acquire
         // the gate, prove it (before touching `ptt_active` at all), then
         // wait for explicit permission before storing and releasing.
         let gate_for_ptt_task = Arc::clone(&ptt_sync_gate);
         let ptt_active_for_task = Arc::clone(&ptt_active);
-        let ptt_task = tokio::task::spawn_blocking(move || {
-            let _guard = gate_for_ptt_task.lock().unwrap_or_else(|p| p.into_inner());
+        let ptt_task = tokio::spawn(async move {
+            let _guard = gate_for_ptt_task.lock().await;
             gate_held_tx
                 .send(())
                 .expect("test harness: receiver dropped before the gate-held handshake");
             proceed_rx
-                .recv()
+                .await
                 .expect("test harness: sender dropped before the proceed handshake");
             ptt_active_for_task.store(true, std::sync::atomic::Ordering::Release);
             // `_guard` drops here, releasing the gate only now.
@@ -10009,7 +10023,7 @@ mod tests {
         // acquire `ptt_sync_gate` elsewhere is structurally unable to
         // succeed.
         gate_held_rx
-            .recv()
+            .await
             .expect("ptt_task must signal gate-held before this point");
 
         // Spawn the method under test concurrently — its own
@@ -10025,11 +10039,7 @@ mod tests {
                 .await
         });
         // Give the scheduler many chances to actually poll `apply_handle`
-        // up to its (currently unavailable) lock attempt. On the
-        // multi-threaded runtime this test requires, a freshly spawned
-        // task is picked up by the other worker thread essentially
-        // immediately rather than waiting for this task to yield, so
-        // this reliably lets it run far enough to genuinely block.
+        // up to its (currently unavailable) lock attempt.
         for _ in 0..64 {
             tokio::task::yield_now().await;
         }
@@ -10070,6 +10080,64 @@ mod tests {
         assert_eq!(
             after.metadata.frequency, before.metadata.frequency,
             "a genuinely-serialized refusal must leave the frequency untouched"
+        );
+    }
+
+    /// PAN-143 round 3 (Codex P1): `apply_tx_offset_switch` must not
+    /// release `ptt_sync_gate` between committing the frequency mutation
+    /// and publishing the resulting `TxOffsetApplied`/one-shot-retransmit
+    /// `MessageToSend` events — releasing it any earlier would let the TX
+    /// worker key PTT for an already-queued, now-stale request in that
+    /// gap. Proven the same way as the test above: hold `ptt_sync_gate`
+    /// externally (simulating a concurrent `PttGuard::new`) across the
+    /// entire span of an operator-forced `CallingCq` nudge (which takes
+    /// the one-shot-retransmit path, exercising the code after the old,
+    /// too-early release point) and confirm the call is still blocked —
+    /// not just at the commit, but all the way through where the second
+    /// `MessageToSend` would be emitted.
+    #[tokio::test]
+    async fn apply_tx_offset_switch_holds_the_gate_through_event_publication_not_just_the_commit() {
+        let mut manager = auto_manager(test_config());
+        let ptt_sync_gate = Arc::new(tokio::sync::Mutex::new(()));
+        manager.set_ptt_sync_gate_source(Arc::clone(&ptt_sync_gate));
+        let mut events = manager.subscribe();
+
+        let qso_id = manager.start_cq(1500.0, None, false, None).await.unwrap();
+        let _ = drain(&mut events); // the initial CQ MessageToSend start_cq itself emits
+
+        // Hold the gate externally, standing in for a concurrent
+        // `PttGuard::new` that won the race to acquire it first.
+        let held = Arc::clone(&ptt_sync_gate);
+        let guard = held.lock_owned().await;
+
+        let manager_for_apply = manager.clone();
+        let apply_handle = tokio::spawn(async move {
+            manager_for_apply
+                .apply_tx_offset_switch(qso_id, 1800.0, OffsetRelocationOrigin::OperatorForced)
+                .await
+        });
+
+        // Give the scheduler ample opportunity to run `apply_handle` all
+        // the way up to (and including an attempt past) the commit — if
+        // the gate were released right after the mutation (the round-3
+        // bug), this would be more than enough time for the rest of the
+        // function, including both event emissions, to complete.
+        for _ in 0..256 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            !apply_handle.is_finished(),
+            "apply_tx_offset_switch must remain blocked on ptt_sync_gate through its own \
+             TxOffsetApplied/MessageToSend publication, not just through the frequency commit — \
+             if this fires, the gate is being released too early (PAN-143 round 3)"
+        );
+
+        drop(guard);
+        let result = apply_handle.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "the call should succeed once the externally-held gate is released: {result:?}"
         );
     }
 

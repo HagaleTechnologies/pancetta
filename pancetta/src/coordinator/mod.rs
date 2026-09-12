@@ -1256,7 +1256,7 @@ pub struct ApplicationCoordinator {
     /// round 2 found. Guards a unit value; only the mutual exclusion matters.
     /// See `docs/superpowers/specs/
     /// 2026-09-12-pan-143-ptt-shared-synchronization-design.md`.
-    pub(crate) ptt_sync_gate: Arc<std::sync::Mutex<()>>,
+    pub(crate) ptt_sync_gate: Arc<tokio::sync::Mutex<()>>,
 
     /// Epoch-ms timestamp of the most recent PTT-on (updated alongside
     /// `ptt_active` going true). Unlike the boolean, this survives past
@@ -2003,7 +2003,7 @@ impl ApplicationCoordinator {
             fox_mode: Arc::new(AtomicBool::new(false)),
             fox_max_streams: Arc::new(AtomicUsize::new(fox_max_streams_init)),
             ptt_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            ptt_sync_gate: Arc::new(std::sync::Mutex::new(())),
+            ptt_sync_gate: Arc::new(tokio::sync::Mutex::new(())),
             last_ptt_on_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             // C9 dedup anchor — no pancetta-initiated frequency command yet.
             last_freq_command: Arc::new(std::sync::Mutex::new(None)),

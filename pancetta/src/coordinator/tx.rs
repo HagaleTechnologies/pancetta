@@ -1993,19 +1993,25 @@ struct PttGuard {
 impl PttGuard {
     /// `ptt_sync_gate` (PAN-143) makes the `ptt_active` store below mutually
     /// exclusive with `pancetta_qso::QsoManager::apply_tx_offset_switch`'s
-    /// recheck of the same flag — closing, not just narrowing, the race
-    /// PAN-140 round 2 found. See that gate's doc comment and
-    /// `docs/superpowers/specs/2026-09-12-pan-143-ptt-shared-synchronization-
-    /// design.md`. No `.await` occurs while it is held, so this stays a
-    /// plain (non-`async`) constructor.
-    fn new(
+    /// recheck-through-publish span — closing, not just narrowing, the race
+    /// PAN-140 round 2 found (and round 3's finding that releasing too early
+    /// reopens it further down the same function). See that gate's doc
+    /// comment and `docs/superpowers/specs/
+    /// 2026-09-12-pan-143-ptt-shared-synchronization-design.md`. An
+    /// async-aware `tokio::sync::Mutex` — round 3 requires the QSO-manager
+    /// side to hold the gate across its own `.await` event-emission points,
+    /// which a blocking `std::sync::Mutex` cannot safely do — so this
+    /// constructor is `async` accordingly; the wait here is expected to be
+    /// negligible (the QSO-manager side never does I/O or hardware calls
+    /// while holding it, only channel sends).
+    async fn new(
         message_bus: MessageBus,
         ptt_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        ptt_sync_gate: &std::sync::Arc<std::sync::Mutex<()>>,
+        ptt_sync_gate: &std::sync::Arc<tokio::sync::Mutex<()>>,
         last_ptt_on_ms: &std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         {
-            let _ptt_sync = ptt_sync_gate.lock().unwrap_or_else(|p| p.into_inner());
+            let _ptt_sync = ptt_sync_gate.lock().await;
             ptt_active.store(true, std::sync::atomic::Ordering::Release);
         }
         last_ptt_on_ms.store(super::now_epoch_ms(), std::sync::atomic::Ordering::Release);
@@ -6026,7 +6032,8 @@ impl super::ApplicationCoordinator {
                                             ptt_active.clone(),
                                             &ptt_sync_gate,
                                             &last_ptt_on_ms,
-                                        );
+                                        )
+                                        .await;
                                         // TX badge on; guard drop clears it on every
                                         // exit path (complete / abort / shutdown).
                                         let _tx_status_guard =
@@ -8328,7 +8335,8 @@ impl super::ApplicationCoordinator {
                                         ptt_active.clone(),
                                         &ptt_sync_gate,
                                         &last_ptt_on_ms,
-                                    );
+                                    )
+                                    .await;
                                     // TX badge on; guard drop clears it on every
                                     // exit path (complete / abort / shutdown).
                                     let _tx_status_guard = TxStatusGuard::new(message_bus.clone());
@@ -9048,7 +9056,8 @@ impl super::ApplicationCoordinator {
                                         ptt_active.clone(),
                                         &ptt_sync_gate,
                                         &last_ptt_on_ms,
-                                    );
+                                    )
+                                    .await;
                                     // TX badge on; guard drop clears it on every
                                     // exit path (complete / abort / shutdown).
                                     let _tx_status_guard = TxStatusGuard::new(message_bus.clone());

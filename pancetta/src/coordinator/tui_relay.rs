@@ -1822,8 +1822,7 @@ impl super::ApplicationCoordinator {
                             // `apply_tx_offset_switch` recheck of the same
                             // atomic, closing (not just narrowing) that race.
                             {
-                                let _ptt_sync =
-                                    cmd_ptt_sync_gate.lock().unwrap_or_else(|p| p.into_inner());
+                                let _ptt_sync = cmd_ptt_sync_gate.lock().await;
                                 cmd_tx_freq_mode_generation.fetch_add(1, Ordering::SeqCst);
                                 cmd_tx_freq_mode.store(next.as_u8(), Ordering::SeqCst);
                             }
@@ -1855,9 +1854,7 @@ impl super::ApplicationCoordinator {
                                     // PAN-143: also under `cmd_ptt_sync_gate`
                                     // -- see ToggleTxFreqMode's PAN-143 note.
                                     {
-                                        let _ptt_sync = cmd_ptt_sync_gate
-                                            .lock()
-                                            .unwrap_or_else(|p| p.into_inner());
+                                        let _ptt_sync = cmd_ptt_sync_gate.lock().await;
                                         cmd_tx_freq_mode_generation.fetch_add(1, Ordering::SeqCst);
                                         cmd_tx_freq_mode.store(
                                             pancetta_core::TxFreqMode::Hold.as_u8(),
@@ -1884,9 +1881,7 @@ impl super::ApplicationCoordinator {
                                     // PAN-143: also under `cmd_ptt_sync_gate`
                                     // -- see ToggleTxFreqMode's PAN-143 note.
                                     {
-                                        let _ptt_sync = cmd_ptt_sync_gate
-                                            .lock()
-                                            .unwrap_or_else(|p| p.into_inner());
+                                        let _ptt_sync = cmd_ptt_sync_gate.lock().await;
                                         cmd_tx_freq_mode_generation.fetch_add(1, Ordering::SeqCst);
                                         cmd_tx_freq_mode.store(
                                             pancetta_core::TxFreqMode::Auto.as_u8(),

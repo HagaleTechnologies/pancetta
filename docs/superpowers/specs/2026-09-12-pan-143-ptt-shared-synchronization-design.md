@@ -12,6 +12,28 @@ check-then-act against state owned by a different subsystem, with no shared lock
 immediately before the gated action can only shrink the window, never close it. This spec covers
 one mechanism applied to **both** sites at once, per the ticket's explicit ask.
 
+> **Amended during implementation (PR #372 review round 3, Codex P1) — one deviation from the
+> design as written below.** The original design (and first implementation) released
+> `ptt_sync_gate` right after committing the frequency mutation, before
+> `apply_tx_offset_switch` published the resulting `TxOffsetApplied`/one-shot-retransmit
+> `MessageToSend` events. That is a real gap: an operator-forced nudge of a `CallingCq` or an
+> Auto QSO past its resend cap takes a one-shot-retransmit path that constructs and emits a
+> *new* `MessageToSend` a few statements later — releasing the gate before that publication let
+> the TX worker acquire it and key PTT for an already-queued, now-stale request in the gap,
+> reopening the exact race this ticket exists to close, just moved later in the function. The
+> fix extends the gate's held span to cover the entire recheck-through-publish sequence
+> (including this method's own `.await` event-emission points), which requires
+> `ptt_sync_gate` to be an async-aware `tokio::sync::Mutex` rather than a blocking
+> `std::sync::Mutex` — holding a blocking lock across an `.await` is a real hazard, not just
+> a lint, so this is a type change, not merely a "hold it longer" tweak. `PttGuard::new` and
+> the three `tui_relay.rs` writers become `async`/`.await` accordingly (mechanically simpler
+> in one respect: `tokio::sync::Mutex::lock` is infallible, so the `unwrap_or_else(|p|
+> p.into_inner())` poison-recovery boilerplate the sync version needed disappears entirely).
+> Every other design decision below (single shared gate vs. per-QSO, rejecting a
+> generation-token protocol, the lock-ordering argument, defaulting to a fresh mutex) is
+> unaffected by this change — see the "Call sites" and regression-test sections below, updated
+> in place to reflect the wider span.
+
 ## Why a recheck can never close this
 
 `apply_tx_offset_switch` already re-reads `ptt_active`/`tx_freq_mode` *inside* its own
