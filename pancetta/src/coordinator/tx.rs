@@ -2782,12 +2782,29 @@ fn dx_parity_freshness_window(slot_ns: i64) -> std::time::Duration {
 /// TX on POSITIVE fresh evidence of a collision, never on missing data,
 /// mirroring `tx_qso_is_live`'s own fail-open posture on a poisoned lock.
 ///
-/// Codex P2 on PR #370 (round 2): `a7_recent_calls` is populated from
-/// on-air decodes, which are canonically uppercase, but `their_callsign`
-/// here comes from `QsoMetadata` — which a remote `callStation` command can
-/// populate verbatim, lowercase included. `their_callsign` is uppercased
-/// before the lookup so a case mismatch can't silently defeat the gate
-/// (a raw `HashMap` lookup is exact-match, not `callsigns_match`-aware).
+/// Codex P2 on PR #370 (round 2, superseded by round 3): the lookup must
+/// use the repo's established callsign-equivalence rules, not an exact
+/// `HashMap` key match — `a7_recent_calls` is populated from on-air decodes
+/// (whatever compound form the DX happened to sign with), while
+/// `their_callsign` here comes from `QsoMetadata`, which can latch a
+/// DIFFERENT compound form of the same station (round 2: also case, e.g. a
+/// remote `callStation` command supplying lowercase; round 3: also compound
+/// spelling, e.g. `EA8/G8BCG` latched but a later frame signs bare
+/// `G8BCG`). Both are exactly what `pancetta_core::callsign::callsigns_match`
+/// already exists to handle, so this scans every fresh matching entry (via
+/// `entries_with_parity`, an existing public iterator, called once per
+/// parity to cover the whole table with no exact-key lookup) using that
+/// same shared matcher instead of hand-rolling a second, narrower
+/// equivalence rule.
+///
+/// Local review gate, round 3: a compound and bare spelling of the same
+/// station are separate table entries with independent timestamps and
+/// parities — scanning only the REQUESTED parity's subset could match a
+/// stale alias while a fresher entry (a different spelling, opposite
+/// parity — i.e. NOT a conflict) exists for the same station. Selecting the
+/// single NEWEST fresh matching entry across both parities first, then
+/// comparing only its parity, uses the DX's actual latest known state
+/// rather than whichever alias happens to match the parity being tested.
 fn dx_parity_conflict(
     their_callsign: &str,
     required_parity: pancetta_core::slot::SlotParity,
@@ -2795,19 +2812,21 @@ fn dx_parity_conflict(
     now: std::time::SystemTime,
     freshness_window: std::time::Duration,
 ) -> bool {
-    let their_callsign = their_callsign.trim().to_uppercase();
     let Ok(a7) = cross_time_state.a7_recent_calls.read() else {
         return false;
     };
-    let Some(entry) = a7.get(&their_callsign) else {
+    let newest = a7
+        .entries_with_parity(0)
+        .chain(a7.entries_with_parity(1))
+        .filter(|entry| pancetta_core::callsign::callsigns_match(&entry.callsign, their_callsign))
+        .filter(|entry| {
+            now.duration_since(entry.decoded_at)
+                .is_ok_and(|age| age <= freshness_window)
+        })
+        .max_by_key(|entry| entry.decoded_at);
+    let Some(entry) = newest else {
         return false;
     };
-    let Ok(age) = now.duration_since(entry.decoded_at) else {
-        return false;
-    };
-    if age > freshness_window {
-        return false;
-    }
     let observed = match entry.slot_parity {
         0 => pancetta_core::slot::SlotParity::Even,
         _ => pancetta_core::slot::SlotParity::Odd,
@@ -9890,6 +9909,61 @@ mod schedule_tx_tests {
             now,
             std::time::Duration::from_secs(30),
         ));
+    }
+
+    /// Codex P2 on PR #370 (round 3): a QSO can latch a compound spelling
+    /// (`EA8/G8BCG`) while a later on-air frame signs the bare base call
+    /// (`G8BCG`), or vice versa — the repo's own `callsigns_match` already
+    /// treats these as the same station; an exact-key lookup must not
+    /// silently defeat the gate for exactly the case it exists to catch.
+    #[test]
+    fn dx_parity_conflict_true_for_compound_callsign_against_bare_table_entry() {
+        let cts = pancetta_qso::CrossTimeState::empty();
+        let now = std::time::SystemTime::now();
+        cts.a7_recent_calls
+            .write()
+            .unwrap()
+            .record(a7_call("G8BCG", 1, now));
+
+        assert!(super::dx_parity_conflict(
+            "EA8/G8BCG",
+            SlotParity::Odd,
+            &cts,
+            now,
+            std::time::Duration::from_secs(30),
+        ));
+    }
+
+    /// Local review gate, round 3: a compound and bare spelling of the same
+    /// station are separate table entries with independent timestamps and
+    /// parities. An OLDER alias (`EA8/G8BCG`, Odd, 25s ago) must not win
+    /// over the DX's actual latest known state (`G8BCG`, Even, now) just
+    /// because it happens to match the parity being tested — the newest
+    /// fresh matching entry decides, not any historically-matching one.
+    #[test]
+    fn dx_parity_conflict_uses_newest_matching_entry_not_a_stale_alias() {
+        let cts = pancetta_qso::CrossTimeState::empty();
+        let now = std::time::SystemTime::now();
+        let older = now - std::time::Duration::from_secs(25);
+        cts.a7_recent_calls
+            .write()
+            .unwrap()
+            .record(a7_call("EA8/G8BCG", 1 /* Odd */, older));
+        cts.a7_recent_calls
+            .write()
+            .unwrap()
+            .record(a7_call("G8BCG", 0 /* Even */, now));
+
+        assert!(
+            !super::dx_parity_conflict(
+                "G8BCG",
+                SlotParity::Odd,
+                &cts,
+                now,
+                std::time::Duration::from_secs(30),
+            ),
+            "the newest entry (Even, now) must win over the older Odd alias"
+        );
     }
 
     #[test]
