@@ -1161,6 +1161,28 @@ async fn drain_pending_qso_offset_requests(
                     "PAN-72: no relocation available — QSO stays on its current offset"
                 );
             }
+            Err(pancetta_qso::QsoManagerError::OffsetActionPttInFlight { .. }) => {
+                // PAN-140 (Codex P1 on PR #369): the caller's own top-of-loop
+                // guard already checks this, but the write lock inside
+                // `apply_tx_offset_switch` can be contended long enough for
+                // PTT to key in between — this is that same race, closed a
+                // moment later. Re-queue exactly like the top-of-loop guard
+                // does, so the action still applies once this slot's PTT
+                // clears, rather than being silently discarded.
+                info!(
+                    target: "tx.freq",
+                    qso_id = %qso_id,
+                    "PAN-140: deferring TX-offset action — a PTT keyed for the \
+                     current slot between this drain's own pre-check and its commit"
+                );
+                if let Ok(mut pending) = pending_qso_offset_requests.lock() {
+                    pending.push(pancetta_qso::qso_manager::OffsetActionRequest {
+                        qso_id,
+                        action: action_for_requeue,
+                        origin,
+                    });
+                }
+            }
             Err(err) if err.is_expected_offset_action_refusal() => {
                 // The QSO completed, went terminal, or advanced between the
                 // action being raised and this once-per-slot drain. All three

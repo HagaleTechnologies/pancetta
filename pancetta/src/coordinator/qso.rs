@@ -2476,6 +2476,10 @@ impl super::ApplicationCoordinator {
         let operating_frequency_hz = self.operating_frequency_hz.clone();
         let split_tx_frequency_hz = self.split_tx_frequency_hz.clone();
         let tx_freq_mode = self.tx_freq_mode.clone();
+        // PAN-140: share the coordinator's real PTT-active flag so
+        // `apply_tx_offset_switch`'s pre-commit recheck sees genuine TX-worker
+        // state, not its private `false` default.
+        let ptt_active = self.ptt_active.clone();
         // T3 will read this to apply the operator's held TX audio offset when
         // starting a manual QSO (Hold mode). Captured here so both atomics
         // are in scope in the StartQso/RespondToCaller handlers below.
@@ -2564,6 +2568,11 @@ impl super::ApplicationCoordinator {
         // stall detector only emits `TxOffsetActionNeeded` in Auto (Hold keeps
         // the offset sticky).
         qso_manager.set_tx_freq_mode_source(tx_freq_mode.clone());
+        // PAN-140 (Codex P1 on PR #369): share the real PTT-active flag so
+        // `apply_tx_offset_switch`'s pre-commit recheck (the last-chance guard
+        // against a stall/nudge action landing mid-transmission) reflects
+        // genuine TX-worker state.
+        qso_manager.set_ptt_active_source(ptt_active.clone());
         // PAN-72 (Codex round 2 on PR #350, finding 5): share the global TX
         // policy too, so the same stall detector does not count a rearm cycle
         // whose re-send the `TxPolicy::Disabled` hard mute blocked outright —
