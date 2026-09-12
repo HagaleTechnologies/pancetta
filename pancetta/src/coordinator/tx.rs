@@ -2855,13 +2855,37 @@ fn dx_parity_conflict(
 /// restart-safe `qso_manager_watch` handle (re-borrowed fresh here, never
 /// cached across the pre-PTT wait — see PAN-72's `qso_manager_watch` amendment
 /// for why a spawn-time-captured clone would go stale across a supervised Qso
-/// restart), then applies [`dx_parity_conflict`]. Fails open (`false`,
-/// "proceed") at every step short of a resolved, established partner: no
-/// `qso_id` (manual/tune sends never carry a target to check), the Qso
-/// component not up yet, an unparseable id, the QSO not found, or a QSO with
-/// no established `their_callsign` yet (e.g. a still-unpartnered
-/// `CallingCq`) — this only ever gates a TX aimed at a specific, currently-
-/// known station.
+/// restart). Fails open (`None`) at every step short of a resolved,
+/// established partner: no `qso_id` (manual/tune sends never carry a target
+/// to check), the Qso component not up yet, an unparseable id, the QSO not
+/// found, or a QSO with no established `their_callsign` yet (e.g. a still-
+/// unpartnered `CallingCq`).
+///
+/// PAN-148: this is the ONLY inherently-async half of the DX-parity check —
+/// `manager.get_qso(id).await` is a real yield point; `their_callsign` is a
+/// stable property of an established QSO once set, so resolving it here and
+/// consulting it in a later, purely SYNCHRONOUS read (see
+/// [`dx_parity_conflict`], over `a7_recent_calls` — a `std::sync::RwLock`,
+/// not async) does not reintroduce staleness. Split out specifically so a
+/// caller checking MULTIPLE items (`bundle_live_mask`) can resolve every
+/// item's callsign first (the only awaits) and then read the actual
+/// freshness-sensitive state for all of them back-to-back with zero
+/// intervening awaits — see that function's doc comment for why a single
+/// combined async-then-sync-per-item loop is NOT equivalent.
+async fn resolve_their_callsign(
+    qso_id: Option<&str>,
+    qso_manager_watch: &tokio::sync::watch::Receiver<Option<pancetta_qso::QsoManager>>,
+) -> Option<String> {
+    let id_str = qso_id?;
+    let id = id_str.parse::<pancetta_qso::QsoId>().ok()?;
+    let manager = qso_manager_watch.borrow().clone()?;
+    let progress = manager.get_qso(id).await.ok()?;
+    progress.metadata.their_callsign
+}
+
+/// PAN-141: resolves `qso_id` to its established DX callsign, then applies
+/// [`dx_parity_conflict`]. See [`resolve_their_callsign`] for the fail-open
+/// conditions.
 async fn dx_parity_conflict_for_qso(
     qso_id: Option<&str>,
     required_parity: pancetta_core::slot::SlotParity,
@@ -2869,19 +2893,7 @@ async fn dx_parity_conflict_for_qso(
     cross_time_state: &pancetta_qso::CrossTimeState,
     freshness_window: std::time::Duration,
 ) -> bool {
-    let Some(id_str) = qso_id else {
-        return false;
-    };
-    let Ok(id) = id_str.parse::<pancetta_qso::QsoId>() else {
-        return false;
-    };
-    let Some(manager) = qso_manager_watch.borrow().clone() else {
-        return false;
-    };
-    let Ok(progress) = manager.get_qso(id).await else {
-        return false;
-    };
-    let Some(their_callsign) = progress.metadata.their_callsign else {
+    let Some(their_callsign) = resolve_their_callsign(qso_id, qso_manager_watch).await else {
         return false;
     };
     dx_parity_conflict(
@@ -2891,6 +2903,135 @@ async fn dx_parity_conflict_for_qso(
         std::time::SystemTime::now(),
         freshness_window,
     )
+}
+
+/// PAN-148: reasons the Step 4d final gate can deny a single-TX key.
+/// Distinct variants only so the denial's log/diagnostic text can name the
+/// actual reason, mirroring Step 4b/4b-parity's separate messages for the
+/// same two conditions re-evaluated here at the true last instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalGateDenial {
+    StaleQso,
+    DxParityConflict,
+}
+
+/// PAN-141 (Step 4b) / PAN-148 (Step 4d): resolves every id's DX callsign —
+/// the batch form of [`resolve_their_callsign`] for a multi-TX bundle.
+/// Callers running this for the Step 4d final gate MUST call it BEFORE
+/// Step 3's final audio-trim (see that call site's comment: round-2 review,
+/// Codex P1 — awaiting this lookup AFTER the trim risked keying `SetPtt`
+/// against a now-stale alignment cursor if `QsoManager`'s internal lock
+/// were ever contended).
+async fn resolve_callsigns(
+    ids: &[Option<String>],
+    qso_manager_watch: &tokio::sync::watch::Receiver<Option<pancetta_qso::QsoManager>>,
+) -> Vec<Option<String>> {
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        out.push(resolve_their_callsign(id.as_deref(), qso_manager_watch).await);
+    }
+    out
+}
+
+/// PAN-148 Step 4d: the single-TX path's final, atomic pre-PTT gate —
+/// SYNCHRONOUS, using ONLY state read at THIS call — never a value cached
+/// from Step 4b/4b-parity earlier in the cycle, which can have gone stale
+/// during Step 4c's pivot/remodulation or Step 5's status-announce awaits
+/// (`send_tx_status`/`send_tx_queue_status`). The caller MUST NOT `.await`
+/// anything else between this call returning and the `SetPtt{true}` send it
+/// gates — see the call site's own comment.
+///
+/// `their_callsign` must be resolved SEPARATELY and EARLY, via
+/// [`resolve_their_callsign`] called before Step 3's final audio-trim — see
+/// that function's doc comment. Round-1 review (Codex P1) found an earlier
+/// version checking liveness before awaiting the DX-parity lookup inline
+/// here (a cancellation landing during that await went uncaught); round-2
+/// review (Codex P1) found that simply reordering those two checks still
+/// left an unbounded `QsoManager`-lock-contention wait sitting AFTER Step
+/// 3's timing-sensitive trim, risking a stale audio-alignment cursor at key
+/// time. Resolving the callsign early and passing it in here — leaving this
+/// function with NO internal `.await` at all — fixes both: liveness and the
+/// actual freshness read (`dx_parity_conflict`) are the true last reads
+/// before `SetPtt`, and nothing async can suspend between Step 3's trim and
+/// the key.
+fn final_single_tx_gate_denial(
+    qso_id: Option<&str>,
+    required_parity: pancetta_core::slot::SlotParity,
+    active_tx_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    their_callsign: Option<&str>,
+    cross_time_state: &pancetta_qso::CrossTimeState,
+    freshness_window: std::time::Duration,
+) -> Option<FinalGateDenial> {
+    if !tx_qso_is_live(qso_id, active_tx_qsos) {
+        return Some(FinalGateDenial::StaleQso);
+    }
+    let conflict = their_callsign.is_some_and(|callsign| {
+        dx_parity_conflict(
+            callsign,
+            required_parity,
+            cross_time_state,
+            std::time::SystemTime::now(),
+            freshness_window,
+        )
+    });
+    if conflict {
+        return Some(FinalGateDenial::DxParityConflict);
+    }
+    None
+}
+
+/// PAN-141 (Step 4b) / PAN-148 (Step 4d): per-item liveness+DX-parity mask
+/// for a multi-TX bundle — SYNCHRONOUS. Extracted so both call sites —
+/// Step 4b's original key-time gate and the new Step 4d final gate — run
+/// the textually identical check against fresh state; Step 4d's caller
+/// MUST NOT `.await` anything else between this call returning and the
+/// `SetPtt{true}` send it gates.
+///
+/// `callsigns` (one entry per `encoded_qso_ids`, same order) must be
+/// resolved SEPARATELY via [`resolve_callsigns`] — round-1 review (Codex
+/// P1) found an earlier version awaiting `dx_parity_conflict_for_qso` per
+/// item in one sequential loop let item 1's synchronous parity read go
+/// stale while item 2..N's lookups were still pending; round-2 review
+/// (Codex P1) found that even a two-pass split awaiting INSIDE this
+/// function still left an unbounded `QsoManager`-lock-contention wait
+/// sitting after Step 3's timing-sensitive trim when called from the Step
+/// 4d final gate. Splitting the resolution out entirely — leaving this
+/// function with NO internal `.await` — fixes both: callers resolve
+/// `callsigns` before Step 3's trim (bounding the misalignment risk to
+/// wherever that resolution already had to happen), and this function's
+/// own reads (`tx_qso_is_live`, `dx_parity_conflict`, both synchronous) run
+/// for every item back-to-back with no yield point between them, so
+/// nothing can interleave a change for one item's evidence while another's
+/// is being read.
+///
+/// Returns `(live_mask, parity_hold_mask)`: `live_mask` is the "should this
+/// item transmit" mask every caller ultimately wants; `parity_hold_mask` is
+/// returned alongside it only so a caller that reports per-item drop
+/// reasons (Step 4b's partial-staleness branch) can distinguish "ended" from
+/// "held for colliding DX parity" without a second pass.
+fn bundle_live_mask(
+    encoded_qso_ids: &[Option<String>],
+    callsigns: &[Option<String>],
+    required_parity: pancetta_core::slot::SlotParity,
+    active_tx_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    cross_time_state: &pancetta_qso::CrossTimeState,
+    freshness_window: std::time::Duration,
+) -> (Vec<bool>, Vec<bool>) {
+    let now = std::time::SystemTime::now();
+    let parity_hold_mask: Vec<bool> = callsigns
+        .iter()
+        .map(|callsign| {
+            callsign.as_deref().is_some_and(|cs| {
+                dx_parity_conflict(cs, required_parity, cross_time_state, now, freshness_window)
+            })
+        })
+        .collect();
+    let live_mask = encoded_qso_ids
+        .iter()
+        .zip(parity_hold_mask.iter())
+        .map(|(id, &held)| tx_qso_is_live(id.as_deref(), active_tx_qsos) && !held)
+        .collect();
+    (live_mask, parity_hold_mask)
 }
 
 /// Build the TX-strip status items for a multi-TX bundle, tagging every item
@@ -6013,6 +6154,24 @@ impl super::ApplicationCoordinator {
                                             continue 'worker;
                                         }
 
+                                        // PAN-148: resolve the DX callsign for the Step 4d
+                                        // final gate's parity re-check NOW, BEFORE Step 3's
+                                        // timing-sensitive trim below — round-2 review (Codex
+                                        // P1) found that awaiting this `QsoManager` lookup
+                                        // AFTER the trim risked keying `SetPtt` against a
+                                        // now-stale audio-alignment cursor if the lookup's
+                                        // internal lock were ever contended. `their_callsign`
+                                        // is a stable property of an established QSO, so
+                                        // resolving it here and consulting it again in Step
+                                        // 4d's synchronous read (further below) doesn't
+                                        // reintroduce staleness — see
+                                        // `final_single_tx_gate_denial`'s doc comment.
+                                        let final_gate_callsign = resolve_their_callsign(
+                                            qso_id.as_deref(),
+                                            &qso_manager_watch,
+                                        )
+                                        .await;
+
                                         // --- Step 3 (moved): build the audio buffer,
                                         // refreshed against real time ---
                                         // request_received_at (Step 2) already decided WHICH
@@ -6252,6 +6411,79 @@ impl super::ApplicationCoordinator {
                                         )
                                         .await;
 
+                                        // --- Step 4d: final atomic pre-PTT gate ---
+                                        // PAN-148: Step 4b/4b-parity's liveness/DX-parity
+                                        // evidence is read BEFORE Step 4c's pivot/remodulation
+                                        // and the two status-announce awaits just above — any
+                                        // of which can span the moment this QSO ends or its DX
+                                        // moves onto the exact parity we're about to key into
+                                        // (Codex P2, PR #370 round 4). Re-check both, here,
+                                        // against fresh state, immediately before the arm
+                                        // recheck and the PTT-on send — nothing else runs
+                                        // between this call and the key. SYNCHRONOUS (uses
+                                        // `final_gate_callsign`, resolved before Step 3's
+                                        // trim above — see that call site's comment).
+                                        if let Some(denial) = final_single_tx_gate_denial(
+                                            qso_id.as_deref(),
+                                            required_parity,
+                                            &active_tx_qsos,
+                                            final_gate_callsign.as_deref(),
+                                            &cross_time_state,
+                                            dx_parity_freshness_window(slot_ns),
+                                        ) {
+                                            ptt_active.store(false, Ordering::Release);
+                                            ptt_guard.disarm();
+                                            // Same tombstone cleanup as the arm-denial branch
+                                            // below — nothing reached the air.
+                                            if let Some(key) = pivoted_this_key.take() {
+                                                pivoted_once.remove(&key);
+                                            }
+                                            let (log_msg, diag_msg) = match denial {
+                                                FinalGateDenial::StaleQso => (
+                                                    format!(
+                                                        "dropping stale TX at final pre-PTT check for ended QSO {}: '{message_text}'",
+                                                        qso_id.as_deref().unwrap_or("?")
+                                                    ),
+                                                    format!(
+                                                        "dropping stale TX at final pre-PTT check for ended QSO: '{message_text}'"
+                                                    ),
+                                                ),
+                                                FinalGateDenial::DxParityConflict => (
+                                                    format!(
+                                                        "holding TX at final pre-PTT check for QSO {}: DX observed transmitting on the colliding parity {required_parity:?}: '{message_text}'",
+                                                        qso_id.as_deref().unwrap_or("?")
+                                                    ),
+                                                    format!(
+                                                        "holding TX at final pre-PTT check: DX observed transmitting on the colliding parity {required_parity:?}: '{message_text}'"
+                                                    ),
+                                                ),
+                                            };
+                                            info!(target: "pancetta::tx.policy", "{log_msg}");
+                                            emit_diagnostic(
+                                                &message_bus,
+                                                "tx.policy",
+                                                pancetta_core::DiagnosticLevel::Info,
+                                                diag_msg,
+                                                qso_id.as_deref(),
+                                            )
+                                            .await;
+                                            send_tx_queue_status(&message_bus, None, Vec::new())
+                                                .await;
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text,
+                                                    duration_ms: 0,
+                                                    qso_id: qso_id.clone(),
+                                                },
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(complete_msg).await;
+                                            continue 'worker;
+                                        }
+
                                         // --- Step 4d-arm: last-instant pre-PTT arm recheck
                                         // (round-3 review, Codex P1) — round-2's placement
                                         // here (before the two awaits above) still left the
@@ -6259,12 +6491,14 @@ impl super::ApplicationCoordinator {
                                         // between the check and the actual PTT-on send below,
                                         // which is exactly the gap this check exists to close.
                                         // This is the genuine last instant: nothing but the
-                                        // PTT-on send itself follows. PTT hardware was never
-                                        // asserted on this path — `ptt_guard` only flipped the
-                                        // in-process `ptt_active` flag on construction — so
-                                        // denying here needs no PTT-off send, just unwinding
-                                        // that flag and the TX-badge/queue status the two
-                                        // awaits above just (prematurely) announced.
+                                        // PTT-on send itself follows (PAN-148 extended this
+                                        // final gate above to also cover liveness/DX-parity).
+                                        // PTT hardware was never asserted on this path —
+                                        // `ptt_guard` only flipped the in-process `ptt_active`
+                                        // flag on construction — so denying here needs no
+                                        // PTT-off send, just unwinding that flag and the
+                                        // TX-badge/queue status the two awaits above just
+                                        // (prematurely) announced.
                                         if origin == crate::message_bus::TxOrigin::Remote
                                             && !remote_tx_permitted_for(
                                                 &remote_tx_arm,
@@ -8113,29 +8347,21 @@ impl super::ApplicationCoordinator {
                                     // before this mask is used — mirrors this file's own
                                     // established "recheck immediately before the
                                     // irreversible step" pattern, generalized to a whole
-                                    // bundle instead of one QSO.
-                                    let mut parity_hold_mask: Vec<bool> =
-                                        Vec::with_capacity(encoded_qso_ids.len());
-                                    for id in &encoded_qso_ids {
-                                        parity_hold_mask.push(
-                                            dx_parity_conflict_for_qso(
-                                                id.as_deref(),
-                                                required_parity,
-                                                &qso_manager_watch,
-                                                &cross_time_state,
-                                                dx_parity_freshness_window(slot_ns),
-                                            )
-                                            .await,
-                                        );
-                                    }
-                                    let live_mask: Vec<bool> = encoded_qso_ids
-                                        .iter()
-                                        .zip(parity_hold_mask.iter())
-                                        .map(|(id, &parity_conflict)| {
-                                            tx_qso_is_live(id.as_deref(), &active_tx_qsos)
-                                                && !parity_conflict
-                                        })
-                                        .collect();
+                                    // bundle instead of one QSO. PAN-148: extracted into
+                                    // `bundle_live_mask` (synchronous) plus `resolve_callsigns`
+                                    // (the async resolution pass) so the new Step 4d final
+                                    // gate below runs the textually identical check.
+                                    let step_4b_callsigns =
+                                        resolve_callsigns(&encoded_qso_ids, &qso_manager_watch)
+                                            .await;
+                                    let (live_mask, parity_hold_mask) = bundle_live_mask(
+                                        &encoded_qso_ids,
+                                        &step_4b_callsigns,
+                                        required_parity,
+                                        &active_tx_qsos,
+                                        &cross_time_state,
+                                        dx_parity_freshness_window(slot_ns),
+                                    );
 
                                     if !live_mask.iter().any(|&live| live) {
                                         info!(
@@ -8536,6 +8762,20 @@ impl super::ApplicationCoordinator {
                                         pivoted_once.insert(qso_key, (new_text, new_freq));
                                     }
 
+                                    // PAN-148: resolve every survivor's DX callsign for the
+                                    // Step 4d final gate's parity re-check NOW, BEFORE Step
+                                    // 3's timing-sensitive trim below — see the single-TX
+                                    // arm's identical fix for why (round-2 review, Codex
+                                    // P1): awaiting these `QsoManager` lookups AFTER the
+                                    // trim risked keying `SetPtt` against a now-stale
+                                    // audio-alignment cursor if a lookup's internal lock
+                                    // were ever contended.
+                                    let final_gate_callsigns = resolve_callsigns(
+                                        &encoded_qso_ids_final,
+                                        &qso_manager_watch,
+                                    )
+                                    .await;
+
                                     // --- Step 3 (final): build the audio buffer,
                                     // refreshed against real time ---
                                     // Mirrors the single-TX arm's equivalent block
@@ -8640,18 +8880,101 @@ impl super::ApplicationCoordinator {
                                         send_tx_queue_status(&message_bus, head, bundle).await;
                                     }
 
+                                    // --- Step 4d: final atomic pre-PTT gate ---
+                                    // PAN-148 (Finding 1, PR #370 round 2): the
+                                    // partial-staleness branch above emits per-item
+                                    // diagnostic/`TransmitComplete` awaits AFTER `live_mask`
+                                    // was computed; Step 5's status-announce awaits just
+                                    // above add more. Any of them can span a survivor QSO
+                                    // ending or its DX moving onto the exact parity we're
+                                    // about to key into. Re-check every item in
+                                    // `encoded_qso_ids_final` (what's actually baked into
+                                    // `audio_out`) against fresh state, here, immediately
+                                    // before the arm recheck and the PTT-on send.
+                                    //
+                                    // Unlike Step 4b, a staleness found HERE does not
+                                    // trigger a second re-encode of the shrunk survivor
+                                    // set — abort the whole bundle instead. See
+                                    // docs/superpowers/specs/2026-09-12-pan-148-final-atomic-ptt-gate-design.md
+                                    // for why: this window is the handful of near-instant
+                                    // in-process channel sends between Step 4b and here (no
+                                    // I/O, no sleep), several orders of magnitude narrower
+                                    // than the ~20-30s pre-PTT sleep Step 4b's own rebuild
+                                    // already covers — trading a vanishingly rare survivor
+                                    // waiting one more cycle for never keying stale/held
+                                    // evidence, without adding a second synchronous-rebuild
+                                    // path through this file's highest-review-churn region.
+                                    // SYNCHRONOUS (uses `final_gate_callsigns`, resolved
+                                    // before Step 3's trim above).
+                                    let (final_live_mask, final_parity_hold_mask) =
+                                        bundle_live_mask(
+                                            &encoded_qso_ids_final,
+                                            &final_gate_callsigns,
+                                            required_parity,
+                                            &active_tx_qsos,
+                                            &cross_time_state,
+                                            dx_parity_freshness_window(slot_ns),
+                                        );
+                                    if !final_live_mask.iter().all(|&live| live) {
+                                        ptt_active.store(false, Ordering::Release);
+                                        ptt_guard.disarm();
+                                        for key in &pivoted_this_bundle_keys {
+                                            pivoted_once.remove(key);
+                                        }
+                                        let newly_stale =
+                                            final_live_mask.iter().filter(|&&live| !live).count();
+                                        let held = final_parity_hold_mask
+                                            .iter()
+                                            .zip(final_live_mask.iter())
+                                            .filter(|(&held, &live)| held && !live)
+                                            .count();
+                                        info!(
+                                            target: "pancetta::tx.policy",
+                                            "dropping multi-TX bundle at final pre-PTT check: {newly_stale} of {} item(s) ended or held (colliding DX parity) since the key-time check ({held} held)",
+                                            final_live_mask.len()
+                                        );
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "tx.policy",
+                                            pancetta_core::DiagnosticLevel::Info,
+                                            format!(
+                                                "dropping multi-TX bundle at final pre-PTT check: {newly_stale} of {} item(s) ended or held (colliding DX parity) since the key-time check",
+                                                final_live_mask.len()
+                                            ),
+                                            None,
+                                        )
+                                        .await;
+                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                        for item in &items {
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text: item.message_text.clone(),
+                                                    duration_ms: 0,
+                                                    qso_id: item.qso_id.clone(),
+                                                },
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(complete_msg).await;
+                                        }
+                                        continue;
+                                    }
+
                                     // --- Step 4d-arm: last-instant pre-PTT arm recheck
                                     // (round-3 review, Codex P1) — mirrors the single-TX
                                     // Step 4d-arm; round-2's placement here (before the
                                     // status-send awaits above) left exactly the gap this
                                     // check exists to close. This is the genuine last
-                                    // instant: nothing but the PTT-on send itself follows.
-                                    // PTT hardware was never asserted on this path —
-                                    // `ptt_guard` only flipped the in-process `ptt_active`
-                                    // flag on construction — so denying here needs no
-                                    // PTT-off send, just unwinding that flag and the
-                                    // TX-badge/queue status the awaits above just
-                                    // (prematurely) announced.
+                                    // instant: nothing but the PTT-on send itself follows
+                                    // (PAN-148 extended this final gate above to also cover
+                                    // liveness/DX-parity). PTT hardware was never asserted
+                                    // on this path — `ptt_guard` only flipped the
+                                    // in-process `ptt_active` flag on construction — so
+                                    // denying here needs no PTT-off send, just unwinding
+                                    // that flag and the TX-badge/queue status the awaits
+                                    // above just (prematurely) announced.
                                     if origin == crate::message_bus::TxOrigin::Remote
                                         && !remote_tx_permitted_for(
                                             &remote_tx_arm,
@@ -10182,6 +10505,277 @@ mod schedule_tx_tests {
             )
             .await
         );
+    }
+
+    // --- PAN-148: final atomic pre-PTT gate ---
+
+    /// Sanity: a live QSO with no colliding DX-parity evidence and no
+    /// remote-arm involvement (Local origin) always proceeds.
+    #[test]
+    fn final_single_tx_gate_denial_none_when_live_and_no_conflict() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, RwLock};
+        let active: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+        active
+            .write()
+            .unwrap()
+            .insert(super::super::active_tx_qso_key("qso-peru"));
+        let cts = pancetta_qso::CrossTimeState::empty();
+
+        assert!(super::final_single_tx_gate_denial(
+            Some("qso-peru"),
+            SlotParity::Odd,
+            &active,
+            None,
+            &cts,
+            std::time::Duration::from_secs(30),
+        )
+        .is_none());
+    }
+
+    /// PAN-148 (Finding 2, PR #370 round 4): pins the actual race. Step
+    /// 4b's original liveness check happens BEFORE Step 4c's
+    /// pivot/remodulation and Step 5's status-announce awaits; if the QSO
+    /// ends during those awaits, only a SECOND check run afterward (this
+    /// gate) can catch it. Modeled here as two calls to the same gate
+    /// function against a set mutated in between — the first call matches
+    /// what Step 4b already saw (live, so it proceeded past that check);
+    /// the second call is what Step 4d now additionally runs immediately
+    /// before `SetPtt`, and must reflect the QSO having ended in the
+    /// interim.
+    #[test]
+    fn final_single_tx_gate_denial_catches_cancellation_landing_after_step_4b() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, RwLock};
+        let active: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+        active
+            .write()
+            .unwrap()
+            .insert(super::super::active_tx_qso_key("qso-peru"));
+        let cts = pancetta_qso::CrossTimeState::empty();
+
+        // Step 4b's moment: still live.
+        assert!(
+            super::final_single_tx_gate_denial(
+                Some("qso-peru"),
+                SlotParity::Odd,
+                &active,
+                None,
+                &cts,
+                std::time::Duration::from_secs(30),
+            )
+            .is_none(),
+            "Step 4b's check must see the QSO as live"
+        );
+
+        // Simulates the QSO ending during Step 4c/5's awaits, e.g. the Qso
+        // component removing it from `active_tx_qsos` on completion/cancel.
+        active
+            .write()
+            .unwrap()
+            .remove(&super::super::active_tx_qso_key("qso-peru"));
+
+        // Step 4d's moment, immediately before SetPtt: must now deny.
+        assert_eq!(
+            super::final_single_tx_gate_denial(
+                Some("qso-peru"),
+                SlotParity::Odd,
+                &active,
+                None,
+                &cts,
+                std::time::Duration::from_secs(30),
+            ),
+            Some(super::FinalGateDenial::StaleQso),
+            "Step 4d's final check must catch a cancellation Step 4b could not have seen"
+        );
+    }
+
+    /// Same race shape as above, for the DX-parity half of the gate: a
+    /// fresh colliding `a7_recent_calls` entry lands (a decode arriving
+    /// during Step 4c/5's awaits) between the two checks. `their_callsign`
+    /// is passed in resolved (as the real Step 4d call site now does,
+    /// resolved before Step 3's trim) — only `a7_recent_calls` (read
+    /// synchronously inside this gate) changes between the two calls.
+    #[tokio::test]
+    async fn final_single_tx_gate_denial_catches_dx_parity_conflict_landing_after_step_4b() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, RwLock};
+        let manager = pancetta_qso::QsoManager::new(test_qso_manager_config());
+        let qso_id = manager
+            .respond_to_cq_manual("5Z4VJ".to_string(), 1500.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        let active: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+        active
+            .write()
+            .unwrap()
+            .insert(super::super::active_tx_qso_key(&qso_id.to_string()));
+        let cts = pancetta_qso::CrossTimeState::empty();
+        let (_tx, rx) = tokio::sync::watch::channel(Some(manager));
+        let their_callsign = super::resolve_their_callsign(Some(&qso_id.to_string()), &rx).await;
+        assert_eq!(their_callsign.as_deref(), Some("5Z4VJ"));
+
+        // Step 4b's moment: no fresh colliding decode yet.
+        assert!(
+            super::final_single_tx_gate_denial(
+                Some(&qso_id.to_string()),
+                SlotParity::Odd,
+                &active,
+                their_callsign.as_deref(),
+                &cts,
+                std::time::Duration::from_secs(30),
+            )
+            .is_none(),
+            "Step 4b's check must see no conflict yet"
+        );
+
+        // A decode lands during Step 4c/5's awaits: 5Z4VJ observed on Odd,
+        // the exact parity we're about to key into.
+        cts.a7_recent_calls.write().unwrap().record(a7_call(
+            "5Z4VJ",
+            1, /* Odd */
+            std::time::SystemTime::now(),
+        ));
+
+        assert_eq!(
+            super::final_single_tx_gate_denial(
+                Some(&qso_id.to_string()),
+                SlotParity::Odd,
+                &active,
+                their_callsign.as_deref(),
+                &cts,
+                std::time::Duration::from_secs(30),
+            ),
+            Some(super::FinalGateDenial::DxParityConflict),
+            "Step 4d's final check must catch a collision decode Step 4b could not have seen"
+        );
+    }
+
+    /// `bundle_live_mask` must reproduce the pre-refactor inline
+    /// computation's semantics exactly (this refactor's only job): all
+    /// live, all held, and mixed cases. `callsigns` is empty (no
+    /// established partner) — irrelevant to the liveness half under test.
+    #[test]
+    fn bundle_live_mask_matches_established_semantics() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, RwLock};
+        let active: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+        active
+            .write()
+            .unwrap()
+            .insert(super::super::active_tx_qso_key("qso-peru"));
+        active
+            .write()
+            .unwrap()
+            .insert(super::super::active_tx_qso_key("qso-kenya"));
+        let cts = pancetta_qso::CrossTimeState::empty();
+        let ids = vec![Some("qso-peru".to_string()), Some("qso-kenya".to_string())];
+        let callsigns: Vec<Option<String>> = vec![None, None];
+
+        let (live, held) = super::bundle_live_mask(
+            &ids,
+            &callsigns,
+            SlotParity::Odd,
+            &active,
+            &cts,
+            std::time::Duration::from_secs(30),
+        );
+        assert_eq!(live, vec![true, true]);
+        assert_eq!(held, vec![false, false]);
+
+        active
+            .write()
+            .unwrap()
+            .remove(&super::super::active_tx_qso_key("qso-kenya"));
+        let (live, held) = super::bundle_live_mask(
+            &ids,
+            &callsigns,
+            SlotParity::Odd,
+            &active,
+            &cts,
+            std::time::Duration::from_secs(30),
+        );
+        assert_eq!(live, vec![true, false]);
+        assert_eq!(held, vec![false, false]);
+    }
+
+    /// PAN-148 (Finding 1, PR #370 round 2): pins the multi-TX race. Step
+    /// 4b computes `live_mask` once; the partial-staleness branch's
+    /// per-item diagnostic/`TransmitComplete` awaits (and Step 5's
+    /// status-announce awaits) run AFTER that, before `SetPtt`. Modeled as
+    /// two calls to `bundle_live_mask` against a set mutated in between —
+    /// the first matches what Step 4b saw (both survivors live), the
+    /// second is what Step 4d now re-checks immediately before keying, and
+    /// must reflect a survivor ending in the interim.
+    #[test]
+    fn bundle_live_mask_catches_survivor_cancellation_landing_after_step_4b() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, RwLock};
+        let active: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+        active
+            .write()
+            .unwrap()
+            .insert(super::super::active_tx_qso_key("qso-peru"));
+        active
+            .write()
+            .unwrap()
+            .insert(super::super::active_tx_qso_key("qso-kenya"));
+        let cts = pancetta_qso::CrossTimeState::empty();
+        // Bundle survivors as re-encoded by Step 4b's own rebuild — both
+        // still live at that point.
+        let survivors = vec![Some("qso-peru".to_string()), Some("qso-kenya".to_string())];
+        let callsigns: Vec<Option<String>> = vec![None, None];
+
+        let (step_4b_mask, _) = super::bundle_live_mask(
+            &survivors,
+            &callsigns,
+            SlotParity::Odd,
+            &active,
+            &cts,
+            std::time::Duration::from_secs(30),
+        );
+        assert_eq!(
+            step_4b_mask,
+            vec![true, true],
+            "Step 4b's check must see both survivors as live"
+        );
+
+        // qso-kenya ends during the partial-staleness branch's diagnostic
+        // awaits (or Step 5's status-announce awaits).
+        active
+            .write()
+            .unwrap()
+            .remove(&super::super::active_tx_qso_key("qso-kenya"));
+
+        let (step_4d_mask, _) = super::bundle_live_mask(
+            &survivors,
+            &callsigns,
+            SlotParity::Odd,
+            &active,
+            &cts,
+            std::time::Duration::from_secs(30),
+        );
+        assert_eq!(
+            step_4d_mask,
+            vec![true, false],
+            "Step 4d's final check must catch a survivor ending after Step 4b's own check"
+        );
+    }
+
+    /// `resolve_callsigns` is the batch form of `resolve_their_callsign` —
+    /// order-preserving, one entry per input id.
+    #[tokio::test]
+    async fn resolve_callsigns_preserves_order_and_resolves_each_id() {
+        let manager = pancetta_qso::QsoManager::new(test_qso_manager_config());
+        let qso_id = manager
+            .respond_to_cq_manual("5Z4VJ".to_string(), 1500.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(Some(manager));
+        let ids = vec![None, Some(qso_id.to_string())];
+
+        let resolved = super::resolve_callsigns(&ids, &rx).await;
+        assert_eq!(resolved, vec![None, Some("5Z4VJ".to_string())]);
     }
 
     #[test]
