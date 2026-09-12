@@ -1,0 +1,6 @@
+interface:
+  display_name: "Catalyst Repo Conventions"
+  short_description: "Draft an AGENTS.md from what's actually in this codebase"
+  default_prompt: "Use $catalyst-repo-conventions to read this codebase and draft an AGENTS.md for it."
+policy:
+  allow_implicit_invocation: false

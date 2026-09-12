@@ -1,0 +1,4 @@
+identity: { pack: catalyst-starter, skill: catalyst-repo-conventions }
+effects: [workspace-write]
+mutating: true
+invocation: explicit
