@@ -44,17 +44,23 @@ pub fn render_qso_status(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()>
         // cross-parity calls (#40), allocate an extra row for them above
         // the control hint so the operator knows those calls are waiting.
         let queued_height = if app.pending_calls.is_empty() { 0 } else { 1 };
+        // PAN-142 (Codex P1 on PR #371): the TX/RX block's 2 mandatory lines
+        // grow by one for the optional DX-activity line (#41) and one more
+        // for the drift-candidate line (PAN-142) when either is present —
+        // a fixed `Length(2)` silently clipped both via `Paragraph`'s
+        // top-down truncation. Mirrors `queued_height` just below.
+        let tx_rx_height = tx_rx_status_height(app.qso_status());
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),             // QSO info
                 Constraint::Length(3),             // Sequence ladder + Now/Next
-                Constraint::Length(2),             // TX/RX status
-                Constraint::Length(2),             // SNR meters
-                Constraint::Min(1),                // Progress/timing
-                Constraint::Length(1),             // Last-10-QSOs history (#165)
+                Constraint::Length(tx_rx_height), // TX/RX status (+ DX activity, + drift candidate)
+                Constraint::Length(2),            // SNR meters
+                Constraint::Min(1),               // Progress/timing
+                Constraint::Length(1),            // Last-10-QSOs history (#165)
                 Constraint::Length(queued_height), // Queued calls (0 when empty)
-                Constraint::Length(1),             // Control hint
+                Constraint::Length(1),            // Control hint
             ])
             .split(block.inner(area));
 
@@ -566,6 +572,16 @@ pub(crate) fn format_qso_history_line(items: &[crate::app::QsoHistoryItem]) -> V
     spans
 }
 
+/// PAN-142 (Codex P1 on PR #371): the number of rows `render_tx_rx_status`
+/// needs — 2 mandatory (TX, RX) plus one each for the optional DX-activity
+/// (#41) and drift-candidate (PAN-142) lines, only when populated. A fixed
+/// allocation silently clipped both optional lines via `Paragraph`'s
+/// top-down truncation. Pure so the layout math is testable without a
+/// terminal backend.
+fn tx_rx_status_height(qso: &crate::app::QsoStatus) -> u16 {
+    2 + u16::from(qso.dx_last_activity.is_some()) + u16::from(qso.pending_freq_drift_hz.is_some())
+}
+
 fn render_tx_rx_status(f: &mut Frame<'_>, area: Rect, app: &App) {
     let qso = app.qso_status();
 
@@ -814,6 +830,24 @@ mod tests {
         let only_time = format_direction_line("TX", None, Some(at));
         assert!(only_time.starts_with("TX: "));
         assert_ne!(only_time, "TX: Never");
+    }
+
+    /// PAN-142 (Codex P1 on PR #371): the TX/RX block's row allocation must
+    /// grow for each optional line it actually renders, or the DX-activity
+    /// and drift-candidate lines get silently clipped by a fixed height.
+    #[test]
+    fn test_tx_rx_status_height() {
+        let mut qso = crate::app::QsoStatus::default();
+        assert_eq!(tx_rx_status_height(&qso), 2, "TX + RX only");
+
+        qso.dx_last_activity = Some("CQ".to_string());
+        assert_eq!(tx_rx_status_height(&qso), 3, "+ DX activity");
+
+        qso.pending_freq_drift_hz = Some(937.5);
+        assert_eq!(tx_rx_status_height(&qso), 4, "+ drift candidate");
+
+        qso.dx_last_activity = None;
+        assert_eq!(tx_rx_status_height(&qso), 3, "drift candidate alone");
     }
 
     /// The QSO Status "Now:" line surfaces the live TX frame when it belongs
