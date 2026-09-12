@@ -1991,12 +1991,29 @@ struct PttGuard {
 }
 
 impl PttGuard {
-    fn new(
+    /// `ptt_sync_gate` (PAN-143) makes the `ptt_active` store below mutually
+    /// exclusive with `pancetta_qso::QsoManager::apply_tx_offset_switch`'s
+    /// recheck-through-publish span — closing, not just narrowing, the race
+    /// PAN-140 round 2 found (and round 3's finding that releasing too early
+    /// reopens it further down the same function). See that gate's doc
+    /// comment and `docs/superpowers/specs/
+    /// 2026-09-12-pan-143-ptt-shared-synchronization-design.md`. An
+    /// async-aware `tokio::sync::Mutex` — round 3 requires the QSO-manager
+    /// side to hold the gate across its own `.await` event-emission points,
+    /// which a blocking `std::sync::Mutex` cannot safely do — so this
+    /// constructor is `async` accordingly; the wait here is expected to be
+    /// negligible (the QSO-manager side never does I/O or hardware calls
+    /// while holding it, only channel sends).
+    async fn new(
         message_bus: MessageBus,
         ptt_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ptt_sync_gate: &std::sync::Arc<tokio::sync::Mutex<()>>,
         last_ptt_on_ms: &std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
-        ptt_active.store(true, std::sync::atomic::Ordering::Release);
+        {
+            let _ptt_sync = ptt_sync_gate.lock().await;
+            ptt_active.store(true, std::sync::atomic::Ordering::Release);
+        }
         last_ptt_on_ms.store(super::now_epoch_ms(), std::sync::atomic::Ordering::Release);
         Self {
             message_bus,
@@ -4831,6 +4848,12 @@ impl super::ApplicationCoordinator {
             let latest_tx_intent = self.latest_tx_intent.clone();
             // Keyed-state flag for the SWR poll / TUI (set by PttGuard).
             let ptt_active = self.ptt_active.clone();
+            // PAN-143: shared with QsoManager's apply_tx_offset_switch and
+            // the TUI-relay task's tx_freq_mode writers so PttGuard::new's
+            // ptt_active store is genuinely atomic against those sites'
+            // recheck/store, not just narrowly raced against them. See
+            // PttGuard::new's doc comment.
+            let ptt_sync_gate = self.ptt_sync_gate.clone();
             // Timestamp of the most recent PTT-on, read by the FT8 decode
             // loop's TX-adjacent-desense diagnostic (see `ft8.rs`).
             let last_ptt_on_ms = self.last_ptt_on_ms.clone();
@@ -6007,8 +6030,10 @@ impl super::ApplicationCoordinator {
                                         let mut ptt_guard = PttGuard::new(
                                             message_bus.clone(),
                                             ptt_active.clone(),
+                                            &ptt_sync_gate,
                                             &last_ptt_on_ms,
-                                        );
+                                        )
+                                        .await;
                                         // TX badge on; guard drop clears it on every
                                         // exit path (complete / abort / shutdown).
                                         let _tx_status_guard =
@@ -8308,8 +8333,10 @@ impl super::ApplicationCoordinator {
                                     let mut ptt_guard = PttGuard::new(
                                         message_bus.clone(),
                                         ptt_active.clone(),
+                                        &ptt_sync_gate,
                                         &last_ptt_on_ms,
-                                    );
+                                    )
+                                    .await;
                                     // TX badge on; guard drop clears it on every
                                     // exit path (complete / abort / shutdown).
                                     let _tx_status_guard = TxStatusGuard::new(message_bus.clone());
@@ -9027,8 +9054,10 @@ impl super::ApplicationCoordinator {
                                     let mut ptt_guard = PttGuard::new(
                                         message_bus.clone(),
                                         ptt_active.clone(),
+                                        &ptt_sync_gate,
                                         &last_ptt_on_ms,
-                                    );
+                                    )
+                                    .await;
                                     // TX badge on; guard drop clears it on every
                                     // exit path (complete / abort / shutdown).
                                     let _tx_status_guard = TxStatusGuard::new(message_bus.clone());
