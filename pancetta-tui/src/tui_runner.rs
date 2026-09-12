@@ -3570,6 +3570,8 @@ mod key_tests {
             watchdog_deadline: None,
             dx_last_activity: None,
             hound: false,
+            pending_freq_drift_hz: None,
+            pending_freq_drift_since: None,
         };
         r.handle_message(TuiMessage::ActiveQsosUpdate {
             qsos: vec![banner],
@@ -4138,6 +4140,8 @@ mod key_tests {
             watchdog_deadline: None,
             dx_last_activity: None,
             hound: false,
+            pending_freq_drift_hz: None,
+            pending_freq_drift_since: None,
         }
     }
 
@@ -5355,6 +5359,8 @@ mod key_tests {
                     watchdog_deadline: None,
                     dx_last_activity: None,
                     hound: false,
+                    pending_freq_drift_hz: None,
+                    pending_freq_drift_since: None,
                 }],
                 Vec::new(),
             );
@@ -5417,6 +5423,8 @@ mod key_tests {
                     watchdog_deadline: None,
                     dx_last_activity: None,
                     hound: false,
+                    pending_freq_drift_hz: None,
+                    pending_freq_drift_since: None,
                 }],
                 Vec::new(),
             );

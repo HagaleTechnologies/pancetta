@@ -5771,6 +5771,8 @@ fn snapshot_item_from_progress(
         // map (#41); this pure per-progress builder has no band context.
         dx_last_activity: None,
         hound: progress.metadata.hound,
+        pending_freq_drift_hz: progress.metadata.pending_freq_drift.map(|(hz, _)| hz),
+        pending_freq_drift_since: progress.metadata.pending_freq_drift.map(|(_, t)| t),
     })
 }
 

@@ -40,6 +40,8 @@ fn banner_at(call: &str, hz: f64, qso_id: &str) -> ActiveQsoBanner {
         watchdog_deadline: None,
         dx_last_activity: None,
         hound: false,
+        pending_freq_drift_hz: None,
+        pending_freq_drift_since: None,
     }
 }
 

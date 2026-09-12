@@ -2062,16 +2062,30 @@ impl QsoManager {
     /// before reaching the in-tolerance reset, so a stale `pending_freq_drift`
     /// would persist in serialized metadata for the QSO's life (PAN-15 item 2).
     async fn stamp_hound_flag(&self, qso_id: QsoId) {
+        // PAN-142 (Codex P2 on PR #371, round 5): a decode landing in the
+        // documented construction-window gap (between `respond_to_cq_with`/
+        // `engage_hound` creating the QSO and this stamp running) can have
+        // `maybe_confirm_frequency_drift_at` note a `pending_freq_drift`
+        // candidate — round 1's fix emits a StateChanged for that. This
+        // stamp then clears the candidate below with no refresh of its own,
+        // so a stale "[DRIFT …]" indicator could sit in the TUI snapshot
+        // until an unrelated QSO event happens to refresh it (genuine Hound
+        // QSOs are skipped by the drift-confirm mechanism entirely from this
+        // point on, so nothing else would ever clear it). Same fix shape as
+        // round 1: emit only when there was actually a candidate to clear.
         let mut qsos = self.qsos.write().await;
         if let Some(progress) = qsos.get_mut(&qso_id) {
             progress.metadata.hound = true;
-            progress.metadata.pending_freq_drift = None;
             // NOTE: do NOT insert "HOUND" into metadata.tags — that would
             // produce a bare `<HOUND:4>true` ADIF field, which is not a
             // valid ADIF name (must be `APP_`-prefixed per the ADIF spec)
             // and can trip LoTW. The human-readable COMMENT "HOUND" and the
             // machine-readable `APP_PANCETTA_HOUND` field are both written
             // by `AdifProcessor::qso_to_adif` from `metadata.hound` directly.
+            if progress.metadata.pending_freq_drift.take().is_some() {
+                let state = progress.state.clone();
+                self.emit_state_change(qso_id, state.clone(), state).await;
+            }
         }
     }
 
@@ -2940,7 +2954,15 @@ impl QsoManager {
             let distance = (match_freq - frequency).abs();
 
             if distance <= ESTABLISHED_FREQ_TOLERANCE_HZ {
-                progress.metadata.pending_freq_drift = None;
+                // PAN-142 (Codex P1 on PR #371): only emit when there was
+                // actually a candidate to clear. This branch is the ordinary
+                // in-tolerance path every normal exchange takes, so emitting
+                // unconditionally here would flood the event stream with a
+                // same-state StateChanged on nearly every decoded frame.
+                if progress.metadata.pending_freq_drift.take().is_some() {
+                    let state = progress.state.clone();
+                    self.emit_state_change(qso_id, state.clone(), state).await;
+                }
                 continue;
             }
 
@@ -3080,6 +3102,18 @@ impl QsoManager {
                         "identity-verified message outside tolerance — noting drift candidate \
                          (needs 1 more confirming sighting >=5s later)"
                     );
+                    // PAN-142 (Codex P1 on PR #371): a new/changed candidate
+                    // is the ONE event the operator-visible drift indicator
+                    // exists to surface — without this, `pending_freq_drift`
+                    // is set here but nothing re-triggers the TUI snapshot
+                    // that carries it (this mechanism's own state-machine
+                    // state is deliberately untouched, so no OTHER event
+                    // naturally fires), and the indicator built for exactly
+                    // this "am I stuck or about to self-heal" moment would
+                    // never actually render it. Mirrors the confirmed-split-TX
+                    // branch's own same-state emit above.
+                    let state = progress.state.clone();
+                    self.emit_state_change(qso_id, state.clone(), state).await;
                 }
             }
         }
@@ -12471,6 +12505,113 @@ mod sender_verification_tests {
         );
     }
 
+    /// PAN-142 (Codex P1 on PR #371): noting a NEW pending drift candidate
+    /// must emit a (same-state) `StateChanged` so the coordinator's TUI
+    /// snapshot picks up `pending_freq_drift` — this mechanism's own
+    /// state-machine state is deliberately untouched, so nothing else would
+    /// ever trigger that snapshot while a candidate is pending, and the
+    /// operator-visible drift indicator built for exactly this moment would
+    /// never actually render.
+    #[tokio::test]
+    async fn noting_a_new_drift_candidate_emits_state_changed() {
+        let manager = manager_with_call("K5ARH");
+        let qso_id = manager
+            .respond_to_cq_manual("LU7LRP".into(), 1500.0, None)
+            .await
+            .unwrap();
+        let mut events = manager.subscribe();
+
+        let report = MessageType::SignalReport {
+            to_station: "K5ARH".into(),
+            from_station: "LU7LRP".into(),
+            report: -11,
+        };
+        manager
+            .maybe_confirm_frequency_drift_at(&report, 937.5, Utc::now())
+            .await;
+
+        assert!(
+            matches!(
+                manager.get_qso(qso_id).await.unwrap().metadata.pending_freq_drift,
+                Some((f, _)) if f == 937.5
+            ),
+            "premise: this call must actually note a new candidate"
+        );
+        let mut saw_state_changed_for_qso = false;
+        while let Ok(ev) = events.try_recv() {
+            if matches!(ev, QsoEvent::StateChanged { qso_id: id, .. } if id == qso_id) {
+                saw_state_changed_for_qso = true;
+            }
+        }
+        assert!(
+            saw_state_changed_for_qso,
+            "a new drift candidate must emit StateChanged so the TUI snapshot refreshes"
+        );
+    }
+
+    /// PAN-142 (Codex P1 on PR #371): a pending candidate cleared by an
+    /// in-tolerance sighting (the DX came back within range before the
+    /// second confirming sighting) must ALSO emit, for the same reason —
+    /// otherwise the drift indicator sticks on the TUI after the QSO engine
+    /// has already dropped the candidate. Calls `maybe_confirm_frequency_drift_at`
+    /// directly (like the duplicate-delivery test above) rather than through
+    /// `process_message`, so a real state advance from the ordinary
+    /// relevance-gate path can't also emit and mask a missing fix here.
+    #[tokio::test]
+    async fn clearing_a_drift_candidate_without_confirming_emits_state_changed() {
+        let manager = manager_with_call("K5ARH");
+        let qso_id = manager
+            .respond_to_cq_manual("LU7LRP".into(), 1500.0, None)
+            .await
+            .unwrap();
+        let report = MessageType::SignalReport {
+            to_station: "K5ARH".into(),
+            from_station: "LU7LRP".into(),
+            report: -11,
+        };
+        manager
+            .maybe_confirm_frequency_drift_at(&report, 937.5, Utc::now())
+            .await;
+        assert!(
+            manager
+                .get_qso(qso_id)
+                .await
+                .unwrap()
+                .metadata
+                .pending_freq_drift
+                .is_some(),
+            "premise: a candidate must be pending before it can be cleared"
+        );
+
+        let mut events = manager.subscribe();
+        // Back within tolerance of the QSO's OWN frequency (1500.0) — the
+        // early "in-tolerance, clear the candidate" branch, not a confirm.
+        manager
+            .maybe_confirm_frequency_drift_at(&report, 1500.0, Utc::now())
+            .await;
+
+        assert!(
+            manager
+                .get_qso(qso_id)
+                .await
+                .unwrap()
+                .metadata
+                .pending_freq_drift
+                .is_none(),
+            "an in-tolerance sighting must clear the pending candidate"
+        );
+        let mut saw_state_changed_for_qso = false;
+        while let Ok(ev) = events.try_recv() {
+            if matches!(ev, QsoEvent::StateChanged { qso_id: id, .. } if id == qso_id) {
+                saw_state_changed_for_qso = true;
+            }
+        }
+        assert!(
+            saw_state_changed_for_qso,
+            "clearing a pending candidate must emit StateChanged so the TUI snapshot refreshes"
+        );
+    }
+
     /// The confirming second sighting at the SAME new frequency relatches and lets the
     /// QSO advance normally through the completely-unmodified existing pipeline —
     /// exactly the real 2026-07-26 LU7LRP timeline (two SignalReport decodes at
@@ -13270,6 +13411,7 @@ mod sender_verification_tests {
         );
 
         // The fix: stamping the hound flag must clear it atomically.
+        let mut events = manager.subscribe();
         manager.stamp_hound_flag(qso_id).await;
         let progress = manager.get_qso(qso_id).await.unwrap();
         assert!(progress.metadata.hound, "hound flag must now be stamped");
@@ -13277,6 +13419,23 @@ mod sender_verification_tests {
             progress.metadata.pending_freq_drift, None,
             "stamp_hound_flag must clear any drift candidate accumulated in the window, \
              otherwise it can never be cleared again for this Hound QSO's life"
+        );
+        // PAN-142 (Codex P2 on PR #371, round 5): clearing it here must ALSO
+        // emit, same as the ordinary in-tolerance clear in
+        // `maybe_confirm_frequency_drift_at` — otherwise a TUI snapshot that
+        // already captured the pending candidate has nothing to ever refresh
+        // it, since genuine Hound QSOs are skipped by that mechanism from
+        // here on (no other event would ever clear a stale indicator).
+        let mut saw_state_changed_for_qso = false;
+        while let Ok(ev) = events.try_recv() {
+            if matches!(ev, QsoEvent::StateChanged { qso_id: id, .. } if id == qso_id) {
+                saw_state_changed_for_qso = true;
+            }
+        }
+        assert!(
+            saw_state_changed_for_qso,
+            "clearing the candidate via the hound stamp must emit StateChanged so the TUI \
+             snapshot refreshes"
         );
     }
 
