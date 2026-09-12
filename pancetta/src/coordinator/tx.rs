@@ -2781,6 +2781,13 @@ fn dx_parity_freshness_window(slot_ns: i64) -> std::time::Duration {
 /// window, or an unreadable (poisoned) table — this gate only ever blocks a
 /// TX on POSITIVE fresh evidence of a collision, never on missing data,
 /// mirroring `tx_qso_is_live`'s own fail-open posture on a poisoned lock.
+///
+/// Codex P2 on PR #370 (round 2): `a7_recent_calls` is populated from
+/// on-air decodes, which are canonically uppercase, but `their_callsign`
+/// here comes from `QsoMetadata` — which a remote `callStation` command can
+/// populate verbatim, lowercase included. `their_callsign` is uppercased
+/// before the lookup so a case mismatch can't silently defeat the gate
+/// (a raw `HashMap` lookup is exact-match, not `callsigns_match`-aware).
 fn dx_parity_conflict(
     their_callsign: &str,
     required_parity: pancetta_core::slot::SlotParity,
@@ -2788,10 +2795,11 @@ fn dx_parity_conflict(
     now: std::time::SystemTime,
     freshness_window: std::time::Duration,
 ) -> bool {
+    let their_callsign = their_callsign.trim().to_uppercase();
     let Ok(a7) = cross_time_state.a7_recent_calls.read() else {
         return false;
     };
-    let Some(entry) = a7.get(their_callsign) else {
+    let Some(entry) = a7.get(&their_callsign) else {
         return false;
     };
     let Ok(age) = now.duration_since(entry.decoded_at) else {
@@ -9855,6 +9863,28 @@ mod schedule_tx_tests {
         // are about to key into (the PAN-141 collision shape).
         assert!(super::dx_parity_conflict(
             "5Z4VJ",
+            SlotParity::Odd,
+            &cts,
+            now,
+            std::time::Duration::from_secs(30),
+        ));
+    }
+
+    /// Codex P2 on PR #370 (round 2): the table is populated from on-air
+    /// decodes (canonically uppercase), but `their_callsign` can arrive
+    /// lowercase from a remote `callStation` command's `QsoMetadata`. A raw
+    /// case-sensitive `HashMap` lookup must not silently defeat the gate.
+    #[test]
+    fn dx_parity_conflict_true_for_lowercase_query_against_uppercase_table_entry() {
+        let cts = pancetta_qso::CrossTimeState::empty();
+        let now = std::time::SystemTime::now();
+        cts.a7_recent_calls
+            .write()
+            .unwrap()
+            .record(a7_call("5Z4VJ", 1, now));
+
+        assert!(super::dx_parity_conflict(
+            "5z4vj",
             SlotParity::Odd,
             &cts,
             now,
