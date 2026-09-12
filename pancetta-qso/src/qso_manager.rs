@@ -10024,16 +10024,34 @@ mod tests {
                 )
                 .await
         });
-        // Not required for correctness (the assertions below hold no
-        // matter how far `apply_handle` got by the time `proceed_tx`
-        // fires) — just gives the scheduler a chance to actually start
-        // polling it and reach the (currently blocked) lock attempt,
-        // exercising the more interesting of the two possible
-        // interleavings. A pure scheduler yield, not a wall-clock delay,
-        // so it carries no timing assumption to be flaky about.
-        for _ in 0..4 {
+        // Give the scheduler many chances to actually poll `apply_handle`
+        // up to its (currently unavailable) lock attempt. On the
+        // multi-threaded runtime this test requires, a freshly spawned
+        // task is picked up by the other worker thread essentially
+        // immediately rather than waiting for this task to yield, so
+        // this reliably lets it run far enough to genuinely block.
+        for _ in 0..64 {
             tokio::task::yield_now().await;
         }
+
+        // Codex round 2 (P2): the yields above give `apply_handle` a
+        // chance to run, but don't by themselves PROVE it reached the
+        // gate rather than simply not having been scheduled yet — this
+        // is that proof. If `ptt_sync_gate` were ever removed from
+        // `apply_tx_offset_switch` (the exact regression this test
+        // exists to catch), there would be nothing here to block on: the
+        // task would run to completion almost immediately once polled,
+        // well before `proceed_tx` fires below. With the real gate in
+        // place, `apply_handle` is *structurally* unable to finish yet —
+        // `ptt_task` still holds the only lock it could pass through —
+        // so this assertion is unconditionally true for the correct
+        // implementation and would fail the moment that guarantee is
+        // ever removed.
+        assert!(
+            !apply_handle.is_finished(),
+            "apply_tx_offset_switch must still be blocked on ptt_sync_gate at this point — \
+             if this fires, the gate is not actually serializing against ptt_task"
+        );
 
         proceed_tx
             .send(())
