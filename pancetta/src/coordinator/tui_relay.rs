@@ -824,6 +824,11 @@ impl super::ApplicationCoordinator {
         // the autonomous operator can detect a transition it didn't directly
         // observe (see `AutonomousOperator::set_tx_freq_mode_generation_source`).
         let cmd_tx_freq_mode_generation = self.tx_freq_mode_generation.clone();
+        // PAN-143: shared with QsoManager's apply_tx_offset_switch and
+        // PttGuard::new so every `cmd_tx_freq_mode.store()` below is
+        // genuinely atomic against that method's recheck of the same
+        // atomic, not just narrowly raced against it.
+        let cmd_ptt_sync_gate = self.ptt_sync_gate.clone();
         // Held TX audio offset in Hz (0 = Auto/unset). Written by the `o`-modal
         // relay arm; read by the manual-call handler at QSO open to place our
         // TX audio offset when the operator has set one.
@@ -1811,8 +1816,17 @@ impl super::ApplicationCoordinator {
                             // race where a concurrent reader could observe
                             // the new mode but the pre-bump generation,
                             // firing neither invalidation check.
-                            cmd_tx_freq_mode_generation.fetch_add(1, Ordering::SeqCst);
-                            cmd_tx_freq_mode.store(next.as_u8(), Ordering::SeqCst);
+                            //
+                            // PAN-143: also under `cmd_ptt_sync_gate` so this
+                            // store is mutually exclusive with QsoManager's
+                            // `apply_tx_offset_switch` recheck of the same
+                            // atomic, closing (not just narrowing) that race.
+                            {
+                                let _ptt_sync =
+                                    cmd_ptt_sync_gate.lock().unwrap_or_else(|p| p.into_inner());
+                                cmd_tx_freq_mode_generation.fetch_add(1, Ordering::SeqCst);
+                                cmd_tx_freq_mode.store(next.as_u8(), Ordering::SeqCst);
+                            }
                             info!(
                                 target: "tx.freq",
                                 "Operator toggled TX-frequency mode: {} -> {}",
@@ -1838,11 +1852,18 @@ impl super::ApplicationCoordinator {
                                     // PAN-38 round 3: generation-before-mode,
                                     // both SeqCst -- see ToggleTxFreqMode's
                                     // comment above for the full reasoning.
-                                    cmd_tx_freq_mode_generation.fetch_add(1, Ordering::SeqCst);
-                                    cmd_tx_freq_mode.store(
-                                        pancetta_core::TxFreqMode::Hold.as_u8(),
-                                        Ordering::SeqCst,
-                                    );
+                                    // PAN-143: also under `cmd_ptt_sync_gate`
+                                    // -- see ToggleTxFreqMode's PAN-143 note.
+                                    {
+                                        let _ptt_sync = cmd_ptt_sync_gate
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner());
+                                        cmd_tx_freq_mode_generation.fetch_add(1, Ordering::SeqCst);
+                                        cmd_tx_freq_mode.store(
+                                            pancetta_core::TxFreqMode::Hold.as_u8(),
+                                            Ordering::SeqCst,
+                                        );
+                                    }
                                     info!(
                                         target: "tx.freq",
                                         "Operator set TX offset hold @ {} Hz (mode → Hold)",
@@ -1860,11 +1881,18 @@ impl super::ApplicationCoordinator {
                                     // PAN-38 round 3: generation-before-mode,
                                     // both SeqCst -- see ToggleTxFreqMode's
                                     // comment above for the full reasoning.
-                                    cmd_tx_freq_mode_generation.fetch_add(1, Ordering::SeqCst);
-                                    cmd_tx_freq_mode.store(
-                                        pancetta_core::TxFreqMode::Auto.as_u8(),
-                                        Ordering::SeqCst,
-                                    );
+                                    // PAN-143: also under `cmd_ptt_sync_gate`
+                                    // -- see ToggleTxFreqMode's PAN-143 note.
+                                    {
+                                        let _ptt_sync = cmd_ptt_sync_gate
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner());
+                                        cmd_tx_freq_mode_generation.fetch_add(1, Ordering::SeqCst);
+                                        cmd_tx_freq_mode.store(
+                                            pancetta_core::TxFreqMode::Auto.as_u8(),
+                                            Ordering::SeqCst,
+                                        );
+                                    }
                                     info!(
                                         target: "tx.freq",
                                         "Operator cleared TX offset hold (mode → Auto)"

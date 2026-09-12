@@ -193,11 +193,11 @@ guards actual authorization state where a poison must not be silently trusted).
 
 ## Test impact
 
-- `PttGuard::new` gains one parameter — touches its 3 production call sites in `tx.rs` and every
-  test that constructs one directly. `tx.rs`'s existing test harness builds a
-  `ptt_active: Arc<AtomicBool>` per test at 14 sites (verified by grep, no shared fixture); each
-  gets one more `Arc::new(std::sync::Mutex::new(()))` alongside it — mechanical, no behavior
-  change for tests that never race the gate.
+- `PttGuard::new` gains one parameter — touches only its 3 production call sites in `tx.rs`
+  (verified: no test calls `PttGuard::new` directly). `tx.rs`'s 14 test sites that build a
+  `ptt_active: Arc<AtomicBool>` all go through `supersede_and_rekey_or_bundle` and similar helper
+  functions, none of which touch `PttGuard::new` — smaller blast radius than originally estimated,
+  no test changes needed on the `tx.rs` side at all.
 - `QsoManager::set_ptt_sync_gate_source` is optional to call in tests exactly like
   `set_ptt_active_source`/`set_tx_freq_mode_source` already are — `QsoManager::new`'s default
   (a fresh, uncontended mutex) means every existing test that never injects a custom source keeps

@@ -2480,6 +2480,11 @@ impl super::ApplicationCoordinator {
         // `apply_tx_offset_switch`'s pre-commit recheck sees genuine TX-worker
         // state, not its private `false` default.
         let ptt_active = self.ptt_active.clone();
+        // PAN-143: share the coordinator's PTT/offset-switch synchronization
+        // gate so the recheck above is genuinely atomic against the TX
+        // worker's/TUI-relay task's writes, not just narrowly raced against
+        // them.
+        let ptt_sync_gate = self.ptt_sync_gate.clone();
         // T3 will read this to apply the operator's held TX audio offset when
         // starting a manual QSO (Hold mode). Captured here so both atomics
         // are in scope in the StartQso/RespondToCaller handlers below.
@@ -2573,6 +2578,9 @@ impl super::ApplicationCoordinator {
         // against a stall/nudge action landing mid-transmission) reflects
         // genuine TX-worker state.
         qso_manager.set_ptt_active_source(ptt_active.clone());
+        // PAN-143: share the synchronization gate too — see the field's doc
+        // comment in qso_manager.rs.
+        qso_manager.set_ptt_sync_gate_source(ptt_sync_gate.clone());
         // PAN-72 (Codex round 2 on PR #350, finding 5): share the global TX
         // policy too, so the same stall detector does not count a rearm cycle
         // whose re-send the `TxPolicy::Disabled` hard mute blocked outright —

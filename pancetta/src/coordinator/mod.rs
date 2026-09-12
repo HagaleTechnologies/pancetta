@@ -1248,6 +1248,16 @@ pub struct ApplicationCoordinator {
     /// status bar to show the live reading only during TX.
     pub(crate) ptt_active: Arc<std::sync::atomic::AtomicBool>,
 
+    /// PAN-143: shared mutex making `ptt_active`'s and `tx_freq_mode`'s
+    /// writers (the TX worker's `PttGuard::new`, the TUI-relay task's three
+    /// `tx_freq_mode` stores) mutually exclusive with
+    /// `pancetta_qso::QsoManager::apply_tx_offset_switch`'s recheck of those
+    /// same flags — closing, not just narrowing, the residual race PAN-140
+    /// round 2 found. Guards a unit value; only the mutual exclusion matters.
+    /// See `docs/superpowers/specs/
+    /// 2026-09-12-pan-143-ptt-shared-synchronization-design.md`.
+    pub(crate) ptt_sync_gate: Arc<std::sync::Mutex<()>>,
+
     /// Epoch-ms timestamp of the most recent PTT-on (updated alongside
     /// `ptt_active` going true). Unlike the boolean, this survives past
     /// unkey, so the FT8 decode loop can flag a "TX-adjacent" window —
@@ -1993,6 +2003,7 @@ impl ApplicationCoordinator {
             fox_mode: Arc::new(AtomicBool::new(false)),
             fox_max_streams: Arc::new(AtomicUsize::new(fox_max_streams_init)),
             ptt_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ptt_sync_gate: Arc::new(std::sync::Mutex::new(())),
             last_ptt_on_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             // C9 dedup anchor — no pancetta-initiated frequency command yet.
             last_freq_command: Arc::new(std::sync::Mutex::new(None)),

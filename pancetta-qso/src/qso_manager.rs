@@ -1046,6 +1046,31 @@ pub struct QsoManager {
     /// caller that never injects a source are unaffected.
     ptt_active: Arc<std::sync::atomic::AtomicBool>,
 
+    /// PAN-143 (follow-up to PAN-140's Codex round 2, itself parented under
+    /// PAN-134's "check-then-act with no shared lock" root cause): a
+    /// recheck of `tx_freq_mode`/`ptt_active` immediately before this
+    /// method's own mutation only NARROWS the race against the TX worker's
+    /// `ptt_active.store` (`PttGuard::new`) and the TUI-relay task's
+    /// `tx_freq_mode.store` (three sites — the `f`-key toggle and both `o`-
+    /// modal branches) — it cannot CLOSE it, because none of those three
+    /// writers share a lock with this method's own `qsos` write lock. This
+    /// gate is that shared lock: `apply_tx_offset_switch` takes it (after
+    /// already holding `qsos.write()`, never before — see the design spec
+    /// for the lock-ordering argument) around its guard-5/guard-6 recheck
+    /// and the frequency mutation itself, and the three writers above take
+    /// it around their own store. No `.await` ever occurs while held, so a
+    /// blocking `std::sync::Mutex` is correct and needs no async plumbing
+    /// through `PttGuard::new` or the TUI-relay handlers. The guarded type
+    /// is `()` — there is no data invariant a poisoning panic could
+    /// corrupt, only the mutual-exclusion property, which recovery via
+    /// `into_inner()` preserves — so every acquisition site recovers from
+    /// poison rather than propagating it. Defaults to a private, fresh
+    /// mutex so unit tests and any caller that never injects a source are
+    /// unaffected (uncontended lock, same behavior as before this field
+    /// existed). See `docs/superpowers/specs/
+    /// 2026-09-12-pan-143-ptt-shared-synchronization-design.md`.
+    ptt_sync_gate: Arc<std::sync::Mutex<()>>,
+
     /// Global operator TX policy (`pancetta_core::TxPolicy` as `u8`), shared
     /// from the coordinator.
     ///
@@ -1367,6 +1392,10 @@ impl QsoManager {
             // Default false: with no injected source, behave exactly as this
             // method did before PAN-140 existed (see the field's doc comment).
             ptt_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            // Default a fresh, private, uncontended mutex: with no injected
+            // source, behave exactly as this method did before PAN-143
+            // existed (see the field's doc comment).
+            ptt_sync_gate: Arc::new(std::sync::Mutex::new(())),
             // Default Full: with no injected source, assume TX is live — the
             // pre-existing behavior (see the field's doc comment).
             tx_policy: Arc::new(std::sync::atomic::AtomicU8::new(
@@ -1420,6 +1449,19 @@ impl QsoManager {
     /// field's doc comment — matches pre-PAN-140 behavior).
     pub fn set_ptt_active_source(&mut self, source: Arc<std::sync::atomic::AtomicBool>) {
         self.ptt_active = source;
+    }
+
+    /// Share the coordinator's PTT/offset-switch synchronization gate
+    /// (PAN-143) so `apply_tx_offset_switch`'s recheck-then-commit is
+    /// genuinely atomic against the TX worker's `ptt_active` store and the
+    /// TUI-relay task's `tx_freq_mode` stores, instead of merely narrowing
+    /// the race between them. Pass the same `Arc<Mutex<()>>` those sites
+    /// take. If never called, the manager keeps its own private, always-
+    /// uncontended mutex (see the field's doc comment — matches pre-PAN-143
+    /// behavior, since nothing else could be racing a lock nobody else
+    /// holds a reference to).
+    pub fn set_ptt_sync_gate_source(&mut self, source: Arc<std::sync::Mutex<()>>) {
+        self.ptt_sync_gate = source;
     }
 
     /// Share the coordinator's global TX-policy atomic (encoded via
@@ -3640,39 +3682,51 @@ impl QsoManager {
             });
         }
         // 5. **Hold mode, re-validated inside this commit** (Codex round 10 on
-        //    PR #350, thread on `autonomous.rs:988`). The caller's own Hold
-        //    checks (`drain_pending_qso_offset_requests`'s batch-level and
-        //    per-request re-reads) run BEFORE the `.await` for this method's
-        //    write lock — a contended lock leaves a real window in which the
-        //    operator's `f` press (Auto → Hold) lands after the caller's last
-        //    check but before this commit runs. Re-checking here, inside the
-        //    SAME locked section that is about to mutate `progress`, closes
-        //    that window by construction rather than relying on the caller to
-        //    win a race against its own `.await`.
-        if !pancetta_core::TxFreqMode::from_u8(
-            self.tx_freq_mode.load(std::sync::atomic::Ordering::Relaxed),
-        )
-        .allows_auto_change()
-        {
-            return Err(QsoManagerError::OffsetActionHeld { qso_id });
-        }
+        //    PR #350, thread on `autonomous.rs:988`; closed for real by
+        //    PAN-143 — see the `ptt_sync_gate` field's doc comment). The
+        //    caller's own Hold checks (`drain_pending_qso_offset_requests`'s
+        //    batch-level and per-request re-reads) run BEFORE the `.await`
+        //    for this method's write lock — a contended lock leaves a real
+        //    window in which the operator's `f`/`o`-modal action (Auto ↔
+        //    Hold) lands after the caller's last check but before this
+        //    commit runs. Re-checking here is not enough by itself (`tx_freq_
+        //    mode` is written by a completely independent task with no lock
+        //    shared with `self.qsos` at all) — `ptt_sync_gate` below is what
+        //    actually closes the window, by making this recheck and that
+        //    task's store mutually exclusive.
+        //
         // 6. **PTT already keyed, re-validated inside this commit** (PAN-140,
-        //    Codex P1 on PR #369). The caller's own pre-commit check
+        //    Codex P1 on PR #369; closed for real by PAN-143). Same shape as
+        //    guard 5, one line down: the caller's own pre-commit check
         //    (`drain_pending_qso_offset_requests`'s top-of-loop guard) runs
-        //    BEFORE the `.await` for this method's write lock — a contended
-        //    lock leaves a real window in which the TX worker keys PTT for
-        //    this exact QSO's rearm after the caller's last check but before
-        //    this commit runs, reopening the same mid-flight collision this
-        //    fix exists to prevent. Re-checking here, inside the SAME locked
-        //    section that is about to mutate `progress`, narrows that window
-        //    to the smallest one achievable without a lock shared with the
-        //    TX worker itself.
-        if self.ptt_active.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(QsoManagerError::OffsetActionPttInFlight { qso_id });
+        //    BEFORE the `.await` for this method's write lock, and a bare
+        //    recheck of the independently-written `ptt_active` atomic here
+        //    can only narrow, not close, the window against the TX worker's
+        //    `PttGuard::new` store. `ptt_sync_gate` closes it.
+        //
+        // Both guards, and the mutation they gate, run inside one
+        // acquisition of `ptt_sync_gate` — acquired AFTER `self.qsos.write()`
+        // above (never before: see the design spec's lock-ordering
+        // argument), held only across synchronous statements (no `.await`
+        // anywhere in this block), and dropped via normal scope exit on
+        // every path (including the two early returns) before this
+        // function's own later `.await` points.
+        {
+            let _ptt_sync = self.ptt_sync_gate.lock().unwrap_or_else(|p| p.into_inner());
+            if !pancetta_core::TxFreqMode::from_u8(
+                self.tx_freq_mode.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .allows_auto_change()
+            {
+                return Err(QsoManagerError::OffsetActionHeld { qso_id });
+            }
+            if self.ptt_active.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(QsoManagerError::OffsetActionPttInFlight { qso_id });
+            }
+            progress.metadata.frequency = applied_hz;
+            progress.metadata.pending_freq_drift = None;
+            progress.metadata.stall_cycles = 0;
         }
-        progress.metadata.frequency = applied_hz;
-        progress.metadata.pending_freq_drift = None;
-        progress.metadata.stall_cycles = 0;
         // PAN-72 (Codex round 4 on PR #350, finding 3): remember the offset we
         // are vacating, and when. The frame that triggered this move went out
         // on it — `rearm_manual_calls_at` re-sends and trips the stall
@@ -7446,6 +7500,7 @@ impl Clone for QsoManager {
             split_tx_frequency_hz: Arc::clone(&self.split_tx_frequency_hz),
             tx_freq_mode: Arc::clone(&self.tx_freq_mode),
             ptt_active: Arc::clone(&self.ptt_active),
+            ptt_sync_gate: Arc::clone(&self.ptt_sync_gate),
             tx_policy: Arc::clone(&self.tx_policy),
             remote_tx_permitted: Arc::clone(&self.remote_tx_permitted),
             hamlib_hard_muted: Arc::clone(&self.hamlib_hard_muted),
@@ -9881,6 +9936,77 @@ mod tests {
         assert_eq!(
             after.metadata.frequency, before.metadata.frequency,
             "frequency must be completely unchanged"
+        );
+    }
+
+    /// PAN-143: the actual regression test for the race PAN-140 round 2
+    /// found — a bare recheck of `ptt_active` cannot close a TOCTOU gap
+    /// against a writer with no shared lock, only `ptt_sync_gate` can. This
+    /// test proves the gate is real mutual exclusion, not just another
+    /// atomic: a task holds `ptt_sync_gate` (standing in for
+    /// `PttGuard::new`'s critical section) for a measurable interval, flips
+    /// `ptt_active` to `true` only AFTER acquiring it, and releases it only
+    /// after a delay. `apply_tx_offset_switch`, called concurrently, must
+    /// block on the gate rather than racing past a bare atomic load — so it
+    /// is guaranteed to observe the post-store `true` and refuse, every
+    /// time, not merely "usually" as a narrowing-only recheck would.
+    #[tokio::test]
+    async fn apply_tx_offset_switch_blocks_on_the_sync_gate_until_a_concurrent_ptt_assert_completes(
+    ) {
+        let mut manager = QsoManager::new(test_config());
+        manager.set_tx_freq_mode_source(Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        let ptt_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        manager.set_ptt_active_source(Arc::clone(&ptt_active));
+        let ptt_sync_gate = Arc::new(std::sync::Mutex::new(()));
+        manager.set_ptt_sync_gate_source(Arc::clone(&ptt_sync_gate));
+
+        let qso_id = manager
+            .respond_to_cq_manual("K1GHI".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+
+        // Simulate `PttGuard::new`'s critical section directly: acquire the
+        // gate, THEN flip `ptt_active`, and hold the gate briefly before
+        // releasing — exactly the shape the production code takes, just
+        // stretched out in time so the race window is exercised
+        // deterministically instead of depending on scheduler luck.
+        let gate_for_ptt_task = Arc::clone(&ptt_sync_gate);
+        let ptt_active_for_task = Arc::clone(&ptt_active);
+        let ptt_task = tokio::task::spawn_blocking(move || {
+            let _guard = gate_for_ptt_task.lock().unwrap_or_else(|p| p.into_inner());
+            ptt_active_for_task.store(true, std::sync::atomic::Ordering::Release);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        });
+        // Give the spawned task a head start so it is very likely already
+        // holding the gate (and has already stored `true`) by the time
+        // `apply_tx_offset_switch` below tries to acquire it -- the
+        // assertion below holds regardless of scheduling, this just makes
+        // the interesting interleaving the common one instead of a fluke.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let before = manager.get_qso(qso_id).await.unwrap();
+        let err = manager
+            .apply_tx_offset_switch(
+                qso_id,
+                14074000.0 + 500.0,
+                OffsetRelocationOrigin::OperatorForced,
+            )
+            .await
+            .unwrap_err();
+
+        ptt_task.await.unwrap();
+
+        assert!(
+            matches!(&err, QsoManagerError::OffsetActionPttInFlight { qso_id: id } if *id == qso_id),
+            "expected OffsetActionPttInFlight (the gate must make the commit observe the \
+             post-store value deterministically), got {err:?}"
+        );
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.frequency, before.metadata.frequency,
+            "a genuinely-serialized refusal must leave the frequency untouched"
         );
     }
 
