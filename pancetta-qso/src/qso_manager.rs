@@ -9943,14 +9943,31 @@ mod tests {
     /// found — a bare recheck of `ptt_active` cannot close a TOCTOU gap
     /// against a writer with no shared lock, only `ptt_sync_gate` can. This
     /// test proves the gate is real mutual exclusion, not just another
-    /// atomic: a task holds `ptt_sync_gate` (standing in for
-    /// `PttGuard::new`'s critical section) for a measurable interval, flips
-    /// `ptt_active` to `true` only AFTER acquiring it, and releases it only
-    /// after a delay. `apply_tx_offset_switch`, called concurrently, must
-    /// block on the gate rather than racing past a bare atomic load — so it
-    /// is guaranteed to observe the post-store `true` and refuse, every
-    /// time, not merely "usually" as a narrowing-only recheck would.
-    #[tokio::test]
+    /// atomic.
+    ///
+    /// Uses an explicit two-channel handshake, not a sleep-based head
+    /// start (Codex round 1 on this PR, P2: a fixed delay can't
+    /// distinguish "the gate genuinely serializes" from "the scheduler
+    /// happened to run things in the lucky order" — a 10ms sleep either
+    /// side of the real timing could flip the outcome either way,
+    /// independent of whether the gate exists at all). `ptt_task` proves
+    /// (via `gate_held_rx`) that it holds `ptt_sync_gate` BEFORE storing
+    /// `ptt_active`, and does not store/release until told to (via
+    /// `proceed_tx`) — so for the entire window between those two
+    /// channel operations, `apply_tx_offset_switch`'s own
+    /// `ptt_sync_gate.lock()` is *structurally* unable to succeed,
+    /// regardless of how the scheduler interleaves the two tasks. Once
+    /// `proceed_tx` fires, `ptt_task` stores `true` and only then drops
+    /// the guard — so whenever `apply_tx_offset_switch`'s lock attempt
+    /// does succeed (before or after that point), it is guaranteed by the
+    /// mutex's own happens-before semantics to observe the post-store
+    /// value, not a stale one. `#[tokio::test(flavor = "multi_thread")]`
+    /// is required: `apply_tx_offset_switch` is spawned as its own task
+    /// so it can sit genuinely blocked in a synchronous
+    /// `std::sync::Mutex::lock()` call while the main test task is still
+    /// running — a single-worker-thread runtime would deadlock here
+    /// instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn apply_tx_offset_switch_blocks_on_the_sync_gate_until_a_concurrent_ptt_assert_completes(
     ) {
         let mut manager = QsoManager::new(test_config());
@@ -9967,36 +9984,64 @@ mod tests {
             .await
             .unwrap();
 
-        // Simulate `PttGuard::new`'s critical section directly: acquire the
-        // gate, THEN flip `ptt_active`, and hold the gate briefly before
-        // releasing — exactly the shape the production code takes, just
-        // stretched out in time so the race window is exercised
-        // deterministically instead of depending on scheduler luck.
+        let (gate_held_tx, gate_held_rx) = std::sync::mpsc::channel::<()>();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel::<()>();
+
+        // Simulate `PttGuard::new`'s critical section directly: acquire
+        // the gate, prove it (before touching `ptt_active` at all), then
+        // wait for explicit permission before storing and releasing.
         let gate_for_ptt_task = Arc::clone(&ptt_sync_gate);
         let ptt_active_for_task = Arc::clone(&ptt_active);
         let ptt_task = tokio::task::spawn_blocking(move || {
             let _guard = gate_for_ptt_task.lock().unwrap_or_else(|p| p.into_inner());
+            gate_held_tx
+                .send(())
+                .expect("test harness: receiver dropped before the gate-held handshake");
+            proceed_rx
+                .recv()
+                .expect("test harness: sender dropped before the proceed handshake");
             ptt_active_for_task.store(true, std::sync::atomic::Ordering::Release);
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            // `_guard` drops here, releasing the gate only now.
         });
-        // Give the spawned task a head start so it is very likely already
-        // holding the gate (and has already stored `true`) by the time
-        // `apply_tx_offset_switch` below tries to acquire it -- the
-        // assertion below holds regardless of scheduling, this just makes
-        // the interesting interleaving the common one instead of a fluke.
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Deterministic: blocks until `ptt_task` genuinely holds the gate.
+        // From this point until `proceed_tx` fires below, any attempt to
+        // acquire `ptt_sync_gate` elsewhere is structurally unable to
+        // succeed.
+        gate_held_rx
+            .recv()
+            .expect("ptt_task must signal gate-held before this point");
+
+        // Spawn the method under test concurrently — its own
+        // `ptt_sync_gate.lock()` is guaranteed blocked right now.
+        let manager_for_apply = manager.clone();
+        let apply_handle = tokio::spawn(async move {
+            manager_for_apply
+                .apply_tx_offset_switch(
+                    qso_id,
+                    14074000.0 + 500.0,
+                    OffsetRelocationOrigin::OperatorForced,
+                )
+                .await
+        });
+        // Not required for correctness (the assertions below hold no
+        // matter how far `apply_handle` got by the time `proceed_tx`
+        // fires) — just gives the scheduler a chance to actually start
+        // polling it and reach the (currently blocked) lock attempt,
+        // exercising the more interesting of the two possible
+        // interleavings. A pure scheduler yield, not a wall-clock delay,
+        // so it carries no timing assumption to be flaky about.
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        proceed_tx
+            .send(())
+            .expect("ptt_task must still be waiting on the proceed handshake");
+        ptt_task.await.unwrap();
 
         let before = manager.get_qso(qso_id).await.unwrap();
-        let err = manager
-            .apply_tx_offset_switch(
-                qso_id,
-                14074000.0 + 500.0,
-                OffsetRelocationOrigin::OperatorForced,
-            )
-            .await
-            .unwrap_err();
-
-        ptt_task.await.unwrap();
+        let err = apply_handle.await.unwrap().unwrap_err();
 
         assert!(
             matches!(&err, QsoManagerError::OffsetActionPttInFlight { qso_id: id } if *id == qso_id),
