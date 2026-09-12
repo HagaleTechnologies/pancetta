@@ -2062,16 +2062,30 @@ impl QsoManager {
     /// before reaching the in-tolerance reset, so a stale `pending_freq_drift`
     /// would persist in serialized metadata for the QSO's life (PAN-15 item 2).
     async fn stamp_hound_flag(&self, qso_id: QsoId) {
+        // PAN-142 (Codex P2 on PR #371, round 5): a decode landing in the
+        // documented construction-window gap (between `respond_to_cq_with`/
+        // `engage_hound` creating the QSO and this stamp running) can have
+        // `maybe_confirm_frequency_drift_at` note a `pending_freq_drift`
+        // candidate — round 1's fix emits a StateChanged for that. This
+        // stamp then clears the candidate below with no refresh of its own,
+        // so a stale "[DRIFT …]" indicator could sit in the TUI snapshot
+        // until an unrelated QSO event happens to refresh it (genuine Hound
+        // QSOs are skipped by the drift-confirm mechanism entirely from this
+        // point on, so nothing else would ever clear it). Same fix shape as
+        // round 1: emit only when there was actually a candidate to clear.
         let mut qsos = self.qsos.write().await;
         if let Some(progress) = qsos.get_mut(&qso_id) {
             progress.metadata.hound = true;
-            progress.metadata.pending_freq_drift = None;
             // NOTE: do NOT insert "HOUND" into metadata.tags — that would
             // produce a bare `<HOUND:4>true` ADIF field, which is not a
             // valid ADIF name (must be `APP_`-prefixed per the ADIF spec)
             // and can trip LoTW. The human-readable COMMENT "HOUND" and the
             // machine-readable `APP_PANCETTA_HOUND` field are both written
             // by `AdifProcessor::qso_to_adif` from `metadata.hound` directly.
+            if progress.metadata.pending_freq_drift.take().is_some() {
+                let state = progress.state.clone();
+                self.emit_state_change(qso_id, state.clone(), state).await;
+            }
         }
     }
 
@@ -13397,6 +13411,7 @@ mod sender_verification_tests {
         );
 
         // The fix: stamping the hound flag must clear it atomically.
+        let mut events = manager.subscribe();
         manager.stamp_hound_flag(qso_id).await;
         let progress = manager.get_qso(qso_id).await.unwrap();
         assert!(progress.metadata.hound, "hound flag must now be stamped");
@@ -13404,6 +13419,23 @@ mod sender_verification_tests {
             progress.metadata.pending_freq_drift, None,
             "stamp_hound_flag must clear any drift candidate accumulated in the window, \
              otherwise it can never be cleared again for this Hound QSO's life"
+        );
+        // PAN-142 (Codex P2 on PR #371, round 5): clearing it here must ALSO
+        // emit, same as the ordinary in-tolerance clear in
+        // `maybe_confirm_frequency_drift_at` — otherwise a TUI snapshot that
+        // already captured the pending candidate has nothing to ever refresh
+        // it, since genuine Hound QSOs are skipped by that mechanism from
+        // here on (no other event would ever clear a stale indicator).
+        let mut saw_state_changed_for_qso = false;
+        while let Ok(ev) = events.try_recv() {
+            if matches!(ev, QsoEvent::StateChanged { qso_id: id, .. } if id == qso_id) {
+                saw_state_changed_for_qso = true;
+            }
+        }
+        assert!(
+            saw_state_changed_for_qso,
+            "clearing the candidate via the hound stamp must emit StateChanged so the TUI \
+             snapshot refreshes"
         );
     }
 
