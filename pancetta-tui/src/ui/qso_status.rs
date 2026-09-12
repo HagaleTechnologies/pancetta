@@ -164,13 +164,19 @@ fn render_multi_qso_table(f: &mut Frame<'_>, area: Rect, app: &App) {
         // ("[HOUND]" = 8 cols, "[DRIFT NNNHz]" = up to ~17) still consumed
         // most of the ~19 columns left after the fixed fields, squeezing a
         // present watchdog down to 1-4 visible characters when both badges
-        // and a watchdog line up on the same manual QSO. Compact
-        // single-letter badges (`status_badge_glyphs`) cut that worst case
-        // to 4 columns total, leaving the watchdog its own space back —
-        // color still carries the meaning (cyan=Hound, the same warning
-        // color drift already used), and the full drift Hz value remains
-        // available in the single-QSO detail view's `combined_status_line`
-        // once that QSO is selected. Hound-mode badge in the table row.
+        // and a watchdog line up on the same manual QSO. Compact badges
+        // (`status_badge_glyphs`) cut that worst case dramatically, leaving
+        // the watchdog its own space back — color still carries the Hound
+        // badge's meaning (cyan), but the drift badge below keeps its Hz
+        // VALUE compact rather than dropping it entirely (round 1 review,
+        // Codex P2): `render_qso_status` only renders the single-QSO
+        // detail view (where `combined_status_line` shows the full value)
+        // when `active_count <= 1` — moving the row cursor while 2+ QSOs
+        // are active never switches views, so a value-less "D" glyph
+        // would make this transient candidate's actual offset genuinely
+        // unreachable for exactly the multi-stream case this table
+        // exists for, not just harder to see. Hound-mode badge in the
+        // table row.
         if qso.hound {
             row.push(Span::styled(
                 status_badge_glyphs::HOUND,
@@ -182,11 +188,11 @@ fn render_multi_qso_table(f: &mut Frame<'_>, area: Rect, app: &App) {
         }
         // Drift-candidate badge — see the module-level PAN-142/PAN-144 doc
         // comment above for why this must precede, not follow, the
-        // watchdog text, and why it's a single letter rather than the Hz
-        // value.
-        if qso.pending_freq_drift_hz.is_some() {
+        // watchdog text, and why it carries the compact Hz value rather
+        // than dropping it.
+        if let Some(hz) = qso.pending_freq_drift_hz {
             row.push(Span::styled(
-                status_badge_glyphs::DRIFT,
+                status_badge_glyphs::drift(hz),
                 Style::default()
                     .fg(Color::Black)
                     .bg(app.theme.warning_color())
@@ -371,21 +377,29 @@ fn render_qso_info(f: &mut Frame<'_>, area: Rect, app: &App) {
     f.render_widget(paragraph, area);
 }
 
-/// Compact single-letter status-badge glyphs for [`render_multi_qso_table`]
-/// (PAN-144, round 6 follow-up on PAN-142). Each is 2 display columns
-/// (a leading space plus one letter) instead of the bracketed
+/// Compact status-badge glyphs for [`render_multi_qso_table`] (PAN-144,
+/// round 6 follow-up on PAN-142). Much shorter than the bracketed
 /// `" [HOUND]"` (8 columns) / `" [DRIFT NNNHz]"` (up to ~17 columns) the
-/// table used before — see [`multi_qso_table_fixed_columns`]'s doc
-/// comment for the column-budget arithmetic this trades off. Color alone
-/// (cyan for Hound, the same warning color the drift indicator already
-/// used) still distinguishes the two; the drift candidate's actual Hz
-/// value remains available in the single-QSO detail view's
-/// `combined_status_line` once that QSO is selected — this table's
-/// per-row space just isn't wide enough for both a legible value AND the
-/// keep-calling watchdog.
+/// table used before — see [`MULTI_QSO_TABLE_FIXED_COLUMNS`]'s doc
+/// comment for the column-budget arithmetic this trades off. Color still
+/// carries the Hound badge's meaning entirely (cyan; it has no
+/// associated value, just presence/absence, matching the old bracketed
+/// form). The drift badge keeps its Hz VALUE, just compacted (round 1
+/// review on PR #373, Codex P2): `render_qso_status` only renders the
+/// single-QSO detail view — where `combined_status_line` shows the full
+/// value — when `active_count <= 1`; moving the row cursor while 2+ QSOs
+/// are active never switches views, so a value-less glyph would make
+/// this transient candidate's actual offset genuinely unreachable for
+/// exactly the multi-stream case this table exists for.
 mod status_badge_glyphs {
     pub(super) const HOUND: &str = " H";
-    pub(super) const DRIFT: &str = " D";
+
+    /// `" D<hz>"` — e.g. `" D937"`. `ACTIVE_QSO_TX_OFFSET_MIN_HZ`/`_MAX_HZ`
+    /// (`pancetta-qso`) bound `hz` to `200.0..=2900.0`, so this is always
+    /// 3-4 digits (5-6 columns total), never negative.
+    pub(super) fn drift(hz: f64) -> String {
+        format!(" D{hz:.0}")
+    }
 }
 
 /// Total display-column width [`render_multi_qso_table`]'s six fixed
@@ -398,13 +412,14 @@ mod status_badge_glyphs {
 const MULTI_QSO_TABLE_FIXED_COLUMNS: usize = 12 + 9 + 13 + 8 + 6 + 3;
 
 /// Worst-case display-column width of the status badges — both present —
-/// under the old bracketed form vs. the current compact glyph form.
-/// `" [HOUND]"` is 8, `" [DRIFT "` + up to 4 digits + `"Hz]"` is up to 17
-/// (e.g. `" [DRIFT -999Hz]"`); each `status_badge_glyphs` entry is 2.
+/// under the old bracketed form vs. the current compact form. `" [HOUND]"`
+/// is 8, `" [DRIFT "` + up to 4 digits + `"Hz]"` is up to 17 (e.g.
+/// `" [DRIFT 2900Hz]"`); the compact form is `" H"` (2) plus
+/// `status_badge_glyphs::drift` at its own worst case (4-digit Hz, 6).
 /// Returns `(old_worst_case, new_worst_case)`.
 fn multi_qso_table_badge_widths() -> (usize, usize) {
-    let old = " [HOUND]".len() + " [DRIFT -999Hz]".len();
-    let new = status_badge_glyphs::HOUND.len() + status_badge_glyphs::DRIFT.len();
+    let old = " [HOUND]".len() + " [DRIFT 2900Hz]".len();
+    let new = status_badge_glyphs::HOUND.len() + status_badge_glyphs::drift(2900.0).len();
     (old, new)
 }
 
@@ -937,7 +952,7 @@ mod tests {
         // manual QSO), so use just the drift half of each for an
         // apples-to-apples comparison against the ticket's own framing.
         let old_drift_only = " [DRIFT 937Hz]".chars().count();
-        let new_drift_only = status_badge_glyphs::DRIFT.chars().count();
+        let new_drift_only = status_badge_glyphs::drift(937.0).chars().count();
         assert!(old_badge_width >= old_drift_only && new_badge_width >= new_drift_only);
 
         // How many characters of the watchdog text are actually visible
@@ -957,12 +972,12 @@ mod tests {
              {old_visible}"
         );
         assert!(
-            new_visible >= old_visible + 10,
+            new_visible >= old_visible + 8,
             "the compact badge must free substantially more room for the watchdog than the old \
              bracketed form (old left {old_visible} cols, new left {new_visible} cols)"
         );
         assert!(
-            new_visible >= watchdog_width.min(15),
+            new_visible >= watchdog_width.min(12),
             "the compact badge should show at least a meaningful prefix of a typical watchdog \
              (new leaves {new_visible} cols, watchdog itself needs {watchdog_width})"
         );
