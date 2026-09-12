@@ -44,18 +44,20 @@ pub fn render_qso_status(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()>
         // cross-parity calls (#40), allocate an extra row for them above
         // the control hint so the operator knows those calls are waiting.
         let queued_height = if app.pending_calls.is_empty() { 0 } else { 1 };
-        // PAN-142 (Codex P1 on PR #371): the TX/RX block's 2 mandatory lines
-        // grow by one for the optional DX-activity line (#41) and one more
-        // for the drift-candidate line (PAN-142) when either is present —
-        // a fixed `Length(2)` silently clipped both via `Paragraph`'s
-        // top-down truncation. Mirrors `queued_height` just below.
+        // PAN-142 (Codex P1/P2 on PR #371): the TX/RX block's 2 mandatory
+        // lines grow by at most one more, shared between the optional
+        // DX-activity (#41) and drift-candidate (PAN-142) lines — see
+        // `tx_rx_status_height`'s doc comment for why growth is capped at
+        // +1 rather than +1 per field. A fixed `Length(2)` silently clipped
+        // both via `Paragraph`'s top-down truncation. Mirrors `queued_height`
+        // just below.
         let tx_rx_height = tx_rx_status_height(app.qso_status());
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),             // QSO info
                 Constraint::Length(3),             // Sequence ladder + Now/Next
-                Constraint::Length(tx_rx_height), // TX/RX status (+ DX activity, + drift candidate)
+                Constraint::Length(tx_rx_height), // TX/RX status (+ DX activity and/or drift candidate)
                 Constraint::Length(2),            // SNR meters
                 Constraint::Min(1),               // Progress/timing
                 Constraint::Length(1),            // Last-10-QSOs history (#165)
@@ -587,14 +589,51 @@ pub(crate) fn format_qso_history_line(items: &[crate::app::QsoHistoryItem]) -> V
     spans
 }
 
-/// PAN-142 (Codex P1 on PR #371): the number of rows `render_tx_rx_status`
-/// needs — 2 mandatory (TX, RX) plus one each for the optional DX-activity
-/// (#41) and drift-candidate (PAN-142) lines, only when populated. A fixed
-/// allocation silently clipped both optional lines via `Paragraph`'s
-/// top-down truncation. Pure so the layout math is testable without a
-/// terminal backend.
+/// PAN-142 (Codex P2 on PR #371, round 3): the number of rows
+/// `render_tx_rx_status` needs — 2 mandatory (TX, RX) plus at most ONE more
+/// for DX-activity (#41) and/or the drift candidate (PAN-142), combined onto
+/// a single line when both are present (`combined_status_line`). Growing by
+/// 2 (one row per optional field) exceeded this panel's actual budget in the
+/// default (unzoomed) layout — `render_operate_view`'s `left_chunks` gives
+/// QSO Status only 40% of the lower-left region — so both could still be
+/// clipped there even with the round-1 fix. Capping growth at +1 keeps this
+/// within the same budget the pre-existing single-optional-line behavior
+/// already fit in. Pure so the layout math is testable without a terminal
+/// backend.
 fn tx_rx_status_height(qso: &crate::app::QsoStatus) -> u16 {
-    2 + u16::from(qso.dx_last_activity.is_some()) + u16::from(qso.pending_freq_drift_hz.is_some())
+    2 + u16::from(qso.dx_last_activity.is_some() || qso.pending_freq_drift_hz.is_some())
+}
+
+/// Combine the DX-activity (#41) and drift-candidate (PAN-142) lines into
+/// at most one `Line` — see `tx_rx_status_height`'s doc comment for why
+/// they can't each get their own row in the default layout. `None` when
+/// neither is populated.
+fn combined_status_line(
+    qso: &crate::app::QsoStatus,
+    theme: &crate::config::Theme,
+) -> Option<Line<'static>> {
+    let drift = qso.pending_freq_drift_hz.map(|hz| {
+        let since = qso
+            .pending_freq_drift_since
+            .map(|t| format!(", {}", format_time_ago(t)))
+            .unwrap_or_default();
+        format!("Drift candidate: {hz:.0} Hz, confirming{since}")
+    });
+    match (qso.dx_last_activity.as_deref(), drift) {
+        (Some(activity), Some(drift)) => Some(Line::from(Span::styled(
+            format!("DX: {activity}  |  {drift}"),
+            Style::default().fg(theme.warning_color()),
+        ))),
+        (Some(activity), None) => Some(Line::from(Span::styled(
+            format!("DX: {activity}"),
+            Style::default().fg(theme.muted_color()),
+        ))),
+        (None, Some(drift)) => Some(Line::from(Span::styled(
+            drift,
+            Style::default().fg(theme.warning_color()),
+        ))),
+        (None, None) => None,
+    }
 }
 
 fn render_tx_rx_status(f: &mut Frame<'_>, area: Rect, app: &App) {
@@ -616,30 +655,14 @@ fn render_tx_rx_status(f: &mut Frame<'_>, area: Rect, app: &App) {
         )),
     ];
 
-    // #41: what the DX is doing on the band right now (their latest decoded
-    // frame, even before they answer us) — so the operator can tell whether
-    // they're working someone else, calling CQ, or coming back to us.
-    if let Some(activity) = qso.dx_last_activity.as_deref() {
-        lines.push(Line::from(Span::styled(
-            format!("DX: {}", activity),
-            Style::default().fg(app.theme.muted_color()),
-        )));
-    }
-
-    // PAN-142: a pending frequency-drift candidate is otherwise invisible —
-    // the auto-sequence keeps silently re-sending the same message either
-    // way, whether this is about to self-heal in the next slot or two, or
-    // is genuinely stuck. Surfacing it lets the operator make an informed
-    // choice instead of guessing whether to intervene.
-    if let Some(hz) = qso.pending_freq_drift_hz {
-        let since = qso
-            .pending_freq_drift_since
-            .map(|t| format!(", {}", format_time_ago(t)))
-            .unwrap_or_default();
-        lines.push(Line::from(Span::styled(
-            format!("Drift candidate: {hz:.0} Hz, confirming{since}"),
-            Style::default().fg(app.theme.warning_color()),
-        )));
+    // #41 / PAN-142: what the DX is doing on the band right now, and/or a
+    // pending frequency-drift candidate — combined onto one line (see
+    // `combined_status_line`'s doc comment for why they share a row) so the
+    // operator can tell whether the DX is busy elsewhere, calling CQ, coming
+    // back to us, or whether this QSO's own frequency gate is mid-confirm
+    // and about to self-heal.
+    if let Some(line) = combined_status_line(qso, &app.theme) {
+        lines.push(line);
     }
 
     let paragraph = Paragraph::new(lines);
@@ -852,17 +875,54 @@ mod tests {
     /// and drift-candidate lines get silently clipped by a fixed height.
     #[test]
     fn test_tx_rx_status_height() {
+        // Round 3 (Codex P2): growth is capped at +1 total, not +1 per
+        // optional field — DX activity and the drift candidate share one
+        // row (`combined_status_line`) rather than each getting their own,
+        // since the default (unzoomed) layout doesn't have room for both.
         let mut qso = crate::app::QsoStatus::default();
         assert_eq!(tx_rx_status_height(&qso), 2, "TX + RX only");
 
         qso.dx_last_activity = Some("CQ".to_string());
         assert_eq!(tx_rx_status_height(&qso), 3, "+ DX activity");
 
-        qso.pending_freq_drift_hz = Some(937.5);
-        assert_eq!(tx_rx_status_height(&qso), 4, "+ drift candidate");
+        qso.pending_freq_drift_hz = Some(940.0);
+        assert_eq!(
+            tx_rx_status_height(&qso),
+            3,
+            "both present must still cap at +1, not grow further"
+        );
 
         qso.dx_last_activity = None;
         assert_eq!(tx_rx_status_height(&qso), 3, "drift candidate alone");
+    }
+
+    /// `combined_status_line` must actually combine both onto one line
+    /// (not, e.g., silently drop one) when both are present, and degrade
+    /// gracefully to just the one field when only it is populated.
+    #[test]
+    fn test_combined_status_line() {
+        use crate::config::Theme;
+        let theme = Theme::Dark;
+        let mut qso = crate::app::QsoStatus::default();
+        assert!(combined_status_line(&qso, &theme).is_none());
+
+        qso.dx_last_activity = Some("CQ".to_string());
+        let line = combined_status_line(&qso, &theme).expect("DX activity alone");
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("DX: CQ"));
+        assert!(!text.contains("Drift"));
+
+        qso.pending_freq_drift_hz = Some(940.0);
+        let line = combined_status_line(&qso, &theme).expect("both present");
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("DX: CQ"), "got {text}");
+        assert!(text.contains("940"), "got {text}");
+
+        qso.dx_last_activity = None;
+        let line = combined_status_line(&qso, &theme).expect("drift alone");
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!text.contains("DX:"), "got {text}");
+        assert!(text.contains("940"), "got {text}");
     }
 
     /// The QSO Status "Now:" line surfaces the live TX frame when it belongs
