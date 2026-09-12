@@ -5756,75 +5756,27 @@ impl super::ApplicationCoordinator {
                                             continue 'worker;
                                         }
 
-                                        // --- Step 4b: Drop-stale-TX gate ---
-                                        // The slot wait above can span the moment a QSO
-                                        // ends (superseded by a newer call, cancelled,
-                                        // or completed-past-grace). Re-check active
-                                        // status at the last instant before keying:
-                                        // if this request's QSO is no longer live, do
-                                        // NOT key PTT / build+send audio — clear the
-                                        // strip, report a failed TransmitComplete, and
-                                        // skip. Requests with no qso_id (manual / tune)
-                                        // are never gated.
-                                        if !tx_qso_is_live(qso_id.as_deref(), &active_tx_qsos) {
-                                            info!(
-                                                target: "pancetta::tx.policy",
-                                                "dropping stale TX for ended QSO {}: '{}'",
-                                                qso_id.as_deref().unwrap_or("?"),
-                                                message_text
-                                            );
-                                            emit_diagnostic(
-                                                &message_bus,
-                                                "tx.policy",
-                                                pancetta_core::DiagnosticLevel::Info,
-                                                format!(
-                                                "dropping stale TX for ended QSO: '{message_text}'"
-                                            ),
-                                                qso_id.as_deref(),
-                                            )
-                                            .await;
-                                            send_tx_queue_status(&message_bus, None, Vec::new())
-                                                .await;
-                                            // Bound `pivoted_once`: a QSO ending via normal
-                                            // drop-stale cleanup also clears its own
-                                            // pivot-tombstone entry so the worker-local map
-                                            // can't grow unboundedly across a long-running
-                                            // process.
-                                            if let Some(id) = qso_id.as_deref() {
-                                                pivoted_once.remove(&super::active_tx_qso_key(id));
-                                            }
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text,
-                                                    duration_ms: 0,
-                                                    qso_id: qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
-                                            continue 'worker;
-                                        }
-
                                         // --- Step 4b-parity: DX-parity freshness gate (PAN-141) ---
-                                        // Same choke point as Step 4b above (post-sleep,
-                                        // pre-PTT — never against an already-keyed
-                                        // transmission). A manually-latched `tx_parity`
-                                        // reflects the DX's LAST-observed decode at
-                                        // QSO-open time; the ~20-30s wait for the next
+                                        // Runs BEFORE the plain liveness check below
+                                        // (Codex P1 on PR #370): this check's own
+                                        // `dx_parity_conflict_for_qso` await (a QsoManager
+                                        // lookup) can itself span a cancellation the way
+                                        // any other await in this worker can — so the
+                                        // liveness check MUST be the very last thing before
+                                        // Step 4b-arm/PTT, not this one. A manually-latched
+                                        // `tx_parity` reflects the DX's LAST-observed decode
+                                        // at QSO-open time; the ~20-30s wait for the next
                                         // opposite-parity slot is long enough for a
                                         // fast-cycling pileup DX to have moved to a
-                                        // different caller on the exact parity we're
-                                        // about to key into. Hold this cycle rather than
-                                        // transmit into a probable collision — never
-                                        // mutates `tx_parity` (the half-duplex single-
-                                        // shared-TX-side invariant across concurrent
-                                        // QSOs stays intact) and never touches QSO state;
-                                        // the QSO's own existing retry/watchdog cadence
-                                        // (`rearm_manual_calls_at`, `manual_call_max_calls`,
-                                        // `report_timeout`) decides what happens next.
+                                        // different caller on the exact parity we're about
+                                        // to key into. Hold this cycle rather than transmit
+                                        // into a probable collision — never mutates
+                                        // `tx_parity` (the half-duplex single-shared-TX-side
+                                        // invariant across concurrent QSOs stays intact) and
+                                        // never touches QSO state; the QSO's own existing
+                                        // retry/watchdog cadence (`rearm_manual_calls_at`,
+                                        // `manual_call_max_calls`, `report_timeout`) decides
+                                        // what happens next.
                                         if dx_parity_conflict_for_qso(
                                             qso_id.as_deref(),
                                             required_parity,
@@ -5853,6 +5805,59 @@ impl super::ApplicationCoordinator {
                                             .await;
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text,
+                                                    duration_ms: 0,
+                                                    qso_id: qso_id.clone(),
+                                                },
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(complete_msg).await;
+                                            continue 'worker;
+                                        }
+
+                                        // --- Step 4b: Drop-stale-TX gate ---
+                                        // The slot wait above (AND the parity check just
+                                        // above, whose own QsoManager lookup is itself an
+                                        // await) can span the moment a QSO ends (superseded
+                                        // by a newer call, cancelled, or completed-past-
+                                        // grace). Re-check active status at the last instant
+                                        // before keying: if this request's QSO is no longer
+                                        // live, do NOT key PTT / build+send audio — clear the
+                                        // strip, report a failed TransmitComplete, and skip.
+                                        // Requests with no qso_id (manual / tune) are never
+                                        // gated.
+                                        if !tx_qso_is_live(qso_id.as_deref(), &active_tx_qsos) {
+                                            info!(
+                                                target: "pancetta::tx.policy",
+                                                "dropping stale TX for ended QSO {}: '{}'",
+                                                qso_id.as_deref().unwrap_or("?"),
+                                                message_text
+                                            );
+                                            emit_diagnostic(
+                                                &message_bus,
+                                                "tx.policy",
+                                                pancetta_core::DiagnosticLevel::Info,
+                                                format!(
+                                                "dropping stale TX for ended QSO: '{message_text}'"
+                                            ),
+                                                qso_id.as_deref(),
+                                            )
+                                            .await;
+                                            send_tx_queue_status(&message_bus, None, Vec::new())
+                                                .await;
+                                            // Bound `pivoted_once`: a QSO ending via normal
+                                            // drop-stale cleanup also clears its own
+                                            // pivot-tombstone entry so the worker-local map
+                                            // can't grow unboundedly across a long-running
+                                            // process.
+                                            if let Some(id) = qso_id.as_deref() {
+                                                pivoted_once.remove(&super::active_tx_qso_key(id));
+                                            }
                                             let complete_msg = ComponentMessage::new(
                                                 ComponentId::Ft8Transmitter,
                                                 ComponentId::Autonomous,
@@ -8038,25 +8043,47 @@ impl super::ApplicationCoordinator {
                                     // the right reason; `live_mask` itself keeps its
                                     // existing "should this item transmit" meaning so
                                     // every downstream consumer needs no further changes.
-                                    let mut live_mask: Vec<bool> =
-                                        Vec::with_capacity(encoded_qso_ids.len());
+                                    //
+                                    // Codex P1 on PR #370 (round 1), refined by the local
+                                    // review gate: `tx_qso_is_live` must be checked AFTER
+                                    // every parity lookup's `QsoManager` await has already
+                                    // completed for the WHOLE bundle, with no further await
+                                    // between the last liveness check and PTT — not merely
+                                    // after each item's OWN lookup. Checking item N's
+                                    // liveness right after item N's lookup (the first
+                                    // attempt at this fix) still left a window: item N-1's
+                                    // cached `is_live = true` could go stale while item N's
+                                    // lookup was still pending, and nothing re-validates
+                                    // it afterward. Two passes closes that: pass 1 runs
+                                    // every parity lookup (the only awaits in this
+                                    // computation); pass 2 is a plain, non-async loop that
+                                    // checks every item's liveness back-to-back, immediately
+                                    // before this mask is used — mirrors this file's own
+                                    // established "recheck immediately before the
+                                    // irreversible step" pattern, generalized to a whole
+                                    // bundle instead of one QSO.
                                     let mut parity_hold_mask: Vec<bool> =
                                         Vec::with_capacity(encoded_qso_ids.len());
                                     for id in &encoded_qso_ids {
-                                        let is_live =
-                                            tx_qso_is_live(id.as_deref(), &active_tx_qsos);
-                                        let parity_conflict = is_live
-                                            && dx_parity_conflict_for_qso(
+                                        parity_hold_mask.push(
+                                            dx_parity_conflict_for_qso(
                                                 id.as_deref(),
                                                 required_parity,
                                                 &qso_manager_watch,
                                                 &cross_time_state,
                                                 dx_parity_freshness_window(slot_ns),
                                             )
-                                            .await;
-                                        parity_hold_mask.push(parity_conflict);
-                                        live_mask.push(is_live && !parity_conflict);
+                                            .await,
+                                        );
                                     }
+                                    let live_mask: Vec<bool> = encoded_qso_ids
+                                        .iter()
+                                        .zip(parity_hold_mask.iter())
+                                        .map(|(id, &parity_conflict)| {
+                                            tx_qso_is_live(id.as_deref(), &active_tx_qsos)
+                                                && !parity_conflict
+                                        })
+                                        .collect();
 
                                     if !live_mask.iter().any(|&live| live) {
                                         info!(
