@@ -290,11 +290,18 @@ impl CachedStationLookup {
     /// unvalidatable value (wrong length, not a real subdivision, free text)
     /// is silently dropped rather than stored — PAN-85 forbids ever showing
     /// a placeholder or a guessed state.
+    ///
+    /// The map is keyed by `resolved_identity`, exactly like every sibling
+    /// accessor on this struct: a hash-rendered decode (`"<W5ABC>"`) must
+    /// store under the same key its plain form does, and the unresolved
+    /// placeholder `"<...>"` — which identifies no station at all — must
+    /// never be stored.
     pub fn record_state(&self, callsign: &str, state: &str) {
+        let Some(key) = resolved_identity(callsign) else {
+            return;
+        };
         if let Some(code) = pancetta_tui::dxcc::normalize_us_state(state) {
-            self.station_states
-                .write()
-                .insert(callsign.trim().to_uppercase(), code.to_string());
+            self.station_states.write().insert(key, code.to_string());
         }
     }
 
@@ -312,12 +319,11 @@ impl CachedStationLookup {
     }
 
     /// The station's known US state, if any. `None` when unknown — the
-    /// caller then renders the entity alone (PAN-85).
+    /// caller then renders the entity alone (PAN-85). Resolves hash-rendered
+    /// callsigns first, so `"<W5ABC>"` finds what `"W5ABC"` stored.
     pub fn state_for(&self, callsign: &str) -> Option<String> {
-        self.station_states
-            .read()
-            .get(&callsign.trim().to_uppercase())
-            .cloned()
+        let key = resolved_identity(callsign)?;
+        self.station_states.read().get(&key).cloned()
     }
 
     pub fn update_recent_failures(&self, callsigns: HashSet<String>) {
@@ -1387,5 +1393,31 @@ mod tests {
         ]);
         assert_eq!(seeded.state_for("W5ABC").as_deref(), Some("AR"));
         assert_eq!(seeded.state_for("BAD"), None);
+    }
+
+    #[test]
+    fn state_store_resolves_hash_render_before_exact_match() {
+        // A station worked as "W5ABC" and later decoded hash-rendered as
+        // "<W5ABC>" must still report its state — the same contract
+        // `is_notable_resolves_hash_render_before_exact_match` pins for the
+        // sibling accessors.
+        let l = CachedStationLookup::new();
+        l.record_state("W5ABC", "AR");
+        assert_eq!(l.state_for("<W5ABC>").as_deref(), Some("AR"));
+
+        // ...and the write side normalizes identically, so a state first
+        // learned from a hash-rendered decode is found under the plain call.
+        let l2 = CachedStationLookup::new();
+        l2.record_state("<W5ABC>", "AR");
+        assert_eq!(l2.state_for("W5ABC").as_deref(), Some("AR"));
+        assert_eq!(l2.state_for("<W5ABC>").as_deref(), Some("AR"));
+    }
+
+    #[test]
+    fn state_store_ignores_the_unresolved_hash_placeholder() {
+        let l = CachedStationLookup::new();
+        l.record_state("<...>", "AR");
+        assert_eq!(l.state_for("<...>"), None);
+        assert!(l.station_states.read().is_empty());
     }
 }

@@ -1530,6 +1530,18 @@ pub struct App {
     pub park_coverage_last: Option<(u64, u8)>,
 }
 
+/// The key `dx_states` is stored under (PAN-85): trimmed, uppercased, and with
+/// an FT8 i3=4 hash-render resolved to the plain callsign it stands for, so a
+/// decode heard as `"<W5ABC>"` shares one entry with `"W5ABC"` — the same
+/// normalization the coordinator's `CachedStationLookup` applies on its side
+/// of the wire (`pancetta::priority_evaluator::resolved_identity`). Returns
+/// `None` for the unresolved hash-miss placeholder `"<...>"`, which carries no
+/// station identity and must never key a state.
+fn station_state_key(callsign: &str) -> Option<String> {
+    let upper = callsign.trim().to_uppercase();
+    pancetta_core::callsign::resolve_hash_render(&upper).map(str::to_string)
+}
+
 /// Peak intensity in the latest waterfall row within ±radius_hz of center_hz.
 fn spectral_peak(row: &[f32], center_hz: f64, radius_hz: f64, range: (f64, f64)) -> f32 {
     if row.is_empty() {
@@ -2440,10 +2452,11 @@ impl App {
 
         // Keep the state map in lockstep with the station window: an entry
         // survives only while its station is still listed (PAN-85). Note that
-        // `dx_states` is keyed UPPERCASE while `dx_stations` is keyed by the
-        // callsign exactly as it was received, so the membership test must be
-        // case-insensitive — a plain `contains_key` would drop every state for
-        // a station spotted with lower-case characters.
+        // `dx_states` is keyed by `station_state_key` (uppercase, hash-render
+        // resolved) while `dx_stations` is keyed by the callsign exactly as it
+        // was received, so the membership test must put each station key
+        // through the same normalization — a plain `contains_key` would drop
+        // every state for a station spotted lower-case or hash-rendered.
         //
         // This bounds `dx_states` exactly as much as `cleanup_old_data` bounds
         // `dx_stations` — no more: the function currently has no production
@@ -2453,24 +2466,31 @@ impl App {
             dx_stations,
             ..
         } = self;
-        dx_states.retain(|call, _| dx_stations.keys().any(|k| k.eq_ignore_ascii_case(call)));
+        dx_states.retain(|call, _| {
+            dx_stations
+                .keys()
+                .any(|k| station_state_key(k).is_some_and(|key| key == *call))
+        });
     }
 
     /// Record a station's US state/territory (PAN-85), validating first. An
     /// unrecognized value is silently dropped — the caller then renders the
     /// entity alone, never a placeholder.
     pub fn set_station_state(&mut self, callsign: &str, state: &str) {
+        let Some(key) = station_state_key(callsign) else {
+            return;
+        };
         if let Some(code) = crate::dxcc::normalize_us_state(state) {
-            self.dx_states
-                .insert(callsign.trim().to_uppercase(), code.to_string());
+            self.dx_states.insert(key, code.to_string());
         }
     }
 
-    /// The station's known US state, if any.
+    /// The station's known US state, if any. Hash-rendered decodes resolve to
+    /// the plain identity first, so a DX Hunter row spotted as `"<W5ABC>"`
+    /// finds the state stored for `"W5ABC"` (PAN-85).
     pub fn station_state_for(&self, callsign: &str) -> Option<&str> {
-        self.dx_states
-            .get(&callsign.trim().to_uppercase())
-            .map(String::as_str)
+        let key = station_state_key(callsign)?;
+        self.dx_states.get(&key).map(String::as_str)
     }
 
     /// Called when the radio reports its actual frequency (via hamlib/rigctld).
@@ -4744,6 +4764,40 @@ mod tests {
         app.cleanup_old_data();
 
         assert_eq!(app.station_state_for("W5ABC"), Some("AR"));
+    }
+
+    /// PAN-85 / F2: a DX Hunter row spotted hash-rendered (`"<W5ABC>"`) must
+    /// read the state stored for the plain callsign, and vice versa —
+    /// otherwise the Entity column silently drops the suffix for exactly the
+    /// decodes `entity_for_callsign` already resolves.
+    #[tokio::test]
+    async fn station_state_resolves_hash_render_both_directions() {
+        let mut app = fixture_app().await;
+        app.set_station_state("W5ABC", "AR");
+        assert_eq!(app.station_state_for("<W5ABC>"), Some("AR"));
+
+        app.set_station_state("<W1XYZ>", "MA");
+        assert_eq!(app.station_state_for("W1XYZ"), Some("MA"));
+        assert_eq!(app.station_state_for("<W1XYZ>"), Some("MA"));
+
+        // The unresolved hash-miss placeholder identifies no station.
+        app.set_station_state("<...>", "AR");
+        assert_eq!(app.station_state_for("<...>"), None);
+    }
+
+    /// The cleanup retain must use the same normalization, or a live
+    /// hash-rendered station would have its state pruned out from under it.
+    #[tokio::test]
+    async fn cleanup_retains_states_for_live_hash_rendered_stations() {
+        let mut app = fixture_app().await;
+        app.set_station_state("<W5ABC>", "AR");
+        app.add_decoded_message(fixture_view("<W5ABC>", -10))
+            .await
+            .unwrap();
+
+        app.cleanup_old_data();
+
+        assert_eq!(app.station_state_for("<W5ABC>"), Some("AR"));
     }
 
     /// Regression: highlighting a CQ at scroll>0, then a new decode arrives
