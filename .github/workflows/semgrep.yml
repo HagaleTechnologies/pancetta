@@ -8,9 +8,14 @@ on:
       - main
   merge_group:
     types: [checks_requested]
-  schedule:
-    # random HH:MM to avoid a load spike on GitHub Actions at 00:00
-    - cron: "12 15 * * *"
+  # fleet-ci phase 0 (2026-09-14): dropped schedule only (GitHub throttles crons to ~6-9/day
+  # regardless of spec, so the daily cron bought nothing beyond what pull_request/push already
+  # cover). pull_request is retained: this repo merges through Mergify's own `queue` action
+  # (.mergify.yml queue_rules, merge_method: squash), not GitHub's native merge queue, so
+  # `merge_group` never fires for a Mergify-queued merge here -- dropping pull_request would
+  # leave every PR with zero pre-merge Semgrep coverage until the post-merge push to main
+  # (caught in Codex review, PR #382). merge_group is kept for the (currently unused) case this
+  # repo ever adopts GitHub's native merge queue instead.
 
 jobs:
   semgrep:
