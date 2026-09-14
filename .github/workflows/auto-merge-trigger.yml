@@ -3,13 +3,22 @@ name: Auto-Merge Trigger
 # Native merge-queue admission: retires the auto-queue half of .mergify.yml's
 # pull_request_rules ("queue on green + threads resolved"). Mergify's own rule did two
 # things at once -- (1) admitting a PR into its queue once every check-success/thread-
-# resolved condition held, gated to an explicit author allowlist (thagale,
-# catalyst-cloud-connector[bot], dependabot[bot] for non-breaking bumps only -- see
-# .mergify.yml's own header comment for the full rationale), and (2) actually performing
-# the merge. GitHub's native `merge_queue` ruleset rule replaces job (2), but has no
-# author-based admission control of its own -- something still has to call `gh pr merge
-# --auto` per PR. This job reproduces the SAME author allowlist Mergify already enforced,
-# not a new or looser policy.
+# resolved condition held, gated to an explicit author allowlist, and (2) actually
+# performing the merge. GitHub's native `merge_queue` ruleset rule replaces job (2), but
+# has no author-based admission control of its own -- something still has to call `gh pr
+# merge --auto` per PR.
+#
+# Author allowlist is narrower than Mergify's own (Codex P1/P2, this rollout's own
+# review): Mergify's rule also admitted dependabot[bot] for non-breaking bumps.
+# Deliberately NOT reproduced here -- this job's own admission step needs
+# CODEX_REVIEW_PAT, and wait-for-codex.yml's own header comment documents (as an
+# established fact for this repo) that GitHub withholds Actions secrets for
+# Dependabot-triggered events; a dependabot-authored run would silently fail every `gh
+# api` call in the admission step below. Rather than ship an admission path that can't be
+# verified to actually work, Dependabot PRs are left with no automatic merge path for now
+# -- an accepted, tracked gap (see the fleet's own equivalent precedent), not a silent
+# regression: an operator can always run `gh pr merge --auto --squash` on a green,
+# non-breaking Dependabot PR by hand.
 on:
   pull_request_target:
     branches: [main]
@@ -46,11 +55,7 @@ jobs:
         (github.event.action == 'labeled' && github.event.label.name == 'queue-needs-human-review') ||
         (
           github.event.pull_request.user.login == 'thagale' ||
-          github.event.pull_request.user.login == 'catalyst-cloud-connector[bot]' ||
-          (
-            github.event.pull_request.user.login == 'dependabot[bot]' &&
-            !contains(github.event.pull_request.labels.*.name, 'needs-review')
-          )
+          github.event.pull_request.user.login == 'catalyst-cloud-connector[bot]'
         )
       )
     runs-on: ubuntu-latest

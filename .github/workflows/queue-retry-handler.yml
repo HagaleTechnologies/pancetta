@@ -280,7 +280,20 @@ jobs:
               gh pr comment "$PR" --repo "${REPO}" --body "Merge-group CI failed for this revision (commit \`$HEAD_SHA12\`) -- automatically re-armed auto-merge for one retry. If this fails again for the same commit, it will NOT retry again; it needs a human to look. [Run]($RUN_URL)" || true
             fi
           else
-            echo "::error::Retry merge call failed for PR #$PR (commit $HEAD_SHA12) -- most likely superseded by a new push between pr-state's check and this call (--match-head-commit rejected the mismatch), a genuinely closed/merged PR, or a permission/token problem. Standing down without a human-handoff label -- if this was a real permission problem rather than a benign race, it will surface again on the next merge-group failure for this head."
+            # Codex P2, this rollout's own review: a bare log-and-exit-0 here let this step
+            # report `success` (mark-handled's own `if:` then marked the whole attempt
+            # handled) even though nothing was actually retried or handed off -- and since
+            # the original queue failure already disarmed the PR, there is no SUBSEQUENT
+            # merge-group failure to ever surface the problem again. The PR sits silently
+            # stranded, with no comment and no visible check reflecting it. Cannot reliably
+            # distinguish "benign race, --match-head-commit rejected a superseded head" from
+            # "genuine permission/token failure" from the exit code alone, so treat both the
+            # same: fail this step (mark-handled correctly withholds the dedup marker,
+            # leaving this attempt eligible for a fresh look) AND post a best-effort comment,
+            # since a failed internal automation run alone is not visible from the PR itself.
+            echo "::error::Retry merge call failed for PR #$PR (commit $HEAD_SHA12) -- possibly superseded by a new push between pr-state's check and this call (--match-head-commit rejected the mismatch), a genuinely closed/merged PR, or a permission/token problem. Failing this step rather than silently marking the attempt handled."
+            gh pr comment "$PR" --repo "${REPO}" --body "Merge-group CI failed for this revision (commit \`$HEAD_SHA12\`), and the automatic retry attempt itself also failed to re-arm auto-merge (superseded head, or a permission/token problem -- check this handler's own workflow run for details). This PR is currently stranded with auto-merge disarmed; a human needs to look. [Run]($RUN_URL)" || true
+            exit 1
           fi
 
       - name: Second failure on this head -- hand off to a human

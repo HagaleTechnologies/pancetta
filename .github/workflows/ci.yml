@@ -20,14 +20,24 @@ on:
   workflow_dispatch:
   # Native merge-queue admission: a merge-group entry needs this required check ("CI") to
   # report on its own synthetic SHA, or it sits pending until the queue's check-response
-  # timeout and gets dequeued. No job-level changes needed to get there: `changes` (line
-  # ~107) only triggers on push/pull_request, so every downstream job gated on
-  # `needs.changes.outputs.*` skips cleanly on merge_group, and `codex-clean`/
-  # `cross-platform-check` already gate explicitly on `github.event_name == 'pull_request'`
-  # too -- the whole file was already written such that a merge_group event makes every
-  # constituent job skip, and the final `ci` aggregator job (bottom of this file) already
-  # treats "skipped" as passing (it only fails on a literal "failure"/"cancelled" result),
-  # so merge_group falls through the same already-correct path.
+  # timeout and gets dequeued.
+  #
+  # Job-level changes WERE needed (Codex P1, this rollout's own review): the `changes` job
+  # (line ~107) only triggers its diff-filter step on push/pull_request, so its `code`
+  # output is empty on merge_group -- every downstream job gated on
+  # `needs.changes.outputs.code == 'true'` would then skip, and this file's own aggregator
+  # (bottom of file) treats "skipped" as passing, meaning a merge-group entry could
+  # previously report a fully green "CI" check having run NOTHING at all: no clippy, no
+  # fmt, no tests, no cargo-deny -- exactly the integration-only failure a merge queue
+  # exists to catch. Each real lane's own `if:` now also runs unconditionally on
+  # `merge_group` (not diff-gated there), since a merge-group entry represents a genuine
+  # integration point against the current tip of main and always warrants a full check,
+  # not a cost-optimized diff. `cross-platform-check` is deliberately NOT included in this
+  # -- it already only ran for `pull_request` even on a push to main (its own existing
+  # `if:`), a pre-existing PR-review-time-only lane this change doesn't alter.
+  # `codex-clean` also correctly stays `pull_request`-only: a merge-group entry's
+  # constituent PR already passed a real Codex review during its own PR phase, and there's
+  # no PR to review against a synthetic integration commit.
   merge_group:
     types: [checks_requested]
 
@@ -243,7 +253,7 @@ jobs:
   clippy:
     name: Clippy
     needs: changes
-    if: needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -270,7 +280,7 @@ jobs:
   fmt:
     name: Format
     needs: changes
-    if: needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -295,7 +305,7 @@ jobs:
     # even though the `changes` condition below explicitly allows it. The
     # `changes`-gate itself is untouched -- that's a real, intentional skip
     # unrelated to codex-clean.
-    if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group')
     runs-on: ubuntu-latest
     steps:
       # Explicit first step, not a richer `if:`: a bare
@@ -339,7 +349,7 @@ jobs:
     name: Workspace Check
     needs: [changes, codex-clean]
     # See ft8-tests's own comment above for why always() is load-bearing.
-    if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group')
     runs-on: ubuntu-latest
     env:
       # This lane links the whole workspace THREE times (check, examples,
@@ -457,7 +467,7 @@ jobs:
     name: Cargo Deny
     needs: [changes, codex-clean]
     # See ft8-tests's own comment above for why always() is load-bearing.
-    if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group')
     runs-on: ubuntu-latest
     steps:
       # See ft8-tests's own comment above for why this explicit step exists
