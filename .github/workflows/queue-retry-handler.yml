@@ -23,11 +23,17 @@ name: Queue Retry Handler
 # Actions-created, so check_run would never fire here, for any of them, ever.
 on:
   workflow_run:
-    # CI and Supply Chain are the required checks a merge-group entry must pass. "Wait for
-    # Codex Review" is excluded -- it never re-reviews a synthetic integration commit
-    # (nothing to fail there structurally), so it's not a workflow this handler needs to
-    # listen for a failed run on.
-    workflows: ['CI', 'Supply Chain']
+    # CI and Supply Chain are the required checks a merge-group entry must pass, and can
+    # genuinely fail on the merge-group's own integration content. "Wait for Codex" is
+    # ALSO listed (Codex P2, this rollout's own review) -- its own required check ("Wait
+    # for Codex Review") is a pure pass-through on merge_group with nothing to substantively
+    # fail on the synthetic commit itself, but the RUN can still fail for infrastructure
+    # reasons (a cancelled run, a runner startup failure) -- GitHub still dequeues and
+    # disarms the PR exactly the same as a real CI failure when that happens, so this
+    # handler needs to hear about it too or the PR is stranded with no retry/handoff.
+    # `workflows:` matches on the workflow's own top-level `name:` field ("Wait for Codex"),
+    # not the check-run/job name ("Wait for Codex Review") that shows in the PR's checks list.
+    workflows: ['CI', 'Supply Chain', 'Wait for Codex']
     types: [completed]
 
 permissions:
@@ -378,9 +384,22 @@ jobs:
           steps.dedup.outputs.already_handled == 'false' &&
           (steps.retry.conclusion == 'success' || steps.handoff.conclusion == 'success')
         run: |
-          if ! gh label create "${{ steps.dedup.outputs.attempt_label }}" --color 8a8a8a \
-              --description "This merge-group attempt has already been retried or handed off" \
-              --repo "${REPO}" >/dev/null 2>&1; then
-            echo "::warning::Could not create the attempt-handled label -- a redelivered event for this same attempt may be processed twice, which is safe (idempotent, dedup checks re-verify live state) but not silent."
+          # Codex P2, this rollout's own review: a bare best-effort attach here is NOT
+          # actually safe on failure, despite what an earlier version of this comment
+          # claimed. If the retry above already succeeded (posting queue-retry-used:<sha>)
+          # but THIS label fails to attach, a redelivered event for the same attempt reads
+          # dedup as "not yet handled" and falls through to check-retried, which finds the
+          # retry-used label this same run just wrote and routes into the SECOND-FAILURE
+          # handoff path -- disarming a PR whose one retry just succeeded, before it ever
+          # gets the chance it was just given. Verify the attach and fail the step if it
+          # can't be confirmed, matching every other must-verify label in this file.
+          ATTEMPT_LABEL="${{ steps.dedup.outputs.attempt_label }}"
+          gh label create "$ATTEMPT_LABEL" --color 8a8a8a \
+            --description "This merge-group attempt has already been retried or handed off" \
+            --repo "${REPO}" >/dev/null 2>&1 || true
+          gh api -X POST "repos/${REPO}/issues/${PR}/labels" -f "labels[]=$ATTEMPT_LABEL" >/dev/null 2>&1 || true
+          existing_labels=$(gh api --paginate "repos/${REPO}/issues/${PR}/labels" --jq '.[].name')
+          if ! grep -qxF "$ATTEMPT_LABEL" <<< "$existing_labels"; then
+            echo "::error::Could not confirm the attempt-handled label ($ATTEMPT_LABEL) attached to PR #$PR -- a redelivered event for this same attempt could misroute into the second-failure handoff path. Failing this step so it can be retried."
+            exit 1
           fi
-          gh api -X POST "repos/${REPO}/issues/${PR}/labels" -f "labels[]=${{ steps.dedup.outputs.attempt_label }}" >/dev/null 2>&1 || true
