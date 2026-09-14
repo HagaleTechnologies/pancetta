@@ -51,6 +51,7 @@ jobs:
       github.event.pull_request.draft == false &&
       (github.event.action != 'edited' || github.event.changes.base != null) &&
       (github.event.action != 'unlabeled' || github.event.label.name == 'queue-needs-human-review') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'queue-needs-human-review') &&
       (
         (github.event.action == 'labeled' && github.event.label.name == 'queue-needs-human-review') ||
         (
@@ -196,7 +197,18 @@ jobs:
               fi
               gh pr merge "$PR_URL" --auto --squash
             else
-              echo "::notice::PR #$PR has queue-needs-human-review covering its current head (or its provenance could not be confirmed) -- standing down without re-arming auto-merge."
+              # Codex P1, round 2: also disarm/dequeue here, not just log -- if this run's own
+              # label fetch above happened to race a `labeled` run that attached this pause
+              # (GitHub's single-pending-run-per-concurrency-group can evict that run before it
+              # finishes disarming), this run could have already armed the PR before reaching
+              # this branch. Standing down without an unconditional disarm/dequeue would leave
+              # it armed or queued despite the maintainer's stop signal.
+              echo "::notice::PR #$PR has queue-needs-human-review covering its current head (or its provenance could not be confirmed) -- standing down without re-arming; ensuring auto-merge is not armed/queued despite the pause."
+              dequeue_and_disarm "$REPO" "$PR"
+              if still_armed_or_queued "$REPO" "$PR"; then
+                echo "::error::Could not fully disarm PR #$PR while queue-needs-human-review is attached -- refusing to report success while it remains armed or queued. Disarm by hand and confirm." >&2
+                exit 1
+              fi
             fi
           else
             gh pr merge "$PR_URL" --auto --squash

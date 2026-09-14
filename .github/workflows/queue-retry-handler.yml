@@ -357,8 +357,18 @@ jobs:
           if [ "$already_present" = "true" ]; then
             gh pr comment "$PR" --repo "${REPO}" --body "Merge-group CI failed again for commit \`$HEAD_SHA12\` after its one automatic retry ([run]($RUN_URL)). queue-needs-human-review was already attached before this handoff ran (from another source) -- not claiming provenance over it; the existing pause stands as-is." || true
           else
+            # Codex P2, round 2: `|| true` here would let the handoff and "mark handled" steps
+            # succeed while silently losing the ONLY provenance auto-merge-trigger.yml's
+            # needs_human_is_stale() has for auto-clearing this label on a later fix push --
+            # verify it landed; fail closed if it didn't.
+            MARKER="<!-- queue-retry-handler:queue-needs-human-review sha=$HEAD_SHA12 -->"
             gh pr comment "$PR" --repo "${REPO}" --body "Merge-group CI failed again for commit \`$HEAD_SHA12\` after its one automatic retry ([run]($RUN_URL)). Not retrying again -- this needs a human decision: push a fix, or investigate and manually re-run \`gh pr merge --auto --squash\` if it's a known flake.
-            <!-- queue-retry-handler:queue-needs-human-review sha=$HEAD_SHA12 -->" || true
+            $MARKER" || true
+            bodies=$(gh api --paginate "repos/${REPO}/issues/${PR}/comments" --jq '.[] | select(.user.login == "github-actions[bot]") | .body')
+            if [[ "$bodies" != *"$MARKER"* ]]; then
+              echo "::error::Could not confirm the queue-needs-human-review provenance marker was recorded for PR #$PR -- a later fix push cannot prove this pause stale without it. Failing this step so the attempt isn't marked handled."
+              exit 1
+            fi
           fi
 
       - name: Mark this merge-group attempt as handled
