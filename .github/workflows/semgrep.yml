@@ -2,15 +2,15 @@ name: Semgrep
 
 on:
   workflow_dispatch: {}
-  pull_request: {}
   push:
     branches:
       - main
   merge_group:
     types: [checks_requested]
-  schedule:
-    # random HH:MM to avoid a load spike on GitHub Actions at 00:00
-    - cron: "12 15 * * *"
+  # fleet-ci phase 0 (2026-09-14): dropped pull_request (redundant per-push scan on every review
+  # round push -- ~12min/PR fleet-wide) and schedule (GitHub throttles crons to ~6-9/day regardless
+  # of spec, so the daily cron bought nothing). push:main + merge_group still give full coverage
+  # at merge time; PRs get Semgrep once, at merge-queue entry, not on every commit.
 
 jobs:
   semgrep:
