@@ -91,7 +91,7 @@ signal-hook = "0.4"
 metrics = "0.24"
 
 # HTTP client and networking
-reqwest = { version = "0.12", features = ["json", "stream", "multipart", "cookies"] }
+reqwest = { version = "0.13", features = ["json", "stream", "multipart", "cookies"] }
 
 # Geographic calculations
 geo = "0.28"
