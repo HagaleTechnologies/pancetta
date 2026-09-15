@@ -249,6 +249,20 @@ jobs:
         id: retry
         if: steps.dedup.outputs.already_handled == 'false' && steps.check-retried.outputs.already_retried == 'false'
         run: |
+          # Re-check the pause label immediately before mutating (Codex P1): a maintainer can
+          # attach queue-needs-human-review between check-pr-state's own read and this step
+          # running, and the later labeled-event disarm in auto-merge-trigger.yml is not
+          # reliable cleanup here -- that handler shares this same admission-<PR#> concurrency
+          # group, which retains only one pending job, so a simultaneous CI/Supply
+          # Chain/Wait-for-Codex failure handler can evict the disarm run entirely; deduplication
+          # then lets this replacement handler exit while the explicitly paused PR stays queued
+          # and eligible to merge. Check the live label directly rather than relying on that path.
+          current_labels=$(gh api --paginate "repos/${REPO}/issues/${PR}/labels" --jq '.[].name')
+          if grep -qxF "queue-needs-human-review" <<< "$current_labels"; then
+            echo "::notice::PR #$PR carries queue-needs-human-review as of right now -- standing down without re-arming or consuming this head's retry budget."
+            exit 0
+          fi
+
           # Re-check the base immediately before mutating: the debounce above only re-checks
           # head/auto-merge, not base -- a contributor could retarget the PR in that gap.
           current_base=$(gh pr view "$PR" --repo "${REPO}" --json baseRefName --jq .baseRefName)

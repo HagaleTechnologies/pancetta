@@ -253,7 +253,14 @@ jobs:
   clippy:
     name: Clippy
     needs: changes
-    if: needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
+    # always() is load-bearing (Codex P2, this rollout's own review), same reasoning as
+    # ft8-tests below: GitHub auto-skips a job whenever any of its `needs` was itself
+    # skipped OR FAILED, regardless of a custom `if:`, unless that `if:` includes always().
+    # Without it, a genuinely-failed `changes` job on a merge_group run (e.g. a transient
+    # checkout failure) would silently skip this job too, and the aggregator's own
+    # `needs.*.result` check doesn't reject "skipped" -- a merge-group entry could report a
+    # fully green "CI" with Clippy never having run.
+    if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -280,7 +287,8 @@ jobs:
   fmt:
     name: Format
     needs: changes
-    if: needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
+    # always() is load-bearing -- see clippy's own comment above, same reasoning applies here.
+    if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
