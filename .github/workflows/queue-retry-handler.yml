@@ -398,27 +398,37 @@ jobs:
             # underneath it, letting an explicitly-paused PR merge anyway. Disarm/dequeue and
             # verify first, same pattern as the pause-recheck block above.
             gh pr merge "$PR" --repo "${REPO}" --disable-auto >/dev/null 2>&1 || true
+            # Codex P1 (next round): every read below must survive bash -e (this job's
+            # steps run under GitHub Actions' default `bash -eo pipefail`) -- an unguarded
+            # `var=$(cmd)` or `cmd1 | jq ...` that fails (a transient API error, jq choking
+            # on empty/invalid input) would abort the step right here, BEFORE the
+            # label-attach/handoff below ever runs, defeating the whole point of this fix:
+            # the pause would never get recorded at all. Every substitution below is guarded
+            # with its own `|| default=...` (or `2>/dev/null`+`// empty` inside jq), and an
+            # unreadable result is treated as "still armed" (fail-closed) rather than
+            # silently treated as safe, same as every other unreadable-state check in this
+            # fleet's admission workflows.
             ruleset_fail_queue_state=$(gh api graphql -f query='
               query($owner: String!, $name: String!, $pr: Int!) {
                 repository(owner: $owner, name: $name) { pullRequest(number: $pr) { id isInMergeQueue } }
-              }' -f owner="${REPO%%/*}" -f name="${REPO##*/}" -F pr="$PR" 2>/dev/null)
-            ruleset_fail_pr_node_id=$(echo "$ruleset_fail_queue_state" | jq -r '.data.repository.pullRequest.id')
-            ruleset_fail_in_queue=$(echo "$ruleset_fail_queue_state" | jq -r '.data.repository.pullRequest.isInMergeQueue')
+              }' -f owner="${REPO%%/*}" -f name="${REPO##*/}" -F pr="$PR" 2>/dev/null) || ruleset_fail_queue_state=""
+            ruleset_fail_pr_node_id=$(printf '%s' "$ruleset_fail_queue_state" | jq -r '.data.repository.pullRequest.id // empty' 2>/dev/null) || ruleset_fail_pr_node_id=""
+            ruleset_fail_in_queue=$(printf '%s' "$ruleset_fail_queue_state" | jq -r '.data.repository.pullRequest.isInMergeQueue // empty' 2>/dev/null) || ruleset_fail_in_queue=""
             if [ "$ruleset_fail_in_queue" = "true" ] && [ -n "$ruleset_fail_pr_node_id" ] && [ "$ruleset_fail_pr_node_id" != "null" ]; then
               gh api graphql -f query='mutation($id: ID!) { dequeuePullRequest(input: {id: $id}) { clientMutationId } }' -f id="$ruleset_fail_pr_node_id" >/dev/null 2>&1 || true
             fi
-            ruleset_fail_still_armed=$(gh pr view "$PR" --repo "${REPO}" --json autoMergeRequest --jq '.autoMergeRequest != null')
+            ruleset_fail_still_armed=$(gh pr view "$PR" --repo "${REPO}" --json autoMergeRequest --jq '.autoMergeRequest != null' 2>/dev/null) || ruleset_fail_still_armed="unreadable"
             ruleset_fail_still_queued=$(gh api graphql -f query='
               query($owner: String!, $name: String!, $pr: Int!) {
                 repository(owner: $owner, name: $name) { pullRequest(number: $pr) { isInMergeQueue } }
-              }' -f owner="${REPO%%/*}" -f name="${REPO##*/}" -F pr="$PR" 2>/dev/null | jq -r '.data.repository.pullRequest.isInMergeQueue')
+              }' -f owner="${REPO%%/*}" -f name="${REPO##*/}" -F pr="$PR" 2>/dev/null | jq -r '.data.repository.pullRequest.isInMergeQueue // empty' 2>/dev/null) || ruleset_fail_still_queued="unreadable"
             gh label create queue-needs-human-review --color b60205 \
               --description "Needs a human decision -- an automated handler could not safely proceed" \
               --repo "${REPO}" >/dev/null 2>&1 || true
             gh api --method POST "repos/${REPO}/issues/${PR}/labels" -f "labels[]=queue-needs-human-review" >/dev/null 2>&1 || true
-            if [ "$ruleset_fail_still_armed" = "true" ] || [ "$ruleset_fail_still_queued" = "true" ]; then
-              echo "::error::PR #$PR is still armed/queued despite the disable-auto/dequeue calls made while recording this ruleset-read-failure pause -- the explicit stop cannot be relied on until this is fixed by hand."
-              gh pr comment "$PR" --repo "${REPO}" --body "This handler could not read the repository's ruleset state (commit \`$HEAD_SHA12\`), and auto-merge could not be confirmed disarmed while recording the pause -- a racing admission run may have armed it first. This needs urgent human attention." || true
+            if [ "$ruleset_fail_still_armed" != "false" ] || [ "$ruleset_fail_still_queued" != "false" ]; then
+              echo "::error::PR #$PR is still armed/queued, or its post-disarm state could not be confirmed, despite the disable-auto/dequeue calls made while recording this ruleset-read-failure pause -- the explicit stop cannot be relied on until this is fixed by hand."
+              gh pr comment "$PR" --repo "${REPO}" --body "This handler could not read the repository's ruleset state (commit \`$HEAD_SHA12\`), and auto-merge could not be confirmed disarmed while recording the pause -- a racing admission run may have armed it first, or its state could not be read. This needs urgent human attention." || true
             else
               gh pr comment "$PR" --repo "${REPO}" --body "Merge-group CI failed for this revision (commit \`$HEAD_SHA12\`), and this handler could not read the repository's ruleset state to confirm it's safe to retry. Standing down without consuming this head's retry budget -- this needs a human to check ruleset/API access and retry manually if appropriate." || true
             fi
