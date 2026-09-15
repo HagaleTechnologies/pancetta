@@ -59,11 +59,15 @@ jobs:
     timeout-minutes: 2
     outputs:
       pr_number: ${{ steps.parse.outputs.pr_number }}
+      tested_parents: ${{ steps.parse.outputs.tested_parents }}
     steps:
-      - name: Parse PR number from the merge-group branch name
+      - name: Parse PR number and recover the merge-group's tested parent commits
         id: parse
         env:
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          SYNTHETIC_SHA: ${{ github.event.workflow_run.head_sha }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           # GitHub's merge-group synthetic branch naming convention:
           #   gh-readonly-queue/<base>/pr-<number>-<baseShaAtEnqueue>
@@ -77,6 +81,23 @@ jobs:
             exit 1
           fi
           echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+
+          # Codex P1, round 6: recover the exact PR head SHA this merge-group run actually
+          # validated, so check-pr-state can refuse to retry a DIFFERENT revision that landed
+          # after the failure -- a real gap when the pushing author is outside auto-merge-
+          # trigger.yml's allowlist, since that workflow's synchronize handler (which the
+          # existing debounce logic below implicitly relies on for a "head changed" signal)
+          # never runs at all for that author, so a replacement head can look identical to the
+          # failed one across both debounce reads. $SYNTHETIC_SHA (the merge-group's own
+          # validation commit) is a merge of the base tip and the PR's exact head at enqueue
+          # time -- one of its parents IS that head SHA, verbatim and immutable once created.
+          # Unlike a commit's own committer date (which a force-push can back-date -- exactly
+          # why this file already deliberately avoids a timestamp heuristic elsewhere), a
+          # parent SHA cannot be spoofed after the commit exists. Best-effort: if this can't be
+          # resolved (API hiccup, unexpected commit shape), tested_parents is left empty and
+          # the downstream check treats that as "unconfirmed" rather than blocking every retry.
+          tested_parents=$(gh api "repos/${REPO}/commits/${SYNTHETIC_SHA}" --jq '[.parents[].sha] | join(",")' 2>/dev/null || echo "")
+          echo "tested_parents=$tested_parents" >> "$GITHUB_OUTPUT"
 
   # Deliberately NOT held under the shared auto-merge-<PR#> lock: this job's own debounce
   # below exists to give auto-merge-trigger.yml's independent run a chance to finish
@@ -102,6 +123,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ needs.parse-pr-number.outputs.pr_number }}
+          TESTED_PARENTS: ${{ needs.parse-pr-number.outputs.tested_parents }}
         run: |
           # The merge-group branch name's trailing SHA is the base branch's commit at
           # enqueue time, not the PR's own head, and the merge-group's own synthetic commit
@@ -124,6 +146,27 @@ jobs:
           base_ref=$(echo "$pr_json" | jq -r .baseRefName)
           is_draft=$(echo "$pr_json" | jq -r .isDraft)
           auto_merge_armed=$(echo "$pr_json" | jq -r '.autoMergeRequest != null')
+
+          # Codex P1, round 6: confirm the current head is actually one of the merge-group's
+          # own tested parents before treating it as the failed candidate at all -- see
+          # parse-pr-number's own comment for why this doesn't use a timestamp heuristic. Runs
+          # before every other check below so a confirmed-superseded head never falls through
+          # to consuming a retry budget or re-arming a revision nobody actually saw fail.
+          if [ -n "$TESTED_PARENTS" ]; then
+            head_confirmed=false
+            IFS=',' read -ra tested_parent_arr <<< "$TESTED_PARENTS"
+            for parent_sha in "${tested_parent_arr[@]}"; do
+              [ "$parent_sha" = "$head_sha" ] && head_confirmed=true && break
+            done
+            if [ "$head_confirmed" != "true" ]; then
+              echo "::notice::PR #$PR's current head ($head_sha) does not match any parent of the merge-group's own validation commit -- a new revision landed since this merge-group attempt was tested. Standing down without treating the current head as the failed candidate."
+              echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+              echo "head_sha12=$(echo "$head_sha" | cut -c1-12)" >> "$GITHUB_OUTPUT"
+              echo "stale=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
           in_queue=$(gh api graphql -f query='
             query($owner: String!, $name: String!, $pr: Int!) {
               repository(owner: $owner, name: $name) { pullRequest(number: $pr) { isInMergeQueue } }
@@ -398,12 +441,27 @@ jobs:
             # succeed while silently losing the ONLY provenance auto-merge-trigger.yml's
             # needs_human_is_stale() has for auto-clearing this label on a later fix push --
             # verify it landed; fail closed if it didn't.
+            #
+            # Codex P1, round 6: verify THIS specific new comment landed, not just that a
+            # marker with this SHA exists anywhere in history -- if the same head SHA was
+            # already handed off once before (a maintainer removed the pause, then this retry
+            # failed again on the SAME unchanged head), an identical marker from THAT prior
+            # handoff already satisfies a plain substring search over all comments even if
+            # this comment's own POST silently failed, making needs_human_is_stale() see a
+            # marker that predates the current label-attachment event and never clear the
+            # pause on a later fix push. `gh pr comment` prints the new comment's own URL on
+            # success -- extract its ID and verify THAT exact comment, not a substring search.
             MARKER="<!-- queue-retry-handler:queue-needs-human-review sha=$HEAD_SHA12 -->"
-            gh pr comment "$PR" --repo "${REPO}" --body "Merge-group CI failed again for commit \`$HEAD_SHA12\` after its one automatic retry ([run]($RUN_URL)). Not retrying again -- this needs a human decision: push a fix, or investigate and manually re-run \`gh pr merge --auto --squash\` if it's a known flake.
-            $MARKER" || true
-            bodies=$(gh api --paginate "repos/${REPO}/issues/${PR}/comments" --jq '.[] | select(.user.login == "github-actions[bot]") | .body')
-            if [[ "$bodies" != *"$MARKER"* ]]; then
-              echo "::error::Could not confirm the queue-needs-human-review provenance marker was recorded for PR #$PR -- a later fix push cannot prove this pause stale without it. Failing this step so the attempt isn't marked handled."
+            comment_url=$(gh pr comment "$PR" --repo "${REPO}" --body "Merge-group CI failed again for commit \`$HEAD_SHA12\` after its one automatic retry ([run]($RUN_URL)). Not retrying again -- this needs a human decision: push a fix, or investigate and manually re-run \`gh pr merge --auto --squash\` if it's a known flake.
+            $MARKER" 2>/dev/null) || comment_url=""
+            comment_id=$(printf '%s' "$comment_url" | grep -oE '[0-9]+$' || echo "")
+            if [ -z "$comment_id" ]; then
+              echo "::error::Could not confirm the queue-needs-human-review provenance marker was recorded for PR #$PR -- gh pr comment did not return a comment URL to verify. Failing this step so the attempt isn't marked handled."
+              exit 1
+            fi
+            posted_body=$(gh api "repos/${REPO}/issues/comments/${comment_id}" --jq '.body' 2>/dev/null || echo "")
+            if [[ "$posted_body" != *"$MARKER"* ]]; then
+              echo "::error::Could not confirm the queue-needs-human-review provenance marker was recorded for PR #$PR (comment $comment_id did not contain it) -- a later fix push cannot prove this pause stale without it. Failing this step so the attempt isn't marked handled."
               exit 1
             fi
           fi

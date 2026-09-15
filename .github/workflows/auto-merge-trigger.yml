@@ -146,6 +146,31 @@ jobs:
             [ "$armed" = "true" ] || [ "$queued" = "true" ]
           }
 
+          # Codex P1, round 6: `gh pr merge --auto`'s own behavior is conditional on the
+          # target branch -- per `gh`'s help text, it's added to the merge queue only when
+          # the branch actually requires one; otherwise the same call just enables ordinary
+          # GitHub auto-merge. This workflow's admission is meant to hand off into GitHub's
+          # native merge queue exclusively -- if this commit lands before the planned
+          # ruleset follow-up installs the native `merge_queue` rule on `main`, calling `gh
+          # pr merge --auto` during that window would silently arm ordinary auto-merge
+          # instead, letting a trusted PR merge directly and bypass both Mergify's own
+          # queue and the new merge_group-triggered checks entirely. Refuse to arm until the
+          # ruleset confirms the native queue rule actually exists.
+          native_merge_queue_installed() {
+            local repo="$1" base="$2"
+            local rules
+            rules=$(gh api "repos/${repo}/rules/branches/${base}" 2>/dev/null) || return 1
+            printf '%s' "$rules" | jq -e '[.[] | select(.type == "merge_queue")] | length > 0' >/dev/null 2>&1
+          }
+          arm_auto_merge() {
+            local pr_url="$1" repo="$2" base="$3"
+            if ! native_merge_queue_installed "$repo" "$base"; then
+              echo "::notice::Native merge_queue ruleset rule is not yet installed on ${base} -- standing down without arming (gh pr merge --auto would only enable ordinary auto-merge and bypass the native queue during this rollout window)."
+              return 0
+            fi
+            gh pr merge "$pr_url" --auto --squash
+          }
+
           # A maintainer can manually attach the pause label at any time, including on a PR
           # already armed by an earlier event -- this label always wins over an existing
           # arm: disarm/dequeue unconditionally and stop, without running the staleness/
@@ -203,7 +228,7 @@ jobs:
                 echo "::error::Could not remove the stale queue-needs-human-review label from PR #$PR -- refusing to arm while it remains attached. Remove it by hand, then rerun this job." >&2
                 exit 1
               fi
-              gh pr merge "$PR_URL" --auto --squash
+              arm_auto_merge "$PR_URL" "$REPO" "main"
             else
               # Codex P1, round 2: also disarm/dequeue here, not just log -- if this run's own
               # label fetch above happened to race a `labeled` run that attached this pause
