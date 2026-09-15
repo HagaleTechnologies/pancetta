@@ -244,5 +244,5 @@ jobs:
               fi
             fi
           else
-            gh pr merge "$PR_URL" --auto --squash
+            arm_auto_merge "$PR_URL" "$REPO" "main"
           fi

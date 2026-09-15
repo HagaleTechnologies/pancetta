@@ -152,19 +152,33 @@ jobs:
           # parse-pr-number's own comment for why this doesn't use a timestamp heuristic. Runs
           # before every other check below so a confirmed-superseded head never falls through
           # to consuming a retry budget or re-arming a revision nobody actually saw fail.
-          if [ -n "$TESTED_PARENTS" ]; then
-            head_confirmed=false
-            IFS=',' read -ra tested_parent_arr <<< "$TESTED_PARENTS"
-            for parent_sha in "${tested_parent_arr[@]}"; do
-              [ "$parent_sha" = "$head_sha" ] && head_confirmed=true && break
-            done
-            if [ "$head_confirmed" != "true" ]; then
-              echo "::notice::PR #$PR's current head ($head_sha) does not match any parent of the merge-group's own validation commit -- a new revision landed since this merge-group attempt was tested. Standing down without treating the current head as the failed candidate."
-              echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
-              echo "head_sha12=$(echo "$head_sha" | cut -c1-12)" >> "$GITHUB_OUTPUT"
-              echo "stale=true" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
+          #
+          # Codex P1, round 7: an EMPTY $TESTED_PARENTS is ambiguous between "the commit API
+          # call in parse-pr-number transiently failed" and "no parents were recoverable" --
+          # the original `if [ -n "$TESTED_PARENTS" ]` skipped this whole check in either case,
+          # silently falling back to the pre-round-6 fail-OPEN behavior (treat whatever the
+          # current head is as the failed candidate) for exactly the transient-failure case
+          # this safeguard exists to close. Empty now fails CLOSED -- standing down without
+          # confirmation is the safe direction; an occasional false human handoff on a
+          # transient API hiccup is a small cost against re-arming an unapproved revision.
+          if [ -z "$TESTED_PARENTS" ]; then
+            echo "::notice::Could not recover the merge-group's tested parent commits for PR #$PR -- treating as unconfirmed and standing down without treating the current head ($head_sha) as the failed candidate."
+            echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+            echo "head_sha12=$(echo "$head_sha" | cut -c1-12)" >> "$GITHUB_OUTPUT"
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          head_confirmed=false
+          IFS=',' read -ra tested_parent_arr <<< "$TESTED_PARENTS"
+          for parent_sha in "${tested_parent_arr[@]}"; do
+            [ "$parent_sha" = "$head_sha" ] && head_confirmed=true && break
+          done
+          if [ "$head_confirmed" != "true" ]; then
+            echo "::notice::PR #$PR's current head ($head_sha) does not match any parent of the merge-group's own validation commit -- a new revision landed since this merge-group attempt was tested. Standing down without treating the current head as the failed candidate."
+            echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+            echo "head_sha12=$(echo "$head_sha" | cut -c1-12)" >> "$GITHUB_OUTPUT"
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
           in_queue=$(gh api graphql -f query='
@@ -402,6 +416,25 @@ jobs:
           if ! grep -qxF "queue-needs-human-review" <<< "$existing_labels"; then
             echo "::error::Could not attach queue-needs-human-review to PR #$PR (commit $HEAD_SHA12) -- failing this step so the attempt isn't marked handled."
             exit 1
+          fi
+
+          # Codex P1, round 7: labels_before/already_present alone can't tell "we own this
+          # pause" from "a maintainer's manual label landed in the race window between that
+          # read and the idempotent create/POST above" -- the POST no-ops silently either
+          # way. Re-derive ownership from the timeline's own LATEST labeling event instead:
+          # if a human (not this workflow's own github-actions[bot] identity) authored it,
+          # this handoff must not claim provenance, or a later fix push's staleness check
+          # (which matches this exact bot identity in its own marker search -- see
+          # auto-merge-trigger.yml's needs_human_is_stale()) would misattribute the
+          # maintainer's still-valid manual pause as handler-generated and auto-clear it.
+          if raw=$(gh api --paginate --slurp "repos/${REPO}/issues/${PR}/timeline" 2>/dev/null); then
+            latest_label_actor=$(printf '%s' "$raw" | jq -r '(add // []) | [.[] | select(.event == "labeled" and .label.name == "queue-needs-human-review")] | if length > 0 then (last | .actor.login) else "" end' 2>/dev/null)
+          else
+            latest_label_actor=""
+          fi
+          if [ -n "$latest_label_actor" ] && [ "$latest_label_actor" != "github-actions[bot]" ]; then
+            echo "::notice::PR #$PR's queue-needs-human-review label's latest timeline event is attributed to @$latest_label_actor, not this handler -- treating as already maintainer-owned and skipping this handoff's own provenance marker."
+            already_present=true
           fi
 
           # Disarm/dequeue any concurrently re-armed auto-merge: a trusted `edited` run of
