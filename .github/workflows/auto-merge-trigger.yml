@@ -176,8 +176,22 @@ jobs:
             return 1
           }
           arm_auto_merge() {
-            local pr_url="$1" repo="$2" base="$3"
-            local install_status
+            local pr_url="$1" repo="$2" base="$3" pr_number="$4"
+            local install_status live_base
+            # Codex P1, round 10: this job's own shared admission-<PR#> concurrency group
+            # (cancel-in-progress: false) can make a dispatched run WAIT before its steps
+            # actually execute -- the PR's base can be retargeted in that gap. Re-checking the
+            # native-queue-installed state for the ORIGINAL "$base" doesn't help if the PR no
+            # longer targets it: gh pr merge --auto conditions queue admission on the branch
+            # the PR ACTUALLY targets right now, not what it targeted when this run was
+            # dispatched -- an unprotected replacement base would silently enable ordinary
+            # auto-merge instead. Same live re-check the retry path (queue-retry-handler.yml)
+            # already does before its own merge call.
+            live_base=$(gh pr view "$pr_number" --repo "$repo" --json baseRefName --jq .baseRefName 2>/dev/null)
+            if [ "$live_base" != "$base" ]; then
+              echo "::notice::PR #$pr_number's base is now '${live_base:-<unreadable>}', not '$base' -- standing down without arming (a concurrency-group wait can let the base change underneath this run)."
+              return 0
+            fi
             native_merge_queue_installed "$repo" "$base"
             install_status=$?
             if [ "$install_status" -eq 2 ]; then
@@ -248,7 +262,7 @@ jobs:
                 echo "::error::Could not remove the stale queue-needs-human-review label from PR #$PR -- refusing to arm while it remains attached. Remove it by hand, then rerun this job." >&2
                 exit 1
               fi
-              arm_auto_merge "$PR_URL" "$REPO" "main" || exit 1
+              arm_auto_merge "$PR_URL" "$REPO" "main" "$PR" || exit 1
             else
               # Codex P1, round 2: also disarm/dequeue here, not just log -- if this run's own
               # label fetch above happened to race a `labeled` run that attached this pause
@@ -264,5 +278,5 @@ jobs:
               fi
             fi
           else
-            arm_auto_merge "$PR_URL" "$REPO" "main" || exit 1
+            arm_auto_merge "$PR_URL" "$REPO" "main" "$PR" || exit 1
           fi
