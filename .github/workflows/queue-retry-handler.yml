@@ -305,6 +305,14 @@ jobs:
       - name: Retry -- re-arm auto-merge for this head's one allowed attempt
         id: retry
         if: steps.dedup.outputs.already_handled == 'false' && steps.check-retried.outputs.already_retried == 'false'
+        env:
+          # Hoisted to env (proactive, this rollout's own review): GitHub silently rejects an
+          # entire workflow file when a single run: block containing ${{ }} exceeds ~21k
+          # characters -- the fleet-wide bug this rollout's own PR #377 fixed elsewhere. This
+          # block has grown across several review rounds; hoisting its remaining ${{ }}
+          # usages to env vars makes it immune to the cap regardless of future size, same
+          # fix shape as that PR.
+          RETRY_LABEL: ${{ steps.check-retried.outputs.retry_label }}
         run: |
           # Re-check the pause label immediately before mutating (Codex P1): a maintainer can
           # attach queue-needs-human-review between check-pr-state's own read and this step
@@ -316,7 +324,34 @@ jobs:
           # and eligible to merge. Check the live label directly rather than relying on that path.
           current_labels=$(gh api --paginate "repos/${REPO}/issues/${PR}/labels" --jq '.[].name')
           if grep -qxF "queue-needs-human-review" <<< "$current_labels"; then
-            echo "::notice::PR #$PR carries queue-needs-human-review as of right now -- standing down without re-arming or consuming this head's retry budget."
+            # Codex P1, round 9: a bare stand-down here isn't enough -- an admission run that
+            # already fetched labels BEFORE the maintainer's pause attach can still arm the PR
+            # if the labeled-event disarm run that should have caught it got evicted from the
+            # shared admission-<PR#> concurrency group (one pending job retained) by a
+            # simultaneous CI/Supply Chain/Wait-for-Codex failure handler. Disarm/dequeue and
+            # verify here too, the same as auto-merge-trigger.yml's own pause-detection paths,
+            # rather than trusting that something else already did.
+            echo "::notice::PR #$PR carries queue-needs-human-review as of right now -- disarming/dequeuing any auto-merge a racing admission run may have already armed, rather than merely standing down."
+            gh pr merge "$PR" --repo "${REPO}" --disable-auto >/dev/null 2>&1 || true
+            pause_queue_state=$(gh api graphql -f query='
+              query($owner: String!, $name: String!, $pr: Int!) {
+                repository(owner: $owner, name: $name) { pullRequest(number: $pr) { id isInMergeQueue } }
+              }' -f owner="${REPO%%/*}" -f name="${REPO##*/}" -F pr="$PR" 2>/dev/null)
+            pause_pr_node_id=$(echo "$pause_queue_state" | jq -r '.data.repository.pullRequest.id')
+            pause_in_queue=$(echo "$pause_queue_state" | jq -r '.data.repository.pullRequest.isInMergeQueue')
+            if [ "$pause_in_queue" = "true" ] && [ -n "$pause_pr_node_id" ] && [ "$pause_pr_node_id" != "null" ]; then
+              gh api graphql -f query='mutation($id: ID!) { dequeuePullRequest(input: {id: $id}) { clientMutationId } }' -f id="$pause_pr_node_id" >/dev/null 2>&1 || true
+            fi
+            pause_still_armed=$(gh pr view "$PR" --repo "${REPO}" --json autoMergeRequest --jq '.autoMergeRequest != null')
+            pause_still_queued=$(gh api graphql -f query='
+              query($owner: String!, $name: String!, $pr: Int!) {
+                repository(owner: $owner, name: $name) { pullRequest(number: $pr) { isInMergeQueue } }
+              }' -f owner="${REPO%%/*}" -f name="${REPO##*/}" -F pr="$PR" 2>/dev/null | jq -r '.data.repository.pullRequest.isInMergeQueue')
+            if [ "$pause_still_armed" = "true" ] || [ "$pause_still_queued" = "true" ]; then
+              echo "::error::PR #$PR carries queue-needs-human-review but is STILL ARMED/QUEUED despite the disable-auto/dequeue calls -- the explicit maintainer stop cannot be relied on until this is fixed by hand."
+              gh pr comment "$PR" --repo "${REPO}" --body "queue-needs-human-review is attached to this PR (commit \`$HEAD_SHA12\`), but auto-merge could not be confirmed disarmed -- a racing admission run may have armed it before this pause was observed. This needs urgent human attention." || true
+              exit 1
+            fi
             exit 0
           fi
 
@@ -338,8 +373,28 @@ jobs:
           # immediately before this call for the same reason as the base/pause-label checks
           # above: gh pr merge --auto only targets the native queue when the branch actually
           # requires one; otherwise it silently enables ordinary auto-merge instead.
-          if ! rules=$(gh api "repos/${REPO}/rules/branches/main" 2>/dev/null) || ! printf '%s' "$rules" | jq -e '[.[] | select(.type == "merge_queue")] | length > 0' >/dev/null 2>&1; then
-            echo "::notice::Native merge_queue ruleset rule is not confirmed present on main right now -- standing down without re-arming (gh pr merge --auto would only enable ordinary auto-merge) and without consuming this head's retry budget."
+          #
+          # Codex P2, round 9: round 8's combined check collapsed "confirmed absent" and
+          # "API call itself failed" into the same exit-0 stand-down -- a transient read
+          # failure then reported this step as `success`, so "Mark this merge-group attempt
+          # as handled" recorded it as handled even though nothing was retried or handed
+          # off. Since the original merge-group failure already disarmed the PR, there is no
+          # SUBSEQUENT event to ever revisit it -- exactly the stranding shape the
+          # --match-head-commit failure branch below already guards against for a different
+          # cause. Distinguish the two: an unreadable ruleset now fails this step (so
+          # mark-handled withholds the dedup marker) and makes a best-effort human-handoff
+          # attempt, rather than silently succeeding.
+          if ! rules=$(gh api "repos/${REPO}/rules/branches/main" 2>/dev/null); then
+            echo "::error::Could not read PR #$PR's ruleset state for main to confirm the native merge_queue rule is installed -- refusing to report success, since that would let mark-handled record this attempt as handled with no retry or handoff actually taken."
+            gh label create queue-needs-human-review --color b60205 \
+              --description "Needs a human decision -- an automated handler could not safely proceed" \
+              --repo "${REPO}" >/dev/null 2>&1 || true
+            gh api --method POST "repos/${REPO}/issues/${PR}/labels" -f "labels[]=queue-needs-human-review" >/dev/null 2>&1 || true
+            gh pr comment "$PR" --repo "${REPO}" --body "Merge-group CI failed for this revision (commit \`$HEAD_SHA12\`), and this handler could not read the repository's ruleset state to confirm it's safe to retry. Standing down without consuming this head's retry budget -- this needs a human to check ruleset/API access and retry manually if appropriate." || true
+            exit 1
+          fi
+          if ! printf '%s' "$rules" | jq -e '[.[] | select(.type == "merge_queue")] | length > 0' >/dev/null 2>&1; then
+            echo "::notice::Native merge_queue ruleset rule is confirmed absent on main -- standing down without re-arming (gh pr merge --auto would only enable ordinary auto-merge) and without consuming this head's retry budget."
             exit 0
           fi
 
@@ -347,12 +402,12 @@ jobs:
           # (a contributor pushes a new commit) would silently arm auto-merge on a
           # DIFFERENT, never-tested revision.
           if GH_TOKEN="$MERGE_TOKEN" gh pr merge "$PR" --repo "${REPO}" --auto --squash --match-head-commit "$HEAD_SHA"; then
-            gh label create "${{ steps.check-retried.outputs.retry_label }}" --color d4c5f9 \
+            gh label create "$RETRY_LABEL" --color d4c5f9 \
               --description "This revision already used its one automatic queue retry" \
               --repo "${REPO}" >/dev/null 2>&1 || true
-            gh api -X POST "repos/${REPO}/issues/${PR}/labels" -f "labels[]=${{ steps.check-retried.outputs.retry_label }}" >/dev/null 2>&1 || true
+            gh api -X POST "repos/${REPO}/issues/${PR}/labels" -f "labels[]=$RETRY_LABEL" >/dev/null 2>&1 || true
             existing_labels=$(gh api --paginate "repos/${REPO}/issues/${PR}/labels" --jq '.[].name')
-            if ! grep -qxF "${{ steps.check-retried.outputs.retry_label }}" <<< "$existing_labels"; then
+            if ! grep -qxF "$RETRY_LABEL" <<< "$existing_labels"; then
               # Recheck the head before disarming: the --match-head-commit call above
               # already proved HEAD_SHA matched at that moment, but a new push can still
               # land in the gap between that success and reaching this disarm.
