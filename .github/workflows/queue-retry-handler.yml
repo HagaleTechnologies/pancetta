@@ -328,6 +328,21 @@ jobs:
             exit 0
           fi
 
+          # Codex P1, round 8: this handler's own trigger precondition (a completed
+          # merge-group run) only proves the native merge_queue rule existed at the MOMENT
+          # that merge-group formed -- not that it still exists NOW, potentially minutes
+          # later, especially during this exact rollout where the ruleset itself is being
+          # installed and could be reverted. Same guard as auto-merge-trigger.yml's own
+          # arm_auto_merge() (not shared across workflow files -- each `run:` block is its
+          # own bash process with no cross-file function import), re-checked live
+          # immediately before this call for the same reason as the base/pause-label checks
+          # above: gh pr merge --auto only targets the native queue when the branch actually
+          # requires one; otherwise it silently enables ordinary auto-merge instead.
+          if ! rules=$(gh api "repos/${REPO}/rules/branches/main" 2>/dev/null) || ! printf '%s' "$rules" | jq -e '[.[] | select(.type == "merge_queue")] | length > 0' >/dev/null 2>&1; then
+            echo "::notice::Native merge_queue ruleset rule is not confirmed present on main right now -- standing down without re-arming (gh pr merge --auto would only enable ordinary auto-merge) and without consuming this head's retry budget."
+            exit 0
+          fi
+
           # --match-head-commit: without it, a race between the pr-state fetch and this call
           # (a contributor pushes a new commit) would silently arm auto-merge on a
           # DIFFERENT, never-tested revision.
@@ -362,13 +377,35 @@ jobs:
                     repository(owner: $owner, name: $name) { pullRequest(number: $pr) { isInMergeQueue } }
                   }' -f owner="${REPO%%/*}" -f name="${REPO##*/}" -F pr="$PR" 2>/dev/null | jq -r '.data.repository.pullRequest.isInMergeQueue')
               fi
+
+              # Codex P1, round 8: a "no-more-retries" comment marker is not read by any
+              # workflow -- if the same unchanged head is later re-armed (including by the
+              # manual command the comment below recommends) and fails again in a NEW
+              # merge group, check-retried finds no queue-retry-used label for this SHA
+              # (it never attached, which is WHY we're in this branch) and grants another
+              # automatic retry, defeating the one-retry bound entirely. Attach the actual
+              # queue-needs-human-review pause label here too -- the same durable, checkable
+              # state the second-failure handoff step already uses -- so a future retry
+              # attempt on this head sees it and stands down (per this step's own live
+              # pause-label check above), regardless of whether the disarm/dequeue above
+              # fully succeeded.
+              gh label create queue-needs-human-review --color b60205 \
+                --description "Needs a human decision -- an automated handler could not safely proceed" \
+                --repo "${REPO}" >/dev/null 2>&1 || true
+              gh api --method POST "repos/${REPO}/issues/${PR}/labels" -f "labels[]=queue-needs-human-review" >/dev/null 2>&1 || true
+              pause_label_attached=$(gh api --paginate "repos/${REPO}/issues/${PR}/labels" --jq '.[].name' | grep -qxF "queue-needs-human-review" && echo true || echo false)
+
               NO_MORE_RETRIES_MARKER="<!-- queue-retry-handler:no-more-retries sha=$HEAD_SHA12 -->"
               if [ "$still_armed" = "true" ] || [ "$in_queue_val" = "true" ]; then
                 echo "::error::Auto-merge is STILL ARMED/QUEUED for PR #$PR despite the disable-auto/dequeue calls -- the one-retry bound cannot be relied on until this is fixed by hand."
                 gh pr comment "$PR" --repo "${REPO}" --body "Merge-group CI failed for this revision (commit \`$HEAD_SHA12\`), and the retry-tracking label could not be recorded. Attempted to disarm/dequeue to prevent an unbounded retry loop, but could NOT confirm it succeeded -- this needs urgent human attention. $NO_MORE_RETRIES_MARKER" || true
                 exit 1
+              elif [ "$pause_label_attached" != "true" ]; then
+                echo "::error::Auto-merge was disarmed, but queue-needs-human-review could not be attached either for PR #$PR -- this head's retry budget has no durable record, risking an unbounded retry loop on a future re-arm. This needs urgent human attention."
+                gh pr comment "$PR" --repo "${REPO}" --body "Merge-group CI failed for this revision (commit \`$HEAD_SHA12\`), and neither the retry-tracking label nor the human-review pause label could be recorded, despite auto-merge itself being disarmed. This needs urgent human attention -- the one-retry bound cannot be relied on for this head until this is fixed by hand. $NO_MORE_RETRIES_MARKER" || true
+                exit 1
               else
-                gh pr comment "$PR" --repo "${REPO}" --body "Merge-group CI failed for this revision (commit \`$HEAD_SHA12\`), and the retry-tracking label could not be recorded. Disarmed rather than risk retrying unboundedly -- this needs a human: push a fix, or manually run \`gh pr merge --auto --squash\` once the labeling problem is resolved. $NO_MORE_RETRIES_MARKER" || true
+                gh pr comment "$PR" --repo "${REPO}" --body "Merge-group CI failed for this revision (commit \`$HEAD_SHA12\`), and the retry-tracking label could not be recorded. Disarmed and attached queue-needs-human-review rather than risk retrying unboundedly -- this needs a human: push a fix, or remove the pause and manually run \`gh pr merge --auto --squash\` once the labeling problem is resolved. $NO_MORE_RETRIES_MARKER" || true
               fi
             else
               gh pr comment "$PR" --repo "${REPO}" --body "Merge-group CI failed for this revision (commit \`$HEAD_SHA12\`) -- automatically re-armed auto-merge for one retry. If this fails again for the same commit, it will NOT retry again; it needs a human to look. [Run]($RUN_URL)" || true
@@ -427,12 +464,22 @@ jobs:
           # (which matches this exact bot identity in its own marker search -- see
           # auto-merge-trigger.yml's needs_human_is_stale()) would misattribute the
           # maintainer's still-valid manual pause as handler-generated and auto-clear it.
+          # Codex P1, round 8: a timeline FETCH FAILURE and "no matching event found" both
+          # collapsed to the same empty latest_label_actor, which left already_present at
+          # its pre-mutation value on failure -- silently falling back to the fail-OPEN
+          # race this safeguard exists to close (an unreadable timeline is exactly the case
+          # this can't confirm ownership either way). A distinct sentinel on fetch failure
+          # forces the explicit "treat as externally owned, don't claim provenance" branch
+          # below regardless of what the pre-mutation snapshot said.
           if raw=$(gh api --paginate --slurp "repos/${REPO}/issues/${PR}/timeline" 2>/dev/null); then
-            latest_label_actor=$(printf '%s' "$raw" | jq -r '(add // []) | [.[] | select(.event == "labeled" and .label.name == "queue-needs-human-review")] | if length > 0 then (last | .actor.login) else "" end' 2>/dev/null)
+            latest_label_actor=$(printf '%s' "$raw" | jq -r '(add // []) | [.[] | select(.event == "labeled" and .label.name == "queue-needs-human-review")] | if length > 0 then (last | .actor.login) else "" end' 2>/dev/null) || latest_label_actor="__UNREADABLE__"
           else
-            latest_label_actor=""
+            latest_label_actor="__UNREADABLE__"
           fi
-          if [ -n "$latest_label_actor" ] && [ "$latest_label_actor" != "github-actions[bot]" ]; then
+          if [ "$latest_label_actor" = "__UNREADABLE__" ]; then
+            echo "::notice::Could not read PR #$PR's timeline to confirm queue-needs-human-review's provenance -- treating as unconfirmed/externally owned and skipping this handoff's own provenance marker."
+            already_present=true
+          elif [ -n "$latest_label_actor" ] && [ "$latest_label_actor" != "github-actions[bot]" ]; then
             echo "::notice::PR #$PR's queue-needs-human-review label's latest timeline event is attributed to @$latest_label_actor, not this handler -- treating as already maintainer-owned and skipping this handoff's own provenance marker."
             already_present=true
           fi
