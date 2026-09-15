@@ -128,15 +128,32 @@ jobs:
             query($owner: String!, $name: String!, $pr: Int!) {
               repository(owner: $owner, name: $name) { pullRequest(number: $pr) { isInMergeQueue } }
             }' -f owner="${REPO%%/*}" -f name="${REPO##*/}" -F pr="$PR" 2>/dev/null | jq -r '.data.repository.pullRequest.isInMergeQueue')
-          [ "$auto_merge_armed" != "true" ] && [ "$in_queue" = "true" ] && auto_merge_armed="true"
+          # Deliberately NOT collapsed into auto_merge_armed here (Codex P2): a bare
+          # `isInMergeQueue=true` reading at this point is ambiguous -- it can mean a
+          # genuinely newer admission already re-armed and queued the PR (stand down), OR
+          # it can mean this read is observing the SAME failed merge-group entry this very
+          # workflow_run.completed event is about, before GitHub has finished dequeuing/
+          # disarming it. Finalizing "armed" on the ambiguous reading would misclassify a
+          # real failure as a race-loss and skip straight to `stale=true` below -- with no
+          # later recheck, once GitHub actually dequeues+disarms moments later there is no
+          # remaining event to grant the promised retry or human handoff, stranding the PR.
+          # Leaving auto_merge_armed unchanged here routes this case into the debounce
+          # block below, which re-queries isInMergeQueue after a wait and only then
+          # resolves the ambiguity.
+          if [ "$in_queue" = "true" ] && [ "$auto_merge_armed" != "true" ]; then
+            echo "::notice::PR #$PR reads isInMergeQueue=true with autoMergeRequest unset -- ambiguous (could be the failed entry pending dequeue, or a genuinely newer admission); deferring to the debounced recheck below."
+          fi
 
           # Debounce before trusting a "disarmed" reading: the check above only catches the
           # race if auto-merge-trigger.yml's own separate run has ALREADY finished
           # re-arming a freshly-pushed head by the time we check -- there's no ordering
           # guarantee between these two independently-triggered workflows. Re-check once
           # after a short wait: if the head changed, or auto-merge became armed/queued in
-          # the meantime, that's proof of the race. This narrows the window; it does not
-          # close it -- bounded to a single missed automatic retry, not an unsafe merge.
+          # the meantime, that's proof of the race -- by now GitHub has had time to finish
+          # dequeuing the original failed entry, so a STILL-true isInMergeQueue reading no
+          # longer refers to that failed entry and really does mean a fresh, genuinely
+          # newer admission. This narrows the window; it does not close it -- bounded to a
+          # single missed automatic retry, not an unsafe merge.
           if [ "$pr_state" = "OPEN" ] && [ "$auto_merge_armed" != "true" ]; then
             sleep 10
             pr_json2=$(gh pr view "$PR" --repo "${{ github.repository }}" --json headRefOid,autoMergeRequest)

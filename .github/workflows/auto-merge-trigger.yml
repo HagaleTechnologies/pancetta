@@ -127,14 +127,22 @@ jobs:
             local repo="$1" pr="$2"
             local owner name state armed queued
             owner="${repo%%/*}"; name="${repo##*/}"
-            state=$(gh api graphql -f query='
+            # Fail-closed verification for a disarm attempt: an unreadable or
+            # indeterminate GraphQL result must be treated as still armed/queued,
+            # never as "confirmed clear" -- otherwise the caller reports success
+            # while the PR may still be queued and eligible to merge (Codex P2).
+            if ! state=$(gh api graphql -f query='
               query($owner: String!, $name: String!, $pr: Int!) {
                 repository(owner: $owner, name: $name) {
                   pullRequest(number: $pr) { autoMergeRequest { enabledAt } isInMergeQueue }
                 }
-              }' -f owner="$owner" -f name="$name" -F pr="$pr" 2>/dev/null)
-            armed=$(printf '%s' "$state" | jq -r '.data.repository.pullRequest.autoMergeRequest != null')
-            queued=$(printf '%s' "$state" | jq -r '.data.repository.pullRequest.isInMergeQueue')
+              }' -f owner="$owner" -f name="$name" -F pr="$pr" 2>/dev/null); then
+              return 0
+            fi
+            armed=$(printf '%s' "$state" | jq -r '.data.repository.pullRequest.autoMergeRequest != null' 2>/dev/null)
+            queued=$(printf '%s' "$state" | jq -r '.data.repository.pullRequest.isInMergeQueue' 2>/dev/null)
+            case "$armed" in true|false) : ;; *) return 0 ;; esac
+            case "$queued" in true|false) : ;; *) return 0 ;; esac
             [ "$armed" = "true" ] || [ "$queued" = "true" ]
           }
 
