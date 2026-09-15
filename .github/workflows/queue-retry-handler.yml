@@ -1,5 +1,14 @@
 name: Queue Retry Handler
 
+# PR #381 (2026-09-15) landed this workflow as part of pancetta's native merge-queue
+# cutover. The "Pancetta - Native Merge Queue" ruleset (id 23456638, scoped to `main`
+# only -- the pre-existing "Public - Pancetta" ruleset also covers release/* and
+# releases/* via wildcard refs, which GitHub rejects alongside a merge_queue rule) was
+# added out-of-band after #381 merged. This PR is that cutover's own live-fire
+# verification, and is the first merge-group completion since the ruleset went live --
+# a real workflow_run-triggered run appearing under this workflow (correctly no-op'ing,
+# since this merge-group won't fail) is the confirmation.
+#
 # GitHub's native merge queue dequeues a PR on a merge-group CI failure, but also fully
 # disarms auto-merge -- and nothing else re-arms it, since auto-merge-trigger.yml only
 # fires on discrete PR-lifecycle events, none of which occur just because a merge-group
