@@ -418,19 +418,39 @@ jobs:
               fi
               echo "::error::Retry-used label failed to attach for PR #$PR (commit $HEAD_SHA12) -- disarming and handing off instead of risking an unbounded retry loop."
               gh pr merge "$PR" --repo "${REPO}" --disable-auto >/dev/null 2>&1 || true
-              still_armed=$(gh pr view "$PR" --repo "${REPO}" --json autoMergeRequest --jq '.autoMergeRequest != null')
-              in_queue=$(gh api graphql -f query='
+              # Codex P2, round 11: bare command substitutions here can trigger GitHub
+              # Actions' default `bash -e` (errexit) on a transient API failure, killing the
+              # script before the pause label below is ever attached -- leaving the PR in an
+              # ambiguous state (disable-auto attempted but not confirmed, no durable pause
+              # marker either). A separately-read indeterminate/empty GraphQL result can also
+              # be silently treated as "not queued," skipping the dequeue mutation -- fail-open
+              # in the same shape round 5's still_armed_or_queued() fix already closed
+              # elsewhere. Guard every read explicitly and treat unreadable/indeterminate as
+              # still-armed (fail closed), so this always reaches the pause-label attachment
+              # below regardless of API health.
+              if ! still_armed=$(gh pr view "$PR" --repo "${REPO}" --json autoMergeRequest --jq '.autoMergeRequest != null' 2>/dev/null); then
+                still_armed="__UNREADABLE__"
+              fi
+              if ! in_queue=$(gh api graphql -f query='
                 query($owner: String!, $name: String!, $pr: Int!) {
                   repository(owner: $owner, name: $name) { pullRequest(number: $pr) { id isInMergeQueue } }
-                }' -f owner="${REPO%%/*}" -f name="${REPO##*/}" -F pr="$PR" 2>/dev/null)
-              pr_node_id=$(echo "$in_queue" | jq -r '.data.repository.pullRequest.id')
-              in_queue_val=$(echo "$in_queue" | jq -r '.data.repository.pullRequest.isInMergeQueue')
-              if [ "$in_queue_val" = "true" ] && [ -n "$pr_node_id" ] && [ "$pr_node_id" != "null" ]; then
-                gh api graphql -f query='mutation($id: ID!) { dequeuePullRequest(input: {id: $id}) { clientMutationId } }' -f id="$pr_node_id" >/dev/null 2>&1 || true
-                in_queue_val=$(gh api graphql -f query='
+                }' -f owner="${REPO%%/*}" -f name="${REPO##*/}" -F pr="$PR" 2>/dev/null); then
+                in_queue='{}'
+              fi
+              pr_node_id=$(echo "$in_queue" | jq -r '.data.repository.pullRequest.id' 2>/dev/null)
+              in_queue_val=$(echo "$in_queue" | jq -r '.data.repository.pullRequest.isInMergeQueue' 2>/dev/null)
+              case "$in_queue_val" in true|false) : ;; *) in_queue_val="__UNREADABLE__" ;; esac
+              if [ "$in_queue_val" = "true" ] || [ "$in_queue_val" = "__UNREADABLE__" ]; then
+                if [ -n "$pr_node_id" ] && [ "$pr_node_id" != "null" ]; then
+                  gh api graphql -f query='mutation($id: ID!) { dequeuePullRequest(input: {id: $id}) { clientMutationId } }' -f id="$pr_node_id" >/dev/null 2>&1 || true
+                fi
+                if ! in_queue_val=$(gh api graphql -f query='
                   query($owner: String!, $name: String!, $pr: Int!) {
                     repository(owner: $owner, name: $name) { pullRequest(number: $pr) { isInMergeQueue } }
-                  }' -f owner="${REPO%%/*}" -f name="${REPO##*/}" -F pr="$PR" 2>/dev/null | jq -r '.data.repository.pullRequest.isInMergeQueue')
+                  }' -f owner="${REPO%%/*}" -f name="${REPO##*/}" -F pr="$PR" 2>/dev/null | jq -r '.data.repository.pullRequest.isInMergeQueue' 2>/dev/null); then
+                  in_queue_val="__UNREADABLE__"
+                fi
+                case "$in_queue_val" in true|false) : ;; *) in_queue_val="__UNREADABLE__" ;; esac
               fi
 
               # Codex P1, round 8: a "no-more-retries" comment marker is not read by any
@@ -451,7 +471,7 @@ jobs:
               pause_label_attached=$(gh api --paginate "repos/${REPO}/issues/${PR}/labels" --jq '.[].name' | grep -qxF "queue-needs-human-review" && echo true || echo false)
 
               NO_MORE_RETRIES_MARKER="<!-- queue-retry-handler:no-more-retries sha=$HEAD_SHA12 -->"
-              if [ "$still_armed" = "true" ] || [ "$in_queue_val" = "true" ]; then
+              if [ "$still_armed" = "true" ] || [ "$still_armed" = "__UNREADABLE__" ] || [ "$in_queue_val" = "true" ] || [ "$in_queue_val" = "__UNREADABLE__" ]; then
                 echo "::error::Auto-merge is STILL ARMED/QUEUED for PR #$PR despite the disable-auto/dequeue calls -- the one-retry bound cannot be relied on until this is fixed by hand."
                 gh pr comment "$PR" --repo "${REPO}" --body "Merge-group CI failed for this revision (commit \`$HEAD_SHA12\`), and the retry-tracking label could not be recorded. Attempted to disarm/dequeue to prevent an unbounded retry loop, but could NOT confirm it succeeded -- this needs urgent human attention. $NO_MORE_RETRIES_MARKER" || true
                 exit 1
