@@ -1757,5 +1757,5 @@ git commit -m "docs: PAN-61 changelog entry for saved rig-config bookmarks"
 ## After implementation
 
 - Move PAN-61 to **In Review** in Linear once the PR is open (`linearis issues update PAN-61 --status "In Review"`), and to **Done** once merged.
-- Open the PR via `/catalyst-dev:create-pr` (or `gh pr create` if that plugin isn't installed in this session), then use the `land-pr` skill to merge once CI is green and review threads are resolved (Mergify queue — `@Mergifyio queue`, never `gh pr merge` directly).
+- Open the PR via `/catalyst-dev:create-pr` (or `gh pr create` if that plugin isn't installed in this session), then use the `land-pr` skill to merge once CI is green and review threads are resolved (native GitHub merge queue — `gh pr merge --auto --squash`; pancetta retired Mergify for its own queue on 2026-09-15).
 - On-air validation (saving a bookmark, restarting pancetta, reloading it) is operator-owed, same as PAN-59's own on-air re-verify — note it as outstanding, don't block the PR on it.

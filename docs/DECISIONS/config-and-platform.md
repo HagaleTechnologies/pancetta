@@ -392,3 +392,19 @@ bumps, which `dependabot-auto-merge.yml`'s own classify step already vets (break
 labeled `needs-review` and excluded regardless of author via the existing `-label = needs-review`
 condition) — caught in review before landing. Branch protection (`required_status_checks`) is
 unchanged by this addendum.
+
+**Superseded again (2026-09-15):** Mergify's own queue is retired in favor of GitHub's native
+`merge_queue` branch-ruleset rule (`Pancetta - Native Merge Queue`, id 23456638, scoped to `main`
+only -- the pre-existing "Public - Pancetta" ruleset also covers `release/*`/`releases/*` via
+wildcard refs, which GitHub rejects alongside a `merge_queue` rule). `.mergify.yml` is deleted.
+`auto-merge-trigger.yml` and `queue-retry-handler.yml` (added in this same cutover, PR #381) now own
+admission -- `auto-merge-trigger.yml`'s author allowlist is this addendum's own trusted-author
+condition ported onto the native path. **`dependabot-auto-merge.yml` does NOT call `gh pr merge
+--auto`** -- it only approves (non-breaking updates) or labels+comments for manual review (breaking
+updates); `auto-merge-trigger.yml`'s own allowlist excludes `dependabot[bot]` entirely. A green,
+auto-approved Dependabot PR therefore has no automatic merge path at all now -- an operator has to
+run `gh pr merge --auto --squash` by hand, same gap already tracked fleet-wide as VAN-710 (vanity's
+own Dependabot-admission policy question), not resolved here. The single-collaborator
+caveat above (Mergify's `author = thagale` condition needing revisiting once a second trusted
+collaborator exists) carries over unchanged to `auto-merge-trigger.yml`'s own allowlist -- same
+mechanism, same limitation, different admission path.
