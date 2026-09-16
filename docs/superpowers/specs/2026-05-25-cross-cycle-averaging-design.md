@@ -52,20 +52,29 @@ classified as a CQ, MyCall, or QSO-partner signal (via tone-pattern
 hit-counting, not a generic similarity score), matched to a *failed*
 decode from the same-parity slot ~30 seconds earlier within 2 Hz / 0.05s.
 
-**Net effect: matching JTDX itself never required a coherent-vs-non-coherent
-gap to bound.** Pancetta's power-only spectrogram is already sufficient to
-replicate JTDX's actual cross-cycle mechanism exactly — no spectrogram
-rework was a prerequisite FOR THAT specific goal. This is separate from
-whether phase-aware combining is independently worth having on its own
-merits: it is — hb-075 (shipped, default-on) genuinely IS coherent
-(extracts complex symbols, phase-aligns them, reliability-weights via MRC,
-`coherent_sum_complex_to_db` in `pancetta-ft8/src/decoder.rs`) and that
-real, working mechanism should not be confused with JTDX-parity, which
-never needed it. PAN-159's proposed retry is the non-coherent one — it
-targets JTDX's actual (different, non-coherent, failed-decode-gated)
-mechanism, which pancetta has never attempted regardless of hb-075's
-existence. hb-075 and PAN-159 are two independent, non-competing
-mechanisms, not one thing correctly and incorrectly labeled.
+**Net effect, precisely scoped:** matching JTDX's cross-cycle power-add
+term specifically (`s2(i) = |cs|² + |csold|²`, the single-symbol `bmeta`
+lane) never required a coherent-vs-non-coherent gap to bound — pancetta's
+power-only spectrogram already suffices for that ONE lane, no spectrogram
+rework needed. This does NOT extend to the rest of what the same
+`isubp1={4,7,10}`/`{5,8,11}` subpasses compute: they also produce
+`bmetb`/`bmetc`, two- and three-symbol joint metrics that coherently sum
+*adjacent* complex `cs` values within the same frame (`research/specs/spec-wsjtx-mainline-ft8b.md:200-209`)
+— power-only bins cannot reconstruct those phases, so a claim of
+replicating JTDX's *isubp1 pass as a whole* "exactly" would be wrong. This
+spec, and PAN-159, target only the cross-cycle power-add term, not the
+multi-symbol lanes.
+
+This is separate from whether phase-aware combining is independently worth
+having on its own merits: it is — hb-075 (shipped, default-on) genuinely IS
+coherent (extracts complex symbols, phase-aligns them, reliability-weights
+via MRC, `coherent_sum_complex_to_db` in `pancetta-ft8/src/decoder.rs`) and
+that real, working mechanism should not be confused with JTDX-parity on the
+cross-cycle term, which never needed it. PAN-159's proposed retry is the
+non-coherent one — it targets JTDX's actual cross-cycle power-add term,
+which pancetta has never attempted regardless of hb-075's existence.
+hb-075 and PAN-159 are two independent, non-competing mechanisms, not one
+thing correctly and incorrectly labeled.
 
 ### 2. The existing 90 s recordings already contain the repeats
 
@@ -172,9 +181,15 @@ buffer removes the cross-slot persistence + new-corpus work.
   the max-of-dB LLR is dominated by the strongest tone, and non-coherent
   power summation of a sub-threshold repeat may not cross the LDPC/CRC
   threshold without phase). That would be a clean, documented negative
-  bounding the technique for pancetta's power-spectrogram architecture —
-  and would motivate the larger "retain complex spectrogram bins" project
-  as the only path to JTDX's coherent gain.
+  bounding the technique for pancetta's power-spectrogram architecture.
+  **CORRECTED 2026-09-16:** the following clause originally said this
+  would motivate "retain complex spectrogram bins... as the only path to
+  JTDX's coherent gain" — false. JTDX's cross-cycle power-add term is
+  non-coherent; there is no JTDX-parity reason to retain phase for it. A
+  "retain complex bins" project is still independently motivated by
+  hb-075's coherent (MRC-weighted) mechanism and by JTDX's separate
+  multi-symbol `bmetb`/`bmetc` lanes (Section 1's precisely-scoped note
+  above) — but not by this term.
 
 ## Open questions for the implementer
 
