@@ -45,13 +45,20 @@ classified as a CQ, MyCall, or QSO-partner signal (via tone-pattern
 hit-counting, not a generic similarity score), matched to a *failed*
 decode from the same-parity slot ~30 seconds earlier within 2 Hz / 0.05s.
 
-**Net effect: there is no coherent-vs-non-coherent gap to bound here.**
-Pancetta's power-only spectrogram is already sufficient to replicate
-JTDX's actual cross-cycle mechanism exactly — no spectrogram rework
-(retaining complex/phase bins) is a prerequisite, contrary to this
-section's original conclusion. hb-075 (shipped, MRC-weighted coherent sum)
-and the phase-agnostic retry tracked as PAN-159 are both non-coherent by
-construction and both already have everything they need architecturally.
+**Net effect: matching JTDX itself never required a coherent-vs-non-coherent
+gap to bound.** Pancetta's power-only spectrogram is already sufficient to
+replicate JTDX's actual cross-cycle mechanism exactly — no spectrogram
+rework was a prerequisite FOR THAT specific goal. This is separate from
+whether phase-aware combining is independently worth having on its own
+merits: it is — hb-075 (shipped, default-on) genuinely IS coherent
+(extracts complex symbols, phase-aligns them, reliability-weights via MRC,
+`coherent_sum_complex_to_db` in `pancetta-ft8/src/decoder.rs`) and that
+real, working mechanism should not be confused with JTDX-parity, which
+never needed it. PAN-159's proposed retry is the non-coherent one — it
+targets JTDX's actual (different, non-coherent, failed-decode-gated)
+mechanism, which pancetta has never attempted regardless of hb-075's
+existence. hb-075 and PAN-159 are two independent, non-competing
+mechanisms, not one thing correctly and incorrectly labeled.
 
 ### 2. The existing 90 s recordings already contain the repeats
 
