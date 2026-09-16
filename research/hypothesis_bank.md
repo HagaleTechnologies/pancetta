@@ -557,6 +557,17 @@ current_ratio: 0.051
     research/experiments/2026-05-26-hb-074-coherent-cross-cycle.md.
     Infrastructure kept flag-gated (default off). Spawned hb-075/076/077.
 
+    UPDATE 2026-09-16: an external clean-room read of the JTDX mechanism
+    this entry's `defensible_prior` cites confirms it is actually
+    non-coherent (power/magnitude accumulation, no phase model at all),
+    not the coherent variant this entry and hb-075/076/077 explored.
+    hb-075's MRC-weighted coherent sum already ships and covers most of
+    the coherent-family opportunity; a purely phase-agnostic retry
+    (structurally distinct mechanism — no rotor, gated only on tone-pattern
+    signature match) is genuinely untested and tracked as PAN-159. Expected
+    size is small per hb-076/077's post-hb-075 headroom estimate, not a
+    rerun of this entry's original expected_delta.
+
 ### hb-075 — Phase-magnitude-weighted coherent cross-cycle sum  [GRADUATED 2026-05-26 — biggest single-iter win of the session] (verified pre-CI: may need re-validation)
   mode: ft8
   # Phase A bootstrap-CI retrofit (2026-06-02): +22 hard-200 rec and
@@ -763,6 +774,8 @@ current_ratio: 0.051
 
 ### hb-057 — Median-filter DT averaging for sync/AP  [PRIORITY: 0.40, V1 SHELVED 2026-06-01, mechanism PROCEED at population level]
   status_2026_06_01_session2: V1 SHELVED. Implementation landed on `iter/2026-06-02-hb-057-session2` (commit 02cf384): per-callsign median+IQR DT history via `pancetta-ft8::dt_history` (`DtPrior` + `DtPriorLookup` trait + `InMemoryDtHistory` reference impl, 5 unit tests pass) wired into `coherent_subtract_and_repass` step 3 → step 4 boundary as a residual-candidate t0-window filter. Config-gated (`dt_history_enabled` default false). A/B on curated-hard-200, FP filter ON: composite raw 0.279114 → 0.279058 (Δ -0.000056), rec 4942/8853 → 4941/8853 (Δ -1, 95% CI [-3.0, +0.0]), novels 1024 → 1003 (Δ -21, 95% CI [-63.5, +0.0]) — both NOT significant per bootstrap; default-SHELVE per RUNBOOK. Methodology lesson (recorded in `research/experiments/2026-06-02-hb-057-session2.md`): the V1 hook filters residual candidates by the union of prior windows for callsigns ALREADY decoded this WAV — wrong population. The Session-1 diagnostic measured 38.6% recovery for callsigns NOT decoded yet whose prior would narrow their OWN sync; that requires either the AP path (where the candidate callsign is known) or a per-candidate-callsign sync-sweep refactor. V1 plumbing kept in place (default-off; zero production impact). Session 3 candidates: (a) AP-path hook (cheap, reuses plumbing; only fires with operator AP context), (b) per-candidate callsign-keyed residual sync (re-architect, ~2 sessions), (c) reject-not-narrow post-decode filter (out-of-V1-scope per spec). Mechanism NOT falsified — population still 38.6%, statistic still right; just need the right hook.
+  status_2026_09_16: Session 3 was never executed. Reopen (starting with
+    candidate (a), the AP-path hook) tracked as PAN-160.
   status_2026_05_31_session1: SCOPED → PROCEED. Multi-pass is back (hb-079 coherent + hb-080 N=3 + hb-086 V1 joint-pair-retry all GRADUATED), so the prior is no longer latent. Diagnostic `hb057_dt_history_potential.rs` on top-20 hard-200: 38.6% of 647 missed truths are sent by callsigns with stable (<0.1s) or moderate (0.1–0.3s) cross-WAV DT variance — the TARGET population. Kill-switch (10%) cleared by 3.86×. Recoverable-by-prior upper bound at ±0.2s leave-one-out median gate = same 38.6% (the window comfortably covers stable+moderate variance by construction — gate-coverage upper bound, not LDPC-conversion estimate). Design spec at `docs/superpowers/specs/2026-05-31-hb-057-median-dt-design.md`. Storage: coordinator-level (cross-WAV history is the recovery population; per-decoder-thread design has zero access on fresh threads). Hook points: localized_costas_sync_search + AP-path sync_search ONLY (pass 1 untouched — preserves new-station discovery). Window: max(0.2s, IQR × 3) around per-callsign median; 10-sighting ring buffer, 30-min eviction. Session 2 implements + sweeps; Session 3 grad/shelve. Diagnostic-first re-run inside Session 2 confirms population before build.
   ---- original priority entry below ----
   [PRIORITY-WAS: 0.35, spawned 2026-05-25 from mr-002]
@@ -6436,6 +6449,10 @@ search to in-repo sources.
 ### hb-242 — wsjtr `sync_bc` partial Costas metric for slot-edge recovery  [SHELVED-CONFIRMED 2026-06-11 Batch 75 — implemented Batch 48 (default-OFF, -18 TPs hard-200); raw_530_full ft8_lib re-test: +0 TPs / -19 FPs, inert. The predicted +50-150 slot-edge truths did not materialize on a realistic corpus. Re-open only with a slot-edge-specific corpus + paired max_sync_candidates bump.]
   mode: ft8
   status: PROPOSED-FROM-RESEARCH — wsjtr (Bodiya KC1WIH) uses 3-position Costas correlation with `sync_bc` partial metric (uses only Costas positions 2 + 3 when position 1 falls outside recorded window). Directly addresses pancetta's slot-edge negative-dt 48.3% recall miss bucket (Batch 40 finding).
+  status_2026_09_16: this entry's own stated reopen condition (a
+    slot-edge-specific corpus + paired max_sync_candidates bump) was never
+    built — both measurements to date used general-purpose corpora that may
+    contain few or no slot-edge signals. Reopen tracked as PAN-161.
   priority_score: 0.15 (was 0.65 pre-measurement)
   estimated_effort: 1-2 sessions (algorithm publicly documented; pancetta writes implementation from docs, not GPL code — license-clean)
   expected_delta: +50-150 RR73-class slot-edge truths on hard-1000 per agent estimate
@@ -6806,6 +6823,10 @@ search to in-repo sources.
     a per-day kurtosis/crest-factor sweep would find candidate days),
     or on-air A/B in lightning season (meatspace). Operators in heavy
     QRN can set Some(6.0) at zero nominal-channel cost.
+
+    UPDATE 2026-09-16: neither re-open path (the per-day impulsiveness
+    metric or a storm-season on-air A/B) has been built. Reopen tracked as
+    PAN-162.
 
 ### hb-257 — Parallel ensemble decoding with ML selection  [PRIORITY: 0.35, spawned 2026-06-12 Batch 96 web scan]
 
