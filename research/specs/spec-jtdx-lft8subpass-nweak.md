@@ -71,8 +71,10 @@ has been built and the alternate matrices (`csr` = reversed-conjugate,
    CQ template hit), bump `nsubpasses` to 3, and if a previously
    stored matching CQ symbol matrix exists for this `(freq, xdt)`,
    bump further to 5. The extra lanes 4 and 5 combine the current
-   `cs` with the saved `csold` from a previous interval to do
-   coherent-averaging across QSO partner repeats.
+   `cs` with the saved `csold` from a previous interval — CORRECTED
+   2026-09-16: this is **non-coherent** power-averaging across QSO
+   partner repeats (see the `isubp1 = 4, 7, 10` detail below), not
+   coherent averaging.
 5. If `lmycsignal` is true (the candidate's data looks like a
    `MyCall ??? ???` template), bump `nsubpasses` to 6, and if a
    previously stored matching `mycsig` symbol matrix exists, bump
