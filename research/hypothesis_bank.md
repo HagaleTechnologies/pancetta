@@ -522,9 +522,16 @@ current_ratio: 0.051
     2026-09-16: hb-074/075's coherent work is a real, independently-useful
     engineering improvement (hb-075 shipped, +22 hard-200 rec) but is NOT
     "the path to JTDX's full headline gain" as originally framed — JTDX's
-    actual mechanism is non-coherent and pancetta has never attempted it;
-    that gap (distinct from the coherent-family work here) is tracked as
-    PAN-159.
+    actual mechanism is non-coherent. CORRECTED 2026-09-16 (cycle 2):
+    "pancetta has never attempted it" overclaimed — the power-add
+    arithmetic itself is exactly what THIS entry (hb-056) already ships.
+    What's genuinely untested is JTDX's specific gating (CQ/MyCall/
+    QSO-partner classification, not this entry's broader freq/t0-proximity
+    + sync-score grouping) and its failed-decode-only, cross-window
+    persistent-state matching (vs. this entry's within-one-buffer grouping
+    of the existing 90s recording's already-present repeats). That
+    narrower question is tracked as PAN-159; expect any remaining delta to
+    be small given how much of the same ground this entry already covers.
 
 ### hb-074 — Complex-spectrogram coherent cross-cycle averaging  [SHELVED 2026-05-26 — infrastructure kept flag-gated]
   mode: ft8

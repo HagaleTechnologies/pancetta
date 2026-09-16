@@ -70,11 +70,26 @@ having on its own merits: it is — hb-075 (shipped, default-on) genuinely IS
 coherent (extracts complex symbols, phase-aligns them, reliability-weights
 via MRC, `coherent_sum_complex_to_db` in `pancetta-ft8/src/decoder.rs`) and
 that real, working mechanism should not be confused with JTDX-parity on the
-cross-cycle term, which never needed it. PAN-159's proposed retry is the
-non-coherent one — it targets JTDX's actual cross-cycle power-add term,
-which pancetta has never attempted regardless of hb-075's existence.
-hb-075 and PAN-159 are two independent, non-competing mechanisms, not one
-thing correctly and incorrectly labeled.
+cross-cycle term, which never needed it.
+
+**CORRECTED 2026-09-16 (cycle 2):** the sentence that used to appear here
+overclaimed PAN-159's novelty. The power-add ARITHMETIC this section
+describes is not untested — THIS spec's own mechanism (below), graduated
+as hb-056, already sums linear power across grouped candidates and ships
+today (`cross_cycle_averaging_pass`, `pancetta-ft8/src/decoder.rs:7577`).
+What PAN-159 actually targets is narrower: JTDX gates its power-add
+specifically to candidates classified as CQ, MyCall, or QSO-partner
+signals (not hb-056's broader freq/t0-proximity + sync-score-similarity
+grouping), and specifically matches against a *failed* decode held in
+cross-window persistent state from ~30 seconds earlier (not hb-056's
+within-one-buffer grouping of whatever the sync search already found,
+successful or not, inside the existing 90 s recording). PAN-159 is a test
+of whether that specific classification-gating + failed-decode-only +
+persistent-state shape finds anything hb-056's broader grouping doesn't
+already catch — it is not "port an untested mechanism," and the honest
+expectation is that any remaining delta is small, since hb-056 already
+operates on the same 90 s buffers JTDX's cross-window state exists to
+reach across separate windows for.
 
 ### 2. The existing 90 s recordings already contain the repeats
 
