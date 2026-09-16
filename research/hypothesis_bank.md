@@ -557,16 +557,30 @@ current_ratio: 0.051
     research/experiments/2026-05-26-hb-074-coherent-cross-cycle.md.
     Infrastructure kept flag-gated (default off). Spawned hb-075/076/077.
 
-    UPDATE 2026-09-16: an external clean-room read of the JTDX mechanism
-    this entry's `defensible_prior` cites confirms it is actually
-    non-coherent (power/magnitude accumulation, no phase model at all),
-    not the coherent variant this entry and hb-075/076/077 explored.
-    hb-075's MRC-weighted coherent sum already ships and covers most of
-    the coherent-family opportunity; a purely phase-agnostic retry
-    (structurally distinct mechanism — no rotor, gated only on tone-pattern
-    signature match) is genuinely untested and tracked as PAN-159. Expected
-    size is small per hb-076/077's post-hb-075 headroom estimate, not a
-    rerun of this entry's original expected_delta.
+    UPDATE 2026-09-16: a direct clean-room read of JTDX's actual source
+    (`lib/ft8b.f90`, subpasses `isubp1={4,7,10}`/`{5,8,11}`, verified
+    against commit 2a0e2bea8c, the confirmed-frozen 2022-03-01 head)
+    resolves this entry's `defensible_prior` claim as WRONG: the cross-cycle
+    combination is non-coherent (`abs(cs)**2 + abs(csold)**2`, two
+    independent real terms — never `abs(cs + csold)`). `csold` is declared
+    complex only because phase is needed for a separate, orthogonal
+    mechanism (intra-frame 2-3 adjacent-symbol combining within the SAME
+    15s frame), not for the cross-cycle step. Gating is CQ/MyCall/QSO-partner
+    tone-pattern classification (not a generic signature match) matched to
+    a FAILED decode from the same-parity slot ~30s earlier within 2 Hz /
+    0.05s. This also corrects `docs/superpowers/specs/2026-05-25-cross-cycle-averaging-design.md`,
+    which self-contradicted its own formula — see that doc's own
+    2026-09-16 correction. Net: there was never a coherent-vs-non-coherent
+    gap to bound; pancetta's power-only spectrogram already fully suffices
+    to replicate JTDX's real mechanism, no phase-retention rework needed.
+    hb-075's MRC-weighted coherent sum already ships (a different,
+    still-valid mechanism on its own terms) and covers most of the
+    coherent-family opportunity explored here; the untested variant —
+    JTDX's actual mechanism, phase-agnostic, gated on CQ/MyCall/QSO-partner
+    classification + freq/DT match against a same-parity failed-decode
+    store — is tracked as PAN-159. Expected size is small per hb-076/077's
+    post-hb-075 headroom estimate, not a rerun of this entry's original
+    expected_delta.
 
 ### hb-075 — Phase-magnitude-weighted coherent cross-cycle sum  [GRADUATED 2026-05-26 — biggest single-iter win of the session] (verified pre-CI: may need re-validation)
   mode: ft8

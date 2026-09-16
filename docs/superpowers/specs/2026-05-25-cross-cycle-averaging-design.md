@@ -22,23 +22,36 @@ These came out of grounding the design in pancetta's code; they change
 the expected payoff and the corpus plan versus the bank entry's
 assumptions.
 
-### 1. pancetta can only do NON-coherent averaging (power, not complex)
+### 1. CORRECTED 2026-09-16 — JTDX's mechanism is non-coherent too; no gap to bound
 
-JTDX's `csold` is **complex** (`complex csold(0:7,79)`) — it integrates
-amplitude *with phase*, i.e. true coherent integration, which is the bulk
-of its edge. pancetta's decode spectrogram stores **power only**
-(`Spectrogram.power` is `10*log10(|FFT|²)`; phase is discarded in
-`compute_spectrogram`). A candidate's evidence is
-`tone_magnitudes: Vec<[f64; NUM_TONES]>` in **dB**.
+An earlier version of this section claimed JTDX's `csold` (`complex
+csold(0:7,79)` in `lib/ft8b.f90`) "integrates amplitude with phase, i.e.
+true coherent integration," and that pancetta's power-only spectrogram
+therefore bounds its achievable gain below JTDX's. **This was wrong, and
+self-contradicted the very formula stated two lines below it**
+(`|cs|² + |csold|²` is already the non-coherent sum, not `|cs + csold|`).
 
-⇒ pancetta can sum *powers* across cycles (`|cs|² + |csold|²`,
-non-coherent) but cannot do coherent (phase-aligned) integration without
-reworking the spectrogram to retain complex bins — a much larger change,
-out of scope here. Non-coherent integration of N repeats still lowers
-noise variance (≈ +1.5 dB for N=2, diminishing), so it's worthwhile, but
-**the achievable gain is bounded below JTDX's coherent result.** The spec
-ships the non-coherent variant and measures it honestly; coherent is a
-possible future follow-up (spectrogram-retains-phase is a prerequisite).
+A direct clean-room read of JTDX's actual source (`lib/ft8b.f90`, subpasses
+`isubp1={4,7,10}` and `{5,8,11}`) confirms: `csold` is declared complex
+because phase is needed for *intra-frame* multi-symbol combining (2-3
+adjacent symbols within the same 15s frame, subpasses' `nsym` handling) —
+a separate, orthogonal mechanism from the cross-cycle averaging this spec
+targets. The cross-cycle combination itself discards phase: it adds
+`abs(cs)**2 + abs(csold)**2` (or `abs(cs) + abs(csold)` in the
+non-squared subpasses) as two independent real terms, never
+`abs(cs + csold)`. Gating is also more specific than "any repeating
+station": `csold` is only populated for a candidate independently
+classified as a CQ, MyCall, or QSO-partner signal (via tone-pattern
+hit-counting, not a generic similarity score), matched to a *failed*
+decode from the same-parity slot ~30 seconds earlier within 2 Hz / 0.05s.
+
+**Net effect: there is no coherent-vs-non-coherent gap to bound here.**
+Pancetta's power-only spectrogram is already sufficient to replicate
+JTDX's actual cross-cycle mechanism exactly — no spectrogram rework
+(retaining complex/phase bins) is a prerequisite, contrary to this
+section's original conclusion. hb-075 (shipped, MRC-weighted coherent sum)
+and the phase-agnostic retry tracked as PAN-159 are both non-coherent by
+construction and both already have everything they need architecturally.
 
 ### 2. The existing 90 s recordings already contain the repeats
 
