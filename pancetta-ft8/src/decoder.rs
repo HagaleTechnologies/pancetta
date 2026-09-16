@@ -7567,9 +7567,13 @@ impl Ft8Decoder {
     /// results. Additive — never removes a per-slot decode, and a
     /// corrupted averaged candidate that fails CRC contributes nothing.
     ///
-    /// Power-only: pancetta's spectrogram discards phase, so this is the
-    /// non-coherent variant of JTDX's `s2(i) = |cs|² + |csold|²` rule.
-    /// Bounds the expected gain below JTDX's coherent edge.
+    /// Power-only: pancetta's spectrogram discards phase, matching the
+    /// non-coherent `s2(i) = |cs|² + |csold|²` rule this is modeled on —
+    /// a direct read of that reference source confirms the rule itself is
+    /// non-coherent (two independent power terms, phase already discarded
+    /// by that mechanism too), not a coherent one pancetta merely
+    /// approximates. See `research/hypothesis_bank.md`'s hb-056/hb-074
+    /// 2026-09-16 correction for the full trail.
     fn cross_cycle_averaging_pass(
         &self,
         spectrogram: &Spectrogram,

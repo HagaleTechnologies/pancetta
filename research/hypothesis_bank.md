@@ -513,25 +513,37 @@ current_ratio: 0.051
   evidence_against (resolved):
     - "Needs new corpus" — REFUTED. The 90s multi-slot recordings (batch-11 hb-012 finding) already contain repeats; cross-cycle averaging works entirely within one decode_window call.
     - "200-400 LOC + coordinator state machine" — REVISED. Single-decode-window scope means no coordinator handoff and no new module: ~120 LOC of grouping + linear-power summation + a pass method.
-    - "Pancetta has no complex-spectrogram path" — INTRINSIC. Confirmed pancetta can only do NON-coherent integration; the +0.000816 bounds that ceiling. The coherent variant (retain phase) remains hb-074.
+    - "Pancetta has no complex-spectrogram path" — CORRECTED 2026-09-16 (was: "INTRINSIC... the +0.000816 bounds that ceiling. The coherent variant (retain phase) remains hb-074."). A complex-spectrogram path WAS since built and shipped (hb-074's infrastructure, hb-075's graduated coherent variant) — that part is no longer a limitation. Separately, a direct read of JTDX's actual source (see hb-074's UPDATE note) confirms JTDX's OWN cross-cycle mechanism is non-coherent, so this non-coherent +0.000816 was never actually "bounded below JTDX's ceiling" in the first place — that framing was wrong from the start, not just superseded by later work.
   notes: |
     See research/experiments/2026-05-25-cross-cycle-averaging.md +
-    docs/superpowers/specs/2026-05-25-cross-cycle-averaging-design.md.
-    Spawned hb-074 (coherent / complex-spectrogram rework) as the path
-    to JTDX's full headline gain, now defensibly motivated against a
-    measured non-coherent baseline.
+    docs/superpowers/specs/2026-05-25-cross-cycle-averaging-design.md
+    (both corrected 2026-09-16 — see the design doc's own correction).
+    Spawned hb-074 (coherent / complex-spectrogram rework). CORRECTED
+    2026-09-16: hb-074/075's coherent work is a real, independently-useful
+    engineering improvement (hb-075 shipped, +22 hard-200 rec) but is NOT
+    "the path to JTDX's full headline gain" as originally framed — JTDX's
+    actual mechanism is non-coherent. CORRECTED 2026-09-16 (cycle 2):
+    "pancetta has never attempted it" overclaimed — the power-add
+    arithmetic itself is exactly what THIS entry (hb-056) already ships.
+    What's genuinely untested is JTDX's specific gating (CQ/MyCall/
+    QSO-partner classification, not this entry's broader freq/t0-proximity
+    + sync-score grouping) and its failed-decode-only, cross-window
+    persistent-state matching (vs. this entry's within-one-buffer grouping
+    of the existing 90s recording's already-present repeats). That
+    narrower question is tracked as PAN-159; expect any remaining delta to
+    be small given how much of the same ground this entry already covers.
 
 ### hb-074 — Complex-spectrogram coherent cross-cycle averaging  [SHELVED 2026-05-26 — infrastructure kept flag-gated]
   mode: ft8
   status: SHELVED — coherent loses 10 hard-200 recovered vs non-coherent. Phase-estimate noise on marginal candidates raises sum variance; inter-slot phase isn't reliably preserved in real-world audio. Math is correct (unit test 3 dB at N=2); the gain doesn't transfer to the operator corpus.
   priority_score: 0.0
   estimated_effort: 3-5 sessions (large structural change to the spectrogram)
-  expected_delta: ~2-3× the non-coherent hb-056 gain (i.e. ~+0.0016-0.0024 composite) if JTDX-class coherent integration carries over; uncertain
-  defensible_prior: yes — JTDX's headline sensitivity edge IS the coherent variant; pancetta now has a measured non-coherent baseline (+0.000816) to compare against.
+  expected_delta: SUPERSEDED 2026-09-16 — was "~2-3× the non-coherent hb-056 gain... if JTDX-class coherent integration carries over." That premise is confirmed false (JTDX's mechanism is non-coherent; see UPDATE note below). The coherent-family work found its own real, independently-measured gain instead: hb-075's MRC-weighted variant, +22 hard-200 rec / +78 hard-1000 rec, unrelated to JTDX-parity.
+  defensible_prior: SUPERSEDED 2026-09-16 — was "yes — JTDX's headline sensitivity edge IS the coherent variant." A direct read of JTDX's actual source confirms this is false; JTDX's cross-cycle mechanism is non-coherent (two independent power terms, never phase-aware). See UPDATE note below.
   wild_card: false
   evidence_for:
-    - Theoretically: coherent integration improves SNR ~3 dB per doubling vs ~1.5 dB non-coherent, so the gain should be roughly double for N=2 and grow with N.
-    - hb-056 graduation proves the cross-cycle MECHANISM works on pancetta's corpus; the limit is the phase-discarded spectrogram, which is a structural property the rework would fix.
+    - Theoretically: coherent integration improves SNR ~3 dB per doubling vs ~1.5 dB non-coherent (still true in isolation, independent of JTDX-parity), so the gain should be roughly double for N=2 and grow with N — this is what hb-075 went on to measure and ship.
+    - hb-056 graduation proves the cross-cycle MECHANISM works on pancetta's corpus. CORRECTED 2026-09-16: "the limit is the phase-discarded spectrogram" was true as an engineering constraint (fixed by hb-074/075's infra) but was never actually a JTDX-parity gap — JTDX doesn't use phase here either.
   evidence_against:
     - Touches the spectrogram hot path (memory + compute) — careful to not regress wall-clock or break the LLR pipeline.
     - Higher implementation risk than hb-056; the spectrogram is consumed everywhere.
@@ -556,6 +568,31 @@ current_ratio: 0.051
     slot phase not preserved in real-world TX/RX/propagation. See
     research/experiments/2026-05-26-hb-074-coherent-cross-cycle.md.
     Infrastructure kept flag-gated (default off). Spawned hb-075/076/077.
+
+    UPDATE 2026-09-16: a direct clean-room read of JTDX's actual source
+    (`lib/ft8b.f90`, subpasses `isubp1={4,7,10}`/`{5,8,11}`, verified
+    against commit 2a0e2bea8c, the confirmed-frozen 2022-03-01 head)
+    resolves this entry's `defensible_prior` claim as WRONG: the cross-cycle
+    combination is non-coherent (`abs(cs)**2 + abs(csold)**2`, two
+    independent real terms — never `abs(cs + csold)`). `csold` is declared
+    complex only because phase is needed for a separate, orthogonal
+    mechanism (intra-frame 2-3 adjacent-symbol combining within the SAME
+    15s frame), not for the cross-cycle step. Gating is CQ/MyCall/QSO-partner
+    tone-pattern classification (not a generic signature match) matched to
+    a FAILED decode from the same-parity slot ~30s earlier within 2 Hz /
+    0.05s. This also corrects `docs/superpowers/specs/2026-05-25-cross-cycle-averaging-design.md`,
+    which self-contradicted its own formula — see that doc's own
+    2026-09-16 correction. Net: there was never a coherent-vs-non-coherent
+    gap to bound; pancetta's power-only spectrogram already fully suffices
+    to replicate JTDX's real mechanism, no phase-retention rework needed.
+    hb-075's MRC-weighted coherent sum already ships (a different,
+    still-valid mechanism on its own terms) and covers most of the
+    coherent-family opportunity explored here; the untested variant —
+    JTDX's actual mechanism, phase-agnostic, gated on CQ/MyCall/QSO-partner
+    classification + freq/DT match against a same-parity failed-decode
+    store — is tracked as PAN-159. Expected size is small per hb-076/077's
+    post-hb-075 headroom estimate, not a rerun of this entry's original
+    expected_delta.
 
 ### hb-075 — Phase-magnitude-weighted coherent cross-cycle sum  [GRADUATED 2026-05-26 — biggest single-iter win of the session] (verified pre-CI: may need re-validation)
   mode: ft8
@@ -763,6 +800,30 @@ current_ratio: 0.051
 
 ### hb-057 — Median-filter DT averaging for sync/AP  [PRIORITY: 0.40, V1 SHELVED 2026-06-01, mechanism PROCEED at population level]
   status_2026_06_01_session2: V1 SHELVED. Implementation landed on `iter/2026-06-02-hb-057-session2` (commit 02cf384): per-callsign median+IQR DT history via `pancetta-ft8::dt_history` (`DtPrior` + `DtPriorLookup` trait + `InMemoryDtHistory` reference impl, 5 unit tests pass) wired into `coherent_subtract_and_repass` step 3 → step 4 boundary as a residual-candidate t0-window filter. Config-gated (`dt_history_enabled` default false). A/B on curated-hard-200, FP filter ON: composite raw 0.279114 → 0.279058 (Δ -0.000056), rec 4942/8853 → 4941/8853 (Δ -1, 95% CI [-3.0, +0.0]), novels 1024 → 1003 (Δ -21, 95% CI [-63.5, +0.0]) — both NOT significant per bootstrap; default-SHELVE per RUNBOOK. Methodology lesson (recorded in `research/experiments/2026-06-02-hb-057-session2.md`): the V1 hook filters residual candidates by the union of prior windows for callsigns ALREADY decoded this WAV — wrong population. The Session-1 diagnostic measured 38.6% recovery for callsigns NOT decoded yet whose prior would narrow their OWN sync; that requires either the AP path (where the candidate callsign is known) or a per-candidate-callsign sync-sweep refactor. V1 plumbing kept in place (default-off; zero production impact). Session 3 candidates: (a) AP-path hook (cheap, reuses plumbing; only fires with operator AP context), (b) per-candidate callsign-keyed residual sync (re-architect, ~2 sessions), (c) reject-not-narrow post-decode filter (out-of-V1-scope per spec). Mechanism NOT falsified — population still 38.6%, statistic still right; just need the right hook.
+  status_2026_09_16: CORRECTED — Session 3 candidate (b) (per-candidate
+    callsign-keyed sync narrowing by frequency proximity, `DtSighting.freq_hz`
+    / `priors_near_freq` in `pancetta-ft8/src/dt_history.rs`) WAS implemented
+    (`research/experiments/2026-06-02-hb-057-hook-fix-chrono.md`, initially
+    DEFERRED under contended eval) and is live on main behind
+    `dt_history_enabled` (default false). It was independently retested under
+    the TRUE production default in Task W5.4
+    (`research/experiments/2026-07-09-w54-shelved-sync-mechanisms-retest.md`):
+    hard-200 rec Δ=+0 EXACT (every bootstrap resample identical) — a
+    a hard-200 null, attributed to hard-200's cold-start sparsity of
+    same-callsign repeats for this per-callsign prior to act on, not a
+    reachability bug. CORRECTED 2026-09-16 (round 2 of this correction):
+    "conclusive" overstated it — hard-200 is not a stateful chrono-replay
+    corpus, so it cannot distinguish "the mechanism doesn't help" from
+    "this corpus has too few repeats to exercise it." The actual prescribed
+    test (`research/experiments/2026-06-02-hb-057-hook-fix-chrono.md`, a
+    33-slot continuous same-callsign chrono-replay session, purpose-built
+    so DT history populates from slot 6 onward) was launched but never
+    completed — it stalled under CPU contention within its 90-min budget,
+    preserved on branch `iter/2026-06-02-hb-057-hook-fix`, ~25-30 min to
+    re-run uncontended. Candidate (b) is DECLINED as a production default
+    given current evidence, but the chrono-replay retest that would give a
+    truly conclusive answer remains outstanding — PAN-160 keeps this open
+    alongside candidate (a), not closed.
   status_2026_05_31_session1: SCOPED → PROCEED. Multi-pass is back (hb-079 coherent + hb-080 N=3 + hb-086 V1 joint-pair-retry all GRADUATED), so the prior is no longer latent. Diagnostic `hb057_dt_history_potential.rs` on top-20 hard-200: 38.6% of 647 missed truths are sent by callsigns with stable (<0.1s) or moderate (0.1–0.3s) cross-WAV DT variance — the TARGET population. Kill-switch (10%) cleared by 3.86×. Recoverable-by-prior upper bound at ±0.2s leave-one-out median gate = same 38.6% (the window comfortably covers stable+moderate variance by construction — gate-coverage upper bound, not LDPC-conversion estimate). Design spec at `docs/superpowers/specs/2026-05-31-hb-057-median-dt-design.md`. Storage: coordinator-level (cross-WAV history is the recovery population; per-decoder-thread design has zero access on fresh threads). Hook points: localized_costas_sync_search + AP-path sync_search ONLY (pass 1 untouched — preserves new-station discovery). Window: max(0.2s, IQR × 3) around per-callsign median; 10-sighting ring buffer, 30-min eviction. Session 2 implements + sweeps; Session 3 grad/shelve. Diagnostic-first re-run inside Session 2 confirms population before build.
   ---- original priority entry below ----
   [PRIORITY-WAS: 0.35, spawned 2026-05-25 from mr-002]
@@ -6436,6 +6497,29 @@ search to in-repo sources.
 ### hb-242 — wsjtr `sync_bc` partial Costas metric for slot-edge recovery  [SHELVED-CONFIRMED 2026-06-11 Batch 75 — implemented Batch 48 (default-OFF, -18 TPs hard-200); raw_530_full ft8_lib re-test: +0 TPs / -19 FPs, inert. The predicted +50-150 slot-edge truths did not materialize on a realistic corpus. Re-open only with a slot-edge-specific corpus + paired max_sync_candidates bump.]
   mode: ft8
   status: PROPOSED-FROM-RESEARCH — wsjtr (Bodiya KC1WIH) uses 3-position Costas correlation with `sync_bc` partial metric (uses only Costas positions 2 + 3 when position 1 falls outside recorded window). Directly addresses pancetta's slot-edge negative-dt 48.3% recall miss bucket (Batch 40 finding).
+  status_2026_09_16: CORRECTED TWICE (see below) — first correction was
+    itself too aggressive; second correction narrows it to what's actually
+    still open. The `max_sync_candidates` pairing WAS tested, on general
+    hard-200, in Batch 49 (`research/notes/2026-06-08-batch49-tuning-results.md`):
+    bumping the cap 300→600 never made recall positive and got
+    substantially worse past 400 (-18→-17→-22→-38 — the 300→400 step is a
+    marginal +1, not monotonic, but the overall trend is a worsening
+    negative with collapsing precision throughout) — the "real TPs
+    displaced at the cap" premise is FALSIFIED on a general corpus. A synthetic slot-edge corpus WAS also
+    tested, in Task W5.4 (`research/experiments/2026-07-09-w54-shelved-sync-mechanisms-retest.md`):
+    zero recall delta across 28 dt×lead cells, plus a hard FP-gate failure
+    on noise_1000. CORRECTION 2026-09-16 (round 2, per review): that W5.4
+    slot-edge test used an ISOLATED signal in an otherwise-quiet window —
+    the report's own §"cannot exercise the candidate-CAP-displacement
+    failure mode" note (lines 131-140) says a lone signal never competes
+    for the flat cap, so this specific test structurally could not exercise
+    the JOINT crowded-slot-edge-plus-cap scenario hb-242's original
+    mechanism targets. That joint condition (a multi-signal "crowded band"
+    corpus — many strong signals plus one slot-edge-marginal one, all
+    competing for the same top-N candidate slots) has never been built or
+    tested, on general OR slot-edge audio. Un-canceling PAN-161, rescoped
+    specifically to that crowded-band joint test — not a repeat of either
+    already-tried isolated condition.
   priority_score: 0.15 (was 0.65 pre-measurement)
   estimated_effort: 1-2 sessions (algorithm publicly documented; pancetta writes implementation from docs, not GPL code — license-clean)
   expected_delta: +50-150 RR73-class slot-edge truths on hard-1000 per agent estimate
@@ -6806,6 +6890,10 @@ search to in-repo sources.
     a per-day kurtosis/crest-factor sweep would find candidate days),
     or on-air A/B in lightning season (meatspace). Operators in heavy
     QRN can set Some(6.0) at zero nominal-channel cost.
+
+    UPDATE 2026-09-16: neither re-open path (the per-day impulsiveness
+    metric or a storm-season on-air A/B) has been built. Reopen tracked as
+    PAN-162.
 
 ### hb-257 — Parallel ensemble decoding with ML selection  [PRIORITY: 0.35, spawned 2026-06-12 Batch 96 web scan]
 

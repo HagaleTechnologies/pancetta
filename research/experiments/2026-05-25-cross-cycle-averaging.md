@@ -12,6 +12,16 @@ delta_vs_main: composite +0.000816 (0.556180 -> 0.556996); hard-200 +14 rec / +8
 disposition: GRADUATE hb-056 — non-coherent cross-cycle averaging is the production default. Second composite WIN this session after hb-063.
 ---
 
+**SUPERSEDED NOTE (2026-09-16), historical record preserved below
+unedited:** this log's framing that phase retention is needed to reach
+"JTDX's coherent gain" (see the passage below on the bounded ceiling) has
+been corrected. A direct read of JTDX's actual source confirms its
+cross-cycle mechanism is non-coherent too — see the 2026-09-16 correction
+in `research/hypothesis_bank.md` (hb-056/hb-074) and
+`docs/superpowers/specs/2026-05-25-cross-cycle-averaging-design.md` for
+the current, authoritative account. What follows is preserved as-written
+at the time.
+
 ## Hypothesis
 
 hb-056 (priority 0.60, top of bank from mr-002 JTDX harvest): port

@@ -71,8 +71,10 @@ has been built and the alternate matrices (`csr` = reversed-conjugate,
    CQ template hit), bump `nsubpasses` to 3, and if a previously
    stored matching CQ symbol matrix exists for this `(freq, xdt)`,
    bump further to 5. The extra lanes 4 and 5 combine the current
-   `cs` with the saved `csold` from a previous interval to do
-   coherent-averaging across QSO partner repeats.
+   `cs` with the saved `csold` from a previous interval — CORRECTED
+   2026-09-16: this is **non-coherent** power-averaging across QSO
+   partner repeats (see the `isubp1 = 4, 7, 10` detail below), not
+   coherent averaging.
 5. If `lmycsignal` is true (the candidate's data looks like a
    `MyCall ??? ???` template), bump `nsubpasses` to 6, and if a
    previously stored matching `mycsig` symbol matrix exists, bump
@@ -102,7 +104,13 @@ The inner loop iterates `do isubp1 = 1, nsubpasses`. Each value of
   magnitudes and sums in power-domain. Used for `lreverse` passes
   where the spectrogram was rebuilt with reversed audio.
 - `isubp1 = 4, 7, 10`: power-add of current `cs` and a previously
-  saved `csold` — coherent-averaging across QSO repeats.
+  saved `csold` — CORRECTED 2026-09-16: this is **non-coherent**
+  averaging across QSO repeats (`abs(cs)**2 + abs(csold)**2`, two
+  independent real terms, never `abs(cs + csold)`) despite `csold` being
+  declared complex — the complex declaration serves a separate,
+  orthogonal intra-frame mechanism (multi-symbol combining within the
+  same frame), not this cross-cycle step. See
+  `research/hypothesis_bank.md`'s hb-056/hb-074 2026-09-16 correction.
 - `isubp1 = 5, 8, 11`: linear-magnitude-add of current `cs` and
   `csold`.
 
