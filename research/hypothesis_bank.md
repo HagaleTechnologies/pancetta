@@ -6485,9 +6485,11 @@ search to in-repo sources.
     itself too aggressive; second correction narrows it to what's actually
     still open. The `max_sync_candidates` pairing WAS tested, on general
     hard-200, in Batch 49 (`research/notes/2026-06-08-batch49-tuning-results.md`):
-    bumping the cap 300→600 monotonically degraded recall (-18→-17→-22→-38)
-    with collapsing precision — the "real TPs displaced at the cap" premise
-    is FALSIFIED on a general corpus. A synthetic slot-edge corpus WAS also
+    bumping the cap 300→600 never made recall positive and got
+    substantially worse past 400 (-18→-17→-22→-38 — the 300→400 step is a
+    marginal +1, not monotonic, but the overall trend is a worsening
+    negative with collapsing precision throughout) — the "real TPs
+    displaced at the cap" premise is FALSIFIED on a general corpus. A synthetic slot-edge corpus WAS also
     tested, in Task W5.4 (`research/experiments/2026-07-09-w54-shelved-sync-mechanisms-retest.md`):
     zero recall delta across 28 dt×lead cells, plus a hard FP-gate failure
     on noise_1000. CORRECTION 2026-09-16 (round 2, per review): that W5.4

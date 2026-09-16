@@ -102,7 +102,13 @@ The inner loop iterates `do isubp1 = 1, nsubpasses`. Each value of
   magnitudes and sums in power-domain. Used for `lreverse` passes
   where the spectrogram was rebuilt with reversed audio.
 - `isubp1 = 4, 7, 10`: power-add of current `cs` and a previously
-  saved `csold` — coherent-averaging across QSO repeats.
+  saved `csold` — CORRECTED 2026-09-16: this is **non-coherent**
+  averaging across QSO repeats (`abs(cs)**2 + abs(csold)**2`, two
+  independent real terms, never `abs(cs + csold)`) despite `csold` being
+  declared complex — the complex declaration serves a separate,
+  orthogonal intra-frame mechanism (multi-symbol combining within the
+  same frame), not this cross-cycle step. See
+  `research/hypothesis_bank.md`'s hb-056/hb-074 2026-09-16 correction.
 - `isubp1 = 5, 8, 11`: linear-magnitude-add of current `cs` and
   `csold`.
 

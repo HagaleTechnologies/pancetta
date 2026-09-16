@@ -1,4 +1,11 @@
-# Cross-cycle coherent symbol averaging (hb-056) — design spec
+# Cross-cycle non-coherent symbol averaging (hb-056) — design spec
+
+**Title corrected 2026-09-16** (was "Cross-cycle *coherent* symbol
+averaging") — hb-056 is, and has always been, the non-coherent variant;
+the original title contradicted the hypothesis bank's own name for this
+same entry. See the 2026-09-16 correction in Section 1 below for the full
+context: the reference mechanism this ports is non-coherent too, so this
+was never an approximation of a coherent original.
 
 **Status:** proposed (design before implementation, per the bank's
 plan-sized policy)
