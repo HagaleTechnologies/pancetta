@@ -396,48 +396,6 @@ fn spawn_probe_worker(
                 result.tier,
                 &decode_effort_budget_ms,
             );
-            // PAN-156 round-1 review finding: `apply_effort_overrides`
-            // resolves `Auto` through the tier just like the budget
-            // does, so it needs the same re-application once the real
-            // tier is known — otherwise an `Auto` station stays on the
-            // startup Fast-tier guess's overrides for its whole session.
-            //
-            // PAN-156 round-2 review finding: `write().await` can yield,
-            // widening the race this whole branch is already guarded
-            // against — the operator could cycle away from `Auto` in the
-            // gap between the `live_effort` check above and the lock
-            // actually being acquired below, which would otherwise let a
-            // now-stale Auto-derived write land on top of the operator's
-            // newer choice. Re-check `current_decode_effort` AFTER
-            // acquiring the lock and skip the write if it's no longer
-            // `Auto`, rather than trusting the pre-await snapshot.
-            //
-            // PAN-156 round-3 review finding: re-checking the live effort
-            // inside the lock isn't enough on its own — `resolved_hardware_
-            // tier` used to be published AFTER this async block (and thus
-            // after the lock was released), leaving a window where a
-            // concurrent TUI cycle could acquire the lock, re-read the
-            // (still stale) tier atomic, and overwrite this correct
-            // Ft8Config write with overrides computed from the wrong
-            // tier. Publish the resolved tier from INSIDE this same
-            // critical section, before the lock is released, so any
-            // other task acquiring the lock afterward always observes
-            // both writes together, never a partial state.
-            tokio::runtime::Handle::current().block_on(async {
-                let mut cfg_guard = ft8_config.write().await;
-                let live_effort_at_write =
-                    DecodeEffort::from_u8(current_decode_effort.load(Ordering::Acquire));
-                if live_effort_at_write == DecodeEffort::Auto {
-                    apply_effort_overrides(DecodeEffort::Auto, result.tier, &mut cfg_guard);
-                } else {
-                    debug!(
-                        "tier probe: skipped Ft8Config override re-application — operator \
-                         cycled to {live_effort_at_write:?} while the config lock was \
-                         being acquired"
-                    );
-                }
-                resolved_hardware_tier.store(result.tier.as_u8(), Ordering::Release);
-            });
             info!(
                 "tier probe: decode_effort_budget_ms re-seeded for {} tier (Auto)",
                 result.tier.as_str()
@@ -448,22 +406,39 @@ fn spawn_probe_worker(
                  cycled decode effort to {:?}; tier is still recorded for a future Auto cycle",
                 live_effort
             );
-            // PAN-156 round-4 review finding: publishing the tier here
-            // without taking the config lock still races the TUI's
-            // CycleDecodeEffort handler — if the operator cycles to Auto
-            // right as this runs, the TUI's own critical section could
-            // read the not-yet-published (stale) tier and apply overrides
-            // for it, with nothing left in THIS branch to correct it
-            // afterward (unlike the reseed branch above, which re-checks
-            // and re-applies under the same lock). Acquire the same
-            // config lock purely to serialize this publish against any
-            // concurrent reader/writer — no field is written to the
-            // config itself on this path.
-            tokio::runtime::Handle::current().block_on(async {
-                let _cfg_guard = ft8_config.write().await;
-                resolved_hardware_tier.store(result.tier.as_u8(), Ordering::Release);
-            });
         }
+        // PAN-156 rounds 1-5 review findings, all versions of the same root
+        // cause: this used to be two DIFFERENT critical sections (one per
+        // `if`/`else` branch above), each trusting the `live_effort`
+        // snapshot taken before this point. Every fix that re-checked state
+        // in one branch, or moved the tier publish inside its lock, or
+        // serialized the other branch's publish, still left a residual gap
+        // because the two branches never shared one code path re-reading
+        // one consistent state. Collapsed into a single, UNCONDITIONAL
+        // critical section: it always re-reads `current_decode_effort`
+        // fresh AFTER acquiring the lock (the outer `live_effort` above is
+        // used only for the budget decision, which has no `.await` between
+        // check and write and so can't go stale the same way), applies the
+        // override only if that fresh read is `Auto`, and always publishes
+        // `resolved_hardware_tier` before releasing the lock — so every
+        // config write and every tier publish, from every path, happens
+        // under one lock ordering with no per-branch special-casing left to
+        // diverge.
+        tokio::runtime::Handle::current().block_on(async {
+            let mut cfg_guard = ft8_config.write().await;
+            let live_effort_at_write =
+                DecodeEffort::from_u8(current_decode_effort.load(Ordering::Acquire));
+            if live_effort_at_write == DecodeEffort::Auto {
+                apply_effort_overrides(DecodeEffort::Auto, result.tier, &mut cfg_guard);
+            } else {
+                debug!(
+                    "tier probe: skipped Ft8Config override re-application — operator \
+                     cycled to {live_effort_at_write:?} while the config lock was being \
+                     acquired"
+                );
+            }
+            resolved_hardware_tier.store(result.tier.as_u8(), Ordering::Release);
+        });
     });
 }
 
