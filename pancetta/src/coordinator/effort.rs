@@ -40,6 +40,7 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 use pancetta_config::DecodeEffort;
 use pancetta_ft8::tier_probe::HardwareTier;
+use pancetta_ft8::Ft8Config;
 
 /// Map a decode-effort preset (and, for `Auto`, the probed hardware tier) to
 /// a per-window wall-time budget in milliseconds.
@@ -111,6 +112,75 @@ pub(crate) fn cycle_decode_effort(
     let budget = preset_budget_ms(next, tier);
     decode_effort_budget_ms.store(budget, Ordering::Release);
     (next, budget)
+}
+
+/// Per-`DecodeEffort`-preset `Ft8Config` field overrides (PAN-156).
+///
+/// `preset_budget_ms` only ever varied the wall-time budget by preset;
+/// decode *technique* flags (`Ft8Config` fields like
+/// `coherent_multipass_iterations`) stayed single global values regardless
+/// of preset. That meant a technique measured to help at one preset's
+/// realistic budget but cost too much at another's (e.g. `Standard`
+/// bounded vs `Max` unbounded) could only ship as an all-or-nothing global
+/// default — so a real, measured win could get declined purely for lack of
+/// per-preset wiring, not because it didn't work. This struct is the seam:
+/// [`effort_ft8_overrides`] maps a preset (and, for `Auto`, the probed
+/// tier, mirroring [`preset_budget_ms`]'s own resolution) to the resolved
+/// values for the fields it controls, and [`apply_effort_ft8_overrides`]
+/// writes them into a live `Ft8Config`.
+///
+/// Every field here is a concrete resolved value, not an `Option` — the
+/// mapping always assigns both fields explicitly (falling back to
+/// `Ft8Config::default()`'s value when a preset has no override), so
+/// cycling AWAY from an overridden preset correctly restores the default
+/// rather than leaving a stale override behind. No other live code path
+/// mutates these two fields (confirmed: `coordinator::tier::apply_tier`
+/// stopped touching `Ft8Config` in decoder-speed-overhaul Task 14; the only
+/// other live `Ft8Config` mutation, `try_switch_operating_mode`, only
+/// touches `protocol`), so always-resolve-explicitly can't race a
+/// competing writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EffortFt8Overrides {
+    pub(crate) max_decode_passes: usize,
+    pub(crate) time_varying_subtraction_enabled: bool,
+}
+
+/// Map a decode-effort preset (and, for `Auto`, the probed hardware tier)
+/// to the `Ft8Config` field values it should run with.
+///
+/// PAN-156 itself is pure plumbing — every arm here resolves to
+/// `Ft8Config::default()`'s values, so wiring this in changes no decode
+/// behavior. A later change (PAN-157) is expected to give `Standard` (and
+/// `Auto` on the tier `preset_budget_ms` treats as Standard-equivalent,
+/// i.e. `Moderate`) a real override, once re-confirmed via the
+/// `pancetta-research` A/B harness.
+pub(crate) fn effort_ft8_overrides(effort: DecodeEffort, tier: HardwareTier) -> EffortFt8Overrides {
+    let default = EffortFt8Overrides {
+        max_decode_passes: Ft8Config::default().max_decode_passes,
+        time_varying_subtraction_enabled: Ft8Config::default().time_varying_subtraction_enabled,
+    };
+    match effort {
+        DecodeEffort::Eco => default,
+        DecodeEffort::Standard => default,
+        DecodeEffort::Deep => default,
+        DecodeEffort::Max => default,
+        DecodeEffort::Auto => match tier {
+            HardwareTier::Slow => default,
+            HardwareTier::Moderate => default,
+            HardwareTier::Fast => default,
+        },
+    }
+}
+
+/// Resolve and write the effort-conditional `Ft8Config` overrides into
+/// `cfg`. Called wherever the effective preset (or, for `Auto`, the
+/// resolved tier) becomes known or changes: coordinator startup, both
+/// `tier::initialize` resolution paths (cache-hit and background-probe
+/// completion), and the TUI's live effort-cycle keybinding.
+pub(crate) fn apply_effort_ft8_overrides(effort: DecodeEffort, tier: HardwareTier, cfg: &mut Ft8Config) {
+    let overrides = effort_ft8_overrides(effort, tier);
+    cfg.max_decode_passes = overrides.max_decode_passes;
+    cfg.time_varying_subtraction_enabled = overrides.time_varying_subtraction_enabled;
 }
 
 #[cfg(test)]
@@ -253,5 +323,85 @@ mod tests {
         assert_eq!(next, DecodeEffort::Eco, "Auto -> Eco");
         assert_eq!(budget_ms, 1);
         assert_eq!(budget.load(Ordering::Acquire), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // PAN-156: effort-conditional Ft8Config overrides
+    // ------------------------------------------------------------------
+
+    fn default_overrides() -> EffortFt8Overrides {
+        EffortFt8Overrides {
+            max_decode_passes: Ft8Config::default().max_decode_passes,
+            time_varying_subtraction_enabled: Ft8Config::default()
+                .time_varying_subtraction_enabled,
+        }
+    }
+
+    #[test]
+    fn effort_ft8_overrides_is_default_for_every_preset_and_tier_today() {
+        // PAN-156 is pure plumbing: nothing has opted in to an override yet,
+        // so every (effort, tier) pair must resolve to Ft8Config::default()'s
+        // values. PAN-157 is expected to change this for Standard.
+        let presets = [
+            DecodeEffort::Eco,
+            DecodeEffort::Standard,
+            DecodeEffort::Deep,
+            DecodeEffort::Max,
+            DecodeEffort::Auto,
+        ];
+        let tiers = [
+            HardwareTier::Slow,
+            HardwareTier::Moderate,
+            HardwareTier::Fast,
+        ];
+        for effort in presets {
+            for tier in tiers {
+                assert_eq!(
+                    effort_ft8_overrides(effort, tier),
+                    default_overrides(),
+                    "{effort:?} on {tier:?} must be a no-op override in PAN-156"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn apply_effort_ft8_overrides_leaves_default_config_unchanged_when_no_override() {
+        let mut cfg = Ft8Config::default();
+        apply_effort_ft8_overrides(DecodeEffort::Standard, HardwareTier::Fast, &mut cfg);
+        assert_eq!(cfg.max_decode_passes, Ft8Config::default().max_decode_passes);
+        assert_eq!(
+            cfg.time_varying_subtraction_enabled,
+            Ft8Config::default().time_varying_subtraction_enabled
+        );
+    }
+
+    #[test]
+    fn apply_effort_ft8_overrides_restores_default_after_a_stale_override() {
+        // Simulates cycling AWAY from a (future) overridden preset: a config
+        // that was left with non-default values for the two controlled
+        // fields must be restored to Ft8Config::default()'s values, not left
+        // stale, once resolved against a preset with no override.
+        let mut cfg = Ft8Config {
+            max_decode_passes: 99,
+            time_varying_subtraction_enabled: true,
+            ..Ft8Config::default()
+        };
+        apply_effort_ft8_overrides(DecodeEffort::Eco, HardwareTier::Fast, &mut cfg);
+        assert_eq!(cfg.max_decode_passes, Ft8Config::default().max_decode_passes);
+        assert_eq!(
+            cfg.time_varying_subtraction_enabled,
+            Ft8Config::default().time_varying_subtraction_enabled
+        );
+    }
+
+    #[test]
+    fn apply_effort_ft8_overrides_does_not_touch_unrelated_fields() {
+        let mut cfg = Ft8Config {
+            protocol: pancetta_ft8::Protocol::Ft4,
+            ..Ft8Config::default()
+        };
+        apply_effort_ft8_overrides(DecodeEffort::Standard, HardwareTier::Fast, &mut cfg);
+        assert_eq!(cfg.protocol, pancetta_ft8::Protocol::Ft4);
     }
 }

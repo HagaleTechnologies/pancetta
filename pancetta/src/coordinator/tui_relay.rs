@@ -1778,6 +1778,28 @@ impl super::ApplicationCoordinator {
                                 &cmd_decode_effort_budget_ms,
                                 tier,
                             );
+                            // PAN-156: re-resolve the effort-conditional
+                            // Ft8Config overrides for the new preset too, so
+                            // e.g. cycling away from `Standard` correctly
+                            // restores the default rather than leaving a
+                            // stale override active. `try_write` (not
+                            // `.await`) matches `try_switch_operating_mode`'s
+                            // convention elsewhere in this handler: on
+                            // contention, skip rather than block the command
+                            // loop — the hot loop's next config re-check
+                            // (`ft8.rs`) will pick it up regardless, since
+                            // this only takes effect after a decoder rebuild
+                            // anyway.
+                            if let Ok(mut cfg) = cmd_ft8_config.try_write() {
+                                super::effort::apply_effort_ft8_overrides(next, tier, &mut cfg);
+                            } else {
+                                warn!(
+                                    target: "decoder.effort",
+                                    "Ft8Config lock busy — effort-conditional overrides for {} \
+                                     not re-applied this cycle",
+                                    next.label()
+                                );
+                            }
                             let label = next.label().to_string();
                             info!(
                                 target: "decoder.effort",

@@ -22,6 +22,14 @@
 //!    `Ft8Config` fields directly. `scoped_fast_path` handling is
 //!    unaffected by this change — it remains a separate, still-valid
 //!    mechanism.
+//! 4. PAN-156: both paths *also* re-resolve `effort::effort_ft8_overrides`
+//!    (a DIFFERENT axis than this module's own `HardwareTier`-keyed preset
+//!    table below — it's keyed on the operator-facing `DecodeEffort`
+//!    preset, with the probed tier only consulted for `Auto`'s
+//!    resolution) into the shared `ft8_config`, using the same
+//!    `probe_completion_should_reseed_budget` race guard as the budget
+//!    atomic. This is the seam PAN-157 uses to ship a technique
+//!    conditionally by `DecodeEffort` preset rather than by hardware tier.
 //!
 //! ## Override matrix
 //!
@@ -52,7 +60,7 @@ use pancetta_ft8::tier_probe::{recommend_actions, HardwareTier};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use super::effort::seed_effort_budget;
+use super::effort::{apply_effort_ft8_overrides, seed_effort_budget};
 
 const CACHE_SCHEMA_VERSION: u32 = 1;
 const ENV_OVERRIDE: &str = "PANCETTA_SCOPED_FAST_PATH";
@@ -332,6 +340,7 @@ fn spawn_probe_worker(
     decode_effort_budget_ms: Arc<AtomicU64>,
     current_decode_effort: Arc<AtomicU8>,
     resolved_hardware_tier: Arc<AtomicU8>,
+    ft8_config: Arc<tokio::sync::RwLock<pancetta_ft8::Ft8Config>>,
 ) {
     tokio::task::spawn_blocking(move || {
         let result = match pancetta_ft8::tier_probe::probe_hardware_tier(10) {
@@ -398,6 +407,13 @@ fn spawn_probe_worker(
                 "tier probe: decode_effort_budget_ms re-seeded for {} tier (Auto)",
                 result.tier.as_str()
             );
+            // PAN-156: same tier-dependency as the budget re-seed above
+            // (only `Auto`'s Ft8Config overrides depend on the probed
+            // tier) — reuse the same race guard.
+            tokio::runtime::Handle::current().block_on(async {
+                let mut cfg = ft8_config.write().await;
+                apply_effort_ft8_overrides(DecodeEffort::Auto, result.tier, &mut cfg);
+            });
         } else {
             debug!(
                 "tier probe: decode_effort_budget_ms NOT re-seeded — operator has already \
@@ -435,6 +451,12 @@ fn spawn_probe_worker(
 /// (final-review Finding 1). The synchronous cache-hit path below has no
 /// such race (it runs before the TUI can accept input), so it seeds from
 /// the startup `effort` value directly, same as before.
+///
+/// PAN-156: also re-resolves `effort::effort_ft8_overrides(effort, tier)`
+/// into `ft8_config` alongside every budget re-seed above (cache-hit path
+/// here, probe-completion path in [`spawn_probe_worker`]) — the caller is
+/// expected to have already applied the assumed-tier overrides before
+/// calling this, same convention as `decode_effort_budget_ms`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn initialize(
     effort: DecodeEffort,
@@ -442,6 +464,7 @@ pub(crate) async fn initialize(
     decode_effort_budget_ms: Arc<AtomicU64>,
     current_decode_effort: Arc<AtomicU8>,
     resolved_hardware_tier: Arc<AtomicU8>,
+    ft8_config: Arc<tokio::sync::RwLock<pancetta_ft8::Ft8Config>>,
 ) -> Arc<AtomicBool> {
     let scoped_fast_path = Arc::new(AtomicBool::new(false));
 
@@ -478,6 +501,10 @@ pub(crate) async fn initialize(
                     summary
                 );
                 seed_effort_budget(effort, budget_override, tier, &decode_effort_budget_ms);
+                {
+                    let mut cfg = ft8_config.write().await;
+                    apply_effort_ft8_overrides(effort, tier, &mut cfg);
+                }
                 resolved_hardware_tier.store(tier.as_u8(), Ordering::Release);
                 false
             } else {
@@ -507,6 +534,7 @@ pub(crate) async fn initialize(
             decode_effort_budget_ms,
             current_decode_effort,
             resolved_hardware_tier,
+            ft8_config,
         );
     }
 
