@@ -1773,11 +1773,58 @@ impl super::ApplicationCoordinator {
                             let tier = pancetta_ft8::tier_probe::HardwareTier::from_u8(
                                 cmd_resolved_hardware_tier.load(Ordering::Acquire),
                             );
-                            let (next, budget_ms) = super::effort::cycle_decode_effort(
+                            let (next, mut budget_ms) = super::effort::cycle_decode_effort(
                                 &cmd_current_decode_effort,
                                 &cmd_decode_effort_budget_ms,
                                 tier,
                             );
+                            // PAN-156: re-apply the new preset's Ft8Config
+                            // overrides immediately so a live cycle doesn't
+                            // wait for a restart to take effect (and so
+                            // cycling AWAY from a preset with an override
+                            // reverts it, not just cycling into one).
+                            //
+                            // PAN-156 round-2 review finding: `write().await`
+                            // can yield, and `tier` above was snapshotted
+                            // before that yield — if the background tier
+                            // probe resolves and applies its own (correct)
+                            // overrides in that gap, this continuation must
+                            // not clobber them with a stale tier's overrides.
+                            // Re-read the resolved-tier atomic fresh, after
+                            // the lock is actually held, mirroring the same
+                            // fix on the probe-worker side (`tier.rs`'s
+                            // `spawn_probe_worker`, which re-checks
+                            // `current_decode_effort` at the same point for
+                            // the opposite direction of this race).
+                            //
+                            // PAN-156 round-6 review finding: fixing the
+                            // config override alone left the BUDGET
+                            // inconsistent with it — `budget_ms` above was
+                            // still computed from the stale pre-lock `tier`
+                            // snapshot, so an Auto cycle racing the tier
+                            // probe could end up with e.g. Slow-tier
+                            // overrides paired with the Fast-tier budget.
+                            // Recompute the budget from the same
+                            // `tier_at_write` used for the override, and
+                            // re-store it, so both halves of Auto's
+                            // tier-dependent state come from one consistent
+                            // read.
+                            {
+                                let mut cfg_guard = cmd_ft8_config.write().await;
+                                let tier_at_write = pancetta_ft8::tier_probe::HardwareTier::from_u8(
+                                    cmd_resolved_hardware_tier.load(Ordering::Acquire),
+                                );
+                                super::effort::apply_effort_overrides(
+                                    next,
+                                    tier_at_write,
+                                    &mut cfg_guard,
+                                );
+                                if next == pancetta_config::DecodeEffort::Auto {
+                                    budget_ms =
+                                        super::effort::preset_budget_ms(next, tier_at_write);
+                                    cmd_decode_effort_budget_ms.store(budget_ms, Ordering::Release);
+                                }
+                            }
                             let label = next.label().to_string();
                             info!(
                                 target: "decoder.effort",

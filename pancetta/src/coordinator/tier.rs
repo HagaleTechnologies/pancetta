@@ -49,10 +49,11 @@ use std::sync::Arc;
 
 use pancetta_config::DecodeEffort;
 use pancetta_ft8::tier_probe::{recommend_actions, HardwareTier};
+use pancetta_ft8::Ft8Config;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use super::effort::seed_effort_budget;
+use super::effort::{apply_effort_overrides, seed_effort_budget};
 
 const CACHE_SCHEMA_VERSION: u32 = 1;
 const ENV_OVERRIDE: &str = "PANCETTA_SCOPED_FAST_PATH";
@@ -332,6 +333,7 @@ fn spawn_probe_worker(
     decode_effort_budget_ms: Arc<AtomicU64>,
     current_decode_effort: Arc<AtomicU8>,
     resolved_hardware_tier: Arc<AtomicU8>,
+    ft8_config: Arc<tokio::sync::RwLock<Ft8Config>>,
 ) {
     tokio::task::spawn_blocking(move || {
         let result = match pancetta_ft8::tier_probe::probe_hardware_tier(10) {
@@ -381,31 +383,53 @@ fn spawn_probe_worker(
         ));
         info!("tier probe: applied — {}", summary);
 
-        // Finding 1: only re-seed the budget atomic if the operator hasn't
-        // already cycled `e` away from `Auto` while this probe was running.
-        // Non-Auto presets resolve to the same budget regardless of tier
-        // (see `preset_budget_ms`), so skipping them here changes nothing
-        // for the untouched case and avoids clobbering an explicit choice.
-        let live_effort = DecodeEffort::from_u8(current_decode_effort.load(Ordering::Acquire));
-        if probe_completion_should_reseed_budget(live_effort) {
-            seed_effort_budget(
-                DecodeEffort::Auto,
-                budget_override,
-                result.tier,
-                &decode_effort_budget_ms,
-            );
-            info!(
-                "tier probe: decode_effort_budget_ms re-seeded for {} tier (Auto)",
-                result.tier.as_str()
-            );
-        } else {
-            debug!(
-                "tier probe: decode_effort_budget_ms NOT re-seeded — operator has already \
-                 cycled decode effort to {:?}; tier is still recorded for a future Auto cycle",
-                live_effort
-            );
-        }
-        resolved_hardware_tier.store(result.tier.as_u8(), Ordering::Release);
+        // PAN-156 rounds 1-5 review findings, all versions of the same root
+        // cause: this used to be two DIFFERENT critical sections (one per
+        // if/else branch, gated on an outer `live_effort` snapshot), each
+        // trusting that snapshot instead of re-reading fresh state under
+        // the lock. Collapsed into a single, UNCONDITIONAL critical
+        // section below that always re-reads `current_decode_effort`
+        // fresh AFTER acquiring the config lock.
+        //
+        // PAN-156 round-8 review finding: collapsing the CONFIG decision
+        // wasn't enough on its own — the BUDGET reseed (`seed_effort_
+        // budget`) was still gated on the stale outer `live_effort`
+        // snapshot from `probe_completion_should_reseed_budget`, so an
+        // operator cycling Max→Auto in the gap between that snapshot and
+        // the lock being acquired could get the fresh tier's Ft8Config
+        // override paired with a budget computed for a DIFFERENT
+        // (earlier) tier that was never reseeded — e.g. Auto+Slow's
+        // overrides with the Fast-tier 1000ms budget instead of 1ms.
+        // Reseed the budget from the SAME fresh `live_effort_at_write` /
+        // `result.tier` pair used for the config override, in this same
+        // critical section, so budget and config can never disagree
+        // about which effort/tier they're for.
+        tokio::runtime::Handle::current().block_on(async {
+            let mut cfg_guard = ft8_config.write().await;
+            let live_effort_at_write =
+                DecodeEffort::from_u8(current_decode_effort.load(Ordering::Acquire));
+            if live_effort_at_write == DecodeEffort::Auto {
+                apply_effort_overrides(DecodeEffort::Auto, result.tier, &mut cfg_guard);
+                seed_effort_budget(
+                    DecodeEffort::Auto,
+                    budget_override,
+                    result.tier,
+                    &decode_effort_budget_ms,
+                );
+                info!(
+                    "tier probe: decode_effort_budget_ms re-seeded for {} tier (Auto)",
+                    result.tier.as_str()
+                );
+            } else {
+                debug!(
+                    "tier probe: skipped Ft8Config override re-application and budget \
+                     reseed — operator cycled to {live_effort_at_write:?} while the \
+                     config lock was being acquired; tier is still recorded for a \
+                     future Auto cycle"
+                );
+            }
+            resolved_hardware_tier.store(result.tier.as_u8(), Ordering::Release);
+        });
     });
 }
 
@@ -442,6 +466,7 @@ pub(crate) async fn initialize(
     decode_effort_budget_ms: Arc<AtomicU64>,
     current_decode_effort: Arc<AtomicU8>,
     resolved_hardware_tier: Arc<AtomicU8>,
+    ft8_config: Arc<tokio::sync::RwLock<Ft8Config>>,
 ) -> Arc<AtomicBool> {
     let scoped_fast_path = Arc::new(AtomicBool::new(false));
 
@@ -478,6 +503,10 @@ pub(crate) async fn initialize(
                     summary
                 );
                 seed_effort_budget(effort, budget_override, tier, &decode_effort_budget_ms);
+                {
+                    let mut cfg_guard = ft8_config.write().await;
+                    apply_effort_overrides(effort, tier, &mut cfg_guard);
+                }
                 resolved_hardware_tier.store(tier.as_u8(), Ordering::Release);
                 false
             } else {
@@ -507,6 +536,7 @@ pub(crate) async fn initialize(
             decode_effort_budget_ms,
             current_decode_effort,
             resolved_hardware_tier,
+            ft8_config,
         );
     }
 
