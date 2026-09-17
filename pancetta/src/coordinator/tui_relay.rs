@@ -1783,9 +1783,29 @@ impl super::ApplicationCoordinator {
                             // wait for a restart to take effect (and so
                             // cycling AWAY from a preset with an override
                             // reverts it, not just cycling into one).
+                            //
+                            // PAN-156 round-2 review finding: `write().await`
+                            // can yield, and `tier` above was snapshotted
+                            // before that yield — if the background tier
+                            // probe resolves and applies its own (correct)
+                            // overrides in that gap, this continuation must
+                            // not clobber them with a stale tier's overrides.
+                            // Re-read the resolved-tier atomic fresh, after
+                            // the lock is actually held, mirroring the same
+                            // fix on the probe-worker side (`tier.rs`'s
+                            // `spawn_probe_worker`, which re-checks
+                            // `current_decode_effort` at the same point for
+                            // the opposite direction of this race).
                             {
                                 let mut cfg_guard = cmd_ft8_config.write().await;
-                                super::effort::apply_effort_overrides(next, tier, &mut cfg_guard);
+                                let tier_at_write = pancetta_ft8::tier_probe::HardwareTier::from_u8(
+                                    cmd_resolved_hardware_tier.load(Ordering::Acquire),
+                                );
+                                super::effort::apply_effort_overrides(
+                                    next,
+                                    tier_at_write,
+                                    &mut cfg_guard,
+                                );
                             }
                             let label = next.label().to_string();
                             info!(
