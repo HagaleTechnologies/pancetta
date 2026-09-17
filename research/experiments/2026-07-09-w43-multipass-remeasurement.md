@@ -6,6 +6,11 @@
 (Task W3.3b — the precedent this task's interpretation follows: an unlimited-budget A/B does NOT
 necessarily reflect real production, which always runs under a bounded budget; the REALISTIC
 bounded-budget measurement is what should govern conclusions about production behavior).
+**Superseded 2026-09-17**: the bounded-budget hard-200 win documented below (+32 TP) was
+re-measured under PAN-157 and no longer reproduces — see
+`research/experiments/2026-09-17-w43-pan157-remeasurement-superseded.md`. This file's numbers and
+narrative below are left as-is (an accurate record of what was measured on 2026-07-09); only the
+production-relevance conclusion has changed.
 **Status**: [A/B] declined the unconditional global default flip. `Ft8Config::default()
 .max_decode_passes` stays `1`. This is a nuanced decline, not a flat "doesn't work" — see
 "Decision" below.

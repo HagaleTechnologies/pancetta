@@ -280,19 +280,33 @@ from different tasks with different, non-interchangeable numbers:
   Standard. This remains a genuine, unresolved gap, not a clean win waiting
   to be flipped on.
 - **Task W4.3 — real multipass (consuming W4.1/W4.2's improved subtraction).**
-  A *separate* mechanism, measured under the same realistic Standard bounded
-  preset, shows a clean **+32-truth win** on hard-200 (95% CI [+12, +57],
-  excludes zero, ~4.0x elapsed cost, zero FP-on-noise cost) — and unlike
-  W3.3/W3.3b, it does **not** regress at Standard. This is the plan's single
-  biggest **unresolved** opportunity: a genuine, gate-passing win under the
-  realistic production regime that still isn't the global default, because
-  that default also has to stay safe for `DecodeBudget::unlimited()`
-  consumers (the test suite, direct `pancetta-ft8` API callers, and the
-  operator-selectable `Max` effort preset), for whom the unbounded
-  measurement shows no benefit at meaningfully higher cost. Shipping it
-  safely needs the same regime-conditional wiring through the coordinator's
-  effort-preset system that W3.3/W3.3b's mechanism would also need — a
-  well-supported next step, not something this plan built.
+  **UPDATE 2026-09-17 (PAN-157): re-measured, no longer reproduces — see
+  below.** A *separate* mechanism from W3.3/W3.3b, originally measured under
+  the same realistic Standard bounded preset on 2026-07-09 as a clean
+  **+32-truth win** on hard-200 (95% CI [+12, +57], excludes zero, ~4.0x
+  elapsed cost, zero FP-on-noise cost) — unlike W3.3/W3.3b, it did **not**
+  regress at Standard, and was the plan's single biggest **unresolved**
+  opportunity at the time: a genuine, gate-passing win under the realistic
+  production regime that still wasn't the global default, only because that
+  default also had to stay safe for `DecodeBudget::unlimited()` consumers
+  (the test suite, direct `pancetta-ft8` API callers, and the
+  operator-selectable `Max` effort preset). PAN-157 proposed the
+  regime-conditional wiring to ship it Standard-only, per PAN-156's new
+  `DecodeEffort`-conditional `Ft8Config` override seam — but its own ticket
+  required reconfirming the number first, since it predated several months
+  of subsequent decoder changes. The reconfirmation (same harness, same
+  flags, same corpus) came back **+0** (95% CI [+0.0, +0.0], bit-for-bit
+  identical decode set to baseline) at +978% elapsed cost. The decoder's
+  pass-0 recall has grown enough since July (coherent-multipass graduating
+  to default-on, LDPC iteration increases, cross-cycle averaging, AP4
+  full-message-mask, and other shipped work) to have closed the exact
+  headroom this mechanism used to recover — the same "pass 0 already
+  exhausts every rescue mechanism" ceiling effect the original measurement
+  documented for the *unlimited*-budget case now also applies under
+  Standard's bounded budget. **Declined — PAN-156's plumbing ships as a
+  correctly-inert no-op for this preset; nothing further to wire.** See
+  `research/experiments/2026-09-17-w43-pan157-remeasurement-superseded.md`
+  for the full re-measurement.
 
 ## Reproduce
 
