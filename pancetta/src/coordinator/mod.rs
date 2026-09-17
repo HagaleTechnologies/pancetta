@@ -1834,10 +1834,19 @@ impl ApplicationCoordinator {
             ..Ft8Config::default()
         };
         // PAN-156: apply the initial decode-effort preset's Ft8Config
-        // overrides before the config is shared. `tui_relay.rs`'s
-        // `CycleDecodeEffort` handler re-applies this on every live
-        // preset switch, so this seeds the starting point only.
-        effort::apply_effort_overrides(decoder_effort_init, &mut ft8_config_init);
+        // overrides before the config is shared, assuming
+        // `HardwareTier::Fast` until the probe resolves (same convention
+        // `decode_effort_budget_ms`'s own initial seed below uses).
+        // `tier::initialize` re-applies this once the real tier is known
+        // (mirroring how it re-seeds `decode_effort_budget_ms`), and
+        // `tui_relay.rs`'s `CycleDecodeEffort` handler re-applies it on
+        // every live preset switch — so this seeds the starting point
+        // only.
+        effort::apply_effort_overrides(
+            decoder_effort_init,
+            pancetta_ft8::tier_probe::HardwareTier::Fast,
+            &mut ft8_config_init,
+        );
         let ft8_config = Arc::new(RwLock::new(ft8_config_init));
 
         // decoder-speed-overhaul Task 14: seed `decode_effort_budget_ms` with
@@ -1874,6 +1883,7 @@ impl ApplicationCoordinator {
             decode_effort_budget_ms.clone(),
             current_decode_effort.clone(),
             resolved_hardware_tier.clone(),
+            ft8_config.clone(),
         )
         .await;
 

@@ -49,10 +49,11 @@ use std::sync::Arc;
 
 use pancetta_config::DecodeEffort;
 use pancetta_ft8::tier_probe::{recommend_actions, HardwareTier};
+use pancetta_ft8::Ft8Config;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use super::effort::seed_effort_budget;
+use super::effort::{apply_effort_overrides, seed_effort_budget};
 
 const CACHE_SCHEMA_VERSION: u32 = 1;
 const ENV_OVERRIDE: &str = "PANCETTA_SCOPED_FAST_PATH";
@@ -332,6 +333,7 @@ fn spawn_probe_worker(
     decode_effort_budget_ms: Arc<AtomicU64>,
     current_decode_effort: Arc<AtomicU8>,
     resolved_hardware_tier: Arc<AtomicU8>,
+    ft8_config: Arc<tokio::sync::RwLock<Ft8Config>>,
 ) {
     tokio::task::spawn_blocking(move || {
         let result = match pancetta_ft8::tier_probe::probe_hardware_tier(10) {
@@ -394,6 +396,15 @@ fn spawn_probe_worker(
                 result.tier,
                 &decode_effort_budget_ms,
             );
+            // PAN-156 round-1 review finding: `apply_effort_overrides`
+            // resolves `Auto` through the tier just like the budget
+            // does, so it needs the same re-application once the real
+            // tier is known — otherwise an `Auto` station stays on the
+            // startup Fast-tier guess's overrides for its whole session.
+            tokio::runtime::Handle::current().block_on(async {
+                let mut cfg_guard = ft8_config.write().await;
+                apply_effort_overrides(DecodeEffort::Auto, result.tier, &mut cfg_guard);
+            });
             info!(
                 "tier probe: decode_effort_budget_ms re-seeded for {} tier (Auto)",
                 result.tier.as_str()
@@ -442,6 +453,7 @@ pub(crate) async fn initialize(
     decode_effort_budget_ms: Arc<AtomicU64>,
     current_decode_effort: Arc<AtomicU8>,
     resolved_hardware_tier: Arc<AtomicU8>,
+    ft8_config: Arc<tokio::sync::RwLock<Ft8Config>>,
 ) -> Arc<AtomicBool> {
     let scoped_fast_path = Arc::new(AtomicBool::new(false));
 
@@ -478,6 +490,10 @@ pub(crate) async fn initialize(
                     summary
                 );
                 seed_effort_budget(effort, budget_override, tier, &decode_effort_budget_ms);
+                {
+                    let mut cfg_guard = ft8_config.write().await;
+                    apply_effort_overrides(effort, tier, &mut cfg_guard);
+                }
                 resolved_hardware_tier.store(tier.as_u8(), Ordering::Release);
                 false
             } else {
@@ -507,6 +523,7 @@ pub(crate) async fn initialize(
             decode_effort_budget_ms,
             current_decode_effort,
             resolved_hardware_tier,
+            ft8_config,
         );
     }
 

@@ -1785,7 +1785,7 @@ impl super::ApplicationCoordinator {
                             // reverts it, not just cycling into one).
                             {
                                 let mut cfg_guard = cmd_ft8_config.write().await;
-                                super::effort::apply_effort_overrides(next, &mut cfg_guard);
+                                super::effort::apply_effort_overrides(next, tier, &mut cfg_guard);
                             }
                             let label = next.label().to_string();
                             info!(

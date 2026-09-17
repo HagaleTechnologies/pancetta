@@ -114,6 +114,24 @@ pub(crate) fn cycle_decode_effort(
     (next, budget)
 }
 
+/// Resolve `Auto` to the literal preset it behaves like on the given
+/// [`HardwareTier`], the same mapping [`preset_budget_ms`] uses for the
+/// wall-clock budget (Slow↔Eco, Moderate↔Standard, Fast↔Deep). A literal
+/// preset (not `Auto`) is returned unchanged. `apply_effort_overrides`
+/// uses this so a field override tied to e.g. `Standard` also fires for
+/// an `Auto` station on Moderate-tier hardware — round-1 review finding:
+/// without this, overrides silently never applied to any `Auto` station.
+fn resolve_effective_effort(effort: DecodeEffort, tier: HardwareTier) -> DecodeEffort {
+    match effort {
+        DecodeEffort::Auto => match tier {
+            HardwareTier::Slow => DecodeEffort::Eco,
+            HardwareTier::Moderate => DecodeEffort::Standard,
+            HardwareTier::Fast => DecodeEffort::Deep,
+        },
+        literal => literal,
+    }
+}
+
 /// Apply per-effort-preset `Ft8Config` field overrides (PAN-156).
 ///
 /// Until this ticket, `Ft8Config` flags could only be tuned globally
@@ -123,25 +141,42 @@ pub(crate) fn cycle_decode_effort(
 /// an effort preset to a set of `Ft8Config` field overrides, applied
 /// in-place onto whatever config the caller already has (so unrelated
 /// fields — `protocol`, anything set outside this function — are left
-/// untouched). Called both at coordinator startup (seeding the initial
-/// preset) and from the TUI's live effort-cycle handler
-/// (`tui_relay.rs`'s `CycleDecodeEffort` arm), so a live preset switch
-/// re-applies the right fields immediately rather than only at restart.
+/// untouched). `Auto` is resolved to its tier-equivalent literal preset
+/// via [`resolve_effective_effort`] first, so it picks up the same
+/// overrides a station manually set to that preset would get.
+///
+/// Called at coordinator startup, from the TUI's live effort-cycle
+/// handler (`tui_relay.rs`'s `CycleDecodeEffort` arm), and from
+/// `tier::initialize`/`tier::spawn_probe_worker`'s tier-resolution paths
+/// (guarded by the same `Auto`-only race guard `seed_effort_budget`
+/// uses there) — so a live preset switch OR a tier probe landing after
+/// startup both re-apply the right fields immediately rather than only
+/// at restart.
 ///
 /// **Pure plumbing — no default decode behavior changes as part of this
 /// ticket.** Every arm currently reproduces `Ft8Config::default()`'s
 /// values for the fields it's prepared to override, so calling this for
-/// any preset today is byte-identical to not calling it at all
-/// (`effort_overrides_are_currently_a_no_op_for_every_preset` below is
-/// the regression guard). A later ticket (e.g. PAN-157) fills in a real
-/// override for a specific preset once its own A/B confirms the win.
-pub(crate) fn apply_effort_overrides(effort: DecodeEffort, config: &mut Ft8Config) {
-    match effort {
-        DecodeEffort::Eco
-        | DecodeEffort::Standard
-        | DecodeEffort::Deep
-        | DecodeEffort::Max
-        | DecodeEffort::Auto => {}
+/// any preset/tier combination today is byte-identical to not calling it
+/// at all (`effort_overrides_are_currently_a_no_op_for_every_preset`
+/// below is the regression guard). A later ticket (e.g. PAN-157) fills
+/// in a real override for a specific preset once its own A/B confirms
+/// the win — when it does, EVERY arm below must explicitly assign that
+/// field (not just the overriding arm), so switching to a preset that
+/// doesn't want the override reverts it rather than inheriting whatever
+/// the config happened to hold before (round-1 review finding); and the
+/// FT8 hot loop's decoder-rebuild-trigger comparison
+/// (`coordinator/ft8.rs`, `last_max_passes`/`last_osd_depth`/
+/// `last_protocol`) must gain that field too, or a live preset switch
+/// can update the shared config without the running decoder ever
+/// picking it up (round-1 review finding).
+pub(crate) fn apply_effort_overrides(
+    effort: DecodeEffort,
+    tier: HardwareTier,
+    config: &mut Ft8Config,
+) {
+    match resolve_effective_effort(effort, tier) {
+        DecodeEffort::Eco | DecodeEffort::Standard | DecodeEffort::Deep | DecodeEffort::Max => {}
+        DecodeEffort::Auto => unreachable!("resolve_effective_effort never returns Auto"),
     }
     let _ = config; // silence unused-mut-arg warning until a real arm lands
 }
@@ -297,7 +332,7 @@ mod tests {
     /// byte-identical to the default, until a future ticket fills in a
     /// real per-preset field value.
     #[test]
-    fn effort_overrides_are_currently_a_no_op_for_every_preset() {
+    fn effort_overrides_are_currently_a_no_op_for_every_preset_and_tier() {
         for effort in [
             DecodeEffort::Eco,
             DecodeEffort::Standard,
@@ -305,16 +340,22 @@ mod tests {
             DecodeEffort::Max,
             DecodeEffort::Auto,
         ] {
-            let mut config = Ft8Config::default();
-            apply_effort_overrides(effort, &mut config);
-            // `Ft8Config` doesn't derive `PartialEq` (too many fields to
-            // justify adding it just for this guard); compare via `Debug`
-            // instead, which is already derived and structural.
-            assert_eq!(
-                format!("{config:?}"),
-                format!("{:?}", Ft8Config::default()),
-                "{effort:?} preset must not change any Ft8Config field yet"
-            );
+            for tier in [
+                HardwareTier::Slow,
+                HardwareTier::Moderate,
+                HardwareTier::Fast,
+            ] {
+                let mut config = Ft8Config::default();
+                apply_effort_overrides(effort, tier, &mut config);
+                // `Ft8Config` doesn't derive `PartialEq` (too many fields to
+                // justify adding it just for this guard); compare via
+                // `Debug` instead, which is already derived and structural.
+                assert_eq!(
+                    format!("{config:?}"),
+                    format!("{:?}", Ft8Config::default()),
+                    "{effort:?} on {tier:?} must not change any Ft8Config field yet"
+                );
+            }
         }
     }
 
@@ -327,7 +368,45 @@ mod tests {
             protocol: pancetta_ft8::Protocol::Ft4,
             ..Ft8Config::default()
         };
-        apply_effort_overrides(DecodeEffort::Standard, &mut config);
+        apply_effort_overrides(DecodeEffort::Standard, HardwareTier::Fast, &mut config);
         assert_eq!(config.protocol, pancetta_ft8::Protocol::Ft4);
+    }
+
+    /// `Auto` must resolve through the probed hardware tier the same way
+    /// the wall-time budget does (round-1 review finding) — verified via
+    /// the pure resolver rather than `apply_effort_overrides` itself,
+    /// since no field is overridden yet to observe through the latter.
+    #[test]
+    fn auto_resolves_to_the_tier_equivalent_literal_preset() {
+        assert_eq!(
+            resolve_effective_effort(DecodeEffort::Auto, HardwareTier::Slow),
+            DecodeEffort::Eco
+        );
+        assert_eq!(
+            resolve_effective_effort(DecodeEffort::Auto, HardwareTier::Moderate),
+            DecodeEffort::Standard
+        );
+        assert_eq!(
+            resolve_effective_effort(DecodeEffort::Auto, HardwareTier::Fast),
+            DecodeEffort::Deep
+        );
+    }
+
+    #[test]
+    fn literal_presets_resolve_to_themselves_regardless_of_tier() {
+        for effort in [
+            DecodeEffort::Eco,
+            DecodeEffort::Standard,
+            DecodeEffort::Deep,
+            DecodeEffort::Max,
+        ] {
+            for tier in [
+                HardwareTier::Slow,
+                HardwareTier::Moderate,
+                HardwareTier::Fast,
+            ] {
+                assert_eq!(resolve_effective_effort(effort, tier), effort);
+            }
+        }
     }
 }
