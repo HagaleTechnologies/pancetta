@@ -169,6 +169,25 @@ fn resolve_effective_effort(effort: DecodeEffort, tier: HardwareTier) -> DecodeE
 /// `last_protocol`) must gain that field too, or a live preset switch
 /// can update the shared config without the running decoder ever
 /// picking it up (round-1 review finding).
+///
+/// **Round-7 review finding — window atomicity.** `coordinator/ft8.rs`'s
+/// hot loop reads `decode_effort_budget_ms` (a plain atomic) and
+/// `ft8_config_shared` (a separate `try_read`) independently per window
+/// (`ft8.rs:~1547-1569`). `docs/superpowers/specs/2026-07-06-decoder-
+/// speed-overhaul-design.md` §6.2 states the authoritative invariant:
+/// "effort changes take effect at the next window" — i.e. atomically, as
+/// one unit, never a mix of the old budget with the new config or vice
+/// versa. Today this can't actually tear, because nothing this function
+/// touches feeds into the hot loop's read of either value. Once a real
+/// field IS added here, that field's PR must also either (a) make the
+/// hot loop consume budget and config as one atomically-published
+/// snapshot (e.g. a shared generation counter it checks once per
+/// window), or (b) demonstrate why the specific field added is exempt
+/// from the §6.2 invariant. This is deliberately not solved here:
+/// redesigning ft8.rs's per-window state acquisition needs a concrete
+/// field to test against, and doing it speculatively risks introducing
+/// a bug into the hot loop with no way to verify the fix actually closes
+/// the gap.
 pub(crate) fn apply_effort_overrides(
     effort: DecodeEffort,
     tier: HardwareTier,

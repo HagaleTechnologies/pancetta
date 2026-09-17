@@ -1565,6 +1565,14 @@ impl super::ApplicationCoordinator {
                         // hb-237: cache the cross-sequence A7 enable flag
                         // alongside the config-rebuild check so we read the
                         // shared Ft8Config at most once per window.
+                        //
+                        // PAN-156 round-7 review finding: `decode_budget`
+                        // above and this config read are two independent,
+                        // unsynchronized reads -- see
+                        // `coordinator::effort::apply_effort_overrides`'s
+                        // doc comment for the §6.2 window-atomicity
+                        // invariant this must satisfy once a real
+                        // effort-conditional Ft8Config field exists.
                         let mut cross_seq_enabled = false;
                         if let Ok(cfg_guard) = ft8_config_shared.try_read() {
                             let cur_max = cfg_guard.max_decode_passes;
