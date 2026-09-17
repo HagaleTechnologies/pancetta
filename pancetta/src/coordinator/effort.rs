@@ -40,6 +40,7 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 use pancetta_config::DecodeEffort;
 use pancetta_ft8::tier_probe::HardwareTier;
+use pancetta_ft8::Ft8Config;
 
 /// Map a decode-effort preset (and, for `Auto`, the probed hardware tier) to
 /// a per-window wall-time budget in milliseconds.
@@ -111,6 +112,38 @@ pub(crate) fn cycle_decode_effort(
     let budget = preset_budget_ms(next, tier);
     decode_effort_budget_ms.store(budget, Ordering::Release);
     (next, budget)
+}
+
+/// Apply per-effort-preset `Ft8Config` field overrides (PAN-156).
+///
+/// Until this ticket, `Ft8Config` flags could only be tuned globally
+/// (or by [`HardwareTier`], via the now-retired `tier::apply_tier` — see
+/// `tier.rs`'s module doc); there was no way to say "on for this
+/// [`DecodeEffort`] preset, off for that one." This is the seam: it maps
+/// an effort preset to a set of `Ft8Config` field overrides, applied
+/// in-place onto whatever config the caller already has (so unrelated
+/// fields — `protocol`, anything set outside this function — are left
+/// untouched). Called both at coordinator startup (seeding the initial
+/// preset) and from the TUI's live effort-cycle handler
+/// (`tui_relay.rs`'s `CycleDecodeEffort` arm), so a live preset switch
+/// re-applies the right fields immediately rather than only at restart.
+///
+/// **Pure plumbing — no default decode behavior changes as part of this
+/// ticket.** Every arm currently reproduces `Ft8Config::default()`'s
+/// values for the fields it's prepared to override, so calling this for
+/// any preset today is byte-identical to not calling it at all
+/// (`effort_overrides_are_currently_a_no_op_for_every_preset` below is
+/// the regression guard). A later ticket (e.g. PAN-157) fills in a real
+/// override for a specific preset once its own A/B confirms the win.
+pub(crate) fn apply_effort_overrides(effort: DecodeEffort, config: &mut Ft8Config) {
+    match effort {
+        DecodeEffort::Eco
+        | DecodeEffort::Standard
+        | DecodeEffort::Deep
+        | DecodeEffort::Max
+        | DecodeEffort::Auto => {}
+    }
+    let _ = config; // silence unused-mut-arg warning until a real arm lands
 }
 
 #[cfg(test)]
@@ -253,5 +286,48 @@ mod tests {
         assert_eq!(next, DecodeEffort::Eco, "Auto -> Eco");
         assert_eq!(budget_ms, 1);
         assert_eq!(budget.load(Ordering::Acquire), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // PAN-156: effort-preset-conditional Ft8Config overrides
+    // ------------------------------------------------------------------
+
+    /// Pure plumbing must not change decode behavior on its own: applying
+    /// any preset's overrides to a fresh default config must leave it
+    /// byte-identical to the default, until a future ticket fills in a
+    /// real per-preset field value.
+    #[test]
+    fn effort_overrides_are_currently_a_no_op_for_every_preset() {
+        for effort in [
+            DecodeEffort::Eco,
+            DecodeEffort::Standard,
+            DecodeEffort::Deep,
+            DecodeEffort::Max,
+            DecodeEffort::Auto,
+        ] {
+            let mut config = Ft8Config::default();
+            apply_effort_overrides(effort, &mut config);
+            // `Ft8Config` doesn't derive `PartialEq` (too many fields to
+            // justify adding it just for this guard); compare via `Debug`
+            // instead, which is already derived and structural.
+            assert_eq!(
+                format!("{config:?}"),
+                format!("{:?}", Ft8Config::default()),
+                "{effort:?} preset must not change any Ft8Config field yet"
+            );
+        }
+    }
+
+    /// Overrides apply on top of whatever the caller's config already
+    /// has — fields not named by this ticket (e.g. `protocol`, set by
+    /// [rig].mode) must survive untouched.
+    #[test]
+    fn effort_overrides_preserve_fields_it_does_not_own() {
+        let mut config = Ft8Config {
+            protocol: pancetta_ft8::Protocol::Ft4,
+            ..Ft8Config::default()
+        };
+        apply_effort_overrides(DecodeEffort::Standard, &mut config);
+        assert_eq!(config.protocol, pancetta_ft8::Protocol::Ft4);
     }
 }

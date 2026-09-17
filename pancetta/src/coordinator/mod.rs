@@ -1829,10 +1829,16 @@ impl ApplicationCoordinator {
         // Costas) in FT4 mode, not just retunes the slot grid. Without this the
         // decoder would run FT8 geometry against FT4 audio. mode=FT8 →
         // protocol=Ft8, byte-identical to the previous `Ft8Config::default()`.
-        let ft8_config = Arc::new(RwLock::new(Ft8Config {
+        let mut ft8_config_init = Ft8Config {
             protocol: active_protocol,
             ..Ft8Config::default()
-        }));
+        };
+        // PAN-156: apply the initial decode-effort preset's Ft8Config
+        // overrides before the config is shared. `tui_relay.rs`'s
+        // `CycleDecodeEffort` handler re-applies this on every live
+        // preset switch, so this seeds the starting point only.
+        effort::apply_effort_overrides(decoder_effort_init, &mut ft8_config_init);
+        let ft8_config = Arc::new(RwLock::new(ft8_config_init));
 
         // decoder-speed-overhaul Task 14: seed `decode_effort_budget_ms` with
         // an initial value before the hardware tier is known, assuming

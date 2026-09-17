@@ -1778,6 +1778,15 @@ impl super::ApplicationCoordinator {
                                 &cmd_decode_effort_budget_ms,
                                 tier,
                             );
+                            // PAN-156: re-apply the new preset's Ft8Config
+                            // overrides immediately so a live cycle doesn't
+                            // wait for a restart to take effect (and so
+                            // cycling AWAY from a preset with an override
+                            // reverts it, not just cycling into one).
+                            {
+                                let mut cfg_guard = cmd_ft8_config.write().await;
+                                super::effort::apply_effort_overrides(next, &mut cfg_guard);
+                            }
                             let label = next.label().to_string();
                             info!(
                                 target: "decoder.effort",
