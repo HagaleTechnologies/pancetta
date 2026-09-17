@@ -1,0 +1,3 @@
+identity: { pack: catalyst-starter, skill: catalyst-file-ticket }
+effects: []
+invocation: implicit
