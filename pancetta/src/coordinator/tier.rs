@@ -411,6 +411,18 @@ fn spawn_probe_worker(
             // newer choice. Re-check `current_decode_effort` AFTER
             // acquiring the lock and skip the write if it's no longer
             // `Auto`, rather than trusting the pre-await snapshot.
+            //
+            // PAN-156 round-3 review finding: re-checking the live effort
+            // inside the lock isn't enough on its own — `resolved_hardware_
+            // tier` used to be published AFTER this async block (and thus
+            // after the lock was released), leaving a window where a
+            // concurrent TUI cycle could acquire the lock, re-read the
+            // (still stale) tier atomic, and overwrite this correct
+            // Ft8Config write with overrides computed from the wrong
+            // tier. Publish the resolved tier from INSIDE this same
+            // critical section, before the lock is released, so any
+            // other task acquiring the lock afterward always observes
+            // both writes together, never a partial state.
             tokio::runtime::Handle::current().block_on(async {
                 let mut cfg_guard = ft8_config.write().await;
                 let live_effort_at_write =
@@ -424,6 +436,7 @@ fn spawn_probe_worker(
                          being acquired"
                     );
                 }
+                resolved_hardware_tier.store(result.tier.as_u8(), Ordering::Release);
             });
             info!(
                 "tier probe: decode_effort_budget_ms re-seeded for {} tier (Auto)",
@@ -435,8 +448,10 @@ fn spawn_probe_worker(
                  cycled decode effort to {:?}; tier is still recorded for a future Auto cycle",
                 live_effort
             );
+            // No config write happens on this path, so there is no lock
+            // to publish the tier under — safe to store immediately.
+            resolved_hardware_tier.store(result.tier.as_u8(), Ordering::Release);
         }
-        resolved_hardware_tier.store(result.tier.as_u8(), Ordering::Release);
     });
 }
 
