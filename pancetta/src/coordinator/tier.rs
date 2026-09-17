@@ -401,9 +401,29 @@ fn spawn_probe_worker(
             // does, so it needs the same re-application once the real
             // tier is known — otherwise an `Auto` station stays on the
             // startup Fast-tier guess's overrides for its whole session.
+            //
+            // PAN-156 round-2 review finding: `write().await` can yield,
+            // widening the race this whole branch is already guarded
+            // against — the operator could cycle away from `Auto` in the
+            // gap between the `live_effort` check above and the lock
+            // actually being acquired below, which would otherwise let a
+            // now-stale Auto-derived write land on top of the operator's
+            // newer choice. Re-check `current_decode_effort` AFTER
+            // acquiring the lock and skip the write if it's no longer
+            // `Auto`, rather than trusting the pre-await snapshot.
             tokio::runtime::Handle::current().block_on(async {
                 let mut cfg_guard = ft8_config.write().await;
-                apply_effort_overrides(DecodeEffort::Auto, result.tier, &mut cfg_guard);
+                let live_effort_at_write =
+                    DecodeEffort::from_u8(current_decode_effort.load(Ordering::Acquire));
+                if live_effort_at_write == DecodeEffort::Auto {
+                    apply_effort_overrides(DecodeEffort::Auto, result.tier, &mut cfg_guard);
+                } else {
+                    debug!(
+                        "tier probe: skipped Ft8Config override re-application — operator \
+                         cycled to {live_effort_at_write:?} while the config lock was \
+                         being acquired"
+                    );
+                }
             });
             info!(
                 "tier probe: decode_effort_budget_ms re-seeded for {} tier (Auto)",
