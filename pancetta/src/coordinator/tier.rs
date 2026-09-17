@@ -448,9 +448,21 @@ fn spawn_probe_worker(
                  cycled decode effort to {:?}; tier is still recorded for a future Auto cycle",
                 live_effort
             );
-            // No config write happens on this path, so there is no lock
-            // to publish the tier under — safe to store immediately.
-            resolved_hardware_tier.store(result.tier.as_u8(), Ordering::Release);
+            // PAN-156 round-4 review finding: publishing the tier here
+            // without taking the config lock still races the TUI's
+            // CycleDecodeEffort handler — if the operator cycles to Auto
+            // right as this runs, the TUI's own critical section could
+            // read the not-yet-published (stale) tier and apply overrides
+            // for it, with nothing left in THIS branch to correct it
+            // afterward (unlike the reseed branch above, which re-checks
+            // and re-applies under the same lock). Acquire the same
+            // config lock purely to serialize this publish against any
+            // concurrent reader/writer — no field is written to the
+            // config itself on this path.
+            tokio::runtime::Handle::current().block_on(async {
+                let _cfg_guard = ft8_config.write().await;
+                resolved_hardware_tier.store(result.tier.as_u8(), Ordering::Release);
+            });
         }
     });
 }
