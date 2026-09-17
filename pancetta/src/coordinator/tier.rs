@@ -383,58 +383,49 @@ fn spawn_probe_worker(
         ));
         info!("tier probe: applied — {}", summary);
 
-        // Finding 1: only re-seed the budget atomic if the operator hasn't
-        // already cycled `e` away from `Auto` while this probe was running.
-        // Non-Auto presets resolve to the same budget regardless of tier
-        // (see `preset_budget_ms`), so skipping them here changes nothing
-        // for the untouched case and avoids clobbering an explicit choice.
-        let live_effort = DecodeEffort::from_u8(current_decode_effort.load(Ordering::Acquire));
-        if probe_completion_should_reseed_budget(live_effort) {
-            seed_effort_budget(
-                DecodeEffort::Auto,
-                budget_override,
-                result.tier,
-                &decode_effort_budget_ms,
-            );
-            info!(
-                "tier probe: decode_effort_budget_ms re-seeded for {} tier (Auto)",
-                result.tier.as_str()
-            );
-        } else {
-            debug!(
-                "tier probe: decode_effort_budget_ms NOT re-seeded — operator has already \
-                 cycled decode effort to {:?}; tier is still recorded for a future Auto cycle",
-                live_effort
-            );
-        }
         // PAN-156 rounds 1-5 review findings, all versions of the same root
         // cause: this used to be two DIFFERENT critical sections (one per
-        // `if`/`else` branch above), each trusting the `live_effort`
-        // snapshot taken before this point. Every fix that re-checked state
-        // in one branch, or moved the tier publish inside its lock, or
-        // serialized the other branch's publish, still left a residual gap
-        // because the two branches never shared one code path re-reading
-        // one consistent state. Collapsed into a single, UNCONDITIONAL
-        // critical section: it always re-reads `current_decode_effort`
-        // fresh AFTER acquiring the lock (the outer `live_effort` above is
-        // used only for the budget decision, which has no `.await` between
-        // check and write and so can't go stale the same way), applies the
-        // override only if that fresh read is `Auto`, and always publishes
-        // `resolved_hardware_tier` before releasing the lock — so every
-        // config write and every tier publish, from every path, happens
-        // under one lock ordering with no per-branch special-casing left to
-        // diverge.
+        // if/else branch, gated on an outer `live_effort` snapshot), each
+        // trusting that snapshot instead of re-reading fresh state under
+        // the lock. Collapsed into a single, UNCONDITIONAL critical
+        // section below that always re-reads `current_decode_effort`
+        // fresh AFTER acquiring the config lock.
+        //
+        // PAN-156 round-8 review finding: collapsing the CONFIG decision
+        // wasn't enough on its own — the BUDGET reseed (`seed_effort_
+        // budget`) was still gated on the stale outer `live_effort`
+        // snapshot from `probe_completion_should_reseed_budget`, so an
+        // operator cycling Max→Auto in the gap between that snapshot and
+        // the lock being acquired could get the fresh tier's Ft8Config
+        // override paired with a budget computed for a DIFFERENT
+        // (earlier) tier that was never reseeded — e.g. Auto+Slow's
+        // overrides with the Fast-tier 1000ms budget instead of 1ms.
+        // Reseed the budget from the SAME fresh `live_effort_at_write` /
+        // `result.tier` pair used for the config override, in this same
+        // critical section, so budget and config can never disagree
+        // about which effort/tier they're for.
         tokio::runtime::Handle::current().block_on(async {
             let mut cfg_guard = ft8_config.write().await;
             let live_effort_at_write =
                 DecodeEffort::from_u8(current_decode_effort.load(Ordering::Acquire));
             if live_effort_at_write == DecodeEffort::Auto {
                 apply_effort_overrides(DecodeEffort::Auto, result.tier, &mut cfg_guard);
+                seed_effort_budget(
+                    DecodeEffort::Auto,
+                    budget_override,
+                    result.tier,
+                    &decode_effort_budget_ms,
+                );
+                info!(
+                    "tier probe: decode_effort_budget_ms re-seeded for {} tier (Auto)",
+                    result.tier.as_str()
+                );
             } else {
                 debug!(
-                    "tier probe: skipped Ft8Config override re-application — operator \
-                     cycled to {live_effort_at_write:?} while the config lock was being \
-                     acquired"
+                    "tier probe: skipped Ft8Config override re-application and budget \
+                     reseed — operator cycled to {live_effort_at_write:?} while the \
+                     config lock was being acquired; tier is still recorded for a \
+                     future Auto cycle"
                 );
             }
             resolved_hardware_tier.store(result.tier.as_u8(), Ordering::Release);
