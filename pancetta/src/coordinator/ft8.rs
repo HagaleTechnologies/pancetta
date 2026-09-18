@@ -1573,6 +1573,16 @@ impl super::ApplicationCoordinator {
                         // doc comment for the §6.2 window-atomicity
                         // invariant this must satisfy once a real
                         // effort-conditional Ft8Config field exists.
+                        // PAN-157: `effort::apply_effort_overrides`'s `Max`
+                        // arm sets `max_decode_passes` AND
+                        // `time_varying_subtraction_enabled` together,
+                        // never independently — so `cur_max !=
+                        // last_max_passes` already fires a rebuild (which
+                        // clones the WHOLE current config, below) whenever
+                        // either field changes. `time_varying_subtraction_
+                        // enabled` doesn't need its own tracked `last_*`
+                        // variable unless a future override decouples the
+                        // two fields.
                         let mut cross_seq_enabled = false;
                         if let Ok(cfg_guard) = ft8_config_shared.try_read() {
                             let cur_max = cfg_guard.max_decode_passes;
