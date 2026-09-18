@@ -53,7 +53,7 @@ use pancetta_ft8::Ft8Config;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use super::effort::{apply_effort_overrides, seed_effort_budget};
+use super::effort::{apply_effort_overrides, preset_budget_ms, seed_effort_budget};
 
 const CACHE_SCHEMA_VERSION: u32 = 1;
 const ENV_OVERRIDE: &str = "PANCETTA_SCOPED_FAST_PATH";
@@ -429,7 +429,8 @@ fn spawn_probe_worker(
                 apply_effort_overrides(
                     DecodeEffort::Auto,
                     result.tier,
-                    budget_override,
+                    budget_override
+                        .unwrap_or_else(|| preset_budget_ms(DecodeEffort::Auto, result.tier)),
                     &mut cfg_guard,
                 );
                 info!(
@@ -521,7 +522,12 @@ pub(crate) async fn initialize(
                 seed_effort_budget(effort, budget_override, tier, &decode_effort_budget_ms);
                 {
                     let mut cfg_guard = ft8_config.write().await;
-                    apply_effort_overrides(effort, tier, budget_override, &mut cfg_guard);
+                    apply_effort_overrides(
+                        effort,
+                        tier,
+                        budget_override.unwrap_or_else(|| preset_budget_ms(effort, tier)),
+                        &mut cfg_guard,
+                    );
                 }
                 resolved_hardware_tier.store(tier.as_u8(), Ordering::Release);
                 false

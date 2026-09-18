@@ -1669,6 +1669,7 @@ impl super::ApplicationCoordinator {
                                 &cmd_active_decode_phase_ns,
                                 &cmd_current_decode_effort,
                                 &cmd_resolved_hardware_tier,
+                                &cmd_decode_effort_budget_ms,
                             ) {
                                 Ok(()) => {
                                     let mode_str = super::mode_str(next).to_string();
@@ -1835,14 +1836,19 @@ impl super::ApplicationCoordinator {
                                         super::effort::preset_budget_ms(next, tier_at_write);
                                     cmd_decode_effort_budget_ms.store(budget_ms, Ordering::Release);
                                 }
-                                // Live operator cycle: deliberately ignores
-                                // any persisted `[decoder].budget_ms`
-                                // override, same as `cycle_decode_effort`
-                                // above already does for the budget atomic.
+                                // Round-12 review finding: pass the SAME
+                                // `budget_ms` value that's already been
+                                // stored into `cmd_decode_effort_budget_ms`
+                                // (by `cycle_decode_effort` above, or by
+                                // the Auto-recompute just above this),
+                                // not a guessed `None` — this is always
+                                // consistent with the atomic's actual
+                                // state by construction, the same fix
+                                // applied to `try_switch_operating_mode`.
                                 super::effort::apply_effort_overrides(
                                     next,
                                     tier_at_write,
-                                    None,
+                                    budget_ms,
                                     &mut cfg_guard,
                                 );
                             }

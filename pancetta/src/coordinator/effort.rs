@@ -265,21 +265,36 @@ fn resolve_effective_effort(effort: DecodeEffort, tier: HardwareTier) -> DecodeE
 pub(crate) fn apply_effort_overrides(
     effort: DecodeEffort,
     tier: HardwareTier,
-    // Round-11-of-PAN-157 review finding: `Max`'s own budget preset
-    // resolves to `0` (meaning "use the protocol's ceiling" — see
-    // `super::ft8::decode_budget_ceiling_ms`, empirically confirmed
-    // sufficient by the round-11 prod-ceiling re-measurement below), but
-    // a station's PERSISTED `[decoder].budget_ms` config, when set,
-    // wins over any preset (`seed_effort_budget`'s contract). A station
-    // configured with `effort = "max"` AND an explicit small
-    // `budget_ms` would otherwise still get the 2-pass override applied
-    // even though its ACTUAL effective budget can't afford it. Callers
-    // that deliberately ignore the persisted override when a LIVE
-    // operator action supersedes it (`cycle_decode_effort`,
-    // `try_switch_operating_mode` — both documented as ignoring it, the
-    // same way `cycle_decode_effort` ignores it for the budget atomic
-    // itself) pass `None` here too, for the same reason.
-    budget_override: Option<u64>,
+    // Round-12-of-PAN-157 review finding: an earlier version of this
+    // parameter was `budget_override: Option<u64>` (the STARTUP config
+    // value) — wrong axis. `try_switch_operating_mode` passed `None`
+    // for it unconditionally, on the theory that a live operator action
+    // ignores the persisted override the same way `cycle_decode_effort`
+    // does — but `cycle_decode_effort` ALSO reseeds
+    // `decode_effort_budget_ms` to the plain preset value, so `None`
+    // was consistent with the atomic's actual post-call state there. A
+    // mode switch does NOT touch `decode_effort_budget_ms` at all — the
+    // atomic keeps whatever it held before (possibly an explicit
+    // startup `budget_ms` override), so passing `None` there was
+    // internally inconsistent: it could re-enable the override while
+    // the REAL atomic stayed at a too-small explicit budget.
+    //
+    // Fixed by asking every caller for what actually matters: the
+    // resolved EFFECTIVE per-window budget this call will leave in
+    // place (`decode_effort_budget_ms`'s own `0`-means-unlimited-or-
+    // ceiling convention — see `preset_budget_ms`), not whether a
+    // persisted override happens to exist. Each call site already
+    // knows or can read this value directly:
+    // - Startup / `tier.rs`'s two paths: `budget_override.unwrap_or_else
+    //   (|| preset_budget_ms(effort, tier))` — literally what
+    //   `seed_effort_budget` is about to store, computed the same way.
+    // - `tui_relay.rs`'s `CycleDecodeEffort` handler: the `budget_ms`
+    //   `cycle_decode_effort` already computed and stored — pass it
+    //   directly instead of recomputing.
+    // - `try_switch_operating_mode`: reads `decode_effort_budget_ms`
+    //   fresh, since a mode switch never changes it — always correct by
+    //   construction, unlike guessing `None`.
+    effective_budget_ms: u64,
     config: &mut Ft8Config,
 ) {
     match resolve_effective_effort(effort, tier) {
@@ -314,11 +329,11 @@ pub(crate) fn apply_effort_overrides(
         // the correct un-overridden defaults, not a stale FT8 override.
         DecodeEffort::Max
             if config.protocol == pancetta_ft8::Protocol::Ft8
-                && budget_override
-                    .map(|ms| {
-                        ms >= super::ft8::decode_budget_ceiling_ms(config.protocol.slot_ns() as u64)
-                    })
-                    .unwrap_or(true) =>
+                && (effective_budget_ms == 0
+                    || effective_budget_ms
+                        >= super::ft8::decode_budget_ceiling_ms(
+                            config.protocol.slot_ns() as u64
+                        )) =>
         {
             config.max_decode_passes = 2;
             config.time_varying_subtraction_enabled = true;
@@ -497,7 +512,7 @@ mod tests {
                 HardwareTier::Fast,
             ] {
                 let mut config = Ft8Config::default();
-                apply_effort_overrides(effort, tier, None, &mut config);
+                apply_effort_overrides(effort, tier, 0, &mut config);
                 // `Ft8Config` doesn't derive `PartialEq` (too many fields to
                 // justify adding it just for this guard); compare via
                 // `Debug` instead, which is already derived and structural.
@@ -530,7 +545,7 @@ mod tests {
             HardwareTier::Fast,
         ] {
             let mut config = Ft8Config::default();
-            apply_effort_overrides(DecodeEffort::Max, tier, None, &mut config);
+            apply_effort_overrides(DecodeEffort::Max, tier, 0, &mut config);
             assert_eq!(
                 config.max_decode_passes, 2,
                 "Max on {tier:?} must enable the second decode pass"
@@ -552,7 +567,7 @@ mod tests {
             protocol: pancetta_ft8::Protocol::Ft4,
             ..Ft8Config::default()
         };
-        apply_effort_overrides(DecodeEffort::Max, HardwareTier::Fast, None, &mut config);
+        apply_effort_overrides(DecodeEffort::Max, HardwareTier::Fast, 0, &mut config);
         assert_eq!(
             config.max_decode_passes, 1,
             "FT4 + Max must NOT enable the FT8-only second pass"
@@ -576,10 +591,10 @@ mod tests {
             DecodeEffort::Deep,
         ] {
             let mut config = Ft8Config::default();
-            apply_effort_overrides(DecodeEffort::Max, HardwareTier::Fast, None, &mut config);
+            apply_effort_overrides(DecodeEffort::Max, HardwareTier::Fast, 0, &mut config);
             assert_eq!(config.max_decode_passes, 2, "sanity: Max applied first");
 
-            apply_effort_overrides(next, HardwareTier::Fast, None, &mut config);
+            apply_effort_overrides(next, HardwareTier::Fast, 0, &mut config);
             assert_eq!(
                 config.max_decode_passes, 1,
                 "{next:?} must clear Max's max_decode_passes override, not inherit it"
@@ -600,12 +615,7 @@ mod tests {
             protocol: pancetta_ft8::Protocol::Ft4,
             ..Ft8Config::default()
         };
-        apply_effort_overrides(
-            DecodeEffort::Standard,
-            HardwareTier::Fast,
-            None,
-            &mut config,
-        );
+        apply_effort_overrides(DecodeEffort::Standard, HardwareTier::Fast, 0, &mut config);
         assert_eq!(config.protocol, pancetta_ft8::Protocol::Ft4);
     }
 
@@ -617,12 +627,7 @@ mod tests {
     #[test]
     fn max_preset_does_not_override_when_explicit_budget_is_too_small() {
         let mut config = Ft8Config::default();
-        apply_effort_overrides(
-            DecodeEffort::Max,
-            HardwareTier::Fast,
-            Some(250),
-            &mut config,
-        );
+        apply_effort_overrides(DecodeEffort::Max, HardwareTier::Fast, 250, &mut config);
         assert_eq!(
             config.max_decode_passes, 1,
             "an explicit 250ms override can't afford the second pass, \
@@ -638,12 +643,7 @@ mod tests {
     #[test]
     fn max_preset_overrides_when_explicit_budget_meets_the_ceiling() {
         let mut config = Ft8Config::default();
-        apply_effort_overrides(
-            DecodeEffort::Max,
-            HardwareTier::Fast,
-            Some(2000),
-            &mut config,
-        );
+        apply_effort_overrides(DecodeEffort::Max, HardwareTier::Fast, 2000, &mut config);
         assert_eq!(config.max_decode_passes, 2);
         assert!(config.time_varying_subtraction_enabled);
     }
@@ -654,7 +654,7 @@ mod tests {
     #[test]
     fn max_preset_overrides_when_there_is_no_explicit_budget() {
         let mut config = Ft8Config::default();
-        apply_effort_overrides(DecodeEffort::Max, HardwareTier::Fast, None, &mut config);
+        apply_effort_overrides(DecodeEffort::Max, HardwareTier::Fast, 0, &mut config);
         assert_eq!(config.max_decode_passes, 2);
         assert!(config.time_varying_subtraction_enabled);
     }
