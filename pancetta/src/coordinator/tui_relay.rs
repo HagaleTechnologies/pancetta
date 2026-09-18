@@ -1667,6 +1667,8 @@ impl super::ApplicationCoordinator {
                                 &cmd_active_protocol_mode,
                                 &cmd_active_slot_ns,
                                 &cmd_active_decode_phase_ns,
+                                &cmd_current_decode_effort,
+                                &cmd_resolved_hardware_tier,
                             ) {
                                 Ok(()) => {
                                     let mode_str = super::mode_str(next).to_string();

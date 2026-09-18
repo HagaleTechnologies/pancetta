@@ -183,6 +183,18 @@ fn resolve_effective_effort(effort: DecodeEffort, tier: HardwareTier) -> DecodeE
 ///   showed a bounded Standard budget can be exhausted by pass 1 ALONE
 ///   on slow-enough hardware, silently starving pass 2 regardless of
 ///   this flag — `Max` sidesteps that failure mode entirely.
+/// - `Max`'s override ALSO requires `config.protocol == Protocol::Ft8`
+///   (round-9 review finding): the coherent-subtraction machinery it
+///   enables is FT8-79-symbol-specific, so on FT4 (105 symbols) a
+///   second pass just repeats the decode against an unchanged residual
+///   — wasted work under FT4's tighter slot budget, not the measured
+///   win. `Max` on any other protocol falls through to the same
+///   explicit-default arm as `Eco`/`Standard`/`Deep`. This is why
+///   `try_switch_operating_mode` (`coordinator/mod.rs`) now re-runs this
+///   function right after writing the new protocol — a bare protocol
+///   switch while already on `Max` previously never re-evaluated the
+///   override at all, leaving an FT8-era override silently active under
+///   the new protocol.
 /// - Every other literal preset (`Eco`/`Standard`/`Deep`) explicitly
 ///   resets both fields to `Ft8Config::default()`'s values (`1`,
 ///   `false`). NOT leaving them untouched: this function mutates
@@ -262,9 +274,25 @@ pub(crate) fn apply_effort_overrides(
             config.max_decode_passes = 1;
             config.time_varying_subtraction_enabled = false;
         }
-        DecodeEffort::Max => {
+        // Round-9-of-PAN-157 review finding (P2/protocol): the coherent-
+        // subtraction machinery this override enables is FT8-79-symbol-
+        // specific (`subtract_signal` hardcodes FT8's `NUM_SYMBOLS`).
+        // FT4 has 105 symbols, so on FT4 a second pass just re-runs the
+        // full decode against an UNCHANGED residual — wasted work under
+        // FT4's tighter 800ms slot budget, not the measured win. Only
+        // apply the override when the config is actually FT8; every
+        // other protocol falls through to the same explicit-default arm
+        // Eco/Standard/Deep use, so a station on `Max` in FT4 (or one
+        // that switches protocol while already on `Max`, via
+        // `try_switch_operating_mode`'s now-added re-application) gets
+        // the correct un-overridden defaults, not a stale FT8 override.
+        DecodeEffort::Max if config.protocol == pancetta_ft8::Protocol::Ft8 => {
             config.max_decode_passes = 2;
             config.time_varying_subtraction_enabled = true;
+        }
+        DecodeEffort::Max => {
+            config.max_decode_passes = 1;
+            config.time_varying_subtraction_enabled = false;
         }
         DecodeEffort::Auto => unreachable!("resolve_effective_effort never returns Auto"),
     }
@@ -478,6 +506,27 @@ mod tests {
                 "Max on {tier:?} must enable time-varying subtraction"
             );
         }
+    }
+
+    /// Round-9 review finding (protocol): `Max`'s override is FT8-79-
+    /// symbol-specific and must NOT apply on any other protocol — a
+    /// second pass on FT4 just repeats the decode against an unchanged
+    /// residual, wasted work under FT4's tighter slot budget.
+    #[test]
+    fn max_preset_does_not_override_on_non_ft8_protocol() {
+        let mut config = Ft8Config {
+            protocol: pancetta_ft8::Protocol::Ft4,
+            ..Ft8Config::default()
+        };
+        apply_effort_overrides(DecodeEffort::Max, HardwareTier::Fast, &mut config);
+        assert_eq!(
+            config.max_decode_passes, 1,
+            "FT4 + Max must NOT enable the FT8-only second pass"
+        );
+        assert!(
+            !config.time_varying_subtraction_enabled,
+            "FT4 + Max must NOT enable the FT8-only override"
+        );
     }
 
     /// Round-9 review finding (P1): `Max`'s override must NOT be sticky
