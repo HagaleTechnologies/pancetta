@@ -12390,13 +12390,30 @@ fn subtract_decode_coherent(
             // the arithmetic (not just the storage) at f64 avoids
             // compounding rounding error across rounds.
             let flat_idx = (t_idx * freq_osr + fs) * num_bins + f_idx;
+            // Round-5 review finding: the same deterministic FFT-bin-
+            // parity artifact that corrupted the drift estimator and
+            // accumulator also misaligns the projection here — `rotor`
+            // was estimated from a CANONICALIZED (parity-corrected)
+            // accumulator, so projecting the RAW (uncorrected) bin
+            // against it is wrong whenever this symbol's tone is odd.
+            // Canonicalize before projecting, un-canonicalize (parity
+            // sign is self-inverse) before subtracting from the raw
+            // bin. `0.0` (every pre-existing call site) skips this
+            // entirely — byte-identical to no canonicalization.
+            let parity = if symbol_phase_drift_rad == 0.0 {
+                1.0
+            } else {
+                tone_parity_sign(tone)
+            };
             let residual = {
                 let complex = spectrogram.complex.as_mut().unwrap();
                 let bin = complex[flat_idx];
                 let bin64 = Complex::new(bin.re as f64, bin.im as f64);
-                let proj_real = (bin64 * effective_rotor_conj).re;
+                let canon_bin64 = bin64 * parity;
+                let proj_real = (canon_bin64 * effective_rotor_conj).re;
                 // hb-081: scale the subtracted projection magnitude.
-                let signal_est = Complex::new(proj_real * scale, 0.0) * effective_rotor;
+                let signal_est_canon = Complex::new(proj_real * scale, 0.0) * effective_rotor;
+                let signal_est = signal_est_canon * parity;
                 let residual = bin64 - signal_est;
                 complex[flat_idx] =
                     Complex::new(residual.re as SpecScalar, residual.im as SpecScalar);
@@ -12677,6 +12694,36 @@ fn compute_costas_complex_accumulator(
     acc
 }
 
+/// PAN-153 round-5 review finding: `par_extract_complex_symbols_from_
+/// spectrogram`'s underlying FFT bin selection (`src_bin = (freq_bin +
+/// tone) * freq_osr + freq_sub`) carries a deterministic, tone-PARITY-
+/// dependent phase — confirmed empirically
+/// (`phase_drift_estimate_is_near_zero_on_a_real_clean_signal`: a real,
+/// clean, non-drifting signal estimated ~-2.7 rad of "drift" before this
+/// fix, not the ~0 a genuinely non-drifting signal should show). Only
+/// the RELATIVE parity between two terms matters for any pairwise
+/// product or sum mixing tones — this returns `-1.0` for an odd tone
+/// and `1.0` for an even one, multiplied onto a term before combining it
+/// with a term of possibly-different tone parity, canceling the
+/// artifact's contribution. Self-inverse (multiplying twice is a no-op),
+/// so the same call also "un-canonicalizes" a reconstructed value back
+/// to the raw basis.
+///
+/// Scope: applied ONLY within this ticket's NEW full-frame code
+/// (`compute_full_frame_complex_accumulator`, this estimator, and
+/// `subtract_decode_coherent`'s full-frame-only branch) — never to the
+/// pre-existing, already-shipped `compute_costas_complex_accumulator`
+/// or the default (`symbol_phase_drift_rad == 0.0`) subtraction path,
+/// which are out of scope for this PR and must stay byte-identical.
+#[inline]
+fn tone_parity_sign(tone: usize) -> f64 {
+    if tone % 2 == 0 {
+        1.0
+    } else {
+        -1.0
+    }
+}
+
 /// PAN-153 round 2 review finding: estimate the symbol-to-symbol phase
 /// drift (radians) from consecutive-pair phase differences at the 21
 /// KNOWN Costas positions. A residual frequency offset — the candidate
@@ -12713,7 +12760,9 @@ fn estimate_symbol_phase_drift_rad(
             if tone_a >= NUM_TONES || tone_b >= NUM_TONES {
                 continue;
             }
-            diff_sum += complex_symbols[sym_b][tone_b] * complex_symbols[sym_a][tone_a].conj();
+            let canon_b = complex_symbols[sym_b][tone_b] * tone_parity_sign(tone_b);
+            let canon_a = complex_symbols[sym_a][tone_a] * tone_parity_sign(tone_a);
+            diff_sum += canon_b * canon_a.conj();
         }
     }
     if diff_sum.norm() < 1e-30 {
@@ -12741,6 +12790,12 @@ fn estimate_symbol_phase_drift_rad(
 /// case, not just the already-guarded `freq_sub == 1` discrete case)
 /// rotates the raw sum toward cancellation, more severely than the
 /// shorter Costas-only sum it's meant to improve on.
+///
+/// Round-5 review finding: also canonicalized per `tone_parity_sign`
+/// before summing — the same deterministic FFT-bin-parity artifact that
+/// corrupted the drift estimator corrupts a raw sum across ALL 8 tones
+/// (unlike the Costas-only sum's fixed 7-tone pattern) just as directly,
+/// independent of any real drift.
 fn compute_full_frame_complex_accumulator(
     pp: &ProtocolParams,
     complex_symbols: &[[Complex<f64>; NUM_TONES]],
@@ -12758,7 +12813,7 @@ fn compute_full_frame_complex_accumulator(
             continue;
         }
         let derotate = Complex::from_polar(1.0, -drift_rad * sym_idx as f64);
-        acc += complex_symbols[sym_idx][tone] * derotate;
+        acc += complex_symbols[sym_idx][tone] * tone_parity_sign(tone) * derotate;
     }
     acc
 }
@@ -18264,6 +18319,70 @@ mod tests {
     // BASE_FREQUENCY (1500 Hz). `modulate_symbols(symbols, freq_offset)`
     // emits at `1500 + freq_offset` Hz. Costas freq_bins are spaced at
     // tone_spacing = 6.25 Hz, so freq_bin = total_hz / 6.25.
+    /// PAN-153 round-5 review finding: verify `estimate_symbol_phase_
+    /// drift_rad` against a REAL spectrogram built through the actual
+    /// FFT/windowing pipeline (`compute_spectrogram` + a real Costas
+    /// sync search), not a hand-built synthetic `complex_symbols` array
+    /// like every other test in this file uses. The finding claims a
+    /// deterministic tone-parity FFT artifact makes the estimator's
+    /// `diff_sum` "nearly cancel even for a clean zero-drift signal" --
+    /// a claim my existing synthetic-array tests structurally CANNOT
+    /// catch (they inject values directly, bypassing the real FFT
+    /// extraction entirely). A clean, on-frequency (freq_bin exactly on
+    /// the 6.25 Hz lattice, so freq_sub == 0), non-drifting synthetic
+    /// FT8 transmission should report a drift estimate near zero if the
+    /// finding is wrong, or something large/noisy if it's right.
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn phase_drift_estimate_is_near_zero_on_a_real_clean_signal() {
+        let mut encoder = crate::Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("CQ K5ARH EM10", None)
+            .expect("encode");
+        let mut modulator = crate::Ft8Modulator::new_default().expect("modulator");
+        // 1500 (base) + 500 = 2000 Hz = 320 * 6.25 Hz -> exactly on the
+        // freq_bin lattice, so the truth candidate's freq_sub == 0.
+        let mut tx = modulator
+            .modulate_symbols(&symbols, 500.0)
+            .expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+        let tx_f64: Vec<f64> = tx.iter().map(|&s| s as f64).collect();
+
+        let decoder = Ft8Decoder::new(Ft8Config::default())
+            .expect("decoder (cross_cycle_coherent default-on)");
+        let spectrogram = decoder
+            .compute_spectrogram(&tx_f64)
+            .expect("spectrogram (complex retained by default)");
+        let pp = ProtocolParams::ft8();
+        let candidates = decoder
+            .costas_sync_search(&spectrogram, None)
+            .expect("costas sync search");
+        let truth = candidates
+            .iter()
+            .find(|c| c.freq_bin == 320 && c.freq_sub == 0)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a freq_sub==0 candidate at freq_bin=320; got: {:?}",
+                    candidates
+                        .iter()
+                        .map(|c| (c.freq_bin, c.freq_sub, c.sync_score))
+                        .collect::<Vec<_>>()
+                )
+            });
+        let cs = par_extract_complex_symbols_from_spectrogram(&pp, &spectrogram, truth)
+            .expect("complex retention present");
+
+        let drift = estimate_symbol_phase_drift_rad(&pp, &cs);
+        assert!(
+            drift.abs() < 0.05,
+            "a clean, non-drifting, on-lattice real signal should estimate \
+             near-zero drift; got {drift} rad — if this fails, the \
+             tone-parity FFT artifact finding is confirmed and the \
+             estimator needs the phase-canonicalization fix, not just \
+             this assertion loosened"
+        );
+    }
+
     #[cfg(feature = "transmit")]
     #[test]
     fn test_scoped_decode_within_range_recovers_message() {
@@ -21764,21 +21883,24 @@ mod three_stage_sync_tests {
         );
     }
 
-    /// Build a `complex_symbols` table where `complex_symbols[sym][tone]
-    /// == Complex::new(1.0 + sym as f64 + tone as f64 * 0.01, 0.0)` — a
-    /// distinct, REAL-valued (zero-phase) marker per (symbol, tone)
-    /// cell. Every term therefore has phase 0, so
-    /// `estimate_symbol_phase_drift_rad` reads exactly 0 drift and the
-    /// derotation `compute_full_frame_complex_accumulator` applies is a
-    /// no-op — keeping the sum exactly checkable against a
-    /// hand-computed expectation while still exercising the (trivial,
-    /// zero-drift) derotation path.
+    /// Build a `complex_symbols` table where the CANONICALIZED value
+    /// (after the production code's own `tone_parity_sign` correction)
+    /// is `Complex::new(1.0 + sym as f64 + tone as f64 * 0.01, 0.0)` — a
+    /// distinct, real-valued (zero-phase) marker per (symbol, tone)
+    /// cell. The RAW stored value bakes in `tone_parity_sign(tone)` up
+    /// front (round-5 review finding: real extracted bins carry this
+    /// same deterministic per-tone-parity artifact, and production code
+    /// now cancels it before use) so canonicalization exactly recovers
+    /// the clean marker — keeping the sum checkable against a
+    /// hand-computed expectation while still exercising the real
+    /// canonicalization + (trivial, zero-drift) derotation paths.
     fn marker_complex_symbols(num_symbols: usize) -> Vec<[Complex<f64>; NUM_TONES]> {
         (0..num_symbols)
             .map(|sym| {
                 let mut row = [Complex::new(0.0, 0.0); NUM_TONES];
                 for (tone, cell) in row.iter_mut().enumerate() {
-                    *cell = Complex::new(1.0 + sym as f64 + tone as f64 * 0.01, 0.0);
+                    let canonical = 1.0 + sym as f64 + tone as f64 * 0.01;
+                    *cell = Complex::new(canonical * tone_parity_sign(tone), 0.0);
                 }
                 row
             })
@@ -21863,6 +21985,10 @@ mod three_stage_sync_tests {
     /// carries unit magnitude and phase `drift_rad * sym` — a synthetic
     /// constant per-symbol phase drift, the exact effect a residual
     /// frequency offset produces on a real signal.
+    /// Round-5 review finding: bakes in `tone_parity_sign(tone)` up
+    /// front, same as `marker_complex_symbols`, so production's own
+    /// canonicalization recovers the clean `drift_rad * sym` phase this
+    /// doc describes.
     fn drifting_complex_symbols(
         pp: &ProtocolParams,
         tone_symbols: &[u8],
@@ -21873,7 +21999,8 @@ mod three_stage_sync_tests {
                 let mut row = [Complex::new(0.0, 0.0); NUM_TONES];
                 let tone = tone_symbols[sym] as usize;
                 if tone < NUM_TONES {
-                    row[tone] = Complex::from_polar(1.0, drift_rad * sym as f64);
+                    row[tone] =
+                        Complex::from_polar(1.0, drift_rad * sym as f64) * tone_parity_sign(tone);
                 }
                 row
             })
@@ -21943,7 +22070,10 @@ mod three_stage_sync_tests {
                 // substep is `1/steps_per_symbol` of a symbol period
                 // further ahead, matching real FFT phase behavior.
                 let frac_symbol = sym_idx as f64 + s as f64 / steps_per_symbol as f64;
-                let phasor = Complex::from_polar(1.0f32, (drift_rad * frac_symbol) as f32);
+                // Round-5 review finding: bake in tone_parity_sign, same
+                // as the other synthetic-data helpers.
+                let phasor = Complex::from_polar(1.0f32, (drift_rad * frac_symbol) as f32)
+                    * tone_parity_sign(tone) as f32;
                 let flat_idx = (t_idx * freq_osr + seed_freq_sub) * num_bins + f_idx;
                 complex[flat_idx] = phasor;
                 power[flat_idx] = (10.0 * (1e-12_f64 + 1.0).log10()) as SpecScalar;
