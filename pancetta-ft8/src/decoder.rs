@@ -602,6 +602,18 @@ pub struct Ft8Config {
     /// a second, independent, deterministic layer rather than relying on
     /// the estimator alone at that specific instability.
     ///
+    /// **Round-3 review finding, subtraction corrected too:** derotating
+    /// the ACCUMULATOR only fixed the rotor ESTIMATE — the resulting
+    /// `rotor` is referenced to symbol 0's phase, but
+    /// `coherent_subtract_and_repass` was still handing that single
+    /// constant rotor to `subtract_decode_coherent`, which applied it
+    /// identically at all 79 symbols. Under real drift, that leaves a
+    /// residual proportional to `sin(drift_rad * s)` — growing with
+    /// distance from symbol 0 — instead of cleanly removing the signal.
+    /// `subtract_decode_coherent` now takes the SAME estimated drift and
+    /// applies a per-symbol-corrected effective rotor during subtraction
+    /// too (`0.0` for every other, pre-existing caller — an exact no-op).
+    ///
     /// More samples averaged into a (now-derotated) coherent accumulator
     /// should mean a lower-variance phase/magnitude estimate (√79/√21 ≈
     /// 1.9× the effective averaging), at the cost of trusting the
@@ -7943,9 +7955,9 @@ impl Ft8Decoder {
             // now derotates each term using a drift estimate from the
             // known Costas positions before summing (see its doc and
             // `estimate_symbol_phase_drift_rad`).
-            let acc = if self.config.coherent_subtract_full_frame_reference_enabled
-                && candidate.freq_sub == 0
-            {
+            let full_frame_active = self.config.coherent_subtract_full_frame_reference_enabled
+                && candidate.freq_sub == 0;
+            let acc = if full_frame_active {
                 compute_full_frame_complex_accumulator(pp, &cs, tone_symbols)
             } else {
                 compute_costas_complex_accumulator(pp, &cs)
@@ -7960,7 +7972,25 @@ impl Ft8Decoder {
             } else {
                 1.0
             };
-            subtract_decode_coherent(spectrogram, pp, &candidate, rotor, tone_symbols, scale);
+            // PAN-153 round-3 review finding: the rotor above was
+            // derotated to a symbol-0 reference (when `full_frame_active`),
+            // so subtraction must apply the SAME drift back, per symbol,
+            // or the constant `rotor` only correctly represents symbol
+            // 0's phase and leaves a growing residual at later symbols.
+            let symbol_phase_drift_rad = if full_frame_active {
+                estimate_symbol_phase_drift_rad(pp, &cs)
+            } else {
+                0.0
+            };
+            subtract_decode_coherent(
+                spectrogram,
+                pp,
+                &candidate,
+                rotor,
+                tone_symbols,
+                scale,
+                symbol_phase_drift_rad,
+            );
             subtracted_candidates.push(candidate);
         }
         if subtracted_candidates.is_empty() {
@@ -12288,6 +12318,19 @@ fn subtract_decode_coherent(
     // (hb-079 default); <1.0 reduces the magnitude (MRC weighting from a
     // noisy-rotor caller). Outside [0,1] is clamped.
     scale: f64,
+    // PAN-153 round-3 review finding: a single constant `rotor` assumes
+    // the true signal phase is the SAME at every one of `pp.num_symbols`
+    // positions. When the caller estimated `rotor` from a derotated
+    // accumulator (`compute_full_frame_complex_accumulator`, referenced
+    // to symbol 0), the true phase at symbol `s` is actually
+    // `symbol_phase_drift_rad * s` AHEAD of `rotor` — projecting with
+    // the same constant rotor at every symbol would leave a residual
+    // proportional to `sin(symbol_phase_drift_rad * s)`, growing with
+    // distance from symbol 0, instead of cleanly removing the signal.
+    // `0.0` (every existing caller before this ticket) is an EXACT
+    // no-op, skipped entirely rather than multiplying by
+    // `exp(j*0*s) == 1` — byte-identical to not having this parameter.
+    symbol_phase_drift_rad: f64,
 ) {
     if spectrogram.complex.is_none() {
         return;
@@ -12303,7 +12346,6 @@ fn subtract_decode_coherent(
         return;
     }
     let steps_per_symbol = TIME_OSR;
-    let rotor_conj = rotor.conj();
 
     for sym_idx in 0..pp.num_symbols.min(tone_symbols.len()) {
         let tone = tone_symbols[sym_idx] as usize;
@@ -12314,6 +12356,15 @@ fn subtract_decode_coherent(
         if f_idx >= num_bins {
             continue;
         }
+        // Per-symbol effective rotor: byte-identical to the original
+        // constant `rotor` when `symbol_phase_drift_rad == 0.0` (every
+        // pre-existing call site).
+        let effective_rotor = if symbol_phase_drift_rad == 0.0 {
+            rotor
+        } else {
+            rotor * Complex::from_polar(1.0, symbol_phase_drift_rad * sym_idx as f64)
+        };
+        let effective_rotor_conj = effective_rotor.conj();
         let t_base = t0 + sym_idx * steps_per_symbol;
         for s in 0..steps_per_symbol {
             let t_idx = t_base + s;
@@ -12334,9 +12385,9 @@ fn subtract_decode_coherent(
                 let complex = spectrogram.complex.as_mut().unwrap();
                 let bin = complex[flat_idx];
                 let bin64 = Complex::new(bin.re as f64, bin.im as f64);
-                let proj_real = (bin64 * rotor_conj).re;
+                let proj_real = (bin64 * effective_rotor_conj).re;
                 // hb-081: scale the subtracted projection magnitude.
-                let signal_est = Complex::new(proj_real * scale, 0.0) * rotor;
+                let signal_est = Complex::new(proj_real * scale, 0.0) * effective_rotor;
                 let residual = bin64 - signal_est;
                 complex[flat_idx] =
                     Complex::new(residual.re as SpecScalar, residual.im as SpecScalar);
@@ -21654,8 +21705,24 @@ mod three_stage_sync_tests {
             "synthetic signal has non-zero Costas accumulator"
         );
         let rotor = acc / mag;
-        subtract_decode_coherent(&mut spec_off, &pp, &legacy_candidate, rotor, &tones, 1.0);
-        subtract_decode_coherent(&mut spec_on, &pp, &refined_candidate, rotor, &tones, 1.0);
+        subtract_decode_coherent(
+            &mut spec_off,
+            &pp,
+            &legacy_candidate,
+            rotor,
+            &tones,
+            1.0,
+            0.0,
+        );
+        subtract_decode_coherent(
+            &mut spec_on,
+            &pp,
+            &refined_candidate,
+            rotor,
+            &tones,
+            1.0,
+            0.0,
+        );
 
         let num_bins = spec_off.num_bins;
         let freq_osr = spec_off.freq_osr;
@@ -21821,6 +21888,151 @@ mod three_stage_sync_tests {
                 "known_drift={known_drift}, estimated={estimated}"
             );
         }
+    }
+
+    /// Sibling of `build_clean_spectrogram` that places a DRIFTING
+    /// (not flat) phase: `Complex::from_polar(1.0, drift_rad * sym_idx)`
+    /// at every symbol's expected-tone position, on both `TIME_OSR`
+    /// substeps — the exact signal shape `estimate_symbol_phase_drift_rad`
+    /// is designed to detect and `subtract_decode_coherent`'s new
+    /// `symbol_phase_drift_rad` parameter is designed to remove.
+    fn build_drifting_spectrogram(
+        pp: &ProtocolParams,
+        seed_time: usize,
+        seed_freq_bin: usize,
+        seed_freq_sub: usize,
+        tone_symbols: &[u8],
+        drift_rad: f64,
+        pad: usize,
+    ) -> Spectrogram {
+        let steps_per_symbol = TIME_OSR;
+        let num_steps = seed_time + pp.num_symbols * steps_per_symbol + pad;
+        let num_bins = seed_freq_bin + NUM_TONES + pad;
+        let freq_osr = FREQ_OSR;
+
+        let mut power: Vec<SpecScalar> = vec![-120.0; num_steps * freq_osr * num_bins];
+        let mut complex =
+            vec![Complex::<SpecScalar>::new(0.0, 0.0); num_steps * freq_osr * num_bins];
+
+        for sym_idx in 0..pp.num_symbols.min(tone_symbols.len()) {
+            let tone = tone_symbols[sym_idx] as usize;
+            if tone >= NUM_TONES {
+                continue;
+            }
+            let f_idx = seed_freq_bin + tone;
+            if f_idx >= num_bins {
+                continue;
+            }
+            let t_base = seed_time + sym_idx * steps_per_symbol;
+            let phasor = Complex::from_polar(1.0f32, (drift_rad * sym_idx as f64) as f32);
+            for s in 0..steps_per_symbol {
+                let t_idx = t_base + s;
+                if t_idx >= num_steps {
+                    continue;
+                }
+                let flat_idx = (t_idx * freq_osr + seed_freq_sub) * num_bins + f_idx;
+                complex[flat_idx] = phasor;
+                power[flat_idx] = (10.0 * (1e-12_f64 + 1.0).log10()) as SpecScalar;
+            }
+        }
+
+        Spectrogram {
+            power,
+            complex: Some(complex),
+            num_steps,
+            num_bins,
+            freq_osr,
+            time_padding: 0,
+        }
+    }
+
+    #[test]
+    fn subtract_decode_coherent_with_drift_correction_removes_a_drifting_signal() {
+        // Round-3 review finding: `rotor` derotated from a full-frame
+        // accumulator only represents symbol 0's phase. Subtracting
+        // with that constant rotor and NO per-symbol correction leaves
+        // a growing residual under drift; passing the SAME estimated
+        // drift into `subtract_decode_coherent` should clean it up.
+        let pp = ProtocolParams::ft8();
+        let mut tone_symbols = vec![0u8; pp.num_symbols];
+        for (m, &group_start) in pp.costas_positions.iter().enumerate() {
+            for k in 0..pp.costas_length {
+                tone_symbols[group_start + k] = pp.costas_arrays[m][k];
+            }
+        }
+        let drift = 0.08;
+        let seed_time = 5;
+        let seed_freq_bin = 50;
+        let seed_freq_sub = 0;
+        let candidate = CostasCandidate {
+            time_step: seed_time,
+            freq_bin: seed_freq_bin,
+            freq_sub: seed_freq_sub,
+            sync_score: 0.0,
+            time_refinement: 0.0,
+        };
+
+        let mut spec_corrected = build_drifting_spectrogram(
+            &pp,
+            seed_time,
+            seed_freq_bin,
+            seed_freq_sub,
+            &tone_symbols,
+            drift,
+            4,
+        );
+        let mut spec_uncorrected = build_drifting_spectrogram(
+            &pp,
+            seed_time,
+            seed_freq_bin,
+            seed_freq_sub,
+            &tone_symbols,
+            drift,
+            4,
+        );
+
+        let cs = par_extract_complex_symbols_from_spectrogram(&pp, &spec_corrected, &candidate)
+            .expect("complex retention present");
+        let acc = compute_full_frame_complex_accumulator(&pp, &cs, &tone_symbols);
+        let rotor = acc / acc.norm();
+        let estimated_drift = estimate_symbol_phase_drift_rad(&pp, &cs);
+
+        subtract_decode_coherent(
+            &mut spec_corrected,
+            &pp,
+            &candidate,
+            rotor,
+            &tone_symbols,
+            1.0,
+            estimated_drift,
+        );
+        subtract_decode_coherent(
+            &mut spec_uncorrected,
+            &pp,
+            &candidate,
+            rotor,
+            &tone_symbols,
+            1.0,
+            0.0,
+        );
+
+        let residual_energy = |spec: &Spectrogram| -> f64 {
+            spec.complex
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|c| (c.re as f64).powi(2) + (c.im as f64).powi(2))
+                .sum()
+        };
+        let corrected_energy = residual_energy(&spec_corrected);
+        let uncorrected_energy = residual_energy(&spec_uncorrected);
+
+        assert!(
+            corrected_energy < uncorrected_energy * 0.1,
+            "drift-corrected subtraction should leave far less residual \
+             energy than uncorrected: corrected={corrected_energy}, \
+             uncorrected={uncorrected_energy}"
+        );
     }
 
     #[test]
