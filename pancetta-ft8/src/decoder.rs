@@ -575,25 +575,41 @@ pub struct Ft8Config {
     /// comment ("rotor reference set (21 Costas symbols vs all 79), not
     /// in algorithm").
     ///
-    /// More samples averaged into the accumulator should mean a
-    /// lower-variance phase/magnitude estimate (√79/√21 ≈ 1.9× the
-    /// effective averaging), at the cost of trusting the decoded tones at
-    /// the 58 extra positions — rare to be wrong given CRC validation, but
-    /// not impossible (undetected CRC collision). Whether the lower
-    /// estimator variance actually improves subtraction quality (and
-    /// therefore residual/repass recall) enough to matter is unmeasured.
+    /// **Round-1 review finding, restricted scope:** at
+    /// `candidate.freq_sub == 1` (the fractional/oversampled sub-bin),
+    /// consecutive symbols' bins carry a systematic sub-bin phase
+    /// rotation distinct from the general residual-offset drift below —
+    /// close enough to π that the phase-drift estimator's `.arg()` call
+    /// is numerically unstable right at the wraparound boundary. The
+    /// call site (`coherent_subtract_and_repass`) therefore still only
+    /// applies this widening at `freq_sub == 0`; `freq_sub == 1`
+    /// candidates always fall back to the Costas-only accumulator
+    /// regardless of this flag, as a deterministic guard rather than
+    /// relying on the noisy near-π estimate.
     ///
-    /// **Review finding, restricted scope:** at `candidate.freq_sub == 1`
-    /// (the fractional/oversampled sub-bin), consecutive symbols' bins
-    /// carry a systematic sub-bin phase rotation a raw sum doesn't
-    /// correct for — summing more terms from an alternating-phase series
-    /// cancels MORE, not less, unlike the Costas-only sum's smaller,
-    /// odd-grouped term count. The call site (`coherent_subtract_and_
-    /// repass`) therefore only applies this widening at `freq_sub == 0`;
-    /// `freq_sub == 1` candidates always fall back to the Costas-only
-    /// accumulator regardless of this flag. Extending to `freq_sub == 1`
-    /// needs a derotated accumulator (correcting each term's phase
-    /// before summing), not implemented here.
+    /// **Round-2 review finding, derotation added:** `freq_sub == 0`
+    /// alone does NOT guarantee a common phase across symbols — a real
+    /// off-air carrier normally sits between lattice points (this is the
+    /// NORMAL case, not an edge case), and a raw sum over more terms
+    /// decoheres FASTER under the same per-symbol residual-offset drift
+    /// than the shorter Costas-only sum does. `compute_full_frame_
+    /// complex_accumulator` now estimates the drift from consecutive-
+    /// pair phase differences at the 21 known Costas positions
+    /// (`estimate_symbol_phase_drift_rad`) and derotates every term
+    /// before summing, which corrects for both this and (empirically,
+    /// per its own regression test) drift magnitudes comparable to the
+    /// `freq_sub == 1` case — the `freq_sub == 0` guard above is kept as
+    /// a second, independent, deterministic layer rather than relying on
+    /// the estimator alone at that specific instability.
+    ///
+    /// More samples averaged into a (now-derotated) coherent accumulator
+    /// should mean a lower-variance phase/magnitude estimate (√79/√21 ≈
+    /// 1.9× the effective averaging), at the cost of trusting the
+    /// decoded tones at the 58 extra positions — rare to be wrong given
+    /// CRC validation, but not impossible (undetected CRC collision).
+    /// Whether the lower estimator variance actually improves
+    /// subtraction quality (and therefore residual/repass recall) enough
+    /// to matter is unmeasured.
     ///
     /// Default **false**: needs its own A/B (`compare` scorecard, not
     /// this doc comment) before flipping — same discipline as every other
@@ -7908,19 +7924,25 @@ impl Ft8Decoder {
             // does not, so it keeps using the Costas-only accumulator
             // unconditionally.
             //
-            // Review finding: at `candidate.freq_sub == 1` (the
+            // Round-1 review finding: at `candidate.freq_sub == 1` (the
             // fractional/oversampled sub-bin — `FREQ_OSR == 2`, so this is
             // the only other value), consecutive symbols' extracted bins
-            // carry a systematic phase rotation from the sub-bin offset
-            // that a raw sum doesn't correct for. Summing MORE terms from
-            // an alternating-phase series makes cancellation WORSE, not
-            // better — the 21-term Costas-only sum happens to retain a
-            // net signal from its 3-groups-of-7 (odd count) structure,
-            // but a 79-term raw sum over mostly-consecutive symbols
-            // cancels far more severely. Restrict the widened reference
-            // to `freq_sub == 0`, where this cancellation doesn't apply,
-            // until a derotated version (correcting each term's phase
-            // before summing) is implemented and re-verified.
+            // carry a phase rotation close enough to π that the
+            // drift estimator below is numerically unstable right at
+            // that wraparound boundary. Kept as a deterministic guard:
+            // restrict the widened reference to `freq_sub == 0`, where
+            // `compute_full_frame_complex_accumulator`'s derotation
+            // (round-2 review finding, corrects for the general
+            // residual-frequency-offset case) is reliable.
+            //
+            // Round-2 review finding: `freq_sub == 0` alone does NOT
+            // guarantee a common phase across symbols — a real off-air
+            // carrier normally sits between lattice points, and a raw
+            // sum decoheres faster with more terms under the same
+            // residual drift. `compute_full_frame_complex_accumulator`
+            // now derotates each term using a drift estimate from the
+            // known Costas positions before summing (see its doc and
+            // `estimate_symbol_phase_drift_rad`).
             let acc = if self.config.coherent_subtract_full_frame_reference_enabled
                 && candidate.freq_sub == 0
             {
@@ -12595,6 +12617,51 @@ fn compute_costas_complex_accumulator(
     acc
 }
 
+/// PAN-153 round 2 review finding: estimate the symbol-to-symbol phase
+/// drift (radians) from consecutive-pair phase differences at the 21
+/// KNOWN Costas positions. A residual frequency offset — the candidate
+/// isn't exactly on a lattice point, which is the NORMAL case for a
+/// real off-air carrier, not an edge case — rotates each symbol's
+/// extracted bin by a roughly constant extra phase each symbol; a raw
+/// sum over many terms without correcting for this decoheres faster the
+/// more terms are summed (a fixed per-symbol drift that a 21-term sum
+/// tolerates can nearly fully cancel a 79-term sum). Estimated via
+/// vector-summed consecutive differences (`b · conj(a)`, not naive angle
+/// subtraction) so opposite-signed noisy estimates partially cancel
+/// instead of biasing a wraparound-prone average; restricted to pairs
+/// WITHIN the same Costas group (the three groups sit at fixed,
+/// non-adjacent positions 0-6/36-42/72-78, so a cross-group difference
+/// would mix real drift with the unrelated gap between groups).
+fn estimate_symbol_phase_drift_rad(
+    pp: &ProtocolParams,
+    complex_symbols: &[[Complex<f64>; NUM_TONES]],
+) -> f64 {
+    let mut diff_sum = Complex::<f64>::new(0.0, 0.0);
+    for (m, &group_start) in pp.costas_positions.iter().enumerate() {
+        for k in 0..pp.costas_length.saturating_sub(1) {
+            let sym_a = group_start + k;
+            let sym_b = group_start + k + 1;
+            if sym_b >= complex_symbols.len() {
+                continue;
+            }
+            let (Some(&tone_a), Some(&tone_b)) =
+                (pp.costas_arrays[m].get(k), pp.costas_arrays[m].get(k + 1))
+            else {
+                continue;
+            };
+            let (tone_a, tone_b) = (tone_a as usize, tone_b as usize);
+            if tone_a >= NUM_TONES || tone_b >= NUM_TONES {
+                continue;
+            }
+            diff_sum += complex_symbols[sym_b][tone_b] * complex_symbols[sym_a][tone_a].conj();
+        }
+    }
+    if diff_sum.norm() < 1e-30 {
+        return 0.0;
+    }
+    diff_sum.arg()
+}
+
 /// PAN-153: sibling of [`compute_costas_complex_accumulator`] that sums
 /// the candidate's complex FFT bins at ALL `pp.num_symbols` (79 for FT8)
 /// positions instead of just the 21 Costas ones, using `tone_symbols`
@@ -12607,11 +12674,19 @@ fn compute_costas_complex_accumulator(
 /// doesn't) means a lower-variance phase/magnitude estimate — see
 /// `Ft8Config::coherent_subtract_full_frame_reference_enabled`'s doc for
 /// the tradeoff this trades against.
+///
+/// Each term is derotated by `estimate_symbol_phase_drift_rad`'s
+/// estimate (relative to symbol 0) before summing — round-2 review
+/// finding: without this, ANY residual frequency offset (the normal
+/// case, not just the already-guarded `freq_sub == 1` discrete case)
+/// rotates the raw sum toward cancellation, more severely than the
+/// shorter Costas-only sum it's meant to improve on.
 fn compute_full_frame_complex_accumulator(
     pp: &ProtocolParams,
     complex_symbols: &[[Complex<f64>; NUM_TONES]],
     tone_symbols: &[u8],
 ) -> Complex<f64> {
+    let drift_rad = estimate_symbol_phase_drift_rad(pp, complex_symbols);
     let mut acc = Complex::<f64>::new(0.0, 0.0);
     let n = pp
         .num_symbols
@@ -12622,7 +12697,8 @@ fn compute_full_frame_complex_accumulator(
         if tone >= NUM_TONES {
             continue;
         }
-        acc += complex_symbols[sym_idx][tone];
+        let derotate = Complex::from_polar(1.0, -drift_rad * sym_idx as f64);
+        acc += complex_symbols[sym_idx][tone] * derotate;
     }
     acc
 }
@@ -21613,15 +21689,20 @@ mod three_stage_sync_tests {
     }
 
     /// Build a `complex_symbols` table where `complex_symbols[sym][tone]
-    /// == Complex::new(sym as f64, tone as f64)` — a distinct marker per
-    /// (symbol, tone) cell, so summing at chosen (sym, tone) pairs is
-    /// exactly checkable against a hand-computed expectation.
+    /// == Complex::new(1.0 + sym as f64 + tone as f64 * 0.01, 0.0)` — a
+    /// distinct, REAL-valued (zero-phase) marker per (symbol, tone)
+    /// cell. Every term therefore has phase 0, so
+    /// `estimate_symbol_phase_drift_rad` reads exactly 0 drift and the
+    /// derotation `compute_full_frame_complex_accumulator` applies is a
+    /// no-op — keeping the sum exactly checkable against a
+    /// hand-computed expectation while still exercising the (trivial,
+    /// zero-drift) derotation path.
     fn marker_complex_symbols(num_symbols: usize) -> Vec<[Complex<f64>; NUM_TONES]> {
         (0..num_symbols)
             .map(|sym| {
                 let mut row = [Complex::new(0.0, 0.0); NUM_TONES];
                 for (tone, cell) in row.iter_mut().enumerate() {
-                    *cell = Complex::new(sym as f64, tone as f64);
+                    *cell = Complex::new(1.0 + sym as f64 + tone as f64 * 0.01, 0.0);
                 }
                 row
             })
@@ -21637,13 +21718,15 @@ mod three_stage_sync_tests {
         let expected: Complex<f64> = (0..pp.num_symbols)
             .map(|sym| {
                 let tone = tone_symbols[sym] as usize;
-                Complex::new(sym as f64, tone as f64)
+                Complex::new(1.0 + sym as f64 + tone as f64 * 0.01, 0.0)
             })
             .sum();
-        assert_eq!(
-            acc, expected,
+        let delta = (acc - expected).norm();
+        assert!(
+            delta < 1e-9,
             "must sum complex_symbols[sym][tone_symbols[sym]] over ALL \
-             {} symbols, not just the 21 Costas ones",
+             {} symbols, not just the 21 Costas ones (zero-drift markers \
+             make derotation a no-op here); acc={acc:?} expected={expected:?}",
             pp.num_symbols
         );
     }
@@ -21698,6 +21781,86 @@ mod three_stage_sync_tests {
         let short_tones = &tone_symbols[..10];
         let acc_short = compute_full_frame_complex_accumulator(&pp, &complex_symbols, short_tones);
         assert!(acc_short.norm().is_finite());
+    }
+
+    /// Build `complex_symbols` where symbol `sym`'s bin at `tone_symbols[sym]`
+    /// carries unit magnitude and phase `drift_rad * sym` — a synthetic
+    /// constant per-symbol phase drift, the exact effect a residual
+    /// frequency offset produces on a real signal.
+    fn drifting_complex_symbols(
+        pp: &ProtocolParams,
+        tone_symbols: &[u8],
+        drift_rad: f64,
+    ) -> Vec<[Complex<f64>; NUM_TONES]> {
+        (0..pp.num_symbols)
+            .map(|sym| {
+                let mut row = [Complex::new(0.0, 0.0); NUM_TONES];
+                let tone = tone_symbols[sym] as usize;
+                if tone < NUM_TONES {
+                    row[tone] = Complex::from_polar(1.0, drift_rad * sym as f64);
+                }
+                row
+            })
+            .collect()
+    }
+
+    #[test]
+    fn phase_drift_estimate_recovers_a_known_constant_drift() {
+        let pp = ProtocolParams::ft8();
+        let mut tone_symbols = vec![0u8; pp.num_symbols];
+        for (m, &group_start) in pp.costas_positions.iter().enumerate() {
+            for k in 0..pp.costas_length {
+                tone_symbols[group_start + k] = pp.costas_arrays[m][k];
+            }
+        }
+        for known_drift in [0.0, 0.05, 0.3, -0.3, 1.0, -1.0] {
+            let complex_symbols = drifting_complex_symbols(&pp, &tone_symbols, known_drift);
+            let estimated = estimate_symbol_phase_drift_rad(&pp, &complex_symbols);
+            assert!(
+                (estimated - known_drift).abs() < 1e-6,
+                "known_drift={known_drift}, estimated={estimated}"
+            );
+        }
+    }
+
+    #[test]
+    fn full_frame_accumulator_derotation_recovers_coherent_magnitude_under_drift() {
+        // Round-2 review finding: without derotation, a per-symbol phase
+        // drift that a 21-term Costas-only sum tolerates can nearly fully
+        // cancel a 79-term raw sum. A small, realistic drift (0.08 rad/
+        // symbol -- close to the review's own worked example) should
+        // still recover close to the full N=79 coherent magnitude once
+        // derotated, whereas summing the SAME drifting terms without any
+        // correction visibly loses magnitude to cancellation.
+        let pp = ProtocolParams::ft8();
+        let mut tone_symbols = vec![0u8; pp.num_symbols];
+        for (m, &group_start) in pp.costas_positions.iter().enumerate() {
+            for k in 0..pp.costas_length {
+                tone_symbols[group_start + k] = pp.costas_arrays[m][k];
+            }
+        }
+        let drift = 0.08;
+        let complex_symbols = drifting_complex_symbols(&pp, &tone_symbols, drift);
+
+        let derotated =
+            compute_full_frame_complex_accumulator(&pp, &complex_symbols, &tone_symbols);
+        let raw_undecorated: Complex<f64> = (0..pp.num_symbols)
+            .map(|sym| complex_symbols[sym][tone_symbols[sym] as usize])
+            .sum();
+
+        assert!(
+            derotated.norm() > pp.num_symbols as f64 * 0.99,
+            "derotated sum should recover ~N={} coherent magnitude, got {}",
+            pp.num_symbols,
+            derotated.norm()
+        );
+        assert!(
+            raw_undecorated.norm() < derotated.norm() * 0.5,
+            "undecorated raw sum should show substantial cancellation \
+             relative to the derotated sum: raw={}, derotated={}",
+            raw_undecorated.norm(),
+            derotated.norm()
+        );
     }
 
     #[test]
