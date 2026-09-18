@@ -12356,21 +12356,30 @@ fn subtract_decode_coherent(
         if f_idx >= num_bins {
             continue;
         }
-        // Per-symbol effective rotor: byte-identical to the original
-        // constant `rotor` when `symbol_phase_drift_rad == 0.0` (every
-        // pre-existing call site).
-        let effective_rotor = if symbol_phase_drift_rad == 0.0 {
-            rotor
-        } else {
-            rotor * Complex::from_polar(1.0, symbol_phase_drift_rad * sym_idx as f64)
-        };
-        let effective_rotor_conj = effective_rotor.conj();
         let t_base = t0 + sym_idx * steps_per_symbol;
         for s in 0..steps_per_symbol {
             let t_idx = t_base + s;
             if t_idx >= num_steps {
                 continue;
             }
+            // Round-4 review finding: the FFT phase advances continuously
+            // through TIME, not just once per symbol — with
+            // `steps_per_symbol == TIME_OSR` substeps evenly spaced
+            // within each symbol period, substep `s` sits an additional
+            // `symbol_phase_drift_rad * s / steps_per_symbol` ahead of
+            // that symbol's own `s == 0` reference. Computing the
+            // effective rotor once per SYMBOL and reusing it for every
+            // substep (the round-3 fix's original mistake) left a
+            // residual in every non-zero substep. Byte-identical to the
+            // original constant `rotor` when `symbol_phase_drift_rad ==
+            // 0.0` (every pre-existing call site).
+            let effective_rotor = if symbol_phase_drift_rad == 0.0 {
+                rotor
+            } else {
+                let frac_symbol = sym_idx as f64 + s as f64 / steps_per_symbol as f64;
+                rotor * Complex::from_polar(1.0, symbol_phase_drift_rad * frac_symbol)
+            };
+            let effective_rotor_conj = effective_rotor.conj();
             // Scoped &mut to spectrogram.complex; ends before .power access.
             //
             // perf F4: `complex` storage is `SpecScalar` (f32) precision,
@@ -21924,12 +21933,17 @@ mod three_stage_sync_tests {
                 continue;
             }
             let t_base = seed_time + sym_idx * steps_per_symbol;
-            let phasor = Complex::from_polar(1.0f32, (drift_rad * sym_idx as f64) as f32);
             for s in 0..steps_per_symbol {
                 let t_idx = t_base + s;
                 if t_idx >= num_steps {
                     continue;
                 }
+                // Round-4 review finding: phase advances CONTINUOUSLY
+                // through time, not just once per symbol -- each
+                // substep is `1/steps_per_symbol` of a symbol period
+                // further ahead, matching real FFT phase behavior.
+                let frac_symbol = sym_idx as f64 + s as f64 / steps_per_symbol as f64;
+                let phasor = Complex::from_polar(1.0f32, (drift_rad * frac_symbol) as f32);
                 let flat_idx = (t_idx * freq_osr + seed_freq_sub) * num_bins + f_idx;
                 complex[flat_idx] = phasor;
                 power[flat_idx] = (10.0 * (1e-12_f64 + 1.0).log10()) as SpecScalar;
