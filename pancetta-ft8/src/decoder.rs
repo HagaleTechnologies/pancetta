@@ -562,6 +562,32 @@ pub struct Ft8Config {
     /// (full) subtract.
     pub coherent_subtract_mrc_threshold: f64,
 
+    /// PAN-153: widen `coherent_subtract_and_repass`'s rotor/MRC-magnitude
+    /// reference from the 21 Costas sync symbols
+    /// (`compute_costas_complex_accumulator`) to the full 79-symbol frame
+    /// (`compute_full_frame_complex_accumulator`), using the LDPC-decoded,
+    /// CRC-validated `tone_symbols` as the expected tone at the 58
+    /// non-Costas (message) positions the Costas-only sum can't see.
+    /// WSJT-X mainline's `subtractft8.f90` already estimates its
+    /// subtraction reference from the full known message (it decodes
+    /// first, subtracts second); Pancetta's Costas-only accumulator was
+    /// the narrower of the two — see `coherent_subtract_and_repass`'s doc
+    /// comment ("rotor reference set (21 Costas symbols vs all 79), not
+    /// in algorithm").
+    ///
+    /// More samples averaged into the accumulator should mean a
+    /// lower-variance phase/magnitude estimate (√79/√21 ≈ 1.9× the
+    /// effective averaging), at the cost of trusting the decoded tones at
+    /// the 58 extra positions — rare to be wrong given CRC validation, but
+    /// not impossible (undetected CRC collision). Whether the lower
+    /// estimator variance actually improves subtraction quality (and
+    /// therefore residual/repass recall) enough to matter is unmeasured.
+    ///
+    /// Default **false**: needs its own A/B (`compare` scorecard, not
+    /// this doc comment) before flipping — same discipline as every other
+    /// flag in this struct that names a specific default-off tradeoff.
+    pub coherent_subtract_full_frame_reference_enabled: bool,
+
     /// Coherent iterative-subtract multi-pass. After
     /// pass 1 (regular + cross-cycle), each decoded message's signal is
     /// subtracted from the complex spectrogram via ML projection
@@ -1894,6 +1920,7 @@ impl Default for Ft8Config {
             // hb-081: MRC subtract scaling off by default until the
             // A/B confirms.
             coherent_subtract_mrc_threshold: 0.0,
+            coherent_subtract_full_frame_reference_enabled: false,
             // hb-082: residual sync threshold uses production `min_sync_score`
             // until the A/B confirms a lower value is better.
             residual_min_sync_score: None,
@@ -7859,7 +7886,20 @@ impl Ft8Decoder {
             };
             // hb-081: compute both the accumulator (for MRC scaling) and
             // the unit rotor (for ML projection direction).
-            let acc = compute_costas_complex_accumulator(pp, &cs);
+            //
+            // PAN-153: `tone_symbols` is the LDPC-decoded, CRC-validated
+            // message this loop is about to subtract — exactly the
+            // "known tones at all 79 positions" ground truth
+            // `compute_full_frame_complex_accumulator` needs. Only this
+            // call site (post-decode) has that data; the cross-cycle
+            // averaging call site above (pre-decode candidate grouping)
+            // does not, so it keeps using the Costas-only accumulator
+            // unconditionally.
+            let acc = if self.config.coherent_subtract_full_frame_reference_enabled {
+                compute_full_frame_complex_accumulator(pp, &cs, tone_symbols)
+            } else {
+                compute_costas_complex_accumulator(pp, &cs)
+            };
             let mag = acc.norm();
             if mag < 1e-30 {
                 continue;
@@ -12523,6 +12563,38 @@ fn compute_costas_complex_accumulator(
             }
             acc += complex_symbols[sym_idx][expected_tone];
         }
+    }
+    acc
+}
+
+/// PAN-153: sibling of [`compute_costas_complex_accumulator`] that sums
+/// the candidate's complex FFT bins at ALL `pp.num_symbols` (79 for FT8)
+/// positions instead of just the 21 Costas ones, using `tone_symbols`
+/// (the LDPC-decoded, CRC-validated message) as the expected tone at
+/// every position — including the Costas ones, where `tone_symbols`
+/// already agrees with `pp.costas_arrays` by construction (the encoder
+/// places the fixed Costas pattern at those positions), so this is a
+/// strict superset of the Costas-only sum, not a different basis. More
+/// terms summed into a coherent accumulator (signal adds in-phase, noise
+/// doesn't) means a lower-variance phase/magnitude estimate — see
+/// `Ft8Config::coherent_subtract_full_frame_reference_enabled`'s doc for
+/// the tradeoff this trades against.
+fn compute_full_frame_complex_accumulator(
+    pp: &ProtocolParams,
+    complex_symbols: &[[Complex<f64>; NUM_TONES]],
+    tone_symbols: &[u8],
+) -> Complex<f64> {
+    let mut acc = Complex::<f64>::new(0.0, 0.0);
+    let n = pp
+        .num_symbols
+        .min(complex_symbols.len())
+        .min(tone_symbols.len());
+    for sym_idx in 0..n {
+        let tone = tone_symbols[sym_idx] as usize;
+        if tone >= NUM_TONES {
+            continue;
+        }
+        acc += complex_symbols[sym_idx][tone];
     }
     acc
 }
@@ -21497,6 +21569,107 @@ mod three_stage_sync_tests {
                  on={on_v:?}, delta={delta}"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // PAN-153: full-frame coherent-subtraction rotor reference
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn full_frame_accumulator_defaults_off() {
+        assert!(
+            !Ft8Config::default().coherent_subtract_full_frame_reference_enabled,
+            "widening the rotor reference needs its own A/B before \
+             flipping the default"
+        );
+    }
+
+    /// Build a `complex_symbols` table where `complex_symbols[sym][tone]
+    /// == Complex::new(sym as f64, tone as f64)` — a distinct marker per
+    /// (symbol, tone) cell, so summing at chosen (sym, tone) pairs is
+    /// exactly checkable against a hand-computed expectation.
+    fn marker_complex_symbols(num_symbols: usize) -> Vec<[Complex<f64>; NUM_TONES]> {
+        (0..num_symbols)
+            .map(|sym| {
+                let mut row = [Complex::new(0.0, 0.0); NUM_TONES];
+                for (tone, cell) in row.iter_mut().enumerate() {
+                    *cell = Complex::new(sym as f64, tone as f64);
+                }
+                row
+            })
+            .collect()
+    }
+
+    #[test]
+    fn full_frame_accumulator_sums_every_position_at_its_tone_symbol() {
+        let pp = ProtocolParams::ft8();
+        let complex_symbols = marker_complex_symbols(pp.num_symbols);
+        let tone_symbols = synthetic_tone_symbols(&pp); // tone_symbols[i] = i % 8
+        let acc = compute_full_frame_complex_accumulator(&pp, &complex_symbols, &tone_symbols);
+        let expected: Complex<f64> = (0..pp.num_symbols)
+            .map(|sym| {
+                let tone = tone_symbols[sym] as usize;
+                Complex::new(sym as f64, tone as f64)
+            })
+            .sum();
+        assert_eq!(
+            acc, expected,
+            "must sum complex_symbols[sym][tone_symbols[sym]] over ALL \
+             {} symbols, not just the 21 Costas ones",
+            pp.num_symbols
+        );
+    }
+
+    #[test]
+    fn full_frame_accumulator_covers_more_terms_than_costas_only() {
+        // Direct evidence the "full frame" sum is a strict superset:
+        // restricting tone_symbols to agree with pp.costas_arrays at the
+        // Costas positions (and using ANY in-range tone elsewhere,
+        // since compute_costas_complex_accumulator ignores non-Costas
+        // positions entirely) must make the two accumulators' term
+        // counts differ by exactly the number of non-Costas symbols.
+        let pp = ProtocolParams::ft8();
+        let complex_symbols = marker_complex_symbols(pp.num_symbols);
+        let mut tone_symbols = vec![0u8; pp.num_symbols];
+        for (m, &group_start) in pp.costas_positions.iter().enumerate() {
+            for k in 0..pp.costas_length {
+                tone_symbols[group_start + k] = pp.costas_arrays[m][k];
+            }
+        }
+        let costas_only = compute_costas_complex_accumulator(&pp, &complex_symbols);
+        let full_frame =
+            compute_full_frame_complex_accumulator(&pp, &complex_symbols, &tone_symbols);
+        let costas_symbol_count = pp.costas_positions.len() * pp.costas_length;
+        assert!(
+            costas_symbol_count < pp.num_symbols,
+            "sanity: FT8 has non-Costas symbols to widen into"
+        );
+        // The two sums generally differ (extra terms added), and must
+        // agree only in the degenerate case where every non-Costas cell
+        // happens to be zero -- not true here since markers are non-zero
+        // almost everywhere.
+        assert_ne!(
+            costas_only, full_frame,
+            "full-frame sum must include terms costas-only doesn't"
+        );
+    }
+
+    #[test]
+    fn full_frame_accumulator_skips_out_of_range_tones_and_truncated_slices() {
+        let pp = ProtocolParams::ft8();
+        let complex_symbols = marker_complex_symbols(pp.num_symbols);
+        // Out-of-range tone (>= NUM_TONES) at position 0 must be skipped,
+        // not panic or index out of bounds.
+        let mut tone_symbols = synthetic_tone_symbols(&pp);
+        tone_symbols[0] = 200;
+        let acc = compute_full_frame_complex_accumulator(&pp, &complex_symbols, &tone_symbols);
+        assert!(acc.norm().is_finite());
+
+        // A tone_symbols slice shorter than pp.num_symbols must not
+        // panic -- just sum what's available.
+        let short_tones = &tone_symbols[..10];
+        let acc_short = compute_full_frame_complex_accumulator(&pp, &complex_symbols, short_tones);
+        assert!(acc_short.norm().is_finite());
     }
 
     #[test]
