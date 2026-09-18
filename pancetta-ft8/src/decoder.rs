@@ -583,6 +583,18 @@ pub struct Ft8Config {
     /// estimator variance actually improves subtraction quality (and
     /// therefore residual/repass recall) enough to matter is unmeasured.
     ///
+    /// **Review finding, restricted scope:** at `candidate.freq_sub == 1`
+    /// (the fractional/oversampled sub-bin), consecutive symbols' bins
+    /// carry a systematic sub-bin phase rotation a raw sum doesn't
+    /// correct for — summing more terms from an alternating-phase series
+    /// cancels MORE, not less, unlike the Costas-only sum's smaller,
+    /// odd-grouped term count. The call site (`coherent_subtract_and_
+    /// repass`) therefore only applies this widening at `freq_sub == 0`;
+    /// `freq_sub == 1` candidates always fall back to the Costas-only
+    /// accumulator regardless of this flag. Extending to `freq_sub == 1`
+    /// needs a derotated accumulator (correcting each term's phase
+    /// before summing), not implemented here.
+    ///
     /// Default **false**: needs its own A/B (`compare` scorecard, not
     /// this doc comment) before flipping — same discipline as every other
     /// flag in this struct that names a specific default-off tradeoff.
@@ -7895,7 +7907,23 @@ impl Ft8Decoder {
             // averaging call site above (pre-decode candidate grouping)
             // does not, so it keeps using the Costas-only accumulator
             // unconditionally.
-            let acc = if self.config.coherent_subtract_full_frame_reference_enabled {
+            //
+            // Review finding: at `candidate.freq_sub == 1` (the
+            // fractional/oversampled sub-bin — `FREQ_OSR == 2`, so this is
+            // the only other value), consecutive symbols' extracted bins
+            // carry a systematic phase rotation from the sub-bin offset
+            // that a raw sum doesn't correct for. Summing MORE terms from
+            // an alternating-phase series makes cancellation WORSE, not
+            // better — the 21-term Costas-only sum happens to retain a
+            // net signal from its 3-groups-of-7 (odd count) structure,
+            // but a 79-term raw sum over mostly-consecutive symbols
+            // cancels far more severely. Restrict the widened reference
+            // to `freq_sub == 0`, where this cancellation doesn't apply,
+            // until a derotated version (correcting each term's phase
+            // before summing) is implemented and re-verified.
+            let acc = if self.config.coherent_subtract_full_frame_reference_enabled
+                && candidate.freq_sub == 0
+            {
                 compute_full_frame_complex_accumulator(pp, &cs, tone_symbols)
             } else {
                 compute_costas_complex_accumulator(pp, &cs)
