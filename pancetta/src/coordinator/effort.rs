@@ -193,6 +193,24 @@ fn resolve_effective_effort(effort: DecodeEffort, tier: HardwareTier) -> DecodeE
 ///   it holds on genuinely slower target hardware (e.g. the Windows
 ///   MiniPC tier) is unverified and should be checked before an on-air
 ///   soak, not assumed from this one measurement.
+///
+///   **Round-13 review finding, second measurement-fidelity gap:** the
+///   `prodmax` scorecards above still don't fully reproduce production
+///   timing — `research/decoder.rs`'s harness starts its 2000ms deadline
+///   fresh immediately before the native decode call, but the real
+///   `ft8.rs` hot loop anchors the SAME 2000ms deadline at window
+///   RECEIPT and performs waterfall generation, the optional scoped
+///   fast-path decode, and the ft8_lib FFI decode BEFORE the main
+///   native call that actually consumes `max_decode_passes`. So the
+///   native call's true remaining headroom in production is `2000ms
+///   minus that earlier work`, not a fresh 2000ms. Closing this
+///   precisely needs either a full coordinator-path integration
+///   benchmark or a remaining-headroom-aware override decision, neither
+///   of which is a small patch — tracked as PAN-165, not fixed here.
+///   Bounded, self-correcting risk in the meantime, same shape as
+///   PAN-164: if the native call gets less time than 2000ms in a given
+///   window, `DecodeBudget::has_time()` gating already makes pass 2
+///   gracefully skip for that window — not a wrong decode or a crash.
 /// - `Max`'s override ALSO requires `config.protocol == Protocol::Ft8`
 ///   (round-9 review finding): the coherent-subtraction machinery it
 ///   enables is FT8-79-symbol-specific, so on FT4 (105 symbols) a
