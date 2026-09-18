@@ -330,6 +330,19 @@ pub struct CoordSim {
     pub active_slot_ns: Arc<std::sync::atomic::AtomicI64>,
     /// Active decode-phase atomic (ns), exactly as the coordinator holds it.
     pub active_decode_phase_ns: Arc<std::sync::atomic::AtomicI64>,
+    /// PAN-157: current decode-effort preset atomic, exactly as the
+    /// coordinator holds it — `try_switch_operating_mode` reads it to
+    /// re-evaluate the Max-preset multipass override under the new
+    /// protocol.
+    pub current_decode_effort: Arc<std::sync::atomic::AtomicU8>,
+    /// PAN-157: resolved hardware-tier atomic, exactly as the
+    /// coordinator holds it.
+    pub resolved_hardware_tier: Arc<std::sync::atomic::AtomicU8>,
+    /// PAN-157: decode-effort budget atomic (ms; `0` = unlimited/
+    /// ceiling), exactly as the coordinator holds it —
+    /// `try_switch_operating_mode` reads it fresh rather than
+    /// reseeding it (round-12 review finding).
+    pub decode_effort_budget_ms: Arc<std::sync::atomic::AtomicU64>,
     /// Shutdown flag for the spawned hamlib consumer.
     shutdown: Arc<AtomicBool>,
     /// Our callsign (for building expected message text).
@@ -392,6 +405,13 @@ impl CoordSim {
             active_protocol_mode: Arc::new(AtomicU8::new(OperatingMode::Ft8.as_u8())),
             active_slot_ns,
             active_decode_phase_ns: Arc::new(std::sync::atomic::AtomicI64::new(13_000_000_000)),
+            current_decode_effort: Arc::new(std::sync::atomic::AtomicU8::new(
+                pancetta_config::DecodeEffort::Standard.as_u8(),
+            )),
+            resolved_hardware_tier: Arc::new(std::sync::atomic::AtomicU8::new(
+                pancetta_ft8::tier_probe::HardwareTier::Fast.as_u8(),
+            )),
+            decode_effort_budget_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             shutdown,
             our_callsign: our_callsign.to_string(),
             timeline: Timeline::default(),
@@ -2717,6 +2737,9 @@ async fn mode_switch_refused_while_qso_active() {
         &sim.active_protocol_mode,
         &sim.active_slot_ns,
         &sim.active_decode_phase_ns,
+        &sim.current_decode_effort,
+        &sim.resolved_hardware_tier,
+        &sim.decode_effort_budget_ms,
     );
 
     assert!(
@@ -2746,6 +2769,9 @@ async fn mode_switch_succeeds_idle_and_next_qso_uses_new_mode() {
         &sim.active_protocol_mode,
         &sim.active_slot_ns,
         &sim.active_decode_phase_ns,
+        &sim.current_decode_effort,
+        &sim.resolved_hardware_tier,
+        &sim.decode_effort_budget_ms,
     );
     assert!(result.is_ok(), "expected Ok, got {:?}", result);
     assert_eq!(sim.active_slot_ns.load(Ordering::Relaxed), 7_500_000_000);
@@ -2828,6 +2854,9 @@ async fn mode_switch_retunes_the_qso_engines_rearm_cadence() {
         &sim.active_protocol_mode,
         &sim.active_slot_ns,
         &sim.active_decode_phase_ns,
+        &sim.current_decode_effort,
+        &sim.resolved_hardware_tier,
+        &sim.decode_effort_budget_ms,
     )
     .expect("idle mode switch");
     assert_eq!(sim.active_slot_ns.load(Ordering::Relaxed), 7_500_000_000);
