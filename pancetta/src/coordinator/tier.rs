@@ -404,18 +404,29 @@ fn spawn_probe_worker(
         // `result.tier` pair used for the config override, in this same
         // critical section, so budget and config can never disagree
         // about which effort/tier they're for.
+        //
+        // PAN-157 round-9 review finding: the budget write must happen
+        // BEFORE the config write, not after. `ft8.rs`'s hot loop reads
+        // `decode_effort_budget_ms` first, then separately `try_read`s
+        // the config — so if config publishes first, a window can land
+        // in the gap and see the NEW (e.g. 2-pass) config with the OLD,
+        // possibly-bounded budget, which can starve the very pass the
+        // new config just enabled. Publishing budget first means the
+        // only reachable tear is the opposite (new budget + old config),
+        // which is harmless: nothing in the old config needs the extra
+        // time the new budget grants.
         tokio::runtime::Handle::current().block_on(async {
             let mut cfg_guard = ft8_config.write().await;
             let live_effort_at_write =
                 DecodeEffort::from_u8(current_decode_effort.load(Ordering::Acquire));
             if live_effort_at_write == DecodeEffort::Auto {
-                apply_effort_overrides(DecodeEffort::Auto, result.tier, &mut cfg_guard);
                 seed_effort_budget(
                     DecodeEffort::Auto,
                     budget_override,
                     result.tier,
                     &decode_effort_budget_ms,
                 );
+                apply_effort_overrides(DecodeEffort::Auto, result.tier, &mut cfg_guard);
                 info!(
                     "tier probe: decode_effort_budget_ms re-seeded for {} tier (Auto)",
                     result.tier.as_str()

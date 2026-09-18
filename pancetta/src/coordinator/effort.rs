@@ -183,13 +183,20 @@ fn resolve_effective_effort(effort: DecodeEffort, tier: HardwareTier) -> DecodeE
 ///   showed a bounded Standard budget can be exhausted by pass 1 ALONE
 ///   on slow-enough hardware, silently starving pass 2 regardless of
 ///   this flag — `Max` sidesteps that failure mode entirely.
-/// - Every other literal preset (`Eco`/`Standard`/`Deep`) is left
-///   completely untouched — not just "off," genuinely un-visited by this
-///   function — so an operator (or a future config file) who explicitly
-///   sets `max_decode_passes`/`time_varying_subtraction_enabled`
-///   manually at a lower preset is never silently overwritten by a
-///   preset switch. "Don't push it in Eco/Standard/Deep, but don't stop
-///   someone from forcing it there either" (Tony, 2026-09-17).
+/// - Every other literal preset (`Eco`/`Standard`/`Deep`) explicitly
+///   resets both fields to `Ft8Config::default()`'s values (`1`,
+///   `false`). NOT leaving them untouched: this function mutates
+///   `config` in place and is re-invoked on every tier probe/live
+///   preset cycle, so an empty arm here would make a PRIOR `Max` call's
+///   override sticky — an operator cycling Max→Deep would silently keep
+///   running 2 passes under Deep's now-BOUNDED 1000ms budget forever,
+///   the exact failure mode `Max`-only scoping exists to avoid (PAN-157
+///   review round 9). "Don't push it in Eco/Standard/Deep" (Tony,
+///   2026-09-17) is satisfied because those presets never apply the
+///   override in the first place; "let someone force it" is satisfied
+///   by the existing effort-cycling keybinding itself — cycling to
+///   `Max` IS the forcing mechanism, so there's no separate manual
+///   Ft8Config-field override path this function needs to preserve.
 /// - `Auto` does NOT get this override today: `resolve_effective_effort`
 ///   only ever maps `Auto` to `Eco`/`Standard`/`Deep`, never `Max`, so
 ///   `Auto` stays a no-op here for now. A hardware-probed extension
@@ -200,34 +207,61 @@ fn resolve_effective_effort(effort: DecodeEffort, tier: HardwareTier) -> DecodeE
 ///   rather than bundled in, since it touches the same probe/lock path
 ///   `tier.rs` just spent 9 review rounds hardening.
 ///
-/// Both fields are set together, never independently, by this arm — see
-/// the note below on why that means `coordinator/ft8.rs`'s
-/// decoder-rebuild-trigger comparison needs no new field.
+/// Both fields are always set TOGETHER by every arm, never
+/// independently — see the note below on why that means
+/// `coordinator/ft8.rs`'s decoder-rebuild-trigger comparison needs no
+/// new field.
 ///
-/// **Round-7 review finding — window atomicity.** `coordinator/ft8.rs`'s
-/// hot loop reads `decode_effort_budget_ms` (a plain atomic) and
-/// `ft8_config_shared` (a separate `try_read`) independently per window
-/// (`ft8.rs:~1547-1569`). `docs/superpowers/specs/2026-07-06-decoder-
-/// speed-overhaul-design.md` §6.2 states the authoritative invariant:
-/// "effort changes take effect at the next window" — i.e. atomically, as
-/// one unit, never a mix of the old budget with the new config or vice
-/// versa. `Max`'s budget is the `0`/unlimited sentinel regardless of
-/// which config values happen to be visible on a given window read, so a
-/// torn read (old config + new unlimited budget, or vice versa) can't
-/// produce a WRONG decode here — at worst a single window either does or
-/// doesn't get the second pass one window later than a perfectly
-/// atomic switch would, which is exactly the "next window" granularity
-/// §6.2 already allows. A future override on a BOUNDED preset would need
-/// the atomic-snapshot fix described here previously; deferred until a
-/// bounded preset actually needs one, per the same reasoning PAN-156
-/// used to defer this originally.
+/// **Round-7/round-9 review findings — window atomicity.**
+/// `coordinator/ft8.rs`'s hot loop reads `decode_effort_budget_ms` (a
+/// plain atomic) and `ft8_config_shared` (a separate `try_read`)
+/// independently per window (`ft8.rs:~1547-1569`).
+/// `docs/superpowers/specs/2026-07-06-decoder-speed-overhaul-design.md`
+/// §6.2 states the authoritative invariant: "effort changes take effect
+/// at the next window" — atomically, as one unit, never a mix of the
+/// old budget with the new config or vice versa.
+///
+/// Round-9 review correctly rejected an earlier draft of this comment's
+/// claim that a torn read here "can't produce a wrong decode" — that
+/// overstated it. A **new bounded budget + an OLD (1-pass) config** is
+/// harmless (nothing extra configured to starve). But an **OLD bounded
+/// budget + the NEW 2-pass config** (e.g. mid-transition into `Max`) CAN
+/// transiently starve pass 2 for one window — not a wrong DECODE
+/// (LDPC/CRC still gate correctness) and not new territory (it's the
+/// same "budget exhausted, skip optional work" degradation the anytime-
+/// decoder architecture already tolerates at every bounded tier,
+/// signal-difficulty-dependent), but a real, slightly-longer-than-"next-
+/// window" gap this comment should not have waved away. Both writer
+/// call sites (`tier.rs`'s probe-completion path, `tui_relay.rs`'s live
+/// cycle handler — the latter already had the safe order) now publish
+/// the budget no later than the config write, which limits the tear to
+/// exactly that one harmless-vs-benign-degradation pair rather than an
+/// unbounded ordering. Full atomic-snapshot publishing (one generation
+/// counter for both) remains deferred until a bounded preset needs the
+/// override too, per the same reasoning PAN-156 used to defer this
+/// originally — this round only fixes the ordering, not the tear itself.
 pub(crate) fn apply_effort_overrides(
     effort: DecodeEffort,
     tier: HardwareTier,
     config: &mut Ft8Config,
 ) {
     match resolve_effective_effort(effort, tier) {
-        DecodeEffort::Eco | DecodeEffort::Standard | DecodeEffort::Deep => {}
+        // Round-9-of-PAN-157 review finding (P1): explicitly restore both
+        // fields to their true defaults here, not just "leave them
+        // alone." `config` is mutated in place and this function is
+        // re-called on every tier probe/cycle, so an empty arm here
+        // would make a PRIOR call's `Max` override sticky forever once
+        // the operator cycles away — Max's `max_decode_passes = 2` would
+        // silently persist under a now-BOUNDED budget, defeating the
+        // whole point of confining the override to the one preset that
+        // is guaranteed unlimited. This matches PAN-156's own original
+        // contract for this function ("EVERY arm below must explicitly
+        // assign that field... so switching to a preset that doesn't
+        // want the override reverts it").
+        DecodeEffort::Eco | DecodeEffort::Standard | DecodeEffort::Deep => {
+            config.max_decode_passes = 1;
+            config.time_varying_subtraction_enabled = false;
+        }
         DecodeEffort::Max => {
             config.max_decode_passes = 2;
             config.time_varying_subtraction_enabled = true;
@@ -442,6 +476,34 @@ mod tests {
             assert!(
                 config.time_varying_subtraction_enabled,
                 "Max on {tier:?} must enable time-varying subtraction"
+            );
+        }
+    }
+
+    /// Round-9 review finding (P1): `Max`'s override must NOT be sticky
+    /// after cycling away. Applying `Max` then a lower preset to the
+    /// SAME config object (mirroring how the real caller re-invokes this
+    /// function on the same `Ft8Config` across live cycles) must leave
+    /// both fields at their true defaults, not at whatever `Max` set.
+    #[test]
+    fn cycling_away_from_max_clears_the_multipass_override() {
+        for next in [
+            DecodeEffort::Eco,
+            DecodeEffort::Standard,
+            DecodeEffort::Deep,
+        ] {
+            let mut config = Ft8Config::default();
+            apply_effort_overrides(DecodeEffort::Max, HardwareTier::Fast, &mut config);
+            assert_eq!(config.max_decode_passes, 2, "sanity: Max applied first");
+
+            apply_effort_overrides(next, HardwareTier::Fast, &mut config);
+            assert_eq!(
+                config.max_decode_passes, 1,
+                "{next:?} must clear Max's max_decode_passes override, not inherit it"
+            );
+            assert!(
+                !config.time_varying_subtraction_enabled,
+                "{next:?} must clear Max's time_varying_subtraction_enabled override"
             );
         }
     }

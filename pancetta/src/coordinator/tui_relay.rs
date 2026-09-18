@@ -1809,21 +1809,35 @@ impl super::ApplicationCoordinator {
                             // re-store it, so both halves of Auto's
                             // tier-dependent state come from one consistent
                             // read.
+                            // PAN-157 round-9 review finding: budget must
+                            // publish no later than config, not after —
+                            // ft8.rs's hot loop reads the budget atomic
+                            // first and the config `try_read` second, so
+                            // publishing config before budget can land a
+                            // window on the NEW config with the OLD,
+                            // possibly-bounded budget (risking starving a
+                            // pass the new config just enabled). The
+                            // reverse tear (new budget + old config) is
+                            // harmless — nothing in the old config needs
+                            // the extra time. See `effort.rs`'s
+                            // `apply_effort_overrides` doc for the full
+                            // reasoning; `tier.rs`'s probe-completion path
+                            // got the same fix.
                             {
                                 let mut cfg_guard = cmd_ft8_config.write().await;
                                 let tier_at_write = pancetta_ft8::tier_probe::HardwareTier::from_u8(
                                     cmd_resolved_hardware_tier.load(Ordering::Acquire),
-                                );
-                                super::effort::apply_effort_overrides(
-                                    next,
-                                    tier_at_write,
-                                    &mut cfg_guard,
                                 );
                                 if next == pancetta_config::DecodeEffort::Auto {
                                     budget_ms =
                                         super::effort::preset_budget_ms(next, tier_at_write);
                                     cmd_decode_effort_budget_ms.store(budget_ms, Ordering::Release);
                                 }
+                                super::effort::apply_effort_overrides(
+                                    next,
+                                    tier_at_write,
+                                    &mut cfg_guard,
+                                );
                             }
                             let label = next.label().to_string();
                             info!(
