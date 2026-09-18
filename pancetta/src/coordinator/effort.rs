@@ -132,10 +132,10 @@ fn resolve_effective_effort(effort: DecodeEffort, tier: HardwareTier) -> DecodeE
     }
 }
 
-/// Apply per-effort-preset `Ft8Config` field overrides (PAN-156).
+/// Apply per-effort-preset `Ft8Config` field overrides (PAN-156/PAN-157).
 ///
-/// Until this ticket, `Ft8Config` flags could only be tuned globally
-/// (or by [`HardwareTier`], via the now-retired `tier::apply_tier` — see
+/// Until PAN-156, `Ft8Config` flags could only be tuned globally (or by
+/// [`HardwareTier`], via the now-retired `tier::apply_tier` — see
 /// `tier.rs`'s module doc); there was no way to say "on for this
 /// [`DecodeEffort`] preset, off for that one." This is the seam: it maps
 /// an effort preset to a set of `Ft8Config` field overrides, applied
@@ -153,51 +153,215 @@ fn resolve_effective_effort(effort: DecodeEffort, tier: HardwareTier) -> DecodeE
 /// startup both re-apply the right fields immediately rather than only
 /// at restart.
 ///
-/// **Pure plumbing — no default decode behavior changes as part of this
-/// ticket.** Every arm currently reproduces `Ft8Config::default()`'s
-/// values for the fields it's prepared to override, so calling this for
-/// any preset/tier combination today is byte-identical to not calling it
-/// at all (`effort_overrides_are_currently_a_no_op_for_every_preset`
-/// below is the regression guard). A later ticket (e.g. PAN-157) fills
-/// in a real override for a specific preset once its own A/B confirms
-/// the win — when it does, EVERY arm below must explicitly assign that
-/// field (not just the overriding arm), so switching to a preset that
-/// doesn't want the override reverts it rather than inheriting whatever
-/// the config happened to hold before (round-1 review finding); and the
-/// FT8 hot loop's decoder-rebuild-trigger comparison
-/// (`coordinator/ft8.rs`, `last_max_passes`/`last_osd_depth`/
-/// `last_protocol`) must gain that field too, or a live preset switch
-/// can update the shared config without the running decoder ever
-/// picking it up (round-1 review finding).
+/// ## PAN-157: the first real override — `Max` only
 ///
-/// **Round-7 review finding — window atomicity.** `coordinator/ft8.rs`'s
-/// hot loop reads `decode_effort_budget_ms` (a plain atomic) and
-/// `ft8_config_shared` (a separate `try_read`) independently per window
-/// (`ft8.rs:~1547-1569`). `docs/superpowers/specs/2026-07-06-decoder-
-/// speed-overhaul-design.md` §6.2 states the authoritative invariant:
-/// "effort changes take effect at the next window" — i.e. atomically, as
-/// one unit, never a mix of the old budget with the new config or vice
-/// versa. Today this can't actually tear, because nothing this function
-/// touches feeds into the hot loop's read of either value. Once a real
-/// field IS added here, that field's PR must also either (a) make the
-/// hot loop consume budget and config as one atomically-published
-/// snapshot (e.g. a shared generation counter it checks once per
-/// window), or (b) demonstrate why the specific field added is exempt
-/// from the §6.2 invariant. This is deliberately not solved here:
-/// redesigning ft8.rs's per-window state acquisition needs a concrete
-/// field to test against, and doing it speculatively risks introducing
-/// a bug into the hot loop with no way to verify the fix actually closes
-/// the gap.
+/// PAN-157 originally proposed shipping Task W4.3's overlapping-signal
+/// multipass technique (`max_decode_passes = 2` +
+/// `time_varying_subtraction_enabled = true`) at `Standard`. Re-running
+/// the ticket's own pre-registered A/B on the current decoder (full
+/// `curated-hard-200` + `synth-clean`, 2026-09-17) found **zero** recall
+/// delta at +978% cost — the general signal population's headroom this
+/// technique used to recover in July has since been closed by other
+/// shipped work (coherent-multipass default-on, LDPC iteration
+/// increases, cross-cycle averaging, AP4 full-message-mask). That result
+/// stands; see PR #389 and
+/// `research/experiments/2026-09-17-w43-pan157-remeasurement-superseded.md`.
+///
+/// It does NOT generalize to every corpus, though: `synth-pair-200`
+/// (WAVs synthesized as deliberately-overlapping signal pairs — exactly
+/// the scenario this technique targets) reproduces the original W4.3 win
+/// exactly under an unbounded budget (55.6%→97.2% weak-signal recovery),
+/// even on today's decoder. The two results coexist because they measure
+/// different populations: the general hard-200 distribution no longer
+/// benefits, but the narrow overlapping-pair case still does.
+///
+/// So the override is bound to the literal `Max` preset ONLY:
+/// - **Round-11 review finding, corrected:** `preset_budget_ms(Max, _)
+///   == 0` is NOT literally unlimited in production — `coordinator/
+///   ft8.rs`'s hot loop (`decode_budget_ceiling_ms`) maps the `0`
+///   sentinel to the protocol's slot ceiling (2000ms for FT8, this
+///   override's only active case). An earlier draft of this comment
+///   claimed "unconditionally unlimited" and "no hardware... dependence"
+///   — both overstated. What's actually true, empirically re-confirmed
+///   under that REAL 2000ms ceiling (not the research harness's
+///   `DecodeBudget::unlimited()`, which the original A/B used):
+///   `research/scorecards/pan157-pair-{control,variant}-prodmax.json`
+///   reproduces the SAME 55.6%→97.2% weak-signal win under the actual
+///   production budget, on the same (slow, virtualized) test hardware
+///   the round-9 diagnostic showed exhausting a 250ms Standard budget on
+///   pass 1 alone. 2000ms is generous enough on this hardware; whether
+///   it holds on genuinely slower target hardware (e.g. the Windows
+///   MiniPC tier) is unverified and should be checked before an on-air
+///   soak, not assumed from this one measurement.
+///
+///   **Round-13 review finding, second measurement-fidelity gap:** the
+///   `prodmax` scorecards above still don't fully reproduce production
+///   timing — `research/decoder.rs`'s harness starts its 2000ms deadline
+///   fresh immediately before the native decode call, but the real
+///   `ft8.rs` hot loop anchors the SAME 2000ms deadline at window
+///   RECEIPT and performs waterfall generation, the optional scoped
+///   fast-path decode, and the ft8_lib FFI decode BEFORE the main
+///   native call that actually consumes `max_decode_passes`. So the
+///   native call's true remaining headroom in production is `2000ms
+///   minus that earlier work`, not a fresh 2000ms. Closing this
+///   precisely needs either a full coordinator-path integration
+///   benchmark or a remaining-headroom-aware override decision, neither
+///   of which is a small patch — tracked as PAN-165, not fixed here.
+///   Bounded, self-correcting risk in the meantime, same shape as
+///   PAN-164: if the native call gets less time than 2000ms in a given
+///   window, `DecodeBudget::has_time()` gating already makes pass 2
+///   gracefully skip for that window — not a wrong decode or a crash.
+/// - `Max`'s override ALSO requires `config.protocol == Protocol::Ft8`
+///   (round-9 review finding): the coherent-subtraction machinery it
+///   enables is FT8-79-symbol-specific, so on FT4 (105 symbols) a
+///   second pass just repeats the decode against an unchanged residual
+///   — wasted work under FT4's tighter slot budget, not the measured
+///   win. `Max` on any other protocol falls through to the same
+///   explicit-default arm as `Eco`/`Standard`/`Deep`. This is why
+///   `try_switch_operating_mode` (`coordinator/mod.rs`) now re-runs this
+///   function right after writing the new protocol — a bare protocol
+///   switch while already on `Max` previously never re-evaluated the
+///   override at all, leaving an FT8-era override silently active under
+///   the new protocol.
+/// - Every other literal preset (`Eco`/`Standard`/`Deep`) explicitly
+///   resets both fields to `Ft8Config::default()`'s values (`1`,
+///   `false`). NOT leaving them untouched: this function mutates
+///   `config` in place and is re-invoked on every tier probe/live
+///   preset cycle, so an empty arm here would make a PRIOR `Max` call's
+///   override sticky — an operator cycling Max→Deep would silently keep
+///   running 2 passes under Deep's now-BOUNDED 1000ms budget forever,
+///   the exact failure mode `Max`-only scoping exists to avoid (PAN-157
+///   review round 9). "Don't push it in Eco/Standard/Deep" (Tony,
+///   2026-09-17) is satisfied because those presets never apply the
+///   override in the first place; "let someone force it" is satisfied
+///   by the existing effort-cycling keybinding itself — cycling to
+///   `Max` IS the forcing mechanism, so there's no separate manual
+///   Ft8Config-field override path this function needs to preserve.
+/// - `Auto` does NOT get this override today: `resolve_effective_effort`
+///   only ever maps `Auto` to `Eco`/`Standard`/`Deep`, never `Max`, so
+///   `Auto` stays a no-op here for now. A hardware-probed extension
+///   (measure whether THIS host has real headroom for a second pass,
+///   and apply the override for capable `Auto` stations even at a
+///   bounded tier) is planned as a PAN-157 follow-up — deliberately
+///   sequenced after this smaller, fully-justified increment lands,
+///   rather than bundled in, since it touches the same probe/lock path
+///   `tier.rs` just spent 9 review rounds hardening.
+///
+/// Both fields are always set TOGETHER by every arm, never
+/// independently — see the note below on why that means
+/// `coordinator/ft8.rs`'s decoder-rebuild-trigger comparison needs no
+/// new field.
+///
+/// **Round-7/round-9 review findings — window atomicity.**
+/// `coordinator/ft8.rs`'s hot loop reads `decode_effort_budget_ms` (a
+/// plain atomic) and `ft8_config_shared` (a separate `try_read`)
+/// independently per window (`ft8.rs:~1547-1569`).
+/// `docs/superpowers/specs/2026-07-06-decoder-speed-overhaul-design.md`
+/// §6.2 states the authoritative invariant: "effort changes take effect
+/// at the next window" — atomically, as one unit, never a mix of the
+/// old budget with the new config or vice versa.
+///
+/// Round-9 review correctly rejected an earlier draft of this comment's
+/// claim that a torn read here "can't produce a wrong decode" — that
+/// overstated it. A **new bounded budget + an OLD (1-pass) config** is
+/// harmless (nothing extra configured to starve). But an **OLD bounded
+/// budget + the NEW 2-pass config** (e.g. mid-transition into `Max`) CAN
+/// transiently starve pass 2 for one window — not a wrong DECODE
+/// (LDPC/CRC still gate correctness) and not new territory (it's the
+/// same "budget exhausted, skip optional work" degradation the anytime-
+/// decoder architecture already tolerates at every bounded tier,
+/// signal-difficulty-dependent), but a real, slightly-longer-than-"next-
+/// window" gap this comment should not have waved away. Both writer
+/// call sites (`tier.rs`'s probe-completion path, `tui_relay.rs`'s live
+/// cycle handler — the latter already had the safe order) now publish
+/// the budget no later than the config write, which limits the tear to
+/// exactly that one harmless-vs-benign-degradation pair rather than an
+/// unbounded ordering. Full atomic-snapshot publishing (one generation
+/// counter for both) remains deferred until a bounded preset needs the
+/// override too, per the same reasoning PAN-156 used to defer this
+/// originally — this round only fixes the ordering, not the tear itself.
 pub(crate) fn apply_effort_overrides(
     effort: DecodeEffort,
     tier: HardwareTier,
+    // Round-12-of-PAN-157 review finding: an earlier version of this
+    // parameter was `budget_override: Option<u64>` (the STARTUP config
+    // value) — wrong axis. `try_switch_operating_mode` passed `None`
+    // for it unconditionally, on the theory that a live operator action
+    // ignores the persisted override the same way `cycle_decode_effort`
+    // does — but `cycle_decode_effort` ALSO reseeds
+    // `decode_effort_budget_ms` to the plain preset value, so `None`
+    // was consistent with the atomic's actual post-call state there. A
+    // mode switch does NOT touch `decode_effort_budget_ms` at all — the
+    // atomic keeps whatever it held before (possibly an explicit
+    // startup `budget_ms` override), so passing `None` there was
+    // internally inconsistent: it could re-enable the override while
+    // the REAL atomic stayed at a too-small explicit budget.
+    //
+    // Fixed by asking every caller for what actually matters: the
+    // resolved EFFECTIVE per-window budget this call will leave in
+    // place (`decode_effort_budget_ms`'s own `0`-means-unlimited-or-
+    // ceiling convention — see `preset_budget_ms`), not whether a
+    // persisted override happens to exist. Each call site already
+    // knows or can read this value directly:
+    // - Startup / `tier.rs`'s two paths: `budget_override.unwrap_or_else
+    //   (|| preset_budget_ms(effort, tier))` — literally what
+    //   `seed_effort_budget` is about to store, computed the same way.
+    // - `tui_relay.rs`'s `CycleDecodeEffort` handler: the `budget_ms`
+    //   `cycle_decode_effort` already computed and stored — pass it
+    //   directly instead of recomputing.
+    // - `try_switch_operating_mode`: reads `decode_effort_budget_ms`
+    //   fresh, since a mode switch never changes it — always correct by
+    //   construction, unlike guessing `None`.
+    effective_budget_ms: u64,
     config: &mut Ft8Config,
 ) {
     match resolve_effective_effort(effort, tier) {
-        DecodeEffort::Eco | DecodeEffort::Standard | DecodeEffort::Deep | DecodeEffort::Max => {}
+        // Round-9-of-PAN-157 review finding (P1): explicitly restore both
+        // fields to their true defaults here, not just "leave them
+        // alone." `config` is mutated in place and this function is
+        // re-called on every tier probe/cycle, so an empty arm here
+        // would make a PRIOR call's `Max` override sticky forever once
+        // the operator cycles away — Max's `max_decode_passes = 2` would
+        // silently persist under a now-tighter-budget preset (Standard/
+        // Deep), defeating the whole point of confining the override to
+        // the one preset with the generous (empirically-confirmed
+        // sufficient) 2000ms ceiling. This matches PAN-156's own original
+        // contract for this function ("EVERY arm below must explicitly
+        // assign that field... so switching to a preset that doesn't
+        // want the override reverts it").
+        DecodeEffort::Eco | DecodeEffort::Standard | DecodeEffort::Deep => {
+            config.max_decode_passes = 1;
+            config.time_varying_subtraction_enabled = false;
+        }
+        // Round-9-of-PAN-157 review finding (P2/protocol): the coherent-
+        // subtraction machinery this override enables is FT8-79-symbol-
+        // specific (`subtract_signal` hardcodes FT8's `NUM_SYMBOLS`).
+        // FT4 has 105 symbols, so on FT4 a second pass just re-runs the
+        // full decode against an UNCHANGED residual — wasted work under
+        // FT4's tighter 800ms slot budget, not the measured win. Only
+        // apply the override when the config is actually FT8; every
+        // other protocol falls through to the same explicit-default arm
+        // Eco/Standard/Deep use, so a station on `Max` in FT4 (or one
+        // that switches protocol while already on `Max`, via
+        // `try_switch_operating_mode`'s now-added re-application) gets
+        // the correct un-overridden defaults, not a stale FT8 override.
+        DecodeEffort::Max
+            if config.protocol == pancetta_ft8::Protocol::Ft8
+                && (effective_budget_ms == 0
+                    || effective_budget_ms
+                        >= super::ft8::decode_budget_ceiling_ms(
+                            config.protocol.slot_ns() as u64
+                        )) =>
+        {
+            config.max_decode_passes = 2;
+            config.time_varying_subtraction_enabled = true;
+        }
+        DecodeEffort::Max => {
+            config.max_decode_passes = 1;
+            config.time_varying_subtraction_enabled = false;
+        }
         DecodeEffort::Auto => unreachable!("resolve_effective_effort never returns Auto"),
     }
-    let _ = config; // silence unused-mut-arg warning until a real arm lands
 }
 
 #[cfg(test)]
@@ -346,17 +510,18 @@ mod tests {
     // PAN-156: effort-preset-conditional Ft8Config overrides
     // ------------------------------------------------------------------
 
-    /// Pure plumbing must not change decode behavior on its own: applying
-    /// any preset's overrides to a fresh default config must leave it
-    /// byte-identical to the default, until a future ticket fills in a
-    /// real per-preset field value.
+    /// PAN-157 bound the W4.3 overlapping-pair multipass override to the
+    /// literal `Max` preset only (see `apply_effort_overrides`'s doc).
+    /// Every OTHER preset — including `Auto`, which never literally
+    /// resolves to `Max` today — must remain byte-identical to the
+    /// default: no override, and no accidental clobber of a value the
+    /// operator (or a future config file) set manually.
     #[test]
-    fn effort_overrides_are_currently_a_no_op_for_every_preset_and_tier() {
+    fn effort_overrides_remain_a_no_op_for_every_preset_except_max() {
         for effort in [
             DecodeEffort::Eco,
             DecodeEffort::Standard,
             DecodeEffort::Deep,
-            DecodeEffort::Max,
             DecodeEffort::Auto,
         ] {
             for tier in [
@@ -365,16 +530,97 @@ mod tests {
                 HardwareTier::Fast,
             ] {
                 let mut config = Ft8Config::default();
-                apply_effort_overrides(effort, tier, &mut config);
+                apply_effort_overrides(effort, tier, 0, &mut config);
                 // `Ft8Config` doesn't derive `PartialEq` (too many fields to
                 // justify adding it just for this guard); compare via
                 // `Debug` instead, which is already derived and structural.
                 assert_eq!(
                     format!("{config:?}"),
                     format!("{:?}", Ft8Config::default()),
-                    "{effort:?} on {tier:?} must not change any Ft8Config field yet"
+                    "{effort:?} on {tier:?} must not change any Ft8Config field"
                 );
             }
+        }
+    }
+
+    /// The literal `Max` preset is the ONE case with a real override:
+    /// PAN-157's re-confirmed synth-pair-200 A/B reproduces the original
+    /// W4.3 win exactly (55.6%→97.2% weak-signal recovery) for
+    /// deliberately-overlapping signal pairs — re-confirmed AGAIN
+    /// (round 11) under the REAL production 2000ms FT8 ceiling
+    /// `preset_budget_ms(Max, _) == 0` actually maps to
+    /// (`pan157-pair-*-prodmax.json`), not just the research harness's
+    /// idealized `DecodeBudget::unlimited()`. Unlike Standard/Deep,
+    /// where the round-9 PAN-156 diagnostic showed even PASS 1 alone can
+    /// exhaust a 250ms budget on slow-enough hardware, 2000ms held up on
+    /// the same test hardware — though that's one data point, not a
+    /// guarantee across every hardware tier.
+    #[test]
+    fn max_preset_enables_the_w43_overlapping_pair_multipass_override() {
+        for tier in [
+            HardwareTier::Slow,
+            HardwareTier::Moderate,
+            HardwareTier::Fast,
+        ] {
+            let mut config = Ft8Config::default();
+            apply_effort_overrides(DecodeEffort::Max, tier, 0, &mut config);
+            assert_eq!(
+                config.max_decode_passes, 2,
+                "Max on {tier:?} must enable the second decode pass"
+            );
+            assert!(
+                config.time_varying_subtraction_enabled,
+                "Max on {tier:?} must enable time-varying subtraction"
+            );
+        }
+    }
+
+    /// Round-9 review finding (protocol): `Max`'s override is FT8-79-
+    /// symbol-specific and must NOT apply on any other protocol — a
+    /// second pass on FT4 just repeats the decode against an unchanged
+    /// residual, wasted work under FT4's tighter slot budget.
+    #[test]
+    fn max_preset_does_not_override_on_non_ft8_protocol() {
+        let mut config = Ft8Config {
+            protocol: pancetta_ft8::Protocol::Ft4,
+            ..Ft8Config::default()
+        };
+        apply_effort_overrides(DecodeEffort::Max, HardwareTier::Fast, 0, &mut config);
+        assert_eq!(
+            config.max_decode_passes, 1,
+            "FT4 + Max must NOT enable the FT8-only second pass"
+        );
+        assert!(
+            !config.time_varying_subtraction_enabled,
+            "FT4 + Max must NOT enable the FT8-only override"
+        );
+    }
+
+    /// Round-9 review finding (P1): `Max`'s override must NOT be sticky
+    /// after cycling away. Applying `Max` then a lower preset to the
+    /// SAME config object (mirroring how the real caller re-invokes this
+    /// function on the same `Ft8Config` across live cycles) must leave
+    /// both fields at their true defaults, not at whatever `Max` set.
+    #[test]
+    fn cycling_away_from_max_clears_the_multipass_override() {
+        for next in [
+            DecodeEffort::Eco,
+            DecodeEffort::Standard,
+            DecodeEffort::Deep,
+        ] {
+            let mut config = Ft8Config::default();
+            apply_effort_overrides(DecodeEffort::Max, HardwareTier::Fast, 0, &mut config);
+            assert_eq!(config.max_decode_passes, 2, "sanity: Max applied first");
+
+            apply_effort_overrides(next, HardwareTier::Fast, 0, &mut config);
+            assert_eq!(
+                config.max_decode_passes, 1,
+                "{next:?} must clear Max's max_decode_passes override, not inherit it"
+            );
+            assert!(
+                !config.time_varying_subtraction_enabled,
+                "{next:?} must clear Max's time_varying_subtraction_enabled override"
+            );
         }
     }
 
@@ -387,8 +633,48 @@ mod tests {
             protocol: pancetta_ft8::Protocol::Ft4,
             ..Ft8Config::default()
         };
-        apply_effort_overrides(DecodeEffort::Standard, HardwareTier::Fast, &mut config);
+        apply_effort_overrides(DecodeEffort::Standard, HardwareTier::Fast, 0, &mut config);
         assert_eq!(config.protocol, pancetta_ft8::Protocol::Ft4);
+    }
+
+    /// Round-11 review finding: an explicit `[decoder].budget_ms`
+    /// override that's smaller than the FT8 ceiling must suppress the
+    /// `Max` override entirely — the station's ACTUAL effective budget
+    /// can't afford the second pass regardless of what preset name it's
+    /// running under.
+    #[test]
+    fn max_preset_does_not_override_when_explicit_budget_is_too_small() {
+        let mut config = Ft8Config::default();
+        apply_effort_overrides(DecodeEffort::Max, HardwareTier::Fast, 250, &mut config);
+        assert_eq!(
+            config.max_decode_passes, 1,
+            "an explicit 250ms override can't afford the second pass, \
+             regardless of the Max preset name"
+        );
+        assert!(!config.time_varying_subtraction_enabled);
+    }
+
+    /// An explicit override AT OR ABOVE the FT8 ceiling (2000ms) is
+    /// exactly as sufficient as the unbounded case — the override still
+    /// gets the full ceiling's worth of time either way, so the
+    /// override should still apply.
+    #[test]
+    fn max_preset_overrides_when_explicit_budget_meets_the_ceiling() {
+        let mut config = Ft8Config::default();
+        apply_effort_overrides(DecodeEffort::Max, HardwareTier::Fast, 2000, &mut config);
+        assert_eq!(config.max_decode_passes, 2);
+        assert!(config.time_varying_subtraction_enabled);
+    }
+
+    /// No explicit override (`None`) means the preset's own `0`/ceiling
+    /// semantics apply — the common case, and the one every other test
+    /// in this module already exercises via `None`.
+    #[test]
+    fn max_preset_overrides_when_there_is_no_explicit_budget() {
+        let mut config = Ft8Config::default();
+        apply_effort_overrides(DecodeEffort::Max, HardwareTier::Fast, 0, &mut config);
+        assert_eq!(config.max_decode_passes, 2);
+        assert!(config.time_varying_subtraction_enabled);
     }
 
     /// `Auto` must resolve through the probed hardware tier the same way

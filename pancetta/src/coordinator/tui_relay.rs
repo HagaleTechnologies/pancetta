@@ -1667,6 +1667,9 @@ impl super::ApplicationCoordinator {
                                 &cmd_active_protocol_mode,
                                 &cmd_active_slot_ns,
                                 &cmd_active_decode_phase_ns,
+                                &cmd_current_decode_effort,
+                                &cmd_resolved_hardware_tier,
+                                &cmd_decode_effort_budget_ms,
                             ) {
                                 Ok(()) => {
                                     let mode_str = super::mode_str(next).to_string();
@@ -1809,21 +1812,45 @@ impl super::ApplicationCoordinator {
                             // re-store it, so both halves of Auto's
                             // tier-dependent state come from one consistent
                             // read.
+                            // PAN-157 round-9 review finding: budget must
+                            // publish no later than config, not after —
+                            // ft8.rs's hot loop reads the budget atomic
+                            // first and the config `try_read` second, so
+                            // publishing config before budget can land a
+                            // window on the NEW config with the OLD,
+                            // possibly-bounded budget (risking starving a
+                            // pass the new config just enabled). The
+                            // reverse tear (new budget + old config) is
+                            // harmless — nothing in the old config needs
+                            // the extra time. See `effort.rs`'s
+                            // `apply_effort_overrides` doc for the full
+                            // reasoning; `tier.rs`'s probe-completion path
+                            // got the same fix.
                             {
                                 let mut cfg_guard = cmd_ft8_config.write().await;
                                 let tier_at_write = pancetta_ft8::tier_probe::HardwareTier::from_u8(
                                     cmd_resolved_hardware_tier.load(Ordering::Acquire),
-                                );
-                                super::effort::apply_effort_overrides(
-                                    next,
-                                    tier_at_write,
-                                    &mut cfg_guard,
                                 );
                                 if next == pancetta_config::DecodeEffort::Auto {
                                     budget_ms =
                                         super::effort::preset_budget_ms(next, tier_at_write);
                                     cmd_decode_effort_budget_ms.store(budget_ms, Ordering::Release);
                                 }
+                                // Round-12 review finding: pass the SAME
+                                // `budget_ms` value that's already been
+                                // stored into `cmd_decode_effort_budget_ms`
+                                // (by `cycle_decode_effort` above, or by
+                                // the Auto-recompute just above this),
+                                // not a guessed `None` — this is always
+                                // consistent with the atomic's actual
+                                // state by construction, the same fix
+                                // applied to `try_switch_operating_mode`.
+                                super::effort::apply_effort_overrides(
+                                    next,
+                                    tier_at_write,
+                                    budget_ms,
+                                    &mut cfg_guard,
+                                );
                             }
                             let label = next.label().to_string();
                             info!(

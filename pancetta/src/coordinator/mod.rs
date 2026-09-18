@@ -542,6 +542,30 @@ pub fn try_switch_operating_mode(
     active_protocol_mode: &std::sync::Arc<std::sync::atomic::AtomicU8>,
     active_slot_ns: &std::sync::Arc<std::sync::atomic::AtomicI64>,
     active_decode_phase_ns: &std::sync::Arc<std::sync::atomic::AtomicI64>,
+    // PAN-157 round 3 review finding: a station already on the `Max`
+    // effort preset that switches protocol (e.g. FT8 -> FT4) must not
+    // carry FT8's `max_decode_passes = 2` override into FT4, where the
+    // coherent-subtraction machinery is FT8-79-symbol-specific — a
+    // second pass just repeats the full decode against an unchanged
+    // residual, wasting time under FT4's tighter 800ms slot budget.
+    // `apply_effort_overrides` itself now gates its `Max` arm on
+    // `config.protocol == Protocol::Ft8`, but that gate only re-fires
+    // when apply_effort_overrides is CALLED — a bare protocol switch
+    // previously never called it at all, leaving a stale FT8-era
+    // override in place. Re-run it here, right after the protocol
+    // write, using the CURRENT effort/tier atomics, so a protocol
+    // switch alone (no effort-preset change) also re-evaluates the
+    // override under the new protocol.
+    current_decode_effort: &std::sync::Arc<std::sync::atomic::AtomicU8>,
+    resolved_hardware_tier: &std::sync::Arc<std::sync::atomic::AtomicU8>,
+    // Round-12-of-PAN-157 review finding: a mode switch never touches
+    // `decode_effort_budget_ms` — it stays at whatever it held before
+    // (possibly an explicit startup `[decoder].budget_ms` override
+    // smaller than the FT8 ceiling). Passing a guessed `None`/`Some`
+    // here would be wrong; read the atomic fresh so the override
+    // decision always matches the budget this station will ACTUALLY
+    // run under, which this function does not and must not change.
+    decode_effort_budget_ms: &std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<(), ModeSwitchError> {
     use std::sync::atomic::Ordering;
 
@@ -557,6 +581,13 @@ pub fn try_switch_operating_mode(
         .try_write()
         .map_err(|_| ModeSwitchError::ConfigLockBusy)?;
     cfg_guard.protocol = new_protocol;
+    let effort =
+        pancetta_config::DecodeEffort::from_u8(current_decode_effort.load(Ordering::Acquire));
+    let tier = pancetta_ft8::tier_probe::HardwareTier::from_u8(
+        resolved_hardware_tier.load(Ordering::Acquire),
+    );
+    let effective_budget_ms = decode_effort_budget_ms.load(Ordering::Acquire);
+    effort::apply_effort_overrides(effort, tier, effective_budget_ms, &mut cfg_guard);
     drop(cfg_guard);
 
     let timing = derive_dsp_timing(&pancetta_ft8::ProtocolParams::from_protocol(new_protocol));
@@ -1845,6 +1876,12 @@ impl ApplicationCoordinator {
         effort::apply_effort_overrides(
             decoder_effort_init,
             pancetta_ft8::tier_probe::HardwareTier::Fast,
+            decoder_budget_override_init.unwrap_or_else(|| {
+                effort::preset_budget_ms(
+                    decoder_effort_init,
+                    pancetta_ft8::tier_probe::HardwareTier::Fast,
+                )
+            }),
             &mut ft8_config_init,
         );
         let ft8_config = Arc::new(RwLock::new(ft8_config_init));
@@ -3782,6 +3819,13 @@ mod tests {
         ));
         let active_slot_ns = Arc::new(std::sync::atomic::AtomicI64::new(15_000_000_000));
         let active_decode_phase_ns = Arc::new(std::sync::atomic::AtomicI64::new(13_000_000_000));
+        let current_decode_effort = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_config::DecodeEffort::Standard.as_u8(),
+        ));
+        let resolved_hardware_tier = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_ft8::tier_probe::HardwareTier::Fast.as_u8(),
+        ));
+        let decode_effort_budget_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let result = try_switch_operating_mode(
             pancetta_config::OperatingMode::Ft4,
@@ -3790,6 +3834,9 @@ mod tests {
             &active_protocol_mode,
             &active_slot_ns,
             &active_decode_phase_ns,
+            &current_decode_effort,
+            &resolved_hardware_tier,
+            &decode_effort_budget_ms,
         );
 
         assert!(matches!(result, Err(ModeSwitchError::QsosActive(1))));
@@ -3810,6 +3857,13 @@ mod tests {
         ));
         let active_slot_ns = Arc::new(std::sync::atomic::AtomicI64::new(15_000_000_000));
         let active_decode_phase_ns = Arc::new(std::sync::atomic::AtomicI64::new(13_000_000_000));
+        let current_decode_effort = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_config::DecodeEffort::Standard.as_u8(),
+        ));
+        let resolved_hardware_tier = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_ft8::tier_probe::HardwareTier::Fast.as_u8(),
+        ));
+        let decode_effort_budget_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let result = try_switch_operating_mode(
             pancetta_config::OperatingMode::Ft4,
@@ -3818,6 +3872,9 @@ mod tests {
             &active_protocol_mode,
             &active_slot_ns,
             &active_decode_phase_ns,
+            &current_decode_effort,
+            &resolved_hardware_tier,
+            &decode_effort_budget_ms,
         );
 
         assert!(result.is_ok());
@@ -3832,6 +3889,115 @@ mod tests {
         );
     }
 
+    /// PAN-157 round-3 review finding regression: a station on `Max` that
+    /// switches protocol away from FT8 must not carry the FT8-only
+    /// multipass override into the new protocol.
+    #[tokio::test]
+    async fn switching_away_from_ft8_clears_the_ft8_only_multipass_override() {
+        let active_tx_qsos = Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
+        let ft8_config = Arc::new(tokio::sync::RwLock::new(Ft8Config {
+            max_decode_passes: 2,
+            time_varying_subtraction_enabled: true,
+            ..Ft8Config::default()
+        }));
+        let active_protocol_mode = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_config::OperatingMode::Ft8.as_u8(),
+        ));
+        let active_slot_ns = Arc::new(std::sync::atomic::AtomicI64::new(15_000_000_000));
+        let active_decode_phase_ns = Arc::new(std::sync::atomic::AtomicI64::new(13_000_000_000));
+        let current_decode_effort = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_config::DecodeEffort::Max.as_u8(),
+        ));
+        let resolved_hardware_tier = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_ft8::tier_probe::HardwareTier::Fast.as_u8(),
+        ));
+        let decode_effort_budget_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let result = try_switch_operating_mode(
+            pancetta_config::OperatingMode::Ft4,
+            &active_tx_qsos,
+            &ft8_config,
+            &active_protocol_mode,
+            &active_slot_ns,
+            &active_decode_phase_ns,
+            &current_decode_effort,
+            &resolved_hardware_tier,
+            &decode_effort_budget_ms,
+        );
+
+        assert!(result.is_ok());
+        let cfg = ft8_config.read().await;
+        assert_eq!(cfg.protocol, pancetta_ft8::Protocol::Ft4);
+        assert_eq!(
+            cfg.max_decode_passes, 1,
+            "FT8-only Max override must be cleared on switching to FT4"
+        );
+        assert!(
+            !cfg.time_varying_subtraction_enabled,
+            "FT8-only Max override must be cleared on switching to FT4"
+        );
+    }
+
+    /// Round-12 review finding regression: a mode switch never touches
+    /// `decode_effort_budget_ms`, so a station on `Max` with an explicit,
+    /// too-small `[decoder].budget_ms` already active in that atomic
+    /// (simulated here directly, as a live config-loaded station would
+    /// have it) must NOT get the multipass override re-enabled just by
+    /// switching (back) into FT8 — the guessed-`None` bug would have
+    /// enabled it here despite the real budget being unable to afford it.
+    #[tokio::test]
+    async fn switching_into_ft8_honors_an_already_bounded_budget_atomic() {
+        let active_tx_qsos = Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
+        let ft8_config = Arc::new(tokio::sync::RwLock::new(Ft8Config {
+            protocol: pancetta_ft8::Protocol::Ft4,
+            ..Ft8Config::default()
+        }));
+        let active_protocol_mode = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_config::OperatingMode::Ft4.as_u8(),
+        ));
+        let active_slot_ns = Arc::new(std::sync::atomic::AtomicI64::new(7_500_000_000));
+        let active_decode_phase_ns = Arc::new(std::sync::atomic::AtomicI64::new(6_500_000_000));
+        let current_decode_effort = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_config::DecodeEffort::Max.as_u8(),
+        ));
+        let resolved_hardware_tier = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_ft8::tier_probe::HardwareTier::Fast.as_u8(),
+        ));
+        // Simulates an explicit `[decoder].budget_ms = 250` already
+        // seeded into the atomic at startup -- smaller than the FT8
+        // ceiling (2000ms).
+        let decode_effort_budget_ms = Arc::new(std::sync::atomic::AtomicU64::new(250));
+
+        let result = try_switch_operating_mode(
+            pancetta_config::OperatingMode::Ft8,
+            &active_tx_qsos,
+            &ft8_config,
+            &active_protocol_mode,
+            &active_slot_ns,
+            &active_decode_phase_ns,
+            &current_decode_effort,
+            &resolved_hardware_tier,
+            &decode_effort_budget_ms,
+        );
+
+        assert!(result.is_ok());
+        let cfg = ft8_config.read().await;
+        assert_eq!(cfg.protocol, pancetta_ft8::Protocol::Ft8);
+        assert_eq!(
+            cfg.max_decode_passes, 1,
+            "the already-bounded 250ms budget atomic can't afford the \
+             second pass, even though the mode switch landed on FT8 \
+             while the preset is Max"
+        );
+        assert!(!cfg.time_varying_subtraction_enabled);
+        // The mode switch itself must not have touched the budget atomic.
+        assert_eq!(
+            decode_effort_budget_ms.load(Ordering::Relaxed),
+            250,
+            "try_switch_operating_mode must never reseed decode_effort_budget_ms"
+        );
+    }
+
     #[test]
     fn try_switch_operating_mode_reports_unavailable_on_poisoned_lock() {
         let active_tx_qsos = Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
@@ -3841,6 +4007,13 @@ mod tests {
         ));
         let active_slot_ns = Arc::new(std::sync::atomic::AtomicI64::new(15_000_000_000));
         let active_decode_phase_ns = Arc::new(std::sync::atomic::AtomicI64::new(13_000_000_000));
+        let current_decode_effort = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_config::DecodeEffort::Standard.as_u8(),
+        ));
+        let resolved_hardware_tier = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_ft8::tier_probe::HardwareTier::Fast.as_u8(),
+        ));
+        let decode_effort_budget_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         // Poison the lock by panicking while holding a write guard.
         let poison_target = Arc::clone(&active_tx_qsos);
@@ -3857,6 +4030,9 @@ mod tests {
             &active_protocol_mode,
             &active_slot_ns,
             &active_decode_phase_ns,
+            &current_decode_effort,
+            &resolved_hardware_tier,
+            &decode_effort_budget_ms,
         );
 
         assert!(matches!(result, Err(ModeSwitchError::QsoSetUnavailable)));
