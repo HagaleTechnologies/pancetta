@@ -176,13 +176,23 @@ fn resolve_effective_effort(effort: DecodeEffort, tier: HardwareTier) -> DecodeE
 /// benefits, but the narrow overlapping-pair case still does.
 ///
 /// So the override is bound to the literal `Max` preset ONLY:
-/// - `Max`'s budget is unconditionally unlimited
-///   (`preset_budget_ms(Max, _) == 0`), so the technique is guaranteed
-///   the wall-clock room it needs — no hardware or signal-difficulty
-///   dependence, unlike a bounded tier. The round-9 PAN-156 diagnostic
-///   showed a bounded Standard budget can be exhausted by pass 1 ALONE
-///   on slow-enough hardware, silently starving pass 2 regardless of
-///   this flag — `Max` sidesteps that failure mode entirely.
+/// - **Round-11 review finding, corrected:** `preset_budget_ms(Max, _)
+///   == 0` is NOT literally unlimited in production — `coordinator/
+///   ft8.rs`'s hot loop (`decode_budget_ceiling_ms`) maps the `0`
+///   sentinel to the protocol's slot ceiling (2000ms for FT8, this
+///   override's only active case). An earlier draft of this comment
+///   claimed "unconditionally unlimited" and "no hardware... dependence"
+///   — both overstated. What's actually true, empirically re-confirmed
+///   under that REAL 2000ms ceiling (not the research harness's
+///   `DecodeBudget::unlimited()`, which the original A/B used):
+///   `research/scorecards/pan157-pair-{control,variant}-prodmax.json`
+///   reproduces the SAME 55.6%→97.2% weak-signal win under the actual
+///   production budget, on the same (slow, virtualized) test hardware
+///   the round-9 diagnostic showed exhausting a 250ms Standard budget on
+///   pass 1 alone. 2000ms is generous enough on this hardware; whether
+///   it holds on genuinely slower target hardware (e.g. the Windows
+///   MiniPC tier) is unverified and should be checked before an on-air
+///   soak, not assumed from this one measurement.
 /// - `Max`'s override ALSO requires `config.protocol == Protocol::Ft8`
 ///   (round-9 review finding): the coherent-subtraction machinery it
 ///   enables is FT8-79-symbol-specific, so on FT4 (105 symbols) a
@@ -255,6 +265,21 @@ fn resolve_effective_effort(effort: DecodeEffort, tier: HardwareTier) -> DecodeE
 pub(crate) fn apply_effort_overrides(
     effort: DecodeEffort,
     tier: HardwareTier,
+    // Round-11-of-PAN-157 review finding: `Max`'s own budget preset
+    // resolves to `0` (meaning "use the protocol's ceiling" — see
+    // `super::ft8::decode_budget_ceiling_ms`, empirically confirmed
+    // sufficient by the round-11 prod-ceiling re-measurement below), but
+    // a station's PERSISTED `[decoder].budget_ms` config, when set,
+    // wins over any preset (`seed_effort_budget`'s contract). A station
+    // configured with `effort = "max"` AND an explicit small
+    // `budget_ms` would otherwise still get the 2-pass override applied
+    // even though its ACTUAL effective budget can't afford it. Callers
+    // that deliberately ignore the persisted override when a LIVE
+    // operator action supersedes it (`cycle_decode_effort`,
+    // `try_switch_operating_mode` — both documented as ignoring it, the
+    // same way `cycle_decode_effort` ignores it for the budget atomic
+    // itself) pass `None` here too, for the same reason.
+    budget_override: Option<u64>,
     config: &mut Ft8Config,
 ) {
     match resolve_effective_effort(effort, tier) {
@@ -264,9 +289,10 @@ pub(crate) fn apply_effort_overrides(
         // re-called on every tier probe/cycle, so an empty arm here
         // would make a PRIOR call's `Max` override sticky forever once
         // the operator cycles away — Max's `max_decode_passes = 2` would
-        // silently persist under a now-BOUNDED budget, defeating the
-        // whole point of confining the override to the one preset that
-        // is guaranteed unlimited. This matches PAN-156's own original
+        // silently persist under a now-tighter-budget preset (Standard/
+        // Deep), defeating the whole point of confining the override to
+        // the one preset with the generous (empirically-confirmed
+        // sufficient) 2000ms ceiling. This matches PAN-156's own original
         // contract for this function ("EVERY arm below must explicitly
         // assign that field... so switching to a preset that doesn't
         // want the override reverts it").
@@ -286,7 +312,14 @@ pub(crate) fn apply_effort_overrides(
         // that switches protocol while already on `Max`, via
         // `try_switch_operating_mode`'s now-added re-application) gets
         // the correct un-overridden defaults, not a stale FT8 override.
-        DecodeEffort::Max if config.protocol == pancetta_ft8::Protocol::Ft8 => {
+        DecodeEffort::Max
+            if config.protocol == pancetta_ft8::Protocol::Ft8
+                && budget_override
+                    .map(|ms| {
+                        ms >= super::ft8::decode_budget_ceiling_ms(config.protocol.slot_ns() as u64)
+                    })
+                    .unwrap_or(true) =>
+        {
             config.max_decode_passes = 2;
             config.time_varying_subtraction_enabled = true;
         }
@@ -464,7 +497,7 @@ mod tests {
                 HardwareTier::Fast,
             ] {
                 let mut config = Ft8Config::default();
-                apply_effort_overrides(effort, tier, &mut config);
+                apply_effort_overrides(effort, tier, None, &mut config);
                 // `Ft8Config` doesn't derive `PartialEq` (too many fields to
                 // justify adding it just for this guard); compare via
                 // `Debug` instead, which is already derived and structural.
@@ -478,16 +511,17 @@ mod tests {
     }
 
     /// The literal `Max` preset is the ONE case with a real override:
-    /// PAN-157's re-confirmed synth-pair-200 A/B (2026-09-17, unbounded
-    /// budget) reproduces the original W4.3 win exactly (55.6%→97.2%
-    /// weak-signal recovery) for deliberately-overlapping signal pairs.
-    /// `Max`'s budget is unconditionally unlimited
-    /// (`preset_budget_ms(Max, _) == 0`), so the technique is guaranteed
-    /// to get the wall-clock room it needs regardless of hardware or
-    /// signal difficulty — unlike Standard/Deep, where the round-9
-    /// PAN-156 diagnostic showed even PASS 1 alone can exhaust a bounded
-    /// budget on slow-enough hardware, silently starving pass 2 either
-    /// way.
+    /// PAN-157's re-confirmed synth-pair-200 A/B reproduces the original
+    /// W4.3 win exactly (55.6%→97.2% weak-signal recovery) for
+    /// deliberately-overlapping signal pairs — re-confirmed AGAIN
+    /// (round 11) under the REAL production 2000ms FT8 ceiling
+    /// `preset_budget_ms(Max, _) == 0` actually maps to
+    /// (`pan157-pair-*-prodmax.json`), not just the research harness's
+    /// idealized `DecodeBudget::unlimited()`. Unlike Standard/Deep,
+    /// where the round-9 PAN-156 diagnostic showed even PASS 1 alone can
+    /// exhaust a 250ms budget on slow-enough hardware, 2000ms held up on
+    /// the same test hardware — though that's one data point, not a
+    /// guarantee across every hardware tier.
     #[test]
     fn max_preset_enables_the_w43_overlapping_pair_multipass_override() {
         for tier in [
@@ -496,7 +530,7 @@ mod tests {
             HardwareTier::Fast,
         ] {
             let mut config = Ft8Config::default();
-            apply_effort_overrides(DecodeEffort::Max, tier, &mut config);
+            apply_effort_overrides(DecodeEffort::Max, tier, None, &mut config);
             assert_eq!(
                 config.max_decode_passes, 2,
                 "Max on {tier:?} must enable the second decode pass"
@@ -518,7 +552,7 @@ mod tests {
             protocol: pancetta_ft8::Protocol::Ft4,
             ..Ft8Config::default()
         };
-        apply_effort_overrides(DecodeEffort::Max, HardwareTier::Fast, &mut config);
+        apply_effort_overrides(DecodeEffort::Max, HardwareTier::Fast, None, &mut config);
         assert_eq!(
             config.max_decode_passes, 1,
             "FT4 + Max must NOT enable the FT8-only second pass"
@@ -542,10 +576,10 @@ mod tests {
             DecodeEffort::Deep,
         ] {
             let mut config = Ft8Config::default();
-            apply_effort_overrides(DecodeEffort::Max, HardwareTier::Fast, &mut config);
+            apply_effort_overrides(DecodeEffort::Max, HardwareTier::Fast, None, &mut config);
             assert_eq!(config.max_decode_passes, 2, "sanity: Max applied first");
 
-            apply_effort_overrides(next, HardwareTier::Fast, &mut config);
+            apply_effort_overrides(next, HardwareTier::Fast, None, &mut config);
             assert_eq!(
                 config.max_decode_passes, 1,
                 "{next:?} must clear Max's max_decode_passes override, not inherit it"
@@ -566,8 +600,63 @@ mod tests {
             protocol: pancetta_ft8::Protocol::Ft4,
             ..Ft8Config::default()
         };
-        apply_effort_overrides(DecodeEffort::Standard, HardwareTier::Fast, &mut config);
+        apply_effort_overrides(
+            DecodeEffort::Standard,
+            HardwareTier::Fast,
+            None,
+            &mut config,
+        );
         assert_eq!(config.protocol, pancetta_ft8::Protocol::Ft4);
+    }
+
+    /// Round-11 review finding: an explicit `[decoder].budget_ms`
+    /// override that's smaller than the FT8 ceiling must suppress the
+    /// `Max` override entirely — the station's ACTUAL effective budget
+    /// can't afford the second pass regardless of what preset name it's
+    /// running under.
+    #[test]
+    fn max_preset_does_not_override_when_explicit_budget_is_too_small() {
+        let mut config = Ft8Config::default();
+        apply_effort_overrides(
+            DecodeEffort::Max,
+            HardwareTier::Fast,
+            Some(250),
+            &mut config,
+        );
+        assert_eq!(
+            config.max_decode_passes, 1,
+            "an explicit 250ms override can't afford the second pass, \
+             regardless of the Max preset name"
+        );
+        assert!(!config.time_varying_subtraction_enabled);
+    }
+
+    /// An explicit override AT OR ABOVE the FT8 ceiling (2000ms) is
+    /// exactly as sufficient as the unbounded case — the override still
+    /// gets the full ceiling's worth of time either way, so the
+    /// override should still apply.
+    #[test]
+    fn max_preset_overrides_when_explicit_budget_meets_the_ceiling() {
+        let mut config = Ft8Config::default();
+        apply_effort_overrides(
+            DecodeEffort::Max,
+            HardwareTier::Fast,
+            Some(2000),
+            &mut config,
+        );
+        assert_eq!(config.max_decode_passes, 2);
+        assert!(config.time_varying_subtraction_enabled);
+    }
+
+    /// No explicit override (`None`) means the preset's own `0`/ceiling
+    /// semantics apply — the common case, and the one every other test
+    /// in this module already exercises via `None`.
+    #[test]
+    fn max_preset_overrides_when_there_is_no_explicit_budget() {
+        let mut config = Ft8Config::default();
+        apply_effort_overrides(DecodeEffort::Max, HardwareTier::Fast, None, &mut config);
+        assert_eq!(config.max_decode_passes, 2);
+        assert!(config.time_varying_subtraction_enabled);
     }
 
     /// `Auto` must resolve through the probed hardware tier the same way

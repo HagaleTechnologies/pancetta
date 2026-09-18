@@ -426,7 +426,12 @@ fn spawn_probe_worker(
                     result.tier,
                     &decode_effort_budget_ms,
                 );
-                apply_effort_overrides(DecodeEffort::Auto, result.tier, &mut cfg_guard);
+                apply_effort_overrides(
+                    DecodeEffort::Auto,
+                    result.tier,
+                    budget_override,
+                    &mut cfg_guard,
+                );
                 info!(
                     "tier probe: decode_effort_budget_ms re-seeded for {} tier (Auto)",
                     result.tier.as_str()
@@ -516,7 +521,7 @@ pub(crate) async fn initialize(
                 seed_effort_budget(effort, budget_override, tier, &decode_effort_budget_ms);
                 {
                     let mut cfg_guard = ft8_config.write().await;
-                    apply_effort_overrides(effort, tier, &mut cfg_guard);
+                    apply_effort_overrides(effort, tier, budget_override, &mut cfg_guard);
                 }
                 resolved_hardware_tier.store(tier.as_u8(), Ordering::Release);
                 false

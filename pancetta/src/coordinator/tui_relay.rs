@@ -1835,9 +1835,14 @@ impl super::ApplicationCoordinator {
                                         super::effort::preset_budget_ms(next, tier_at_write);
                                     cmd_decode_effort_budget_ms.store(budget_ms, Ordering::Release);
                                 }
+                                // Live operator cycle: deliberately ignores
+                                // any persisted `[decoder].budget_ms`
+                                // override, same as `cycle_decode_effort`
+                                // above already does for the budget atomic.
                                 super::effort::apply_effort_overrides(
                                     next,
                                     tier_at_write,
+                                    None,
                                     &mut cfg_guard,
                                 );
                             }

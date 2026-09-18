@@ -578,7 +578,10 @@ pub fn try_switch_operating_mode(
     let tier = pancetta_ft8::tier_probe::HardwareTier::from_u8(
         resolved_hardware_tier.load(Ordering::Acquire),
     );
-    effort::apply_effort_overrides(effort, tier, &mut cfg_guard);
+    // A bare mode switch is a live operator action, same as
+    // `cycle_decode_effort` — deliberately ignores any persisted
+    // `[decoder].budget_ms` override rather than re-honoring it here.
+    effort::apply_effort_overrides(effort, tier, None, &mut cfg_guard);
     drop(cfg_guard);
 
     let timing = derive_dsp_timing(&pancetta_ft8::ProtocolParams::from_protocol(new_protocol));
@@ -1867,6 +1870,7 @@ impl ApplicationCoordinator {
         effort::apply_effort_overrides(
             decoder_effort_init,
             pancetta_ft8::tier_probe::HardwareTier::Fast,
+            decoder_budget_override_init,
             &mut ft8_config_init,
         );
         let ft8_config = Arc::new(RwLock::new(ft8_config_init));

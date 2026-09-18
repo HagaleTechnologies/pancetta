@@ -54,7 +54,7 @@ const MAX_DECODED_FIELD_LEN: usize = 64;
 /// native `pancetta-ft8` AP-enhanced decode call. The separate
 /// `decode_window_ft8lib_protocol` ft8_lib C FFI decode path (below) runs
 /// unconditionally and is not bounded by either budget.
-fn decode_budget_ceiling_ms(slot_ns: u64) -> u64 {
+pub(crate) fn decode_budget_ceiling_ms(slot_ns: u64) -> u64 {
     if slot_ns <= 7_500_000_000 {
         800
     } else {
