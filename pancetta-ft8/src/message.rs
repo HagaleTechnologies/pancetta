@@ -1146,6 +1146,22 @@ pub struct DecodedMessage {
     pub frequency_offset: f64,
     /// Time offset in seconds
     pub time_offset: f64,
+    /// PAN-153 round-9 finding 1/3: the fractional `time_step` offset
+    /// (same units/convention as `CostasCandidate::time_refinement`,
+    /// `0.0` = integer-bin alignment) the sync candidate that produced
+    /// this decode carried, when known. `DecodedMessage::time_offset`
+    /// is the coarse integer-grid time in seconds and does NOT encode
+    /// this — reconstructing it from `time_offset`'s rounding remainder
+    /// (the round-8 fix) degenerates to floating-point noise whenever
+    /// `time_offset` was itself built from an integer-only `time_step`
+    /// grid, which is true on the dominant decode path
+    /// (`par_decode_candidate`'s primary spectrogram-based extraction).
+    /// Set explicitly at construction sites that have the originating
+    /// candidate in scope; `0.0` elsewhere (FFI import, template
+    /// constructors, test scaffolding) — the same default `reverse_
+    /// derive_candidate` always produced before this field existed, so
+    /// every such caller is an exact no-op.
+    pub time_refinement: f64,
     /// Decode timestamp
     pub timestamp: SystemTime,
     /// Number of error corrections applied
@@ -1275,6 +1291,7 @@ impl DecodedMessage {
             confidence,
             frequency_offset,
             time_offset,
+            time_refinement: 0.0,
             timestamp: SystemTime::now(),
             error_corrections: 0,
             tone_symbols: None,
@@ -1303,6 +1320,7 @@ impl DecodedMessage {
             confidence: if ldpc_errors == 0 { 1.0 } else { 0.8 },
             frequency_offset: freq_hz as f64,
             time_offset: 0.0,
+            time_refinement: 0.0,
             timestamp: SystemTime::now(),
             error_corrections: ldpc_errors.clamp(0, 255) as u8,
             tone_symbols: None,

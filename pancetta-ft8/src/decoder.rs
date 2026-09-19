@@ -5010,6 +5010,7 @@ impl Ft8Decoder {
                         time_offset_s,
                     );
                     msg.via_cross_sequence_a7 = true;
+                    msg.time_refinement = cand.time_refinement;
                     decoded_new.push(msg);
                 }
             }
@@ -7294,6 +7295,7 @@ impl Ft8Decoder {
                     confidence,
                     base_frequency,
                     time_offset_s,
+                    candidate.time_refinement,
                 )? {
                     return Ok(Some(msg));
                 }
@@ -7315,6 +7317,7 @@ impl Ft8Decoder {
                         confidence,
                         base_frequency,
                         time_offset_s,
+                        candidate.time_refinement,
                     )? {
                         return Ok(Some(msg));
                     }
@@ -7332,6 +7335,7 @@ impl Ft8Decoder {
                     confidence,
                     base_frequency,
                     time_offset_s,
+                    candidate.time_refinement,
                 )? {
                     return Ok(Some(msg));
                 }
@@ -7351,6 +7355,7 @@ impl Ft8Decoder {
                             confidence,
                             base_frequency,
                             time_offset_s,
+                            candidate.time_refinement,
                         )? {
                             return Ok(Some(msg));
                         }
@@ -7403,6 +7408,7 @@ impl Ft8Decoder {
                             confidence,
                             base_frequency,
                             time_offset_s,
+                            candidate.time_refinement,
                         )? {
                             // Extra content-AP-specific confidence floor —
                             // see the matching comment in
@@ -7437,6 +7443,7 @@ impl Ft8Decoder {
         confidence: f32,
         base_frequency: f64,
         time_offset_s: f64,
+        time_refinement: f64,
     ) -> Ft8Result<Option<DecodedMessage>> {
         // Perf (Pass 1b / A6): `confidence` is loop-invariant — the caller
         // derives it from the candidate's sync_score, so it is fixed before any
@@ -7621,6 +7628,7 @@ impl Ft8Decoder {
         );
         decoded_message.tone_symbols = Some(Self::codeword_to_symbols(&corrected_bits));
         decoded_message.ap_level = ap_level_num;
+        decoded_message.time_refinement = time_refinement;
         // FDR Session 2: stamp the BP-derived confidence telemetry so
         // downstream consumers (FDR module in Session 4, hb-103 content
         // scoring, autonomous-TX gating) can read per-decode features.
@@ -7817,6 +7825,7 @@ impl Ft8Decoder {
                 // W2.1: `llrs` is the cross-cycle-averaged channel LLRs
                 // fed to `decode_soft` above (pre-BP).
                 new_msg.acceptance = crate::acceptance::score_from_slice(&corrected_bits, &llrs);
+                new_msg.time_refinement = anchor.time_refinement;
                 Some(new_msg)
             })();
 
@@ -8282,6 +8291,7 @@ impl Ft8Decoder {
             // W2.1: `llrs` is this residual candidate's own channel LLRs
             // (post-subtraction spectrogram, pre-BP).
             new_msg.acceptance = crate::acceptance::score_from_slice(&corrected_bits, &llrs);
+            new_msg.time_refinement = cand.time_refinement;
             if diagnostic_on {
                 self.residual_snr_records
                     .push((cand.sync_score, pre_snr_db, true));
@@ -8417,6 +8427,7 @@ impl Ft8Decoder {
                 // W2.1: `llrs` is this candidate's own channel LLRs
                 // (original sync position, pre-BP).
                 new_msg.acceptance = crate::acceptance::score_from_slice(&corrected_bits, &llrs);
+                new_msg.time_refinement = cand.time_refinement;
                 Some(new_msg)
             })();
 
@@ -8755,13 +8766,14 @@ impl Ft8Decoder {
                     if !ft8_message.is_plausible() {
                         continue;
                     }
-                    let new_msg = DecodedMessage::new(
+                    let mut new_msg = DecodedMessage::new(
                         ft8_message,
                         snr_db,
                         confidence,
                         base_frequency,
                         time_offset_s,
                     );
+                    new_msg.time_refinement = cand.time_refinement;
                     decoded_new.push(new_msg);
                 }
             }
@@ -8930,6 +8942,7 @@ impl Ft8Decoder {
                 // W2.1: `llrs` is this localized-sync candidate's own
                 // channel LLRs (pre-BP).
                 new_msg.acceptance = crate::acceptance::score_from_slice(&corrected_bits, &llrs);
+                new_msg.time_refinement = cand.time_refinement;
                 Some(new_msg)
             })();
 
@@ -10241,6 +10254,7 @@ fn par_decode_candidate(
             decoded_message.tone_symbols = Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
             decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
             decoded_message.acceptance = acceptance_score;
+            decoded_message.time_refinement = candidate.time_refinement;
             if let Some(unsat) = rescue_unsat {
                 // hb-252 (Batch 98): dedicated origin ordinal for the
                 // BICM-ID rescue. The shipped hb-103 v3 content gate
@@ -10426,6 +10440,7 @@ fn par_decode_candidate(
             decoded_message.tone_symbols = Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
             decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
             decoded_message.acceptance = acceptance_score;
+            decoded_message.time_refinement = candidate.time_refinement;
 
             return Some(decoded_message);
         }
@@ -10794,6 +10809,7 @@ fn matched_demod_attempt(
     );
     decoded_message.tone_symbols = Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
     decoded_message.acceptance = acceptance_score;
+    decoded_message.time_refinement = candidate.time_refinement;
     Some(decoded_message)
 }
 
@@ -11141,6 +11157,7 @@ fn par_try_ap_decode(
                 confidence,
                 base_frequency,
                 time_offset_s,
+                candidate.time_refinement,
             ) {
                 return Some(msg);
             }
@@ -11159,6 +11176,7 @@ fn par_try_ap_decode(
                 confidence,
                 base_frequency,
                 time_offset_s,
+                candidate.time_refinement,
             ) {
                 return Some(msg);
             }
@@ -11181,6 +11199,7 @@ fn par_try_ap_decode(
                     confidence,
                     base_frequency,
                     time_offset_s,
+                    candidate.time_refinement,
                 ) {
                     return Some(msg);
                 }
@@ -11210,6 +11229,7 @@ fn par_try_ap_decode(
                     confidence,
                     base_frequency,
                     time_offset_s,
+                    candidate.time_refinement,
                 ) {
                     return Some(msg);
                 }
@@ -11224,6 +11244,7 @@ fn par_try_ap_decode(
                     confidence,
                     base_frequency,
                     time_offset_s,
+                    candidate.time_refinement,
                 ) {
                     return Some(msg);
                 }
@@ -11243,6 +11264,7 @@ fn par_try_ap_decode(
                 confidence,
                 base_frequency,
                 time_offset_s,
+                candidate.time_refinement,
             ) {
                 return Some(msg);
             }
@@ -11271,6 +11293,7 @@ fn par_try_ap_decode(
                                 confidence,
                                 base_frequency,
                                 time_offset_s,
+                                candidate.time_refinement,
                             ) {
                                 return Some(msg);
                             }
@@ -11287,6 +11310,7 @@ fn par_try_ap_decode(
                         confidence,
                         base_frequency,
                         time_offset_s,
+                        candidate.time_refinement,
                     ) {
                         return Some(msg);
                     }
@@ -11344,6 +11368,7 @@ fn par_try_ap_decode(
                         confidence,
                         base_frequency,
                         time_offset_s,
+                        candidate.time_refinement,
                     ) {
                         // Extra content-AP-specific confidence floor, on
                         // top of the generic AP floor `par_try_ldpc_with_ap`
@@ -11380,6 +11405,7 @@ fn par_try_ldpc_with_ap(
     confidence: f32,
     base_frequency: f64,
     time_offset_s: f64,
+    time_refinement: f64,
 ) -> Option<DecodedMessage> {
     let mut llrs = base_llrs.to_vec();
     let xor_sequence = ctx.xor_sequence;
@@ -11531,6 +11557,7 @@ fn par_try_ldpc_with_ap(
     decoded_message.ap_level = ap_level_num;
     decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
     decoded_message.acceptance = acceptance_score;
+    decoded_message.time_refinement = time_refinement;
 
     Some(decoded_message)
 }
@@ -11548,6 +11575,7 @@ fn par_try_ldpc_with_cq(
     confidence: f32,
     base_frequency: f64,
     time_offset_s: f64,
+    time_refinement: f64,
 ) -> Option<DecodedMessage> {
     let mut llrs = base_llrs.to_vec();
     let xor_sequence = ctx.xor_sequence;
@@ -11622,6 +11650,7 @@ fn par_try_ldpc_with_cq(
     decoded_message.ap_level = 5; // Cq
     decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
     decoded_message.acceptance = acceptance_score;
+    decoded_message.time_refinement = time_refinement;
     Some(decoded_message)
 }
 
@@ -11646,6 +11675,7 @@ fn par_try_ldpc_with_ap4_full(
     confidence: f32,
     base_frequency: f64,
     time_offset_s: f64,
+    time_refinement: f64,
 ) -> Option<DecodedMessage> {
     let mut llrs = base_llrs.to_vec();
     let xor_sequence = ctx.xor_sequence;
@@ -11732,6 +11762,7 @@ fn par_try_ldpc_with_ap4_full(
     decoded_message.ap_level = 4; // still AP4-family for telemetry purposes
     decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
     decoded_message.acceptance = acceptance_score;
+    decoded_message.time_refinement = time_refinement;
     Some(decoded_message)
 }
 
@@ -11760,6 +11791,7 @@ fn par_try_ldpc_with_recent_only(
     confidence: f32,
     base_frequency: f64,
     time_offset_s: f64,
+    time_refinement: f64,
 ) -> Option<DecodedMessage> {
     let mut llrs = base_llrs.to_vec();
     let inject = |llrs: &mut Vec<f32>| match pos {
@@ -11850,6 +11882,7 @@ fn par_try_ldpc_with_recent_only(
     decoded_message.ap_level = 2;
     decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
     decoded_message.acceptance = acceptance_score;
+    decoded_message.time_refinement = time_refinement;
     Some(decoded_message)
 }
 
@@ -12307,20 +12340,28 @@ fn translate_ft8lib_seed(
 /// (not consumed downstream of subtract).
 ///
 /// **Round-8 review finding:** `time_refinement` used to be hardcoded to
-/// `0.0` here, reasoned (in this doc comment) as fine because
-/// `sync_time_interpolation` is off in production — but that reasoning
-/// only covers whether the ORIGINAL sync-search candidate had a
-/// refinement; `msg.time_offset` is its own continuous value, and
-/// rounding it to the nearest integer `time_step` below (as this
-/// function must, to build a `CostasCandidate`) always has SOME
-/// fractional remainder regardless of that flag. Discarding it silently
-/// made `par_extract_complex_symbols_from_spectrogram_refined`'s
-/// fractional-time correction dead code on this call path — the ONLY
-/// consumer of `.time_refinement` on any of `reverse_derive_candidate`'s
-/// callers — so the round-6/7 fix (real, verified in isolation against
-/// `costas_sync_search`-produced candidates) never actually reached the
-/// production `coherent_subtract_and_repass` path it was meant to fix.
-/// Now reconstructs the rounding remainder instead of discarding it.
+/// `0.0` here. Fixed (at the time) by reconstructing it from
+/// `msg.time_offset`'s rounding remainder against the integer `time_step`
+/// grid.
+///
+/// **Round-9 finding 1/3:** that reconstruction degenerates to
+/// floating-point noise near zero on the dominant decode path —
+/// `par_decode_candidate`'s primary spectrogram-based extraction builds
+/// `msg.time_offset` from `coarse_offset` alone (the candidate's integer
+/// `time_step`, converted to seconds), so its "rounding remainder" is
+/// exactly zero up to float error, never the real Costas-search
+/// `CostasCandidate::time_refinement`. `msg.time_offset`'s job is to
+/// report the decode's absolute time in seconds — coarsening it to the
+/// spectrogram's integer grid there is correct and NOT itself a bug; the
+/// bug was reconstructing a fractional signal from a value that was
+/// documented and used elsewhere as integer-grid-only.
+///
+/// Fixed at the source instead: `DecodedMessage` now carries its own
+/// `time_refinement` field, set directly from the originating
+/// `CostasCandidate` at every construction site that has one in scope
+/// (`0.0` — an exact no-op — everywhere else: FFI import, template
+/// constructors, test scaffolding). Read it straight through here rather
+/// than re-deriving it from `time_offset`.
 fn reverse_derive_candidate(
     msg: &DecodedMessage,
     pp: &ProtocolParams,
@@ -12335,7 +12376,6 @@ fn reverse_derive_candidate(
     let spec_step = sps / TIME_OSR;
     let time_step_f64 = msg.time_offset * SAMPLE_RATE as f64 / spec_step as f64;
     let time_step_rel = time_step_f64.round() as isize;
-    let time_refinement = time_step_f64 - time_step_rel as f64;
     let time_step =
         (time_step_rel + time_padding as isize + SLIDING_FRAME_LOOKBACK_STEPS).max(0) as usize;
     CostasCandidate {
@@ -12343,7 +12383,7 @@ fn reverse_derive_candidate(
         freq_bin,
         freq_sub,
         sync_score: 0.0,
-        time_refinement,
+        time_refinement: msg.time_refinement,
     }
 }
 
@@ -18429,6 +18469,7 @@ mod tests {
             confidence: 1.0,
             frequency_offset: base_freq,
             time_offset: time_offset_samples as f64 / SAMPLE_RATE as f64,
+            time_refinement: 0.0,
             timestamp: SystemTime::now(),
             error_corrections: 0,
             tone_symbols: Some(symbols),
@@ -24859,6 +24900,7 @@ mod w26_ap_coverage_tests {
             confidence,
             base_frequency,
             time_offset_s,
+            candidate.time_refinement,
         )
         .expect("par_try_ldpc_with_cq must decode a real, clean CQ signal");
 
@@ -26145,27 +26187,33 @@ mod pan7_ft8lib_sync_seed_tests {
     /// three phases later in the measurement.
     ///
     /// PAN-153 round-8 review finding: `reverse_derive_candidate` used to
-    /// hardcode `time_refinement: 0.0`, silently discarding the rounding
-    /// remainder from snapping `msg.time_offset` to the nearest integer
-    /// `time_step` — the ONLY consumer of `.time_refinement` on any of
-    /// this function's callers is
-    /// `par_extract_complex_symbols_from_spectrogram_refined` (via
-    /// `coherent_subtract_and_repass`), so that made the round-6/7
-    /// fractional-time fix dead code on the actual production path,
-    /// even though it worked correctly in isolation (verified against
-    /// `costas_sync_search`-produced candidates directly). Picks a
-    /// `time_offset` deliberately NOT on the integer `time_step` grid
-    /// and checks the reconstructed `time_refinement` is the expected
-    /// nonzero remainder, not the old hardcoded `0.0`.
+    /// hardcode `time_refinement: 0.0`. Fixed (at the time) by
+    /// reconstructing it from `msg.time_offset`'s rounding remainder
+    /// against the integer `time_step` grid.
+    ///
+    /// PAN-153 round-9 finding 1/3: that reconstruction degenerates to
+    /// floating-point noise on the dominant decode path, because
+    /// `msg.time_offset` there is itself built from the integer
+    /// `time_step` grid alone — there is no real fractional information
+    /// left in it to reconstruct. Fixed at the source: `DecodedMessage`
+    /// now carries its own `time_refinement` field, and
+    /// `reverse_derive_candidate` reads it directly. This test picks a
+    /// `time_offset` exactly ON the integer `time_step` grid (so the old
+    /// rounding-remainder reconstruction would yield 0.0) but gives
+    /// `msg.time_refinement` a real nonzero value, and checks the
+    /// reconstructed candidate carries that value through unchanged —
+    /// proving the field is read directly, not re-derived from
+    /// `time_offset`.
     #[test]
-    fn reverse_derive_candidate_preserves_the_rounding_remainder_as_time_refinement() {
+    fn reverse_derive_candidate_reads_time_refinement_directly_from_the_message() {
         let pp = ProtocolParams::ft8();
         let sps = pp.samples_per_symbol(SAMPLE_RATE);
         let spec_step = sps / TIME_OSR;
-        // Half a time_step off the integer grid -> time_refinement should
-        // land at exactly +-0.5 (the documented range's edge).
-        let time_step_target = 10.5_f64;
+        // Exactly on the integer time_step grid: the old rounding-remainder
+        // reconstruction would land at time_refinement == 0.0 here.
+        let time_step_target = 10.0_f64;
         let time_offset = time_step_target * spec_step as f64 / SAMPLE_RATE as f64;
+        let true_time_refinement = 0.3_f64;
 
         let msg = DecodedMessage {
             message: crate::message::Ft8Message {
@@ -26188,6 +26236,7 @@ mod pan7_ft8lib_sync_seed_tests {
             confidence: 1.0,
             frequency_offset: 500.0,
             time_offset,
+            time_refinement: true_time_refinement,
             timestamp: SystemTime::now(),
             error_corrections: 0,
             tone_symbols: None,
@@ -26201,18 +26250,11 @@ mod pan7_ft8lib_sync_seed_tests {
         };
 
         let candidate = reverse_derive_candidate(&msg, &pp, 0);
-        assert!(
-            candidate.time_refinement.abs() > 0.01,
-            "a time_offset deliberately off the integer time_step grid \
-             must reconstruct a nonzero time_refinement, not the old \
-             hardcoded 0.0; got {}",
-            candidate.time_refinement
-        );
-        assert!(
-            candidate.time_refinement.abs() <= 0.5 + 1e-9,
-            "time_refinement must stay within the documented [-0.5, +0.5] \
-             range; got {}",
-            candidate.time_refinement
+        assert_eq!(
+            candidate.time_refinement, true_time_refinement,
+            "reverse_derive_candidate must read msg.time_refinement \
+             directly, not re-derive it from time_offset's rounding \
+             remainder (which is exactly 0.0 for this on-grid time_offset)"
         );
     }
 
