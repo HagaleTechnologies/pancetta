@@ -562,6 +562,95 @@ pub struct Ft8Config {
     /// (full) subtract.
     pub coherent_subtract_mrc_threshold: f64,
 
+    /// PAN-153: widen `coherent_subtract_and_repass`'s rotor/MRC-magnitude
+    /// reference from the 21 Costas sync symbols
+    /// (`compute_costas_complex_accumulator`) to the full 79-symbol frame
+    /// (`compute_full_frame_complex_accumulator`), using the LDPC-decoded,
+    /// CRC-validated `tone_symbols` as the expected tone at the 58
+    /// non-Costas (message) positions the Costas-only sum can't see.
+    /// WSJT-X mainline's `subtractft8.f90` already estimates its
+    /// subtraction reference from the full known message (it decodes
+    /// first, subtracts second); Pancetta's Costas-only accumulator was
+    /// the narrower of the two — see `coherent_subtract_and_repass`'s doc
+    /// comment ("rotor reference set (21 Costas symbols vs all 79), not
+    /// in algorithm").
+    ///
+    /// **Round-1 review finding, restricted scope:** at
+    /// `candidate.freq_sub == 1` (the fractional/oversampled sub-bin),
+    /// consecutive symbols' bins carry a systematic sub-bin phase
+    /// rotation distinct from the general residual-offset drift below —
+    /// close enough to π that the phase-drift estimator's `.arg()` call
+    /// is numerically unstable right at the wraparound boundary. The
+    /// call site (`coherent_subtract_and_repass`) therefore still only
+    /// applies this widening at `freq_sub == 0`; `freq_sub == 1`
+    /// candidates always fall back to the Costas-only accumulator
+    /// regardless of this flag, as a deterministic guard rather than
+    /// relying on the noisy near-π estimate.
+    ///
+    /// **Round-2 review finding, derotation added:** `freq_sub == 0`
+    /// alone does NOT guarantee a common phase across symbols — a real
+    /// off-air carrier normally sits between lattice points (this is the
+    /// NORMAL case, not an edge case), and a raw sum over more terms
+    /// decoheres FASTER under the same per-symbol residual-offset drift
+    /// than the shorter Costas-only sum does. `compute_full_frame_
+    /// complex_accumulator` now estimates the drift from consecutive-
+    /// pair phase differences at the 21 known Costas positions
+    /// (`estimate_symbol_phase_drift_rad`) and derotates every term
+    /// before summing, which corrects for both this and (empirically,
+    /// per its own regression test) drift magnitudes comparable to the
+    /// `freq_sub == 1` case — the `freq_sub == 0` guard above is kept as
+    /// a second, independent, deterministic layer rather than relying on
+    /// the estimator alone at that specific instability.
+    ///
+    /// **Round-3 review finding, subtraction corrected too:** derotating
+    /// the ACCUMULATOR only fixed the rotor ESTIMATE — the resulting
+    /// `rotor` is referenced to symbol 0's phase, but
+    /// `coherent_subtract_and_repass` was still handing that single
+    /// constant rotor to `subtract_decode_coherent`, which applied it
+    /// identically at all 79 symbols. Under real drift, that leaves a
+    /// residual proportional to `sin(drift_rad * s)` — growing with
+    /// distance from symbol 0 — instead of cleanly removing the signal.
+    /// `subtract_decode_coherent` now takes the SAME estimated drift and
+    /// applies a per-symbol-corrected effective rotor during subtraction
+    /// too (`0.0` for every other, pre-existing caller — an exact no-op).
+    ///
+    /// **Round-6/round-7 review findings, fractional time still
+    /// imperfect (PAN-166):** `candidate.time_refinement` — a normal,
+    /// continuous, usually-nonzero fractional-`time_step` offset for
+    /// real candidates, not an edge case — was being ignored entirely
+    /// (snapped to the nearest integer), empirically confirmed to swing
+    /// the drift estimate between ~0 and ~1.6 rad depending only on its
+    /// sign. `par_extract_complex_symbols_from_spectrogram_refined`'s
+    /// complex linear interpolation cuts this by roughly 8x but does
+    /// NOT fully eliminate it (worst case ~0.43 rad residual, itself
+    /// sign-asymmetric) — an exact STFT phase-rotation derivation was
+    /// attempted and didn't pan out under review-round time pressure;
+    /// see that function's doc for the account. PAN-166 tracks finishing
+    /// this properly.
+    ///
+    /// **Round-8 review finding:** the round-6/7 fix, though correct in
+    /// isolation, never actually reached production — the real call path
+    /// (`coherent_subtract_and_repass`) reconstructs its candidate via
+    /// `reverse_derive_candidate`, which hardcoded `time_refinement:
+    /// 0.0`, making `par_extract_complex_symbols_from_spectrogram_
+    /// refined` degenerate to the plain extractor's output on every real
+    /// decode. Fixed: `reverse_derive_candidate` now reconstructs the
+    /// actual rounding remainder instead of discarding it.
+    ///
+    /// More samples averaged into a (now-derotated) coherent accumulator
+    /// should mean a lower-variance phase/magnitude estimate (√79/√21 ≈
+    /// 1.9× the effective averaging), at the cost of trusting the
+    /// decoded tones at the 58 extra positions — rare to be wrong given
+    /// CRC validation, but not impossible (undetected CRC collision).
+    /// Whether the lower estimator variance actually improves
+    /// subtraction quality (and therefore residual/repass recall) enough
+    /// to matter is unmeasured.
+    ///
+    /// Default **false**: needs its own A/B (`compare` scorecard, not
+    /// this doc comment) before flipping — same discipline as every other
+    /// flag in this struct that names a specific default-off tradeoff.
+    pub coherent_subtract_full_frame_reference_enabled: bool,
+
     /// Coherent iterative-subtract multi-pass. After
     /// pass 1 (regular + cross-cycle), each decoded message's signal is
     /// subtracted from the complex spectrogram via ML projection
@@ -1894,6 +1983,7 @@ impl Default for Ft8Config {
             // hb-081: MRC subtract scaling off by default until the
             // A/B confirms.
             coherent_subtract_mrc_threshold: 0.0,
+            coherent_subtract_full_frame_reference_enabled: false,
             // hb-082: residual sync threshold uses production `min_sync_score`
             // until the A/B confirms a lower value is better.
             residual_min_sync_score: None,
@@ -4920,6 +5010,7 @@ impl Ft8Decoder {
                         time_offset_s,
                     );
                     msg.via_cross_sequence_a7 = true;
+                    msg.time_refinement = cand.time_refinement;
                     decoded_new.push(msg);
                 }
             }
@@ -7204,6 +7295,7 @@ impl Ft8Decoder {
                     confidence,
                     base_frequency,
                     time_offset_s,
+                    candidate.time_refinement,
                 )? {
                     return Ok(Some(msg));
                 }
@@ -7225,6 +7317,7 @@ impl Ft8Decoder {
                         confidence,
                         base_frequency,
                         time_offset_s,
+                        candidate.time_refinement,
                     )? {
                         return Ok(Some(msg));
                     }
@@ -7242,6 +7335,7 @@ impl Ft8Decoder {
                     confidence,
                     base_frequency,
                     time_offset_s,
+                    candidate.time_refinement,
                 )? {
                     return Ok(Some(msg));
                 }
@@ -7261,6 +7355,7 @@ impl Ft8Decoder {
                             confidence,
                             base_frequency,
                             time_offset_s,
+                            candidate.time_refinement,
                         )? {
                             return Ok(Some(msg));
                         }
@@ -7313,6 +7408,7 @@ impl Ft8Decoder {
                             confidence,
                             base_frequency,
                             time_offset_s,
+                            candidate.time_refinement,
                         )? {
                             // Extra content-AP-specific confidence floor —
                             // see the matching comment in
@@ -7347,6 +7443,7 @@ impl Ft8Decoder {
         confidence: f32,
         base_frequency: f64,
         time_offset_s: f64,
+        time_refinement: f64,
     ) -> Ft8Result<Option<DecodedMessage>> {
         // Perf (Pass 1b / A6): `confidence` is loop-invariant — the caller
         // derives it from the candidate's sync_score, so it is fixed before any
@@ -7531,6 +7628,7 @@ impl Ft8Decoder {
         );
         decoded_message.tone_symbols = Some(Self::codeword_to_symbols(&corrected_bits));
         decoded_message.ap_level = ap_level_num;
+        decoded_message.time_refinement = time_refinement;
         // FDR Session 2: stamp the BP-derived confidence telemetry so
         // downstream consumers (FDR module in Session 4, hb-103 content
         // scoring, autonomous-TX gating) can read per-decode features.
@@ -7727,6 +7825,7 @@ impl Ft8Decoder {
                 // W2.1: `llrs` is the cross-cycle-averaged channel LLRs
                 // fed to `decode_soft` above (pre-BP).
                 new_msg.acceptance = crate::acceptance::score_from_slice(&corrected_bits, &llrs);
+                new_msg.time_refinement = anchor.time_refinement;
                 Some(new_msg)
             })();
 
@@ -7852,14 +7951,58 @@ impl Ft8Decoder {
             } else {
                 seed_candidate
             };
-            let Some(cs) =
-                par_extract_complex_symbols_from_spectrogram(pp, spectrogram, &candidate)
-            else {
-                continue;
-            };
             // hb-081: compute both the accumulator (for MRC scaling) and
             // the unit rotor (for ML projection direction).
-            let acc = compute_costas_complex_accumulator(pp, &cs);
+            //
+            // PAN-153: `tone_symbols` is the LDPC-decoded, CRC-validated
+            // message this loop is about to subtract — exactly the
+            // "known tones at all 79 positions" ground truth
+            // `compute_full_frame_complex_accumulator` needs. Only this
+            // call site (post-decode) has that data; the cross-cycle
+            // averaging call site above (pre-decode candidate grouping)
+            // does not, so it keeps using the Costas-only accumulator
+            // unconditionally.
+            //
+            // Round-1 review finding: at `candidate.freq_sub == 1` (the
+            // fractional/oversampled sub-bin — `FREQ_OSR == 2`, so this is
+            // the only other value), consecutive symbols' extracted bins
+            // carry a phase rotation close enough to π that the
+            // drift estimator below is numerically unstable right at
+            // that wraparound boundary. Kept as a deterministic guard:
+            // restrict the widened reference to `freq_sub == 0`, where
+            // `compute_full_frame_complex_accumulator`'s derotation
+            // (round-2 review finding, corrects for the general
+            // residual-frequency-offset case) is reliable.
+            //
+            // Round-2 review finding: `freq_sub == 0` alone does NOT
+            // guarantee a common phase across symbols — a real off-air
+            // carrier normally sits between lattice points, and a raw
+            // sum decoheres faster with more terms under the same
+            // residual drift. `compute_full_frame_complex_accumulator`
+            // now derotates each term using a drift estimate from the
+            // known Costas positions before summing (see its doc and
+            // `estimate_symbol_phase_drift_rad`).
+            let full_frame_active = self.config.coherent_subtract_full_frame_reference_enabled
+                && candidate.freq_sub == 0;
+            // Round-6 review finding: `candidate.time_refinement` is a
+            // normal, usually-nonzero property of real candidates that
+            // the plain extractor ignores — empirically confirmed to
+            // flip the drift estimate between ~0 and ~1.6 rad depending
+            // only on its sign. Full-frame path uses the fractional-
+            // time-aware extractor; the Costas-only path is untouched
+            // (byte-identical to before this ticket).
+            let Some(cs) = (if full_frame_active {
+                par_extract_complex_symbols_from_spectrogram_refined(pp, spectrogram, &candidate)
+            } else {
+                par_extract_complex_symbols_from_spectrogram(pp, spectrogram, &candidate)
+            }) else {
+                continue;
+            };
+            let acc = if full_frame_active {
+                compute_full_frame_complex_accumulator(pp, &cs, tone_symbols)
+            } else {
+                compute_costas_complex_accumulator(pp, &cs)
+            };
             let mag = acc.norm();
             if mag < 1e-30 {
                 continue;
@@ -7870,7 +8013,25 @@ impl Ft8Decoder {
             } else {
                 1.0
             };
-            subtract_decode_coherent(spectrogram, pp, &candidate, rotor, tone_symbols, scale);
+            // PAN-153 round-3 review finding: the rotor above was
+            // derotated to a symbol-0 reference (when `full_frame_active`),
+            // so subtraction must apply the SAME drift back, per symbol,
+            // or the constant `rotor` only correctly represents symbol
+            // 0's phase and leaves a growing residual at later symbols.
+            let symbol_phase_drift_rad = if full_frame_active {
+                estimate_symbol_phase_drift_rad(pp, &cs)
+            } else {
+                0.0
+            };
+            subtract_decode_coherent(
+                spectrogram,
+                pp,
+                &candidate,
+                rotor,
+                tone_symbols,
+                scale,
+                symbol_phase_drift_rad,
+            );
             subtracted_candidates.push(candidate);
         }
         if subtracted_candidates.is_empty() {
@@ -8130,6 +8291,7 @@ impl Ft8Decoder {
             // W2.1: `llrs` is this residual candidate's own channel LLRs
             // (post-subtraction spectrogram, pre-BP).
             new_msg.acceptance = crate::acceptance::score_from_slice(&corrected_bits, &llrs);
+            new_msg.time_refinement = cand.time_refinement;
             if diagnostic_on {
                 self.residual_snr_records
                     .push((cand.sync_score, pre_snr_db, true));
@@ -8265,6 +8427,7 @@ impl Ft8Decoder {
                 // W2.1: `llrs` is this candidate's own channel LLRs
                 // (original sync position, pre-BP).
                 new_msg.acceptance = crate::acceptance::score_from_slice(&corrected_bits, &llrs);
+                new_msg.time_refinement = cand.time_refinement;
                 Some(new_msg)
             })();
 
@@ -8603,13 +8766,14 @@ impl Ft8Decoder {
                     if !ft8_message.is_plausible() {
                         continue;
                     }
-                    let new_msg = DecodedMessage::new(
+                    let mut new_msg = DecodedMessage::new(
                         ft8_message,
                         snr_db,
                         confidence,
                         base_frequency,
                         time_offset_s,
                     );
+                    new_msg.time_refinement = cand.time_refinement;
                     decoded_new.push(new_msg);
                 }
             }
@@ -8778,6 +8942,7 @@ impl Ft8Decoder {
                 // W2.1: `llrs` is this localized-sync candidate's own
                 // channel LLRs (pre-BP).
                 new_msg.acceptance = crate::acceptance::score_from_slice(&corrected_bits, &llrs);
+                new_msg.time_refinement = cand.time_refinement;
                 Some(new_msg)
             })();
 
@@ -10089,6 +10254,7 @@ fn par_decode_candidate(
             decoded_message.tone_symbols = Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
             decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
             decoded_message.acceptance = acceptance_score;
+            decoded_message.time_refinement = candidate.time_refinement;
             if let Some(unsat) = rescue_unsat {
                 // hb-252 (Batch 98): dedicated origin ordinal for the
                 // BICM-ID rescue. The shipped hb-103 v3 content gate
@@ -10274,6 +10440,7 @@ fn par_decode_candidate(
             decoded_message.tone_symbols = Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
             decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
             decoded_message.acceptance = acceptance_score;
+            decoded_message.time_refinement = candidate.time_refinement;
 
             return Some(decoded_message);
         }
@@ -10642,6 +10809,7 @@ fn matched_demod_attempt(
     );
     decoded_message.tone_symbols = Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
     decoded_message.acceptance = acceptance_score;
+    decoded_message.time_refinement = candidate.time_refinement;
     Some(decoded_message)
 }
 
@@ -10989,6 +11157,7 @@ fn par_try_ap_decode(
                 confidence,
                 base_frequency,
                 time_offset_s,
+                candidate.time_refinement,
             ) {
                 return Some(msg);
             }
@@ -11007,6 +11176,7 @@ fn par_try_ap_decode(
                 confidence,
                 base_frequency,
                 time_offset_s,
+                candidate.time_refinement,
             ) {
                 return Some(msg);
             }
@@ -11029,6 +11199,7 @@ fn par_try_ap_decode(
                     confidence,
                     base_frequency,
                     time_offset_s,
+                    candidate.time_refinement,
                 ) {
                     return Some(msg);
                 }
@@ -11058,6 +11229,7 @@ fn par_try_ap_decode(
                     confidence,
                     base_frequency,
                     time_offset_s,
+                    candidate.time_refinement,
                 ) {
                     return Some(msg);
                 }
@@ -11072,6 +11244,7 @@ fn par_try_ap_decode(
                     confidence,
                     base_frequency,
                     time_offset_s,
+                    candidate.time_refinement,
                 ) {
                     return Some(msg);
                 }
@@ -11091,6 +11264,7 @@ fn par_try_ap_decode(
                 confidence,
                 base_frequency,
                 time_offset_s,
+                candidate.time_refinement,
             ) {
                 return Some(msg);
             }
@@ -11119,6 +11293,7 @@ fn par_try_ap_decode(
                                 confidence,
                                 base_frequency,
                                 time_offset_s,
+                                candidate.time_refinement,
                             ) {
                                 return Some(msg);
                             }
@@ -11135,6 +11310,7 @@ fn par_try_ap_decode(
                         confidence,
                         base_frequency,
                         time_offset_s,
+                        candidate.time_refinement,
                     ) {
                         return Some(msg);
                     }
@@ -11192,6 +11368,7 @@ fn par_try_ap_decode(
                         confidence,
                         base_frequency,
                         time_offset_s,
+                        candidate.time_refinement,
                     ) {
                         // Extra content-AP-specific confidence floor, on
                         // top of the generic AP floor `par_try_ldpc_with_ap`
@@ -11228,6 +11405,7 @@ fn par_try_ldpc_with_ap(
     confidence: f32,
     base_frequency: f64,
     time_offset_s: f64,
+    time_refinement: f64,
 ) -> Option<DecodedMessage> {
     let mut llrs = base_llrs.to_vec();
     let xor_sequence = ctx.xor_sequence;
@@ -11379,6 +11557,7 @@ fn par_try_ldpc_with_ap(
     decoded_message.ap_level = ap_level_num;
     decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
     decoded_message.acceptance = acceptance_score;
+    decoded_message.time_refinement = time_refinement;
 
     Some(decoded_message)
 }
@@ -11396,6 +11575,7 @@ fn par_try_ldpc_with_cq(
     confidence: f32,
     base_frequency: f64,
     time_offset_s: f64,
+    time_refinement: f64,
 ) -> Option<DecodedMessage> {
     let mut llrs = base_llrs.to_vec();
     let xor_sequence = ctx.xor_sequence;
@@ -11470,6 +11650,7 @@ fn par_try_ldpc_with_cq(
     decoded_message.ap_level = 5; // Cq
     decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
     decoded_message.acceptance = acceptance_score;
+    decoded_message.time_refinement = time_refinement;
     Some(decoded_message)
 }
 
@@ -11494,6 +11675,7 @@ fn par_try_ldpc_with_ap4_full(
     confidence: f32,
     base_frequency: f64,
     time_offset_s: f64,
+    time_refinement: f64,
 ) -> Option<DecodedMessage> {
     let mut llrs = base_llrs.to_vec();
     let xor_sequence = ctx.xor_sequence;
@@ -11580,6 +11762,7 @@ fn par_try_ldpc_with_ap4_full(
     decoded_message.ap_level = 4; // still AP4-family for telemetry purposes
     decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
     decoded_message.acceptance = acceptance_score;
+    decoded_message.time_refinement = time_refinement;
     Some(decoded_message)
 }
 
@@ -11608,6 +11791,7 @@ fn par_try_ldpc_with_recent_only(
     confidence: f32,
     base_frequency: f64,
     time_offset_s: f64,
+    time_refinement: f64,
 ) -> Option<DecodedMessage> {
     let mut llrs = base_llrs.to_vec();
     let inject = |llrs: &mut Vec<f32>| match pos {
@@ -11698,6 +11882,7 @@ fn par_try_ldpc_with_recent_only(
     decoded_message.ap_level = 2;
     decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
     decoded_message.acceptance = acceptance_score;
+    decoded_message.time_refinement = time_refinement;
     Some(decoded_message)
 }
 
@@ -12151,9 +12336,32 @@ fn translate_ft8lib_seed(
 /// Reverse-derive a candidate from a DecodedMessage's
 /// `frequency_offset` and `time_offset`. We don't keep `(message,
 /// candidate)` pairs through the rayon decode path, so we reconstruct
-/// the candidate for coherent subtraction. `time_refinement` defaults
-/// to 0 (production state — `sync_time_interpolation = false`);
-/// `sync_score` is a placeholder (not consumed downstream of subtract).
+/// the candidate for coherent subtraction. `sync_score` is a placeholder
+/// (not consumed downstream of subtract).
+///
+/// **Round-8 review finding:** `time_refinement` used to be hardcoded to
+/// `0.0` here. Fixed (at the time) by reconstructing it from
+/// `msg.time_offset`'s rounding remainder against the integer `time_step`
+/// grid.
+///
+/// **Round-9 finding 1/3:** that reconstruction degenerates to
+/// floating-point noise near zero on the dominant decode path —
+/// `par_decode_candidate`'s primary spectrogram-based extraction builds
+/// `msg.time_offset` from `coarse_offset` alone (the candidate's integer
+/// `time_step`, converted to seconds), so its "rounding remainder" is
+/// exactly zero up to float error, never the real Costas-search
+/// `CostasCandidate::time_refinement`. `msg.time_offset`'s job is to
+/// report the decode's absolute time in seconds — coarsening it to the
+/// spectrogram's integer grid there is correct and NOT itself a bug; the
+/// bug was reconstructing a fractional signal from a value that was
+/// documented and used elsewhere as integer-grid-only.
+///
+/// Fixed at the source instead: `DecodedMessage` now carries its own
+/// `time_refinement` field, set directly from the originating
+/// `CostasCandidate` at every construction site that has one in scope
+/// (`0.0` — an exact no-op — everywhere else: FFI import, template
+/// constructors, test scaffolding). Read it straight through here rather
+/// than re-deriving it from `time_offset`.
 fn reverse_derive_candidate(
     msg: &DecodedMessage,
     pp: &ProtocolParams,
@@ -12166,7 +12374,8 @@ fn reverse_derive_candidate(
     let freq_sub = (remainder / sub_bin).round() as usize;
     let sps = pp.samples_per_symbol(SAMPLE_RATE);
     let spec_step = sps / TIME_OSR;
-    let time_step_rel = (msg.time_offset * SAMPLE_RATE as f64 / spec_step as f64).round() as isize;
+    let time_step_f64 = msg.time_offset * SAMPLE_RATE as f64 / spec_step as f64;
+    let time_step_rel = time_step_f64.round() as isize;
     let time_step =
         (time_step_rel + time_padding as isize + SLIDING_FRAME_LOOKBACK_STEPS).max(0) as usize;
     CostasCandidate {
@@ -12174,7 +12383,7 @@ fn reverse_derive_candidate(
         freq_bin,
         freq_sub,
         sync_score: 0.0,
-        time_refinement: 0.0,
+        time_refinement: msg.time_refinement,
     }
 }
 
@@ -12198,6 +12407,19 @@ fn subtract_decode_coherent(
     // (hb-079 default); <1.0 reduces the magnitude (MRC weighting from a
     // noisy-rotor caller). Outside [0,1] is clamped.
     scale: f64,
+    // PAN-153 round-3 review finding: a single constant `rotor` assumes
+    // the true signal phase is the SAME at every one of `pp.num_symbols`
+    // positions. When the caller estimated `rotor` from a derotated
+    // accumulator (`compute_full_frame_complex_accumulator`, referenced
+    // to symbol 0), the true phase at symbol `s` is actually
+    // `symbol_phase_drift_rad * s` AHEAD of `rotor` — projecting with
+    // the same constant rotor at every symbol would leave a residual
+    // proportional to `sin(symbol_phase_drift_rad * s)`, growing with
+    // distance from symbol 0, instead of cleanly removing the signal.
+    // `0.0` (every existing caller before this ticket) is an EXACT
+    // no-op, skipped entirely rather than multiplying by
+    // `exp(j*0*s) == 1` — byte-identical to not having this parameter.
+    symbol_phase_drift_rad: f64,
 ) {
     if spectrogram.complex.is_none() {
         return;
@@ -12213,7 +12435,6 @@ fn subtract_decode_coherent(
         return;
     }
     let steps_per_symbol = TIME_OSR;
-    let rotor_conj = rotor.conj();
 
     for sym_idx in 0..pp.num_symbols.min(tone_symbols.len()) {
         let tone = tone_symbols[sym_idx] as usize;
@@ -12230,6 +12451,42 @@ fn subtract_decode_coherent(
             if t_idx >= num_steps {
                 continue;
             }
+            // Round-4 review finding: the FFT phase advances continuously
+            // through TIME, not just once per symbol — with
+            // `steps_per_symbol == TIME_OSR` substeps evenly spaced
+            // within each symbol period, substep `s` sits an additional
+            // `symbol_phase_drift_rad * s / steps_per_symbol` ahead of
+            // that symbol's own `s == 0` reference. Computing the
+            // effective rotor once per SYMBOL and reusing it for every
+            // substep (the round-3 fix's original mistake) left a
+            // residual in every non-zero substep. Byte-identical to the
+            // original constant `rotor` when `symbol_phase_drift_rad ==
+            // 0.0` (every pre-existing call site).
+            let effective_rotor = if symbol_phase_drift_rad == 0.0 {
+                rotor
+            } else {
+                // Round-9 review finding: `rotor` was estimated from
+                // samples interpolated at the FRACTIONAL extraction
+                // position `t0 + candidate.time_refinement` (the
+                // refined extractor's own reference — see
+                // `par_extract_complex_symbols_from_spectrogram_
+                // refined`), not the integer row `t0`. Treating the raw
+                // row read here (at the plain integer `t_idx`) as
+                // though `frac_symbol == 0` coincided with `t0` ignores
+                // that shift, leaving every symbol's projection
+                // displaced by `symbol_phase_drift_rad *
+                // time_refinement / steps_per_symbol`. Subtract the
+                // refinement (in the same symbol-fraction units) to
+                // re-reference the rotor to where it was actually
+                // estimated. `time_refinement == 0.0` (every
+                // pre-existing caller, and any full-frame candidate the
+                // sync search happened to land exactly on-grid) makes
+                // this an exact no-op.
+                let frac_symbol = sym_idx as f64
+                    + (s as f64 - candidate.time_refinement) / steps_per_symbol as f64;
+                rotor * Complex::from_polar(1.0, symbol_phase_drift_rad * frac_symbol)
+            };
+            let effective_rotor_conj = effective_rotor.conj();
             // Scoped &mut to spectrogram.complex; ends before .power access.
             //
             // perf F4: `complex` storage is `SpecScalar` (f32) precision,
@@ -12240,13 +12497,30 @@ fn subtract_decode_coherent(
             // the arithmetic (not just the storage) at f64 avoids
             // compounding rounding error across rounds.
             let flat_idx = (t_idx * freq_osr + fs) * num_bins + f_idx;
+            // Round-5 review finding: the same deterministic FFT-bin-
+            // parity artifact that corrupted the drift estimator and
+            // accumulator also misaligns the projection here — `rotor`
+            // was estimated from a CANONICALIZED (parity-corrected)
+            // accumulator, so projecting the RAW (uncorrected) bin
+            // against it is wrong whenever this symbol's tone is odd.
+            // Canonicalize before projecting, un-canonicalize (parity
+            // sign is self-inverse) before subtracting from the raw
+            // bin. `0.0` (every pre-existing call site) skips this
+            // entirely — byte-identical to no canonicalization.
+            let parity = if symbol_phase_drift_rad == 0.0 {
+                1.0
+            } else {
+                tone_parity_sign(tone)
+            };
             let residual = {
                 let complex = spectrogram.complex.as_mut().unwrap();
                 let bin = complex[flat_idx];
                 let bin64 = Complex::new(bin.re as f64, bin.im as f64);
-                let proj_real = (bin64 * rotor_conj).re;
+                let canon_bin64 = bin64 * parity;
+                let proj_real = (canon_bin64 * effective_rotor_conj).re;
                 // hb-081: scale the subtracted projection magnitude.
-                let signal_est = Complex::new(proj_real * scale, 0.0) * rotor;
+                let signal_est_canon = Complex::new(proj_real * scale, 0.0) * effective_rotor;
+                let signal_est = signal_est_canon * parity;
                 let residual = bin64 - signal_est;
                 complex[flat_idx] =
                     Complex::new(residual.re as SpecScalar, residual.im as SpecScalar);
@@ -12502,6 +12776,90 @@ fn par_extract_complex_symbols_from_spectrogram(
     Some(out)
 }
 
+/// PAN-153 round-6 review finding: fractional-time-aware sibling of
+/// [`par_extract_complex_symbols_from_spectrogram`], for the full-frame
+/// path only. `candidate.time_refinement` (fractional `time_step`
+/// offset, [-0.5, +0.5], from parabolic interpolation of the Costas
+/// sync score — see that field's doc) is a NORMAL, continuous, usually-
+/// nonzero property of real candidates, not an edge case. The plain
+/// extractor snaps to the nearest integer `time_step`, ignoring it
+/// entirely; empirically, this makes `estimate_symbol_phase_drift_rad`'s
+/// output flip between ~0 rad and ~1.6 rad of BOGUS drift depending only
+/// on `time_refinement`'s sign, for an otherwise clean, non-drifting
+/// signal (confirmed via a real-signal sweep across multiple candidates
+/// — see `phase_drift_estimate_is_near_zero_on_a_real_clean_signal_*`).
+///
+/// Complex-valued linear interpolation between the two neighboring
+/// integer `time_step` samples, mirroring `lookup_time_interp`'s
+/// already-validated pattern for magnitude/power (this is its
+/// complex-valued counterpart, indexed per SYMBOL rather than per
+/// substep). `time_refinement == 0.0` degenerates to exactly the plain
+/// extractor's output (`frac == 0.0`, so only the lower/integer sample
+/// contributes) — used ONLY by the full-frame path; the pre-existing
+/// Costas-only path keeps using the plain extractor unconditionally, so
+/// its already-validated behavior is untouched.
+///
+/// **Known incomplete** (round-7 investigation): empirically cuts the
+/// round-6 bogus-drift magnitude by roughly 8x (~1.66 rad -> ~0.19 rad
+/// on the same real-signal sweep) but does not eliminate it. An exact
+/// STFT phase-advance-per-hop rotation (`exp(j·2π·bin·H/N)` scaled by
+/// the fractional hop) was derived and tried as an alternative — it
+/// correctly reproduces round 5's INTEGER-time_step tone-parity finding
+/// exactly (`(-1)^(freq_bin+tone)` per whole time_step, confirming the
+/// underlying theory), but made the FRACTIONAL case measurably WORSE in
+/// every tried sign convention, meaning either the formula's derivation
+/// or an assumption about the windowed-STFT's behavior at fractional
+/// hop positions is still wrong. Linear interpolation is kept as the
+/// better-verified of the two despite being incomplete; the residual
+/// gap needs further DSP investigation as a follow-up, not another
+/// guessed formula under continued review pressure.
+fn par_extract_complex_symbols_from_spectrogram_refined(
+    pp: &ProtocolParams,
+    spectrogram: &Spectrogram,
+    candidate: &CostasCandidate,
+) -> Option<Vec<[Complex<f64>; NUM_TONES]>> {
+    let complex = spectrogram.complex.as_ref()?;
+    let t0 = candidate.time_step;
+    let f0 = candidate.freq_bin;
+    let fs = candidate.freq_sub;
+    let steps_per_symbol = TIME_OSR;
+    let dt = candidate.time_refinement;
+
+    let read_complex = |t_idx: isize, freq_bin: usize| -> Complex<f64> {
+        if t_idx >= 0
+            && (t_idx as usize) < spectrogram.num_steps
+            && freq_bin < spectrogram.num_bins
+            && fs < spectrogram.freq_osr
+        {
+            let raw = complex[spectrogram.idx(t_idx as usize, fs, freq_bin)];
+            Complex::new(raw.re as f64, raw.im as f64)
+        } else {
+            Complex::new(0.0, 0.0)
+        }
+    };
+
+    let mut out: Vec<[Complex<f64>; NUM_TONES]> = Vec::with_capacity(pp.num_symbols);
+    for sym_idx in 0..pp.num_symbols {
+        let mut row = [Complex::new(0.0f64, 0.0); NUM_TONES];
+        let t_cont = t0 as f64 + dt + (sym_idx * steps_per_symbol) as f64;
+        let t_lo_f = t_cont.floor();
+        let frac = t_cont - t_lo_f;
+        let lo_idx = t_lo_f as isize;
+        let hi_idx = lo_idx + 1;
+        for tone in 0..pp.num_tones {
+            let freq_bin = f0 + tone;
+            if freq_bin >= spectrogram.num_bins {
+                continue;
+            }
+            let lo = read_complex(lo_idx, freq_bin);
+            let hi = read_complex(hi_idx, freq_bin);
+            row[tone] = lo * (1.0 - frac) + hi * frac;
+        }
+        out.push(row);
+    }
+    Some(out)
+}
+
 /// Sum the candidate's complex FFT bins at all 21 Costas positions
 /// (each at its expected tone). `Σ cs[costas_sym][expected_tone] =
 /// N·A·exp(jφ_cand)` (signal coherent, noise uncorrelated). The result's
@@ -12523,6 +12881,130 @@ fn compute_costas_complex_accumulator(
             }
             acc += complex_symbols[sym_idx][expected_tone];
         }
+    }
+    acc
+}
+
+/// PAN-153 round-5 review finding: `par_extract_complex_symbols_from_
+/// spectrogram`'s underlying FFT bin selection (`src_bin = (freq_bin +
+/// tone) * freq_osr + freq_sub`) carries a deterministic, tone-PARITY-
+/// dependent phase — confirmed empirically
+/// (`phase_drift_estimate_is_near_zero_on_a_real_clean_signal`: a real,
+/// clean, non-drifting signal estimated ~-2.7 rad of "drift" before this
+/// fix, not the ~0 a genuinely non-drifting signal should show). Only
+/// the RELATIVE parity between two terms matters for any pairwise
+/// product or sum mixing tones — this returns `-1.0` for an odd tone
+/// and `1.0` for an even one, multiplied onto a term before combining it
+/// with a term of possibly-different tone parity, canceling the
+/// artifact's contribution. Self-inverse (multiplying twice is a no-op),
+/// so the same call also "un-canonicalizes" a reconstructed value back
+/// to the raw basis.
+///
+/// Scope: applied ONLY within this ticket's NEW full-frame code
+/// (`compute_full_frame_complex_accumulator`, this estimator, and
+/// `subtract_decode_coherent`'s full-frame-only branch) — never to the
+/// pre-existing, already-shipped `compute_costas_complex_accumulator`
+/// or the default (`symbol_phase_drift_rad == 0.0`) subtraction path,
+/// which are out of scope for this PR and must stay byte-identical.
+#[inline]
+fn tone_parity_sign(tone: usize) -> f64 {
+    if tone % 2 == 0 {
+        1.0
+    } else {
+        -1.0
+    }
+}
+
+/// PAN-153 round 2 review finding: estimate the symbol-to-symbol phase
+/// drift (radians) from consecutive-pair phase differences at the 21
+/// KNOWN Costas positions. A residual frequency offset — the candidate
+/// isn't exactly on a lattice point, which is the NORMAL case for a
+/// real off-air carrier, not an edge case — rotates each symbol's
+/// extracted bin by a roughly constant extra phase each symbol; a raw
+/// sum over many terms without correcting for this decoheres faster the
+/// more terms are summed (a fixed per-symbol drift that a 21-term sum
+/// tolerates can nearly fully cancel a 79-term sum). Estimated via
+/// vector-summed consecutive differences (`b · conj(a)`, not naive angle
+/// subtraction) so opposite-signed noisy estimates partially cancel
+/// instead of biasing a wraparound-prone average; restricted to pairs
+/// WITHIN the same Costas group (the three groups sit at fixed,
+/// non-adjacent positions 0-6/36-42/72-78, so a cross-group difference
+/// would mix real drift with the unrelated gap between groups).
+fn estimate_symbol_phase_drift_rad(
+    pp: &ProtocolParams,
+    complex_symbols: &[[Complex<f64>; NUM_TONES]],
+) -> f64 {
+    let mut diff_sum = Complex::<f64>::new(0.0, 0.0);
+    for (m, &group_start) in pp.costas_positions.iter().enumerate() {
+        for k in 0..pp.costas_length.saturating_sub(1) {
+            let sym_a = group_start + k;
+            let sym_b = group_start + k + 1;
+            if sym_b >= complex_symbols.len() {
+                continue;
+            }
+            let (Some(&tone_a), Some(&tone_b)) =
+                (pp.costas_arrays[m].get(k), pp.costas_arrays[m].get(k + 1))
+            else {
+                continue;
+            };
+            let (tone_a, tone_b) = (tone_a as usize, tone_b as usize);
+            if tone_a >= NUM_TONES || tone_b >= NUM_TONES {
+                continue;
+            }
+            let canon_b = complex_symbols[sym_b][tone_b] * tone_parity_sign(tone_b);
+            let canon_a = complex_symbols[sym_a][tone_a] * tone_parity_sign(tone_a);
+            diff_sum += canon_b * canon_a.conj();
+        }
+    }
+    if diff_sum.norm() < 1e-30 {
+        return 0.0;
+    }
+    diff_sum.arg()
+}
+
+/// PAN-153: sibling of [`compute_costas_complex_accumulator`] that sums
+/// the candidate's complex FFT bins at ALL `pp.num_symbols` (79 for FT8)
+/// positions instead of just the 21 Costas ones, using `tone_symbols`
+/// (the LDPC-decoded, CRC-validated message) as the expected tone at
+/// every position — including the Costas ones, where `tone_symbols`
+/// already agrees with `pp.costas_arrays` by construction (the encoder
+/// places the fixed Costas pattern at those positions), so this is a
+/// strict superset of the Costas-only sum, not a different basis. More
+/// terms summed into a coherent accumulator (signal adds in-phase, noise
+/// doesn't) means a lower-variance phase/magnitude estimate — see
+/// `Ft8Config::coherent_subtract_full_frame_reference_enabled`'s doc for
+/// the tradeoff this trades against.
+///
+/// Each term is derotated by `estimate_symbol_phase_drift_rad`'s
+/// estimate (relative to symbol 0) before summing — round-2 review
+/// finding: without this, ANY residual frequency offset (the normal
+/// case, not just the already-guarded `freq_sub == 1` discrete case)
+/// rotates the raw sum toward cancellation, more severely than the
+/// shorter Costas-only sum it's meant to improve on.
+///
+/// Round-5 review finding: also canonicalized per `tone_parity_sign`
+/// before summing — the same deterministic FFT-bin-parity artifact that
+/// corrupted the drift estimator corrupts a raw sum across ALL 8 tones
+/// (unlike the Costas-only sum's fixed 7-tone pattern) just as directly,
+/// independent of any real drift.
+fn compute_full_frame_complex_accumulator(
+    pp: &ProtocolParams,
+    complex_symbols: &[[Complex<f64>; NUM_TONES]],
+    tone_symbols: &[u8],
+) -> Complex<f64> {
+    let drift_rad = estimate_symbol_phase_drift_rad(pp, complex_symbols);
+    let mut acc = Complex::<f64>::new(0.0, 0.0);
+    let n = pp
+        .num_symbols
+        .min(complex_symbols.len())
+        .min(tone_symbols.len());
+    for sym_idx in 0..n {
+        let tone = tone_symbols[sym_idx] as usize;
+        if tone >= NUM_TONES {
+            continue;
+        }
+        let derotate = Complex::from_polar(1.0, -drift_rad * sym_idx as f64);
+        acc += complex_symbols[sym_idx][tone] * tone_parity_sign(tone) * derotate;
     }
     acc
 }
@@ -17987,6 +18469,7 @@ mod tests {
             confidence: 1.0,
             frequency_offset: base_freq,
             time_offset: time_offset_samples as f64 / SAMPLE_RATE as f64,
+            time_refinement: 0.0,
             timestamp: SystemTime::now(),
             error_corrections: 0,
             tone_symbols: Some(symbols),
@@ -18028,6 +18511,117 @@ mod tests {
     // BASE_FREQUENCY (1500 Hz). `modulate_symbols(symbols, freq_offset)`
     // emits at `1500 + freq_offset` Hz. Costas freq_bins are spaced at
     // tone_spacing = 6.25 Hz, so freq_bin = total_hz / 6.25.
+    /// PAN-153 round-5/round-6 review findings: verify `estimate_symbol_
+    /// phase_drift_rad` against REAL spectrograms built through the
+    /// actual FFT/windowing pipeline (`compute_spectrogram` + a real
+    /// Costas sync search), not a hand-built synthetic `complex_symbols`
+    /// array like every other test in this file uses — every prior test
+    /// structurally CANNOT catch either of the following, since they
+    /// inject values directly and bypass real FFT extraction.
+    ///
+    /// Round 5 found a deterministic tone-parity FFT artifact (fixed via
+    /// `tone_parity_sign`). Round 6's stated hypothesis (the artifact
+    /// ALSO depends on `candidate.time_step`'s parity) was tested
+    /// directly here with a sweep across many sample-level lead-in
+    /// shifts spanning both time_step parities, and REFUTED by the
+    /// evidence — the same `time_step` value produced both clean and
+    /// badly-wrong drift estimates on different runs, which a pure
+    /// parity rule cannot explain.
+    ///
+    /// What the sweep DID find, cleanly and consistently across every
+    /// sample: `candidate.time_refinement`'s SIGN, not `time_step`'s
+    /// parity, predicts the outcome. `time_refinement` is a normal,
+    /// continuous, usually-nonzero property of real candidates (not an
+    /// edge case) that the plain extractor ignores by snapping to the
+    /// nearest integer `time_step`.
+    ///
+    /// **Round-7 investigation, partial fix.**
+    /// `par_extract_complex_symbols_from_spectrogram_refined`'s complex
+    /// linear interpolation cuts the bogus drift by roughly 8x on this
+    /// same sweep (worst case ~1.66 rad -> ~0.43 rad) but does NOT fully
+    /// eliminate it, and the residual is itself asymmetric — clean
+    /// (<0.003 rad) for negative `time_refinement`, ~0.2-0.4 rad for
+    /// positive. An exact STFT phase-advance-per-hop derivation was
+    /// tried and independently re-confirmed round 5's finding at
+    /// INTEGER time_step offsets, but made the fractional case
+    /// measurably worse under every sign convention tried — see that
+    /// function's doc for the full account. Tony's call (2026-09-18):
+    /// ship the verified partial improvement rather than keep guessing
+    /// formulas; PAN-166 tracks the remaining exact fix. This test's
+    /// threshold (5x looser than round 5/6's, at the current worst
+    /// observed magnitude plus margin) reflects today's REAL, partial
+    /// state — not a claim of full correctness.
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn phase_drift_estimate_is_near_zero_on_a_real_clean_signal_across_time_offsets() {
+        const SUBBLOCK_SIZE: usize = 960;
+        for lead_in_samples in [
+            0,
+            SUBBLOCK_SIZE,
+            2 * SUBBLOCK_SIZE,
+            3 * SUBBLOCK_SIZE,
+            4 * SUBBLOCK_SIZE,
+            5 * SUBBLOCK_SIZE,
+            6 * SUBBLOCK_SIZE,
+            7 * SUBBLOCK_SIZE,
+        ] {
+            let mut encoder = crate::Ft8Encoder::new();
+            let symbols = encoder
+                .encode_message("CQ K5ARH EM10", None)
+                .expect("encode");
+            let mut modulator = crate::Ft8Modulator::new_default().expect("modulator");
+            // 1500 (base) + 500 = 2000 Hz = 320 * 6.25 Hz -> exactly on
+            // the freq_bin lattice, so the truth candidate's
+            // freq_sub == 0 regardless of the lead-in shift.
+            let tx = modulator
+                .modulate_symbols(&symbols, 500.0)
+                .expect("modulate");
+            let mut tx_shifted = vec![0.0f32; lead_in_samples];
+            tx_shifted.extend_from_slice(&tx);
+            tx_shifted.resize(WINDOW_SAMPLES, 0.0);
+            let tx_f64: Vec<f64> = tx_shifted.iter().map(|&s| s as f64).collect();
+
+            let decoder = Ft8Decoder::new(Ft8Config::default())
+                .expect("decoder (cross_cycle_coherent default-on)");
+            let spectrogram = decoder
+                .compute_spectrogram(&tx_f64)
+                .expect("spectrogram (complex retained by default)");
+            let pp = ProtocolParams::ft8();
+            let candidates = decoder
+                .costas_sync_search(&spectrogram, None)
+                .expect("costas sync search");
+            let truth = candidates
+                .iter()
+                .filter(|c| c.freq_bin == 320 && c.freq_sub == 0)
+                .max_by(|a, b| a.sync_score.partial_cmp(&b.sync_score).unwrap())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "lead_in={lead_in_samples}: expected a freq_sub==0 \
+                         candidate at freq_bin=320; got: {:?}",
+                        candidates
+                            .iter()
+                            .map(|c| (c.freq_bin, c.freq_sub, c.sync_score))
+                            .collect::<Vec<_>>()
+                    )
+                });
+            let cs = par_extract_complex_symbols_from_spectrogram_refined(&pp, &spectrogram, truth)
+                .expect("complex retention present");
+
+            let drift = estimate_symbol_phase_drift_rad(&pp, &cs);
+            assert!(
+                drift.abs() < 0.6,
+                "lead_in={lead_in_samples} (time_step={}, time_refinement={}): \
+                 the round-7 partial fix should keep drift under ~0.6 rad \
+                 at every sample offset (current worst observed ~0.43 rad, \
+                 down from ~1.66 rad unfixed) -- this threshold is NOT \
+                 near-zero, it's a regression guard on the partial \
+                 improvement PAN-166 will complete; got {drift} rad",
+                truth.time_step,
+                truth.time_refinement
+            );
+        }
+    }
+
     #[cfg(feature = "transmit")]
     #[test]
     fn test_scoped_decode_within_range_recovers_message() {
@@ -21478,8 +22072,24 @@ mod three_stage_sync_tests {
             "synthetic signal has non-zero Costas accumulator"
         );
         let rotor = acc / mag;
-        subtract_decode_coherent(&mut spec_off, &pp, &legacy_candidate, rotor, &tones, 1.0);
-        subtract_decode_coherent(&mut spec_on, &pp, &refined_candidate, rotor, &tones, 1.0);
+        subtract_decode_coherent(
+            &mut spec_off,
+            &pp,
+            &legacy_candidate,
+            rotor,
+            &tones,
+            1.0,
+            0.0,
+        );
+        subtract_decode_coherent(
+            &mut spec_on,
+            &pp,
+            &refined_candidate,
+            rotor,
+            &tones,
+            1.0,
+            0.0,
+        );
 
         let num_bins = spec_off.num_bins;
         let freq_osr = spec_off.freq_osr;
@@ -21497,6 +22107,478 @@ mod three_stage_sync_tests {
                  on={on_v:?}, delta={delta}"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // PAN-153: full-frame coherent-subtraction rotor reference
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn full_frame_accumulator_defaults_off() {
+        assert!(
+            !Ft8Config::default().coherent_subtract_full_frame_reference_enabled,
+            "widening the rotor reference needs its own A/B before \
+             flipping the default"
+        );
+    }
+
+    /// Build a `complex_symbols` table where the CANONICALIZED value
+    /// (after the production code's own `tone_parity_sign` correction)
+    /// is `Complex::new(1.0 + sym as f64 + tone as f64 * 0.01, 0.0)` — a
+    /// distinct, real-valued (zero-phase) marker per (symbol, tone)
+    /// cell. The RAW stored value bakes in `tone_parity_sign(tone)` up
+    /// front (round-5 review finding: real extracted bins carry this
+    /// same deterministic per-tone-parity artifact, and production code
+    /// now cancels it before use) so canonicalization exactly recovers
+    /// the clean marker — keeping the sum checkable against a
+    /// hand-computed expectation while still exercising the real
+    /// canonicalization + (trivial, zero-drift) derotation paths.
+    fn marker_complex_symbols(num_symbols: usize) -> Vec<[Complex<f64>; NUM_TONES]> {
+        (0..num_symbols)
+            .map(|sym| {
+                let mut row = [Complex::new(0.0, 0.0); NUM_TONES];
+                for (tone, cell) in row.iter_mut().enumerate() {
+                    let canonical = 1.0 + sym as f64 + tone as f64 * 0.01;
+                    *cell = Complex::new(canonical * tone_parity_sign(tone), 0.0);
+                }
+                row
+            })
+            .collect()
+    }
+
+    #[test]
+    fn full_frame_accumulator_sums_every_position_at_its_tone_symbol() {
+        let pp = ProtocolParams::ft8();
+        let complex_symbols = marker_complex_symbols(pp.num_symbols);
+        let tone_symbols = synthetic_tone_symbols(&pp); // tone_symbols[i] = i % 8
+        let acc = compute_full_frame_complex_accumulator(&pp, &complex_symbols, &tone_symbols);
+        let expected: Complex<f64> = (0..pp.num_symbols)
+            .map(|sym| {
+                let tone = tone_symbols[sym] as usize;
+                Complex::new(1.0 + sym as f64 + tone as f64 * 0.01, 0.0)
+            })
+            .sum();
+        let delta = (acc - expected).norm();
+        assert!(
+            delta < 1e-9,
+            "must sum complex_symbols[sym][tone_symbols[sym]] over ALL \
+             {} symbols, not just the 21 Costas ones (zero-drift markers \
+             make derotation a no-op here); acc={acc:?} expected={expected:?}",
+            pp.num_symbols
+        );
+    }
+
+    #[test]
+    fn full_frame_accumulator_covers_more_terms_than_costas_only() {
+        // Direct evidence the "full frame" sum is a strict superset:
+        // restricting tone_symbols to agree with pp.costas_arrays at the
+        // Costas positions (and using ANY in-range tone elsewhere,
+        // since compute_costas_complex_accumulator ignores non-Costas
+        // positions entirely) must make the two accumulators' term
+        // counts differ by exactly the number of non-Costas symbols.
+        let pp = ProtocolParams::ft8();
+        let complex_symbols = marker_complex_symbols(pp.num_symbols);
+        let mut tone_symbols = vec![0u8; pp.num_symbols];
+        for (m, &group_start) in pp.costas_positions.iter().enumerate() {
+            for k in 0..pp.costas_length {
+                tone_symbols[group_start + k] = pp.costas_arrays[m][k];
+            }
+        }
+        let costas_only = compute_costas_complex_accumulator(&pp, &complex_symbols);
+        let full_frame =
+            compute_full_frame_complex_accumulator(&pp, &complex_symbols, &tone_symbols);
+        let costas_symbol_count = pp.costas_positions.len() * pp.costas_length;
+        assert!(
+            costas_symbol_count < pp.num_symbols,
+            "sanity: FT8 has non-Costas symbols to widen into"
+        );
+        // The two sums generally differ (extra terms added), and must
+        // agree only in the degenerate case where every non-Costas cell
+        // happens to be zero -- not true here since markers are non-zero
+        // almost everywhere.
+        assert_ne!(
+            costas_only, full_frame,
+            "full-frame sum must include terms costas-only doesn't"
+        );
+    }
+
+    #[test]
+    fn full_frame_accumulator_skips_out_of_range_tones_and_truncated_slices() {
+        let pp = ProtocolParams::ft8();
+        let complex_symbols = marker_complex_symbols(pp.num_symbols);
+        // Out-of-range tone (>= NUM_TONES) at position 0 must be skipped,
+        // not panic or index out of bounds.
+        let mut tone_symbols = synthetic_tone_symbols(&pp);
+        tone_symbols[0] = 200;
+        let acc = compute_full_frame_complex_accumulator(&pp, &complex_symbols, &tone_symbols);
+        assert!(acc.norm().is_finite());
+
+        // A tone_symbols slice shorter than pp.num_symbols must not
+        // panic -- just sum what's available.
+        let short_tones = &tone_symbols[..10];
+        let acc_short = compute_full_frame_complex_accumulator(&pp, &complex_symbols, short_tones);
+        assert!(acc_short.norm().is_finite());
+    }
+
+    /// Build `complex_symbols` where symbol `sym`'s bin at `tone_symbols[sym]`
+    /// carries unit magnitude and phase `drift_rad * sym` — a synthetic
+    /// constant per-symbol phase drift, the exact effect a residual
+    /// frequency offset produces on a real signal.
+    /// Round-5 review finding: bakes in `tone_parity_sign(tone)` up
+    /// front, same as `marker_complex_symbols`, so production's own
+    /// canonicalization recovers the clean `drift_rad * sym` phase this
+    /// doc describes.
+    fn drifting_complex_symbols(
+        pp: &ProtocolParams,
+        tone_symbols: &[u8],
+        drift_rad: f64,
+    ) -> Vec<[Complex<f64>; NUM_TONES]> {
+        (0..pp.num_symbols)
+            .map(|sym| {
+                let mut row = [Complex::new(0.0, 0.0); NUM_TONES];
+                let tone = tone_symbols[sym] as usize;
+                if tone < NUM_TONES {
+                    row[tone] =
+                        Complex::from_polar(1.0, drift_rad * sym as f64) * tone_parity_sign(tone);
+                }
+                row
+            })
+            .collect()
+    }
+
+    #[test]
+    fn phase_drift_estimate_recovers_a_known_constant_drift() {
+        let pp = ProtocolParams::ft8();
+        let mut tone_symbols = vec![0u8; pp.num_symbols];
+        for (m, &group_start) in pp.costas_positions.iter().enumerate() {
+            for k in 0..pp.costas_length {
+                tone_symbols[group_start + k] = pp.costas_arrays[m][k];
+            }
+        }
+        for known_drift in [0.0, 0.05, 0.3, -0.3, 1.0, -1.0] {
+            let complex_symbols = drifting_complex_symbols(&pp, &tone_symbols, known_drift);
+            let estimated = estimate_symbol_phase_drift_rad(&pp, &complex_symbols);
+            assert!(
+                (estimated - known_drift).abs() < 1e-6,
+                "known_drift={known_drift}, estimated={estimated}"
+            );
+        }
+    }
+
+    /// Sibling of `build_clean_spectrogram` that places a DRIFTING
+    /// (not flat) phase: `Complex::from_polar(1.0, drift_rad * sym_idx)`
+    /// at every symbol's expected-tone position, on both `TIME_OSR`
+    /// substeps — the exact signal shape `estimate_symbol_phase_drift_rad`
+    /// is designed to detect and `subtract_decode_coherent`'s new
+    /// `symbol_phase_drift_rad` parameter is designed to remove.
+    fn build_drifting_spectrogram(
+        pp: &ProtocolParams,
+        seed_time: usize,
+        seed_freq_bin: usize,
+        seed_freq_sub: usize,
+        tone_symbols: &[u8],
+        drift_rad: f64,
+        pad: usize,
+    ) -> Spectrogram {
+        let steps_per_symbol = TIME_OSR;
+        let num_steps = seed_time + pp.num_symbols * steps_per_symbol + pad;
+        let num_bins = seed_freq_bin + NUM_TONES + pad;
+        let freq_osr = FREQ_OSR;
+
+        let mut power: Vec<SpecScalar> = vec![-120.0; num_steps * freq_osr * num_bins];
+        let mut complex =
+            vec![Complex::<SpecScalar>::new(0.0, 0.0); num_steps * freq_osr * num_bins];
+
+        for sym_idx in 0..pp.num_symbols.min(tone_symbols.len()) {
+            let tone = tone_symbols[sym_idx] as usize;
+            if tone >= NUM_TONES {
+                continue;
+            }
+            let f_idx = seed_freq_bin + tone;
+            if f_idx >= num_bins {
+                continue;
+            }
+            let t_base = seed_time + sym_idx * steps_per_symbol;
+            for s in 0..steps_per_symbol {
+                let t_idx = t_base + s;
+                if t_idx >= num_steps {
+                    continue;
+                }
+                // Round-4 review finding: phase advances CONTINUOUSLY
+                // through time, not just once per symbol -- each
+                // substep is `1/steps_per_symbol` of a symbol period
+                // further ahead, matching real FFT phase behavior.
+                let frac_symbol = sym_idx as f64 + s as f64 / steps_per_symbol as f64;
+                // Round-5 review finding: bake in tone_parity_sign, same
+                // as the other synthetic-data helpers.
+                let phasor = Complex::from_polar(1.0f32, (drift_rad * frac_symbol) as f32)
+                    * tone_parity_sign(tone) as f32;
+                let flat_idx = (t_idx * freq_osr + seed_freq_sub) * num_bins + f_idx;
+                complex[flat_idx] = phasor;
+                power[flat_idx] = (10.0 * (1e-12_f64 + 1.0).log10()) as SpecScalar;
+            }
+        }
+
+        Spectrogram {
+            power,
+            complex: Some(complex),
+            num_steps,
+            num_bins,
+            freq_osr,
+            time_padding: 0,
+        }
+    }
+
+    #[test]
+    fn subtract_decode_coherent_with_drift_correction_removes_a_drifting_signal() {
+        // Round-3 review finding: `rotor` derotated from a full-frame
+        // accumulator only represents symbol 0's phase. Subtracting
+        // with that constant rotor and NO per-symbol correction leaves
+        // a growing residual under drift; passing the SAME estimated
+        // drift into `subtract_decode_coherent` should clean it up.
+        let pp = ProtocolParams::ft8();
+        let mut tone_symbols = vec![0u8; pp.num_symbols];
+        for (m, &group_start) in pp.costas_positions.iter().enumerate() {
+            for k in 0..pp.costas_length {
+                tone_symbols[group_start + k] = pp.costas_arrays[m][k];
+            }
+        }
+        let drift = 0.08;
+        let seed_time = 5;
+        let seed_freq_bin = 50;
+        let seed_freq_sub = 0;
+        let candidate = CostasCandidate {
+            time_step: seed_time,
+            freq_bin: seed_freq_bin,
+            freq_sub: seed_freq_sub,
+            sync_score: 0.0,
+            time_refinement: 0.0,
+        };
+
+        let mut spec_corrected = build_drifting_spectrogram(
+            &pp,
+            seed_time,
+            seed_freq_bin,
+            seed_freq_sub,
+            &tone_symbols,
+            drift,
+            4,
+        );
+        let mut spec_uncorrected = build_drifting_spectrogram(
+            &pp,
+            seed_time,
+            seed_freq_bin,
+            seed_freq_sub,
+            &tone_symbols,
+            drift,
+            4,
+        );
+
+        let cs = par_extract_complex_symbols_from_spectrogram(&pp, &spec_corrected, &candidate)
+            .expect("complex retention present");
+        let acc = compute_full_frame_complex_accumulator(&pp, &cs, &tone_symbols);
+        let rotor = acc / acc.norm();
+        let estimated_drift = estimate_symbol_phase_drift_rad(&pp, &cs);
+
+        subtract_decode_coherent(
+            &mut spec_corrected,
+            &pp,
+            &candidate,
+            rotor,
+            &tone_symbols,
+            1.0,
+            estimated_drift,
+        );
+        subtract_decode_coherent(
+            &mut spec_uncorrected,
+            &pp,
+            &candidate,
+            rotor,
+            &tone_symbols,
+            1.0,
+            0.0,
+        );
+
+        let residual_energy = |spec: &Spectrogram| -> f64 {
+            spec.complex
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|c| (c.re as f64).powi(2) + (c.im as f64).powi(2))
+                .sum()
+        };
+        let corrected_energy = residual_energy(&spec_corrected);
+        let uncorrected_energy = residual_energy(&spec_uncorrected);
+
+        assert!(
+            corrected_energy < uncorrected_energy * 0.1,
+            "drift-corrected subtraction should leave far less residual \
+             energy than uncorrected: corrected={corrected_energy}, \
+             uncorrected={uncorrected_energy}"
+        );
+    }
+
+    /// Round-9 review finding: `subtract_decode_coherent`'s per-substep
+    /// rotor rebasing (round 4) treats `frac_symbol == 0` as coinciding
+    /// with the integer row `t0`, but when the candidate has a nonzero
+    /// `time_refinement`, the rotor was actually estimated from samples
+    /// referenced to the FRACTIONAL position `t0 + time_refinement` (via
+    /// `par_extract_complex_symbols_from_spectrogram_refined`). Builds a
+    /// signal whose TRUE phase origin sits at a fractional offset from
+    /// the integer grid, derives the rotor/drift from the refined
+    /// extractor (matching production), and compares subtracting with
+    /// the real (nonzero) `time_refinement` against a candidate with it
+    /// zeroed out (simulating the pre-fix formula) on the SAME
+    /// spectrogram.
+    #[test]
+    fn subtract_decode_coherent_rebases_the_rotor_by_time_refinement() {
+        let pp = ProtocolParams::ft8();
+        let mut tone_symbols = vec![0u8; pp.num_symbols];
+        for (m, &group_start) in pp.costas_positions.iter().enumerate() {
+            for k in 0..pp.costas_length {
+                tone_symbols[group_start + k] = pp.costas_arrays[m][k];
+            }
+        }
+        let drift = 0.08;
+        let time_refinement = 0.3;
+        let seed_time = 5;
+        let seed_freq_bin = 50;
+        let seed_freq_sub = 0;
+        let steps_per_symbol = TIME_OSR;
+
+        // Build a spectrogram whose TRUE phase origin sits at the
+        // fractional position `seed_time + time_refinement`, not the
+        // integer `seed_time` — i.e. what a real signal timed exactly
+        // like the candidate's refinement claims would produce at each
+        // INTEGER raw sample position.
+        let num_steps = seed_time + pp.num_symbols * steps_per_symbol + 4;
+        let num_bins = seed_freq_bin + NUM_TONES + 4;
+        let build_spec = || {
+            let mut power: Vec<SpecScalar> = vec![-120.0; num_steps * FREQ_OSR * num_bins];
+            let mut complex =
+                vec![Complex::<SpecScalar>::new(0.0, 0.0); num_steps * FREQ_OSR * num_bins];
+            for sym_idx in 0..pp.num_symbols {
+                let tone = tone_symbols[sym_idx] as usize;
+                let f_idx = seed_freq_bin + tone;
+                let t_base = seed_time + sym_idx * steps_per_symbol;
+                for s in 0..steps_per_symbol {
+                    let t_idx = t_base + s;
+                    let frac_symbol =
+                        sym_idx as f64 + (s as f64 - time_refinement) / steps_per_symbol as f64;
+                    let phasor = Complex::from_polar(1.0f32, (drift * frac_symbol) as f32)
+                        * tone_parity_sign(tone) as f32;
+                    let flat_idx = (t_idx * FREQ_OSR + seed_freq_sub) * num_bins + f_idx;
+                    complex[flat_idx] = phasor;
+                    power[flat_idx] = (10.0 * (1e-12_f64 + 1.0).log10()) as SpecScalar;
+                }
+            }
+            Spectrogram {
+                power,
+                complex: Some(complex),
+                num_steps,
+                num_bins,
+                freq_osr: FREQ_OSR,
+                time_padding: 0,
+            }
+        };
+        let base_spec = build_spec();
+
+        let candidate = CostasCandidate {
+            time_step: seed_time,
+            freq_bin: seed_freq_bin,
+            freq_sub: seed_freq_sub,
+            sync_score: 0.0,
+            time_refinement,
+        };
+        let zeroed_candidate = CostasCandidate {
+            time_refinement: 0.0,
+            ..candidate
+        };
+
+        let cs = par_extract_complex_symbols_from_spectrogram_refined(&pp, &base_spec, &candidate)
+            .expect("complex retention present");
+        let acc = compute_full_frame_complex_accumulator(&pp, &cs, &tone_symbols);
+        let rotor = acc / acc.norm();
+        let estimated_drift = estimate_symbol_phase_drift_rad(&pp, &cs);
+
+        let mut spec_rebased = build_spec();
+        let mut spec_not_rebased = build_spec();
+        subtract_decode_coherent(
+            &mut spec_rebased,
+            &pp,
+            &candidate,
+            rotor,
+            &tone_symbols,
+            1.0,
+            estimated_drift,
+        );
+        subtract_decode_coherent(
+            &mut spec_not_rebased,
+            &pp,
+            &zeroed_candidate,
+            rotor,
+            &tone_symbols,
+            1.0,
+            estimated_drift,
+        );
+
+        let residual_energy = |spec: &Spectrogram| -> f64 {
+            spec.complex
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|c| (c.re as f64).powi(2) + (c.im as f64).powi(2))
+                .sum()
+        };
+        let rebased_energy = residual_energy(&spec_rebased);
+        let not_rebased_energy = residual_energy(&spec_not_rebased);
+
+        assert!(
+            rebased_energy < not_rebased_energy * 0.5,
+            "rebasing by the candidate's time_refinement should leave \
+             meaningfully less residual than ignoring it (the pre-fix \
+             formula): rebased={rebased_energy}, not_rebased={not_rebased_energy}"
+        );
+    }
+
+    #[test]
+    fn full_frame_accumulator_derotation_recovers_coherent_magnitude_under_drift() {
+        // Round-2 review finding: without derotation, a per-symbol phase
+        // drift that a 21-term Costas-only sum tolerates can nearly fully
+        // cancel a 79-term raw sum. A small, realistic drift (0.08 rad/
+        // symbol -- close to the review's own worked example) should
+        // still recover close to the full N=79 coherent magnitude once
+        // derotated, whereas summing the SAME drifting terms without any
+        // correction visibly loses magnitude to cancellation.
+        let pp = ProtocolParams::ft8();
+        let mut tone_symbols = vec![0u8; pp.num_symbols];
+        for (m, &group_start) in pp.costas_positions.iter().enumerate() {
+            for k in 0..pp.costas_length {
+                tone_symbols[group_start + k] = pp.costas_arrays[m][k];
+            }
+        }
+        let drift = 0.08;
+        let complex_symbols = drifting_complex_symbols(&pp, &tone_symbols, drift);
+
+        let derotated =
+            compute_full_frame_complex_accumulator(&pp, &complex_symbols, &tone_symbols);
+        let raw_undecorated: Complex<f64> = (0..pp.num_symbols)
+            .map(|sym| complex_symbols[sym][tone_symbols[sym] as usize])
+            .sum();
+
+        assert!(
+            derotated.norm() > pp.num_symbols as f64 * 0.99,
+            "derotated sum should recover ~N={} coherent magnitude, got {}",
+            pp.num_symbols,
+            derotated.norm()
+        );
+        assert!(
+            raw_undecorated.norm() < derotated.norm() * 0.5,
+            "undecorated raw sum should show substantial cancellation \
+             relative to the derotated sum: raw={}, derotated={}",
+            raw_undecorated.norm(),
+            derotated.norm()
+        );
     }
 
     #[test]
@@ -23818,6 +24900,7 @@ mod w26_ap_coverage_tests {
             confidence,
             base_frequency,
             time_offset_s,
+            candidate.time_refinement,
         )
         .expect("par_try_ldpc_with_cq must decode a real, clean CQ signal");
 
@@ -25103,6 +26186,78 @@ mod pan7_ft8lib_sync_seed_tests {
     /// a missing `min_bin` shows up as a red test rather than as a null result
     /// three phases later in the measurement.
     ///
+    /// PAN-153 round-8 review finding: `reverse_derive_candidate` used to
+    /// hardcode `time_refinement: 0.0`. Fixed (at the time) by
+    /// reconstructing it from `msg.time_offset`'s rounding remainder
+    /// against the integer `time_step` grid.
+    ///
+    /// PAN-153 round-9 finding 1/3: that reconstruction degenerates to
+    /// floating-point noise on the dominant decode path, because
+    /// `msg.time_offset` there is itself built from the integer
+    /// `time_step` grid alone — there is no real fractional information
+    /// left in it to reconstruct. Fixed at the source: `DecodedMessage`
+    /// now carries its own `time_refinement` field, and
+    /// `reverse_derive_candidate` reads it directly. This test picks a
+    /// `time_offset` exactly ON the integer `time_step` grid (so the old
+    /// rounding-remainder reconstruction would yield 0.0) but gives
+    /// `msg.time_refinement` a real nonzero value, and checks the
+    /// reconstructed candidate carries that value through unchanged —
+    /// proving the field is read directly, not re-derived from
+    /// `time_offset`.
+    #[test]
+    fn reverse_derive_candidate_reads_time_refinement_directly_from_the_message() {
+        let pp = ProtocolParams::ft8();
+        let sps = pp.samples_per_symbol(SAMPLE_RATE);
+        let spec_step = sps / TIME_OSR;
+        // Exactly on the integer time_step grid: the old rounding-remainder
+        // reconstruction would land at time_refinement == 0.0 here.
+        let time_step_target = 10.0_f64;
+        let time_offset = time_step_target * spec_step as f64 / SAMPLE_RATE as f64;
+        let true_time_refinement = 0.3_f64;
+
+        let msg = DecodedMessage {
+            message: crate::message::Ft8Message {
+                message_type: crate::message::MessageType::FreeText,
+                standard_type: None,
+                from_callsign: None,
+                to_callsign: None,
+                grid_square: None,
+                signal_report: None,
+                text: Some("TEST".to_string()),
+                contest_exchange: None,
+                special_operation: None,
+                payload_bits: bitvec![0; 77],
+                crc: 0,
+                crc_valid: false,
+                uses_hash_calls: false,
+            },
+            text: "TEST".to_string(),
+            snr_db: 0.0,
+            confidence: 1.0,
+            frequency_offset: 500.0,
+            time_offset,
+            time_refinement: true_time_refinement,
+            timestamp: SystemTime::now(),
+            error_corrections: 0,
+            tone_symbols: None,
+            ap_level: 0,
+            slot_parity: None,
+            captured_dial_hz: None,
+            decode_time_into_window: None,
+            via_cross_sequence_a7: false,
+            confidence_features: None,
+            acceptance: None,
+        };
+
+        let candidate = reverse_derive_candidate(&msg, &pp, 0);
+        assert_eq!(
+            candidate.time_refinement, true_time_refinement,
+            "reverse_derive_candidate must read msg.time_refinement \
+             directly, not re-derive it from time_offset's rounding \
+             remainder (which is exactly 0.0 for this on-grid time_offset)"
+        );
+    }
+
     /// Both `translate_ft8lib_seed` and `reverse_derive_candidate` are private,
     /// which is why this lives in-crate rather than in
     /// `tests/ft8lib_seed_tests.rs`.
