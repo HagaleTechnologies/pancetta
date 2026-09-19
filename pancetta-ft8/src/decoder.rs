@@ -628,6 +628,15 @@ pub struct Ft8Config {
     /// see that function's doc for the account. PAN-166 tracks finishing
     /// this properly.
     ///
+    /// **Round-8 review finding:** the round-6/7 fix, though correct in
+    /// isolation, never actually reached production — the real call path
+    /// (`coherent_subtract_and_repass`) reconstructs its candidate via
+    /// `reverse_derive_candidate`, which hardcoded `time_refinement:
+    /// 0.0`, making `par_extract_complex_symbols_from_spectrogram_
+    /// refined` degenerate to the plain extractor's output on every real
+    /// decode. Fixed: `reverse_derive_candidate` now reconstructs the
+    /// actual rounding remainder instead of discarding it.
+    ///
     /// More samples averaged into a (now-derotated) coherent accumulator
     /// should mean a lower-variance phase/magnitude estimate (√79/√21 ≈
     /// 1.9× the effective averaging), at the cost of trusting the
@@ -12294,9 +12303,24 @@ fn translate_ft8lib_seed(
 /// Reverse-derive a candidate from a DecodedMessage's
 /// `frequency_offset` and `time_offset`. We don't keep `(message,
 /// candidate)` pairs through the rayon decode path, so we reconstruct
-/// the candidate for coherent subtraction. `time_refinement` defaults
-/// to 0 (production state — `sync_time_interpolation = false`);
-/// `sync_score` is a placeholder (not consumed downstream of subtract).
+/// the candidate for coherent subtraction. `sync_score` is a placeholder
+/// (not consumed downstream of subtract).
+///
+/// **Round-8 review finding:** `time_refinement` used to be hardcoded to
+/// `0.0` here, reasoned (in this doc comment) as fine because
+/// `sync_time_interpolation` is off in production — but that reasoning
+/// only covers whether the ORIGINAL sync-search candidate had a
+/// refinement; `msg.time_offset` is its own continuous value, and
+/// rounding it to the nearest integer `time_step` below (as this
+/// function must, to build a `CostasCandidate`) always has SOME
+/// fractional remainder regardless of that flag. Discarding it silently
+/// made `par_extract_complex_symbols_from_spectrogram_refined`'s
+/// fractional-time correction dead code on this call path — the ONLY
+/// consumer of `.time_refinement` on any of `reverse_derive_candidate`'s
+/// callers — so the round-6/7 fix (real, verified in isolation against
+/// `costas_sync_search`-produced candidates) never actually reached the
+/// production `coherent_subtract_and_repass` path it was meant to fix.
+/// Now reconstructs the rounding remainder instead of discarding it.
 fn reverse_derive_candidate(
     msg: &DecodedMessage,
     pp: &ProtocolParams,
@@ -12309,7 +12333,9 @@ fn reverse_derive_candidate(
     let freq_sub = (remainder / sub_bin).round() as usize;
     let sps = pp.samples_per_symbol(SAMPLE_RATE);
     let spec_step = sps / TIME_OSR;
-    let time_step_rel = (msg.time_offset * SAMPLE_RATE as f64 / spec_step as f64).round() as isize;
+    let time_step_f64 = msg.time_offset * SAMPLE_RATE as f64 / spec_step as f64;
+    let time_step_rel = time_step_f64.round() as isize;
+    let time_refinement = time_step_f64 - time_step_rel as f64;
     let time_step =
         (time_step_rel + time_padding as isize + SLIDING_FRAME_LOOKBACK_STEPS).max(0) as usize;
     CostasCandidate {
@@ -12317,7 +12343,7 @@ fn reverse_derive_candidate(
         freq_bin,
         freq_sub,
         sync_score: 0.0,
-        time_refinement: 0.0,
+        time_refinement,
     }
 }
 
@@ -25977,6 +26003,78 @@ mod pan7_ft8lib_sync_seed_tests {
     /// a missing `min_bin` shows up as a red test rather than as a null result
     /// three phases later in the measurement.
     ///
+    /// PAN-153 round-8 review finding: `reverse_derive_candidate` used to
+    /// hardcode `time_refinement: 0.0`, silently discarding the rounding
+    /// remainder from snapping `msg.time_offset` to the nearest integer
+    /// `time_step` — the ONLY consumer of `.time_refinement` on any of
+    /// this function's callers is
+    /// `par_extract_complex_symbols_from_spectrogram_refined` (via
+    /// `coherent_subtract_and_repass`), so that made the round-6/7
+    /// fractional-time fix dead code on the actual production path,
+    /// even though it worked correctly in isolation (verified against
+    /// `costas_sync_search`-produced candidates directly). Picks a
+    /// `time_offset` deliberately NOT on the integer `time_step` grid
+    /// and checks the reconstructed `time_refinement` is the expected
+    /// nonzero remainder, not the old hardcoded `0.0`.
+    #[test]
+    fn reverse_derive_candidate_preserves_the_rounding_remainder_as_time_refinement() {
+        let pp = ProtocolParams::ft8();
+        let sps = pp.samples_per_symbol(SAMPLE_RATE);
+        let spec_step = sps / TIME_OSR;
+        // Half a time_step off the integer grid -> time_refinement should
+        // land at exactly +-0.5 (the documented range's edge).
+        let time_step_target = 10.5_f64;
+        let time_offset = time_step_target * spec_step as f64 / SAMPLE_RATE as f64;
+
+        let msg = DecodedMessage {
+            message: crate::message::Ft8Message {
+                message_type: crate::message::MessageType::FreeText,
+                standard_type: None,
+                from_callsign: None,
+                to_callsign: None,
+                grid_square: None,
+                signal_report: None,
+                text: Some("TEST".to_string()),
+                contest_exchange: None,
+                special_operation: None,
+                payload_bits: bitvec![0; 77],
+                crc: 0,
+                crc_valid: false,
+                uses_hash_calls: false,
+            },
+            text: "TEST".to_string(),
+            snr_db: 0.0,
+            confidence: 1.0,
+            frequency_offset: 500.0,
+            time_offset,
+            timestamp: SystemTime::now(),
+            error_corrections: 0,
+            tone_symbols: None,
+            ap_level: 0,
+            slot_parity: None,
+            captured_dial_hz: None,
+            decode_time_into_window: None,
+            via_cross_sequence_a7: false,
+            confidence_features: None,
+            acceptance: None,
+        };
+
+        let candidate = reverse_derive_candidate(&msg, &pp, 0);
+        assert!(
+            candidate.time_refinement.abs() > 0.01,
+            "a time_offset deliberately off the integer time_step grid \
+             must reconstruct a nonzero time_refinement, not the old \
+             hardcoded 0.0; got {}",
+            candidate.time_refinement
+        );
+        assert!(
+            candidate.time_refinement.abs() <= 0.5 + 1e-9,
+            "time_refinement must stay within the documented [-0.5, +0.5] \
+             range; got {}",
+            candidate.time_refinement
+        );
+    }
+
     /// Both `translate_ft8lib_seed` and `reverse_derive_candidate` are private,
     /// which is why this lives in-crate rather than in
     /// `tests/ft8lib_seed_tests.rs`.
