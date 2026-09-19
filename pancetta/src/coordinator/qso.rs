@@ -1617,6 +1617,7 @@ mod pan6_diagnostic_tests {
             end_time: None,
             reports: Default::default(),
             grids: Default::default(),
+            their_state: None,
             contest_info: None,
             tags: Default::default(),
             notes: None,
@@ -2270,6 +2271,7 @@ mod ap_ranking_tests {
             end_time: None,
             reports: pancetta_qso::states::SignalReports::default(),
             grids: pancetta_qso::states::GridSquares::default(),
+            their_state: None,
             contest_info: None,
             tags: std::collections::HashMap::new(),
             notes: None,
@@ -2760,6 +2762,7 @@ impl super::ApplicationCoordinator {
                         station_power_watts,
                         qso_manager.subscribe(),
                         shutdown.clone(),
+                        qso_lookup.clone(),
                     );
                 }
 
@@ -2901,6 +2904,11 @@ impl super::ApplicationCoordinator {
 
                         let band_grid_pairs = db.get_worked_bands_and_grids().await;
                         qso_lookup.seed_worked_grids_from_list(band_grid_pairs);
+
+                        // PAN-85: seed the DX Hunter's US-state display from
+                        // any prior contact whose log record carries a state.
+                        qso_lookup
+                            .seed_states_from_list(db.get_worked_callsigns_and_states().await);
                     } else {
                         warn!(
                             "Could not open QSO database for startup seed ({}) — \
@@ -2959,6 +2967,12 @@ impl super::ApplicationCoordinator {
 
                             let band_grid_pairs = db.get_worked_bands_and_grids().await;
                             qso_lookup.seed_worked_grids_from_list(band_grid_pairs);
+
+                            // PAN-85: seed the DX Hunter's US-state display
+                            // from any prior contact whose log record
+                            // carries a state.
+                            qso_lookup
+                                .seed_states_from_list(db.get_worked_callsigns_and_states().await);
                         }
                         Err(e) => {
                             info!(
@@ -3541,6 +3555,13 @@ impl super::ApplicationCoordinator {
                                     qso_lookup.record_worked(their_call, &band);
                                     if let Some(grid) = metadata.grids.theirs.as_deref() {
                                         qso_lookup.record_worked_grid(grid, &band);
+                                    }
+                                    // PAN-85: a completed QSO whose metadata carries
+                                    // a state (ADIF import, or QRZ enrichment on a
+                                    // prior QSO) makes it available to the DX Hunter
+                                    // display for the rest of the session.
+                                    if let Some(state) = metadata.their_state.as_deref() {
+                                        qso_lookup.record_state(their_call, state);
                                     }
 
                                     // item-2-auto-73: stash MANUAL completions so
@@ -5391,6 +5412,7 @@ mod secondary_decoder_hint_tests {
                 end_time: None,
                 reports: SignalReports::default(),
                 grids: GridSquares::default(),
+                their_state: None,
                 contest_info: None,
                 tags: std::collections::HashMap::new(),
                 notes: None,
@@ -6817,6 +6839,7 @@ mod snapshot_tests {
                     received: Some(-12),
                 },
                 grids: GridSquares::default(),
+                their_state: None,
                 contest_info: None,
                 tags: std::collections::HashMap::new(),
                 notes: None,
@@ -7729,6 +7752,8 @@ struct QrzMergeResult {
     grid_filled: bool,
     /// `true` if a name was appended to notes (for logging/display only).
     name_added: bool,
+    /// `true` if a missing state was filled from the QRZ lookup (PAN-85).
+    state_filled: bool,
 }
 
 /// Merge a QRZ lookup into the QSO metadata, **only filling MISSING fields**.
@@ -7794,29 +7819,82 @@ fn merge_qrz_lookup(
         }
     }
 
+    // PAN-85: QRZ's <state> is the one live source of state for a station we
+    // have just worked. Fill only when missing; never override a value that
+    // came from the operator's own log.
+    //
+    // The same US-related + `normalize_us_state` gate the display applies is
+    // enforced HERE, before the value is stored: `their_state` is rendered
+    // into the uploaded ADIF `STATE` field (an enumerated field), so a
+    // free-text QRZ value for a non-US station -- a Japanese prefecture, a
+    // Canadian province -- must never reach a logbook. Only the canonical
+    // two-letter code is stored.
+    let state_missing = metadata
+        .their_state
+        .as_ref()
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(true);
+    let us_related = metadata
+        .their_callsign
+        .as_deref()
+        .and_then(pancetta_tui::dxcc::entity_for_callsign)
+        .is_some_and(pancetta_tui::dxcc::is_us_related_entity);
+    if state_missing && us_related {
+        if let Some(code) = lookup
+            .state
+            .as_deref()
+            .and_then(pancetta_tui::dxcc::normalize_us_state)
+        {
+            metadata.their_state = Some(code.to_string());
+            result.state_filled = true;
+        }
+    }
+
     result
 }
 
-/// Best-effort QRZ-XML grid enrichment for a completed QSO.
-///
-/// Looks up the contra-callsign via [`QrzXmlClient`](pancetta_dx::QrzXmlClient)
-/// **only when the their-grid is missing**, caches the result (hit or miss) for
-/// the session, and merges it into `metadata` via [`merge_qrz_lookup`]. Never
-/// blocks or fails the pipeline: any error/timeout is logged at debug (target
-/// `dx.qrz`) and the metadata is left unchanged.
-async fn maybe_enrich_grid_from_qrz(
-    metadata: &mut pancetta_qso::QsoMetadata,
-    client: &pancetta_dx::QrzXmlClient,
-    cache: &Mutex<HashMap<String, Option<pancetta_dx::QrzLookup>>>,
-) {
-    // Only spend a lookup when the grid is actually missing.
+/// Does this completed QSO still need a QRZ lookup? Either the their-grid
+/// is missing (pre-PAN-85 behaviour), or the station is a US-related DXCC
+/// entity whose state we do not know yet and which the DX Hunter would
+/// display (PAN-85 / D7). Non-US entities are never looked up for state,
+/// so the added QRZ traffic is exactly proportional to the feature.
+fn needs_qrz_enrichment(metadata: &pancetta_qso::QsoMetadata) -> bool {
     let grid_missing = metadata
         .grids
         .theirs
         .as_ref()
         .map(|g| g.trim().is_empty())
         .unwrap_or(true);
-    if !grid_missing {
+    if grid_missing {
+        return true;
+    }
+    let state_missing = metadata
+        .their_state
+        .as_ref()
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(true);
+    state_missing
+        && metadata
+            .their_callsign
+            .as_deref()
+            .and_then(pancetta_tui::dxcc::entity_for_callsign)
+            .is_some_and(pancetta_tui::dxcc::is_us_related_entity)
+}
+
+/// Best-effort QRZ-XML grid/state enrichment for a completed QSO.
+///
+/// Looks up the contra-callsign via [`QrzXmlClient`](pancetta_dx::QrzXmlClient)
+/// only when [`needs_qrz_enrichment`] says something is still missing, caches
+/// the result (hit or miss) for the session, and merges it into `metadata`
+/// via [`merge_qrz_lookup`]. Never blocks or fails the pipeline: any
+/// error/timeout is logged at debug (target `dx.qrz`) and the metadata is
+/// left unchanged.
+async fn maybe_enrich_from_qrz(
+    metadata: &mut pancetta_qso::QsoMetadata,
+    client: &pancetta_dx::QrzXmlClient,
+    cache: &Mutex<HashMap<String, Option<pancetta_dx::QrzLookup>>>,
+) {
+    if !needs_qrz_enrichment(metadata) {
         return;
     }
 
@@ -7836,6 +7914,13 @@ async fn maybe_enrich_grid_from_qrz(
                         target: "dx.qrz",
                         "QRZ (cached): filled grid for {} = {:?}",
                         callsign, metadata.grids.theirs
+                    );
+                }
+                if merged.state_filled {
+                    debug!(
+                        target: "dx.qrz",
+                        "QRZ (cached): filled state for {} = {:?}",
+                        callsign, metadata.their_state
                     );
                 }
             }
@@ -7858,6 +7943,12 @@ async fn maybe_enrich_grid_from_qrz(
                 );
             } else {
                 debug!(target: "dx.qrz", "QRZ: no usable grid for {}", callsign);
+            }
+            if merged.state_filled {
+                debug!(
+                    target: "dx.qrz",
+                    "QRZ: filled state for {} = {:?}", callsign, metadata.their_state
+                );
             }
             cache.lock().await.insert(key, Some(lookup));
         }
@@ -7884,6 +7975,7 @@ fn start_qso_upload_subscriber(
     station_power_watts: u32,
     mut events: tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    station_lookup: std::sync::Arc<crate::priority_evaluator::CachedStationLookup>,
 ) {
     use std::sync::Arc;
 
@@ -8019,7 +8111,11 @@ fn start_qso_upload_subscriber(
         info!(target: "qso.upload", "cqdx.io per-QSO logbook upload enabled");
     }
     if qrz_xml_client.is_some() {
-        info!(target: "dx.qrz", "QRZ XML grid enrichment enabled (fills missing grid before upload)");
+        info!(
+            target: "dx.qrz",
+            "QRZ XML enrichment enabled (fills missing grid, and state for US-related \
+             entities, before upload — PAN-85)"
+        );
     }
 
     tokio::spawn(async move {
@@ -8035,7 +8131,17 @@ fn start_qso_upload_subscriber(
                     // is already known from decode/cqdx; never blocks or fails
                     // the upload pipeline.
                     if let Some(client) = qrz_xml_client.clone() {
-                        maybe_enrich_grid_from_qrz(&mut metadata, &client, &qrz_xml_cache).await;
+                        maybe_enrich_from_qrz(&mut metadata, &client, &qrz_xml_cache).await;
+                    }
+
+                    // PAN-85: session-scoped only — the ADIF writer and the
+                    // SQLite logger already consumed their own copies of this
+                    // event, so this value is not persisted (see D6).
+                    if let (Some(call), Some(state)) = (
+                        metadata.their_callsign.as_deref(),
+                        metadata.their_state.as_deref(),
+                    ) {
+                        station_lookup.record_state(call, state);
                     }
 
                     // Render the single ADIF record the same way the
@@ -8401,6 +8507,7 @@ mod cqdx_upload_tests {
                 ours: Some("EM10".to_string()),
                 theirs: Some("PM95".to_string()),
             },
+            their_state: None,
             contest_info: None,
             tags: std::collections::HashMap::new(),
             notes: None,
@@ -8522,6 +8629,7 @@ mod qrz_enrichment_tests {
                 ours: Some("EM10".to_string()),
                 theirs: their_grid.map(str::to_string),
             },
+            their_state: None,
             contest_info: None,
             tags: std::collections::HashMap::new(),
             notes: notes.map(str::to_string),
@@ -8629,6 +8737,117 @@ mod qrz_enrichment_tests {
         assert!(!res.grid_filled && !res.name_added);
         assert_eq!(md.grids.theirs, before.grids.theirs);
         assert_eq!(md.notes, before.notes);
+    }
+
+    // --- PAN-85: state fill + widened enrichment gate ---
+
+    /// A US-related station whose state is unknown: the metadata helper
+    /// defaults to a JA call, so the US cases must set it explicitly.
+    fn us_metadata(their_grid: Option<&str>) -> QsoMetadata {
+        let mut m = metadata(their_grid, None);
+        m.their_callsign = Some("W5ABC".to_string());
+        m
+    }
+
+    #[test]
+    fn merge_qrz_fills_missing_state() {
+        let mut m = us_metadata(Some("EM34"));
+        let l = QrzLookup {
+            state: Some("AR".into()),
+            ..lookup(None, None)
+        };
+        let r = merge_qrz_lookup(&mut m, &l);
+        assert_eq!(m.their_state.as_deref(), Some("AR"));
+        assert!(r.state_filled);
+    }
+
+    /// QRZ's casing/padding is normalized to the canonical ADIF code before
+    /// it is stored, so the uploaded `STATE` field is always enumerated.
+    #[test]
+    fn merge_qrz_normalizes_state_case_and_padding() {
+        let mut m = us_metadata(Some("EM34"));
+        let l = QrzLookup {
+            state: Some(" ar ".into()),
+            ..lookup(None, None)
+        };
+        let r = merge_qrz_lookup(&mut m, &l);
+        assert_eq!(m.their_state.as_deref(), Some("AR"));
+        assert!(r.state_filled);
+    }
+
+    #[test]
+    fn merge_qrz_never_overrides_existing_state() {
+        let mut m = us_metadata(Some("EM34"));
+        m.their_state = Some("TX".into());
+        let l = QrzLookup {
+            state: Some("AR".into()),
+            ..lookup(None, None)
+        };
+        let r = merge_qrz_lookup(&mut m, &l);
+        assert_eq!(m.their_state.as_deref(), Some("TX"));
+        assert!(!r.state_filled);
+    }
+
+    #[test]
+    fn merge_qrz_ignores_blank_state() {
+        let mut m = us_metadata(Some("EM34"));
+        let l = QrzLookup {
+            state: Some("   ".into()),
+            ..lookup(None, None)
+        };
+        merge_qrz_lookup(&mut m, &l);
+        assert!(m.their_state.is_none());
+    }
+
+    /// A non-US station's free-text QRZ `<state>` (a Japanese prefecture, a
+    /// Canadian province) is never stored -- `their_state` rides into the
+    /// uploaded ADIF `STATE`, an enumerated field.
+    #[test]
+    fn merge_qrz_rejects_state_for_non_us_entity() {
+        let mut m = metadata(Some("PM95"), None); // JA1ABC
+        let l = QrzLookup {
+            state: Some("Tokyo".into()),
+            ..lookup(None, None)
+        };
+        let r = merge_qrz_lookup(&mut m, &l);
+        assert!(m.their_state.is_none());
+        assert!(!r.state_filled);
+    }
+
+    /// Even for a US station, a value that is not a known US subdivision code
+    /// is dropped rather than stored verbatim.
+    #[test]
+    fn merge_qrz_rejects_unrecognized_state_value() {
+        let mut m = us_metadata(Some("EM34"));
+        let l = QrzLookup {
+            state: Some("Arkansas".into()),
+            ..lookup(None, None)
+        };
+        let r = merge_qrz_lookup(&mut m, &l);
+        assert!(m.their_state.is_none());
+        assert!(!r.state_filled);
+    }
+
+    #[test]
+    fn qrz_enrichment_gate_covers_us_state_gap() {
+        use super::needs_qrz_enrichment;
+
+        // grid known + US-related + state unknown  -> now fires (PAN-85)
+        let mut m = metadata(Some("EM34"), None);
+        m.their_callsign = Some("W5ABC".to_string());
+        assert!(needs_qrz_enrichment(&m));
+
+        // grid known + US-related + state known    -> does not fire
+        m.their_state = Some("AR".to_string());
+        assert!(!needs_qrz_enrichment(&m));
+
+        // grid known + NOT US-related + no state   -> does not fire (D7)
+        let j = metadata(Some("PM95"), None);
+        assert!(!needs_qrz_enrichment(&j));
+
+        // grid missing -> fires regardless of entity (pre-existing behaviour)
+        let j2 = metadata(None, None);
+        assert!(needs_qrz_enrichment(&j2));
     }
 }
 
@@ -8972,6 +9191,7 @@ mod replay_history_seed_tests {
                 end_time: None,
                 reports: SignalReports::default(),
                 grids: GridSquares::default(),
+                their_state: None,
                 contest_info: None,
                 tags: HashMap::new(),
                 notes: None,

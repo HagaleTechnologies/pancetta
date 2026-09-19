@@ -167,6 +167,14 @@ impl super::ApplicationCoordinator {
             // C20 — RF-present / zero-decodes detector (mode/clock fault),
             // fed from the cumulative DSP-window + decode telemetry below.
             let mut rf_no_decode = super::health::RfNoDecodeMonitor::new();
+            // PAN-85: remember the last US state actually forwarded for each
+            // callsign (uppercased key) rather than merely that one was sent,
+            // so both a state learned later (QRZ enrichment mid-session) and a
+            // state *corrected* later (log-seeded code superseded by QRZ)
+            // reach the TUI on the next decode/spot for that callsign. Repeats
+            // of an unchanged value are still suppressed.
+            let mut sent_states: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
             while !relay_shutdown.load(Ordering::Acquire) {
                 if !ft8_disconnected {
                     match ft8_to_tui_rx.try_recv() {
@@ -236,6 +244,23 @@ impl super::ApplicationCoordinator {
                                 call_sign.as_deref(),
                                 dial_mhz * 1_000_000.0,
                             );
+
+                            // PAN-85: forward a known US state whenever it is
+                            // new or has changed since the last one sent.
+                            if let Some(call) = call_sign.as_deref() {
+                                if let Some(state) = state_for(&relay_station_lookup, Some(call)) {
+                                    let key = call.to_uppercase();
+                                    if sent_states.get(&key) != Some(&state) {
+                                        sent_states.insert(key, state.clone());
+                                        let _ = tui_msg_tx_relay.send(
+                                            pancetta_tui::tui_runner::TuiMessage::StationState {
+                                                callsign: call.to_string(),
+                                                state,
+                                            },
+                                        );
+                                    }
+                                }
+                            }
 
                             // Compute the #164 tiered priority score via the
                             // real PriorityScorer's classification (ATNO >
@@ -517,6 +542,22 @@ impl super::ApplicationCoordinator {
                                 Some(callsign.as_str()),
                                 frequency as f64,
                             );
+                            // PAN-85: forward a known US state whenever it is
+                            // new or has changed since the last one sent.
+                            if let Some(state) =
+                                state_for(&relay_station_lookup, Some(callsign.as_str()))
+                            {
+                                let key = callsign.to_uppercase();
+                                if sent_states.get(&key) != Some(&state) {
+                                    sent_states.insert(key, state.clone());
+                                    let _ = tui_msg_tx_relay.send(
+                                        pancetta_tui::tui_runner::TuiMessage::StationState {
+                                            callsign: callsign.clone(),
+                                            state,
+                                        },
+                                    );
+                                }
+                            }
                             let _ = tui_msg_tx_relay.send(
                                 pancetta_tui::tui_runner::TuiMessage::DxSpot {
                                     callsign,
@@ -3422,6 +3463,18 @@ fn dxcc_needed_on_band_for(
         Some(c) if !c.is_empty() => lookup.is_dxcc_needed_on_band(c, freq_hz),
         _ => false,
     }
+}
+
+/// The station's known US state, from the same `CachedStationLookup` the
+/// scorer uses. `None` when unknown — the TUI then renders the entity
+/// alone (PAN-85).
+fn state_for(
+    lookup: &crate::priority_evaluator::CachedStationLookup,
+    callsign: Option<&str>,
+) -> Option<String> {
+    callsign
+        .filter(|c| !c.is_empty())
+        .and_then(|c| lookup.state_for(c))
 }
 
 fn map_autonomous_status(

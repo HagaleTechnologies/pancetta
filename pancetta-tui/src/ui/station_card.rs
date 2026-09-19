@@ -79,10 +79,14 @@ fn newest_decode_for<'a>(app: &'a App, call: &str) -> Option<&'a DecodedMessageV
 
 /// Line 1: `"{call} — {entity|'---'} {ATNO★|needed|worked|new}"`.
 fn render_line1<'a>(app: &App, call: &str, last_decode: Option<&DecodedMessageView>) -> Line<'a> {
+    // PAN-85: append the station's US state/territory when known, matching
+    // DX Hunter. Deliberately no offline `dxcc::entity_for_callsign`
+    // fallback here — out of scope (see D10).
     let entity = app
         .dx_stations
         .get(call)
         .and_then(|d| d.entity_name.clone())
+        .map(|e| crate::dxcc::format_entity_with_state(&e, app.station_state_for(call)))
         .unwrap_or_else(|| "---".to_string());
 
     let status_flag = last_decode

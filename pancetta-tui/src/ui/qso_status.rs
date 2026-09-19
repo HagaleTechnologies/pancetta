@@ -15,12 +15,14 @@ use crate::app::{ActivePanel, App};
 /// appeared in DX Hunter as a network/Both spot) and fall back to the
 /// offline prefix table for locally-decoded-only stations, matching the
 /// pattern `dx_hunter.rs::create_dx_row` and `station_card.rs::render_line1`
-/// already use. `None` when neither resolves.
+/// already use. `None` when neither resolves. The station's US
+/// state/territory is appended when known (PAN-85), matching DX Hunter.
 fn resolve_entity(app: &App, call_sign: &str) -> Option<String> {
     app.dx_stations
         .get(call_sign)
         .and_then(|d| d.entity_name.clone())
         .or_else(|| crate::dxcc::entity_for_callsign(call_sign).map(str::to_string))
+        .map(|e| crate::dxcc::format_entity_with_state(&e, app.station_state_for(call_sign)))
 }
 
 pub fn render_qso_status(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
