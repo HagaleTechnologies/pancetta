@@ -12706,7 +12706,30 @@ fn refine_candidate_with_known_symbols(
                     freq_bin: seed.freq_bin,
                     freq_sub: fs,
                     sync_score: seed.sync_score,
-                    time_refinement: seed.time_refinement,
+                    // Round-9 (4th pass) review finding: `seed.
+                    // time_refinement` is a fractional offset estimated
+                    // RELATIVE TO `seed.time_step` (the parabolic
+                    // interpolation's own reference row). This search
+                    // only scores INTEGER rows (`known_coherence_score`
+                    // takes no fractional position at all) — when it
+                    // selects a DIFFERENT row (`t_candidate !=
+                    // seed.time_step`), carrying the old refinement
+                    // forward unchanged applies it relative to a row
+                    // stage three never evaluated, corrupting the
+                    // refined extractor's fractional alignment
+                    // downstream. `0.0` (unrefined, integer-bin
+                    // alignment) is always a safe fallback — never
+                    // wrong, just less precise — unlike guessing a new
+                    // fractional value stage three has no data for.
+                    // Unchanged (`t_candidate == seed.time_step`): the
+                    // seed's own refinement is still relative to the
+                    // right row, so keep it — exact no-op for every
+                    // seed that stage three doesn't move.
+                    time_refinement: if t_candidate == seed.time_step {
+                        seed.time_refinement
+                    } else {
+                        0.0
+                    },
                 };
             }
         }
@@ -22060,6 +22083,85 @@ mod three_stage_sync_tests {
         );
         assert_eq!(refined.freq_bin, seed.freq_bin);
         assert_eq!(refined.time_step, truth_time);
+    }
+
+    /// PAN-153 round-9 (4th pass) review finding: `refine_candidate_
+    /// with_known_symbols` only scores INTEGER rows and, when it selects
+    /// a DIFFERENT row than the seed's, used to carry the seed's
+    /// `time_refinement` forward unchanged — a fractional offset
+    /// estimated relative to the SEED's row, now silently misapplied
+    /// relative to a row stage three never evaluated. Plants the truth
+    /// signal one row later than a seed carrying a nonzero, stale
+    /// `time_refinement`; stage three should move to the truth row AND
+    /// clear the now-invalid refinement to `0.0`, not carry it forward.
+    #[test]
+    fn stage_three_clears_stale_time_refinement_when_it_moves_the_row() {
+        let pp = ProtocolParams::ft8();
+        let tones = synthetic_tone_symbols(&pp);
+        let truth_time = 10;
+        let truth_freq_bin = 50;
+        let truth_freq_sub = 0;
+        let mut spec =
+            build_clean_spectrogram(&pp, truth_time, truth_freq_bin, truth_freq_sub, &tones, 4);
+
+        // Plant valid-but-phase-jittered samples one row EARLIER than
+        // truth (the seed's own row) so the seed's own score is `Some`
+        // (not `None`) and worse than the truth row's ceiling score —
+        // otherwise `refine_candidate_with_known_symbols` returns the
+        // seed unchanged before ever comparing candidates.
+        //
+        // `known_coherence_score` only reads ONE substep per symbol
+        // (`t_idx = time_step + sym_idx * TIME_OSR`), so a `time_step`
+        // one row off an even truth row reads the opposite parity of
+        // `t_idx` entirely (odd vs even) — writing jittered samples ONLY
+        // at those exact odd positions overwrites none of the even
+        // positions `time_step = truth_time` reads, so truth's score
+        // stays the clean ceiling untouched by this overwrite.
+        let seed_time = truth_time - 1;
+        {
+            let num_bins = spec.num_bins;
+            let num_steps = spec.num_steps;
+            let freq_osr = spec.freq_osr;
+            let complex = spec.complex.as_mut().unwrap();
+            let steps_per_symbol = TIME_OSR;
+            for sym_idx in 0..pp.num_symbols.min(tones.len()) {
+                let tone = tones[sym_idx] as usize;
+                if tone >= NUM_TONES {
+                    continue;
+                }
+                let f_idx = truth_freq_bin + tone;
+                let theta = ((sym_idx as f64) * 1.31).sin() * std::f64::consts::PI;
+                let sample = Complex::new(theta.cos() as SpecScalar, theta.sin() as SpecScalar);
+                let t_idx = seed_time + sym_idx * steps_per_symbol;
+                if t_idx < num_steps && f_idx < num_bins {
+                    let flat_idx = (t_idx * freq_osr + truth_freq_sub) * num_bins + f_idx;
+                    complex[flat_idx] = sample;
+                }
+            }
+        }
+
+        let seed = CostasCandidate {
+            time_step: seed_time,
+            freq_bin: truth_freq_bin,
+            freq_sub: truth_freq_sub,
+            sync_score: 1.0,
+            // Deliberately nonzero and stale: relative to the seed's OWN
+            // row, not the truth row stage three should move to.
+            time_refinement: 0.3,
+        };
+
+        let refined = refine_candidate_with_known_symbols(&spec, &pp, &seed, &tones);
+
+        assert_eq!(
+            refined.time_step, truth_time,
+            "stage 3 should move to the higher-scoring truth row"
+        );
+        assert_eq!(
+            refined.time_refinement, 0.0,
+            "moving to a different row must clear the stale, row-relative \
+             refinement rather than carry it forward unchanged; got {}",
+            refined.time_refinement
+        );
     }
 
     #[test]
