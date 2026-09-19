@@ -10440,7 +10440,15 @@ fn par_decode_candidate(
             decoded_message.tone_symbols = Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
             decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
             decoded_message.acceptance = acceptance_score;
-            decoded_message.time_refinement = candidate.time_refinement;
+            // Round-9 (2nd pass) review finding: this fallback searches
+            // AWAY from the original Costas candidate's position (`dt`
+            // over 7 eighth-symbol steps) — `candidate.time_refinement`
+            // describes the ORIGINAL, possibly-superseded estimate, not
+            // the fractional spectrogram-step remainder of the position
+            // this decode actually succeeded at. Derive it fresh from
+            // the selected `time_offset` instead.
+            decoded_message.time_refinement =
+                spectrogram_step_fractional_remainder(time_offset as f64, spec_step);
 
             return Some(decoded_message);
         }
@@ -10809,7 +10817,16 @@ fn matched_demod_attempt(
     );
     decoded_message.tone_symbols = Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
     decoded_message.acceptance = acceptance_score;
-    decoded_message.time_refinement = candidate.time_refinement;
+    // Round-9 (2nd pass) review finding: `fine_sync::refine`'s
+    // `dt_samples` moves the decode's actual time position away from
+    // the original Costas candidate's — `candidate.time_refinement`
+    // describes the now-superseded estimate. Derive the refinement
+    // fresh from the selected `time_offset_s` (already `coarse_offset +
+    // dt_samples*DECIM` in audio-domain seconds) instead, matching
+    // `reverse_derive_candidate`'s own rounding-remainder convention.
+    let spec_step = pp.samples_per_symbol(SAMPLE_RATE) / TIME_OSR;
+    decoded_message.time_refinement =
+        spectrogram_step_fractional_remainder(time_offset_s * SAMPLE_RATE as f64, spec_step);
     Some(decoded_message)
 }
 
@@ -12906,6 +12923,27 @@ fn compute_costas_complex_accumulator(
 /// pre-existing, already-shipped `compute_costas_complex_accumulator`
 /// or the default (`symbol_phase_drift_rad == 0.0`) subtraction path,
 /// which are out of scope for this PR and must stay byte-identical.
+/// PAN-153 round-9 (2nd pass) review finding: when a decode succeeds at
+/// a fine-timing position that has moved AWAY from the original Costas
+/// candidate's `time_step` (the legacy 21-trial fallback's `dt` sweep,
+/// or `fine_sync::refine`'s `dt_samples`), the message's
+/// `DecodedMessage::time_refinement` must describe the fractional
+/// spectrogram-step remainder of that SELECTED position — not
+/// `candidate.time_refinement`, which describes the original,
+/// now-superseded estimate. Matches `reverse_derive_candidate`'s own
+/// rounding-remainder convention, computed here at the point where the
+/// true selected position is known rather than reconstructed later.
+///
+/// Worked example from the review: a `dt` of `3 * sps / 8` samples is a
+/// `0.75`-row shift in `TIME_OSR = 2` units; rounding to the nearest
+/// spectrogram row lands one row later, so the correct refinement is
+/// `-0.25`, not whatever `candidate.time_refinement` happened to be.
+#[inline]
+fn spectrogram_step_fractional_remainder(selected_offset_samples: f64, spec_step: usize) -> f64 {
+    let time_step_f64 = selected_offset_samples / spec_step as f64;
+    time_step_f64 - time_step_f64.round()
+}
+
 #[inline]
 fn tone_parity_sign(tone: usize) -> f64 {
     if tone % 2 == 0 {
@@ -22415,6 +22453,34 @@ mod three_stage_sync_tests {
             "drift-corrected subtraction should leave far less residual \
              energy than uncorrected: corrected={corrected_energy}, \
              uncorrected={uncorrected_energy}"
+        );
+    }
+
+    /// Round-9 (2nd pass) review finding: reproduces the reviewer's own
+    /// worked example verbatim. A `dt` of `3 * sps / 8` samples (the
+    /// legacy 21-trial fallback's largest time-delta trial) is a
+    /// `0.75`-row shift in `TIME_OSR = 2` units; rounding to the nearest
+    /// spectrogram row lands one row later, so the correct refinement is
+    /// `-0.25` — computed from the SELECTED position, independent of
+    /// whatever the original candidate's `time_refinement` happened to
+    /// be (tested here as three different values, none of which should
+    /// affect the result).
+    #[test]
+    fn spectrogram_step_fractional_remainder_matches_the_reviewers_worked_example() {
+        let pp = ProtocolParams::ft8();
+        let sps = pp.samples_per_symbol(SAMPLE_RATE);
+        let spec_step = sps / TIME_OSR;
+        let coarse_offset = 40 * spec_step; // exactly on the integer row grid
+        let dt = 3 * (sps / 8) as isize; // reviewer's example: 0.75-row shift
+        let selected_offset = coarse_offset as f64 + dt as f64;
+
+        let refinement = spectrogram_step_fractional_remainder(selected_offset, spec_step);
+
+        assert!(
+            (refinement - (-0.25)).abs() < 1e-9,
+            "reviewer's worked example: dt = 3*sps/8 is a 0.75-row shift, \
+             so the refinement after rounding to the next row should be \
+             exactly -0.25; got {refinement}"
         );
     }
 
