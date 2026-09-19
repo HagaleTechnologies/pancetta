@@ -12425,7 +12425,25 @@ fn subtract_decode_coherent(
             let effective_rotor = if symbol_phase_drift_rad == 0.0 {
                 rotor
             } else {
-                let frac_symbol = sym_idx as f64 + s as f64 / steps_per_symbol as f64;
+                // Round-9 review finding: `rotor` was estimated from
+                // samples interpolated at the FRACTIONAL extraction
+                // position `t0 + candidate.time_refinement` (the
+                // refined extractor's own reference — see
+                // `par_extract_complex_symbols_from_spectrogram_
+                // refined`), not the integer row `t0`. Treating the raw
+                // row read here (at the plain integer `t_idx`) as
+                // though `frac_symbol == 0` coincided with `t0` ignores
+                // that shift, leaving every symbol's projection
+                // displaced by `symbol_phase_drift_rad *
+                // time_refinement / steps_per_symbol`. Subtract the
+                // refinement (in the same symbol-fraction units) to
+                // re-reference the rotor to where it was actually
+                // estimated. `time_refinement == 0.0` (every
+                // pre-existing caller, and any full-frame candidate the
+                // sync search happened to land exactly on-grid) makes
+                // this an exact no-op.
+                let frac_symbol = sym_idx as f64
+                    + (s as f64 - candidate.time_refinement) / steps_per_symbol as f64;
                 rotor * Complex::from_polar(1.0, symbol_phase_drift_rad * frac_symbol)
             };
             let effective_rotor_conj = effective_rotor.conj();
@@ -22356,6 +22374,129 @@ mod three_stage_sync_tests {
             "drift-corrected subtraction should leave far less residual \
              energy than uncorrected: corrected={corrected_energy}, \
              uncorrected={uncorrected_energy}"
+        );
+    }
+
+    /// Round-9 review finding: `subtract_decode_coherent`'s per-substep
+    /// rotor rebasing (round 4) treats `frac_symbol == 0` as coinciding
+    /// with the integer row `t0`, but when the candidate has a nonzero
+    /// `time_refinement`, the rotor was actually estimated from samples
+    /// referenced to the FRACTIONAL position `t0 + time_refinement` (via
+    /// `par_extract_complex_symbols_from_spectrogram_refined`). Builds a
+    /// signal whose TRUE phase origin sits at a fractional offset from
+    /// the integer grid, derives the rotor/drift from the refined
+    /// extractor (matching production), and compares subtracting with
+    /// the real (nonzero) `time_refinement` against a candidate with it
+    /// zeroed out (simulating the pre-fix formula) on the SAME
+    /// spectrogram.
+    #[test]
+    fn subtract_decode_coherent_rebases_the_rotor_by_time_refinement() {
+        let pp = ProtocolParams::ft8();
+        let mut tone_symbols = vec![0u8; pp.num_symbols];
+        for (m, &group_start) in pp.costas_positions.iter().enumerate() {
+            for k in 0..pp.costas_length {
+                tone_symbols[group_start + k] = pp.costas_arrays[m][k];
+            }
+        }
+        let drift = 0.08;
+        let time_refinement = 0.3;
+        let seed_time = 5;
+        let seed_freq_bin = 50;
+        let seed_freq_sub = 0;
+        let steps_per_symbol = TIME_OSR;
+
+        // Build a spectrogram whose TRUE phase origin sits at the
+        // fractional position `seed_time + time_refinement`, not the
+        // integer `seed_time` — i.e. what a real signal timed exactly
+        // like the candidate's refinement claims would produce at each
+        // INTEGER raw sample position.
+        let num_steps = seed_time + pp.num_symbols * steps_per_symbol + 4;
+        let num_bins = seed_freq_bin + NUM_TONES + 4;
+        let build_spec = || {
+            let mut power: Vec<SpecScalar> = vec![-120.0; num_steps * FREQ_OSR * num_bins];
+            let mut complex =
+                vec![Complex::<SpecScalar>::new(0.0, 0.0); num_steps * FREQ_OSR * num_bins];
+            for sym_idx in 0..pp.num_symbols {
+                let tone = tone_symbols[sym_idx] as usize;
+                let f_idx = seed_freq_bin + tone;
+                let t_base = seed_time + sym_idx * steps_per_symbol;
+                for s in 0..steps_per_symbol {
+                    let t_idx = t_base + s;
+                    let frac_symbol =
+                        sym_idx as f64 + (s as f64 - time_refinement) / steps_per_symbol as f64;
+                    let phasor = Complex::from_polar(1.0f32, (drift * frac_symbol) as f32)
+                        * tone_parity_sign(tone) as f32;
+                    let flat_idx = (t_idx * FREQ_OSR + seed_freq_sub) * num_bins + f_idx;
+                    complex[flat_idx] = phasor;
+                    power[flat_idx] = (10.0 * (1e-12_f64 + 1.0).log10()) as SpecScalar;
+                }
+            }
+            Spectrogram {
+                power,
+                complex: Some(complex),
+                num_steps,
+                num_bins,
+                freq_osr: FREQ_OSR,
+                time_padding: 0,
+            }
+        };
+        let base_spec = build_spec();
+
+        let candidate = CostasCandidate {
+            time_step: seed_time,
+            freq_bin: seed_freq_bin,
+            freq_sub: seed_freq_sub,
+            sync_score: 0.0,
+            time_refinement,
+        };
+        let zeroed_candidate = CostasCandidate {
+            time_refinement: 0.0,
+            ..candidate
+        };
+
+        let cs = par_extract_complex_symbols_from_spectrogram_refined(&pp, &base_spec, &candidate)
+            .expect("complex retention present");
+        let acc = compute_full_frame_complex_accumulator(&pp, &cs, &tone_symbols);
+        let rotor = acc / acc.norm();
+        let estimated_drift = estimate_symbol_phase_drift_rad(&pp, &cs);
+
+        let mut spec_rebased = build_spec();
+        let mut spec_not_rebased = build_spec();
+        subtract_decode_coherent(
+            &mut spec_rebased,
+            &pp,
+            &candidate,
+            rotor,
+            &tone_symbols,
+            1.0,
+            estimated_drift,
+        );
+        subtract_decode_coherent(
+            &mut spec_not_rebased,
+            &pp,
+            &zeroed_candidate,
+            rotor,
+            &tone_symbols,
+            1.0,
+            estimated_drift,
+        );
+
+        let residual_energy = |spec: &Spectrogram| -> f64 {
+            spec.complex
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|c| (c.re as f64).powi(2) + (c.im as f64).powi(2))
+                .sum()
+        };
+        let rebased_energy = residual_energy(&spec_rebased);
+        let not_rebased_energy = residual_energy(&spec_not_rebased);
+
+        assert!(
+            rebased_energy < not_rebased_energy * 0.5,
+            "rebasing by the candidate's time_refinement should leave \
+             meaningfully less residual than ignoring it (the pre-fix \
+             formula): rebased={rebased_energy}, not_rebased={not_rebased_energy}"
         );
     }
 
