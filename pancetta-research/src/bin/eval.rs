@@ -95,6 +95,10 @@ struct Args {
     /// Only has any observable effect when `max_decode_passes >= 2`. See
     /// `Ft8Config::time_varying_subtraction_enabled`.
     time_varying_subtraction_enabled: Option<bool>,
+    /// PAN-153 [A/B]: widen the coherent-subtraction rotor reference
+    /// from the 21 Costas symbols to the full 79-symbol frame. See
+    /// `Ft8Config::coherent_subtract_full_frame_reference_enabled`.
+    coherent_subtract_full_frame_reference_enabled: Option<bool>,
     /// Decoder-TP-sensitivity Task W4.2/W4.3 [A/B]: subtract the
     /// time-varying fit at full scale (1.0) instead of the legacy 0.9
     /// hold-back. Only takes effect when `time_varying_subtraction_enabled`
@@ -312,6 +316,7 @@ impl Args {
         let mut nsym_combining_enabled: Option<bool> = None;
         let mut per_candidate_freq_tracker_enabled: Option<bool> = None;
         let mut time_varying_subtraction_enabled: Option<bool> = None;
+        let mut coherent_subtract_full_frame_reference_enabled: Option<bool> = None;
         let mut full_scale_subtraction_enabled: Option<bool> = None;
         let mut llr_whitening: Option<bool> = None;
         let mut acceptance_gating: Option<bool> = None;
@@ -565,6 +570,9 @@ impl Args {
                 }
                 "--time-varying-subtraction-enabled" => {
                     time_varying_subtraction_enabled = Some(true);
+                }
+                "--coherent-subtract-full-frame-reference-enabled" => {
+                    coherent_subtract_full_frame_reference_enabled = Some(true);
                 }
                 "--full-scale-subtraction-enabled" => {
                     full_scale_subtraction_enabled = Some(true);
@@ -942,6 +950,7 @@ impl Args {
                     eprintln!("  --nsym-combining-enabled: decoder-TP-sensitivity Task W3.4 [A/B] — nsym=2/3 noncoherent combining LLR variants on top of the W3.3 stage; requires --fine-sync-enabled to have any effect (default off). See Ft8Config::nsym_combining_enabled.");
                     eprintln!("  --per-candidate-freq-tracker-enabled: decoder-TP-sensitivity Task W3.6 [A/B] — re-test of the per-candidate frequency tracker as a consumer of the W3.3 matched-demod stage; requires --fine-sync-enabled to have any effect (default off). See Ft8Config::per_candidate_freq_tracker_enabled.");
                     eprintln!("  --time-varying-subtraction-enabled: decoder-TP-sensitivity Task W4.2/W4.3 [A/B] — per-block time-varying GFSK subtraction, replacing the legacy whole-signal fit; only observable when --max-passes >= 2 (default off). See Ft8Config::time_varying_subtraction_enabled.");
+                    eprintln!("  --coherent-subtract-full-frame-reference-enabled: PAN-153 [A/B] — widen the coherent-subtraction rotor reference from the 21 Costas symbols to the full 79-symbol frame (default off). See Ft8Config::coherent_subtract_full_frame_reference_enabled.");
                     eprintln!("  --full-scale-subtraction-enabled: decoder-TP-sensitivity Task W4.2/W4.3 [A/B] — subtract the time-varying fit at full scale (1.0) instead of the legacy 0.9 hold-back; requires --time-varying-subtraction-enabled to have any effect (default off, UNTESTED on weak signals). See Ft8Config::full_scale_subtraction_enabled.");
                     eprintln!("  --linear-power-averaging: decoder-TP-sensitivity Task W3.5 [A/B] — combine each symbol's two TIME_OSR sub-steps in linear power instead of dB; runs unconditionally on the always-active coarse-sync path, independent of --sync-time-interp-linear-power (default off). See Ft8Config::linear_power_averaging.");
                     eprintln!("  --llr-whitening / --no-llr-whitening: decoder-TP-sensitivity Task W1.4 [A/B] — force the divisive LLR whitening step on/off (production default: off, flipped by the W1.4 A/B result). See Ft8Config::llr_whitening_enabled.");
@@ -1003,6 +1012,7 @@ impl Args {
             nsym_combining_enabled,
             per_candidate_freq_tracker_enabled,
             time_varying_subtraction_enabled,
+            coherent_subtract_full_frame_reference_enabled,
             full_scale_subtraction_enabled,
             llr_whitening,
             acceptance_gating,
@@ -2146,6 +2156,9 @@ fn build_decoder_from_args(args: &Args, protocol: pancetta_ft8::Protocol) -> Ft8
     }
     if let Some(on) = args.time_varying_subtraction_enabled {
         d = d.with_time_varying_subtraction_enabled(on);
+    }
+    if let Some(on) = args.coherent_subtract_full_frame_reference_enabled {
+        d = d.with_coherent_subtract_full_frame_reference_enabled(on);
     }
     if let Some(on) = args.full_scale_subtraction_enabled {
         d = d.with_full_scale_subtraction_enabled(on);

@@ -483,6 +483,16 @@ impl Ft8Decoder {
         self
     }
 
+    /// PAN-153 round-4 review finding: this flag had no harness/CLI
+    /// wiring at all, unlike every neighboring coherent-subtraction
+    /// knob — meaning the `compare` A/B workflow its own doc comment
+    /// requires could never actually exercise it without hand-written
+    /// code. See `Ft8Config::coherent_subtract_full_frame_reference_enabled`.
+    pub fn with_coherent_subtract_full_frame_reference_enabled(mut self, on: bool) -> Self {
+        self.config.coherent_subtract_full_frame_reference_enabled = on;
+        self
+    }
+
     /// Task W4.2 [A/B]: independent sub-flag controlling whether the
     /// time-varying path subtracts its fitted estimate at full scale
     /// (1.0) vs. the legacy path's conservative 0.9 hold-back. Only takes
