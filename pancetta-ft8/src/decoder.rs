@@ -12706,26 +12706,29 @@ fn refine_candidate_with_known_symbols(
                     freq_bin: seed.freq_bin,
                     freq_sub: fs,
                     sync_score: seed.sync_score,
-                    // Round-9 (4th pass) review finding: `seed.
-                    // time_refinement` is a fractional offset estimated
-                    // RELATIVE TO `seed.time_step` (the parabolic
-                    // interpolation's own reference row). This search
-                    // only scores INTEGER rows (`known_coherence_score`
-                    // takes no fractional position at all) — when it
-                    // selects a DIFFERENT row (`t_candidate !=
-                    // seed.time_step`), carrying the old refinement
-                    // forward unchanged applies it relative to a row
-                    // stage three never evaluated, corrupting the
-                    // refined extractor's fractional alignment
-                    // downstream. `0.0` (unrefined, integer-bin
-                    // alignment) is always a safe fallback — never
-                    // wrong, just less precise — unlike guessing a new
-                    // fractional value stage three has no data for.
-                    // Unchanged (`t_candidate == seed.time_step`): the
-                    // seed's own refinement is still relative to the
-                    // right row, so keep it — exact no-op for every
-                    // seed that stage three doesn't move.
-                    time_refinement: if t_candidate == seed.time_step {
+                    // Round-9 (4th and 5th pass) review findings:
+                    // `seed.time_refinement` is a fractional offset
+                    // `refine_costas_score`'s parabolic interpolation
+                    // estimated RELATIVE TO `seed.time_step` AND `seed.
+                    // freq_sub` together (the parabolic peak position on
+                    // the seed's own frequency axis). This search only
+                    // scores INTEGER (time_step, freq_sub) pairs
+                    // (`known_coherence_score` takes no fractional
+                    // position at all) — when it selects a DIFFERENT row
+                    // OR a DIFFERENT sub-bin, carrying the old refinement
+                    // forward unchanged applies it relative to a
+                    // (time_step, freq_sub) pair stage three never
+                    // evaluated, corrupting the refined extractor's
+                    // fractional alignment downstream. `0.0` (unrefined,
+                    // integer-bin alignment) is always a safe fallback —
+                    // never wrong, just less precise — unlike guessing a
+                    // new fractional value stage three has no data for.
+                    // Unchanged (both `time_step` AND `freq_sub` match
+                    // the seed): the seed's own refinement is still
+                    // relative to the right (row, sub-bin) pair, so keep
+                    // it — exact no-op for every seed that stage three
+                    // doesn't move.
+                    time_refinement: if t_candidate == seed.time_step && fs == seed.freq_sub {
                         seed.time_refinement
                     } else {
                         0.0
@@ -22083,6 +22086,80 @@ mod three_stage_sync_tests {
         );
         assert_eq!(refined.freq_bin, seed.freq_bin);
         assert_eq!(refined.time_step, truth_time);
+    }
+
+    /// PAN-153 round-9 (5th pass) review finding: extends the round-9
+    /// (4th pass) fix — `refine_candidate_with_known_symbols` used to
+    /// only clear `time_refinement` when `time_step` changed, but stage
+    /// three can also select a DIFFERENT `freq_sub` while keeping the
+    /// same `time_step`. The refinement was estimated on the seed's
+    /// ORIGINAL frequency axis (`refine_costas_score`'s parabolic peak
+    /// position), so it's just as stale when only the sub-bin moves.
+    /// Reuses `refine_picks_correct_freq_sub_over_noisy_neighbor`'s
+    /// exact truth/wrong-sub-bin construction (same `time_step`,
+    /// different `freq_sub`) with a nonzero, stale seed refinement, and
+    /// confirms stage three both snaps to the truth sub-bin AND clears
+    /// the refinement.
+    #[test]
+    fn stage_three_clears_stale_time_refinement_when_only_freq_sub_moves() {
+        let pp = ProtocolParams::ft8();
+        let tones = synthetic_tone_symbols(&pp);
+        let truth_time = 5;
+        let truth_freq_bin = 50;
+        let mut spec =
+            build_clean_spectrogram(&pp, truth_time, truth_freq_bin, /*fs=*/ 0, &tones, 4);
+        let steps_per_symbol = TIME_OSR;
+        {
+            let num_bins = spec.num_bins;
+            let num_steps = spec.num_steps;
+            let freq_osr = spec.freq_osr;
+            let complex = spec.complex.as_mut().unwrap();
+            for sym_idx in 0..pp.num_symbols.min(tones.len()) {
+                let tone = tones[sym_idx] as usize;
+                if tone >= NUM_TONES {
+                    continue;
+                }
+                let f_idx = truth_freq_bin + tone;
+                let theta = ((sym_idx as f64) * 1.31).sin() * std::f64::consts::PI;
+                let sample = Complex::new(theta.cos() as SpecScalar, theta.sin() as SpecScalar);
+                let t_base = truth_time + sym_idx * steps_per_symbol;
+                for s in 0..steps_per_symbol {
+                    let t_idx = t_base + s;
+                    if t_idx < num_steps && f_idx < num_bins {
+                        let flat_idx = (t_idx * freq_osr + 1) * num_bins + f_idx;
+                        complex[flat_idx] = sample;
+                    }
+                }
+            }
+        }
+
+        let seed = CostasCandidate {
+            time_step: truth_time,
+            freq_bin: truth_freq_bin,
+            freq_sub: 1, // off by one sub-bin; time_step already correct
+            sync_score: 1.0,
+            // Deliberately nonzero and stale: estimated on freq_sub=1's
+            // frequency axis, not the freq_sub=0 stage three should move to.
+            time_refinement: 0.4,
+        };
+
+        let refined = refine_candidate_with_known_symbols(&spec, &pp, &seed, &tones);
+
+        assert_eq!(
+            refined.freq_sub, 0,
+            "stage 3 should snap the off-by-1 sub-bin seed to the truth sub-bin"
+        );
+        assert_eq!(
+            refined.time_step, seed.time_step,
+            "time_step should stay unchanged in this scenario"
+        );
+        assert_eq!(
+            refined.time_refinement, 0.0,
+            "moving to a different freq_sub must clear the stale, \
+             frequency-axis-relative refinement even though time_step \
+             didn't move; got {}",
+            refined.time_refinement
+        );
     }
 
     /// PAN-153 round-9 (4th pass) review finding: `refine_candidate_
