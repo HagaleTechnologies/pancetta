@@ -18686,6 +18686,142 @@ mod tests {
         }
     }
 
+    /// PAN-166 (round 10) finding, pinned as a permanent regression test
+    /// for future attempts at this ticket.
+    ///
+    /// Round 7/9 both derived a per-hop phase-rotation formula
+    /// (`exp(j*2*pi*bin*frac/freq_osr)` in row units) from the standard
+    /// STFT shift identity, verified it reproduces round 5's INTEGER
+    /// finding exactly, then applied it directly to the real (multi-tone)
+    /// FT8 regression signal and found it made the FRACTIONAL case worse.
+    /// Neither attempt validated the formula in isolation against a
+    /// PURE, stationary (non-symbol-changing) tone first.
+    ///
+    /// This test does that isolation, and settles two things:
+    ///
+    /// 1. **The formula's sign was backwards.** For a pure on-lattice
+    ///    tone with no symbol changes, the exact relationship is
+    ///    `X(row=t+frac) = X(row=t) * exp(+j*2*pi*raw_bin*frac/(freq_osr*
+    ///    time_osr))` (verified below to f32-storage precision, ~1e-7,
+    ///    across `frac` from -0.4 to +0.4) -- but round 7/9's formula, as
+    ///    stated and as applied to `par_extract_complex_symbols_from_
+    ///    spectrogram_refined`'s `frac`, used the OPPOSITE sign. This is
+    ///    exactly the kind of bug integer-`time_step` testing structurally
+    ///    cannot catch: at integer `frac`, `exp(j*theta)` and
+    ///    `exp(-j*theta)` coincide whenever `theta` is a multiple of π,
+    ///    which is precisely round 5's `(-1)^n` finding.
+    ///
+    /// 2. **The sign was not the real bug.** Round 10 (this investigation)
+    ///    implemented the corrected-sign rotation as a replacement for
+    ///    `par_extract_complex_symbols_from_spectrogram_refined`'s linear
+    ///    interpolation -- both as a flat average of the two
+    ///    neighbor-rotated estimates, and as a distance-weighted blend
+    ///    mirroring the original interpolation's weighting -- and BOTH
+    ///    made `phase_drift_estimate_is_near_zero_on_a_real_clean_signal_
+    ///    across_time_offsets` measurably worse (~1.12-1.23 rad worst
+    ///    case, vs. the shipped linear interpolation's ~0.43 rad), not
+    ///    better. Reverted; not shipped.
+    ///
+    /// Why: `compute_spectrogram_with`'s sliding-window FFT uses `nfft` =
+    /// 2 symbol periods (3840 samples) hopping by `subblock_size` = 960
+    /// samples (1/4 of the window). The exact-rotation identity holds only
+    /// because a stationary tone's window response factors out as a
+    /// t-independent constant -- but a REAL FT8 signal changes tone every
+    /// symbol, so any given window generally straddles 2-3 DIFFERENT
+    /// tones, and each of `lo`/`hi`'s neighbor-symbol leakage is a
+    /// different, non-rotating contamination that no linear combination
+    /// of just those two raw bin reads can remove. This rules out "wrong
+    /// sign" or "wrong interpolation weight" as the remaining gap; an
+    /// exact fix needs to either model the known (post-decode)
+    /// neighbor-symbol leakage explicitly, or avoid the wide window
+    /// altogether -- e.g. `extract_symbols_complex` already computes a
+    /// clean single-symbol-width complex FFT anchored at an exact sample
+    /// offset for a different call site, which structurally avoids this
+    /// leakage; reusing that approach for the full-frame coherent path
+    /// would require threading raw audio through
+    /// `coherent_subtract_and_repass` and its multipass-round callers
+    /// (currently spectrogram-only), which is a real architectural change
+    /// warranting its own design, not a formula tweak. See PAN-166.
+    ///
+    /// Method: generate a real cosine at a single on-lattice frequency
+    /// for the whole buffer (no tone changes), and an exact copy time-
+    /// shifted by a known fractional-sample delay `delta_samples`
+    /// (computed directly via the closed-form cosine, not resampling).
+    /// Because delaying the ENTIRE continuous signal by `delta_samples`
+    /// and then reading spectrogram row `t` is identical to reading the
+    /// undelayed signal's spectrogram at the continuous (non-integer)
+    /// position `t - delta_samples/subblock_size`, this gives an EXACT
+    /// ground truth for "what would row t look like at a fractional
+    /// offset" -- without needing any interpolation approximation. We
+    /// compare that ground truth's phase, relative to the undelayed
+    /// row-t value, against the round-7 formula's prediction.
+    #[test]
+    fn pan166_pure_tone_isolates_fractional_phase_rotation_formula() {
+        let freq_bin = 317usize; // arbitrary bin whose raw index isn't a
+        let raw_bin = freq_bin * FREQ_OSR; // multiple of 4 (avoids a degenerate
+        let fs = SAMPLE_RATE as f64; // all-predictions-collapse-to-1 case)
+        let nfft = 3840usize; // block_size(1920) * FREQ_OSR(2)
+        let freq_hz = raw_bin as f64 * fs / nfft as f64; // exact on-lattice frequency for raw_bin
+        let phase0 = 0.7_f64; // arbitrary nonzero starting phase
+
+        let make_tone = |delta_samples: f64| -> Vec<f64> {
+            (0..WINDOW_SAMPLES)
+                .map(|n| (2.0 * PI * freq_hz * (n as f64 - delta_samples) / fs + phase0).cos())
+                .collect()
+        };
+
+        let decoder = Ft8Decoder::new(Ft8Config::default()).expect("decoder");
+        let spec0 = decoder
+            .compute_spectrogram(&make_tone(0.0))
+            .expect("spectrogram (undelayed)");
+
+        const SUBBLOCK_SIZE: f64 = 960.0;
+        let t = 40usize; // comfortably interior row, away from edges/padding
+
+        let x0 = {
+            let complex = spec0.complex.as_ref().expect("complex retained");
+            let c = complex[spec0.idx(t, 0, raw_bin / FREQ_OSR)];
+            Complex::new(c.re as f64, c.im as f64)
+        };
+
+        for delta_row in [-0.4, -0.2, -0.1, 0.1, 0.2, 0.3, 0.4] {
+            let delta_samples = delta_row * SUBBLOCK_SIZE;
+            let spec_shifted = decoder
+                .compute_spectrogram(&make_tone(delta_samples))
+                .expect("spectrogram (shifted)");
+            let ground_truth = {
+                let complex = spec_shifted.complex.as_ref().expect("complex retained");
+                let c = complex[spec_shifted.idx(t, 0, raw_bin / FREQ_OSR)];
+                Complex::new(c.re as f64, c.im as f64)
+            };
+
+            // Ground-truth ratio: what actually happened to the phase.
+            let actual_ratio = ground_truth / x0;
+
+            // Round-7 formula's prediction: exp(j*2*pi*raw_bin*frac/nfft)
+            // with frac = delta_row (one row = subblock_size samples),
+            // nfft/subblock_size = 4 hops per window.
+            let nfft_over_subblock = 4.0;
+            let round7_predicted =
+                Complex::from_polar(1.0, 2.0 * PI * raw_bin as f64 * delta_row / nfft_over_subblock);
+            let sign_flipped_predicted =
+                Complex::from_polar(1.0, -2.0 * PI * raw_bin as f64 * delta_row / nfft_over_subblock);
+
+            let round7_err = (actual_ratio - round7_predicted).norm();
+            let flipped_err = (actual_ratio - sign_flipped_predicted).norm();
+            eprintln!(
+                "delta_row={delta_row:+.2}: actual={actual_ratio:.6} round7={round7_predicted:.6} \
+                 (err={round7_err:.6}) sign_flipped={sign_flipped_predicted:.6} (err={flipped_err:.6})"
+            );
+            assert!(
+                flipped_err < 1e-4, // f32 spectrogram storage precision floor
+                "delta_row={delta_row}: sign-flipped formula should be EXACT for a pure \
+                 stationary tone -- actual={actual_ratio:?} predicted={sign_flipped_predicted:?} \
+                 err={flipped_err}"
+            );
+        }
+    }
+
     #[cfg(feature = "transmit")]
     #[test]
     fn test_scoped_decode_within_range_recovers_message() {
