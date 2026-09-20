@@ -18802,10 +18802,14 @@ mod tests {
             // with frac = delta_row (one row = subblock_size samples),
             // nfft/subblock_size = 4 hops per window.
             let nfft_over_subblock = 4.0;
-            let round7_predicted =
-                Complex::from_polar(1.0, 2.0 * PI * raw_bin as f64 * delta_row / nfft_over_subblock);
-            let sign_flipped_predicted =
-                Complex::from_polar(1.0, -2.0 * PI * raw_bin as f64 * delta_row / nfft_over_subblock);
+            let round7_predicted = Complex::from_polar(
+                1.0,
+                2.0 * PI * raw_bin as f64 * delta_row / nfft_over_subblock,
+            );
+            let sign_flipped_predicted = Complex::from_polar(
+                1.0,
+                -2.0 * PI * raw_bin as f64 * delta_row / nfft_over_subblock,
+            );
 
             let round7_err = (actual_ratio - round7_predicted).norm();
             let flipped_err = (actual_ratio - sign_flipped_predicted).norm();
