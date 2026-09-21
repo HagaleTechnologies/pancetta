@@ -18962,6 +18962,195 @@ mod tests {
         }
     }
 
+    /// PAN-166 round 14: the fractional (`time_refinement != 0`) sibling
+    /// of `pan166_pure_tone_isolates_audio_vs_spectrogram_basis_conversion`.
+    /// Nails the formula BEFORE touching `coherent_subtract_and_repass`,
+    /// per this ticket's own established methodology.
+    ///
+    /// Round 13's basis conversion only covered INTEGER `time_step`
+    /// positions, where the audio extraction's window start
+    /// (`sym_start`) exactly matches a real spectrogram row's position.
+    /// A candidate's `time_refinement` (`dt`, normally nonzero) shifts
+    /// the TRUE symbol boundary by up to half a spectrogram time-step
+    /// (`subblock_size` = `sps/2` samples) from the nearest integer
+    /// `time_step`. The previously-shipped approach
+    /// (`par_extract_complex_symbols_from_spectrogram_refined`) handled
+    /// this by linearly interpolating between the two neighboring
+    /// INTEGER-time_step spectrogram rows -- each of which is itself
+    /// leakage-contaminated (2-symbol-wide window), so no linear
+    /// combination of the two can remove it (round 10's finding).
+    ///
+    /// The audio path doesn't need to interpolate between two coarse,
+    /// row-granularity (`subblock_size`-spaced) positions at all: the
+    /// TRUE continuous sample offset (`sym_start_cont`) is directly
+    /// computable to full precision (it's just
+    /// `candidate_offset_samples`'s formula evaluated at a real-valued
+    /// `time_step + time_refinement` instead of an integer), and can be
+    /// rounded to the NEAREST INTEGER SAMPLE rather than the nearest
+    /// spectrogram row. That rounding residual (`delta`) is bounded to
+    /// `[-0.5, +0.5]` SAMPLES out of `sps` (~1920) -- not `[-0.5, +0.5]`
+    /// ROWS (up to `sps/4` samples) like the old row-interpolation
+    /// approach -- so the window this extracts is off from the TRUE
+    /// symbol boundary by at most half a sample: negligible
+    /// neighbor-symbol leakage, a fundamentally different (much easier)
+    /// regime than what round 12 was fighting.
+    ///
+    /// The residual sub-sample `delta` is corrected via the DFT time-shift
+    /// identity (`exp(j*2*pi*tone*delta/sps)`) -- the same exact-for-an-
+    /// isolated-tone formula round 10 already validated at ROW granularity,
+    /// applied here at SAMPLE granularity where it's an even better
+    /// approximation (a leakage-free single-symbol window shifted by
+    /// under a sample is about as clean as `compute_spectrogram_with`'s
+    /// wide window shifted by a full fractional row was NOT).
+    ///
+    /// Ground truth: extends
+    /// `pan166_pure_tone_isolates_fractional_phase_rotation_formula`'s
+    /// exact "advance the tone, read an integer row" trick to arbitrary
+    /// continuous `t_cont = time_step + time_refinement + sym_idx*TIME_OSR`
+    /// -- reading spectrogram row `round(t_cont)` of a copy of the tone
+    /// advanced by `(t_cont - round(t_cont)) * subblock_size` samples is
+    /// exact for what a continuous-time spectrogram would read AT
+    /// `t_cont`, no approximation, so it also serves as the analytic
+    /// continuation target for round 13's `n0(t_base)` term evaluated at
+    /// continuous `t_cont` instead of an integer `t_base`.
+    ///
+    /// Validated formula:
+    /// `F(t_cont) == X_audio(sym_start_int) * exp(j*2*pi*tone*delta/sps)
+    ///      * tone_parity_sign(tone)
+    ///      * exp(j*2*pi*base_frequency*n0(t_cont)/SAMPLE_RATE)`
+    #[test]
+    fn pan166_pure_tone_isolates_fractional_time_refinement_audio_extraction_formula() {
+        let decoder = Ft8Decoder::new(Ft8Config::default()).expect("decoder");
+        let sps = decoder.protocol_params.samples_per_symbol(SAMPLE_RATE);
+        let subblock_size = sps / TIME_OSR;
+        let nfft = sps * FREQ_OSR;
+        let fs_rate = SAMPLE_RATE as f64;
+        let pi2 = 2.0 * PI;
+
+        let spec_window_sum: f64 = decoder.spectrogram_window.iter().map(|&w| w as f64).sum();
+        let symbol_window_sum: f64 = decoder.symbol_window.iter().sum();
+        let window_scale = spec_window_sum / symbol_window_sum;
+
+        let freq_bin = 300usize;
+        let phase0 = 1.1_f64;
+
+        // Sweeps both signs and magnitudes approaching the [-0.5, 0.5]
+        // row-unit bound (candidate.time_refinement's documented range),
+        // plus 0.0 as the round-13 degenerate case (already covered
+        // there, kept here as a continuity check).
+        let dt_values = [-0.47, -0.3, -0.1, 0.0, 0.1, 0.3, 0.47];
+
+        for freq_sub in 0..FREQ_OSR {
+            let base_frequency =
+                freq_bin as f64 * TONE_SPACING + freq_sub as f64 * (TONE_SPACING / FREQ_OSR as f64);
+
+            for tone in 0..NUM_TONES {
+                let freq_hz = base_frequency + tone as f64 * TONE_SPACING;
+
+                let audio: Vec<f64> = (0..WINDOW_SAMPLES)
+                    .map(|n| (pi2 * freq_hz * n as f64 / fs_rate + phase0).cos())
+                    .collect();
+
+                for &t0 in &[5usize, 6, 40, 41] {
+                    for &dt in &dt_values {
+                        for sym_idx in 0..3usize {
+                            let t_cont = t0 as f64 + dt + (sym_idx * TIME_OSR) as f64;
+
+                            // Ground truth via the exact advance-tone trick
+                            // (see doc above): F(t_cont) == reading integer
+                            // row `row0` of a copy of the tone advanced by
+                            // `frac * subblock_size` samples.
+                            let row0_signed = t_cont.round() as isize;
+                            if row0_signed < 0 {
+                                continue;
+                            }
+                            let row0 = row0_signed as usize;
+                            let frac = t_cont - row0 as f64; // in [-0.5, 0.5)
+                            let advance_samples = frac * subblock_size as f64;
+                            let advanced_audio: Vec<f64> = (0..WINDOW_SAMPLES)
+                                .map(|n| {
+                                    (pi2 * freq_hz * (n as f64 + advance_samples) / fs_rate
+                                        + phase0)
+                                        .cos()
+                                })
+                                .collect();
+                            let spec_advanced = decoder
+                                .compute_spectrogram(&advanced_audio)
+                                .expect("spectrogram (advanced)");
+                            if row0 >= spec_advanced.num_steps {
+                                continue;
+                            }
+                            let freq_bin_idx = freq_bin + tone;
+                            if freq_bin_idx >= spec_advanced.num_bins {
+                                continue;
+                            }
+                            let complex_advanced =
+                                spec_advanced.complex.as_ref().expect("complex retained");
+                            let c =
+                                complex_advanced[spec_advanced.idx(row0, freq_sub, freq_bin_idx)];
+                            let ground_truth = Complex::new(c.re as f64, c.im as f64);
+
+                            // Predicted: nearest-integer-SAMPLE-anchored
+                            // audio extraction (from the ORIGINAL,
+                            // unadvanced audio -- this is what production
+                            // would actually read) plus the sub-sample
+                            // correction and round-13's basis conversion,
+                            // both evaluated at continuous t_cont.
+                            let sym_start_cont = (t_cont - SLIDING_FRAME_LOOKBACK_STEPS as f64)
+                                * subblock_size as f64;
+                            let sym_start_int_signed = sym_start_cont.round() as isize;
+                            if sym_start_int_signed < 0 {
+                                continue;
+                            }
+                            let sym_start_int = sym_start_int_signed as usize;
+                            if sym_start_int + sps > audio.len() {
+                                continue;
+                            }
+                            let delta = sym_start_cont - sym_start_int as f64; // in [-0.5, 0.5]
+
+                            let phase_step_angle = -pi2 * base_frequency / fs_rate;
+                            let phase_step =
+                                Complex::new(phase_step_angle.cos(), phase_step_angle.sin());
+                            let initial_angle =
+                                -pi2 * base_frequency * sym_start_int as f64 / fs_rate;
+                            let mut rotator =
+                                Complex::new(initial_angle.cos(), initial_angle.sin());
+                            let symbol_audio = &audio[sym_start_int..sym_start_int + sps];
+                            let mut buf = vec![Complex::new(0.0f64, 0.0); sps];
+                            for i in 0..sps {
+                                let w = decoder.symbol_window[i];
+                                buf[i] = Complex::new(
+                                    symbol_audio[i] * w * rotator.re,
+                                    symbol_audio[i] * w * rotator.im,
+                                );
+                                rotator *= phase_step;
+                            }
+                            decoder.symbol_fft.process(&mut buf);
+                            let x_audio = buf[tone] * window_scale;
+
+                            let n0 = (t_cont + 1.0) * subblock_size as f64 - nfft as f64;
+                            let sub_sample_correction =
+                                Complex::from_polar(1.0, pi2 * tone as f64 * delta / sps as f64);
+                            let predicted = x_audio
+                                * sub_sample_correction
+                                * tone_parity_sign(tone)
+                                * Complex::from_polar(1.0, pi2 * base_frequency * n0 / fs_rate);
+
+                            let err = (ground_truth - predicted).norm();
+                            let scale = ground_truth.norm().max(predicted.norm()).max(1e-6);
+                            assert!(
+                                err / scale < 1e-4,
+                                "tone={tone} freq_sub={freq_sub} t0={t0} dt={dt} sym_idx={sym_idx}: \
+                                 ground_truth={ground_truth:?} predicted={predicted:?} rel_err={}",
+                                err / scale
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[cfg(feature = "transmit")]
     #[test]
     fn test_scoped_decode_within_range_recovers_message() {
