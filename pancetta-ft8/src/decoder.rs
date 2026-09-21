@@ -18821,6 +18821,147 @@ mod tests {
         }
     }
 
+    /// PAN-166 round 13: isolates the phase-basis mismatch between the
+    /// leakage-free single-symbol-width audio extraction (round 12's
+    /// `par_extract_complex_symbols_from_audio_refined`, not yet
+    /// committed) and the spectrogram's own bin convention, BEFORE wiring
+    /// either into the real multi-tone pipeline again. Round 12's
+    /// hand-derived "exact term" (`exp(j*2*pi*tone*sym_start/sps)`)
+    /// referenced the audio extraction's own sample offset (`sym_start`,
+    /// from `candidate_offset_samples`) as if it were the spectrogram's
+    /// phase origin. It isn't: the spectrogram's analysis window for row
+    /// `t_base` STARTS at `n0(t_base) = (t_base+1)*subblock_size - nfft`
+    /// (see `SLIDING_FRAME_LOOKBACK_STEPS`'s doc), which differs from
+    /// `sym_start` by a FIXED `-subblock_size` (`= -sps/2`, independent of
+    /// `time_step`) -- not by anything depending on `time_step`'s parity.
+    /// That fixed half-symbol offset reduces to exactly
+    /// `tone_parity_sign(tone)`, which is why round 12's variants
+    /// flip-flopped with `P`'s parity: they were missing a
+    /// P-INDEPENDENT constant correction and mistakenly searching for a
+    /// P-DEPENDENT one instead.
+    ///
+    /// The correct conversion (verified below to direct-FFT precision,
+    /// swept across every tone, both `freq_sub` values, and BOTH parities
+    /// of `P = time_step - time_padding - 2`):
+    ///
+    /// `X_spectrogram(t_base) == X_audio(sym_start) * tone_parity_sign(tone)
+    ///      * exp(j * 2*pi * base_frequency * n0(t_base) / SAMPLE_RATE)`
+    ///
+    /// `X_audio` is computed by the exact same window+rotate+FFT steps as
+    /// `extract_symbols_complex`/`par_extract_symbols_complex` (duplicated
+    /// here only to retain phase instead of discarding it via `.norm()`);
+    /// `n0(t_base)` uses the spectrogram's own absolute window-start
+    /// formula -- NOT `sym_start`, which is where round 12 went wrong.
+    ///
+    /// A separate, purely-magnitude, real-and-positive scale factor also
+    /// applies: `compute_spectrogram_with`'s window bakes in a `2.0/nfft`
+    /// normalization (ft8_lib's `fft_norm` convention, unit window sum),
+    /// while `extract_symbols_complex`'s `symbol_window` is a plain,
+    /// unnormalized Hann (sum ~= sps/2). This is unrelated to the phase
+    /// bug -- it only rescales magnitude -- but must be corrected too for
+    /// a byte-for-byte drop-in replacement, so it's included below
+    /// (`window_scale`) rather than laundered through a loose tolerance.
+    #[test]
+    fn pan166_pure_tone_isolates_audio_vs_spectrogram_basis_conversion() {
+        let decoder = Ft8Decoder::new(Ft8Config::default()).expect("decoder");
+        let sps = decoder.protocol_params.samples_per_symbol(SAMPLE_RATE);
+        let subblock_size = sps / TIME_OSR;
+        let nfft = sps * FREQ_OSR;
+        let fs_rate = SAMPLE_RATE as f64;
+        let pi2 = 2.0 * PI;
+
+        let spec_window_sum: f64 = decoder.spectrogram_window.iter().map(|&w| w as f64).sum();
+        let symbol_window_sum: f64 = decoder.symbol_window.iter().sum();
+        let window_scale = spec_window_sum / symbol_window_sum;
+
+        let freq_bin = 300usize;
+        let phase0 = 1.1_f64;
+
+        for freq_sub in 0..FREQ_OSR {
+            let base_frequency =
+                freq_bin as f64 * TONE_SPACING + freq_sub as f64 * (TONE_SPACING / FREQ_OSR as f64);
+
+            for tone in 0..NUM_TONES {
+                let freq_hz = base_frequency + tone as f64 * TONE_SPACING;
+
+                let audio: Vec<f64> = (0..WINDOW_SAMPLES)
+                    .map(|n| (pi2 * freq_hz * n as f64 / fs_rate + phase0).cos())
+                    .collect();
+
+                let spectrogram = decoder.compute_spectrogram(&audio).expect("spectrogram");
+                let complex = spectrogram.complex.as_ref().expect("complex retained");
+
+                // t0 in {5,6} => P in {3,4}; {40,41} => P in {38,39}:
+                // covers both parities at two different absolute
+                // positions, plus a sym_idx sweep (which never changes
+                // P's parity, only its magnitude) to confirm parity of
+                // P -- not the absolute time_step -- is what mattered.
+                for &t0 in &[5usize, 6, 40, 41] {
+                    for sym_idx in 0..3usize {
+                        let t_base = t0 + sym_idx * TIME_OSR;
+                        if t_base >= spectrogram.num_steps {
+                            continue;
+                        }
+                        let freq_bin_idx = freq_bin + tone;
+                        if freq_bin_idx >= spectrogram.num_bins {
+                            continue;
+                        }
+
+                        let c = complex[spectrogram.idx(t_base, freq_sub, freq_bin_idx)];
+                        let x_spectrogram = Complex::new(c.re as f64, c.im as f64);
+
+                        let sym_start = candidate_offset_samples(
+                            t_base,
+                            spectrogram.time_padding,
+                            subblock_size,
+                        );
+                        if sym_start < 0 || (sym_start as usize) + sps > audio.len() {
+                            continue;
+                        }
+                        let sym_start = sym_start as usize;
+
+                        // X_audio: byte-for-byte the same window+rotate+FFT
+                        // steps as extract_symbols_complex, just keeping
+                        // the complex bin instead of its magnitude.
+                        let phase_step_angle = -pi2 * base_frequency / fs_rate;
+                        let phase_step =
+                            Complex::new(phase_step_angle.cos(), phase_step_angle.sin());
+                        let initial_angle = -pi2 * base_frequency * sym_start as f64 / fs_rate;
+                        let mut rotator = Complex::new(initial_angle.cos(), initial_angle.sin());
+                        let symbol_audio = &audio[sym_start..sym_start + sps];
+                        let mut buf = vec![Complex::new(0.0f64, 0.0); sps];
+                        for i in 0..sps {
+                            let w = decoder.symbol_window[i];
+                            buf[i] = Complex::new(
+                                symbol_audio[i] * w * rotator.re,
+                                symbol_audio[i] * w * rotator.im,
+                            );
+                            rotator *= phase_step;
+                        }
+                        decoder.symbol_fft.process(&mut buf);
+                        let x_audio = buf[tone] * window_scale;
+
+                        let n0 = (t_base as f64 + 1.0) * subblock_size as f64 - nfft as f64;
+                        let predicted = x_audio
+                            * tone_parity_sign(tone)
+                            * Complex::from_polar(1.0, pi2 * base_frequency * n0 / fs_rate);
+
+                        let err = (x_spectrogram - predicted).norm();
+                        let scale = x_spectrogram.norm().max(x_audio.norm()).max(1e-6);
+                        let p = t0 as isize - spectrogram.time_padding as isize - 2;
+                        assert!(
+                            err / scale < 1e-4,
+                            "tone={tone} freq_sub={freq_sub} t0={t0} P={p} sym_idx={sym_idx}: \
+                             spectrogram={x_spectrogram:?} predicted={predicted:?} \
+                             (audio={x_audio:?}) rel_err={}",
+                            err / scale
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[cfg(feature = "transmit")]
     #[test]
     fn test_scoped_decode_within_range_recovers_message() {
