@@ -646,6 +646,21 @@ pub struct Ft8Config {
     /// subtraction quality (and therefore residual/repass recall) enough
     /// to matter is unmeasured.
     ///
+    /// **Rounds 10-15 (PAN-166):** `par_extract_complex_symbols_from_
+    /// spectrogram_refined`'s 2-symbol-wide analysis window structurally
+    /// straddles neighboring, DIFFERENT-tone symbols (leakage no linear
+    /// interpolation can remove — round 10). When this flag is on, the
+    /// extractor is now `par_extract_complex_symbols_from_audio_refined`
+    /// instead: a leakage-free, single-symbol-width audio extraction,
+    /// positioned via `fine_sync::refine`'s independent audio-domain
+    /// Costas correlation rather than the spectrogram-derived `candidate.
+    /// time_refinement` (round 15 finding: that value is unreliable
+    /// whenever the true boundary sits near the midpoint between two
+    /// `time_step`s — see `Ft8Config::costas_half_loop_disabled`'s "two-
+    /// step score plateau" doc). Measured worst-case drift on a real
+    /// signal is ~0.05 rad (see `phase_drift_estimate_is_near_zero_on_a_
+    /// real_clean_signal_across_time_offsets`), down from ~0.43-0.6 rad.
+    ///
     /// Default **false**: needs its own A/B (`compare` scorecard, not
     /// this doc comment) before flipping — same discipline as every other
     /// flag in this struct that names a specific default-off tradeoff.
@@ -4460,6 +4475,7 @@ impl Ft8Decoder {
                         energy_stop,
                         residual_scope,
                         partner_freq_hz,
+                        &audio,
                     );
                     if extra.is_empty() {
                         self.current_budget_report.stages.push((
@@ -7921,12 +7937,19 @@ impl Ft8Decoder {
         // hb-230: partner audio freq for the relaxed-threshold branch on
         // the residual sync sweep. `None` keeps the historical behaviour.
         partner_freq_hz: Option<f64>,
+        // PAN-166 round 15: raw window audio, needed by the full-frame
+        // path's leakage-free audio-anchored extraction (and the
+        // `fine_sync::refine` position refinement it depends on) — see
+        // `par_extract_complex_symbols_from_audio_refined`'s doc.
+        audio: &[f64],
     ) -> Vec<DecodedMessage> {
         if self.config.coherent_multipass_iterations == 0 || spectrogram.complex.is_none() {
             return Vec::new();
         }
         let pp = &self.protocol_params;
         let time_padding = spectrogram.time_padding;
+        let audio_window_scale =
+            audio_to_spectrogram_window_scale(&self.spectrogram_window, &self.symbol_window);
 
         // Step 1: subtract each decoded signal's coherent contribution.
         let mut subtracted_candidates: Vec<CostasCandidate> = Vec::new();
@@ -7988,11 +8011,41 @@ impl Ft8Decoder {
             // normal, usually-nonzero property of real candidates that
             // the plain extractor ignores — empirically confirmed to
             // flip the drift estimate between ~0 and ~1.6 rad depending
-            // only on its sign. Full-frame path uses the fractional-
-            // time-aware extractor; the Costas-only path is untouched
-            // (byte-identical to before this ticket).
+            // only on its sign. Full-frame path uses the leakage-free,
+            // audio-anchored extractor (PAN-166 rounds 13-15); the
+            // Costas-only path is untouched (byte-identical to before
+            // this ticket).
             let Some(cs) = (if full_frame_active {
-                par_extract_complex_symbols_from_spectrogram_refined(pp, spectrogram, &candidate)
+                // Round 15: `candidate.time_refinement` is NOT a reliable
+                // sample-level position (see `par_extract_complex_symbols_
+                // from_audio_refined`'s doc) — get an independent, accurate
+                // one via `fine_sync::refine`'s audio-domain Costas
+                // correlation, anchored at the INTEGER `time_step` alone.
+                let subblock_size = pp.samples_per_symbol(SAMPLE_RATE) / TIME_OSR;
+                let coarse_start_sample =
+                    candidate_offset_samples(candidate.time_step, time_padding, subblock_size);
+                let base_frequency = candidate.freq_bin as f64 * TONE_SPACING
+                    + candidate.freq_sub as f64 * (TONE_SPACING / FREQ_OSR as f64);
+                let bb = crate::baseband::extract_candidate_baseband_with(
+                    audio,
+                    base_frequency,
+                    coarse_start_sample,
+                    pp,
+                    &self.baseband_taps,
+                );
+                let fs_result = crate::fine_sync::refine(&bb, pp);
+                let refined_start_sample = coarse_start_sample as f64
+                    + fs_result.dt_samples as f64 * crate::baseband::DECIM as f64;
+                let refined_freq_hz = base_frequency + fs_result.df_hz as f64;
+                par_extract_complex_symbols_from_audio_refined(
+                    pp,
+                    audio,
+                    refined_start_sample,
+                    refined_freq_hz,
+                    &self.symbol_fft,
+                    &self.symbol_window,
+                    audio_window_scale,
+                )
             } else {
                 par_extract_complex_symbols_from_spectrogram(pp, spectrogram, &candidate)
             }) else {
@@ -12897,6 +12950,144 @@ fn par_extract_complex_symbols_from_spectrogram_refined(
             let lo = read_complex(lo_idx, freq_bin);
             let hi = read_complex(hi_idx, freq_bin);
             row[tone] = lo * (1.0 - frac) + hi * frac;
+        }
+        out.push(row);
+    }
+    Some(out)
+}
+
+/// Precompute the real, positive scale factor needed to put
+/// [`par_extract_complex_symbols_from_audio_refined`]'s output into the
+/// same magnitude convention as [`par_extract_complex_symbols_from_spectrogram`]'s
+/// raw bins: `compute_spectrogram_with`'s window bakes in a `2.0/nfft`
+/// unit-window-sum normalization (ft8_lib's `fft_norm` convention) that
+/// `extract_symbols_complex`'s plain, unnormalized Hann `symbol_window`
+/// doesn't. Purely a magnitude factor -- unrelated to either basis-
+/// conversion phase term below -- computed once per decoder (both
+/// windows are fixed at construction) rather than per candidate/symbol.
+fn audio_to_spectrogram_window_scale(
+    spectrogram_window: &[SpecScalar],
+    symbol_window: &[f64],
+) -> f64 {
+    let spec_window_sum: f64 = spectrogram_window.iter().map(|&w| w as f64).sum();
+    let symbol_window_sum: f64 = symbol_window.iter().sum();
+    spec_window_sum / symbol_window_sum
+}
+
+/// PAN-166 rounds 13/14: audio-anchored, leakage-free sibling of
+/// [`par_extract_complex_symbols_from_spectrogram_refined`]. That
+/// function linearly interpolates between two neighboring INTEGER-
+/// `time_step` spectrogram rows to approximate `candidate.
+/// time_refinement`'s fractional offset -- but each row individually is
+/// already leakage-contaminated (`compute_spectrogram_with`'s analysis
+/// window spans 2 symbol periods, so a row generally straddles 2-3
+/// DIFFERENT tones), and no linear combination of two such rows can
+/// remove that (round 10's finding; round 12 confirmed the leakage-free
+/// single-symbol-width alternative is architecturally sound but got the
+/// basis-conversion formula wrong).
+///
+/// This extracts each symbol independently from raw audio (mirroring
+/// `extract_symbols_complex`'s existing demodulate + per-symbol-FFT
+/// approach, generalized to arbitrary sub-sample anchoring), which
+/// structurally cannot straddle a neighbor symbol's DIFFERENT tone the
+/// way the wide spectrogram window does. The candidate's continuous
+/// ideal sample offset (`time_step + time_refinement`, converted to
+/// samples via `candidate_offset_samples`'s formula evaluated at a
+/// real-valued time_step) is rounded to the nearest INTEGER SAMPLE, not
+/// the nearest spectrogram ROW -- bounding the rounding residual to
+/// `[-0.5, +0.5]` samples out of `sps` (~1920), not `[-0.5, +0.5]` ROWS
+/// (up to `sps/4` samples) like the interpolation approach. That
+/// residual is corrected via the DFT time-shift identity (exact for an
+/// isolated tone, per round 10), and the result is converted into the
+/// SAME basis `par_extract_complex_symbols_from_spectrogram`'s raw
+/// output uses (so `estimate_symbol_phase_drift_rad` /
+/// `compute_full_frame_complex_accumulator`'s unconditional
+/// `tone_parity_sign(tone)` multiply -- itself a correction for the
+/// SPECTROGRAM path's own bin-selection artifact, round 5 -- still
+/// applies correctly).
+///
+/// Derivation and validation: see the pure-tone regression tests
+/// `pan166_pure_tone_isolates_audio_vs_spectrogram_basis_conversion`
+/// (integer `time_step`, round 13) and
+/// `pan166_pure_tone_isolates_fractional_time_refinement_audio_extraction_formula`
+/// (fractional `time_refinement`, round 14) -- both verified to 1e-4
+/// (the f32-storage-precision floor used throughout this file) across
+/// every tone, both `freq_sub` values, and the full documented
+/// `time_refinement` range.
+///
+/// Round 15: `candidate.time_refinement` (round 13/14's original position
+/// source) turned out to be unreliable for THIS extraction's needs -- its
+/// 3-point parabolic fit degenerates into a clamped, near-arbitrary ±0.5
+/// (post-damping ±0.15) value whenever the true symbol boundary sits near
+/// the midpoint between two `time_step`s (the well-known, load-bearing-for-
+/// recall "two-step score plateau", see `Ft8Config::costas_half_loop_
+/// disabled`'s doc) -- confirmed directly: for one such candidate,
+/// `time_step=3` and `time_step=4` scored 20.755 vs. 20.752, an
+/// unresolvable near-tie for a 3-point parabola. The old, wide-window
+/// spectrogram interpolation tolerates this sloppy refinement (its own
+/// window is wide enough to still substantially overlap either integer
+/// position); this precise, single-symbol extraction cannot. Round 15
+/// therefore takes the caller-supplied `symbol0_start_sample`/
+/// `base_frequency` as already-accurate (e.g. from `fine_sync::refine`'s
+/// independent audio-domain Costas correlation, NOT the spectrogram-
+/// derived `time_refinement`) rather than deriving them internally from a
+/// `CostasCandidate`. This also drops round 13/14's `common_phase`
+/// (spectrogram-window-start-referenced) term entirely -- empirically
+/// confirmed to have zero effect on the drift estimate for an on-lattice
+/// carrier (it's an exact multiple of 2π per symbol in that case) and, more
+/// fundamentally, wrong in general: it implicitly assumed the same tone
+/// spans both the extracted symbol and the spectrogram window-start
+/// reference point, which structurally sits in the PRECEDING symbol's own
+/// second half.
+#[allow(clippy::too_many_arguments)]
+fn par_extract_complex_symbols_from_audio_refined(
+    pp: &ProtocolParams,
+    audio: &[f64],
+    symbol0_start_sample: f64,
+    base_frequency: f64,
+    symbol_fft: &std::sync::Arc<dyn rustfft::Fft<f64>>,
+    symbol_window: &[f64],
+    window_scale: f64,
+) -> Option<Vec<[Complex<f64>; NUM_TONES]>> {
+    let sps = pp.samples_per_symbol(SAMPLE_RATE);
+    let fs_rate = SAMPLE_RATE as f64;
+    let pi2 = 2.0 * std::f64::consts::PI;
+
+    let phase_step_angle = -pi2 * base_frequency / fs_rate;
+    let phase_step = Complex::new(phase_step_angle.cos(), phase_step_angle.sin());
+
+    let mut out: Vec<[Complex<f64>; NUM_TONES]> = Vec::with_capacity(pp.num_symbols);
+    let mut fft_buffer = vec![Complex::new(0.0f64, 0.0); sps];
+
+    for sym_idx in 0..pp.num_symbols {
+        let mut row = [Complex::new(0.0f64, 0.0); NUM_TONES];
+        let sym_start_cont = symbol0_start_sample + (sym_idx * sps) as f64;
+        let sym_start_int_signed = sym_start_cont.round() as isize;
+        if sym_start_int_signed < 0 || (sym_start_int_signed as usize) + sps > audio.len() {
+            out.push(row);
+            continue;
+        }
+        let sym_start_int = sym_start_int_signed as usize;
+        let delta = sym_start_cont - sym_start_int as f64;
+
+        let initial_angle = -pi2 * base_frequency * sym_start_int as f64 / fs_rate;
+        let mut rotator = Complex::new(initial_angle.cos(), initial_angle.sin());
+        let symbol_audio = &audio[sym_start_int..sym_start_int + sps];
+        for i in 0..sps {
+            let w = symbol_window[i];
+            fft_buffer[i] = Complex::new(
+                symbol_audio[i] * w * rotator.re,
+                symbol_audio[i] * w * rotator.im,
+            );
+            rotator *= phase_step;
+        }
+        symbol_fft.process(&mut fft_buffer);
+
+        for tone in 0..pp.num_tones {
+            let sub_sample_correction =
+                Complex::from_polar(1.0, pi2 * tone as f64 * delta / sps as f64);
+            row[tone] =
+                fft_buffer[tone] * window_scale * sub_sample_correction * tone_parity_sign(tone);
         }
         out.push(row);
     }
@@ -18668,20 +18859,69 @@ mod tests {
                             .collect::<Vec<_>>()
                     )
                 });
-            let cs = par_extract_complex_symbols_from_spectrogram_refined(&pp, &spectrogram, truth)
-                .expect("complex retention present");
+
+            // PAN-166 round 15: `truth.time_refinement` is NOT a reliable
+            // sample-level position (see `par_extract_complex_symbols_
+            // from_audio_refined`'s doc -- it degenerates whenever the
+            // true boundary sits near the midpoint between two
+            // `time_step`s, the well-known "two-step score plateau").
+            // Get an independent, accurate position instead via
+            // `fine_sync::refine`'s audio-domain Costas correlation,
+            // anchored at the INTEGER `time_step` alone (ignoring the
+            // unreliable `time_refinement`).
+            let subblock_size = pp.samples_per_symbol(SAMPLE_RATE) / TIME_OSR;
+            let coarse_start_sample =
+                candidate_offset_samples(truth.time_step, spectrogram.time_padding, subblock_size);
+            let base_frequency = truth.freq_bin as f64 * TONE_SPACING
+                + truth.freq_sub as f64 * (TONE_SPACING / FREQ_OSR as f64);
+            let bb = crate::baseband::extract_candidate_baseband_with(
+                &tx_f64,
+                base_frequency,
+                coarse_start_sample,
+                &pp,
+                &decoder.baseband_taps,
+            );
+            let fs_result = crate::fine_sync::refine(&bb, &pp);
+            let refined_start_sample = coarse_start_sample as f64
+                + fs_result.dt_samples as f64 * crate::baseband::DECIM as f64;
+            let refined_freq_hz = base_frequency + fs_result.df_hz as f64;
+
+            // PAN-166 rounds 13/14/15: the leakage-free, audio-anchored
+            // extraction, positioned via the independent fine-sync
+            // refinement above, replaces the leakage-prone spectrogram-row
+            // interpolation as the full-frame path's source of complex
+            // symbols -- see `par_extract_complex_symbols_from_audio_
+            // refined`'s doc for the derivation.
+            let window_scale = audio_to_spectrogram_window_scale(
+                &decoder.spectrogram_window,
+                &decoder.symbol_window,
+            );
+            let cs = par_extract_complex_symbols_from_audio_refined(
+                &pp,
+                &tx_f64,
+                refined_start_sample,
+                refined_freq_hz,
+                &decoder.symbol_fft,
+                &decoder.symbol_window,
+                window_scale,
+            )
+            .expect("audio-anchored extraction always succeeds");
 
             let drift = estimate_symbol_phase_drift_rad(&pp, &cs);
             assert!(
-                drift.abs() < 0.6,
-                "lead_in={lead_in_samples} (time_step={}, time_refinement={}): \
-                 the round-7 partial fix should keep drift under ~0.6 rad \
-                 at every sample offset (current worst observed ~0.43 rad, \
-                 down from ~1.66 rad unfixed) -- this threshold is NOT \
-                 near-zero, it's a regression guard on the partial \
-                 improvement PAN-166 will complete; got {drift} rad",
+                drift.abs() < 0.06,
+                "lead_in={lead_in_samples} (time_step={}, time_refinement={}, \
+                 fine_sync dt_samples={} df_hz={}): PAN-166's leakage-free \
+                 audio-anchored extraction, positioned via fine_sync::refine, \
+                 should keep drift small (measured worst case across all 8 \
+                 offsets is ~0.051 rad -- fine_sync's noncoherent, \
+                 Costas-only positioning leaves a small signal-content- \
+                 dependent residual, not a bug -- still ~10x tighter than \
+                 the shipped ~0.43-0.6 rad bound); got {drift} rad",
                 truth.time_step,
-                truth.time_refinement
+                truth.time_refinement,
+                fs_result.dt_samples,
+                fs_result.df_hz
             );
         }
     }
