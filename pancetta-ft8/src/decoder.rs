@@ -8266,27 +8266,24 @@ impl Ft8Decoder {
             // so subtraction must apply the SAME drift back, per symbol,
             // or the constant `rotor` only correctly represents symbol
             // 0's phase and leaves a growing residual at later symbols.
-            // Computed from `cs` FIRST (the refined, fine-sync-anchored
-            // basis) -- see `compute_full_frame_complex_accumulator_
-            // rebased_to_coarse`'s doc for why the accumulator below must
-            // reuse THIS value rather than re-deriving it from the
-            // rebased (coarse-basis, per-tone-jittery when `shift_samples`
-            // is large) symbols directly.
+            //
+            // Round 19 (Codex review finding): `rotor` stays in `cs`'s own
+            // (fine-sync-refined, when full-frame) basis -- an earlier
+            // attempt to rebase it into the spectrogram's coarse basis
+            // HERE, before deriving `rotor`, collapsed a genuinely PER-
+            // TONE correction into one scalar, which `subtract_decode_
+            // coherent`'s per-symbol projection can't undo per symbol.
+            // `subtract_decode_coherent` now applies that same per-tone
+            // rebase itself, per symbol, during projection instead (see
+            // its `rebase_frequency_hz`/`rebase_shift_samples` params'
+            // doc) -- exactly how it already applies `tone_parity_sign`.
             let symbol_phase_drift_rad = if full_frame_active {
                 estimate_symbol_phase_drift_rad(pp, &cs)
             } else {
                 0.0
             };
             let acc = if full_frame_active {
-                compute_full_frame_complex_accumulator_rebased_to_coarse(
-                    pp,
-                    &cs,
-                    tone_symbols,
-                    symbol_phase_drift_rad,
-                    base_frequency,
-                    shift_samples,
-                    sps,
-                )
+                compute_full_frame_complex_accumulator(pp, &cs, tone_symbols)
             } else {
                 compute_costas_complex_accumulator(pp, &cs)
             };
@@ -8300,10 +8297,6 @@ impl Ft8Decoder {
             } else {
                 1.0
             };
-            // `rotor` is now already rebased to the spectrogram's own
-            // coarse basis (see above), so `subtract_decode_coherent`
-            // uses the ORIGINAL, unmodified `candidate` -- no
-            // `time_refinement` override needed.
             subtract_decode_coherent(
                 spectrogram,
                 pp,
@@ -8312,6 +8305,8 @@ impl Ft8Decoder {
                 tone_symbols,
                 scale,
                 symbol_phase_drift_rad,
+                base_frequency,
+                shift_samples,
             );
             // Round 16 (Codex review finding): keep the audio-domain
             // residual in sync with the spectrogram's own residual (see
@@ -12757,6 +12752,25 @@ fn subtract_decode_coherent(
     // no-op, skipped entirely rather than multiplying by
     // `exp(j*0*s) == 1` — byte-identical to not having this parameter.
     symbol_phase_drift_rad: f64,
+    // PAN-166 round 19 (Codex review finding): `rotor` (from the full-
+    // frame path) is referenced to the audio extraction's fine-sync-
+    // refined position, but this function always projects against the
+    // spectrogram's COARSE, integer-row basis. The two bases differ by a
+    // PER-TONE phase term -- `exp(-j*2*pi*rebase_shift_samples*
+    // (rebase_frequency_hz/Fs + tone/sps))` -- that varies by which tone
+    // EACH symbol happens to carry, not by symbol index, so (unlike
+    // `symbol_phase_drift_rad`) it cannot be baked into a single scalar
+    // `rotor` upstream -- an earlier attempt to do exactly that
+    // (averaging the per-tone corrections into the accumulator before
+    // computing `rotor`) collapsed the tone-specific information the
+    // per-SYMBOL projection below still needs. Applying it HERE, per
+    // symbol, mirrors how `tone_parity_sign(tone)` below is already
+    // applied per symbol rather than baked into `rotor` once.
+    // `rebase_shift_samples == 0.0` (every pre-existing caller, and any
+    // full-frame candidate fine_sync found already on-grid) is an EXACT
+    // no-op regardless of `rebase_frequency_hz`.
+    rebase_frequency_hz: f64,
+    rebase_shift_samples: f64,
 ) {
     if spectrogram.complex.is_none() {
         return;
@@ -12823,6 +12837,22 @@ fn subtract_decode_coherent(
                     + (s as f64 - candidate.time_refinement) / steps_per_symbol as f64;
                 rotor * Complex::from_polar(1.0, symbol_phase_drift_rad * frac_symbol)
             };
+            // Round 19: per-symbol, per-TONE rebase from the audio
+            // extraction's fine-sync basis to this projection's coarse
+            // basis -- see this function's doc for why it must be applied
+            // HERE, per symbol, rather than folded into `rotor` upstream.
+            let rebase_to_coarse = if rebase_shift_samples == 0.0 {
+                Complex::new(1.0, 0.0)
+            } else {
+                let pi2 = 2.0 * std::f64::consts::PI;
+                let sps = pp.samples_per_symbol(SAMPLE_RATE);
+                Complex::from_polar(
+                    1.0,
+                    -pi2 * rebase_shift_samples
+                        * (rebase_frequency_hz / SAMPLE_RATE as f64 + tone as f64 / sps as f64),
+                )
+            };
+            let effective_rotor = effective_rotor * rebase_to_coarse;
             let effective_rotor_conj = effective_rotor.conj();
             // Scoped &mut to spectrogram.complex; ends before .power access.
             //
@@ -13561,63 +13591,6 @@ fn compute_full_frame_complex_accumulator(
         }
         let derotate = Complex::from_polar(1.0, -drift_rad * sym_idx as f64);
         acc += complex_symbols[sym_idx][tone] * tone_parity_sign(tone) * derotate;
-    }
-    acc
-}
-
-/// PAN-166 round 17 (Codex review finding, cycle 2 round 1): the audio-
-/// anchored full-frame extraction's `common_phase`/sub-sample-correction
-/// terms reference the CONTINUOUS, fine-sync-refined symbol position
-/// (`refined_start_sample`) -- the right basis for `estimate_symbol_
-/// phase_drift_rad` (a purely relative, symbol-to-symbol measure the
-/// per-candidate-constant reference point cancels out of), but `rotor`
-/// still needs to be projected against `subtract_decode_coherent`'s
-/// spectrogram, which is ALWAYS referenced to the coarse, integer-`t_idx`
-/// basis. The two bases differ by `exp(-j*2*pi*shift_samples*(base_
-/// frequency/Fs + tone/sps))` per (symbol, tone) -- NOT just a per-symbol
-/// drift-rate term, since it depends on which tone each symbol happens to
-/// carry (this is why the earlier attempt to fix this by rebasing
-/// `candidate.time_refinement` was an exact no-op whenever the measured
-/// drift was zero: that correction only ever multiplies by
-/// `symbol_phase_drift_rad`, which has nothing to do with this term at
-/// all). `shift_samples` is the SAME (constant per candidate) `refined_
-/// start_sample - coarse_start_sample` gap fine_sync::refine found.
-///
-/// A twin of [`compute_full_frame_complex_accumulator`] that takes an
-/// externally-computed `drift_rad` (from the CLEAN, refined-basis
-/// extraction) instead of re-deriving it from `complex_symbols` directly
-/// -- re-deriving it here would measure drift in the shifted, per-tone-
-/// jittery coarse basis instead, which can be substantially wrong when
-/// `shift_samples` is large (bounded by fine_sync's own +-0.5-symbol
-/// search range, so potentially hundreds of samples).
-fn compute_full_frame_complex_accumulator_rebased_to_coarse(
-    pp: &ProtocolParams,
-    complex_symbols: &[[Complex<f64>; NUM_TONES]],
-    tone_symbols: &[u8],
-    drift_rad: f64,
-    base_frequency: f64,
-    shift_samples: f64,
-    sps: usize,
-) -> Complex<f64> {
-    let pi2 = 2.0 * std::f64::consts::PI;
-    let fs_rate = SAMPLE_RATE as f64;
-    let mut acc = Complex::<f64>::new(0.0, 0.0);
-    let n = pp
-        .num_symbols
-        .min(complex_symbols.len())
-        .min(tone_symbols.len());
-    for sym_idx in 0..n {
-        let tone = tone_symbols[sym_idx] as usize;
-        if tone >= NUM_TONES {
-            continue;
-        }
-        let derotate = Complex::from_polar(1.0, -drift_rad * sym_idx as f64);
-        let rebase_to_coarse = Complex::from_polar(
-            1.0,
-            -pi2 * shift_samples * (base_frequency / fs_rate + tone as f64 / sps as f64),
-        );
-        acc +=
-            complex_symbols[sym_idx][tone] * tone_parity_sign(tone) * derotate * rebase_to_coarse;
     }
     acc
 }
@@ -23364,6 +23337,8 @@ mod three_stage_sync_tests {
             &tones,
             1.0,
             0.0,
+            0.0,
+            0.0,
         );
         subtract_decode_coherent(
             &mut spec_on,
@@ -23372,6 +23347,8 @@ mod three_stage_sync_tests {
             rotor,
             &tones,
             1.0,
+            0.0,
+            0.0,
             0.0,
         );
 
@@ -23672,6 +23649,8 @@ mod three_stage_sync_tests {
             &tone_symbols,
             1.0,
             estimated_drift,
+            0.0,
+            0.0,
         );
         subtract_decode_coherent(
             &mut spec_uncorrected,
@@ -23680,6 +23659,8 @@ mod three_stage_sync_tests {
             rotor,
             &tone_symbols,
             1.0,
+            0.0,
+            0.0,
             0.0,
         );
 
@@ -23823,6 +23804,8 @@ mod three_stage_sync_tests {
             &tone_symbols,
             1.0,
             estimated_drift,
+            0.0,
+            0.0,
         );
         subtract_decode_coherent(
             &mut spec_not_rebased,
@@ -23832,6 +23815,8 @@ mod three_stage_sync_tests {
             &tone_symbols,
             1.0,
             estimated_drift,
+            0.0,
+            0.0,
         );
 
         let residual_energy = |spec: &Spectrogram| -> f64 {
