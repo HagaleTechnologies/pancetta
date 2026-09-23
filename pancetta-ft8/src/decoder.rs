@@ -5104,14 +5104,19 @@ impl Ft8Decoder {
     }
 
     /// Generate CPFSK I/Q reference signals for given symbols and frequency.
-    fn generate_cpfsk_iq(symbols: &[u8], base_freq: f64, sps: usize) -> (Vec<f64>, Vec<f64>) {
+    fn generate_cpfsk_iq(
+        symbols: &[u8],
+        base_freq: f64,
+        sps: usize,
+        tone_spacing: f64,
+    ) -> (Vec<f64>, Vec<f64>) {
         use std::f64::consts::PI;
         let total_len = symbols.len() * sps;
         let mut recon_i = vec![0.0f64; total_len];
         let mut recon_q = vec![0.0f64; total_len];
         let mut phase = 0.0f64;
         for (sym_idx, &sym) in symbols.iter().enumerate() {
-            let freq = base_freq + sym as f64 * TONE_SPACING;
+            let freq = base_freq + sym as f64 * tone_spacing;
             let omega = 2.0 * PI * freq / SAMPLE_RATE as f64;
             let start = sym_idx * sps;
             for i in 0..sps {
@@ -5645,6 +5650,104 @@ impl Ft8Decoder {
         }
     }
 
+    /// PAN-166 round 16 (Codex review, cycle reset per the round-5
+    /// checkpoint -- see `coherent_subtract_and_repass`'s call site):
+    /// audio-domain interference cancellation anchored EXACTLY at an
+    /// already-known position and frequency, with no independent search.
+    ///
+    /// `subtract_signal` (below) is designed for a caller that has ONLY a
+    /// `DecodedMessage`'s own nominal `frequency_offset`/`time_offset` and
+    /// needs to independently re-derive where the signal actually sits
+    /// (±1.5 Hz / ±480 samples). Reusing it for the full-frame path
+    /// produced a whole family of review findings across five rounds --
+    /// wrong frequency basis, wrong tone spacing, stale residual, wrong
+    /// protocol gate, wrong subtraction reference point, and finally a
+    /// refined-candidate anchor that can fall outside `subtract_signal`'s
+    /// own search range entirely (three-stage sync cascade can move the
+    /// true position by up to ±1920 samples / ±3.125 Hz) -- because every
+    /// fix patched the AUDIO side to match ONE more aspect of what the
+    /// SPECTROGRAM side already used, instead of making both sides
+    /// provably use the SAME position/frequency by construction.
+    ///
+    /// This function is the fix for that root cause, not another patch:
+    /// the caller (`coherent_subtract_and_repass`) already knows the
+    /// EXACT position (`fine_sync::refine`'s `refined_start_sample`) and
+    /// frequency (the coarse `base_frequency` the spectrogram subtraction
+    /// itself uses) its extraction was anchored to -- there is nothing
+    /// left to search for. Reconstructs the signal directly at that
+    /// position/frequency (protocol-generic: `sps`/`tone_spacing` are
+    /// parameters, not hardcoded FT8 constants), independently fits
+    /// amplitude/phase via the same 2x2 least-squares projection
+    /// `subtract_signal`'s own fallback path uses, and subtracts. No
+    /// GFSK-ramp refinement (`subtract_signal`'s optional, default-off
+    /// `time_varying_subtraction_enabled` path) -- this matches
+    /// `subtract_decode_coherent`'s own spectrogram-side ML projection,
+    /// which also has no time-domain pulse shaping.
+    fn subtract_reconstructed_signal_at_known_position(
+        residual_audio: &mut [f32],
+        tone_symbols: &[u8],
+        sps: usize,
+        tone_spacing: f64,
+        base_frequency: f64,
+        symbol0_start_sample: f64,
+    ) {
+        let total_len = tone_symbols.len() * sps;
+        let start_signed = symbol0_start_sample.round() as isize;
+        let recon_start = start_signed.max(0) as usize;
+        let recon_offset = (recon_start as isize - start_signed) as usize;
+        let signal_len = (total_len.saturating_sub(recon_offset))
+            .min(residual_audio.len().saturating_sub(recon_start));
+        if signal_len == 0 {
+            return;
+        }
+
+        let (recon_i, recon_q) =
+            Self::generate_cpfsk_iq(tone_symbols, base_frequency, sps, tone_spacing);
+
+        // Full 2x2 least-squares for amplitude and phase -- identical
+        // math to `subtract_signal`'s own fallback path, just anchored
+        // directly here rather than at a fine-search result.
+        let mut dot_ai = 0.0f64;
+        let mut dot_aq = 0.0f64;
+        let mut dot_ii = 0.0f64;
+        let mut dot_qq = 0.0f64;
+        let mut dot_iq = 0.0f64;
+        for i in 0..signal_len {
+            let a = residual_audio[recon_start + i] as f64;
+            let ri = recon_i[recon_offset + i];
+            let rq = recon_q[recon_offset + i];
+            dot_ai += a * ri;
+            dot_aq += a * rq;
+            dot_ii += ri * ri;
+            dot_qq += rq * rq;
+            dot_iq += ri * rq;
+        }
+
+        let det = dot_ii * dot_qq - dot_iq * dot_iq;
+        let (amp_i, amp_q) = if det.abs() > 1e-12 {
+            let ai = (dot_ai * dot_qq - dot_aq * dot_iq) / det;
+            let aq = (dot_aq * dot_ii - dot_ai * dot_iq) / det;
+            (ai, aq)
+        } else {
+            (0.0, 0.0)
+        };
+
+        let total_amp = (amp_i * amp_i + amp_q * amp_q).sqrt();
+        let max_amp = 3.0;
+        let (amp_i, amp_q) = if total_amp > max_amp {
+            let s = max_amp / total_amp;
+            (amp_i * s, amp_q * s)
+        } else {
+            (amp_i, amp_q)
+        };
+
+        let scale = 0.9;
+        for i in 0..signal_len {
+            let subtracted = amp_i * recon_i[recon_offset + i] + amp_q * recon_q[recon_offset + i];
+            residual_audio[recon_start + i] -= (subtracted * scale) as f32;
+        }
+    }
+
     /// Subtract a decoded signal from the audio buffer (time-domain interference cancellation).
     ///
     /// Uses the tone symbols stored in the DecodedMessage to reconstruct the signal
@@ -5683,7 +5786,7 @@ impl Ft8Decoder {
             if ramp_enabled {
                 Self::generate_cpfsk_iq_ramped(sym, freq, sps, ramp_samples)
             } else {
-                Self::generate_cpfsk_iq(sym, freq, sps)
+                Self::generate_cpfsk_iq(sym, freq, sps, TONE_SPACING)
             }
         };
 
@@ -5883,7 +5986,8 @@ impl Ft8Decoder {
                 continue;
             }
 
-            let (recon_i, recon_q) = Self::generate_cpfsk_iq(symbols, shifted_freq, sps);
+            let (recon_i, recon_q) =
+                Self::generate_cpfsk_iq(symbols, shifted_freq, sps, TONE_SPACING);
             let recon_start = nominal_time.max(0) as usize;
             let recon_offset = (recon_start as isize - nominal_time) as usize;
             let signal_len = (total_len.saturating_sub(recon_offset))
@@ -8030,60 +8134,62 @@ impl Ft8Decoder {
             // now derotates each term using a drift estimate from the
             // known Costas positions before summing (see its doc and
             // `estimate_symbol_phase_drift_rad`).
-            // Round 16 (Codex review finding): the audio-domain residual
-            // canceller this path depends on (`subtract_signal`) is FT8-
-            // specific -- hardcoded `NUM_SYMBOLS`/`SYMBOL_DURATION` (a
-            // length mismatch makes it silently no-op for FT4's 105
-            // symbols) and, even where the length happens to check out
-            // (FT2), it synthesizes FT8's own 0.16s/6.25Hz waveform, not
-            // the calling protocol's. Making it protocol-generic is real,
-            // separate scope (`self.protocol_params`-driven symbol
-            // duration/tone spacing throughout its fine freq/time search
-            // AND its GFSK reference path) -- not something to rush
-            // under review pressure. `coherent_subtract_and_repass` is
-            // itself protocol-generic (FT4/FT2 too), so gate the whole
-            // full-frame path to FT8 specifically for now; FT4/FT2
-            // candidates fall back to the pre-existing, already protocol-
-            // generic spectrogram-based extractor, unchanged.
-            let full_frame_active = self.config.coherent_subtract_full_frame_reference_enabled
-                && candidate.freq_sub == 0
+            // PAN-166 round 16: this whole block (through the residual-
+            // audio subtraction below) was redesigned after 5 review
+            // rounds each found a NEW bug in the audio-domain side using
+            // a DIFFERENT position/frequency/protocol convention than the
+            // spectrogram side (wrong frequency basis, wrong tone
+            // spacing, stale residual, wrong protocol gate, wrong
+            // subtraction reference point, refined-candidate anchor
+            // outside the old canceller's own search range) -- the
+            // pattern itself, not any single finding, meant the fix
+            // needed to change: `audio_anchor_start_sample`/
+            // `audio_anchor_frequency` below are now computed ONCE and
+            // used for BOTH this candidate's extraction (when full-frame)
+            // and its residual-audio subtraction, so the two can no
+            // longer diverge by construction.
+            //
+            // `subtract_signal`/`generate_cpfsk_iq` are FT8-specific
+            // (hardcoded `NUM_SYMBOLS`/`SYMBOL_DURATION`/`TONE_SPACING` in
+            // various places) -- protocol-genericizing them is real,
+            // separate scope, not something to rush under review
+            // pressure. `coherent_subtract_and_repass` is itself
+            // protocol-generic (FT4/FT2 too), so gate the whole full-
+            // frame path AND the residual-audio tracking to FT8
+            // specifically for now; FT4/FT2 candidates fall back to the
+            // pre-existing, already protocol-generic spectrogram-based
+            // extractor, unchanged, and never touch `residual_audio`
+            // (always empty for them -- see the caller).
+            let ft8_full_frame_capable = self.config.coherent_subtract_full_frame_reference_enabled
                 && pp.protocol == crate::protocol::Protocol::Ft8;
-            // Round-6 review finding: `candidate.time_refinement` is a
-            // normal, usually-nonzero property of real candidates that
-            // the plain extractor ignores — empirically confirmed to
-            // flip the drift estimate between ~0 and ~1.6 rad depending
-            // only on its sign. Full-frame path uses the leakage-free,
-            // audio-anchored extractor (PAN-166 rounds 13-15); the
-            // Costas-only path is untouched (byte-identical to before
-            // this ticket).
-            // Round 16 (Codex review finding): `subtract_decode_coherent`'s
-            // per-substep rebasing re-references the rotor using
-            // `candidate.time_refinement` as "where, in symbol-fraction
-            // units, the rotor was actually estimated from" -- correct for
-            // the OLD spectrogram-refined extractor (whose own reference
-            // point WAS `time_step + time_refinement`), but WRONG now that
-            // the full-frame rotor is estimated at `fine_sync::refine`'s
-            // `refined_start_sample` instead, which can differ substantially
-            // from that (unreliable, see above) value. Captured here so the
-            // subtraction call below can pass a candidate carrying the
-            // EFFECTIVE fractional offset the rotor was actually measured
-            // at, not the discarded spectrogram-derived one. `time_step`/
-            // `freq_bin`/`freq_sub` (which DO drive spectrogram indexing)
-            // are deliberately left untouched -- only `time_refinement`
-            // (used purely for this phase bookkeeping) needs correcting.
+            let full_frame_active = ft8_full_frame_capable && candidate.freq_sub == 0;
+
+            let sps = pp.samples_per_symbol(SAMPLE_RATE);
+            let subblock_size = sps / TIME_OSR;
+            let coarse_start_sample =
+                candidate_offset_samples(candidate.time_step, time_padding, subblock_size);
+            let tone_spacing = pp.tone_spacing;
+            let base_frequency = candidate.freq_bin as f64 * tone_spacing
+                + candidate.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
+            // Defaults for the Costas-only (non-full-frame) case: EXACTLY
+            // what `subtract_decode_coherent` already uses for the
+            // spectrogram there (`time_refinement` is a no-op when
+            // `symbol_phase_drift_rad == 0.0`, and the coarse position/
+            // frequency ARE the spectrogram's own basis) -- so a Costas-
+            // only candidate's residual-audio subtraction below is
+            // provably consistent with its spectrogram subtraction with
+            // no fine_sync needed.
             let mut effective_time_refinement = candidate.time_refinement;
+            let mut audio_anchor_start_sample = coarse_start_sample as f64;
+            let audio_anchor_frequency = base_frequency;
+
             let Some(cs) = (if full_frame_active {
                 // Round 15: `candidate.time_refinement` is NOT a reliable
                 // sample-level position (see `par_extract_complex_symbols_
                 // from_audio_refined`'s doc) — get an independent, accurate
                 // one via `fine_sync::refine`'s audio-domain Costas
                 // correlation, anchored at the INTEGER `time_step` alone.
-                let subblock_size = pp.samples_per_symbol(SAMPLE_RATE) / TIME_OSR;
-                let coarse_start_sample =
-                    candidate_offset_samples(candidate.time_step, time_padding, subblock_size);
-                let tone_spacing = pp.tone_spacing;
-                let base_frequency = candidate.freq_bin as f64 * tone_spacing
-                    + candidate.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
+                //
                 // Round 16 (Codex review finding): read the CURRENT
                 // residual, not the original window audio -- earlier
                 // messages in this same loop (and earlier rounds, via
@@ -8104,6 +8210,7 @@ impl Ft8Decoder {
                 let fs_result = crate::fine_sync::refine(&bb, pp);
                 let refined_start_sample = coarse_start_sample as f64
                     + fs_result.dt_samples as f64 * crate::baseband::DECIM as f64;
+                audio_anchor_start_sample = refined_start_sample;
                 // Effective time_refinement (in the SAME time_step-fraction
                 // units candidate.time_refinement uses) for the ACTUAL
                 // position this extraction used, for subtraction's rebasing.
@@ -8182,16 +8289,29 @@ impl Ft8Decoder {
             // `decoded` batch: its signal is removed from `spectrogram`
             // but was left untouched in `residual_audio`, so the LATER
             // full-frame candidate's fine_sync/extraction would still see
-            // it at full strength. `subtract_signal` is FT8-specific (see
-            // `full_frame_active`'s doc above), so gate on the protocol
-            // too, not just the feature flag -- `residual_audio` is only
-            // ever non-empty (see the caller) when the flag is on, but for
-            // FT4/FT2 `full_frame_active` (and this call) must both stay
-            // unconditionally off regardless of that flag.
-            if self.config.coherent_subtract_full_frame_reference_enabled
-                && pp.protocol == crate::protocol::Protocol::Ft8
-            {
-                self.subtract_signal(residual_audio, msg);
+            // it at full strength. `ft8_full_frame_capable` covers both
+            // cases; `residual_audio` is only ever non-empty (see the
+            // caller) when it's true, so this is a no-op cost-wise for
+            // FT4/FT2 or the flag off regardless.
+            //
+            // `audio_anchor_start_sample`/`audio_anchor_frequency` are the
+            // SAME position/frequency used for this candidate's own
+            // extraction above (fine_sync-refined when full-frame, the
+            // plain coarse position otherwise, matching what
+            // `subtract_decode_coherent` used for the spectrogram in that
+            // case) -- see `subtract_reconstructed_signal_at_known_
+            // position`'s doc for why anchoring both sides to the same
+            // already-known values, instead of independently re-deriving
+            // one from `msg`, is the point of this redesign.
+            if ft8_full_frame_capable {
+                Self::subtract_reconstructed_signal_at_known_position(
+                    residual_audio,
+                    tone_symbols,
+                    sps,
+                    tone_spacing,
+                    audio_anchor_frequency,
+                    audio_anchor_start_sample,
+                );
             }
             subtracted_candidates.push(candidate);
         }
@@ -20888,7 +21008,7 @@ mod hb226_gaussian_ramp_tests {
         let sym = hb226_synthetic_symbols();
         let sps = (SYMBOL_DURATION * SAMPLE_RATE as f64) as usize;
         let ramp = Ft8Decoder::ramp_samples_from_fraction(sps, 0.11);
-        let (ri_u, rq_u) = Ft8Decoder::generate_cpfsk_iq(&sym, 1500.0, sps);
+        let (ri_u, rq_u) = Ft8Decoder::generate_cpfsk_iq(&sym, 1500.0, sps, TONE_SPACING);
         let (ri_r, rq_r) = Ft8Decoder::generate_cpfsk_iq_ramped(&sym, 1500.0, sps, ramp);
 
         let e_u: f64 = ri_u
@@ -20926,7 +21046,7 @@ mod hb226_gaussian_ramp_tests {
         // Build a synthetic audio buffer: amplitude 0.5 sinusoid at
         // the symbol's CPFSK frequency, padded with zeros for the
         // search margin.
-        let (ri, _rq) = Ft8Decoder::generate_cpfsk_iq(&symbols, 1500.0, sps);
+        let (ri, _rq) = Ft8Decoder::generate_cpfsk_iq(&symbols, 1500.0, sps, TONE_SPACING);
         let pad = sps; // leave room for the time-search lower bound
         let mut audio: Vec<f32> = vec![0.0; pad + ri.len() + pad];
         for k in 0..ri.len() {
@@ -20982,7 +21102,7 @@ mod hb226_gaussian_ramp_tests {
         // Build a synthetic audio buffer the same way as the
         // identical-output test, but use a clean reconstructed
         // signal we can subtract.
-        let (ri, _rq) = Ft8Decoder::generate_cpfsk_iq(&symbols, 1500.0, sps);
+        let (ri, _rq) = Ft8Decoder::generate_cpfsk_iq(&symbols, 1500.0, sps, TONE_SPACING);
         let pad = sps;
         let mut audio: Vec<f32> = vec![0.0; pad + ri.len() + pad];
         for k in 0..ri.len() {
@@ -26826,7 +26946,8 @@ mod w4_1_gfsk_reference_tests {
         // real (cosine) quadrature component as the "transmitted" signal —
         // same magnitude-spectrum shape as the actual `sin(phase)` audio
         // the legacy subtract path fits against.
-        let (rect_i, _rect_q) = Ft8Decoder::generate_cpfsk_iq(&symbols, base_freq, sps);
+        let (rect_i, _rect_q) =
+            Ft8Decoder::generate_cpfsk_iq(&symbols, base_freq, sps, TONE_SPACING);
 
         // New GFSK reference via the real TX modulator, same symbols/freq,
         // zero refinement (df=0, dt=0) so both references describe the
