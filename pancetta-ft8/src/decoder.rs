@@ -12845,24 +12845,50 @@ fn subtract_decode_coherent(
                 rotor
             } else {
                 // Round-9 review finding: `rotor` was estimated from
-                // samples interpolated at the FRACTIONAL extraction
-                // position `t0 + candidate.time_refinement` (the
-                // refined extractor's own reference — see
-                // `par_extract_complex_symbols_from_spectrogram_
-                // refined`), not the integer row `t0`. Treating the raw
-                // row read here (at the plain integer `t_idx`) as
-                // though `frac_symbol == 0` coincided with `t0` ignores
-                // that shift, leaving every symbol's projection
-                // displaced by `symbol_phase_drift_rad *
-                // time_refinement / steps_per_symbol`. Subtract the
-                // refinement (in the same symbol-fraction units) to
-                // re-reference the rotor to where it was actually
-                // estimated. `time_refinement == 0.0` (every
-                // pre-existing caller, and any full-frame candidate the
-                // sync search happened to land exactly on-grid) makes
-                // this an exact no-op.
+                // samples interpolated at some FRACTIONAL extraction
+                // position, not the integer row `t0`. Treating the raw
+                // row read here (at the plain integer `t_idx`) as though
+                // `frac_symbol == 0` coincided with `t0` ignores that
+                // shift, leaving every symbol's projection displaced by
+                // `symbol_phase_drift_rad * reference_offset_substeps /
+                // steps_per_symbol`. Subtract the reference offset (in
+                // the same symbol-fraction units) to re-reference the
+                // rotor to where it was actually estimated.
+                //
+                // PAN-166 cycle-2 round-5 checkpoint redesign (5
+                // consecutive review rounds each found a new bug in this
+                // full-frame ↔ coarse-basis reconciliation, rounds 17-21 —
+                // convergence-policy.md's mandatory round-5 checkpoint):
+                // this function had TWO disagreeing notions of "where is
+                // rotor's own reference point" -- `candidate.
+                // time_refinement` (the OLD, PAN-166-documented-unreliable
+                // Costas-search refinement) used ONLY here, versus
+                // `rebase_shift_samples` (the NEW, fine-sync-derived,
+                // accurate offset) used only by the per-tone rebase below.
+                // On the full-frame path `rotor` is estimated at the
+                // fine-sync position, so using `candidate.time_refinement`
+                // here left a residual `symbol_phase_drift_rad *
+                // (shift_samples/subblock_size - candidate.time_refinement)`
+                // phase error whenever the two disagreed -- rather than add
+                // a fifth patch for a fifth disagreement site, collapse to
+                // ONE authoritative source: whenever `rebase_shift_samples`
+                // is nonzero (a full-frame candidate; see this function's
+                // param doc), it alone determines the reference offset,
+                // converted from samples to substep units. Only when it's
+                // exactly 0.0 (every non-full-frame caller, and the
+                // vanishingly-rare full-frame candidate fine_sync finds
+                // exactly on-grid) does `candidate.time_refinement` apply --
+                // consistent with this function's own pre-existing
+                // zero-sentinel convention for `rebase_shift_samples`.
+                let reference_offset_substeps = if rebase_shift_samples != 0.0 {
+                    let sps = pp.samples_per_symbol(SAMPLE_RATE);
+                    let subblock_size = sps as f64 / steps_per_symbol as f64;
+                    rebase_shift_samples / subblock_size
+                } else {
+                    candidate.time_refinement
+                };
                 let frac_symbol = sym_idx as f64
-                    + (s as f64 - candidate.time_refinement) / steps_per_symbol as f64;
+                    + (s as f64 - reference_offset_substeps) / steps_per_symbol as f64;
                 rotor * Complex::from_polar(1.0, symbol_phase_drift_rad * frac_symbol)
             };
             // Round 19: per-symbol, per-TONE rebase from the audio
