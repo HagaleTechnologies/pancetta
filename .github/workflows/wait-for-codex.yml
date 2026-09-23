@@ -104,7 +104,14 @@ jobs:
     # Marking this job's own check-run "success" instead (coppa's approach, which has no
     # equivalent downstream skip-tolerant consumer) would diverge from that established,
     # working contract for no benefit.
-    if: github.event_name == 'merge_group' || (github.event.pull_request.draft == false && github.actor != 'dependabot[bot]')
+    # Codex P1, this PR's own round-2 review: round-1's fix subscribed the WORKFLOW to
+    # pull_request_review/issue_comment (for codex-review-response below) -- without
+    # `github.event_name == 'pull_request_target'` explicitly required here, this producer
+    # job's `if:` also evaluated true on those SAME events (draft==false and non-dependabot
+    # hold regardless of event type), running a second, all-steps-skipped instance of THIS
+    # exact check name in parallel with codex-review-response's own real evaluation --
+    # reintroducing the duplicate-same-name-check-run ambiguity this design exists to avoid.
+    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request_target' && github.event.pull_request.draft == false && github.actor != 'dependabot[bot]')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
