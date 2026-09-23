@@ -53,6 +53,15 @@ on:
   # SHA) from the event payload.
   pull_request_target:
     types: [opened, ready_for_review, synchronize, reopened]
+  # Codex P1, this PR's own round-1 review: codex-review-response's own job-level `if:`
+  # already gates on pull_request_review/issue_comment from the Codex bot actor -- but
+  # without these two event types actually triggering the WORKFLOW at all, that job could
+  # never run in the first place. Every real Codex response would leave the managed check
+  # permanently in_progress until the org-wide timeout-scan backstop eventually failed it.
+  pull_request_review:
+    types: [submitted]
+  issue_comment:
+    types: [created]
   # merge_group: pancetta's native merge-queue ruleset re-evaluates every required check
   # against a temporary merge-group SHA with no associated PR context. Handled by an
   # event-gated pass-through step in the request job rather than a second job (two
