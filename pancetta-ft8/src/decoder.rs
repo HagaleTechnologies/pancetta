@@ -4457,6 +4457,19 @@ impl Ft8Decoder {
                 // `coherent_multipass_iterations` rounds still run
                 // exactly as before this task.
                 let total_rounds = self.config.coherent_multipass_iterations;
+                // PAN-166 round 16: mutable audio-domain residual for the
+                // full-frame path (see `coherent_subtract_and_repass`'s
+                // `residual_audio` doc) -- owned here, across ALL rounds,
+                // exactly like `spectrogram`. Left empty (zero allocation)
+                // when the flag is off, matching this file's byte-
+                // identical-when-disabled convention; the Costas-only
+                // path never reads it.
+                let mut residual_audio_for_full_frame: Vec<f32> =
+                    if self.config.coherent_subtract_full_frame_reference_enabled {
+                        audio.iter().map(|&s| s as f32).collect()
+                    } else {
+                        Vec::new()
+                    };
                 for round in 0..total_rounds {
                     if !current_budget.has_time() {
                         self.current_budget_report.budget_exhausted = true;
@@ -4475,7 +4488,7 @@ impl Ft8Decoder {
                         energy_stop,
                         residual_scope,
                         partner_freq_hz,
-                        &audio,
+                        &mut residual_audio_for_full_frame,
                     );
                     if extra.is_empty() {
                         self.current_budget_report.stages.push((
@@ -7937,11 +7950,23 @@ impl Ft8Decoder {
         // hb-230: partner audio freq for the relaxed-threshold branch on
         // the residual sync sweep. `None` keeps the historical behaviour.
         partner_freq_hz: Option<f64>,
-        // PAN-166 round 15: raw window audio, needed by the full-frame
-        // path's leakage-free audio-anchored extraction (and the
-        // `fine_sync::refine` position refinement it depends on) — see
-        // `par_extract_complex_symbols_from_audio_refined`'s doc.
-        audio: &[f64],
+        // PAN-166 round 15/16: mutable audio-domain residual, needed by
+        // the full-frame path's leakage-free audio-anchored extraction
+        // (and the `fine_sync::refine` position refinement it depends
+        // on) — see `par_extract_complex_symbols_from_audio_refined`'s
+        // doc. Round 16 (Codex review finding): earlier rounds' (and
+        // earlier messages in THIS round's) decoded signals must
+        // already be subtracted out of this buffer by the time a later
+        // message's fine_sync/extraction reads it, or a still-present
+        // strong signal corrupts the very masked-signal case multipass
+        // exists to recover — mirrors `spectrogram`'s own in-place
+        // residual mutation via `subtract_decode_coherent`, using the
+        // existing `subtract_signal` time-domain canceller (same
+        // mechanism the legacy per-pass residual loop already uses on
+        // `residual_samples`) instead of inventing a new one. Owned by
+        // the caller so it persists correctly across the caller's own
+        // multi-round loop, exactly like `spectrogram`.
+        residual_audio: &mut [f32],
     ) -> Vec<DecodedMessage> {
         if self.config.coherent_multipass_iterations == 0 || spectrogram.complex.is_none() {
             return Vec::new();
@@ -8027,8 +8052,18 @@ impl Ft8Decoder {
                 let tone_spacing = pp.tone_spacing;
                 let base_frequency = candidate.freq_bin as f64 * tone_spacing
                     + candidate.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
+                // Round 16 (Codex review finding): read the CURRENT
+                // residual, not the original window audio -- earlier
+                // messages in this same loop (and earlier rounds, via
+                // the caller's persistent `residual_audio`) have already
+                // had their coherent contribution subtracted out below;
+                // skipping this would let an already-decoded, still-
+                // present strong signal corrupt fine_sync's correlation
+                // and this extraction's phase measurement for exactly
+                // the masked-signal case multipass exists to recover.
+                let audio_f64: Vec<f64> = residual_audio.iter().map(|&s| s as f64).collect();
                 let bb = crate::baseband::extract_candidate_baseband_with(
-                    audio,
+                    &audio_f64,
                     base_frequency,
                     coarse_start_sample,
                     pp,
@@ -8050,7 +8085,7 @@ impl Ft8Decoder {
                 // accuracy) even though it isn't applied to the demod here.
                 par_extract_complex_symbols_from_audio_refined(
                     pp,
-                    audio,
+                    &audio_f64,
                     refined_start_sample,
                     base_frequency,
                     &self.symbol_fft,
@@ -8096,6 +8131,14 @@ impl Ft8Decoder {
                 scale,
                 symbol_phase_drift_rad,
             );
+            // Round 16: keep the audio-domain residual in sync with the
+            // spectrogram's own residual (see `residual_audio`'s doc) --
+            // only needed while the full-frame path actually reads audio;
+            // the Costas-only path never does, so skip the extra cost
+            // when the flag is off (this ticket's default).
+            if full_frame_active {
+                self.subtract_signal(residual_audio, msg);
+            }
             subtracted_candidates.push(candidate);
         }
         if subtracted_candidates.is_empty() {
