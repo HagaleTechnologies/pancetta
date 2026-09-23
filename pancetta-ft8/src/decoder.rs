@@ -8382,6 +8382,13 @@ impl Ft8Decoder {
             } else {
                 1.0
             };
+            // Round 23 (Codex review finding): `Some` only when this
+            // candidate actually used the fine-sync-refined basis
+            // (`full_frame_active`) -- NOT merely `shift_samples != 0.0`,
+            // which would wrongly read as `None` for the rare full-frame
+            // candidate fine_sync finds exactly on-grid (see
+            // `subtract_decode_coherent`'s param doc).
+            let rebase = full_frame_active.then_some((base_frequency, shift_samples));
             subtract_decode_coherent(
                 spectrogram,
                 pp,
@@ -8390,8 +8397,7 @@ impl Ft8Decoder {
                 tone_symbols,
                 scale,
                 symbol_phase_drift_rad,
-                base_frequency,
-                shift_samples,
+                rebase,
             );
             // Round 16 (Codex review finding): keep the audio-domain
             // residual in sync with the spectrogram's own residual (see
@@ -12852,11 +12858,26 @@ fn subtract_decode_coherent(
     // per-SYMBOL projection below still needs. Applying it HERE, per
     // symbol, mirrors how `tone_parity_sign(tone)` below is already
     // applied per symbol rather than baked into `rotor` once.
-    // `rebase_shift_samples == 0.0` (every pre-existing caller, and any
-    // full-frame candidate fine_sync found already on-grid) is an EXACT
-    // no-op regardless of `rebase_frequency_hz`.
-    rebase_frequency_hz: f64,
-    rebase_shift_samples: f64,
+    //
+    // PAN-166 round 23 (Codex review finding, cycle 3 round 2): this used
+    // to be two plain `f64` params with `rebase_shift_samples == 0.0`
+    // overloaded to mean BOTH "not applicable" (every non-full-frame
+    // caller) AND "applicable, and the fine-sync offset happens to be
+    // exactly zero" (a full-frame candidate whose true position lands
+    // exactly on the coarse grid) -- genuinely rare, but not impossible,
+    // and when it happened the zero-sentinel silently fell back to the
+    // stale `candidate.time_refinement` instead of the correct authoritative
+    // zero, reintroducing the exact reference-point-disagreement bug the
+    // round-5 checkpoint redesign (see the doc below) existed to
+    // eliminate. `Option<(f64, f64)>` makes the two cases distinguishable
+    // at the type level instead of by convention: `None` (every non-full-
+    // frame caller) means "use `candidate.time_refinement`, this
+    // function's original reference"; `Some((rebase_frequency_hz,
+    // rebase_shift_samples))` (any full-frame candidate, regardless of
+    // whether the fine-sync offset it found is nonzero) means "use THIS
+    // value, always" -- ignoring `candidate.time_refinement` even when
+    // `rebase_shift_samples` is exactly `0.0`.
+    rebase: Option<(f64, f64)>,
 ) {
     if spectrogram.complex.is_none() {
         return;
@@ -12920,25 +12941,21 @@ fn subtract_decode_coherent(
                 // this function had TWO disagreeing notions of "where is
                 // rotor's own reference point" -- `candidate.
                 // time_refinement` (the OLD, PAN-166-documented-unreliable
-                // Costas-search refinement) used ONLY here, versus
-                // `rebase_shift_samples` (the NEW, fine-sync-derived,
-                // accurate offset) used only by the per-tone rebase below.
-                // On the full-frame path `rotor` is estimated at the
-                // fine-sync position, so using `candidate.time_refinement`
-                // here left a residual `symbol_phase_drift_rad *
+                // Costas-search refinement) used ONLY here, versus the
+                // rebase offset (the NEW, fine-sync-derived, accurate
+                // offset) used only by the per-tone rebase below. On the
+                // full-frame path `rotor` is estimated at the fine-sync
+                // position, so using `candidate.time_refinement` here left
+                // a residual `symbol_phase_drift_rad *
                 // (shift_samples/subblock_size - candidate.time_refinement)`
-                // phase error whenever the two disagreed -- rather than add
-                // a fifth patch for a fifth disagreement site, collapse to
-                // ONE authoritative source: whenever `rebase_shift_samples`
-                // is nonzero (a full-frame candidate; see this function's
-                // param doc), it alone determines the reference offset,
-                // converted from samples to substep units. Only when it's
-                // exactly 0.0 (every non-full-frame caller, and the
-                // vanishingly-rare full-frame candidate fine_sync finds
-                // exactly on-grid) does `candidate.time_refinement` apply --
-                // consistent with this function's own pre-existing
-                // zero-sentinel convention for `rebase_shift_samples`.
-                let reference_offset_substeps = if rebase_shift_samples != 0.0 {
+                // phase error whenever the two disagreed -- collapse to
+                // ONE authoritative source: whenever `rebase` is `Some`
+                // (round 23: regardless of whether its shift happens to be
+                // exactly zero -- see this function's param doc), it alone
+                // determines the reference offset, converted from samples
+                // to substep units. Only `None` (every non-full-frame
+                // caller) falls back to `candidate.time_refinement`.
+                let reference_offset_substeps = if let Some((_, rebase_shift_samples)) = rebase {
                     let sps = pp.samples_per_symbol(SAMPLE_RATE);
                     let subblock_size = sps as f64 / steps_per_symbol as f64;
                     rebase_shift_samples / subblock_size
@@ -12953,16 +12970,21 @@ fn subtract_decode_coherent(
             // extraction's fine-sync basis to this projection's coarse
             // basis -- see this function's doc for why it must be applied
             // HERE, per symbol, rather than folded into `rotor` upstream.
-            let rebase_to_coarse = if rebase_shift_samples == 0.0 {
-                Complex::new(1.0, 0.0)
-            } else {
-                let pi2 = 2.0 * std::f64::consts::PI;
-                let sps = pp.samples_per_symbol(SAMPLE_RATE);
-                Complex::from_polar(
-                    1.0,
-                    -pi2 * rebase_shift_samples
-                        * (rebase_frequency_hz / SAMPLE_RATE as f64 + tone as f64 / sps as f64),
-                )
+            // `Some((_, 0.0))` (round 23: a full-frame candidate fine_sync
+            // found exactly on-grid) naturally reduces to the identity
+            // rotor via the formula itself (`exp(-j*0) == 1`), so no
+            // separate zero-shift branch is needed here.
+            let rebase_to_coarse = match rebase {
+                Some((rebase_frequency_hz, rebase_shift_samples)) => {
+                    let pi2 = 2.0 * std::f64::consts::PI;
+                    let sps = pp.samples_per_symbol(SAMPLE_RATE);
+                    Complex::from_polar(
+                        1.0,
+                        -pi2 * rebase_shift_samples
+                            * (rebase_frequency_hz / SAMPLE_RATE as f64 + tone as f64 / sps as f64),
+                    )
+                }
+                None => Complex::new(1.0, 0.0),
             };
             let effective_rotor = effective_rotor * rebase_to_coarse;
             let effective_rotor_conj = effective_rotor.conj();
@@ -23449,8 +23471,7 @@ mod three_stage_sync_tests {
             &tones,
             1.0,
             0.0,
-            0.0,
-            0.0,
+            None,
         );
         subtract_decode_coherent(
             &mut spec_on,
@@ -23460,8 +23481,7 @@ mod three_stage_sync_tests {
             &tones,
             1.0,
             0.0,
-            0.0,
-            0.0,
+            None,
         );
 
         let num_bins = spec_off.num_bins;
@@ -23761,8 +23781,7 @@ mod three_stage_sync_tests {
             &tone_symbols,
             1.0,
             estimated_drift,
-            0.0,
-            0.0,
+            None,
         );
         subtract_decode_coherent(
             &mut spec_uncorrected,
@@ -23772,8 +23791,7 @@ mod three_stage_sync_tests {
             &tone_symbols,
             1.0,
             0.0,
-            0.0,
-            0.0,
+            None,
         );
 
         let residual_energy = |spec: &Spectrogram| -> f64 {
@@ -23916,8 +23934,7 @@ mod three_stage_sync_tests {
             &tone_symbols,
             1.0,
             estimated_drift,
-            0.0,
-            0.0,
+            None,
         );
         subtract_decode_coherent(
             &mut spec_not_rebased,
@@ -23927,8 +23944,7 @@ mod three_stage_sync_tests {
             &tone_symbols,
             1.0,
             estimated_drift,
-            0.0,
-            0.0,
+            None,
         );
 
         let residual_energy = |spec: &Spectrogram| -> f64 {
@@ -23947,6 +23963,136 @@ mod three_stage_sync_tests {
             "rebasing by the candidate's time_refinement should leave \
              meaningfully less residual than ignoring it (the pre-fix \
              formula): rebased={rebased_energy}, not_rebased={not_rebased_energy}"
+        );
+    }
+
+    #[test]
+    fn subtract_decode_coherent_treats_a_zero_rebase_shift_as_authoritative_over_stale_time_refinement(
+    ) {
+        // PAN-166 round 23 (Codex review finding): a full-frame candidate
+        // whose fine_sync genuinely found `shift_samples == 0.0` (rotor
+        // estimated exactly at the integer coarse row) must still ignore
+        // `candidate.time_refinement` even when that stale Costas-search
+        // value happens to be nonzero -- `Some((_, 0.0))` must NOT read as
+        // if it were `None`. This is the exact zero-sentinel-overload bug
+        // `Option<(f64, f64)>` (replacing two plain `f64` params) exists
+        // to make impossible to reintroduce.
+        let pp = ProtocolParams::ft8();
+        let mut tone_symbols = vec![0u8; pp.num_symbols];
+        for (m, &group_start) in pp.costas_positions.iter().enumerate() {
+            for k in 0..pp.costas_length {
+                tone_symbols[group_start + k] = pp.costas_arrays[m][k];
+            }
+        }
+        let drift = 0.08;
+        let seed_time = 5;
+        let seed_freq_bin = 50;
+        let seed_freq_sub = 0;
+        let steps_per_symbol = TIME_OSR;
+
+        // Spectrogram's TRUE phase origin sits exactly at the INTEGER
+        // `seed_time` row (no sub-sample offset) -- i.e. what fine_sync
+        // finding `shift_samples == 0.0` actually represents.
+        let num_steps = seed_time + pp.num_symbols * steps_per_symbol + 4;
+        let num_bins = seed_freq_bin + NUM_TONES + 4;
+        let build_spec = || {
+            let mut power: Vec<SpecScalar> = vec![-120.0; num_steps * FREQ_OSR * num_bins];
+            let mut complex =
+                vec![Complex::<SpecScalar>::new(0.0, 0.0); num_steps * FREQ_OSR * num_bins];
+            for sym_idx in 0..pp.num_symbols {
+                let tone = tone_symbols[sym_idx] as usize;
+                let f_idx = seed_freq_bin + tone;
+                let t_base = seed_time + sym_idx * steps_per_symbol;
+                for s in 0..steps_per_symbol {
+                    let t_idx = t_base + s;
+                    let frac_symbol = sym_idx as f64 + s as f64 / steps_per_symbol as f64;
+                    let phasor = Complex::from_polar(1.0f32, (drift * frac_symbol) as f32)
+                        * tone_parity_sign(tone) as f32;
+                    let flat_idx = (t_idx * FREQ_OSR + seed_freq_sub) * num_bins + f_idx;
+                    complex[flat_idx] = phasor;
+                    power[flat_idx] = (10.0 * (1e-12_f64 + 1.0).log10()) as SpecScalar;
+                }
+            }
+            Spectrogram {
+                power,
+                complex: Some(complex),
+                num_steps,
+                num_bins,
+                freq_osr: FREQ_OSR,
+                time_padding: 0,
+            }
+        };
+        let base_spec = build_spec();
+
+        // The rotor is estimated at the TRUE (zero-offset) position...
+        let true_candidate = CostasCandidate {
+            time_step: seed_time,
+            freq_bin: seed_freq_bin,
+            freq_sub: seed_freq_sub,
+            sync_score: 0.0,
+            time_refinement: 0.0,
+        };
+        // ...but the candidate the caller actually has carries a STALE,
+        // nonzero Costas-search refinement -- exactly the PAN-166-
+        // documented-unreliable value this whole redesign exists to stop
+        // trusting for sample-precise positioning.
+        let stale_candidate = CostasCandidate {
+            time_refinement: 0.3,
+            ..true_candidate
+        };
+
+        let cs =
+            par_extract_complex_symbols_from_spectrogram_refined(&pp, &base_spec, &true_candidate)
+                .expect("complex retention present");
+        let acc = compute_full_frame_complex_accumulator(&pp, &cs, &tone_symbols);
+        let rotor = acc / acc.norm();
+        let estimated_drift = estimate_symbol_phase_drift_rad(&pp, &cs);
+
+        let mut spec_authoritative_zero = build_spec();
+        let mut spec_stale_fallback = build_spec();
+        // Fine_sync genuinely found shift_samples == 0.0 -- must be
+        // authoritative, ignoring stale_candidate.time_refinement == 0.3.
+        subtract_decode_coherent(
+            &mut spec_authoritative_zero,
+            &pp,
+            &stale_candidate,
+            rotor,
+            &tone_symbols,
+            1.0,
+            estimated_drift,
+            Some((0.0, 0.0)),
+        );
+        // The pre-fix behavior this test guards against: treating the
+        // zero shift as "not applicable" (`None`) falls back to the
+        // stale, wrong `time_refinement`.
+        subtract_decode_coherent(
+            &mut spec_stale_fallback,
+            &pp,
+            &stale_candidate,
+            rotor,
+            &tone_symbols,
+            1.0,
+            estimated_drift,
+            None,
+        );
+
+        let residual_energy = |spec: &Spectrogram| -> f64 {
+            spec.complex
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|c| (c.re as f64).powi(2) + (c.im as f64).powi(2))
+                .sum()
+        };
+        let authoritative_energy = residual_energy(&spec_authoritative_zero);
+        let stale_fallback_energy = residual_energy(&spec_stale_fallback);
+
+        assert!(
+            authoritative_energy < stale_fallback_energy * 0.5,
+            "treating a genuine zero rebase shift as authoritative should leave \
+             meaningfully less residual than falling back to the stale \
+             time_refinement: authoritative={authoritative_energy}, \
+             stale_fallback={stale_fallback_energy}"
         );
     }
 
