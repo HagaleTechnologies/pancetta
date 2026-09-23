@@ -8179,7 +8179,10 @@ impl Ft8Decoder {
             // subtraction below is provably consistent with its
             // spectrogram subtraction with no fine_sync needed.
             let mut audio_anchor_start_sample = coarse_start_sample as f64;
-            let audio_anchor_frequency = base_frequency;
+            // NOT the same value as `base_frequency` used for the rotor/
+            // spectrogram basis above -- see where this is set inside the
+            // full-frame branch below for why (round 18 finding).
+            let mut audio_anchor_frequency = base_frequency;
             let mut shift_samples = 0.0f64;
 
             let Some(cs) = (if full_frame_active {
@@ -8217,6 +8220,22 @@ impl Ft8Decoder {
                 // rotor back into the basis `subtract_decode_coherent`
                 // needs (see round 17's finding on that function).
                 shift_samples = refined_start_sample - coarse_start_sample as f64;
+                // Round 18 (Codex review finding): the audio-domain
+                // cancellation (`subtract_reconstructed_signal_at_known_
+                // position`, below) fits a SINGLE constant amplitude/phase
+                // over the whole 79-symbol (12.64s) reference -- unlike
+                // the spectrogram's per-symbol rotor projection, it has no
+                // per-symbol mechanism to absorb a residual frequency
+                // error. Reconstructing at the coarse `base_frequency`
+                // when the true carrier sits `df_hz` away makes the
+                // reference's phase continuously rotate over the full
+                // frame (many full cycles for even a fraction of a Hz),
+                // driving the fitted amplitude toward zero and leaving
+                // most of the signal in `residual_audio`. Use the fine-
+                // corrected frequency here -- this is a SEPARATE anchor
+                // from `base_frequency` (which must stay coarse for the
+                // rotor/spectrogram projection above).
+                audio_anchor_frequency = base_frequency + fs_result.df_hz as f64;
                 // Round-16 review finding (Codex): `subtract_decode_coherent`
                 // projects the spectrogram at the COARSE `candidate.freq_bin/
                 // freq_sub` bins unconditionally (no fine df_hz correction) --
@@ -8309,15 +8328,20 @@ impl Ft8Decoder {
             // caller) when it's true, so this is a no-op cost-wise for
             // FT4/FT2 or the flag off regardless.
             //
-            // `audio_anchor_start_sample`/`audio_anchor_frequency` are the
-            // SAME position/frequency used for this candidate's own
-            // extraction above (fine_sync-refined when full-frame, the
-            // plain coarse position otherwise, matching what
-            // `subtract_decode_coherent` used for the spectrogram in that
-            // case) -- see `subtract_reconstructed_signal_at_known_
-            // position`'s doc for why anchoring both sides to the same
-            // already-known values, instead of independently re-deriving
-            // one from `msg`, is the point of this redesign.
+            // `audio_anchor_start_sample` is the SAME fine_sync-refined
+            // position used for this candidate's own extraction above
+            // (the plain coarse position for the Costas-only case) -- see
+            // `subtract_reconstructed_signal_at_known_position`'s doc for
+            // why anchoring the POSITION to an already-known value,
+            // instead of independently re-deriving it from `msg`, is the
+            // point of this redesign. `audio_anchor_frequency` is
+            // deliberately NOT the same value as the rotor's
+            // `base_frequency` above (round 18 finding): the time-domain
+            // cancellation's single, whole-frame amplitude/phase fit
+            // needs the fine-corrected carrier (`base_frequency + df_hz`)
+            // to avoid a continuously-rotating reference over 79 symbols,
+            // while the rotor must stay in the coarse basis to match
+            // `subtract_decode_coherent`'s own spectrogram projection.
             if ft8_full_frame_capable {
                 Self::subtract_reconstructed_signal_at_known_position(
                     residual_audio,
