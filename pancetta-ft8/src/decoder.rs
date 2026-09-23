@@ -8030,8 +8030,24 @@ impl Ft8Decoder {
             // now derotates each term using a drift estimate from the
             // known Costas positions before summing (see its doc and
             // `estimate_symbol_phase_drift_rad`).
+            // Round 16 (Codex review finding): the audio-domain residual
+            // canceller this path depends on (`subtract_signal`) is FT8-
+            // specific -- hardcoded `NUM_SYMBOLS`/`SYMBOL_DURATION` (a
+            // length mismatch makes it silently no-op for FT4's 105
+            // symbols) and, even where the length happens to check out
+            // (FT2), it synthesizes FT8's own 0.16s/6.25Hz waveform, not
+            // the calling protocol's. Making it protocol-generic is real,
+            // separate scope (`self.protocol_params`-driven symbol
+            // duration/tone spacing throughout its fine freq/time search
+            // AND its GFSK reference path) -- not something to rush
+            // under review pressure. `coherent_subtract_and_repass` is
+            // itself protocol-generic (FT4/FT2 too), so gate the whole
+            // full-frame path to FT8 specifically for now; FT4/FT2
+            // candidates fall back to the pre-existing, already protocol-
+            // generic spectrogram-based extractor, unchanged.
             let full_frame_active = self.config.coherent_subtract_full_frame_reference_enabled
-                && candidate.freq_sub == 0;
+                && candidate.freq_sub == 0
+                && pp.protocol == crate::protocol::Protocol::Ft8;
             // Round-6 review finding: `candidate.time_refinement` is a
             // normal, usually-nonzero property of real candidates that
             // the plain extractor ignores — empirically confirmed to
@@ -8131,12 +8147,25 @@ impl Ft8Decoder {
                 scale,
                 symbol_phase_drift_rad,
             );
-            // Round 16: keep the audio-domain residual in sync with the
-            // spectrogram's own residual (see `residual_audio`'s doc) --
-            // only needed while the full-frame path actually reads audio;
-            // the Costas-only path never does, so skip the extra cost
-            // when the flag is off (this ticket's default).
-            if full_frame_active {
+            // Round 16 (Codex review finding): keep the audio-domain
+            // residual in sync with the spectrogram's own residual (see
+            // `residual_audio`'s doc) for EVERY candidate whose spectrogram
+            // gets updated above -- not just `full_frame_active` ones.
+            // Gating on `full_frame_active` alone missed the case where a
+            // `freq_sub == 1` (Costas-only fallback) message is decoded
+            // BEFORE a `freq_sub == 0` (full-frame) one in the same
+            // `decoded` batch: its signal is removed from `spectrogram`
+            // but was left untouched in `residual_audio`, so the LATER
+            // full-frame candidate's fine_sync/extraction would still see
+            // it at full strength. `subtract_signal` is FT8-specific (see
+            // `full_frame_active`'s doc above), so gate on the protocol
+            // too, not just the feature flag -- `residual_audio` is only
+            // ever non-empty (see the caller) when the flag is on, but for
+            // FT4/FT2 `full_frame_active` (and this call) must both stay
+            // unconditionally off regardless of that flag.
+            if self.config.coherent_subtract_full_frame_reference_enabled
+                && pp.protocol == crate::protocol::Protocol::Ft8
+            {
                 self.subtract_signal(residual_audio, msg);
             }
             subtracted_candidates.push(candidate);
