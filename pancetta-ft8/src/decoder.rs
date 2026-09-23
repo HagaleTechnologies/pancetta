@@ -8056,6 +8056,22 @@ impl Ft8Decoder {
             // audio-anchored extractor (PAN-166 rounds 13-15); the
             // Costas-only path is untouched (byte-identical to before
             // this ticket).
+            // Round 16 (Codex review finding): `subtract_decode_coherent`'s
+            // per-substep rebasing re-references the rotor using
+            // `candidate.time_refinement` as "where, in symbol-fraction
+            // units, the rotor was actually estimated from" -- correct for
+            // the OLD spectrogram-refined extractor (whose own reference
+            // point WAS `time_step + time_refinement`), but WRONG now that
+            // the full-frame rotor is estimated at `fine_sync::refine`'s
+            // `refined_start_sample` instead, which can differ substantially
+            // from that (unreliable, see above) value. Captured here so the
+            // subtraction call below can pass a candidate carrying the
+            // EFFECTIVE fractional offset the rotor was actually measured
+            // at, not the discarded spectrogram-derived one. `time_step`/
+            // `freq_bin`/`freq_sub` (which DO drive spectrogram indexing)
+            // are deliberately left untouched -- only `time_refinement`
+            // (used purely for this phase bookkeeping) needs correcting.
+            let mut effective_time_refinement = candidate.time_refinement;
             let Some(cs) = (if full_frame_active {
                 // Round 15: `candidate.time_refinement` is NOT a reliable
                 // sample-level position (see `par_extract_complex_symbols_
@@ -8088,6 +8104,11 @@ impl Ft8Decoder {
                 let fs_result = crate::fine_sync::refine(&bb, pp);
                 let refined_start_sample = coarse_start_sample as f64
                     + fs_result.dt_samples as f64 * crate::baseband::DECIM as f64;
+                // Effective time_refinement (in the SAME time_step-fraction
+                // units candidate.time_refinement uses) for the ACTUAL
+                // position this extraction used, for subtraction's rebasing.
+                effective_time_refinement =
+                    (refined_start_sample - coarse_start_sample as f64) / subblock_size as f64;
                 // Round-16 review finding (Codex): `subtract_decode_coherent`
                 // projects the spectrogram at the COARSE `candidate.freq_bin/
                 // freq_sub` bins unconditionally (no fine df_hz correction) --
@@ -8138,10 +8159,14 @@ impl Ft8Decoder {
             } else {
                 0.0
             };
+            let subtraction_candidate = CostasCandidate {
+                time_refinement: effective_time_refinement,
+                ..candidate
+            };
             subtract_decode_coherent(
                 spectrogram,
                 pp,
-                &candidate,
+                &subtraction_candidate,
                 rotor,
                 tone_symbols,
                 scale,
