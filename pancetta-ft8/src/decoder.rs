@@ -8171,27 +8171,38 @@ impl Ft8Decoder {
             let tone_spacing = pp.tone_spacing;
             let base_frequency = candidate.freq_bin as f64 * tone_spacing
                 + candidate.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
-            // Defaults for the Costas-only (non-full-frame) case: the
-            // coarse position/frequency ARE the spectrogram's own basis,
-            // and `shift_samples == 0.0` makes `compute_full_frame_
-            // complex_accumulator_rebased_to_coarse`'s rebasing term an
-            // exact no-op -- so a Costas-only candidate's residual-audio
-            // subtraction below is provably consistent with its
-            // spectrogram subtraction with no fine_sync needed.
+            // Defaults for when `ft8_full_frame_capable` is false (FT4/FT2,
+            // or the flag off): the coarse position/frequency ARE the
+            // spectrogram's own basis, and `shift_samples == 0.0` makes
+            // `subtract_decode_coherent`'s rebasing term an exact no-op.
             let mut audio_anchor_start_sample = coarse_start_sample as f64;
             // NOT the same value as `base_frequency` used for the rotor/
-            // spectrogram basis above -- see where this is set inside the
-            // full-frame branch below for why (round 18 finding).
+            // spectrogram basis above -- see where this is set below for
+            // why (round 18 finding).
             let mut audio_anchor_frequency = base_frequency;
             let mut shift_samples = 0.0f64;
 
-            let Some(cs) = (if full_frame_active {
-                // Round 15: `candidate.time_refinement` is NOT a reliable
-                // sample-level position (see `par_extract_complex_symbols_
-                // from_audio_refined`'s doc) — get an independent, accurate
-                // one via `fine_sync::refine`'s audio-domain Costas
-                // correlation, anchored at the INTEGER `time_step` alone.
-                //
+            // Round 20 (Codex review finding): fine-sync the audio-domain
+            // cancellation anchor (`audio_anchor_start_sample`/`_frequency`)
+            // whenever `ft8_full_frame_capable`, not just when
+            // `full_frame_active` (`candidate.freq_sub == 0`). On the
+            // `freq_sub == 1` Costas-only fallback path, an off-lattice
+            // carrier can still differ from the coarse anchor by up to
+            // `tone_spacing / (2 * FREQ_OSR)` (~1.56 Hz for FT8) -- over
+            // `subtract_reconstructed_signal_at_known_position`'s single
+            // whole-79-symbol-frame least-squares fit (no per-symbol
+            // mechanism to absorb a residual frequency error, unlike the
+            // spectrogram's per-symbol rotor projection), that rotating
+            // phase drives the fitted amplitude toward zero and leaves the
+            // signal in `residual_audio` to corrupt later full-frame
+            // candidates' fine_sync/extraction. `shift_samples` (consumed
+            // by `subtract_decode_coherent`'s per-symbol rebase) stays
+            // 0.0 outside the `full_frame_active` branch below: the rotor
+            // there comes from `par_extract_complex_symbols_from_spectrogram`,
+            // already in the spectrogram's own coarse basis, so it needs no
+            // rebase regardless of what this fine-sync pass finds for the
+            // audio anchor.
+            let audio_f64_for_fine_sync = if ft8_full_frame_capable {
                 // Round 16 (Codex review finding): read the CURRENT
                 // residual, not the original window audio -- earlier
                 // messages in this same loop (and earlier rounds, via
@@ -8213,13 +8224,6 @@ impl Ft8Decoder {
                 let refined_start_sample = coarse_start_sample as f64
                     + fs_result.dt_samples as f64 * crate::baseband::DECIM as f64;
                 audio_anchor_start_sample = refined_start_sample;
-                // The constant (per candidate) sample gap between where
-                // this extraction is anchored and the spectrogram's own
-                // coarse basis -- consumed below by `compute_full_frame_
-                // complex_accumulator_rebased_to_coarse` to bring the
-                // rotor back into the basis `subtract_decode_coherent`
-                // needs (see round 17's finding on that function).
-                shift_samples = refined_start_sample - coarse_start_sample as f64;
                 // Round 18 (Codex review finding): the audio-domain
                 // cancellation (`subtract_reconstructed_signal_at_known_
                 // position`, below) fits a SINGLE constant amplitude/phase
@@ -8236,6 +8240,30 @@ impl Ft8Decoder {
                 // from `base_frequency` (which must stay coarse for the
                 // rotor/spectrogram projection above).
                 audio_anchor_frequency = base_frequency + fs_result.df_hz as f64;
+                if full_frame_active {
+                    // The constant (per candidate) sample gap between
+                    // where this extraction is anchored and the
+                    // spectrogram's own coarse basis -- consumed below by
+                    // `subtract_decode_coherent` to bring the rotor back
+                    // into the basis it projects against (see round 17/19's
+                    // findings on that function).
+                    shift_samples = refined_start_sample - coarse_start_sample as f64;
+                }
+                Some((audio_f64, refined_start_sample))
+            } else {
+                None
+            };
+
+            let Some(cs) = (if full_frame_active {
+                // Round 15: `candidate.time_refinement` is NOT a reliable
+                // sample-level position (see `par_extract_complex_symbols_
+                // from_audio_refined`'s doc) — get an independent, accurate
+                // one via `fine_sync::refine`'s audio-domain Costas
+                // correlation, anchored at the INTEGER `time_step` alone
+                // (done above, unconditionally on `ft8_full_frame_capable`).
+                let (audio_f64, refined_start_sample) = audio_f64_for_fine_sync.expect(
+                    "computed above whenever full_frame_active (implies ft8_full_frame_capable)",
+                );
                 // Round-16 review finding (Codex): `subtract_decode_coherent`
                 // projects the spectrogram at the COARSE `candidate.freq_bin/
                 // freq_sub` bins unconditionally (no fine df_hz correction) --
