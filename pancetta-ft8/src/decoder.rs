@@ -5650,6 +5650,51 @@ impl Ft8Decoder {
         }
     }
 
+    /// PAN-166 round 22 (Codex review finding): build the reference I/Q
+    /// pair `subtract_reconstructed_signal_at_known_position` cancels
+    /// against, preferring the real Gaussian-shaped GFSK waveform
+    /// (`Self::build_gfsk_iq_pair`, the same TX modulator that shaped the
+    /// actual over-the-air signal) over the rectangular-pulse CPFSK
+    /// approximation. Falls back to CPFSK when GFSK synthesis fails (e.g.
+    /// a frequency near the modulator's deviation limit) or returns fewer
+    /// samples than the full `tone_symbols.len() * sps` reference needs --
+    /// same fallback discipline as `subtract_signal`'s own GFSK path
+    /// (never leave a candidate un-subtracted just because the richer
+    /// reference wasn't available). `#[cfg(not(feature = "transmit"))]`
+    /// builds always use CPFSK: `generate_gfsk_reference`'s own doc notes
+    /// every production/decode consumer of this crate already builds with
+    /// `transmit` enabled, so this doesn't reduce subtraction quality
+    /// anywhere it currently matters.
+    #[cfg(feature = "transmit")]
+    fn reconstruction_iq_pair(
+        tone_symbols: &[u8],
+        pp: &ProtocolParams,
+        base_frequency: f64,
+        sps: usize,
+        tone_spacing: f64,
+    ) -> (Vec<f64>, Vec<f64>) {
+        let min_len = tone_symbols.len() * sps;
+        if let Some((gfsk_i, gfsk_q)) =
+            Self::build_gfsk_iq_pair(tone_symbols, pp, SAMPLE_RATE, base_frequency, 0.0)
+        {
+            if gfsk_i.len() >= min_len {
+                return (gfsk_i, gfsk_q);
+            }
+        }
+        Self::generate_cpfsk_iq(tone_symbols, base_frequency, sps, tone_spacing)
+    }
+
+    #[cfg(not(feature = "transmit"))]
+    fn reconstruction_iq_pair(
+        tone_symbols: &[u8],
+        _pp: &ProtocolParams,
+        base_frequency: f64,
+        sps: usize,
+        tone_spacing: f64,
+    ) -> (Vec<f64>, Vec<f64>) {
+        Self::generate_cpfsk_iq(tone_symbols, base_frequency, sps, tone_spacing)
+    }
+
     /// PAN-166 round 16 (Codex review, cycle reset per the round-5
     /// checkpoint -- see `coherent_subtract_and_repass`'s call site):
     /// audio-domain interference cancellation anchored EXACTLY at an
@@ -5678,14 +5723,26 @@ impl Ft8Decoder {
     /// position/frequency (protocol-generic: `sps`/`tone_spacing` are
     /// parameters, not hardcoded FT8 constants), independently fits
     /// amplitude/phase via the same 2x2 least-squares projection
-    /// `subtract_signal`'s own fallback path uses, and subtracts. No
-    /// GFSK-ramp refinement (`subtract_signal`'s optional, default-off
-    /// `time_varying_subtraction_enabled` path) -- this matches
-    /// `subtract_decode_coherent`'s own spectrogram-side ML projection,
-    /// which also has no time-domain pulse shaping.
+    /// `subtract_signal`'s own fallback path uses, and subtracts.
+    ///
+    /// PAN-166 cycle-3 round-1 review finding (round 22): unlike
+    /// `subtract_signal`'s default CPFSK path -- dead code in production
+    /// (`subtract_signal` is unreachable while `max_decode_passes` stays
+    /// at 1, per `Ft8Config::time_varying_subtraction_enabled`'s doc), so
+    /// its rectangular-pulse mismatch against the real Gaussian-shaped
+    /// GFSK transmission never actually matters -- THIS function's caller
+    /// (`coherent_subtract_and_repass`) is the active, always-reachable
+    /// full-frame coherent-subtraction path this whole ticket exists to
+    /// fix. Reconstructing abrupt CPFSK to cancel a real GFSK-shaped
+    /// signal here leaves genuine symbol-transition-dependent residual
+    /// energy behind, which can then dominate fine-sync/phase extraction
+    /// for a weaker overlapping candidate. Use the real GFSK reference
+    /// (`Self::reconstruction_iq_pair`, below) instead, matching the
+    /// modulator that actually shaped the over-the-air signal.
     fn subtract_reconstructed_signal_at_known_position(
         residual_audio: &mut [f32],
         tone_symbols: &[u8],
+        pp: &ProtocolParams,
         sps: usize,
         tone_spacing: f64,
         base_frequency: f64,
@@ -5702,7 +5759,7 @@ impl Ft8Decoder {
         }
 
         let (recon_i, recon_q) =
-            Self::generate_cpfsk_iq(tone_symbols, base_frequency, sps, tone_spacing);
+            Self::reconstruction_iq_pair(tone_symbols, pp, base_frequency, sps, tone_spacing);
 
         // Full 2x2 least-squares for amplitude and phase -- identical
         // math to `subtract_signal`'s own fallback path, just anchored
@@ -8369,6 +8426,7 @@ impl Ft8Decoder {
                 Self::subtract_reconstructed_signal_at_known_position(
                     residual_audio,
                     tone_symbols,
+                    pp,
                     sps,
                     tone_spacing,
                     audio_anchor_frequency,
