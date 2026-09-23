@@ -95,22 +95,25 @@ jobs:
   # actually replies.
   # ============================================================================================
   codex-review-request:
-    name: Codex review clean (gate before expensive downstream jobs)
-    # dependabot[bot]/draft excluded at the JOB level, not via a pass-through-to-success
-    # step: pancetta's OWN ci.yml codex-clean job independently mirrors this exact
-    # exclusion (`if: ... && github.actor != 'dependabot[bot]' && ... draft == false`), and
-    # both reporting `skipped` in tandem is what ft8-tests/workspace-check/deny's own
-    # explicit `result != 'success' && result != 'skipped'` check already tolerates.
-    # Marking this job's own check-run "success" instead (coppa's approach, which has no
-    # equivalent downstream skip-tolerant consumer) would diverge from that established,
-    # working contract for no benefit.
-    # Codex P1, this PR's own round-2 review: round-1's fix subscribed the WORKFLOW to
-    # pull_request_review/issue_comment (for codex-review-response below) -- without
-    # `github.event_name == 'pull_request_target'` explicitly required here, this producer
-    # job's `if:` also evaluated true on those SAME events (draft==false and non-dependabot
-    # hold regardless of event type), running a second, all-steps-skipped instance of THIS
-    # exact check name in parallel with codex-review-response's own real evaluation --
-    # reintroducing the duplicate-same-name-check-run ambiguity this design exists to avoid.
+    # Live-discovered, this PR's own round-5 real Codex-review event (a genuine
+    # pull_request_review from Codex triggered a real workflow run): naming this JOB the
+    # SAME as the Checks-API-managed check it upserts ("Codex review clean (gate before
+    # expensive downstream jobs)") works fine as long as this job's OWN steps always end up
+    # calling upsert_check_run -- but round-2's fix means this job now correctly
+    # JOB-LEVEL-SKIPS (not just skips its steps) for pull_request_review/issue_comment
+    # events, since BOTH jobs are evaluated every time the WORKFLOW fires for ANY
+    # subscribed event. GitHub creates a check-run for a job with `if: false` too, reported
+    # "skipped", under the JOB's OWN name -- with app.slug=github-actions and a
+    # GitHub-generated external_id, NOT the custom one upsert_check_run sets. That
+    # freshly-created "skipped" native check-run then becomes the MOST RECENT check-run
+    # named "Codex review clean...", poisoning codex-review-response's own `sort_by
+    # (.started_at) | last` lookup -- its subsequent hagale-agent-authenticated PATCH then
+    # 403s with "Invalid app_id 15368 - check run can only be modified by the GitHub App
+    # that created it" (confirmed live: run 35928199549, check-run 107408254743). Renamed
+    # this job's DISPLAY name only -- job id `codex-review-request` (used by the failsafe's
+    # `needs:`) and every managed-check-run string literal in the bash logic below are
+    # unchanged, since neither depends on this field.
+    name: Codex review request (producer)
     if: github.event_name == 'merge_group' || (github.event_name == 'pull_request_target' && github.event.pull_request.draft == false && github.actor != 'dependabot[bot]')
     runs-on: ubuntu-latest
     timeout-minutes: 5
