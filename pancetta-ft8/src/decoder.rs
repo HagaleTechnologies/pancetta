@@ -8024,8 +8024,9 @@ impl Ft8Decoder {
                 let subblock_size = pp.samples_per_symbol(SAMPLE_RATE) / TIME_OSR;
                 let coarse_start_sample =
                     candidate_offset_samples(candidate.time_step, time_padding, subblock_size);
-                let base_frequency = candidate.freq_bin as f64 * TONE_SPACING
-                    + candidate.freq_sub as f64 * (TONE_SPACING / FREQ_OSR as f64);
+                let tone_spacing = pp.tone_spacing;
+                let base_frequency = candidate.freq_bin as f64 * tone_spacing
+                    + candidate.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
                 let bb = crate::baseband::extract_candidate_baseband_with(
                     audio,
                     base_frequency,
@@ -8036,12 +8037,22 @@ impl Ft8Decoder {
                 let fs_result = crate::fine_sync::refine(&bb, pp);
                 let refined_start_sample = coarse_start_sample as f64
                     + fs_result.dt_samples as f64 * crate::baseband::DECIM as f64;
-                let refined_freq_hz = base_frequency + fs_result.df_hz as f64;
+                // Round-16 review finding (Codex): `subtract_decode_coherent`
+                // projects the spectrogram at the COARSE `candidate.freq_bin/
+                // freq_sub` bins unconditionally (no fine df_hz correction) --
+                // demodulating this extraction at `base_frequency + df_hz`
+                // instead would silently cancel exactly the phase advance
+                // `subtract_decode_coherent` still needs corrected, leaving a
+                // near-constant rotor that under-subtracts the real signal.
+                // Extract in the SAME coarse-frequency basis the subtraction
+                // step uses; `df_hz` is still consumed above by `fine_sync::
+                // refine`'s joint dt/df grid (improves `dt_samples`'
+                // accuracy) even though it isn't applied to the demod here.
                 par_extract_complex_symbols_from_audio_refined(
                     pp,
                     audio,
                     refined_start_sample,
-                    refined_freq_hz,
+                    base_frequency,
                     &self.symbol_fft,
                     &self.symbol_window,
                     audio_window_scale,
@@ -13039,6 +13050,21 @@ fn audio_to_spectrogram_window_scale(
 /// spans both the extracted symbol and the spectrogram window-start
 /// reference point, which structurally sits in the PRECEDING symbol's own
 /// second half.
+///
+/// Round 16 (Codex review finding): `symbol0_start_sample` should come
+/// from an accurate position source (e.g. `fine_sync::refine`'s `dt_
+/// samples`, converted to an audio-domain offset) -- POSITION accuracy is
+/// what this extraction structurally needs. `base_frequency`, however,
+/// must be in the SAME frequency basis the caller's downstream phase
+/// consumer uses, NOT necessarily `fine_sync::refine`'s refined `df_hz`-
+/// corrected estimate: `subtract_decode_coherent` always projects the
+/// spectrogram at the COARSE `candidate.freq_bin`/`freq_sub` bins (no
+/// fine frequency correction), so a caller feeding this extraction's
+/// output into that subtraction path must pass the coarse candidate
+/// frequency here too -- demodulating at the fine-corrected frequency
+/// instead would silently cancel exactly the `2π·df_hz·sps/Fs`-per-symbol
+/// phase advance the subtraction step still needs corrected, leaving a
+/// near-constant rotor that under-subtracts the real signal.
 #[allow(clippy::too_many_arguments)]
 fn par_extract_complex_symbols_from_audio_refined(
     pp: &ProtocolParams,
@@ -18884,14 +18910,18 @@ mod tests {
             let fs_result = crate::fine_sync::refine(&bb, &pp);
             let refined_start_sample = coarse_start_sample as f64
                 + fs_result.dt_samples as f64 * crate::baseband::DECIM as f64;
-            let refined_freq_hz = base_frequency + fs_result.df_hz as f64;
 
-            // PAN-166 rounds 13/14/15: the leakage-free, audio-anchored
+            // PAN-166 rounds 13/14/15/16: the leakage-free, audio-anchored
             // extraction, positioned via the independent fine-sync
             // refinement above, replaces the leakage-prone spectrogram-row
             // interpolation as the full-frame path's source of complex
             // symbols -- see `par_extract_complex_symbols_from_audio_
-            // refined`'s doc for the derivation.
+            // refined`'s doc for the derivation. Extracted at the COARSE
+            // `base_frequency` (matching production, round 16 review
+            // finding) -- `subtract_decode_coherent` always projects the
+            // spectrogram at the coarse candidate.freq_bin/freq_sub bins,
+            // so the drift estimate this test checks must be measured in
+            // that SAME basis, not `base_frequency + fs_result.df_hz`.
             let window_scale = audio_to_spectrogram_window_scale(
                 &decoder.spectrogram_window,
                 &decoder.symbol_window,
@@ -18900,7 +18930,7 @@ mod tests {
                 &pp,
                 &tx_f64,
                 refined_start_sample,
-                refined_freq_hz,
+                base_frequency,
                 &decoder.symbol_fft,
                 &decoder.symbol_window,
                 window_scale,
