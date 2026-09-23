@@ -646,6 +646,21 @@ pub struct Ft8Config {
     /// subtraction quality (and therefore residual/repass recall) enough
     /// to matter is unmeasured.
     ///
+    /// **Rounds 10-15 (PAN-166):** `par_extract_complex_symbols_from_
+    /// spectrogram_refined`'s 2-symbol-wide analysis window structurally
+    /// straddles neighboring, DIFFERENT-tone symbols (leakage no linear
+    /// interpolation can remove — round 10). When this flag is on, the
+    /// extractor is now `par_extract_complex_symbols_from_audio_refined`
+    /// instead: a leakage-free, single-symbol-width audio extraction,
+    /// positioned via `fine_sync::refine`'s independent audio-domain
+    /// Costas correlation rather than the spectrogram-derived `candidate.
+    /// time_refinement` (round 15 finding: that value is unreliable
+    /// whenever the true boundary sits near the midpoint between two
+    /// `time_step`s — see `Ft8Config::costas_half_loop_disabled`'s "two-
+    /// step score plateau" doc). Measured worst-case drift on a real
+    /// signal is ~0.05 rad (see `phase_drift_estimate_is_near_zero_on_a_
+    /// real_clean_signal_across_time_offsets`), down from ~0.43-0.6 rad.
+    ///
     /// Default **false**: needs its own A/B (`compare` scorecard, not
     /// this doc comment) before flipping — same discipline as every other
     /// flag in this struct that names a specific default-off tradeoff.
@@ -4442,6 +4457,19 @@ impl Ft8Decoder {
                 // `coherent_multipass_iterations` rounds still run
                 // exactly as before this task.
                 let total_rounds = self.config.coherent_multipass_iterations;
+                // PAN-166 round 16: mutable audio-domain residual for the
+                // full-frame path (see `coherent_subtract_and_repass`'s
+                // `residual_audio` doc) -- owned here, across ALL rounds,
+                // exactly like `spectrogram`. Left empty (zero allocation)
+                // when the flag is off, matching this file's byte-
+                // identical-when-disabled convention; the Costas-only
+                // path never reads it.
+                let mut residual_audio_for_full_frame: Vec<f32> =
+                    if self.config.coherent_subtract_full_frame_reference_enabled {
+                        audio.iter().map(|&s| s as f32).collect()
+                    } else {
+                        Vec::new()
+                    };
                 for round in 0..total_rounds {
                     if !current_budget.has_time() {
                         self.current_budget_report.budget_exhausted = true;
@@ -4460,6 +4488,7 @@ impl Ft8Decoder {
                         energy_stop,
                         residual_scope,
                         partner_freq_hz,
+                        &mut residual_audio_for_full_frame,
                     );
                     if extra.is_empty() {
                         self.current_budget_report.stages.push((
@@ -5075,14 +5104,19 @@ impl Ft8Decoder {
     }
 
     /// Generate CPFSK I/Q reference signals for given symbols and frequency.
-    fn generate_cpfsk_iq(symbols: &[u8], base_freq: f64, sps: usize) -> (Vec<f64>, Vec<f64>) {
+    fn generate_cpfsk_iq(
+        symbols: &[u8],
+        base_freq: f64,
+        sps: usize,
+        tone_spacing: f64,
+    ) -> (Vec<f64>, Vec<f64>) {
         use std::f64::consts::PI;
         let total_len = symbols.len() * sps;
         let mut recon_i = vec![0.0f64; total_len];
         let mut recon_q = vec![0.0f64; total_len];
         let mut phase = 0.0f64;
         for (sym_idx, &sym) in symbols.iter().enumerate() {
-            let freq = base_freq + sym as f64 * TONE_SPACING;
+            let freq = base_freq + sym as f64 * tone_spacing;
             let omega = 2.0 * PI * freq / SAMPLE_RATE as f64;
             let start = sym_idx * sps;
             for i in 0..sps {
@@ -5616,6 +5650,161 @@ impl Ft8Decoder {
         }
     }
 
+    /// PAN-166 round 22 (Codex review finding): build the reference I/Q
+    /// pair `subtract_reconstructed_signal_at_known_position` cancels
+    /// against, preferring the real Gaussian-shaped GFSK waveform
+    /// (`Self::build_gfsk_iq_pair`, the same TX modulator that shaped the
+    /// actual over-the-air signal) over the rectangular-pulse CPFSK
+    /// approximation. Falls back to CPFSK when GFSK synthesis fails (e.g.
+    /// a frequency near the modulator's deviation limit) or returns fewer
+    /// samples than the full `tone_symbols.len() * sps` reference needs --
+    /// same fallback discipline as `subtract_signal`'s own GFSK path
+    /// (never leave a candidate un-subtracted just because the richer
+    /// reference wasn't available). `#[cfg(not(feature = "transmit"))]`
+    /// builds always use CPFSK: `generate_gfsk_reference`'s own doc notes
+    /// every production/decode consumer of this crate already builds with
+    /// `transmit` enabled, so this doesn't reduce subtraction quality
+    /// anywhere it currently matters.
+    #[cfg(feature = "transmit")]
+    fn reconstruction_iq_pair(
+        tone_symbols: &[u8],
+        pp: &ProtocolParams,
+        base_frequency: f64,
+        sps: usize,
+        tone_spacing: f64,
+    ) -> (Vec<f64>, Vec<f64>) {
+        let min_len = tone_symbols.len() * sps;
+        if let Some((gfsk_i, gfsk_q)) =
+            Self::build_gfsk_iq_pair(tone_symbols, pp, SAMPLE_RATE, base_frequency, 0.0)
+        {
+            if gfsk_i.len() >= min_len {
+                return (gfsk_i, gfsk_q);
+            }
+        }
+        Self::generate_cpfsk_iq(tone_symbols, base_frequency, sps, tone_spacing)
+    }
+
+    #[cfg(not(feature = "transmit"))]
+    fn reconstruction_iq_pair(
+        tone_symbols: &[u8],
+        _pp: &ProtocolParams,
+        base_frequency: f64,
+        sps: usize,
+        tone_spacing: f64,
+    ) -> (Vec<f64>, Vec<f64>) {
+        Self::generate_cpfsk_iq(tone_symbols, base_frequency, sps, tone_spacing)
+    }
+
+    /// PAN-166 round 16 (Codex review, cycle reset per the round-5
+    /// checkpoint -- see `coherent_subtract_and_repass`'s call site):
+    /// audio-domain interference cancellation anchored EXACTLY at an
+    /// already-known position and frequency, with no independent search.
+    ///
+    /// `subtract_signal` (below) is designed for a caller that has ONLY a
+    /// `DecodedMessage`'s own nominal `frequency_offset`/`time_offset` and
+    /// needs to independently re-derive where the signal actually sits
+    /// (±1.5 Hz / ±480 samples). Reusing it for the full-frame path
+    /// produced a whole family of review findings across five rounds --
+    /// wrong frequency basis, wrong tone spacing, stale residual, wrong
+    /// protocol gate, wrong subtraction reference point, and finally a
+    /// refined-candidate anchor that can fall outside `subtract_signal`'s
+    /// own search range entirely (three-stage sync cascade can move the
+    /// true position by up to ±1920 samples / ±3.125 Hz) -- because every
+    /// fix patched the AUDIO side to match ONE more aspect of what the
+    /// SPECTROGRAM side already used, instead of making both sides
+    /// provably use the SAME position/frequency by construction.
+    ///
+    /// This function is the fix for that root cause, not another patch:
+    /// the caller (`coherent_subtract_and_repass`) already knows the
+    /// EXACT position (`fine_sync::refine`'s `refined_start_sample`) and
+    /// frequency (the coarse `base_frequency` the spectrogram subtraction
+    /// itself uses) its extraction was anchored to -- there is nothing
+    /// left to search for. Reconstructs the signal directly at that
+    /// position/frequency (protocol-generic: `sps`/`tone_spacing` are
+    /// parameters, not hardcoded FT8 constants), independently fits
+    /// amplitude/phase via the same 2x2 least-squares projection
+    /// `subtract_signal`'s own fallback path uses, and subtracts.
+    ///
+    /// PAN-166 cycle-3 round-1 review finding (round 22): unlike
+    /// `subtract_signal`'s default CPFSK path -- dead code in production
+    /// (`subtract_signal` is unreachable while `max_decode_passes` stays
+    /// at 1, per `Ft8Config::time_varying_subtraction_enabled`'s doc), so
+    /// its rectangular-pulse mismatch against the real Gaussian-shaped
+    /// GFSK transmission never actually matters -- THIS function's caller
+    /// (`coherent_subtract_and_repass`) is the active, always-reachable
+    /// full-frame coherent-subtraction path this whole ticket exists to
+    /// fix. Reconstructing abrupt CPFSK to cancel a real GFSK-shaped
+    /// signal here leaves genuine symbol-transition-dependent residual
+    /// energy behind, which can then dominate fine-sync/phase extraction
+    /// for a weaker overlapping candidate. Use the real GFSK reference
+    /// (`Self::reconstruction_iq_pair`, below) instead, matching the
+    /// modulator that actually shaped the over-the-air signal.
+    fn subtract_reconstructed_signal_at_known_position(
+        residual_audio: &mut [f32],
+        tone_symbols: &[u8],
+        pp: &ProtocolParams,
+        sps: usize,
+        tone_spacing: f64,
+        base_frequency: f64,
+        symbol0_start_sample: f64,
+    ) {
+        let total_len = tone_symbols.len() * sps;
+        let start_signed = symbol0_start_sample.round() as isize;
+        let recon_start = start_signed.max(0) as usize;
+        let recon_offset = (recon_start as isize - start_signed) as usize;
+        let signal_len = (total_len.saturating_sub(recon_offset))
+            .min(residual_audio.len().saturating_sub(recon_start));
+        if signal_len == 0 {
+            return;
+        }
+
+        let (recon_i, recon_q) =
+            Self::reconstruction_iq_pair(tone_symbols, pp, base_frequency, sps, tone_spacing);
+
+        // Full 2x2 least-squares for amplitude and phase -- identical
+        // math to `subtract_signal`'s own fallback path, just anchored
+        // directly here rather than at a fine-search result.
+        let mut dot_ai = 0.0f64;
+        let mut dot_aq = 0.0f64;
+        let mut dot_ii = 0.0f64;
+        let mut dot_qq = 0.0f64;
+        let mut dot_iq = 0.0f64;
+        for i in 0..signal_len {
+            let a = residual_audio[recon_start + i] as f64;
+            let ri = recon_i[recon_offset + i];
+            let rq = recon_q[recon_offset + i];
+            dot_ai += a * ri;
+            dot_aq += a * rq;
+            dot_ii += ri * ri;
+            dot_qq += rq * rq;
+            dot_iq += ri * rq;
+        }
+
+        let det = dot_ii * dot_qq - dot_iq * dot_iq;
+        let (amp_i, amp_q) = if det.abs() > 1e-12 {
+            let ai = (dot_ai * dot_qq - dot_aq * dot_iq) / det;
+            let aq = (dot_aq * dot_ii - dot_ai * dot_iq) / det;
+            (ai, aq)
+        } else {
+            (0.0, 0.0)
+        };
+
+        let total_amp = (amp_i * amp_i + amp_q * amp_q).sqrt();
+        let max_amp = 3.0;
+        let (amp_i, amp_q) = if total_amp > max_amp {
+            let s = max_amp / total_amp;
+            (amp_i * s, amp_q * s)
+        } else {
+            (amp_i, amp_q)
+        };
+
+        let scale = 0.9;
+        for i in 0..signal_len {
+            let subtracted = amp_i * recon_i[recon_offset + i] + amp_q * recon_q[recon_offset + i];
+            residual_audio[recon_start + i] -= (subtracted * scale) as f32;
+        }
+    }
+
     /// Subtract a decoded signal from the audio buffer (time-domain interference cancellation).
     ///
     /// Uses the tone symbols stored in the DecodedMessage to reconstruct the signal
@@ -5654,7 +5843,7 @@ impl Ft8Decoder {
             if ramp_enabled {
                 Self::generate_cpfsk_iq_ramped(sym, freq, sps, ramp_samples)
             } else {
-                Self::generate_cpfsk_iq(sym, freq, sps)
+                Self::generate_cpfsk_iq(sym, freq, sps, TONE_SPACING)
             }
         };
 
@@ -5854,7 +6043,8 @@ impl Ft8Decoder {
                 continue;
             }
 
-            let (recon_i, recon_q) = Self::generate_cpfsk_iq(symbols, shifted_freq, sps);
+            let (recon_i, recon_q) =
+                Self::generate_cpfsk_iq(symbols, shifted_freq, sps, TONE_SPACING);
             let recon_start = nominal_time.max(0) as usize;
             let recon_offset = (recon_start as isize - nominal_time) as usize;
             let signal_len = (total_len.saturating_sub(recon_offset))
@@ -7921,12 +8111,31 @@ impl Ft8Decoder {
         // hb-230: partner audio freq for the relaxed-threshold branch on
         // the residual sync sweep. `None` keeps the historical behaviour.
         partner_freq_hz: Option<f64>,
+        // PAN-166 round 15/16: mutable audio-domain residual, needed by
+        // the full-frame path's leakage-free audio-anchored extraction
+        // (and the `fine_sync::refine` position refinement it depends
+        // on) — see `par_extract_complex_symbols_from_audio_refined`'s
+        // doc. Round 16 (Codex review finding): earlier rounds' (and
+        // earlier messages in THIS round's) decoded signals must
+        // already be subtracted out of this buffer by the time a later
+        // message's fine_sync/extraction reads it, or a still-present
+        // strong signal corrupts the very masked-signal case multipass
+        // exists to recover — mirrors `spectrogram`'s own in-place
+        // residual mutation via `subtract_decode_coherent`, using the
+        // existing `subtract_signal` time-domain canceller (same
+        // mechanism the legacy per-pass residual loop already uses on
+        // `residual_samples`) instead of inventing a new one. Owned by
+        // the caller so it persists correctly across the caller's own
+        // multi-round loop, exactly like `spectrogram`.
+        residual_audio: &mut [f32],
     ) -> Vec<DecodedMessage> {
         if self.config.coherent_multipass_iterations == 0 || spectrogram.complex.is_none() {
             return Vec::new();
         }
         let pp = &self.protocol_params;
         let time_padding = spectrogram.time_padding;
+        let audio_window_scale =
+            audio_to_spectrogram_window_scale(&self.spectrogram_window, &self.symbol_window);
 
         // Step 1: subtract each decoded signal's coherent contribution.
         let mut subtracted_candidates: Vec<CostasCandidate> = Vec::new();
@@ -7982,21 +8191,181 @@ impl Ft8Decoder {
             // now derotates each term using a drift estimate from the
             // known Costas positions before summing (see its doc and
             // `estimate_symbol_phase_drift_rad`).
-            let full_frame_active = self.config.coherent_subtract_full_frame_reference_enabled
-                && candidate.freq_sub == 0;
-            // Round-6 review finding: `candidate.time_refinement` is a
-            // normal, usually-nonzero property of real candidates that
-            // the plain extractor ignores — empirically confirmed to
-            // flip the drift estimate between ~0 and ~1.6 rad depending
-            // only on its sign. Full-frame path uses the fractional-
-            // time-aware extractor; the Costas-only path is untouched
-            // (byte-identical to before this ticket).
+            // PAN-166 round 16: this whole block (through the residual-
+            // audio subtraction below) was redesigned after 5 review
+            // rounds each found a NEW bug in the audio-domain side using
+            // a DIFFERENT position/frequency/protocol convention than the
+            // spectrogram side (wrong frequency basis, wrong tone
+            // spacing, stale residual, wrong protocol gate, wrong
+            // subtraction reference point, refined-candidate anchor
+            // outside the old canceller's own search range) -- the
+            // pattern itself, not any single finding, meant the fix
+            // needed to change: `audio_anchor_start_sample`/
+            // `audio_anchor_frequency` below are now computed ONCE and
+            // used for BOTH this candidate's extraction (when full-frame)
+            // and its residual-audio subtraction, so the two can no
+            // longer diverge by construction.
+            //
+            // `subtract_signal`/`generate_cpfsk_iq` are FT8-specific
+            // (hardcoded `NUM_SYMBOLS`/`SYMBOL_DURATION`/`TONE_SPACING` in
+            // various places) -- protocol-genericizing them is real,
+            // separate scope, not something to rush under review
+            // pressure. `coherent_subtract_and_repass` is itself
+            // protocol-generic (FT4/FT2 too), so gate the whole full-
+            // frame path AND the residual-audio tracking to FT8
+            // specifically for now; FT4/FT2 candidates fall back to the
+            // pre-existing, already protocol-generic spectrogram-based
+            // extractor, unchanged, and never touch `residual_audio`
+            // (always empty for them -- see the caller).
+            let ft8_full_frame_capable = self.config.coherent_subtract_full_frame_reference_enabled
+                && pp.protocol == crate::protocol::Protocol::Ft8;
+            let full_frame_active = ft8_full_frame_capable && candidate.freq_sub == 0;
+
+            let sps = pp.samples_per_symbol(SAMPLE_RATE);
+            let subblock_size = sps / TIME_OSR;
+            let coarse_start_sample =
+                candidate_offset_samples(candidate.time_step, time_padding, subblock_size);
+            let tone_spacing = pp.tone_spacing;
+            let base_frequency = candidate.freq_bin as f64 * tone_spacing
+                + candidate.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
+            // Defaults for when `ft8_full_frame_capable` is false (FT4/FT2,
+            // or the flag off): the coarse position/frequency ARE the
+            // spectrogram's own basis, and `shift_samples == 0.0` makes
+            // `subtract_decode_coherent`'s rebasing term an exact no-op.
+            let mut audio_anchor_start_sample = coarse_start_sample as f64;
+            // NOT the same value as `base_frequency` used for the rotor/
+            // spectrogram basis above -- see where this is set below for
+            // why (round 18 finding).
+            let mut audio_anchor_frequency = base_frequency;
+            let mut shift_samples = 0.0f64;
+
+            // Round 20 (Codex review finding): fine-sync the audio-domain
+            // cancellation anchor (`audio_anchor_start_sample`/`_frequency`)
+            // whenever `ft8_full_frame_capable`, not just when
+            // `full_frame_active` (`candidate.freq_sub == 0`). On the
+            // `freq_sub == 1` Costas-only fallback path, an off-lattice
+            // carrier can still differ from the coarse anchor by up to
+            // `tone_spacing / (2 * FREQ_OSR)` (~1.56 Hz for FT8) -- over
+            // `subtract_reconstructed_signal_at_known_position`'s single
+            // whole-79-symbol-frame least-squares fit (no per-symbol
+            // mechanism to absorb a residual frequency error, unlike the
+            // spectrogram's per-symbol rotor projection), that rotating
+            // phase drives the fitted amplitude toward zero and leaves the
+            // signal in `residual_audio` to corrupt later full-frame
+            // candidates' fine_sync/extraction. `shift_samples` (consumed
+            // by `subtract_decode_coherent`'s per-symbol rebase) stays
+            // 0.0 outside the `full_frame_active` branch below: the rotor
+            // there comes from `par_extract_complex_symbols_from_spectrogram`,
+            // already in the spectrogram's own coarse basis, so it needs no
+            // rebase regardless of what this fine-sync pass finds for the
+            // audio anchor.
+            let audio_f64_for_fine_sync = if ft8_full_frame_capable {
+                // Round 16 (Codex review finding): read the CURRENT
+                // residual, not the original window audio -- earlier
+                // messages in this same loop (and earlier rounds, via
+                // the caller's persistent `residual_audio`) have already
+                // had their coherent contribution subtracted out below;
+                // skipping this would let an already-decoded, still-
+                // present strong signal corrupt fine_sync's correlation
+                // and this extraction's phase measurement for exactly
+                // the masked-signal case multipass exists to recover.
+                let audio_f64: Vec<f64> = residual_audio.iter().map(|&s| s as f64).collect();
+                let bb = crate::baseband::extract_candidate_baseband_with(
+                    &audio_f64,
+                    base_frequency,
+                    coarse_start_sample,
+                    pp,
+                    &self.baseband_taps,
+                );
+                let fs_result = crate::fine_sync::refine(&bb, pp);
+                let refined_start_sample = coarse_start_sample as f64
+                    + fs_result.dt_samples as f64 * crate::baseband::DECIM as f64;
+                audio_anchor_start_sample = refined_start_sample;
+                // Round 18 (Codex review finding): the audio-domain
+                // cancellation (`subtract_reconstructed_signal_at_known_
+                // position`, below) fits a SINGLE constant amplitude/phase
+                // over the whole 79-symbol (12.64s) reference -- unlike
+                // the spectrogram's per-symbol rotor projection, it has no
+                // per-symbol mechanism to absorb a residual frequency
+                // error. Reconstructing at the coarse `base_frequency`
+                // when the true carrier sits `df_hz` away makes the
+                // reference's phase continuously rotate over the full
+                // frame (many full cycles for even a fraction of a Hz),
+                // driving the fitted amplitude toward zero and leaving
+                // most of the signal in `residual_audio`. Use the fine-
+                // corrected frequency here -- this is a SEPARATE anchor
+                // from `base_frequency` (which must stay coarse for the
+                // rotor/spectrogram projection above).
+                audio_anchor_frequency = base_frequency + fs_result.df_hz as f64;
+                if full_frame_active {
+                    // The constant (per candidate) sample gap between
+                    // where this extraction is anchored and the
+                    // spectrogram's own coarse basis -- consumed below by
+                    // `subtract_decode_coherent` to bring the rotor back
+                    // into the basis it projects against (see round 17/19's
+                    // findings on that function).
+                    shift_samples = refined_start_sample - coarse_start_sample as f64;
+                }
+                Some((audio_f64, refined_start_sample))
+            } else {
+                None
+            };
+
             let Some(cs) = (if full_frame_active {
-                par_extract_complex_symbols_from_spectrogram_refined(pp, spectrogram, &candidate)
+                // Round 15: `candidate.time_refinement` is NOT a reliable
+                // sample-level position (see `par_extract_complex_symbols_
+                // from_audio_refined`'s doc) — get an independent, accurate
+                // one via `fine_sync::refine`'s audio-domain Costas
+                // correlation, anchored at the INTEGER `time_step` alone
+                // (done above, unconditionally on `ft8_full_frame_capable`).
+                let (audio_f64, refined_start_sample) = audio_f64_for_fine_sync.expect(
+                    "computed above whenever full_frame_active (implies ft8_full_frame_capable)",
+                );
+                // Round-16 review finding (Codex): `subtract_decode_coherent`
+                // projects the spectrogram at the COARSE `candidate.freq_bin/
+                // freq_sub` bins unconditionally (no fine df_hz correction) --
+                // demodulating this extraction at `base_frequency + df_hz`
+                // instead would silently cancel exactly the phase advance
+                // `subtract_decode_coherent` still needs corrected, leaving a
+                // near-constant rotor that under-subtracts the real signal.
+                // Extract in the SAME coarse-frequency basis the subtraction
+                // step uses; `df_hz` is still consumed above by `fine_sync::
+                // refine`'s joint dt/df grid (improves `dt_samples`'
+                // accuracy) even though it isn't applied to the demod here.
+                par_extract_complex_symbols_from_audio_refined(
+                    pp,
+                    &audio_f64,
+                    refined_start_sample,
+                    base_frequency,
+                    &self.symbol_fft,
+                    &self.symbol_window,
+                    audio_window_scale,
+                )
             } else {
                 par_extract_complex_symbols_from_spectrogram(pp, spectrogram, &candidate)
             }) else {
                 continue;
+            };
+            // PAN-153 round-3 review finding: the rotor below is
+            // derotated to a symbol-0 reference (when `full_frame_active`),
+            // so subtraction must apply the SAME drift back, per symbol,
+            // or the constant `rotor` only correctly represents symbol
+            // 0's phase and leaves a growing residual at later symbols.
+            //
+            // Round 19 (Codex review finding): `rotor` stays in `cs`'s own
+            // (fine-sync-refined, when full-frame) basis -- an earlier
+            // attempt to rebase it into the spectrogram's coarse basis
+            // HERE, before deriving `rotor`, collapsed a genuinely PER-
+            // TONE correction into one scalar, which `subtract_decode_
+            // coherent`'s per-symbol projection can't undo per symbol.
+            // `subtract_decode_coherent` now applies that same per-tone
+            // rebase itself, per symbol, during projection instead (see
+            // its `rebase_frequency_hz`/`rebase_shift_samples` params'
+            // doc) -- exactly how it already applies `tone_parity_sign`.
+            let symbol_phase_drift_rad = if full_frame_active {
+                estimate_symbol_phase_drift_rad(pp, &cs)
+            } else {
+                0.0
             };
             let acc = if full_frame_active {
                 compute_full_frame_complex_accumulator(pp, &cs, tone_symbols)
@@ -8013,16 +8382,13 @@ impl Ft8Decoder {
             } else {
                 1.0
             };
-            // PAN-153 round-3 review finding: the rotor above was
-            // derotated to a symbol-0 reference (when `full_frame_active`),
-            // so subtraction must apply the SAME drift back, per symbol,
-            // or the constant `rotor` only correctly represents symbol
-            // 0's phase and leaves a growing residual at later symbols.
-            let symbol_phase_drift_rad = if full_frame_active {
-                estimate_symbol_phase_drift_rad(pp, &cs)
-            } else {
-                0.0
-            };
+            // Round 23 (Codex review finding): `Some` only when this
+            // candidate actually used the fine-sync-refined basis
+            // (`full_frame_active`) -- NOT merely `shift_samples != 0.0`,
+            // which would wrongly read as `None` for the rare full-frame
+            // candidate fine_sync finds exactly on-grid (see
+            // `subtract_decode_coherent`'s param doc).
+            let rebase = full_frame_active.then_some((base_frequency, shift_samples));
             subtract_decode_coherent(
                 spectrogram,
                 pp,
@@ -8031,7 +8397,48 @@ impl Ft8Decoder {
                 tone_symbols,
                 scale,
                 symbol_phase_drift_rad,
+                rebase,
             );
+            // Round 16 (Codex review finding): keep the audio-domain
+            // residual in sync with the spectrogram's own residual (see
+            // `residual_audio`'s doc) for EVERY candidate whose spectrogram
+            // gets updated above -- not just `full_frame_active` ones.
+            // Gating on `full_frame_active` alone missed the case where a
+            // `freq_sub == 1` (Costas-only fallback) message is decoded
+            // BEFORE a `freq_sub == 0` (full-frame) one in the same
+            // `decoded` batch: its signal is removed from `spectrogram`
+            // but was left untouched in `residual_audio`, so the LATER
+            // full-frame candidate's fine_sync/extraction would still see
+            // it at full strength. `ft8_full_frame_capable` covers both
+            // cases; `residual_audio` is only ever non-empty (see the
+            // caller) when it's true, so this is a no-op cost-wise for
+            // FT4/FT2 or the flag off regardless.
+            //
+            // `audio_anchor_start_sample` is the SAME fine_sync-refined
+            // position used for this candidate's own extraction above
+            // (the plain coarse position for the Costas-only case) -- see
+            // `subtract_reconstructed_signal_at_known_position`'s doc for
+            // why anchoring the POSITION to an already-known value,
+            // instead of independently re-deriving it from `msg`, is the
+            // point of this redesign. `audio_anchor_frequency` is
+            // deliberately NOT the same value as the rotor's
+            // `base_frequency` above (round 18 finding): the time-domain
+            // cancellation's single, whole-frame amplitude/phase fit
+            // needs the fine-corrected carrier (`base_frequency + df_hz`)
+            // to avoid a continuously-rotating reference over 79 symbols,
+            // while the rotor must stay in the coarse basis to match
+            // `subtract_decode_coherent`'s own spectrogram projection.
+            if ft8_full_frame_capable {
+                Self::subtract_reconstructed_signal_at_known_position(
+                    residual_audio,
+                    tone_symbols,
+                    pp,
+                    sps,
+                    tone_spacing,
+                    audio_anchor_frequency,
+                    audio_anchor_start_sample,
+                );
+            }
             subtracted_candidates.push(candidate);
         }
         if subtracted_candidates.is_empty() {
@@ -12437,6 +12844,40 @@ fn subtract_decode_coherent(
     // no-op, skipped entirely rather than multiplying by
     // `exp(j*0*s) == 1` — byte-identical to not having this parameter.
     symbol_phase_drift_rad: f64,
+    // PAN-166 round 19 (Codex review finding): `rotor` (from the full-
+    // frame path) is referenced to the audio extraction's fine-sync-
+    // refined position, but this function always projects against the
+    // spectrogram's COARSE, integer-row basis. The two bases differ by a
+    // PER-TONE phase term -- `exp(-j*2*pi*rebase_shift_samples*
+    // (rebase_frequency_hz/Fs + tone/sps))` -- that varies by which tone
+    // EACH symbol happens to carry, not by symbol index, so (unlike
+    // `symbol_phase_drift_rad`) it cannot be baked into a single scalar
+    // `rotor` upstream -- an earlier attempt to do exactly that
+    // (averaging the per-tone corrections into the accumulator before
+    // computing `rotor`) collapsed the tone-specific information the
+    // per-SYMBOL projection below still needs. Applying it HERE, per
+    // symbol, mirrors how `tone_parity_sign(tone)` below is already
+    // applied per symbol rather than baked into `rotor` once.
+    //
+    // PAN-166 round 23 (Codex review finding, cycle 3 round 2): this used
+    // to be two plain `f64` params with `rebase_shift_samples == 0.0`
+    // overloaded to mean BOTH "not applicable" (every non-full-frame
+    // caller) AND "applicable, and the fine-sync offset happens to be
+    // exactly zero" (a full-frame candidate whose true position lands
+    // exactly on the coarse grid) -- genuinely rare, but not impossible,
+    // and when it happened the zero-sentinel silently fell back to the
+    // stale `candidate.time_refinement` instead of the correct authoritative
+    // zero, reintroducing the exact reference-point-disagreement bug the
+    // round-5 checkpoint redesign (see the doc below) existed to
+    // eliminate. `Option<(f64, f64)>` makes the two cases distinguishable
+    // at the type level instead of by convention: `None` (every non-full-
+    // frame caller) means "use `candidate.time_refinement`, this
+    // function's original reference"; `Some((rebase_frequency_hz,
+    // rebase_shift_samples))` (any full-frame candidate, regardless of
+    // whether the fine-sync offset it found is nonzero) means "use THIS
+    // value, always" -- ignoring `candidate.time_refinement` even when
+    // `rebase_shift_samples` is exactly `0.0`.
+    rebase: Option<(f64, f64)>,
 ) {
     if spectrogram.complex.is_none() {
         return;
@@ -12483,26 +12924,69 @@ fn subtract_decode_coherent(
                 rotor
             } else {
                 // Round-9 review finding: `rotor` was estimated from
-                // samples interpolated at the FRACTIONAL extraction
-                // position `t0 + candidate.time_refinement` (the
-                // refined extractor's own reference — see
-                // `par_extract_complex_symbols_from_spectrogram_
-                // refined`), not the integer row `t0`. Treating the raw
-                // row read here (at the plain integer `t_idx`) as
-                // though `frac_symbol == 0` coincided with `t0` ignores
-                // that shift, leaving every symbol's projection
-                // displaced by `symbol_phase_drift_rad *
-                // time_refinement / steps_per_symbol`. Subtract the
-                // refinement (in the same symbol-fraction units) to
-                // re-reference the rotor to where it was actually
-                // estimated. `time_refinement == 0.0` (every
-                // pre-existing caller, and any full-frame candidate the
-                // sync search happened to land exactly on-grid) makes
-                // this an exact no-op.
+                // samples interpolated at some FRACTIONAL extraction
+                // position, not the integer row `t0`. Treating the raw
+                // row read here (at the plain integer `t_idx`) as though
+                // `frac_symbol == 0` coincided with `t0` ignores that
+                // shift, leaving every symbol's projection displaced by
+                // `symbol_phase_drift_rad * reference_offset_substeps /
+                // steps_per_symbol`. Subtract the reference offset (in
+                // the same symbol-fraction units) to re-reference the
+                // rotor to where it was actually estimated.
+                //
+                // PAN-166 cycle-2 round-5 checkpoint redesign (5
+                // consecutive review rounds each found a new bug in this
+                // full-frame ↔ coarse-basis reconciliation, rounds 17-21 —
+                // convergence-policy.md's mandatory round-5 checkpoint):
+                // this function had TWO disagreeing notions of "where is
+                // rotor's own reference point" -- `candidate.
+                // time_refinement` (the OLD, PAN-166-documented-unreliable
+                // Costas-search refinement) used ONLY here, versus the
+                // rebase offset (the NEW, fine-sync-derived, accurate
+                // offset) used only by the per-tone rebase below. On the
+                // full-frame path `rotor` is estimated at the fine-sync
+                // position, so using `candidate.time_refinement` here left
+                // a residual `symbol_phase_drift_rad *
+                // (shift_samples/subblock_size - candidate.time_refinement)`
+                // phase error whenever the two disagreed -- collapse to
+                // ONE authoritative source: whenever `rebase` is `Some`
+                // (round 23: regardless of whether its shift happens to be
+                // exactly zero -- see this function's param doc), it alone
+                // determines the reference offset, converted from samples
+                // to substep units. Only `None` (every non-full-frame
+                // caller) falls back to `candidate.time_refinement`.
+                let reference_offset_substeps = if let Some((_, rebase_shift_samples)) = rebase {
+                    let sps = pp.samples_per_symbol(SAMPLE_RATE);
+                    let subblock_size = sps as f64 / steps_per_symbol as f64;
+                    rebase_shift_samples / subblock_size
+                } else {
+                    candidate.time_refinement
+                };
                 let frac_symbol = sym_idx as f64
-                    + (s as f64 - candidate.time_refinement) / steps_per_symbol as f64;
+                    + (s as f64 - reference_offset_substeps) / steps_per_symbol as f64;
                 rotor * Complex::from_polar(1.0, symbol_phase_drift_rad * frac_symbol)
             };
+            // Round 19: per-symbol, per-TONE rebase from the audio
+            // extraction's fine-sync basis to this projection's coarse
+            // basis -- see this function's doc for why it must be applied
+            // HERE, per symbol, rather than folded into `rotor` upstream.
+            // `Some((_, 0.0))` (round 23: a full-frame candidate fine_sync
+            // found exactly on-grid) naturally reduces to the identity
+            // rotor via the formula itself (`exp(-j*0) == 1`), so no
+            // separate zero-shift branch is needed here.
+            let rebase_to_coarse = match rebase {
+                Some((rebase_frequency_hz, rebase_shift_samples)) => {
+                    let pi2 = 2.0 * std::f64::consts::PI;
+                    let sps = pp.samples_per_symbol(SAMPLE_RATE);
+                    Complex::from_polar(
+                        1.0,
+                        -pi2 * rebase_shift_samples
+                            * (rebase_frequency_hz / SAMPLE_RATE as f64 + tone as f64 / sps as f64),
+                    )
+                }
+                None => Complex::new(1.0, 0.0),
+            };
+            let effective_rotor = effective_rotor * rebase_to_coarse;
             let effective_rotor_conj = effective_rotor.conj();
             // Scoped &mut to spectrogram.complex; ends before .power access.
             //
@@ -12897,6 +13381,178 @@ fn par_extract_complex_symbols_from_spectrogram_refined(
             let lo = read_complex(lo_idx, freq_bin);
             let hi = read_complex(hi_idx, freq_bin);
             row[tone] = lo * (1.0 - frac) + hi * frac;
+        }
+        out.push(row);
+    }
+    Some(out)
+}
+
+/// Precompute the real, positive scale factor needed to put
+/// [`par_extract_complex_symbols_from_audio_refined`]'s output into the
+/// same magnitude convention as [`par_extract_complex_symbols_from_spectrogram`]'s
+/// raw bins: `compute_spectrogram_with`'s window bakes in a `2.0/nfft`
+/// unit-window-sum normalization (ft8_lib's `fft_norm` convention) that
+/// `extract_symbols_complex`'s plain, unnormalized Hann `symbol_window`
+/// doesn't. Purely a magnitude factor -- unrelated to either basis-
+/// conversion phase term below -- computed once per decoder (both
+/// windows are fixed at construction) rather than per candidate/symbol.
+fn audio_to_spectrogram_window_scale(
+    spectrogram_window: &[SpecScalar],
+    symbol_window: &[f64],
+) -> f64 {
+    let spec_window_sum: f64 = spectrogram_window.iter().map(|&w| w as f64).sum();
+    let symbol_window_sum: f64 = symbol_window.iter().sum();
+    spec_window_sum / symbol_window_sum
+}
+
+/// PAN-166 rounds 13/14: audio-anchored, leakage-free sibling of
+/// [`par_extract_complex_symbols_from_spectrogram_refined`]. That
+/// function linearly interpolates between two neighboring INTEGER-
+/// `time_step` spectrogram rows to approximate `candidate.
+/// time_refinement`'s fractional offset -- but each row individually is
+/// already leakage-contaminated (`compute_spectrogram_with`'s analysis
+/// window spans 2 symbol periods, so a row generally straddles 2-3
+/// DIFFERENT tones), and no linear combination of two such rows can
+/// remove that (round 10's finding; round 12 confirmed the leakage-free
+/// single-symbol-width alternative is architecturally sound but got the
+/// basis-conversion formula wrong).
+///
+/// This extracts each symbol independently from raw audio (mirroring
+/// `extract_symbols_complex`'s existing demodulate + per-symbol-FFT
+/// approach, generalized to arbitrary sub-sample anchoring), which
+/// structurally cannot straddle a neighbor symbol's DIFFERENT tone the
+/// way the wide spectrogram window does. The candidate's continuous
+/// ideal sample offset (`time_step + time_refinement`, converted to
+/// samples via `candidate_offset_samples`'s formula evaluated at a
+/// real-valued time_step) is rounded to the nearest INTEGER SAMPLE, not
+/// the nearest spectrogram ROW -- bounding the rounding residual to
+/// `[-0.5, +0.5]` samples out of `sps` (~1920), not `[-0.5, +0.5]` ROWS
+/// (up to `sps/4` samples) like the interpolation approach. That
+/// residual is corrected via the DFT time-shift identity (exact for an
+/// isolated tone, per round 10), and the result is converted into the
+/// SAME basis `par_extract_complex_symbols_from_spectrogram`'s raw
+/// output uses (so `estimate_symbol_phase_drift_rad` /
+/// `compute_full_frame_complex_accumulator`'s unconditional
+/// `tone_parity_sign(tone)` multiply -- itself a correction for the
+/// SPECTROGRAM path's own bin-selection artifact, round 5 -- still
+/// applies correctly).
+///
+/// Derivation and validation: see the pure-tone regression tests
+/// `pan166_pure_tone_isolates_audio_vs_spectrogram_basis_conversion`
+/// (integer `time_step`, round 13) and
+/// `pan166_pure_tone_isolates_fractional_time_refinement_audio_extraction_formula`
+/// (fractional `time_refinement`, round 14) -- both verified to 1e-4
+/// (the f32-storage-precision floor used throughout this file) across
+/// every tone, both `freq_sub` values, and the full documented
+/// `time_refinement` range.
+///
+/// Round 15: `candidate.time_refinement` (round 13/14's original position
+/// source) turned out to be unreliable for THIS extraction's needs -- its
+/// 3-point parabolic fit degenerates into a clamped, near-arbitrary ±0.5
+/// (post-damping ±0.15) value whenever the true symbol boundary sits near
+/// the midpoint between two `time_step`s (the well-known, load-bearing-for-
+/// recall "two-step score plateau", see `Ft8Config::costas_half_loop_
+/// disabled`'s doc) -- confirmed directly: for one such candidate,
+/// `time_step=3` and `time_step=4` scored 20.755 vs. 20.752, an
+/// unresolvable near-tie for a 3-point parabola. The old, wide-window
+/// spectrogram interpolation tolerates this sloppy refinement (its own
+/// window is wide enough to still substantially overlap either integer
+/// position); this precise, single-symbol extraction cannot. Round 15
+/// therefore takes the caller-supplied `symbol0_start_sample`/
+/// `base_frequency` as already-accurate (e.g. from `fine_sync::refine`'s
+/// independent audio-domain Costas correlation, NOT the spectrogram-
+/// derived `time_refinement`) rather than deriving them internally from a
+/// `CostasCandidate`.
+///
+/// (Round 15 originally also dropped round 13/14's `common_phase` term
+/// entirely, reasoning it was an exact multiple of 2π per symbol and
+/// therefore droppable -- true ONLY for FT8's exact `tone_spacing`
+/// (`6.25 == SAMPLE_RATE/sps`), not in general (FT4's stored `20.8333` is
+/// a rounded literal, not exactly `12000/576`); round 16's Codex review
+/// caught this and it's restored below.)
+///
+/// Round 16 (Codex review finding): `symbol0_start_sample` should come
+/// from an accurate position source (e.g. `fine_sync::refine`'s `dt_
+/// samples`, converted to an audio-domain offset) -- POSITION accuracy is
+/// what this extraction structurally needs. `base_frequency`, however,
+/// must be in the SAME frequency basis the caller's downstream phase
+/// consumer uses, NOT necessarily `fine_sync::refine`'s refined `df_hz`-
+/// corrected estimate: `subtract_decode_coherent` always projects the
+/// spectrogram at the COARSE `candidate.freq_bin`/`freq_sub` bins (no
+/// fine frequency correction), so a caller feeding this extraction's
+/// output into that subtraction path must pass the coarse candidate
+/// frequency here too -- demodulating at the fine-corrected frequency
+/// instead would silently cancel exactly the `2π·df_hz·sps/Fs`-per-symbol
+/// phase advance the subtraction step still needs corrected, leaving a
+/// near-constant rotor that under-subtracts the real signal.
+#[allow(clippy::too_many_arguments)]
+fn par_extract_complex_symbols_from_audio_refined(
+    pp: &ProtocolParams,
+    audio: &[f64],
+    symbol0_start_sample: f64,
+    base_frequency: f64,
+    symbol_fft: &std::sync::Arc<dyn rustfft::Fft<f64>>,
+    symbol_window: &[f64],
+    window_scale: f64,
+) -> Option<Vec<[Complex<f64>; NUM_TONES]>> {
+    let sps = pp.samples_per_symbol(SAMPLE_RATE);
+    let subblock_size = sps / TIME_OSR;
+    let fs_rate = SAMPLE_RATE as f64;
+    let pi2 = 2.0 * std::f64::consts::PI;
+
+    let phase_step_angle = -pi2 * base_frequency / fs_rate;
+    let phase_step = Complex::new(phase_step_angle.cos(), phase_step_angle.sin());
+
+    let mut out: Vec<[Complex<f64>; NUM_TONES]> = Vec::with_capacity(pp.num_symbols);
+    let mut fft_buffer = vec![Complex::new(0.0f64, 0.0); sps];
+
+    for sym_idx in 0..pp.num_symbols {
+        let mut row = [Complex::new(0.0f64, 0.0); NUM_TONES];
+        let sym_start_cont = symbol0_start_sample + (sym_idx * sps) as f64;
+        let sym_start_int_signed = sym_start_cont.round() as isize;
+        if sym_start_int_signed < 0 || (sym_start_int_signed as usize) + sps > audio.len() {
+            out.push(row);
+            continue;
+        }
+        let sym_start_int = sym_start_int_signed as usize;
+        let delta = sym_start_cont - sym_start_int as f64;
+
+        let initial_angle = -pi2 * base_frequency * sym_start_int as f64 / fs_rate;
+        let mut rotator = Complex::new(initial_angle.cos(), initial_angle.sin());
+        let symbol_audio = &audio[sym_start_int..sym_start_int + sps];
+        for i in 0..sps {
+            let w = symbol_window[i];
+            fft_buffer[i] = Complex::new(
+                symbol_audio[i] * w * rotator.re,
+                symbol_audio[i] * w * rotator.im,
+            );
+            rotator *= phase_step;
+        }
+        symbol_fft.process(&mut fft_buffer);
+
+        // Round 16 (Codex review finding): restore round 13/14's
+        // spectrogram-window-start-referenced phase-origin term. It's an
+        // exact multiple of 2*pi per symbol (hence droppable) ONLY when
+        // `base_frequency`'s own tone_spacing exactly equals
+        // `SAMPLE_RATE/sps` -- true for FT8 (6.25 == 12000/1920 exactly)
+        // but NOT for FT4 (stored 20.8333 vs the true 12000/576 =
+        // 20.83333... -- a ~3.3e-5 Hz mismatch that accumulates to a
+        // non-negligible per-symbol drift at high freq_bin values over a
+        // 79-symbol frame). `n0 - sym_start_cont` is a fixed
+        // `-subblock_size` regardless of `time_step`/`time_refinement`
+        // (round 13/14's derivation), so it's computable directly from
+        // `sym_start_cont` here without needing the caller's `time_step`.
+        let n0 = sym_start_cont - subblock_size as f64;
+        let common_phase = Complex::from_polar(1.0, pi2 * base_frequency * n0 / fs_rate);
+
+        for tone in 0..pp.num_tones {
+            let sub_sample_correction =
+                Complex::from_polar(1.0, pi2 * tone as f64 * delta / sps as f64);
+            row[tone] = fft_buffer[tone]
+                * window_scale
+                * sub_sample_correction
+                * tone_parity_sign(tone)
+                * common_phase;
         }
         out.push(row);
     }
@@ -18668,20 +19324,73 @@ mod tests {
                             .collect::<Vec<_>>()
                     )
                 });
-            let cs = par_extract_complex_symbols_from_spectrogram_refined(&pp, &spectrogram, truth)
-                .expect("complex retention present");
+
+            // PAN-166 round 15: `truth.time_refinement` is NOT a reliable
+            // sample-level position (see `par_extract_complex_symbols_
+            // from_audio_refined`'s doc -- it degenerates whenever the
+            // true boundary sits near the midpoint between two
+            // `time_step`s, the well-known "two-step score plateau").
+            // Get an independent, accurate position instead via
+            // `fine_sync::refine`'s audio-domain Costas correlation,
+            // anchored at the INTEGER `time_step` alone (ignoring the
+            // unreliable `time_refinement`).
+            let subblock_size = pp.samples_per_symbol(SAMPLE_RATE) / TIME_OSR;
+            let coarse_start_sample =
+                candidate_offset_samples(truth.time_step, spectrogram.time_padding, subblock_size);
+            let base_frequency = truth.freq_bin as f64 * TONE_SPACING
+                + truth.freq_sub as f64 * (TONE_SPACING / FREQ_OSR as f64);
+            let bb = crate::baseband::extract_candidate_baseband_with(
+                &tx_f64,
+                base_frequency,
+                coarse_start_sample,
+                &pp,
+                &decoder.baseband_taps,
+            );
+            let fs_result = crate::fine_sync::refine(&bb, &pp);
+            let refined_start_sample = coarse_start_sample as f64
+                + fs_result.dt_samples as f64 * crate::baseband::DECIM as f64;
+
+            // PAN-166 rounds 13/14/15/16: the leakage-free, audio-anchored
+            // extraction, positioned via the independent fine-sync
+            // refinement above, replaces the leakage-prone spectrogram-row
+            // interpolation as the full-frame path's source of complex
+            // symbols -- see `par_extract_complex_symbols_from_audio_
+            // refined`'s doc for the derivation. Extracted at the COARSE
+            // `base_frequency` (matching production, round 16 review
+            // finding) -- `subtract_decode_coherent` always projects the
+            // spectrogram at the coarse candidate.freq_bin/freq_sub bins,
+            // so the drift estimate this test checks must be measured in
+            // that SAME basis, not `base_frequency + fs_result.df_hz`.
+            let window_scale = audio_to_spectrogram_window_scale(
+                &decoder.spectrogram_window,
+                &decoder.symbol_window,
+            );
+            let cs = par_extract_complex_symbols_from_audio_refined(
+                &pp,
+                &tx_f64,
+                refined_start_sample,
+                base_frequency,
+                &decoder.symbol_fft,
+                &decoder.symbol_window,
+                window_scale,
+            )
+            .expect("audio-anchored extraction always succeeds");
 
             let drift = estimate_symbol_phase_drift_rad(&pp, &cs);
             assert!(
-                drift.abs() < 0.6,
-                "lead_in={lead_in_samples} (time_step={}, time_refinement={}): \
-                 the round-7 partial fix should keep drift under ~0.6 rad \
-                 at every sample offset (current worst observed ~0.43 rad, \
-                 down from ~1.66 rad unfixed) -- this threshold is NOT \
-                 near-zero, it's a regression guard on the partial \
-                 improvement PAN-166 will complete; got {drift} rad",
+                drift.abs() < 0.06,
+                "lead_in={lead_in_samples} (time_step={}, time_refinement={}, \
+                 fine_sync dt_samples={} df_hz={}): PAN-166's leakage-free \
+                 audio-anchored extraction, positioned via fine_sync::refine, \
+                 should keep drift small (measured worst case across all 8 \
+                 offsets is ~0.051 rad -- fine_sync's noncoherent, \
+                 Costas-only positioning leaves a small signal-content- \
+                 dependent residual, not a bug -- still ~10x tighter than \
+                 the shipped ~0.43-0.6 rad bound); got {drift} rad",
                 truth.time_step,
-                truth.time_refinement
+                truth.time_refinement,
+                fs_result.dt_samples,
+                fs_result.df_hz
             );
         }
     }
@@ -18956,6 +19665,195 @@ mod tests {
                              (audio={x_audio:?}) rel_err={}",
                             err / scale
                         );
+                    }
+                }
+            }
+        }
+    }
+
+    /// PAN-166 round 14: the fractional (`time_refinement != 0`) sibling
+    /// of `pan166_pure_tone_isolates_audio_vs_spectrogram_basis_conversion`.
+    /// Nails the formula BEFORE touching `coherent_subtract_and_repass`,
+    /// per this ticket's own established methodology.
+    ///
+    /// Round 13's basis conversion only covered INTEGER `time_step`
+    /// positions, where the audio extraction's window start
+    /// (`sym_start`) exactly matches a real spectrogram row's position.
+    /// A candidate's `time_refinement` (`dt`, normally nonzero) shifts
+    /// the TRUE symbol boundary by up to half a spectrogram time-step
+    /// (`subblock_size` = `sps/2` samples) from the nearest integer
+    /// `time_step`. The previously-shipped approach
+    /// (`par_extract_complex_symbols_from_spectrogram_refined`) handled
+    /// this by linearly interpolating between the two neighboring
+    /// INTEGER-time_step spectrogram rows -- each of which is itself
+    /// leakage-contaminated (2-symbol-wide window), so no linear
+    /// combination of the two can remove it (round 10's finding).
+    ///
+    /// The audio path doesn't need to interpolate between two coarse,
+    /// row-granularity (`subblock_size`-spaced) positions at all: the
+    /// TRUE continuous sample offset (`sym_start_cont`) is directly
+    /// computable to full precision (it's just
+    /// `candidate_offset_samples`'s formula evaluated at a real-valued
+    /// `time_step + time_refinement` instead of an integer), and can be
+    /// rounded to the NEAREST INTEGER SAMPLE rather than the nearest
+    /// spectrogram row. That rounding residual (`delta`) is bounded to
+    /// `[-0.5, +0.5]` SAMPLES out of `sps` (~1920) -- not `[-0.5, +0.5]`
+    /// ROWS (up to `sps/4` samples) like the old row-interpolation
+    /// approach -- so the window this extracts is off from the TRUE
+    /// symbol boundary by at most half a sample: negligible
+    /// neighbor-symbol leakage, a fundamentally different (much easier)
+    /// regime than what round 12 was fighting.
+    ///
+    /// The residual sub-sample `delta` is corrected via the DFT time-shift
+    /// identity (`exp(j*2*pi*tone*delta/sps)`) -- the same exact-for-an-
+    /// isolated-tone formula round 10 already validated at ROW granularity,
+    /// applied here at SAMPLE granularity where it's an even better
+    /// approximation (a leakage-free single-symbol window shifted by
+    /// under a sample is about as clean as `compute_spectrogram_with`'s
+    /// wide window shifted by a full fractional row was NOT).
+    ///
+    /// Ground truth: extends
+    /// `pan166_pure_tone_isolates_fractional_phase_rotation_formula`'s
+    /// exact "advance the tone, read an integer row" trick to arbitrary
+    /// continuous `t_cont = time_step + time_refinement + sym_idx*TIME_OSR`
+    /// -- reading spectrogram row `round(t_cont)` of a copy of the tone
+    /// advanced by `(t_cont - round(t_cont)) * subblock_size` samples is
+    /// exact for what a continuous-time spectrogram would read AT
+    /// `t_cont`, no approximation, so it also serves as the analytic
+    /// continuation target for round 13's `n0(t_base)` term evaluated at
+    /// continuous `t_cont` instead of an integer `t_base`.
+    ///
+    /// Validated formula:
+    /// `F(t_cont) == X_audio(sym_start_int) * exp(j*2*pi*tone*delta/sps)
+    ///      * tone_parity_sign(tone)
+    ///      * exp(j*2*pi*base_frequency*n0(t_cont)/SAMPLE_RATE)`
+    #[test]
+    fn pan166_pure_tone_isolates_fractional_time_refinement_audio_extraction_formula() {
+        let decoder = Ft8Decoder::new(Ft8Config::default()).expect("decoder");
+        let sps = decoder.protocol_params.samples_per_symbol(SAMPLE_RATE);
+        let subblock_size = sps / TIME_OSR;
+        let nfft = sps * FREQ_OSR;
+        let fs_rate = SAMPLE_RATE as f64;
+        let pi2 = 2.0 * PI;
+
+        let spec_window_sum: f64 = decoder.spectrogram_window.iter().map(|&w| w as f64).sum();
+        let symbol_window_sum: f64 = decoder.symbol_window.iter().sum();
+        let window_scale = spec_window_sum / symbol_window_sum;
+
+        let freq_bin = 300usize;
+        let phase0 = 1.1_f64;
+
+        // Sweeps both signs and magnitudes approaching the [-0.5, 0.5]
+        // row-unit bound (candidate.time_refinement's documented range),
+        // plus 0.0 as the round-13 degenerate case (already covered
+        // there, kept here as a continuity check).
+        let dt_values = [-0.47, -0.3, -0.1, 0.0, 0.1, 0.3, 0.47];
+
+        for freq_sub in 0..FREQ_OSR {
+            let base_frequency =
+                freq_bin as f64 * TONE_SPACING + freq_sub as f64 * (TONE_SPACING / FREQ_OSR as f64);
+
+            for tone in 0..NUM_TONES {
+                let freq_hz = base_frequency + tone as f64 * TONE_SPACING;
+
+                let audio: Vec<f64> = (0..WINDOW_SAMPLES)
+                    .map(|n| (pi2 * freq_hz * n as f64 / fs_rate + phase0).cos())
+                    .collect();
+
+                for &t0 in &[5usize, 6, 40, 41] {
+                    for &dt in &dt_values {
+                        for sym_idx in 0..3usize {
+                            let t_cont = t0 as f64 + dt + (sym_idx * TIME_OSR) as f64;
+
+                            // Ground truth via the exact advance-tone trick
+                            // (see doc above): F(t_cont) == reading integer
+                            // row `row0` of a copy of the tone advanced by
+                            // `frac * subblock_size` samples.
+                            let row0_signed = t_cont.round() as isize;
+                            if row0_signed < 0 {
+                                continue;
+                            }
+                            let row0 = row0_signed as usize;
+                            let frac = t_cont - row0 as f64; // in [-0.5, 0.5)
+                            let advance_samples = frac * subblock_size as f64;
+                            let advanced_audio: Vec<f64> = (0..WINDOW_SAMPLES)
+                                .map(|n| {
+                                    (pi2 * freq_hz * (n as f64 + advance_samples) / fs_rate
+                                        + phase0)
+                                        .cos()
+                                })
+                                .collect();
+                            let spec_advanced = decoder
+                                .compute_spectrogram(&advanced_audio)
+                                .expect("spectrogram (advanced)");
+                            if row0 >= spec_advanced.num_steps {
+                                continue;
+                            }
+                            let freq_bin_idx = freq_bin + tone;
+                            if freq_bin_idx >= spec_advanced.num_bins {
+                                continue;
+                            }
+                            let complex_advanced =
+                                spec_advanced.complex.as_ref().expect("complex retained");
+                            let c =
+                                complex_advanced[spec_advanced.idx(row0, freq_sub, freq_bin_idx)];
+                            let ground_truth = Complex::new(c.re as f64, c.im as f64);
+
+                            // Predicted: nearest-integer-SAMPLE-anchored
+                            // audio extraction (from the ORIGINAL,
+                            // unadvanced audio -- this is what production
+                            // would actually read) plus the sub-sample
+                            // correction and round-13's basis conversion,
+                            // both evaluated at continuous t_cont.
+                            let sym_start_cont = (t_cont - SLIDING_FRAME_LOOKBACK_STEPS as f64)
+                                * subblock_size as f64;
+                            let sym_start_int_signed = sym_start_cont.round() as isize;
+                            if sym_start_int_signed < 0 {
+                                continue;
+                            }
+                            let sym_start_int = sym_start_int_signed as usize;
+                            if sym_start_int + sps > audio.len() {
+                                continue;
+                            }
+                            let delta = sym_start_cont - sym_start_int as f64; // in [-0.5, 0.5]
+
+                            let phase_step_angle = -pi2 * base_frequency / fs_rate;
+                            let phase_step =
+                                Complex::new(phase_step_angle.cos(), phase_step_angle.sin());
+                            let initial_angle =
+                                -pi2 * base_frequency * sym_start_int as f64 / fs_rate;
+                            let mut rotator =
+                                Complex::new(initial_angle.cos(), initial_angle.sin());
+                            let symbol_audio = &audio[sym_start_int..sym_start_int + sps];
+                            let mut buf = vec![Complex::new(0.0f64, 0.0); sps];
+                            for i in 0..sps {
+                                let w = decoder.symbol_window[i];
+                                buf[i] = Complex::new(
+                                    symbol_audio[i] * w * rotator.re,
+                                    symbol_audio[i] * w * rotator.im,
+                                );
+                                rotator *= phase_step;
+                            }
+                            decoder.symbol_fft.process(&mut buf);
+                            let x_audio = buf[tone] * window_scale;
+
+                            let n0 = (t_cont + 1.0) * subblock_size as f64 - nfft as f64;
+                            let sub_sample_correction =
+                                Complex::from_polar(1.0, pi2 * tone as f64 * delta / sps as f64);
+                            let predicted = x_audio
+                                * sub_sample_correction
+                                * tone_parity_sign(tone)
+                                * Complex::from_polar(1.0, pi2 * base_frequency * n0 / fs_rate);
+
+                            let err = (ground_truth - predicted).norm();
+                            let scale = ground_truth.norm().max(predicted.norm()).max(1e-6);
+                            assert!(
+                                err / scale < 1e-4,
+                                "tone={tone} freq_sub={freq_sub} t0={t0} dt={dt} sym_idx={sym_idx}: \
+                                 ground_truth={ground_truth:?} predicted={predicted:?} rel_err={}",
+                                err / scale
+                            );
+                        }
                     }
                 }
             }
@@ -20313,7 +21211,7 @@ mod hb226_gaussian_ramp_tests {
         let sym = hb226_synthetic_symbols();
         let sps = (SYMBOL_DURATION * SAMPLE_RATE as f64) as usize;
         let ramp = Ft8Decoder::ramp_samples_from_fraction(sps, 0.11);
-        let (ri_u, rq_u) = Ft8Decoder::generate_cpfsk_iq(&sym, 1500.0, sps);
+        let (ri_u, rq_u) = Ft8Decoder::generate_cpfsk_iq(&sym, 1500.0, sps, TONE_SPACING);
         let (ri_r, rq_r) = Ft8Decoder::generate_cpfsk_iq_ramped(&sym, 1500.0, sps, ramp);
 
         let e_u: f64 = ri_u
@@ -20351,7 +21249,7 @@ mod hb226_gaussian_ramp_tests {
         // Build a synthetic audio buffer: amplitude 0.5 sinusoid at
         // the symbol's CPFSK frequency, padded with zeros for the
         // search margin.
-        let (ri, _rq) = Ft8Decoder::generate_cpfsk_iq(&symbols, 1500.0, sps);
+        let (ri, _rq) = Ft8Decoder::generate_cpfsk_iq(&symbols, 1500.0, sps, TONE_SPACING);
         let pad = sps; // leave room for the time-search lower bound
         let mut audio: Vec<f32> = vec![0.0; pad + ri.len() + pad];
         for k in 0..ri.len() {
@@ -20407,7 +21305,7 @@ mod hb226_gaussian_ramp_tests {
         // Build a synthetic audio buffer the same way as the
         // identical-output test, but use a clean reconstructed
         // signal we can subtract.
-        let (ri, _rq) = Ft8Decoder::generate_cpfsk_iq(&symbols, 1500.0, sps);
+        let (ri, _rq) = Ft8Decoder::generate_cpfsk_iq(&symbols, 1500.0, sps, TONE_SPACING);
         let pad = sps;
         let mut audio: Vec<f32> = vec![0.0; pad + ri.len() + pad];
         for k in 0..ri.len() {
@@ -22573,6 +23471,7 @@ mod three_stage_sync_tests {
             &tones,
             1.0,
             0.0,
+            None,
         );
         subtract_decode_coherent(
             &mut spec_on,
@@ -22582,6 +23481,7 @@ mod three_stage_sync_tests {
             &tones,
             1.0,
             0.0,
+            None,
         );
 
         let num_bins = spec_off.num_bins;
@@ -22881,6 +23781,7 @@ mod three_stage_sync_tests {
             &tone_symbols,
             1.0,
             estimated_drift,
+            None,
         );
         subtract_decode_coherent(
             &mut spec_uncorrected,
@@ -22890,6 +23791,7 @@ mod three_stage_sync_tests {
             &tone_symbols,
             1.0,
             0.0,
+            None,
         );
 
         let residual_energy = |spec: &Spectrogram| -> f64 {
@@ -23032,6 +23934,7 @@ mod three_stage_sync_tests {
             &tone_symbols,
             1.0,
             estimated_drift,
+            None,
         );
         subtract_decode_coherent(
             &mut spec_not_rebased,
@@ -23041,6 +23944,7 @@ mod three_stage_sync_tests {
             &tone_symbols,
             1.0,
             estimated_drift,
+            None,
         );
 
         let residual_energy = |spec: &Spectrogram| -> f64 {
@@ -23059,6 +23963,136 @@ mod three_stage_sync_tests {
             "rebasing by the candidate's time_refinement should leave \
              meaningfully less residual than ignoring it (the pre-fix \
              formula): rebased={rebased_energy}, not_rebased={not_rebased_energy}"
+        );
+    }
+
+    #[test]
+    fn subtract_decode_coherent_treats_a_zero_rebase_shift_as_authoritative_over_stale_time_refinement(
+    ) {
+        // PAN-166 round 23 (Codex review finding): a full-frame candidate
+        // whose fine_sync genuinely found `shift_samples == 0.0` (rotor
+        // estimated exactly at the integer coarse row) must still ignore
+        // `candidate.time_refinement` even when that stale Costas-search
+        // value happens to be nonzero -- `Some((_, 0.0))` must NOT read as
+        // if it were `None`. This is the exact zero-sentinel-overload bug
+        // `Option<(f64, f64)>` (replacing two plain `f64` params) exists
+        // to make impossible to reintroduce.
+        let pp = ProtocolParams::ft8();
+        let mut tone_symbols = vec![0u8; pp.num_symbols];
+        for (m, &group_start) in pp.costas_positions.iter().enumerate() {
+            for k in 0..pp.costas_length {
+                tone_symbols[group_start + k] = pp.costas_arrays[m][k];
+            }
+        }
+        let drift = 0.08;
+        let seed_time = 5;
+        let seed_freq_bin = 50;
+        let seed_freq_sub = 0;
+        let steps_per_symbol = TIME_OSR;
+
+        // Spectrogram's TRUE phase origin sits exactly at the INTEGER
+        // `seed_time` row (no sub-sample offset) -- i.e. what fine_sync
+        // finding `shift_samples == 0.0` actually represents.
+        let num_steps = seed_time + pp.num_symbols * steps_per_symbol + 4;
+        let num_bins = seed_freq_bin + NUM_TONES + 4;
+        let build_spec = || {
+            let mut power: Vec<SpecScalar> = vec![-120.0; num_steps * FREQ_OSR * num_bins];
+            let mut complex =
+                vec![Complex::<SpecScalar>::new(0.0, 0.0); num_steps * FREQ_OSR * num_bins];
+            for sym_idx in 0..pp.num_symbols {
+                let tone = tone_symbols[sym_idx] as usize;
+                let f_idx = seed_freq_bin + tone;
+                let t_base = seed_time + sym_idx * steps_per_symbol;
+                for s in 0..steps_per_symbol {
+                    let t_idx = t_base + s;
+                    let frac_symbol = sym_idx as f64 + s as f64 / steps_per_symbol as f64;
+                    let phasor = Complex::from_polar(1.0f32, (drift * frac_symbol) as f32)
+                        * tone_parity_sign(tone) as f32;
+                    let flat_idx = (t_idx * FREQ_OSR + seed_freq_sub) * num_bins + f_idx;
+                    complex[flat_idx] = phasor;
+                    power[flat_idx] = (10.0 * (1e-12_f64 + 1.0).log10()) as SpecScalar;
+                }
+            }
+            Spectrogram {
+                power,
+                complex: Some(complex),
+                num_steps,
+                num_bins,
+                freq_osr: FREQ_OSR,
+                time_padding: 0,
+            }
+        };
+        let base_spec = build_spec();
+
+        // The rotor is estimated at the TRUE (zero-offset) position...
+        let true_candidate = CostasCandidate {
+            time_step: seed_time,
+            freq_bin: seed_freq_bin,
+            freq_sub: seed_freq_sub,
+            sync_score: 0.0,
+            time_refinement: 0.0,
+        };
+        // ...but the candidate the caller actually has carries a STALE,
+        // nonzero Costas-search refinement -- exactly the PAN-166-
+        // documented-unreliable value this whole redesign exists to stop
+        // trusting for sample-precise positioning.
+        let stale_candidate = CostasCandidate {
+            time_refinement: 0.3,
+            ..true_candidate
+        };
+
+        let cs =
+            par_extract_complex_symbols_from_spectrogram_refined(&pp, &base_spec, &true_candidate)
+                .expect("complex retention present");
+        let acc = compute_full_frame_complex_accumulator(&pp, &cs, &tone_symbols);
+        let rotor = acc / acc.norm();
+        let estimated_drift = estimate_symbol_phase_drift_rad(&pp, &cs);
+
+        let mut spec_authoritative_zero = build_spec();
+        let mut spec_stale_fallback = build_spec();
+        // Fine_sync genuinely found shift_samples == 0.0 -- must be
+        // authoritative, ignoring stale_candidate.time_refinement == 0.3.
+        subtract_decode_coherent(
+            &mut spec_authoritative_zero,
+            &pp,
+            &stale_candidate,
+            rotor,
+            &tone_symbols,
+            1.0,
+            estimated_drift,
+            Some((0.0, 0.0)),
+        );
+        // The pre-fix behavior this test guards against: treating the
+        // zero shift as "not applicable" (`None`) falls back to the
+        // stale, wrong `time_refinement`.
+        subtract_decode_coherent(
+            &mut spec_stale_fallback,
+            &pp,
+            &stale_candidate,
+            rotor,
+            &tone_symbols,
+            1.0,
+            estimated_drift,
+            None,
+        );
+
+        let residual_energy = |spec: &Spectrogram| -> f64 {
+            spec.complex
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|c| (c.re as f64).powi(2) + (c.im as f64).powi(2))
+                .sum()
+        };
+        let authoritative_energy = residual_energy(&spec_authoritative_zero);
+        let stale_fallback_energy = residual_energy(&spec_stale_fallback);
+
+        assert!(
+            authoritative_energy < stale_fallback_energy * 0.5,
+            "treating a genuine zero rebase shift as authoritative should leave \
+             meaningfully less residual than falling back to the stale \
+             time_refinement: authoritative={authoritative_energy}, \
+             stale_fallback={stale_fallback_energy}"
         );
     }
 
@@ -26251,7 +27285,8 @@ mod w4_1_gfsk_reference_tests {
         // real (cosine) quadrature component as the "transmitted" signal —
         // same magnitude-spectrum shape as the actual `sin(phase)` audio
         // the legacy subtract path fits against.
-        let (rect_i, _rect_q) = Ft8Decoder::generate_cpfsk_iq(&symbols, base_freq, sps);
+        let (rect_i, _rect_q) =
+            Ft8Decoder::generate_cpfsk_iq(&symbols, base_freq, sps, TONE_SPACING);
 
         // New GFSK reference via the real TX modulator, same symbols/freq,
         // zero refinement (df=0, dt=0) so both references describe the

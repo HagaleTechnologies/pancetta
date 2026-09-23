@@ -400,6 +400,77 @@ fn test_live_20m_wav() {
     eprintln!("\nft8_lib={}, ours={}", ft8lib.len(), ours.len());
 }
 
+/// PAN-166 round 15 smoke test: `coherent_subtract_full_frame_reference_
+/// enabled` gates the leakage-free, audio-anchored full-frame extraction
+/// (`par_extract_complex_symbols_from_audio_refined`, wired via `fine_sync::
+/// refine` for accurate positioning) into `coherent_subtract_and_repass`'s
+/// live decode path -- exercised nowhere else in the test suite (the flag
+/// defaults false; `phase_drift_estimate_is_near_zero_on_a_real_clean_
+/// signal_across_time_offsets` calls the extraction function directly,
+/// bypassing `decode_window` entirely). This confirms the real, multi-signal
+/// decode path with the flag ON doesn't panic and doesn't regress recall
+/// against the same fixture with the flag off (the flag being experimental/
+/// off-by-default is a policy choice tracked by PAN-166, not evidence this
+/// path is broken).
+#[test]
+fn test_live_20m_wav_with_full_frame_coherent_reference_enabled() {
+    let wav_path = format!(
+        "{}/tests/fixtures/wav/basicft8/live_now.wav",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    if !std::path::Path::new(&wav_path).exists() {
+        eprintln!("Skipping: {} not found", wav_path);
+        return;
+    }
+
+    let mut reader = hound::WavReader::open(&wav_path).unwrap();
+    let spec = reader.spec();
+    let samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Int => {
+            let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
+            reader
+                .samples::<i32>()
+                .filter_map(|s| s.ok())
+                .map(|s| s as f32 / max)
+                .collect()
+        }
+        hound::SampleFormat::Float => reader.samples::<f32>().filter_map(|s| s.ok()).collect(),
+    };
+
+    let baseline_config = Ft8Config::default();
+    let mut baseline_decoder = Ft8Decoder::new(baseline_config).unwrap();
+    let baseline = baseline_decoder.decode_window(&samples).unwrap_or_default();
+
+    let full_frame_config = Ft8Config {
+        coherent_subtract_full_frame_reference_enabled: true,
+        ..Ft8Config::default()
+    };
+    let mut full_frame_decoder = Ft8Decoder::new(full_frame_config).unwrap();
+    let full_frame = full_frame_decoder
+        .decode_window(&samples)
+        .unwrap_or_default();
+
+    eprintln!(
+        "baseline={} full_frame_reference_enabled={}",
+        baseline.len(),
+        full_frame.len()
+    );
+    for msg in &full_frame {
+        eprintln!(
+            "  [full_frame] {:+.0} dB  {:.1} Hz  conf={:.2}  {}",
+            msg.snr_db, msg.frequency_offset, msg.confidence, msg.text
+        );
+    }
+
+    assert!(
+        full_frame.len() + 1 >= baseline.len(),
+        "enabling coherent_subtract_full_frame_reference_enabled regressed \
+         recall on live_now.wav: baseline={} full_frame={}",
+        baseline.len(),
+        full_frame.len()
+    );
+}
+
 #[test]
 fn test_raw_vs_dsp_decimated() {
     let base = env!("CARGO_MANIFEST_DIR");
