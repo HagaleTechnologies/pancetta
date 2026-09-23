@@ -13085,14 +13085,14 @@ fn audio_to_spectrogram_window_scale(
 /// `base_frequency` as already-accurate (e.g. from `fine_sync::refine`'s
 /// independent audio-domain Costas correlation, NOT the spectrogram-
 /// derived `time_refinement`) rather than deriving them internally from a
-/// `CostasCandidate`. This also drops round 13/14's `common_phase`
-/// (spectrogram-window-start-referenced) term entirely -- empirically
-/// confirmed to have zero effect on the drift estimate for an on-lattice
-/// carrier (it's an exact multiple of 2π per symbol in that case) and, more
-/// fundamentally, wrong in general: it implicitly assumed the same tone
-/// spans both the extracted symbol and the spectrogram window-start
-/// reference point, which structurally sits in the PRECEDING symbol's own
-/// second half.
+/// `CostasCandidate`.
+///
+/// (Round 15 originally also dropped round 13/14's `common_phase` term
+/// entirely, reasoning it was an exact multiple of 2π per symbol and
+/// therefore droppable -- true ONLY for FT8's exact `tone_spacing`
+/// (`6.25 == SAMPLE_RATE/sps`), not in general (FT4's stored `20.8333` is
+/// a rounded literal, not exactly `12000/576`); round 16's Codex review
+/// caught this and it's restored below.)
 ///
 /// Round 16 (Codex review finding): `symbol0_start_sample` should come
 /// from an accurate position source (e.g. `fine_sync::refine`'s `dt_
@@ -13119,6 +13119,7 @@ fn par_extract_complex_symbols_from_audio_refined(
     window_scale: f64,
 ) -> Option<Vec<[Complex<f64>; NUM_TONES]>> {
     let sps = pp.samples_per_symbol(SAMPLE_RATE);
+    let subblock_size = sps / TIME_OSR;
     let fs_rate = SAMPLE_RATE as f64;
     let pi2 = 2.0 * std::f64::consts::PI;
 
@@ -13152,11 +13153,29 @@ fn par_extract_complex_symbols_from_audio_refined(
         }
         symbol_fft.process(&mut fft_buffer);
 
+        // Round 16 (Codex review finding): restore round 13/14's
+        // spectrogram-window-start-referenced phase-origin term. It's an
+        // exact multiple of 2*pi per symbol (hence droppable) ONLY when
+        // `base_frequency`'s own tone_spacing exactly equals
+        // `SAMPLE_RATE/sps` -- true for FT8 (6.25 == 12000/1920 exactly)
+        // but NOT for FT4 (stored 20.8333 vs the true 12000/576 =
+        // 20.83333... -- a ~3.3e-5 Hz mismatch that accumulates to a
+        // non-negligible per-symbol drift at high freq_bin values over a
+        // 79-symbol frame). `n0 - sym_start_cont` is a fixed
+        // `-subblock_size` regardless of `time_step`/`time_refinement`
+        // (round 13/14's derivation), so it's computable directly from
+        // `sym_start_cont` here without needing the caller's `time_step`.
+        let n0 = sym_start_cont - subblock_size as f64;
+        let common_phase = Complex::from_polar(1.0, pi2 * base_frequency * n0 / fs_rate);
+
         for tone in 0..pp.num_tones {
             let sub_sample_correction =
                 Complex::from_polar(1.0, pi2 * tone as f64 * delta / sps as f64);
-            row[tone] =
-                fft_buffer[tone] * window_scale * sub_sample_correction * tone_parity_sign(tone);
+            row[tone] = fft_buffer[tone]
+                * window_scale
+                * sub_sample_correction
+                * tone_parity_sign(tone)
+                * common_phase;
         }
         out.push(row);
     }
