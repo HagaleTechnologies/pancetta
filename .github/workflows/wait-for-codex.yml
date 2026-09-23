@@ -659,6 +659,17 @@ jobs:
           HEAD_SHA: ${{ steps.pr-context.outputs.head_sha }}
           SINCE: ${{ steps.request-comment.outputs.run_started }}
           COMMENT_ID: ${{ steps.request-comment.outputs.comment_node_id }}
+          # Codex P1, this PR's own round-4 review: a thumbs-up reaction carries no body
+          # text, so unlike comment_head_tied/error_head_tied (which verify HEAD_SHA is
+          # embedded in the comment body itself) there is no way to confirm a reaction on
+          # COMMENT_ID actually answers the CURRENT head -- only that COMMENT_ID is itself
+          # the current head's own genuine request comment. is_marked already verifies
+          # exactly that (the selected comment is paired with a marker embedding this
+          # exact HEAD_SHA, computed fresh above) but was never applied here -- a stale
+          # COMMENT_ID (an old head's request, if issue_comment's lack of a commit_id let a
+          # superseded comment get selected) plus a late-arriving reaction on it could
+          # otherwise satisfy responded=true for a head Codex never actually reviewed.
+          IS_MARKED: ${{ steps.request-comment.outputs.is_marked }}
         run: |
           set -o pipefail
           owner="${REPO%%/*}"; name="${REPO##*/}"
@@ -711,10 +722,17 @@ jobs:
           comment_thumbsup=$(echo "$poll" | jq '.comment_thumbsup')
           comment_head_tied=$(echo "$poll" | jq '.comment_head_tied')
           error_head_tied=$(echo "$poll" | jq '.error_head_tied')
+          # A thumbs-up reaction has no body text to check against HEAD_SHA the way
+          # comment_head_tied/error_head_tied can -- it's only trustworthy if COMMENT_ID
+          # itself is confirmed to be the CURRENT head's own request comment (is_marked),
+          # not a stale one an issue_comment event (no commit_id to stale-check against)
+          # could otherwise have let through.
+          tied_thumbsup=0
+          [ "$comment_thumbsup" -gt 0 ] && [ "$IS_MARKED" = "true" ] && tied_thumbsup=1
           # This job only exists because a real event already fired -- use ONLY signals
           # provably tied to this exact request/head.
-          if [ "$reviews" -gt 0 ] || [ "$comment_thumbsup" -gt 0 ] || [ "$comment_head_tied" -gt 0 ]; then
-            echo "Codex responded on this revision: reviews=$reviews comment_thumbsup=$comment_thumbsup comment_head_tied=$comment_head_tied"
+          if [ "$reviews" -gt 0 ] || [ "$tied_thumbsup" -gt 0 ] || [ "$comment_head_tied" -gt 0 ]; then
+            echo "Codex responded on this revision: reviews=$reviews comment_thumbsup=$comment_thumbsup (tied=$tied_thumbsup, is_marked=$IS_MARKED) comment_head_tied=$comment_head_tied"
             echo "responded=true" >> "$GITHUB_OUTPUT"
           elif [ "$error_head_tied" -gt 0 ]; then
             echo "::error::Codex reported an error for this exact revision ($HEAD_SHA) instead of reviewing it."
