@@ -143,8 +143,19 @@ jobs:
   # this repo is public. gate_timeout_minutes is fixed at 95, derived from
   # this repo's OWN wait-for-codex job (75min timeout / 70min in-script
   # poll bound, see wait-for-codex.yml).
+  #
+  # Codex P1, HAG-80 PR #399 round-3 review: this job's own display name
+  # (which is also its check-run name) used to be IDENTICAL to the new,
+  # Checks-API-managed "Codex review clean (gate before expensive downstream
+  # jobs)" check wait-for-codex.yml's codex-review-request job now produces
+  # -- two different producers publishing the SAME check-run name on the
+  # same head_sha, with the ruleset about to be retargeted to require
+  # exactly that name. Renamed the DISPLAY name only; the job id `codex-clean`
+  # below is unchanged, so every `needs: codex-clean` reference elsewhere in
+  # this file (ft8-tests, workspace-check, cross-platform-check, deny) keeps
+  # working exactly as before -- `needs:` resolves by job id, never by name.
   codex-clean:
-    name: Codex review clean (gate before expensive downstream jobs)
+    name: Codex-clean label gate (waits for wait-for-codex.yml's verdict)
     runs-on: ubuntu-latest
     timeout-minutes: 95
     permissions:
