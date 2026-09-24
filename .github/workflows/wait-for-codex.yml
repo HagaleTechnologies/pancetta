@@ -21,6 +21,18 @@ name: Wait for Codex
 # project_hag78_coppa_migration_20260922 for the full saga), since a label has no
 # "creating identity" ownership restriction the way a check-run does.
 #
+# HAG-96 (discovered live during THIS PR's own review cycle): issue_comment has never
+# triggered a single workflow run on pancetta specifically, in its entire history (0 of
+# 5000+ runs, vs coppa's 8) -- root cause not yet identified, tracked separately. This means
+# a Codex response delivered as a bare comment (rather than a formal pull_request_review)
+# is never processed here. Unlike HAG-87's already-accepted reaction-gap, credenza's
+# org-wide timeout-scan backstop does NOT cover this: it only recovers checks stuck
+# in_progress past 90/120 minutes, not one that's already reached a COMPLETED-but-stale
+# conclusion from an earlier round (exactly what happens if a bare-comment response is
+# missed). Until HAG-96 is root-caused, a stuck stale conclusion on this repo needs a human
+# to either push a new commit (resets the check-run's history entirely) or wait for Codex to
+# happen to respond via a formal review instead on a re-request.
+#
 # Top-level workflow `name:` is deliberately UNCHANGED ("Wait for Codex", not renamed) --
 # queue-retry-handler.yml's own `workflows: ['CI', 'Supply Chain', 'Wait for Codex']`
 # matches on this exact field, not the job/check-run name below. Renaming this would
