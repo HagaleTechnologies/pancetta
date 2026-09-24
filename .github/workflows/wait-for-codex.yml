@@ -95,25 +95,31 @@ jobs:
   # actually replies.
   # ============================================================================================
   codex-review-request:
-    # Live-discovered, this PR's own round-5 real Codex-review event (a genuine
-    # pull_request_review from Codex triggered a real workflow run): this job job-level-skips
-    # (not just skips its steps) for pull_request_review/issue_comment events, and for
-    # Dependabot/draft PRs on pull_request_target -- and GitHub creates a check-run for a
-    # skipped job too, under the JOB's OWN name, with app.slug=github-actions and a
-    # GitHub-generated (UUID) external_id, NOT the custom numeric one upsert_check_run sets.
-    # Round-6's own fix (renaming this job's display name) was ITSELF wrong: this job's
-    # merge_group pass-through, and its Dependabot/draft job-level skip, both rely ENTIRELY
-    # on this NATIVE attribution to publish the required "Codex review clean..." check (no
-    # explicit upsert_check_run call happens on either path) -- renaming the job broke BOTH
-    # of those (Codex P1, round 7 on this PR, and independently on coppa's HAG-93 PR #114,
-    # confirmed by the SAME rename in both places). Reverted the rename; the actual fix is at
-    # the LOOKUP sites below, which now exclude any check-run whose external_id isn't the
-    # purely-numeric run-id format upsert_check_run always sets -- GitHub's own native
-    # attribution (whatever this job's name currently is) never produces a numeric
-    # external_id, so it can never again be selected as "the" managed check-run to PATCH,
-    # regardless of what this job happens to be named.
-    name: Codex review clean (gate before expensive downstream jobs)
-    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request_target' && github.event.pull_request.draft == false && github.actor != 'dependabot[bot]')
+    # Codex P1, this PR's own round 8 (redesign after rounds 2/6/7 each patched a
+    # different symptom of the same underlying tension): this job's display name must NEVER
+    # equal the Checks-API-managed check's name. Two independent, previously-tried patches
+    # both failed:
+    #   - Naming it identically (original design) and relying on native per-job attribution
+    #     for the merge_group/Dependabot pass-through paths meant this job's OWN quick
+    #     completion (posting "@codex review" and exiting, seconds after creating the
+    #     managed check as in_progress) ALSO published a native SUCCESS under that same
+    #     name for a REAL round too -- two check-runs sharing one name, one settling
+    #     immediately (native), one correctly staying in_progress until Codex actually
+    #     responds (managed) -- an ambiguous, possibly premature-merge-enabling state for
+    #     GitHub's own required-status-check evaluation, live-caught reviewing round 7 on
+    #     this PR and independently on coppa's HAG-93 PR #114.
+    #   - Renaming it (round 6) fixed that ambiguity but broke the merge_group/Dependabot
+    #     pass-through paths outright, since those relied ENTIRELY on native attribution
+    #     under the managed name with no explicit Checks-API call at all (round 7 finding).
+    # The actual fix: keep this job's name DISTINCT (so its own native attribution, whatever
+    # its outcome, never coincides with the managed check under any circumstance), and
+    # publish the managed check EXPLICITLY via upsert_check_run on every path this job
+    # handles -- merge_group and Dependabot now call it directly (mirroring the real-round
+    # path below), rather than depending on native job-skip/job-success attribution for
+    # either. Draft PRs remain excluded at the job level (unchanged): a draft is never itself
+    # merge-attempted, and ready_for_review re-fires this job on the real path once it is.
+    name: Codex review request (producer)
+    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request_target' && github.event.pull_request.draft == false)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -132,19 +138,17 @@ jobs:
     outputs:
       check_run_id: ${{ steps.create-check.outputs.check_run_id }}
     steps:
-      - name: Pass through for merge-queue evaluation
-        if: github.event_name == 'merge_group'
-        run: |
-          echo "Merge-group evaluation -- the constituent PR already passed a real Codex review during its own PR phase; nothing further to review on this synthetic integration commit."
-
       - name: Mint a hagale-agent installation token for check-run writes
         id: app-token
         # Checks API create/update endpoints only accept a GitHub App token --
         # github.token can create a check-run within its own run but is rejected for
         # updating one a DIFFERENT run created, and a plain PAT is rejected outright for
         # both create and update. hagale-agent (App ID 4696353) is not subject to either
-        # restriction. Already used fleet-wide (HAG-44/74/75/78).
-        if: github.event_name == 'pull_request_target'
+        # restriction. Already used fleet-wide (HAG-44/74/75/78). Also minted for
+        # merge_group now (round 8) -- that path explicitly upserts the managed check too,
+        # rather than relying on this job's own native attribution (see the job's header
+        # comment for why).
+        if: github.event_name == 'merge_group' || github.event_name == 'pull_request_target'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: 4696353
@@ -239,14 +243,25 @@ jobs:
 
       - name: Create/upsert the codex-clean check-run
         id: create-check
-        if: github.event_name == 'pull_request_target' && steps.head-check.outputs.stale != 'true'
+        # Round 8: also runs for merge_group now, explicitly upserting the managed check
+        # to completed/success there (see the job's own header comment) instead of relying
+        # on the "Pass through for merge-queue evaluation" step's mere existence -- that
+        # standalone step is removed; this one step now covers both paths.
+        if: github.event_name == 'merge_group' || (github.event_name == 'pull_request_target' && steps.head-check.outputs.stale != 'true')
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
           RUN_ID: ${{ github.run_id }}
           ALREADY_CLEAN: ${{ steps.existing-label.outputs.already_clean || 'false' }}
           BOOTSTRAP_STATUS: ${{ steps.bootstrap-check.outputs.bootstrap_status || 'absent' }}
+          IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
+          # Round 8: Dependabot is no longer excluded at the JOB level (that relied on
+          # native attribution under the managed name for its pass-through, the same flaw
+          # merge_group had) -- it now flows through this step like any other
+          # pull_request_target event and gets an explicit success upsert below, same as
+          # coppa's own design.
+          IS_DEPENDABOT: ${{ github.actor == 'dependabot[bot]' }}
         run: |
           set -o pipefail
 
@@ -306,12 +321,16 @@ jobs:
             fi
           }
 
-          # Bootstrap not live yet, OR the label already exists: pass through immediately
-          # with a completed, successful check-run -- no prior round to converge on yet.
-          # NOTE: draft/dependabot pass-through is NOT handled here (unlike coppa) --
-          # this job's own top-level `if:` already excludes both entirely, matching
-          # pancetta's existing ci.yml codex-clean contract (see that step's own comment).
-          if [ "$BOOTSTRAP_STATUS" != "ready" ]; then
+          # merge_group (the constituent PR already passed a real Codex review during its
+          # own PR phase -- nothing further to review on this synthetic integration
+          # commit), OR Dependabot (round 8: no longer excluded at the job level, see the
+          # job's own header comment), OR bootstrap not live yet, OR the label already
+          # exists: pass through immediately with a completed, successful check-run.
+          if [ "$IS_MERGE_GROUP" = "true" ]; then
+            conclusion="success"
+          elif [ "$IS_DEPENDABOT" = "true" ]; then
+            conclusion="success"
+          elif [ "$BOOTSTRAP_STATUS" != "ready" ]; then
             conclusion="success"
           elif [ "$ALREADY_CLEAN" = "true" ]; then
             conclusion="success"
@@ -457,12 +476,19 @@ jobs:
           else
             summary="The codex-review-request job failed before it could create the managed check-run (run $RUN_ID). Push a new commit, or re-run the failed job and let it retry, to unblock this PR."
           fi
+          # Proactive fix, mirroring coppa's HAG-93 round-1 finding on the identical code:
+          # without a numeric external_id, this check-run can never be found by the
+          # numeric-external_id lookup filter on a future rerun -- a failed rerun would
+          # stack ANOTHER failure instead of recognizing this one already exists, and a
+          # successful rerun would create a separate managed check rather than patching
+          # this one, breaking the recovery path the summary promises.
           cat <<JSON | gh api "repos/$REPO/check-runs" --input -
           {
             "name": "Codex review clean (gate before expensive downstream jobs)",
             "head_sha": "$HEAD_SHA",
             "status": "completed",
             "conclusion": "failure",
+            "external_id": "$RUN_ID",
             "details_url": "https://github.com/$REPO/actions/runs/$RUN_ID",
             "output": {
               "title": "Codex review request setup failed",
