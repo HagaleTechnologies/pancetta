@@ -46,7 +46,7 @@ on:
 # instant push B supersedes it -- meaning A's codex-clean:<sha12> label can
 # never be produced. Without a concurrency block here too, A's `ci.yml` run
 # (including the codex-clean job above, which polls for exactly that label)
-# would keep running for its FULL 95-minute timeout as a zombie even though
+# would keep running for its FULL 130-minute timeout as a zombie even though
 # its only possible label producer was just cancelled.
 #
 # Unlike wait-for-codex.yml, this workflow also runs on push/schedule/
@@ -140,9 +140,19 @@ jobs:
   # signals this exact revision's Codex round raised nothing new. clippy
   # and fmt stay ungated (fast, ~2min, immediate feedback regardless of
   # review-round status). Self-contained (no external `uses:` call) since
-  # this repo is public. gate_timeout_minutes is fixed at 95, derived from
-  # this repo's OWN wait-for-codex job (75min timeout / 70min in-script
-  # poll bound, see wait-for-codex.yml).
+  # this repo is public.
+  #
+  # Codex P1, HAG-80 PR #399 round 16: gate_timeout_minutes was fixed at 95,
+  # derived only from THIS repo's own wait-for-codex job (75min timeout /
+  # 70min in-script poll bound) -- but that ignores credenza's org-wide
+  # codex-review-timeout-scan backstop (see wait-for-codex.yml's own
+  # "Update the check-run" step comment), which can re-request a review as
+  # late as 90 minutes in and doesn't fail the check outright until 120
+  # minutes. A poll that gives up at 88 minutes exits (and fails CI) before
+  # that backstop's own recovery has a chance to land a genuine success,
+  # discarding exactly the rerun-recovery path the backstop exists to
+  # provide. Extended to 130 minutes so this poll always outlasts the
+  # backstop's own worst-case 120-minute resolution.
   #
   # Codex P1, HAG-80 PR #399 round-3 review: this job's own display name
   # (which is also its check-run name) used to be IDENTICAL to the new,
@@ -157,7 +167,7 @@ jobs:
   codex-clean:
     name: Codex-clean label gate (waits for wait-for-codex.yml's verdict)
     runs-on: ubuntu-latest
-    timeout-minutes: 95
+    timeout-minutes: 130
     permissions:
       contents: read
       pull-requests: read
@@ -238,10 +248,12 @@ jobs:
         run: |
           target="codex-clean:${HEAD_SHA:0:12}"
           # In-script deadline runs a fixed 7-minute margin under this
-          # job's own 95-minute timeout-minutes, leaving slack for the
+          # job's own 130-minute timeout-minutes, leaving slack for the
           # loop to notice and error out cleanly before GitHub kills the
-          # job outright.
-          END=$((SECONDS + 95 * 60 - 420))
+          # job outright, while still comfortably outlasting credenza's
+          # org-wide timeout-scan backstop's own worst-case 120-minute
+          # resolution (see this job's header comment).
+          END=$((SECONDS + 130 * 60 - 420))
           while [ $SECONDS -lt $END ]; do
             # per_page=100: labels accumulate one per round with no
             # cleanup (deleting a stale label is itself a race that can

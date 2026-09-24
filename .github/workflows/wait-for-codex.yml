@@ -302,6 +302,7 @@ jobs:
           # "in_progress". Read by "Request a review" below.
           UPSERT_ID=""
           UPSERT_PRE_STATUS=""
+          UPSERT_PRE_TITLE=""
           # Codex P1, this PR's own round 7 (and independently on coppa's HAG-93): filtered
           # to external_id looking like a numeric run-id -- excludes GitHub's own native
           # per-job check-run attribution (a "skipped" check-run for any job whose `if:`
@@ -310,12 +311,14 @@ jobs:
           # existing check-run to PATCH whenever it happens to be the most recent entry
           # sharing this exact name.
           upsert_check_run() {
-            local name="$1" status="$2" conclusion="$3" existing_id existing_status lookup
+            local name="$1" status="$2" conclusion="$3" existing_id existing_status existing_title lookup
             lookup=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" \
               | jq -s "[.[].check_runs[] | select(.name == \"$name\") | select((.external_id // \"\") | test(\"^[0-9]+\$\"))] | sort_by(.started_at) | last")
             existing_id=$(echo "$lookup" | jq -r '.id // empty')
             existing_status=$(echo "$lookup" | jq -r '.status // empty')
+            existing_title=$(echo "$lookup" | jq -r '.output.title // empty')
             UPSERT_PRE_STATUS="$existing_status"
+            UPSERT_PRE_TITLE="$existing_title"
             if [ -n "$existing_id" ]; then
               if [ -n "$conclusion" ]; then
                 UPSERT_ID=$(gh api -X PATCH "repos/$REPO/check-runs/$existing_id" \
@@ -375,6 +378,7 @@ jobs:
             echo "check_run_id=$check_id"
             echo "conclusion=$conclusion"
             echo "pre_existing_status=$UPSERT_PRE_STATUS"
+            echo "pre_existing_title=$UPSERT_PRE_TITLE"
           } >> "$GITHUB_OUTPUT"
 
       - name: Request a review
@@ -389,6 +393,7 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PRE_EXISTING_STATUS: ${{ steps.create-check.outputs.pre_existing_status }}
+          PRE_EXISTING_TITLE: ${{ steps.create-check.outputs.pre_existing_title }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
             echo "CODEX_REVIEW_PAT not available -- skipping the request comment. A formal Codex review tied to this head still resolves the check normally via codex-review-response, once one lands."
@@ -417,7 +422,17 @@ jobs:
           # marker) then marked ready_for_review with the same unchanged head_sha would
           # otherwise wrongly baseline-and-ignore any unresolved findings from that
           # draft-era review.
-          if [ "$PRE_EXISTING_STATUS" = "completed" ]; then
+          #
+          # Codex P1, this PR's own round 16: codex-review-request-failsafe's own placeholder
+          # ("Codex review request setup failed", posted when the request job fails before
+          # create-check ever runs) also leaves this head_sha's check-run "completed" -- but
+          # that's not a genuine prior review outcome, just a stand-in saying setup itself
+          # never happened. Treating it the same as a real completed round meant the exact
+          # rerun-to-recover path the failsafe's own summary promises would suppress the
+          # marker, misclassify the eventual response as not-genuine, and let unresolved
+          # baseline threads keep blocking success even after a clean recovery. Excluded by
+          # its own distinctive title (must stay byte-identical to the failsafe's `output.title`).
+          if [ "$PRE_EXISTING_STATUS" = "completed" ] && [ "$PRE_EXISTING_TITLE" != "Codex review request setup failed" ]; then
             echo "This head_sha's check-run was already completed before this request -- not marking this round genuine (no new commit landed)."
           else
             gh api "repos/$REPO/issues/$PR/comments" -f body="<!-- codex-review-request head_sha=$HEAD_SHA -->" >/dev/null
