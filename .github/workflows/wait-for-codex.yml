@@ -1065,9 +1065,38 @@ jobs:
           # failure (covers every failure path, including the codex_errored one which never
           # goes through compute-verdict at all), so a later producer run for this SAME
           # head_sha correctly finds no label and proceeds with a real evaluation.
+          # Codex P1, this PR's own round-13 review: the original version's unconditional
+          # `|| true` discarded EVERY failure, including a transient API error or a genuine
+          # permission problem -- not just the expected "label already gone" case -- leaving
+          # the stale-label revival risk exactly as before, just now with a false sense of
+          # having fixed it. Retries (a transient failure is far more likely to be the cause
+          # than a permanent one), and requires either genuine success or a confirmed 404
+          # (the label was never there, or something else already removed it -- nothing left
+          # to do) before treating removal as complete. Deliberately does NOT block
+          # conclude_check's own finalization of the check-run on this succeeding, though
+          # (unlike Codex's own suggested "require success before finalizing the failure"):
+          # the check-run's own conclusion is the PRIMARY, must-always-be-accurate signal,
+          # and gating it on the Issues API's own availability would trade a rare label-
+          # cleanup failure for a WORSE outcome -- the real finding never reported at all
+          # during a transient Issues-API outage. A loud ::error:: (not a silently-swallowed
+          # warning) after 3 exhausted attempts makes a genuine failure visible instead,
+          # matching apply_clean_label's own established fail-open-but-loud precedent above.
           remove_clean_label() {
             local label="codex-clean:${HEAD_SHA:0:12}"
-            gh api -X DELETE "repos/$REPO/issues/$PR/labels/$label" >/dev/null 2>&1 || true
+            local err_file
+            for attempt in 1 2 3; do
+              err_file="$(mktemp)"
+              if gh api -X DELETE "repos/$REPO/issues/$PR/labels/$label" >/dev/null 2>"$err_file"; then
+                return 0
+              fi
+              if grep -qi "does not exist\|not found" "$err_file"; then
+                return 0
+              fi
+              echo "::warning::Failed to remove $label (attempt $attempt): $(cat "$err_file")" >&2
+              sleep 2
+            done
+            echo "::error::Could not confirm removal of $label after 3 attempts -- it may still exist and could wrongly revive this failed gate on a later rerun. Remove it manually if this recurs." >&2
+            return 1
           }
 
           conclude_check() {
