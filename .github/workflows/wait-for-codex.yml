@@ -924,7 +924,7 @@ jobs:
           # design, carried forward unchanged from its old wait-for-codex.yml. Never
           # deletes a stale/older label (cosmetic clutter, not a bug). Deliberately
           # fail-open (the caller wraps every call in `|| true`): ci.yml's own
-          # codex-clean job independently polls for this label for up to 130 minutes and
+          # codex-clean job independently polls for this label for up to 150 minutes and
           # fails loudly itself if it never appears, so a transient failure to apply it
           # here does not need to also fail THIS check red -- that would be double
           # jeopardy for one transient blip.
@@ -1235,7 +1235,7 @@ jobs:
 
           # NOTE, deliberate deviation from coppa's own PR #113 round-8 fix (dispatch
           # before conclude): this repo's downstream gate (ci.yml's codex-clean job,
-          # polling for the codex-clean label) already has its OWN independent 130-minute
+          # polling for the codex-clean label) already has its OWN independent 150-minute
           # timeout and fails loudly on its own if the label never appears -- unlike
           # coppa's ci-full.yml dispatch, which had NO other safety net if it silently
           # failed. Concluding this check "success" here does not need to be gated on the
