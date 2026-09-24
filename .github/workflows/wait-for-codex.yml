@@ -126,12 +126,22 @@ jobs:
     # The actual fix: keep this job's name DISTINCT (so its own native attribution, whatever
     # its outcome, never coincides with the managed check under any circumstance), and
     # publish the managed check EXPLICITLY via upsert_check_run on every path this job
-    # handles -- merge_group and Dependabot now call it directly (mirroring the real-round
-    # path below), rather than depending on native job-skip/job-success attribution for
-    # either. Draft PRs remain excluded at the job level (unchanged): a draft is never itself
-    # merge-attempted, and ready_for_review re-fires this job on the real path once it is.
+    # handles -- merge_group calls it directly (mirroring the real-round path below), rather
+    # than depending on native job-skip/job-success attribution.
+    #
+    # Codex P1, this PR's own round 14: round 8 ALSO moved Dependabot into this same
+    # explicit-upsert bucket (removing it from this job-level exclusion) -- but GitHub
+    # withholds Actions secrets for Dependabot-triggered pull_request_target events (the
+    # EXACT reason pancetta's own pre-migration file excluded Dependabot at the job level in
+    # the first place, per that file's own header comment), so the App-token mint step below
+    # fails before ever reaching the IS_DEPENDABOT success branch -- blocking every
+    # Dependabot PR instead of passing it through. Reverted: Dependabot is excluded at the
+    # job level again, exactly like Draft, both for the same underlying reason (this job's
+    # steps -- App-token mint included -- must never run for either). merge_group is
+    # unaffected by this revert: merge_group events are NOT Dependabot-triggered and have
+    # normal secret access, so its own explicit-upsert fix from round 8 stays correct.
     name: Codex review request (producer)
-    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request_target' && github.event.pull_request.draft == false)
+    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request_target' && github.event.pull_request.draft == false && github.actor != 'dependabot[bot]')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -268,12 +278,6 @@ jobs:
           ALREADY_CLEAN: ${{ steps.existing-label.outputs.already_clean || 'false' }}
           BOOTSTRAP_STATUS: ${{ steps.bootstrap-check.outputs.bootstrap_status || 'absent' }}
           IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
-          # Round 8: Dependabot is no longer excluded at the JOB level (that relied on
-          # native attribution under the managed name for its pass-through, the same flaw
-          # merge_group had) -- it now flows through this step like any other
-          # pull_request_target event and gets an explicit success upsert below, same as
-          # coppa's own design.
-          IS_DEPENDABOT: ${{ github.actor == 'dependabot[bot]' }}
         run: |
           set -o pipefail
 
@@ -335,12 +339,12 @@ jobs:
 
           # merge_group (the constituent PR already passed a real Codex review during its
           # own PR phase -- nothing further to review on this synthetic integration
-          # commit), OR Dependabot (round 8: no longer excluded at the job level, see the
-          # job's own header comment), OR bootstrap not live yet, OR the label already
-          # exists: pass through immediately with a completed, successful check-run.
+          # commit), OR bootstrap not live yet, OR the label already exists: pass through
+          # immediately with a completed, successful check-run. Dependabot never reaches
+          # this step at all -- excluded at the job level (see the job's own header
+          # comment), since GitHub withholds secrets from Dependabot-triggered runs and this
+          # step needs the minted App token.
           if [ "$IS_MERGE_GROUP" = "true" ]; then
-            conclusion="success"
-          elif [ "$IS_DEPENDABOT" = "true" ]; then
             conclusion="success"
           elif [ "$BOOTSTRAP_STATUS" != "ready" ]; then
             conclusion="success"
@@ -598,10 +602,27 @@ jobs:
         if: steps.head-check.outputs.stale != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CODEX_REVIEW_PAT: ${{ secrets.CODEX_REVIEW_PAT }}
           REPO: ${{ github.repository }}
           PR: ${{ steps.pr-context.outputs.pr }}
           HEAD_SHA: ${{ steps.pr-context.outputs.head_sha }}
         run: |
+          # Codex P1, this PR's own round 14: the marker comment is plain text anyone with
+          # comment access could type or paste verbatim -- without an author check, a PR
+          # author could forge `<!-- codex-review-request head_sha=X -->` on an unchanged
+          # head_sha to make it read as genuinely re-synced, letting unresolved baseline
+          # findings through the success path with no remediation commit. Only the identity
+          # behind CODEX_REVIEW_PAT can legitimately post this marker (the request job's own
+          # "Request a review" step), so resolve that identity's login dynamically here
+          # (never hardcode a specific account -- this same file is reused across
+          # HagaleTechnologies repos, and CODEX_REVIEW_PAT is a personal account's PAT, not a
+          # dedicated bot identity, so it can differ by repo/org) and require it on both the
+          # marker query below and marker_count's own query in compute-verdict.
+          TRUSTED_LOGIN=""
+          if [ -n "$CODEX_REVIEW_PAT" ]; then
+            TRUSTED_LOGIN=$(GH_TOKEN="$CODEX_REVIEW_PAT" gh api user --jq '.login' 2>/dev/null || echo "")
+          fi
+          echo "trusted_login=$TRUSTED_LOGIN" >> "$GITHUB_OUTPUT"
           # --paginate, piped into a separate `jq -s`: a heavily-discussed PR can push
           # comment count past 100, silently missing the truly most-recent "@codex review"
           # comment.
@@ -616,8 +637,9 @@ jobs:
           # NOT genuine, matching a bare manual re-request of unchanged code.
           if [ "$comment" != "null" ] && [ -n "$comment" ]; then
             comment_epoch=$(date -u -d "$(echo "$comment" | jq -r '.created_at')" +%s)
-            is_marked=$(echo "$all_comments" | jq --arg sha "$HEAD_SHA" --argjson after "$comment_epoch" '
+            is_marked=$(echo "$all_comments" | jq --arg sha "$HEAD_SHA" --arg login "$TRUSTED_LOGIN" --argjson after "$comment_epoch" '
               [.[] | select(.body == "<!-- codex-review-request head_sha=\($sha) -->")
+                   | select($login != "" and .user.login == $login)
                    | select((.created_at | fromdateiso8601) >= $after and (.created_at | fromdateiso8601) <= ($after + 10))
               ] | length > 0')
             echo "is_marked=$is_marked" >> "$GITHUB_OUTPUT"
@@ -811,6 +833,7 @@ jobs:
           HEAD_SHA: ${{ steps.pr-context.outputs.head_sha }}
           RUN_STARTED: ${{ steps.request-comment.outputs.run_started }}
           IS_MARKED: ${{ steps.request-comment.outputs.is_marked }}
+          TRUSTED_LOGIN: ${{ steps.request-comment.outputs.trusted_login }}
         run: |
           set -o pipefail
           # Read back the durable marker the request job posts: if more than one
@@ -821,8 +844,12 @@ jobs:
           # (distinct from real jq) has no --arg companion flag at all. --paginate, piped
           # into a separate `jq -s`, not `gh api`'s own --jq: a PR with more than 100
           # comments would otherwise only see the first page.
+          # Codex P1, this PR's own round 14: restricted to TRUSTED_LOGIN (the identity
+          # behind CODEX_REVIEW_PAT, resolved once in "Find the most recent request
+          # comment") -- without this, anyone able to comment could forge this exact marker
+          # text on an unchanged head_sha to make it read as genuinely re-synced.
           marker_count=$(gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" \
-            | jq -s "[.[][] | select(.body == \"<!-- codex-review-request head_sha=$HEAD_SHA -->\")] | length")
+            | jq -s --arg login "$TRUSTED_LOGIN" "[.[][] | select(.body == \"<!-- codex-review-request head_sha=$HEAD_SHA -->\") | select(\$login != \"\" and .user.login == \$login)] | length")
           # IS_MARKED (computed by "Find the most recent request comment" above)
           # additionally requires the SELECTED "@codex review" comment itself to be paired
           # with a marker -- a bare manual re-request has no marker at all, so marker_count
@@ -1101,7 +1128,20 @@ jobs:
 
           conclude_check() {
             local conclusion="$1"
-            [ "$conclusion" != "success" ] && remove_clean_label
+            # Codex P1, this PR's own round 14: this whole script runs under bash -e
+            # (GitHub Actions' own default shell for run: steps). `[ cond ] && cmd` where
+            # `cmd` (remove_clean_label) can legitimately return 1 after exhausting its own
+            # retries is a bare top-level statement, not the CONDITION of an if/while --
+            # under errexit that non-zero exit aborts THIS SCRIPT immediately, so
+            # conclude_check's own PATCH/POST below never runs at all when label removal
+            # fails. That's the opposite of the documented "don't block finalization on
+            # this" intent -- it made failed label removal WORSE than the original
+            # unconditional `|| true`, which at least didn't crash. Wrapped in a real `if`
+            # with an explicit `|| true` inside it, which fully neutralizes errexit for
+            # this call regardless of what remove_clean_label itself returns.
+            if [ "$conclusion" != "success" ]; then
+              remove_clean_label || true
+            fi
             if [ -n "$check_id" ]; then
               for attempt in 1 2 3; do
                 if [ "$conclusion" = "success" ]; then
