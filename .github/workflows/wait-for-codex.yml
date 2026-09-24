@@ -626,8 +626,17 @@ jobs:
           # --paginate, piped into a separate `jq -s`: a heavily-discussed PR can push
           # comment count past 100, silently missing the truly most-recent "@codex review"
           # comment.
+          #
+          # Codex P1, this PR's own round 15: round 14's TRUSTED_LOGIN filter only covered
+          # the marker below -- this selection of the "@codex review" comment itself was
+          # still unrestricted. A commenter who posts their own "@codex review" in the brief
+          # window between the automated request job's own "@codex review" and marker posts
+          # could have THEIRS selected as "last" (still chronologically before the genuine
+          # marker), shifting run_started to their forged timestamp while is_marked still
+          # matched the real marker landing within 10s after it. Filtered to TRUSTED_LOGIN
+          # here too, closing the gap completely.
           all_comments=$(gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" | jq -s '[.[][]]')
-          comment=$(echo "$all_comments" | jq '[.[] | select(.body == "@codex review")] | sort_by(.created_at) | last')
+          comment=$(echo "$all_comments" | jq --arg login "$TRUSTED_LOGIN" '[.[] | select(.body == "@codex review") | select($login != "" and .user.login == $login)] | sort_by(.created_at) | last')
           # A maintainer can manually type "@codex review" as a bare comment, bypassing
           # this workflow's own request job entirely -- that comment has no accompanying
           # marker (only the automated request job posts one), so counting markers alone
