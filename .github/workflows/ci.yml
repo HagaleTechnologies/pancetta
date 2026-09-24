@@ -208,7 +208,7 @@ jobs:
           # this label mechanism was added, so an existence-only check here
           # always resolves "ready," making the bootstrap escape hatch a
           # structural no-op on the very first synchronize push, deadlocking
-          # codex-clean for its full ~95min timeout waiting for a label that
+          # codex-clean for its full ~130min timeout waiting for a label that
           # can never arrive. Fetch the file's actual content and grep for
           # apply_clean_label -- present means genuinely migrated (ready);
           # absent means either the file doesn't exist yet, or it exists but

@@ -846,9 +846,45 @@ jobs:
             echo "responded=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Re-check the live head immediately before mutating threads
+        id: freshness-check
+        # Codex P1, this PR's own round 17: pr-context resolves HEAD_SHA once, early in
+        # this job -- request/response run in SEPARATE concurrency groups
+        # (codex-review-request-<PR> vs codex-review-response-<PR>), so a `synchronize`
+        # push landing after pr-context captured HEAD_SHA (but before this point) never
+        # cancels this run, unlike the old single-workflow design's one shared PR-wide
+        # group. Without this re-check, a long-running baseline/verdict computation could
+        # still reach the thread-mutation step below and auto-resolve PR-GLOBAL review
+        # threads (not scoped to any one commit) using a since-superseded head. Re-reading
+        # live, right before mutating, closes the window rather than widening the
+        # concurrency group -- cancel-in-progress: false on the response job is deliberate
+        # (an in-flight thread-resolution loop must finish cleanly, not be killed
+        # mid-mutation), so a shared cancellation domain isn't the right fix here.
+        if: steps.head-check.outputs.stale != 'true' && steps.verdict.outputs.responded == 'true' && steps.verdict.outputs.codex_errored != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.pr-context.outputs.pr }}
+          CAPTURED_HEAD_SHA: ${{ steps.pr-context.outputs.head_sha }}
+        run: |
+          CURRENT_HEAD_SHA=""
+          for _ in 1 2 3; do
+            CURRENT_HEAD_SHA=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/tmp/freshness-err.log) && break
+            echo "::warning::Transient error re-checking PR head -- retrying in 5s: $(cat /tmp/freshness-err.log)"
+            sleep 5
+          done
+          if [ -z "$CURRENT_HEAD_SHA" ]; then
+            echo "::warning::Could not re-verify PR #$PR's live head after 3 attempts -- failing open (proceeding with the originally captured head) rather than blocking this response indefinitely: $(cat /tmp/freshness-err.log)"
+            exit 0
+          fi
+          if [ "$CAPTURED_HEAD_SHA" != "$CURRENT_HEAD_SHA" ]; then
+            echo "::notice::PR #$PR's head advanced from $CAPTURED_HEAD_SHA to $CURRENT_HEAD_SHA while this response was being computed -- skipping thread mutation as superseded. The new head's own request/response cycle supersedes this one."
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Compute the verdict and auto-resolve eligible threads
         id: compute-verdict
-        if: steps.head-check.outputs.stale != 'true' && steps.verdict.outputs.responded == 'true' && steps.verdict.outputs.codex_errored != 'true'
+        if: steps.head-check.outputs.stale != 'true' && steps.verdict.outputs.responded == 'true' && steps.verdict.outputs.codex_errored != 'true' && steps.freshness-check.outputs.stale != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RESOLVE_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
@@ -888,7 +924,7 @@ jobs:
           # design, carried forward unchanged from its old wait-for-codex.yml. Never
           # deletes a stale/older label (cosmetic clutter, not a bug). Deliberately
           # fail-open (the caller wraps every call in `|| true`): ci.yml's own
-          # codex-clean job independently polls for this label for up to 95 minutes and
+          # codex-clean job independently polls for this label for up to 130 minutes and
           # fails loudly itself if it never appears, so a transient failure to apply it
           # here does not need to also fail THIS check red -- that would be double
           # jeopardy for one transient blip.
@@ -1087,7 +1123,13 @@ jobs:
           done
 
       - name: Update the check-run
-        if: always() && steps.head-check.outputs.stale != 'true' && steps.verdict.outputs.responded == 'true'
+        # freshness-check's own `stale` output must also gate this step (not just
+        # compute-verdict): without it, a stale head would leave $OUTCOME empty (compute-
+        # verdict skipped, codex_errored not set either) and conclude_check below would
+        # misread that as a real failure -- PATCHing the check-run to "Codex raised new
+        # concerns" and removing its clean label for a head_sha nothing was actually wrong
+        # with, purely because this run lost a race with a newer push.
+        if: always() && steps.head-check.outputs.stale != 'true' && steps.verdict.outputs.responded == 'true' && steps.freshness-check.outputs.stale != 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
@@ -1193,7 +1235,7 @@ jobs:
 
           # NOTE, deliberate deviation from coppa's own PR #113 round-8 fix (dispatch
           # before conclude): this repo's downstream gate (ci.yml's codex-clean job,
-          # polling for the codex-clean label) already has its OWN independent 95-minute
+          # polling for the codex-clean label) already has its OWN independent 130-minute
           # timeout and fails loudly on its own if the label never appears -- unlike
           # coppa's ci-full.yml dispatch, which had NO other safety net if it silently
           # failed. Concluding this check "success" here does not need to be gated on the
