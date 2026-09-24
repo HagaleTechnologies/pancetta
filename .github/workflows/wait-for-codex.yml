@@ -1040,6 +1040,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
+          PR: ${{ steps.pr-context.outputs.pr }}
           HEAD_SHA: ${{ steps.pr-context.outputs.head_sha }}
           RUN_ID: ${{ github.run_id }}
           # A genuine Codex error (codex_errored) counts as a failed outcome even though
@@ -1053,8 +1054,25 @@ jobs:
           check_id=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" \
             | jq -s '[.[].check_runs[] | select(.name == "Codex review clean (gate before expensive downstream jobs)") | select((.external_id // "") | test("^[0-9]+$"))] | sort_by(.started_at) | last | .id // empty')
 
+          # Codex P1, this PR's own round 12 review: if this exact head_sha PREVIOUSLY passed
+          # (apply_clean_label applied a label for it), then a LATER response on the SAME
+          # head_sha (a rerun, or a reopen) finds a genuine new/restated concern, that earlier
+          # label still sits on the PR untouched -- apply_clean_label only ever ADDS it,
+          # nothing removes it. The producer job's "Self-heal: does the codex-clean label
+          # already exist" step treats ANY existing label for this head as authoritative and
+          # skips straight to success without requesting a fresh round -- reviving a
+          # since-failed gate from stale data. Remove the label whenever THIS conclusion is
+          # failure (covers every failure path, including the codex_errored one which never
+          # goes through compute-verdict at all), so a later producer run for this SAME
+          # head_sha correctly finds no label and proceeds with a real evaluation.
+          remove_clean_label() {
+            local label="codex-clean:${HEAD_SHA:0:12}"
+            gh api -X DELETE "repos/$REPO/issues/$PR/labels/$label" >/dev/null 2>&1 || true
+          }
+
           conclude_check() {
             local conclusion="$1"
+            [ "$conclusion" != "success" ] && remove_clean_label
             if [ -n "$check_id" ]; then
               for attempt in 1 2 3; do
                 if [ "$conclusion" = "success" ]; then
