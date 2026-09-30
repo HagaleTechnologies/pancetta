@@ -3,8 +3,10 @@
 [project]
 linear_team = "PAN"
 
-# Mirrors .github/workflows/ci.yml and rust-toolchain.toml. CI builds and tests
-# with no environment variables, so none are declared. pancetta-research is
+# Mirrors .github/workflows/ci.yml and rust-toolchain.toml. No secrets or
+# configuration variables are declared. The workspace lane links the whole tree
+# several times and ran out of disk with full debuginfo, so, like CI, verify
+# sets CARGO_PROFILE_{DEV,TEST}_DEBUG=line-tables-only. pancetta-research is
 # excluded from CI's workspace steps and from verify here.
 
 [environment.container.git]
@@ -33,10 +35,10 @@ cache_key_files = ["Cargo.lock"]
 
 [[environment.verify]]
 name = "check-workspace"
-run = ["cargo", "check", "--workspace", "--exclude", "pancetta-research"]
+run = ["env", "CARGO_PROFILE_DEV_DEBUG=line-tables-only", "CARGO_PROFILE_TEST_DEBUG=line-tables-only", "cargo", "check", "--workspace", "--exclude", "pancetta-research"]
 timeout_seconds = 1800
 
 [[environment.verify]]
 name = "test-workspace"
-run = ["cargo", "test", "--workspace", "--exclude", "pancetta-research", "--features", "transmit"]
+run = ["env", "CARGO_PROFILE_DEV_DEBUG=line-tables-only", "CARGO_PROFILE_TEST_DEBUG=line-tables-only", "cargo", "test", "--workspace", "--exclude", "pancetta-research", "--features", "transmit"]
 timeout_seconds = 3300
