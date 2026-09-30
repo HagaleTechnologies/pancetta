@@ -1,0 +1,42 @@
+#:schema https://staging.catalystcloud.dev/schemas/catalyst.schema.json
+
+[project]
+linear_team = "PAN"
+
+# Mirrors .github/workflows/ci.yml and rust-toolchain.toml. CI builds and tests
+# with no environment variables, so none are declared. pancetta-research is
+# excluded from CI's workspace steps and from verify here.
+
+[environment.container.git]
+submodules = true # pancetta-ft8/vendor/ft8_lib
+
+[[environment.toolchains]]
+name = "rust"
+version = "stable"
+
+[[environment.system_packages]]
+name = "libasound2-dev"
+
+[[environment.system_packages]]
+name = "libudev-dev"
+
+[[environment.system_packages]]
+name = "libssl-dev"
+
+[[environment.system_packages]]
+name = "pkg-config"
+
+[[environment.setup]]
+name = "fetch-dependencies"
+run = ["cargo", "fetch", "--locked"]
+cache_key_files = ["Cargo.lock"]
+
+[[environment.verify]]
+name = "check-workspace"
+run = ["cargo", "check", "--workspace", "--exclude", "pancetta-research"]
+timeout_seconds = 1800
+
+[[environment.verify]]
+name = "test-workspace"
+run = ["cargo", "test", "--workspace", "--exclude", "pancetta-research", "--features", "transmit"]
+timeout_seconds = 3300
