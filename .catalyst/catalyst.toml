@@ -1,0 +1,44 @@
+#:schema https://staging.catalystcloud.dev/schemas/catalyst.schema.json
+
+[project]
+linear_team = "PAN"
+
+# Mirrors .github/workflows/ci.yml and rust-toolchain.toml. No secrets or
+# configuration variables are declared. The workspace lane links the whole tree
+# several times and ran out of disk with full debuginfo, so, like CI, verify
+# sets CARGO_PROFILE_{DEV,TEST}_DEBUG=line-tables-only. pancetta-research is
+# excluded from CI's workspace steps and from verify here.
+
+[environment.container.git]
+submodules = true # pancetta-ft8/vendor/ft8_lib
+
+[[environment.toolchains]]
+name = "rust"
+version = "stable"
+
+[[environment.system_packages]]
+name = "libasound2-dev"
+
+[[environment.system_packages]]
+name = "libudev-dev"
+
+[[environment.system_packages]]
+name = "libssl-dev"
+
+[[environment.system_packages]]
+name = "pkg-config"
+
+[[environment.setup]]
+name = "fetch-dependencies"
+run = ["cargo", "fetch", "--locked"]
+cache_key_files = ["Cargo.lock"]
+
+[[environment.verify]]
+name = "check-workspace"
+run = ["env", "CARGO_PROFILE_DEV_DEBUG=line-tables-only", "CARGO_PROFILE_TEST_DEBUG=line-tables-only", "cargo", "check", "--workspace", "--exclude", "pancetta-research"]
+timeout_seconds = 1800
+
+[[environment.verify]]
+name = "test-workspace"
+run = ["env", "CARGO_PROFILE_DEV_DEBUG=line-tables-only", "CARGO_PROFILE_TEST_DEBUG=line-tables-only", "cargo", "test", "--workspace", "--exclude", "pancetta-research", "--features", "transmit"]
+timeout_seconds = 3300
