@@ -7898,10 +7898,19 @@ async fn maybe_enrich_from_qrz(
         return;
     }
 
-    let callsign = match metadata.their_callsign.as_ref() {
-        Some(c) if !c.trim().is_empty() => c.trim().to_string(),
+    let trimmed = match metadata.their_callsign.as_deref().map(str::trim) {
+        Some(c) if !c.is_empty() => c,
         _ => return,
     };
+    // Resolve an FT8 hash render ("<W5ABC>") to the plain call before it
+    // becomes the QRZ query and the cache key: `needs_qrz_enrichment` already
+    // resolves it (via `entity_for_callsign`), and QRZ has no record for the
+    // bracketed token. The unresolved "<...>" placeholder names no station,
+    // so there is nothing to look up.
+    let Some(resolved) = pancetta_core::callsign::resolve_hash_render(trimmed) else {
+        return;
+    };
+    let callsign = resolved.to_string();
     let key = callsign.to_ascii_uppercase();
 
     // Session cache: reuse a prior hit OR miss for this callsign.
@@ -8848,6 +8857,39 @@ mod qrz_enrichment_tests {
         // grid missing -> fires regardless of entity (pre-existing behaviour)
         let j2 = metadata(None, None);
         assert!(needs_qrz_enrichment(&j2));
+    }
+
+    /// A hash-rendered completed call ("<W5ABC>") is resolved before the
+    /// session-cache key and the QRZ request are built, so it shares the plain
+    /// call's entry instead of caching a miss for the bracketed token. The
+    /// unresolved "<...>" placeholder is never looked up or cached.
+    #[tokio::test]
+    async fn enrichment_resolves_hash_rendered_call_before_cache_and_lookup() {
+        use super::maybe_enrich_from_qrz;
+        use std::collections::HashMap;
+        use tokio::sync::Mutex;
+
+        let client = pancetta_dx::QrzXmlClient::new("user", "pass", "pancetta-test");
+        let cache = Mutex::new(HashMap::new());
+        cache.lock().await.insert(
+            "W5ABC".to_string(),
+            Some(QrzLookup {
+                call: Some("W5ABC".into()),
+                state: Some("AR".into()),
+                ..lookup(None, None)
+            }),
+        );
+
+        let mut m = us_metadata(Some("EM34"));
+        m.their_callsign = Some("<W5ABC>".to_string());
+        maybe_enrich_from_qrz(&mut m, &client, &cache).await;
+        assert_eq!(m.their_state.as_deref(), Some("AR"));
+        assert!(!cache.lock().await.contains_key("<W5ABC>"));
+
+        let mut p = metadata(None, None);
+        p.their_callsign = Some("<...>".to_string());
+        maybe_enrich_from_qrz(&mut p, &client, &cache).await;
+        assert_eq!(cache.lock().await.len(), 1);
     }
 }
 
