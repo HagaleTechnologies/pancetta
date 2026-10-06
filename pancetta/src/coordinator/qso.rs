@@ -7902,6 +7902,13 @@ async fn maybe_enrich_from_qrz(
         Some(c) if !c.trim().is_empty() => c.trim().to_string(),
         _ => return,
     };
+    // A resolved hash render ("<W5ABC>") passes `needs_qrz_enrichment`'s
+    // US-related check, so query QRZ (and key the cache) by the plain call it
+    // represents. The unresolved "<...>" placeholder has no identity to look up.
+    let callsign = match pancetta_core::callsign::resolve_hash_render(&callsign) {
+        Some(c) => c.to_string(),
+        None => return,
+    };
     let key = callsign.to_ascii_uppercase();
 
     // Session cache: reuse a prior hit OR miss for this callsign.
@@ -8848,6 +8855,35 @@ mod qrz_enrichment_tests {
         // grid missing -> fires regardless of entity (pre-existing behaviour)
         let j2 = metadata(None, None);
         assert!(needs_qrz_enrichment(&j2));
+    }
+
+    /// A resolved hash render ("<W5ABC>") passes the US-state gate, so the
+    /// session cache and the QRZ request must use the plain call it
+    /// represents -- otherwise the bracketed token misses, is sent to QRZ
+    /// verbatim, and the state is never learned. The cache is pre-seeded
+    /// under "W5ABC" so the fixed path never reaches the network.
+    #[tokio::test]
+    async fn enrichment_resolves_hash_rendered_call_before_cache_and_lookup() {
+        use super::maybe_enrich_from_qrz;
+        use std::collections::HashMap;
+        use tokio::sync::Mutex;
+
+        let client = pancetta_dx::QrzXmlClient::new("user", "pass", "pancetta-test");
+        let cache = Mutex::new(HashMap::new());
+        cache.lock().await.insert(
+            "W5ABC".to_string(),
+            Some(QrzLookup {
+                state: Some("AR".into()),
+                ..lookup(None, None)
+            }),
+        );
+
+        let mut m = us_metadata(Some("EM34"));
+        m.their_callsign = Some("<W5ABC>".to_string());
+        maybe_enrich_from_qrz(&mut m, &client, &cache).await;
+
+        assert_eq!(m.their_state.as_deref(), Some("AR"));
+        assert!(!cache.lock().await.contains_key("<W5ABC>"));
     }
 }
 
