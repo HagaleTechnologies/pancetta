@@ -7899,10 +7899,17 @@ async fn maybe_enrich_from_qrz(
     }
 
     let callsign = match metadata.their_callsign.as_ref() {
-        Some(c) if !c.trim().is_empty() => c.trim().to_string(),
+        Some(c) if !c.trim().is_empty() => c.trim().to_ascii_uppercase(),
         _ => return,
     };
-    let key = callsign.to_ascii_uppercase();
+    // A resolved FT8 hash render ("<W5ABC>") is looked up and cached as the
+    // plain call it represents; the unresolved "<...>" placeholder names no
+    // station, so there is nothing to look up.
+    let callsign = match pancetta_core::callsign::resolve_hash_render(&callsign) {
+        Some(c) => c.to_string(),
+        None => return,
+    };
+    let key = callsign.clone();
 
     // Session cache: reuse a prior hit OR miss for this callsign.
     if let Some(cached) = cache.lock().await.get(&key).cloned() {
@@ -8848,6 +8855,40 @@ mod qrz_enrichment_tests {
         // grid missing -> fires regardless of entity (pre-existing behaviour)
         let j2 = metadata(None, None);
         assert!(needs_qrz_enrichment(&j2));
+    }
+
+    /// A resolved FT8 hash render ("<W5ABC>") is looked up -- and cached --
+    /// under its plain callsign, so a prior QRZ hit for W5ABC fills the state.
+    /// The unresolved "<...>" placeholder identifies no station and is never
+    /// looked up (nothing is cached for it). Both cases are served without
+    /// network access once the call is resolved.
+    #[tokio::test]
+    async fn enrichment_resolves_hash_rendered_call_before_cache_and_lookup() {
+        use super::maybe_enrich_from_qrz;
+        use std::collections::HashMap;
+        use tokio::sync::Mutex;
+
+        let client = pancetta_dx::QrzXmlClient::new("user", "pass", "pancetta-test");
+        let cache: Mutex<HashMap<String, Option<QrzLookup>>> = Mutex::new(HashMap::new());
+        cache.lock().await.insert(
+            "W5ABC".to_string(),
+            Some(QrzLookup {
+                state: Some("AR".into()),
+                ..lookup(None, None)
+            }),
+        );
+
+        let mut m = us_metadata(Some("EM34"));
+        m.their_callsign = Some("<W5ABC>".to_string());
+        maybe_enrich_from_qrz(&mut m, &client, &cache).await;
+        assert_eq!(m.their_state.as_deref(), Some("AR"));
+        assert!(!cache.lock().await.contains_key("<W5ABC>"));
+
+        let mut unresolved = metadata(None, None);
+        unresolved.their_callsign = Some("<...>".to_string());
+        maybe_enrich_from_qrz(&mut unresolved, &client, &cache).await;
+        assert!(unresolved.grids.theirs.is_none());
+        assert_eq!(cache.lock().await.len(), 1);
     }
 }
 
