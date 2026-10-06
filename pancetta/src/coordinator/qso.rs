@@ -7898,11 +7898,18 @@ async fn maybe_enrich_from_qrz(
         return;
     }
 
-    let callsign = match metadata.their_callsign.as_ref() {
-        Some(c) if !c.trim().is_empty() => c.trim().to_string(),
+    let raw = match metadata.their_callsign.as_ref() {
+        Some(c) if !c.trim().is_empty() => c.trim().to_ascii_uppercase(),
         _ => return,
     };
-    let key = callsign.to_ascii_uppercase();
+    // A resolved FT8 hash render ("<W5ABC>") is looked up and cached as the
+    // plain call it represents; the unresolved "<...>" placeholder names no
+    // station, so it is never sent to QRZ.
+    let Some(callsign) = pancetta_core::callsign::resolve_hash_render(&raw) else {
+        return;
+    };
+    let callsign = callsign.to_string();
+    let key = callsign.clone();
 
     // Session cache: reuse a prior hit OR miss for this callsign.
     if let Some(cached) = cache.lock().await.get(&key).cloned() {
@@ -8848,6 +8855,46 @@ mod qrz_enrichment_tests {
         // grid missing -> fires regardless of entity (pre-existing behaviour)
         let j2 = metadata(None, None);
         assert!(needs_qrz_enrichment(&j2));
+    }
+
+    /// A completed QSO logged under a resolved FT8 hash render ("<W5ABC>")
+    /// is enriched from the plain call's QRZ record: the gate already treats
+    /// it as United States, so the cache key and the QRZ request must use
+    /// the resolved call too. The cache is seeded with a hit under "W5ABC",
+    /// so the fixed path never touches the network. The unresolved "<...>"
+    /// placeholder names no station: it is neither looked up nor cached.
+    #[tokio::test]
+    async fn enrichment_resolves_hash_rendered_call_before_cache_and_lookup() {
+        use super::maybe_enrich_from_qrz;
+        use std::collections::HashMap;
+        use tokio::sync::Mutex;
+
+        let mut m = us_metadata(Some("EM34"));
+        m.their_callsign = Some("<W5ABC>".to_string());
+        let client = pancetta_dx::QrzXmlClient::new("user", "pass", "pancetta-test");
+        let mut seeded = HashMap::new();
+        seeded.insert(
+            "W5ABC".to_string(),
+            Some(QrzLookup {
+                call: Some("W5ABC".to_string()),
+                state: Some("AR".into()),
+                ..lookup(None, None)
+            }),
+        );
+        let cache = Mutex::new(seeded);
+
+        maybe_enrich_from_qrz(&mut m, &client, &cache).await;
+
+        assert_eq!(m.their_state.as_deref(), Some("AR"));
+
+        // Grid missing, so the gate fires; the placeholder still returns
+        // before the cache or the client is touched.
+        let mut p = metadata(None, None);
+        p.their_callsign = Some("<...>".to_string());
+        let empty = Mutex::new(HashMap::new());
+        maybe_enrich_from_qrz(&mut p, &client, &empty).await;
+        assert!(empty.lock().await.is_empty());
+        assert!(p.grids.theirs.is_none());
     }
 }
 
