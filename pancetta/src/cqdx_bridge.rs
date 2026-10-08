@@ -183,6 +183,12 @@ impl CqdxBridge {
             // Last band we re-fetched per-band needs for. `None` until the
             // dial frequency is first observed.
             let mut last_needed_band: Option<String> = None;
+            // PAN-85: remember the last US state actually forwarded for each
+            // callsign (uppercased key), so a state that is learned *or
+            // corrected* later still reaches the TUI. Repeats of an unchanged
+            // value are suppressed.
+            let mut sent_states: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
 
             loop {
                 timer.tick().await;
@@ -324,6 +330,25 @@ impl CqdxBridge {
                                 tx.send(pancetta_tui::tui_runner::TuiMessage::SpotGroupUpdate {
                                     spots: spot_infos,
                                 });
+
+                            // PAN-85: a cqdx network-only spot for a
+                            // previously-worked US station also gets its
+                            // state, so DX Hunter shows it even without a
+                            // local decode.
+                            for g in &groups {
+                                if let Some(state) = cached_lookup.state_for(&g.dx_call) {
+                                    let key = g.dx_call.to_uppercase();
+                                    if sent_states.get(&key) != Some(&state) {
+                                        sent_states.insert(key, state.clone());
+                                        let _ = tx.send(
+                                            pancetta_tui::tui_runner::TuiMessage::StationState {
+                                                callsign: g.dx_call.clone(),
+                                                state,
+                                            },
+                                        );
+                                    }
+                                }
+                            }
                         }
 
                         // Update cache

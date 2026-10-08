@@ -467,6 +467,13 @@ pub struct QsoMetadata {
     /// Grid squares
     pub grids: GridSquares,
 
+    /// The contacted station's primary administrative subdivision (ADIF
+    /// `STATE`) when known — e.g. "AR". Populated by ADIF import and by QRZ
+    /// XML enrichment; `None` for a live QSO whose state was never looked up.
+    /// PAN-85. Never inferred from a callsign prefix.
+    #[serde(default)]
+    pub their_state: Option<String>,
+
     /// Contest information
     pub contest_info: Option<ContestInfo>,
 
@@ -1153,6 +1160,54 @@ mod tests {
         let mut idle = QsoState::Idle;
         assert!(!idle.set_frequency(1750.0));
         assert_eq!(idle.frequency(), None);
+    }
+
+    /// A minimal, fully-populated `QsoMetadata` for serde round-trip tests.
+    fn test_metadata(their_callsign: &str) -> QsoMetadata {
+        QsoMetadata {
+            qso_id: Uuid::new_v4(),
+            our_callsign: "K5ARH".to_string(),
+            their_callsign: Some(their_callsign.to_string()),
+            frequency: 14_074_000.0,
+            completed_rf_frequency_hz: None,
+            mode: "FT8".to_string(),
+            start_time: Utc::now(),
+            end_time: None,
+            reports: SignalReports::default(),
+            grids: GridSquares::default(),
+            their_state: None,
+            contest_info: None,
+            tags: HashMap::new(),
+            notes: None,
+            tx_parity: None,
+            tx_parity_provisional: false,
+            initiated_by: CallInitiation::default(),
+            role: QsoRole::default(),
+            call_count: 0,
+            first_call_at: None,
+            last_call_at: None,
+            progressed_this_cycle: false,
+            stall_cycles: 0,
+            last_known_good_offset_hz: None,
+            advance_generation: 0,
+            pre_switch_offset: None,
+            hound: false,
+            partner_freq: None,
+            pending_freq_drift: None,
+            hound_qsyed: false,
+            remote_origin: false,
+            remote_client_key_id: None,
+        }
+    }
+
+    #[test]
+    fn qso_metadata_deserializes_without_their_state() {
+        // Back-compat: rows written before PAN-85 have no `their_state` key.
+        let json = serde_json::to_value(test_metadata("W5ABC")).unwrap();
+        let mut obj = json.as_object().unwrap().clone();
+        obj.remove("their_state");
+        let back: QsoMetadata = serde_json::from_value(obj.into()).unwrap();
+        assert!(back.their_state.is_none());
     }
 
     #[test]

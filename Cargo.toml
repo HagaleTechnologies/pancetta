@@ -157,7 +157,13 @@ overflow-checks = true
 [profile.dev]
 # Fast compilation for development
 opt-level = 1
-debug = true
+# PAN-85: remediation hit the relay slot's 20 GiB disk budget. Omit full
+# debug info and incremental caches to reduce disposable build artifacts.
+# Tests inherit this profile; keep assertions and unwind
+# behavior while bounding disposable build artifacts. Local debugging can
+# opt back in with CARGO_PROFILE_DEV_DEBUG=2 and CARGO_INCREMENTAL=1.
+debug = 0
+incremental = false
 # panic = "unwind" so backtraces and panic catching work during testing —
 # release keeps "abort" for binary size and predictable failure semantics.
 panic = "unwind"

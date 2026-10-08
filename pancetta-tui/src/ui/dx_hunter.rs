@@ -141,6 +141,20 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
     Ok(())
 }
 
+/// The Entity cell: cqdx's authoritative name first, offline prefix
+/// resolver second, `"---"` when neither resolves — with the station's
+/// US state/territory appended when known (PAN-85).
+fn entity_cell_text(station: &DxStation, state: Option<&str>) -> String {
+    match station
+        .entity_name
+        .clone()
+        .or_else(|| crate::dxcc::entity_for_callsign(&station.call_sign).map(str::to_string))
+    {
+        Some(entity) => crate::dxcc::format_entity_with_state(&entity, state),
+        None => "---".to_string(),
+    }
+}
+
 fn create_dx_row<'a>(station: &'a DxStation, app: &App) -> Row<'a> {
     // Cross-panel global focus (Task 2): when some OTHER panel is active and
     // this row's callsign is the operator's current focus, flag it here too
@@ -232,14 +246,7 @@ fn create_dx_row<'a>(station: &'a DxStation, app: &App) -> Row<'a> {
     };
 
     let grid_str = station.grid_square.as_deref().unwrap_or("---").to_string();
-    // Prefer cqdx's authoritative entity name; fall back to the offline
-    // prefix resolver for local decodes (which carry no cqdx metadata), so the
-    // DXCC column isn't "---" for every locally-heard station.
-    let entity_str = station
-        .entity_name
-        .clone()
-        .or_else(|| crate::dxcc::entity_for_callsign(&station.call_sign).map(str::to_string))
-        .unwrap_or_else(|| "---".to_string());
+    let entity_str = entity_cell_text(station, app.station_state_for(&station.call_sign));
     // A pure network spot with no reported SNR stores snr:0, which is
     // indistinguishable from a real 0 dB. Render it as "---" so the operator
     // doesn't read a missing value as a strong-but-zero signal. Local decodes
@@ -517,6 +524,39 @@ mod tests {
         let station = make_test_station("W1XYZ");
         let call_display = format_call_display(&station, false);
         assert!(!call_display.contains('◇'));
+    }
+
+    // --- PAN-85: Entity cell state suffix ---
+
+    #[test]
+    fn entity_cell_appends_known_state_for_us_station() {
+        let s = make_test_station("W5ABC"); // no entity_name -> offline resolver -> United States
+        assert_eq!(entity_cell_text(&s, Some("AR")), "United States - AR");
+    }
+
+    #[test]
+    fn entity_cell_without_state_is_entity_alone() {
+        let s = make_test_station("W5ABC");
+        assert_eq!(entity_cell_text(&s, None), "United States");
+    }
+
+    #[test]
+    fn entity_cell_never_suffixes_a_non_us_entity() {
+        let s = make_test_station("JA1ABC");
+        assert_eq!(entity_cell_text(&s, Some("AR")), "Japan");
+    }
+
+    #[test]
+    fn entity_cell_prefers_cqdx_entity_name_and_still_suffixes() {
+        let mut s = make_test_station("W5ABC");
+        s.entity_name = Some("United States".into());
+        assert_eq!(entity_cell_text(&s, Some("ar")), "United States - AR");
+    }
+
+    #[test]
+    fn entity_cell_unresolvable_stays_dashes() {
+        let s = make_test_station("<...>");
+        assert_eq!(entity_cell_text(&s, Some("AR")), "---");
     }
 
     fn make_test_station(call: &str) -> crate::app::DxStation {
