@@ -87,6 +87,7 @@ pub const US_RELATED_ENTITIES: &[&str] = &[
     "Guantanamo Bay",
     "Hawaii",
     "Johnston Island",
+    "Kure Island",
     "Mariana Islands",
     "Midway Island",
     "Navassa Island",
@@ -244,6 +245,7 @@ mod tests {
             "Guam",
             "Midway Island",
             "Johnston Island",
+            "Kure Island",
             "Palmyra & Jarvis Islands",
             "Mariana Islands",
         ] {
@@ -310,6 +312,11 @@ mod tests {
         assert_eq!(
             format_entity_with_state("Puerto Rico", Some("PR")),
             "Puerto Rico - PR"
+        );
+        // KH7K/AH7K/NH7K resolve to Kure Island, logged with STATE=HI.
+        assert_eq!(
+            format_entity_with_state("Kure Island", Some("HI")),
+            "Kure Island - HI"
         );
     }
 
