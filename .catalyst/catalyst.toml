@@ -12,9 +12,12 @@ linear_team = "PAN"
 [environment.container.git]
 submodules = true # pancetta-ft8/vendor/ft8_lib
 
+# Catalyst's runner can't install Rust: the entry must equal the image's 1.98.0
+# ("stable" is not a documented value). rust-toolchain.toml keeps floating on
+# stable for CI's drift check; Catalyst does not read it.
 [[environment.toolchains]]
 name = "rust"
-version = "stable"
+version = "1.98.0"
 
 [[environment.system_packages]]
 name = "libasound2-dev"
