@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// Database / QSO-log persistence settings.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DatabaseConfig {
     /// Layer 2 timeline persistence
     /// (docs/observability-diagnostics-plan.md §"Persist the timeline").

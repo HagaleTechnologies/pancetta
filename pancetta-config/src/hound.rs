@@ -25,6 +25,7 @@ fn default_response_max() -> f64 {
 ///
 /// Corresponds to the `[hound]` section in the TOML config file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct HoundConfig {
     /// Low calling-region min audio offset (Hz). Default 300.
     #[serde(default = "default_call_min")]

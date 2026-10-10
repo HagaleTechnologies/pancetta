@@ -72,6 +72,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Saved rig-config bookmarks (PAN-61): the `i` rig picker can now save the current model/port/baud/PTT as a named bookmark (`F3`) and load one back into the form later (`F2`), without retyping. Builds on PAN-59's live rig-config switch.
 
+<<<<<<< HEAD
 ### Fixed
 
 - Shift+Q emergency stop now works while a dialog or overlay is open
@@ -83,6 +84,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   composer and the rig picker's text fields, Shift+Q (or Caps Lock + q) now
   stops the station instead of typing a capital Q; lowercase `q` still types
   Q in the composer.
+=======
+
+### Fixed
+
+- Every documented minimal config block now parses on its own (PAN-90): the
+  README's `[autonomous] enabled = true`, both GUIDE.md GridTracker
+  `[network.wsjtx_udp]` recipes, and CONFIG.md's minimum viable config used
+  to fail with `missing field …`. Every config table now accepts a partial
+  table; omitted keys keep their documented defaults.
+- A broken config file no longer silently runs the station on all-default
+  settings (callsign N0CALL): `pancetta config --validate` exits non-zero on a
+  file that fails to load, prints which file(s) it read, and never opens the
+  first-run wizard.
+- Load warnings for an explicit `--config` file now reach the console and the
+  TUI diagnostics list.
+- The TUI rig picker no longer writes a config file that fails to load on the
+  next start (`missing field 'data_bits'`).
+
+### Changed
+
+- A config file that exists but fails to load now stops startup with an error
+  naming the file, instead of being skipped with a warning. Run
+  `pancetta config --validate` to find the broken line.
+- Unknown config keys are now warned about at any depth (e.g. `enable` in
+  `[network.wsjtx_udp]`), not only unknown top-level sections.
+- The config search path is deduplicated (`~/.config/pancetta` was read twice
+  on Linux) and documented in docs/CONFIG.md.
+- `pancetta setup` and the first-run wizard now write only the keys you
+  changed, merged into your existing file with its comments kept, instead of
+  replacing it with the full ~960-line schema. A file that does not load, or
+  that the startup recovery prompt rewrites from defaults, is kept as
+  `pancetta.toml.bak` (or the next free `pancetta.toml.bak.N`) before a fresh
+  one is written. The TUI device
+  and rig pickers also keep comments and section order.
+- `pancetta config --generate` writes the same header-annotated schema as
+  `pancetta-config/defaults.toml`, without a random `[metadata]` block.
+
+### Removed
+
+- `pancetta-config/examples/config.toml`: unreferenced, did not parse, and
+  duplicated the generated, drift-tested `pancetta-config/defaults.toml`.
+>>>>>>> 55d6d018a8ca30de162000f84b0ea08a29c349e3
 
 ## [0.9.6] - 2026-09-02
 

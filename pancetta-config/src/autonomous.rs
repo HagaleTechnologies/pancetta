@@ -18,6 +18,7 @@ pub enum SlotParitySetting {
 
 /// Adaptive listen-cycle configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ListenCycleConfig {
     /// TX cycles between forced collision-listen slots (initial value).
     pub initial_interval: u32,
@@ -53,6 +54,7 @@ pub struct BandHopEntry {
 
 /// Band-hopping configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct BandHoppingConfig {
     /// Enable automatic band hopping.
     pub enabled: bool,
@@ -90,6 +92,7 @@ impl Default for BandHoppingConfig {
 ///
 /// Corresponds to `[autonomous.priorities]` in the TOML config file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PriorityWeightsConfig {
     /// Weight for DXCC entities not yet worked.
     pub needed_dxcc: f64,
@@ -161,6 +164,7 @@ impl PriorityWeightsConfig {
 
 /// Frequency allocator configuration for multi-QSO support.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct FrequencyAllocatorConfig {
     /// How many recent decode cycles to consider for occupancy.
     pub decode_history_cycles: usize,
@@ -201,6 +205,7 @@ fn default_qso_stall_switch_after() -> u32 {
 ///
 /// Corresponds to the `[autonomous]` section in the TOML config file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AutonomousConfig {
     /// Enable autonomous mode.
     pub enabled: bool,

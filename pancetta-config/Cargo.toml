@@ -12,6 +12,8 @@ publish.workspace = true
 # Configuration and serialization
 serde = { version = "1.0", features = ["derive"] }
 toml = "1.1"
+# Comment-preserving edits of an operator's config file (PAN-90)
+toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
 serde_json = "1.0"
 
 # Error handling and logging

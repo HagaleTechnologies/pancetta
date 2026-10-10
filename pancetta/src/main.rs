@@ -30,7 +30,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use pancetta_config::Config;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::signal;
@@ -765,30 +765,30 @@ fn list_audio_devices() {
 
 async fn config_command(args: ConfigArgs, cli: &Cli) -> Result<()> {
     if args.validate {
-        let config = load_configuration(cli).await?;
-        match config.validate() {
-            Ok(_) => {
-                println!("Configuration validation: PASS");
-                info!("Configuration is valid");
-            }
-            Err(e) => {
-                println!("Configuration validation: FAIL");
-                error!("Configuration error: {}", e);
-                return Err(e.into());
-            }
-        }
-        return Ok(());
+        return config_validate(cli);
     }
 
     if args.show {
-        let config = load_configuration(cli).await?;
+        // Same non-interactive loader as `--validate`: never runs a wizard,
+        // and a config file that fails to load is an error naming it. The
+        // loader is deliberately unvalidated, so validate here: a config that
+        // startup rejects must not exit 0 from `--show` either.
+        let (config, report) = load_config_report(cli)?;
+        for w in &report.warnings {
+            eprintln!("WARNING: {w}");
+        }
+        config.validate()?;
         println!("{}", config.summary());
         return Ok(());
     }
 
     if let Some(output_path) = args.generate {
-        let default_config = Config::default();
-        default_config.save_to_file(&output_path)?;
+        // The same header-annotated, drift-tested text as
+        // pancetta-config/defaults.toml (no random [metadata] block), written
+        // owner-only into a created-if-missing directory like every other
+        // config save.
+        Config::save_defaults_toml(&output_path)
+            .with_context(|| format!("Failed to write {}", output_path.display()))?;
         println!("Generated default configuration: {}", output_path.display());
         info!("Default configuration saved to: {}", output_path.display());
         return Ok(());
@@ -923,6 +923,92 @@ async fn benchmark_decode_command(args: BenchmarkDecodeArgs) -> Result<()> {
     Ok(())
 }
 
+/// Load the effective configuration for `config --validate` / `--show`
+/// WITHOUT validating it and WITHOUT any wizard (PAN-90): the explicit
+/// `--config` file if given, else every file on the default search path.
+/// A config file that exists but fails to load is an error naming it.
+fn load_config_report(
+    cli: &Cli,
+) -> Result<(Config, pancetta_config::LoadReport), pancetta_config::ConfigError> {
+    match &cli.config {
+        Some(path) => Config::load_from_file_with_report(path),
+        None => Config::load_default_unvalidated(),
+    }
+}
+
+/// `pancetta config --validate` (PAN-90): report which file(s) were read
+/// (or that none was found), any load warnings, then validate. Exits
+/// non-zero (via `Err`) on any load or validation failure; never prompts.
+fn config_validate(cli: &Cli) -> Result<()> {
+    let (config, report) = match load_config_report(cli) {
+        Ok(pair) => pair,
+        Err(e) => {
+            if let pancetta_config::ConfigError::FileLoad { path, .. } = &e {
+                println!("Config file: {} — FAILED TO LOAD", path.display());
+            }
+            println!("Configuration validation: FAIL");
+            error!("Configuration error: {}", e);
+            return Err(e.into());
+        }
+    };
+    print!(
+        "{}",
+        format_load_report(&report, &default_pancetta_toml_path())
+    );
+    match config.validate() {
+        Ok(()) => {
+            println!("Configuration validation: PASS");
+            info!("Configuration is valid");
+            Ok(())
+        }
+        Err(e) => {
+            println!("Configuration validation: FAIL");
+            error!("Configuration error: {}", e);
+            Err(e.into())
+        }
+    }
+}
+
+/// The operator-facing "what did this load read" text printed by
+/// `config --validate`: the file(s) in merge order, or -- when none was
+/// found -- every directory searched plus a note that built-in defaults
+/// apply; then any load warnings as `WARNING:` lines.
+fn format_load_report(report: &pancetta_config::LoadReport, default_path: &Path) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    if report.files.is_empty() {
+        let _ = writeln!(
+            out,
+            "No config file found. Searched these directories (lowest to highest \
+             precedence) for pancetta.toml, config.toml, pancetta.json, config.json:"
+        );
+        let cwd = std::env::current_dir().ok();
+        for dir in &report.searched {
+            if cwd.as_deref() == Some(dir.as_path()) {
+                let _ = writeln!(out, "  {}   (current directory)", dir.display());
+            } else {
+                let _ = writeln!(out, "  {}", dir.display());
+            }
+        }
+        let _ = writeln!(
+            out,
+            "Using built-in defaults (callsign N0CALL). Run `pancetta setup` to create {}.",
+            default_path.display()
+        );
+    } else {
+        for file in &report.files {
+            let _ = writeln!(out, "Config file: {}", file.display());
+        }
+        if report.files.len() > 1 {
+            let _ = writeln!(out, "(later files override earlier ones)");
+        }
+    }
+    for w in &report.warnings {
+        let _ = writeln!(out, "WARNING: {w}");
+    }
+    out
+}
+
 async fn load_configuration(cli: &Cli) -> Result<Config> {
     let (config, _warnings) = load_configuration_with_warnings(cli).await?;
     Ok(config)
@@ -992,14 +1078,15 @@ fn config_write_is_toml(cli: &Cli) -> bool {
 }
 
 /// Like [`load_configuration`] but also returns non-fatal config-load warnings
-/// (e.g. a `pancetta.toml` that existed but failed to parse and was silently
-/// reverted to defaults). The warnings are printed to the console here and also
-/// returned so they can be surfaced in the TUI.
+/// (e.g. an unknown section or misspelled key). The warnings are printed to
+/// the console here and also returned so they can be surfaced in the TUI. A
+/// config file that fails to load is an error, never a warning (PAN-90).
 async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<String>)> {
     let (mut config, warnings) = if let Some(config_path) = &cli.config {
-        let config = Config::load_from_file(config_path)
-            .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
-        (config, Vec::new())
+        // PAN-90: the warnings-returning loader, so an explicit `--config`
+        // file's unknown-key warnings reach the console and the TUI too.
+        Config::load_from_file_with_warnings(config_path)
+            .with_context(|| format!("Failed to load config from {}", config_path.display()))?
     } else {
         match Config::load_default_with_warnings() {
             Ok(pair) => pair,
@@ -1014,15 +1101,27 @@ async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<Stri
                 eprintln!();
                 eprintln!("ERROR: your saved configuration failed to load:");
                 eprintln!("  {e}");
-                eprintln!("  (file: ~/.pancetta/pancetta.toml)");
+                let Some(failed_path) = config_file_to_repair(&e) else {
+                    eprintln!(
+                        "Could not tell which config file to fix; run \
+                         `pancetta config --validate` to list them and edit by hand."
+                    );
+                    return Err(anyhow::anyhow!(e)).context("Failed to load default configuration");
+                };
+                eprintln!("  (file: {})", failed_path.display());
                 eprintln!();
                 if prompt_yes_no(
                     "Re-run first-time setup? (overwrites the broken config on save)",
                     false,
                 )? {
                     let defaults = Config::default();
-                    match run_first_time_setup(&defaults)? {
-                        Some(fixed) => (fixed, Vec::new()),
+                    // Pass the actual failed file so saving can back it up.
+                    // JSON recovery writes a sibling TOML file that discovery
+                    // selects before JSON in the same search directory.
+                    match run_first_time_setup(&defaults, &failed_path, true)? {
+                        Some(fixed) => {
+                            config_after_recovery(fixed, Config::load_default_with_warnings)
+                        }
                         None => {
                             return Err(anyhow::anyhow!(e))
                                 .context("Failed to load default configuration")
@@ -1039,9 +1138,8 @@ async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<Stri
         }
     };
 
-    // Surface parse failures to the console at startup — a broken/partial config
-    // silently reverting to defaults (N0CALL, default audio) is exactly the trap
-    // we are closing here.
+    // Surface load warnings (unknown sections/keys) to the console at startup
+    // so a typo is never a silent no-op.
     for w in &warnings {
         eprintln!("WARNING: {w}");
         warn!("{w}");
@@ -1060,7 +1158,8 @@ async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<Stri
         && cli.replay.is_none()
         && is_interactive
     {
-        if let Some(updated) = run_first_time_setup(&config)? {
+        if let Some(updated) = run_first_time_setup(&config, &default_pancetta_toml_path(), false)?
+        {
             config = updated;
         }
     }
@@ -1081,9 +1180,87 @@ fn offer_wizard_on_load_failure(
     !headless && !wav && !replay && interactive
 }
 
+/// The config file the de-brick wizard should rewrite for load error `e`:
+/// the file that failed to load or, when the merged config failed
+/// validation, the one discovered file that fails validation on its own.
+/// `None` when no single file can be blamed (several invalid files, an
+/// invalid environment override, or a failure only the merge produces).
+fn config_file_to_repair(e: &pancetta_config::ConfigError) -> Option<PathBuf> {
+    if let pancetta_config::ConfigError::FileLoad { path, .. } = e {
+        return Some(path.clone());
+    }
+    let (_, report) = Config::load_default_unvalidated().ok()?;
+    sole_invalid_config_file(&report.files)
+}
+
+/// The configuration to run on after the de-brick wizard: every discovered
+/// file reloaded through `reload`, i.e. exactly what the next start reads, so
+/// the other valid files' settings apply now and not only after a restart.
+/// A warning names the sections where other files change the wizard's
+/// `fixed` values. When the reload still fails (the operator declined to
+/// save, or another file is broken too) this warns and falls back to `fixed`.
+fn config_after_recovery(
+    fixed: Config,
+    reload: impl FnOnce() -> pancetta_config::ConfigResult<(Config, Vec<String>)>,
+) -> (Config, Vec<String>) {
+    match reload() {
+        Ok((config, mut warnings)) => {
+            let changed = sections_that_differ(&fixed, &config);
+            if !changed.is_empty() {
+                warnings.push(format!(
+                    "Other config files change {} after setup; this session uses the \
+                     merged values (run `pancetta config --validate` to list the files read)",
+                    changed.join(", ")
+                ));
+            }
+            (config, warnings)
+        }
+        Err(e) => (
+            fixed,
+            vec![format!(
+                "The configuration on disk still does not load ({e}); this session runs \
+                 on the setup values only"
+            )],
+        ),
+    }
+}
+
+/// Top-level sections (`[station]`, `[audio]`, ...) whose values differ
+/// between `a` and `b`. `metadata` is ignored.
+fn sections_that_differ(a: &Config, b: &Config) -> Vec<String> {
+    let (Ok(serde_json::Value::Object(a)), Ok(serde_json::Value::Object(b))) =
+        (serde_json::to_value(a), serde_json::to_value(b))
+    else {
+        return Vec::new();
+    };
+    a.iter()
+        .filter(|(k, v)| k.as_str() != "metadata" && b.get(k.as_str()) != Some(*v))
+        .map(|(k, _)| format!("[{k}]"))
+        .collect()
+}
+
+/// The only one of `files` that does not load and validate on its own.
+fn sole_invalid_config_file(files: &[PathBuf]) -> Option<PathBuf> {
+    let mut invalid = files.iter().filter(|p| {
+        Config::load_from_file(p)
+            .and_then(|c| c.validate())
+            .is_err()
+    });
+    let first = invalid.next()?;
+    invalid.next().is_none().then(|| first.clone())
+}
+
 /// Interactive first-run setup wizard.
-/// Prompts for callsign, grid square, and saves the config file.
-fn run_first_time_setup(config: &Config) -> Result<Option<Config>> {
+/// Prompts for callsign, grid square, and saves the config file to
+/// `config_path` (a sibling TOML file when recovering JSON). `from_defaults`
+/// is set when `config` did not come from `config_path` (de-brick recovery):
+/// saving then always keeps the existing file as a backup.
+fn run_first_time_setup(
+    config: &Config,
+    config_path: &Path,
+    from_defaults: bool,
+) -> Result<Option<Config>> {
+    let save_path = wizard_save_path(config_path);
     println!();
     println!("=== Pancetta First-Run Setup ===");
     println!();
@@ -1126,20 +1303,18 @@ fn run_first_time_setup(config: &Config) -> Result<Option<Config>> {
         return Ok(None);
     }
 
-    let config_dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".pancetta");
-    let config_path = config_dir.join("pancetta.toml");
-
     if prompt_yes_no(
-        &format!("Save configuration to {}?", config_path.display()),
+        &format!("Save configuration to {}?", save_path.display()),
         true,
     )? {
-        std::fs::create_dir_all(&config_dir)?;
-        new_config
-            .save_to_file(&config_path)
-            .with_context(|| format!("Failed to save config to {}", config_path.display()))?;
-        println!("Configuration saved to {}", config_path.display());
+        if let Some(config_dir) = save_path.parent() {
+            if !config_dir.as_os_str().is_empty() {
+                std::fs::create_dir_all(config_dir)?;
+            }
+        }
+        let backup = persist_wizard_config(&new_config, config_path, from_defaults)?;
+        print_backup_notice(backup.as_deref());
+        println!("Configuration saved to {}", save_path.display());
     }
 
     println!();
@@ -1516,6 +1691,118 @@ fn setup_frequency(config: &mut Config) -> Result<()> {
     Ok(())
 }
 
+/// `<path>.bak` -- where [`persist_wizard_config`] keeps a config file that
+/// does not load before writing a fresh one ([`create_backup`] moves on to
+/// `<path>.bak.1`, `.bak.2`, ... when that name is taken).
+fn backup_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".bak");
+    path.with_file_name(name)
+}
+
+/// Copy `path` to the first free name of `<path>.bak`, `<path>.bak.1`, ...
+/// `<path>.bak.99` and return it. Each name is created exclusively
+/// (`create_new`, i.e. `O_CREAT | O_EXCL`), so a file or symlink already
+/// there -- an earlier backup, or a symlink another user of a shared
+/// directory planted at the predictable name -- is never followed or
+/// overwritten. Owner-only (0600) on Unix, like the config itself
+/// (plaintext credentials); elsewhere it inherits the directory's ACL.
+fn create_backup(path: &Path) -> Result<PathBuf> {
+    use std::io::Write;
+    let contents =
+        std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let first = backup_path(path);
+    for n in 0..100 {
+        let bak = if n == 0 {
+            first.clone()
+        } else {
+            let mut name = first.clone().into_os_string();
+            name.push(format!(".{n}"));
+            PathBuf::from(name)
+        };
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = match options.open(&bak) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("Failed to create backup {}", bak.display()))
+            }
+        };
+        if let Err(e) = file.write_all(&contents).and_then(|()| file.sync_all()) {
+            // Ours: created exclusively above.
+            let _ = std::fs::remove_file(&bak);
+            return Err(e).with_context(|| {
+                format!("Failed to back up {} to {}", path.display(), bak.display())
+            });
+        }
+        return Ok(bak);
+    }
+    anyhow::bail!(
+        "Failed to back up {}: {} and .bak.1 to .bak.99 beside it all exist",
+        path.display(),
+        first.display()
+    )
+}
+
+/// The wizard writes TOML. Recover JSON beside the failed file so discovery
+/// uses the replacement in the same search directory.
+fn wizard_save_path(path: &Path) -> PathBuf {
+    if pancetta_config::path_is_json_format(path) {
+        path.with_extension("toml")
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// Persist a wizard-edited config (`pancetta setup`, the first-run wizard)
+/// to `path` without destroying the operator's file (PAN-90): only keys that
+/// differ from the file / the defaults are written, and comments survive
+/// ([`Config::save_changes_to_file`]). A file that exists but does not load,
+/// or any existing file when `from_defaults` (merging a defaults-based config
+/// would reset every setting the file holds), is first kept as a backup
+/// ([`create_backup`]: `<path>.bak`, or the next free `<path>.bak.N`), then
+/// replaced by a fresh minimal file. Failed JSON is removed only after its
+/// sibling TOML file is saved. Returns the backup path when one was made.
+fn persist_wizard_config(
+    config: &Config,
+    path: &Path,
+    from_defaults: bool,
+) -> Result<Option<PathBuf>> {
+    let save_path = wizard_save_path(path);
+    let mut backup = None;
+    if path.exists() && (from_defaults || Config::load_from_file(path).is_err()) {
+        let bak = create_backup(path)?;
+        if save_path == path {
+            std::fs::remove_file(path)
+                .with_context(|| format!("Failed to replace {}", path.display()))?;
+        }
+        backup = Some(bak);
+    }
+    config
+        .save_changes_to_file(&save_path)
+        .with_context(|| format!("Failed to save config to {}", save_path.display()))?;
+    if save_path != path && backup.is_some() {
+        std::fs::remove_file(path)
+            .with_context(|| format!("Failed to replace {}", path.display()))?;
+    }
+    Ok(backup)
+}
+
+fn print_backup_notice(backup: Option<&Path>) {
+    if let Some(bak) = backup {
+        println!(
+            "Your previous config did not load; it was kept as {}",
+            bak.display()
+        );
+    }
+}
+
 async fn setup_command() -> Result<()> {
     println!();
     println!("=== Pancetta Setup Wizard ===");
@@ -1528,7 +1815,23 @@ async fn setup_command() -> Result<()> {
         .join(".pancetta");
     let config_path = config_dir.join("pancetta.toml");
     let mut config = if config_path.exists() {
-        Config::load_from_file(&config_path).unwrap_or_default()
+        match Config::load_from_file(&config_path) {
+            Ok(config) => config,
+            Err(e) => {
+                println!(
+                    "Existing config at {} does not load: {e}",
+                    config_path.display()
+                );
+                println!(
+                    "Setup will start from defaults; on save the old file is kept as {} \
+                     (or {}.N if that name is taken).",
+                    backup_path(&config_path).display(),
+                    backup_path(&config_path).display()
+                );
+                println!();
+                Config::default()
+            }
+        }
     } else {
         Config::default()
     };
@@ -1568,10 +1871,9 @@ async fn setup_command() -> Result<()> {
 
     if prompt_yes_no(&format!("Save to {}?", config_path.display()), true)? {
         std::fs::create_dir_all(&config_dir)?;
-        config
-            .save_to_file(&config_path)
-            .with_context(|| format!("Failed to save config to {}", config_path.display()))?;
-        println!("Configuration saved.");
+        let backup = persist_wizard_config(&config, &config_path, false)?;
+        print_backup_notice(backup.as_deref());
+        println!("Configuration saved to {}", config_path.display());
     }
 
     println!();
@@ -1873,6 +2175,283 @@ mod tests {
     use super::*;
     use assert_cmd::Command;
     use predicates::prelude::*;
+
+    // ---- PAN-90: wizard saves keep the operator's file ----
+
+    #[test]
+    fn persist_wizard_config_recovers_discovered_json() {
+        for filename in ["config.json", "pancetta.json"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(filename);
+            let broken = "{broken json";
+            std::fs::write(&path, broken).unwrap();
+            let loader =
+                pancetta_config::ConfigLoader::with_search_paths(vec![dir.path().to_path_buf()])
+                    .unwrap();
+            assert!(loader.load().is_err());
+
+            let mut config = Config::default();
+            config.station.callsign = "K1ABC".to_string();
+            let backup = persist_wizard_config(&config, &path, false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(backup, dir.path().join(format!("{filename}.bak")));
+            assert_eq!(std::fs::read_to_string(backup).unwrap(), broken);
+            let recovered = loader.load().expect("recovery must survive discovery");
+            assert_eq!(recovered.station.callsign, "K1ABC");
+            assert_eq!(loader.loaded_files(), vec![path.with_extension("toml")]);
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn persist_wizard_config_backs_up_a_file_that_does_not_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        std::fs::write(&path, "[station\n").unwrap();
+        let mut config = Config::default();
+        config.station.callsign = "K1ABC".to_string();
+        let backup = persist_wizard_config(&config, &path, false).unwrap();
+        let bak = dir.path().join("pancetta.toml.bak");
+        assert_eq!(backup.as_deref(), Some(bak.as_path()));
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), "[station\n");
+        let reloaded = Config::load_from_file(&path).unwrap();
+        assert_eq!(reloaded.station.callsign, "K1ABC");
+    }
+
+    /// PAN-90 review (Codex P1): the backup name is predictable, and the
+    /// search path includes the cwd, so another user of a shared directory
+    /// can plant `<config>.bak` as a symlink. The backup must never follow
+    /// it (writing the plaintext config into the symlink's target), and must
+    /// not be readable by anyone but the owner.
+    #[cfg(unix)]
+    #[test]
+    fn persist_wizard_config_never_follows_a_symlink_planted_at_the_backup_name() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        std::fs::write(&path, "[station\n").unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "do not touch").unwrap();
+        let planted = dir.path().join("pancetta.toml.bak");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        // A dangling symlink: following it would create a file wherever the
+        // planter chose.
+        let dangling_target = dir.path().join("created-by-pancetta.txt");
+        let dangling = dir.path().join("pancetta.toml.bak.1");
+        std::os::unix::fs::symlink(&dangling_target, &dangling).unwrap();
+
+        let mut config = Config::default();
+        config.station.callsign = "K1ABC".to_string();
+        let backup = persist_wizard_config(&config, &path, false)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "do not touch");
+        assert!(!dangling_target.exists());
+        for link in [&planted, &dangling] {
+            assert!(std::fs::symlink_metadata(link)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+        assert_eq!(backup, dir.path().join("pancetta.toml.bak.2"));
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "[station\n");
+        let mode = std::fs::metadata(&backup).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "backup mode {mode:o} is not owner-only");
+        let reloaded = Config::load_from_file(&path).unwrap();
+        assert_eq!(reloaded.station.callsign, "K1ABC");
+    }
+
+    #[test]
+    fn persist_wizard_config_backs_up_a_loading_file_when_recovering_from_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        let original =
+            "[station]\ngrid_square = \"FN42\"\n[autonomous]\ncq_after_idle_cycles = 0\n";
+        std::fs::write(&path, original).unwrap();
+        assert!(Config::load_from_file(&path).is_ok());
+        let mut config = Config::default();
+        config.station.callsign = "K1ABC".to_string();
+        let backup = persist_wizard_config(&config, &path, true).unwrap();
+        let bak = dir.path().join("pancetta.toml.bak");
+        assert_eq!(backup.as_deref(), Some(bak.as_path()));
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), original);
+        let reloaded = Config::load_from_file(&path).unwrap();
+        assert_eq!(reloaded.station.callsign, "K1ABC");
+        reloaded.validate().unwrap();
+    }
+
+    #[test]
+    fn sole_invalid_config_file_blames_only_an_unambiguous_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.toml");
+        let bad = dir.path().join("bad.toml");
+        let bad2 = dir.path().join("bad2.toml");
+        std::fs::write(&good, "[station]\ngrid_square = \"FN42\"\n").unwrap();
+        std::fs::write(&bad, "[autonomous]\ncq_after_idle_cycles = 0\n").unwrap();
+        std::fs::write(&bad2, "[autonomous]\ncq_after_idle_cycles = 0\n").unwrap();
+        assert_eq!(
+            sole_invalid_config_file(&[bad.clone(), good.clone()]),
+            Some(bad.clone())
+        );
+        assert_eq!(sole_invalid_config_file(std::slice::from_ref(&good)), None);
+        assert_eq!(sole_invalid_config_file(&[bad, good, bad2]), None);
+    }
+
+    #[test]
+    fn config_after_recovery_reloads_every_discovered_file() {
+        // Discovery stops on a broken low-precedence file; after the wizard
+        // repairs it, the session must run on what the next start reads,
+        // including the higher valid file, not on the wizard's config alone.
+        let low = tempfile::tempdir().unwrap();
+        let high = tempfile::tempdir().unwrap();
+        let broken = low.path().join("pancetta.toml");
+        std::fs::write(&broken, "[station\n").unwrap();
+        std::fs::write(
+            high.path().join("pancetta.toml"),
+            "[station]\ncallsign = \"K1ABC\"\n[audio]\ninput_device = \"USB Audio CODEC\"\n",
+        )
+        .unwrap();
+        let loader = pancetta_config::ConfigLoader::with_search_paths(vec![
+            low.path().to_path_buf(),
+            high.path().to_path_buf(),
+        ])
+        .unwrap();
+        assert!(loader.load().is_err());
+
+        let mut fixed = Config::default();
+        fixed.station.callsign = "W1AW".to_string();
+        persist_wizard_config(&fixed, &broken, true).unwrap();
+
+        let (config, warnings) = config_after_recovery(fixed, || {
+            let config = loader.load()?;
+            Ok((config, loader.load_warnings()))
+        });
+        let next_start = loader.load().unwrap();
+        assert_eq!(config.station.callsign, next_start.station.callsign);
+        assert_eq!(config.station.callsign, "K1ABC");
+        assert_eq!(config.audio.input_device, "USB Audio CODEC");
+        // The operator is told the wizard's values did not all survive.
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("[audio], [station]"), "{warnings:?}");
+    }
+
+    #[test]
+    fn config_after_recovery_is_quiet_for_a_single_repaired_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let broken = dir.path().join("pancetta.toml");
+        std::fs::write(&broken, "[station\n").unwrap();
+        let loader =
+            pancetta_config::ConfigLoader::with_search_paths(vec![dir.path().to_path_buf()])
+                .unwrap();
+        let mut fixed = Config::default();
+        fixed.station.callsign = "W1AW".to_string();
+        fixed.audio.input_device = "USB Audio CODEC".to_string();
+        persist_wizard_config(&fixed, &broken, true).unwrap();
+
+        let (config, warnings) = config_after_recovery(fixed, || {
+            let config = loader.load()?;
+            Ok((config, loader.load_warnings()))
+        });
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(config.station.callsign, "W1AW");
+    }
+
+    #[test]
+    fn config_after_recovery_falls_back_when_the_reload_fails() {
+        let mut fixed = Config::default();
+        fixed.station.callsign = "W1AW".to_string();
+        let (config, warnings) = config_after_recovery(fixed, || {
+            Err(pancetta_config::ConfigError::Validation(
+                "still broken".into(),
+            ))
+        });
+        assert_eq!(config.station.callsign, "W1AW");
+        // A warning, not just stderr: the TUI takes over the terminal.
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("still broken"), "{warnings:?}");
+    }
+
+    #[test]
+    fn persist_wizard_config_merges_when_the_file_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        let original = "# K1ABC home station\n[station]\ncallsign = \"K1ABC\"   # licensed 2019\n";
+        std::fs::write(&path, original).unwrap();
+        let mut config = Config::load_from_file(&path).unwrap();
+        config.audio.input_device = "USB Audio CODEC".to_string();
+        let backup = persist_wizard_config(&config, &path, false).unwrap();
+        assert!(backup.is_none());
+        assert!(!dir.path().join("pancetta.toml.bak").exists());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with(original), "{text}");
+        assert!(
+            text.contains("input_device = \"USB Audio CODEC\""),
+            "{text}"
+        );
+    }
+
+    // ---- PAN-90: `config --validate` load report ----
+
+    #[test]
+    fn format_load_report_lists_files_in_merge_order() {
+        let report = pancetta_config::LoadReport {
+            files: vec![
+                PathBuf::from("/home/op/.pancetta/pancetta.toml"),
+                PathBuf::from("/home/op/.config/pancetta/config.toml"),
+            ],
+            searched: vec![],
+            warnings: vec![],
+        };
+        let text = format_load_report(&report, Path::new("/home/op/.pancetta/pancetta.toml"));
+        assert_eq!(
+            text,
+            "Config file: /home/op/.pancetta/pancetta.toml\n\
+             Config file: /home/op/.config/pancetta/config.toml\n\
+             (later files override earlier ones)\n"
+        );
+    }
+
+    #[test]
+    fn format_load_report_with_no_files_lists_search_dirs_and_defaults_note() {
+        let report = pancetta_config::LoadReport {
+            files: vec![],
+            searched: vec![
+                PathBuf::from("/etc/pancetta"),
+                PathBuf::from("/home/op/.pancetta"),
+            ],
+            warnings: vec![],
+        };
+        let text = format_load_report(&report, Path::new("/home/op/.pancetta/pancetta.toml"));
+        assert!(text.starts_with("No config file found. Searched these directories"));
+        assert!(
+            text.contains("\n  /etc/pancetta\n  /home/op/.pancetta\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "Using built-in defaults (callsign N0CALL). Run `pancetta setup` to create \
+                 /home/op/.pancetta/pancetta.toml."
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn format_load_report_prints_warnings_as_warning_lines() {
+        let report = pancetta_config::LoadReport {
+            files: vec![PathBuf::from("/home/op/.pancetta/pancetta.toml")],
+            searched: vec![],
+            warnings: vec!["Unknown config key `enable` in [network.wsjtx_udp]".to_string()],
+        };
+        let text = format_load_report(&report, Path::new("/x"));
+        assert_eq!(
+            text,
+            "Config file: /home/op/.pancetta/pancetta.toml\n\
+             WARNING: Unknown config key `enable` in [network.wsjtx_udp]\n"
+        );
+    }
 
     /// docs/task-supervision-plan.md item 4: a panic must be counted and
     /// logged (not just chained to the default hook silently). Uses a

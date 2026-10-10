@@ -25,6 +25,7 @@ fn default_repark_min_score_gain() -> f64 {
 /// TX-placement instrument configuration. Corresponds to the
 /// `[tx_placement]` section in the TOML config file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TxPlacementConfig {
     /// Enable opt-in auto-repark of the parked idle TX offset when it
     /// degrades to busy-both and a meaningfully better slice exists.
