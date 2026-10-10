@@ -88,6 +88,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TUI diagnostics list.
 - The TUI rig picker no longer writes a config file that fails to load on the
   next start (`missing field 'data_bits'`).
+- Shift+Q emergency stop now works while a dialog or overlay is open
+  (PAN-113). Every modal's key handler swallowed keys it didn't use, so the
+  stop did nothing while quit-confirm, the out-of-band warning, help,
+  Diagnostics, Station Health, Recent QSOs, the audio or rig picker, the
+  frequency or TX-offset entry, or the composer was up. The stop is now
+  checked before any modal and leaves the open dialog as it was. In the
+  composer and the rig picker's text fields, Shift+Q (or Caps Lock + q) now
+  stops the station instead of typing a capital Q; lowercase `q` still types
+  Q in the composer.
 
 ### Changed
 
