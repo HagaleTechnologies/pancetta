@@ -575,7 +575,8 @@ enum PttWaitStep {
 /// Pure decision behind [`wait_for_ptt_instant`]. Drops the frame only if
 /// (a) the PTT instant is now more than two periods away (a backward step:
 /// `schedule_tx` never targets further ahead than that), or (b) the wait
-/// started before the PTT instant and `now` is more than `late_max_ms` past
+/// started before the PTT instant (on the jump-free clock, see
+/// [`wait_for_ptt_instant`]) and `now` is more than `late_max_ms` past
 /// `target_slot` (a forward jump past the late-start policy). A request that
 /// was already late when the wait began keeps today's path exactly.
 fn ptt_wait_step(
@@ -626,11 +627,25 @@ enum PttWait {
 /// [`interruptible_sleep`], so wake latency stays ~50 ms. With no clock
 /// jump this returns `Reached` at the same wall instant the old monotonic
 /// sleep ended.
+///
+/// `scheduled_at` is the wall-clock/monotonic pair read together when
+/// `schedule_tx` picked the slot (`request_received_at`), or `None` for a
+/// mid-TX re-key schedule (never future-facing). Before the first
+/// evaluation, a wall-vs-monotonic divergence since then of at least
+/// `CLOCK_STEP_THRESHOLD_MS` is taken back out of `now`, so a forward jump
+/// during the pre-wait work (coalescing, encode/modulate, the defer-time
+/// gates) cannot make a future-facing frame look like a late start and skip
+/// the forward-jump drop. Below the threshold this is the plain
+/// `ptt_target > now` inference, so no-jump behaviour is unchanged. NTP
+/// steps diverge on every platform; sleep/wake only where the monotonic
+/// clock stops during suspend (Linux, macOS).
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_ptt_instant(
     ptt_target: chrono::DateTime<chrono::Utc>,
     target_slot: chrono::DateTime<chrono::Utc>,
     late_max_ms: u64,
     slot_ns: i64,
+    scheduled_at: Option<(chrono::DateTime<chrono::Utc>, Instant)>,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     abort: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     wall_now: impl Fn() -> chrono::DateTime<chrono::Utc>,
@@ -642,7 +657,15 @@ async fn wait_for_ptt_instant(
             return PttWait::Interrupted;
         }
         let now = wall_now();
-        let waited = *waited_from_before_target.get_or_insert(ptt_target > now);
+        let waited = *waited_from_before_target.get_or_insert_with(|| {
+            let pre_wait_step = scheduled_at
+                .and_then(|(wall, mono)| {
+                    pancetta_core::slot_clock::ClockStepDetector::new(wall)
+                        .observe(now, mono.elapsed())
+                })
+                .unwrap_or_else(chrono::Duration::zero);
+            ptt_target > now - pre_wait_step
+        });
         match ptt_wait_step(now, ptt_target, target_slot, waited, late_max_ms, slot_ns) {
             PttWaitStep::Sleep(chunk) => sleep(chunk).await,
             PttWaitStep::Reached => return PttWait::Reached,
@@ -5454,6 +5477,10 @@ impl super::ApplicationCoordinator {
                             // scheduling decision being made ~800ms later than the
                             // request actually arrived — an unforced ~30s defer.
                             let request_received_at = chrono::Utc::now();
+                            // PAN-114: read with request_received_at so the
+                            // pre-PTT wait can tell a wall-clock step during
+                            // the pre-wait work from the work itself.
+                            let request_received_mono = Instant::now();
 
                             // --- Backpressure / staleness coalescing ---
                             // The worker processes one request at a time and a
@@ -6066,6 +6093,10 @@ impl super::ApplicationCoordinator {
                                                 tx_late_max_ms,
                                             ),
                                             slot_ns,
+                                            (!is_rekey).then_some((
+                                                request_received_at,
+                                                request_received_mono,
+                                            )),
                                             &shutdown,
                                             &abort_current_tx,
                                             chrono::Utc::now,
@@ -8490,6 +8521,7 @@ impl super::ApplicationCoordinator {
                                         schedule.target_slot,
                                         tx_late_max_ms_effective(active_protocol, tx_late_max_ms),
                                         slot_ns,
+                                        Some((request_received_at, request_received_mono)),
                                         &shutdown,
                                         &abort_current_tx,
                                         chrono::Utc::now,
@@ -11393,6 +11425,7 @@ mod schedule_tx_tests {
             target_slot,
             8000,
             SLOT_NS,
+            Some((start_wall, Instant::now())),
             &shutdown,
             &abort,
             move || *reader.lock().unwrap(),
@@ -11433,6 +11466,7 @@ mod schedule_tx_tests {
             target_slot,
             8000,
             SLOT_NS,
+            Some((start_wall, Instant::now())),
             &shutdown,
             &abort,
             move || *reader.lock().unwrap(),
@@ -11475,6 +11509,7 @@ mod schedule_tx_tests {
             target_slot,
             8000,
             SLOT_NS,
+            Some((start_wall, Instant::now())),
             &shutdown,
             &abort,
             move || *reader.lock().unwrap(),
@@ -11492,6 +11527,69 @@ mod schedule_tx_tests {
             elapsed < Duration::from_millis(250),
             "forward jump must be seen within about one chunk (elapsed={elapsed:?})"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_ptt_instant_drops_a_forward_jump_that_landed_before_the_wait() {
+        // Codex P1 on PR #413: schedule_tx picked a future slot at :29.0,
+        // then the wall clock jumped ~11 s forward during encode/modulate
+        // (monotonic time barely moved), so the wait's FIRST read is already
+        // 10 s past the slot, beyond the 8 s late cap.
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let target_slot = at(30.0);
+        let ptt_target = target_slot - chrono::Duration::milliseconds(PTT_LEAD_MS);
+        let jumped_wall = target_slot + chrono::Duration::seconds(10);
+        let outcome = wait_for_ptt_instant(
+            ptt_target,
+            target_slot,
+            8000,
+            SLOT_NS,
+            Some((at(29.0), Instant::now())),
+            &shutdown,
+            &abort,
+            move || jumped_wall,
+        )
+        .await;
+        match outcome {
+            PttWait::ClockJumped(pancetta_core::slot_clock::WallClockJump::Forward(d)) => {
+                assert_eq!(d, jumped_wall - ptt_target);
+            }
+            other => panic!("expected ClockJumped(Forward), got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_ptt_instant_does_not_blame_slow_pre_wait_work_on_a_clock_jump() {
+        // A deferred head gets the full 3 s coalesce extension, so with a
+        // configured 2 s late cap the first read can land past the cap with
+        // no clock step at all: wall and monotonic time both moved 3.9 s.
+        // That keeps today's late-start path; it is not a clock jump.
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let target_slot = at(30.0);
+        let ptt_target = target_slot - chrono::Duration::milliseconds(PTT_LEAD_MS);
+        let pre_wait_work = Duration::from_millis(3900);
+        let scheduled_mono = Instant::now()
+            .checked_sub(pre_wait_work)
+            .expect("monotonic clock has 3.9 s of history");
+        let first_read = at(29.5) + chrono::Duration::from_std(pre_wait_work).unwrap();
+        let outcome = wait_for_ptt_instant(
+            ptt_target,
+            target_slot,
+            2000,
+            SLOT_NS,
+            Some((at(29.5), scheduled_mono)),
+            &shutdown,
+            &abort,
+            move || first_read,
+        )
+        .await;
+        assert_eq!(outcome, PttWait::Reached);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -11522,6 +11620,7 @@ mod schedule_tx_tests {
                 target_slot,
                 8000,
                 SLOT_NS,
+                Some((start_wall, Instant::now())),
                 &shutdown,
                 &abort,
                 move || start_wall,
@@ -11546,6 +11645,7 @@ mod schedule_tx_tests {
             target_slot,
             8000,
             SLOT_NS,
+            None,
             &shutdown,
             &abort,
             || -> chrono::DateTime<chrono::Utc> { panic!("clock read after abort") },

@@ -218,13 +218,21 @@ used by the clock-skew monitor.
   arms' Step 4): re-reads the wall clock every ≤ 50 ms chunk (D5). It drops the frame only if the
   PTT instant is now more than two periods away (backward step; `schedule_tx` never targets
   further), or if the wait started before the PTT instant and finished more than
-  `tx_late_max_ms_effective` past `target_slot` (forward jump). A request that was already a late
-  start when the wait began keeps the old path exactly; a forward jump that lands inside the
-  late-start policy ships as a policy late start.
+  `tx_late_max_ms_effective` past `target_slot` (forward jump). "Started before" is judged on the
+  jump-free clock: the wait gets the wall/monotonic pair read with `request_received_at`, and a
+  `ClockStepDetector`-sized divergence (≥ 250 ms) since then is taken out of its first read, so a
+  forward jump during coalescing or encode/modulate cannot disable the drop. Below that threshold
+  the first read is used as is, so slow pre-wait work is never reported as a clock jump. (NTP steps
+  diverge on every platform; sleep/wake only where the monotonic clock stops in suspend.) A request
+  that was already a late start when the wait began keeps the old path exactly; a forward jump that
+  lands inside the late-start policy ships as a policy late start.
 - **PTT hold bound** (`ptt_hold_exceeds_bound`, both arms' Step 6, D6): if `to_slot` exceeds
   `ptt_lead_ms` + `PTT_HOLD_SLACK_MS` (1000 ms) with PTT keyed, PTT is released first (the
   `AbortedByDisarm` pattern, including the pivot-tombstone cleanup) and the frame is dropped.
-  Nothing reassigns `schedule` between Step 4 and Step 6, so the bound only trips on a step.
+  Nothing reassigns `schedule` between Step 4 and Step 6, so the bound only trips on a step. The
+  check runs once, as Step 6 starts; the hold after it is still a monotonic sleep of at most that
+  bound, so a step landing inside the hold ships that one frame on the pre-step grid, the same as a
+  step landing during audio playback.
 - **Drop reporting** (`drop_frames_for_clock_jump`, D7): target `tx.policy`, Warn, text
   "dropping stale TX after a {±secs} s clock jump: '…' — next frame uses the current UTC slot", so it
   counts in the TUI's session TX-drops tally next to the existing stale-TX drops, plus one failed
