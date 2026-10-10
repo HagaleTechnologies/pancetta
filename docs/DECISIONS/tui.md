@@ -88,3 +88,20 @@ The QSO Status panel's single-QSO-detail layout gained a compact history line
 relayed to a new `TuiMessage::QsoHistoryEntry`. "Successful" = `QsoCompleted`; any `QsoFailed`
 reason renders the ✗ glyph (not color-only, for accessibility). The multi-QSO table view does not
 get this line — only the single-QSO-detail layout.
+
+## Shift+Q emergency stop is live in every modal (PAN-113, 2026-10-10)
+
+`pancetta-tui/src/tui_runner.rs::handle_key_event`: the emergency-stop check now runs right after
+the app write-lock, ahead of all 13 modal/overlay blocks (out-of-band ack, quit confirm, help,
+audio picker, rig picker and its two bookmark sub-states, frequency entry, TX-offset entry,
+composer, Diagnostics, Station Health, Recent QSOs). Each block ends in `_ => {}` +
+`return Ok(true)`, so the old `Char('Q')` arm in the main match was dead whenever any of them was
+open (P0 #2 in `docs/reviews/2026-09-05-product-review/lane1-tui.md`). One check ahead of the chain
+was chosen over a `Q` arm per block (the pattern PAN-24 used for `k`) so a new modal can't forget
+it. Any modifiers are accepted: PAN-112's Ctrl/Alt guard is for keys that start TX and does not
+apply to the stop. The open dialog is left as it was: Esc closes it, a second Esc clears the
+banner. Accepted trade-off: in the composer, rig model and bookmark-name fields, Shift+Q (and
+Caps Lock + q, which crossterm also delivers as `Char('Q')`) stops the station instead of typing
+`Q`. The composer uppercases input and rig-model lookup ignores case, so lowercase `q` covers both.
+Tests: `tui_runner::key_tests::shift_q_emergency_stops_through_every_overlay` and the four
+`shift_q_*` / `modified_shift_q_*` tests beside it.

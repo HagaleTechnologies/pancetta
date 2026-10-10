@@ -1024,6 +1024,36 @@ impl TuiRunner {
 
         let mut app = self.app.write().await;
 
+        // === Emergency stop (hb-161: Phase 5 safety driver) ===
+        // Shift+Q halts the station without exiting. Distinct from
+        // lowercase `q` (quit-confirm). Checked before every modal and
+        // overlay below, because each of those ends in `_ => {}` +
+        // `return Ok(true)` and would otherwise swallow it (PAN-113). Any
+        // modifiers are accepted, and the open dialog is left as it is. In
+        // the text-entry modals (compose, rig model, bookmark name) this
+        // means Shift+Q stops the station instead of typing `Q`.
+        // The coordinator handles the event: aborts in-flight TX, disables
+        // autonomous at runtime, stops the repeating CQ + active tune, and
+        // logs at WARN. The TUI also flips `stopped_by_operator` locally so
+        // the banner appears immediately — no round-trip needed for the
+        // visual signal.
+        if key.code == KeyCode::Char('Q') {
+            app.stopped_by_operator = true;
+            // Emergency stop hard-mutes TX: reflect Disabled in the local
+            // banner immediately; the coordinator confirms via
+            // TxPolicyUpdate.
+            app.tx_policy = pancetta_core::TxPolicy::Disabled;
+            app.status_message =
+                "STOPPED BY OPERATOR — autonomous off, TX aborted (press Esc to clear banner)"
+                    .to_string();
+            warn!(
+                target: "operator.override",
+                "Operator pressed Q emergency stop key — halting station"
+            );
+            self.message_tx.send(TuiCommand::OperatorEmergencyStop)?;
+            return Ok(true);
+        }
+
         // Required out-of-band acknowledgment modal — must be dismissed first.
         if app.out_of_band_ack_visible {
             match key.code {
@@ -1717,29 +1747,8 @@ impl TuiRunner {
                     "Quit pancetta? Press y/Enter to confirm, n/Esc/q to cancel".to_string();
             }
 
-            // === Emergency stop (hb-161: Phase 5 safety driver) ===
-            // Shift+Q halts the station without exiting. Distinct from
-            // lowercase `q` (quit-confirm). The coordinator handles the
-            // event: aborts in-flight TX, disables autonomous at runtime,
-            // stops the repeating CQ + active tune, and logs at WARN.
-            // The TUI also flips `stopped_by_operator` locally so the
-            // banner appears immediately — no round-trip needed for the
-            // visual signal.
-            KeyCode::Char('Q') => {
-                app.stopped_by_operator = true;
-                // Emergency stop hard-mutes TX: reflect Disabled in the local
-                // banner immediately; the coordinator confirms via
-                // TxPolicyUpdate.
-                app.tx_policy = pancetta_core::TxPolicy::Disabled;
-                app.status_message =
-                    "STOPPED BY OPERATOR — autonomous off, TX aborted (press Esc to clear banner)"
-                        .to_string();
-                warn!(
-                    target: "operator.override",
-                    "Operator pressed Q emergency stop key — halting station"
-                );
-                self.message_tx.send(TuiCommand::OperatorEmergencyStop)?;
-            }
+            // Shift+Q (emergency stop) is handled at the top of this
+            // function, ahead of every modal (PAN-113).
 
             // === Modal shortcuts ===
             KeyCode::Char('d') => {
@@ -3435,6 +3444,203 @@ mod key_tests {
             "lowercase q must not emit OperatorEmergencyStop (got {:?})",
             cmd
         );
+    }
+
+    /// PAN-113: every modal/overlay block in `handle_key_event` ends in
+    /// `_ => {}` + `return Ok(true)`, so Shift+Q used to die inside all of
+    /// them. One case per early-return block, including the frequency and
+    /// offset modals the ticket didn't list. The stop leaves dialog state
+    /// alone, so each case also checks its overlay is still open.
+    #[tokio::test]
+    async fn shift_q_emergency_stops_through_every_overlay() {
+        type Open = fn(&mut crate::app::App);
+        type IsOpen = fn(&crate::app::App) -> bool;
+        let cases: [(&str, Open, IsOpen); 13] = [
+            (
+                "out-of-band ack",
+                |a| a.out_of_band_ack_visible = true,
+                |a| a.out_of_band_ack_visible,
+            ),
+            (
+                "quit confirm",
+                |a| a.quit_confirm_visible = true,
+                |a| a.quit_confirm_visible,
+            ),
+            ("help", |a| a.help_visible = true, |a| a.help_visible),
+            (
+                "device selection",
+                |a| a.device_selection.visible = true,
+                |a| a.device_selection.visible,
+            ),
+            (
+                "rig selection",
+                |a| a.rig_selection.visible = true,
+                |a| a.rig_selection.visible,
+            ),
+            (
+                "rig bookmark name",
+                |a| {
+                    a.rig_selection.visible = true;
+                    a.rig_selection.naming_bookmark = true;
+                },
+                |a| a.rig_selection.naming_bookmark,
+            ),
+            (
+                "rig bookmark list",
+                |a| {
+                    a.rig_selection.visible = true;
+                    a.rig_selection.bookmark_overlay_visible = true;
+                },
+                |a| a.rig_selection.bookmark_overlay_visible,
+            ),
+            (
+                "frequency modal",
+                |a| a.freq_modal.visible = true,
+                |a| a.freq_modal.visible,
+            ),
+            (
+                "offset modal",
+                |a| a.offset_modal.visible = true,
+                |a| a.offset_modal.visible,
+            ),
+            ("composer", |a| a.compose_mode = true, |a| a.compose_mode),
+            (
+                "diagnostics",
+                |a| a.show_diagnostics = true,
+                |a| a.show_diagnostics,
+            ),
+            (
+                "station health",
+                |a| a.show_health = true,
+                |a| a.show_health,
+            ),
+            (
+                "recent QSOs",
+                |a| a.show_recent_qsos = true,
+                |a| a.show_recent_qsos,
+            ),
+        ];
+        for (name, open, is_open) in cases {
+            let (mut r, cmd_rx, app) = make_runner().await;
+            open(&mut *app.write().await);
+            r.handle_key_event(key_shift('Q')).await.unwrap();
+            assert!(
+                matches!(cmd_rx.try_recv(), Ok(TuiCommand::OperatorEmergencyStop)),
+                "{name}: Shift+Q must emit OperatorEmergencyStop"
+            );
+            let a = app.read().await;
+            assert!(
+                a.stopped_by_operator,
+                "{name}: Shift+Q must raise the stop banner"
+            );
+            assert_eq!(
+                a.tx_policy,
+                pancetta_core::TxPolicy::Disabled,
+                "{name}: Shift+Q must show TX disabled"
+            );
+            assert!(is_open(&a), "{name}: the stop must leave the overlay open");
+        }
+    }
+
+    /// PAN-113 scenario 1: Shift+Q with quit-confirm open stops the station
+    /// and leaves the dialog up; lowercase `q` then cancels it as before.
+    #[tokio::test]
+    async fn shift_q_through_quit_confirm_then_q_still_cancels() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        r.handle_key_event(key('q')).await.unwrap();
+        assert!(app.read().await.quit_confirm_visible);
+
+        r.handle_key_event(key_shift('Q')).await.unwrap();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::OperatorEmergencyStop)
+        ));
+        assert!(app.read().await.quit_confirm_visible);
+
+        assert!(
+            r.handle_key_event(key('q')).await.unwrap(),
+            "q cancels the dialog, it does not quit"
+        );
+        let a = app.read().await;
+        assert!(!a.quit_confirm_visible);
+        assert!(
+            a.stopped_by_operator,
+            "cancelling the dialog keeps the stop banner"
+        );
+    }
+
+    /// PAN-113: in the composer Shift+Q stops the station instead of typing
+    /// `Q`. Lowercase `q` still types `Q` (`App::input_char` uppercases), so
+    /// "CQ" stays typeable.
+    #[tokio::test]
+    async fn shift_q_in_composer_stops_without_typing() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        app.write().await.enter_compose_mode();
+        r.handle_key_event(key('c')).await.unwrap();
+        r.handle_key_event(key('q')).await.unwrap();
+        assert_eq!(app.read().await.get_input_text(), "CQ");
+        assert!(cmd_rx.try_recv().is_err(), "typing must not send anything");
+
+        r.handle_key_event(key_shift('Q')).await.unwrap();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::OperatorEmergencyStop)
+        ));
+        let a = app.read().await;
+        assert_eq!(
+            a.get_input_text(),
+            "CQ",
+            "Shift+Q must not reach the TX buffer"
+        );
+        assert!(a.compose_mode, "the composer stays open with its text");
+    }
+
+    /// PAN-113: the rig picker's free-text fields lose capital Q the same
+    /// way. Model lookup is case-insensitive (`hamlib_model_id` lowercases),
+    /// so lowercase `q` still works there.
+    #[tokio::test]
+    async fn shift_q_in_rig_text_fields_stops_without_typing() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.rig_selection.visible = true;
+            a.rig_selection.active_field = crate::app::RigField::Model;
+            a.rig_selection.model = "FT".to_string();
+        }
+        r.handle_key_event(key_shift('Q')).await.unwrap();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::OperatorEmergencyStop)
+        ));
+        assert_eq!(app.read().await.rig_selection.model, "FT");
+
+        app.write().await.rig_selection.naming_bookmark = true;
+        r.handle_key_event(key_shift('Q')).await.unwrap();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::OperatorEmergencyStop)
+        ));
+        assert_eq!(app.read().await.rig_selection.bookmark_name_input, "");
+    }
+
+    /// PAN-113: extra modifiers never disarm the stop. Windows reports
+    /// Ctrl+Shift+Q as `Char('Q')` + CONTROL|SHIFT (see PAN-112).
+    #[tokio::test]
+    async fn modified_shift_q_emergency_stops_through_overlay() {
+        for mods in [
+            KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+            KeyModifiers::SHIFT | KeyModifiers::ALT,
+        ] {
+            let (mut r, cmd_rx, app) = make_runner().await;
+            app.write().await.help_visible = true;
+            r.handle_key_event(KeyEvent::new(KeyCode::Char('Q'), mods))
+                .await
+                .unwrap();
+            assert!(
+                matches!(cmd_rx.try_recv(), Ok(TuiCommand::OperatorEmergencyStop)),
+                "{mods:?}+Q must emit OperatorEmergencyStop"
+            );
+        }
     }
 
     /// Esc clears the operator-stop banner. The banner is informational,
