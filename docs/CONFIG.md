@@ -35,9 +35,12 @@ uses the first of `pancetta.toml`, `config.toml`, `pancetta.json`,
 | 5 | `~/.pancetta` | `~/.pancetta` | `%USERPROFILE%\.pancetta` |
 | 6 | `~/.config/pancetta` | `~/.config/pancetta` | `%USERPROFILE%\.config\pancetta` |
 
-Every file found is loaded, and later rows override earlier ones. A file
-that exists but fails to load (syntax error, wrong value type, unreadable)
-stops pancetta with an error naming it; it is never silently skipped. Keep
+Every file found is loaded, and later rows override earlier ones. The
+override is per file, not per key: a later file's defaults also replace
+most values an earlier file set, even in sections the later file never
+mentions. A file that exists but fails to load (syntax error, wrong
+value type, unreadable) stops pancetta with an error naming it; it is
+never silently skipped. Keep
 a single file at `~/.pancetta/pancetta.toml`, and run
 `pancetta config --validate` to see which file(s) were read. A table only
 needs the keys you change; every key you leave out keeps its default.

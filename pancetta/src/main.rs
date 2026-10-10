@@ -1116,7 +1116,9 @@ async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<Stri
                     // JSON recovery writes a sibling TOML file that discovery
                     // selects before JSON in the same search directory.
                     match run_first_time_setup(&defaults, &failed_path, true)? {
-                        Some(fixed) => (fixed, Vec::new()),
+                        Some(fixed) => {
+                            config_after_recovery(fixed, Config::load_default_with_warnings)
+                        }
                         None => {
                             return Err(anyhow::anyhow!(e))
                                 .context("Failed to load default configuration")
@@ -1186,6 +1188,52 @@ fn config_file_to_repair(e: &pancetta_config::ConfigError) -> Option<PathBuf> {
     }
     let (_, report) = Config::load_default_unvalidated().ok()?;
     sole_invalid_config_file(&report.files)
+}
+
+/// The configuration to run on after the de-brick wizard: every discovered
+/// file reloaded through `reload`, i.e. exactly what the next start reads, so
+/// the other valid files' settings apply now and not only after a restart.
+/// A warning names the sections where other files change the wizard's
+/// `fixed` values. When the reload still fails (the operator declined to
+/// save, or another file is broken too) this warns and falls back to `fixed`.
+fn config_after_recovery(
+    fixed: Config,
+    reload: impl FnOnce() -> pancetta_config::ConfigResult<(Config, Vec<String>)>,
+) -> (Config, Vec<String>) {
+    match reload() {
+        Ok((config, mut warnings)) => {
+            let changed = sections_that_differ(&fixed, &config);
+            if !changed.is_empty() {
+                warnings.push(format!(
+                    "Other config files change {} after setup; this session uses the \
+                     merged values (run `pancetta config --validate` to list the files read)",
+                    changed.join(", ")
+                ));
+            }
+            (config, warnings)
+        }
+        Err(e) => (
+            fixed,
+            vec![format!(
+                "The configuration on disk still does not load ({e}); this session runs \
+                 on the setup values only"
+            )],
+        ),
+    }
+}
+
+/// Top-level sections (`[station]`, `[audio]`, ...) whose values differ
+/// between `a` and `b`. `metadata` is ignored.
+fn sections_that_differ(a: &Config, b: &Config) -> Vec<String> {
+    let (Ok(serde_json::Value::Object(a)), Ok(serde_json::Value::Object(b))) =
+        (serde_json::to_value(a), serde_json::to_value(b))
+    else {
+        return Vec::new();
+    };
+    a.iter()
+        .filter(|(k, v)| k.as_str() != "metadata" && b.get(k.as_str()) != Some(*v))
+        .map(|(k, _)| format!("[{k}]"))
+        .collect()
 }
 
 /// The only one of `files` that does not load and validate on its own.
@@ -2152,6 +2200,80 @@ mod tests {
         );
         assert_eq!(sole_invalid_config_file(std::slice::from_ref(&good)), None);
         assert_eq!(sole_invalid_config_file(&[bad, good, bad2]), None);
+    }
+
+    #[test]
+    fn config_after_recovery_reloads_every_discovered_file() {
+        // Discovery stops on a broken low-precedence file; after the wizard
+        // repairs it, the session must run on what the next start reads,
+        // including the higher valid file, not on the wizard's config alone.
+        let low = tempfile::tempdir().unwrap();
+        let high = tempfile::tempdir().unwrap();
+        let broken = low.path().join("pancetta.toml");
+        std::fs::write(&broken, "[station\n").unwrap();
+        std::fs::write(
+            high.path().join("pancetta.toml"),
+            "[station]\ncallsign = \"K1ABC\"\n[audio]\ninput_device = \"USB Audio CODEC\"\n",
+        )
+        .unwrap();
+        let loader = pancetta_config::ConfigLoader::with_search_paths(vec![
+            low.path().to_path_buf(),
+            high.path().to_path_buf(),
+        ])
+        .unwrap();
+        assert!(loader.load().is_err());
+
+        let mut fixed = Config::default();
+        fixed.station.callsign = "W1AW".to_string();
+        persist_wizard_config(&fixed, &broken, true).unwrap();
+
+        let (config, warnings) = config_after_recovery(fixed, || {
+            let config = loader.load()?;
+            Ok((config, loader.load_warnings()))
+        });
+        let next_start = loader.load().unwrap();
+        assert_eq!(config.station.callsign, next_start.station.callsign);
+        assert_eq!(config.station.callsign, "K1ABC");
+        assert_eq!(config.audio.input_device, "USB Audio CODEC");
+        // The operator is told the wizard's values did not all survive.
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("[audio], [station]"), "{warnings:?}");
+    }
+
+    #[test]
+    fn config_after_recovery_is_quiet_for_a_single_repaired_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let broken = dir.path().join("pancetta.toml");
+        std::fs::write(&broken, "[station\n").unwrap();
+        let loader =
+            pancetta_config::ConfigLoader::with_search_paths(vec![dir.path().to_path_buf()])
+                .unwrap();
+        let mut fixed = Config::default();
+        fixed.station.callsign = "W1AW".to_string();
+        fixed.audio.input_device = "USB Audio CODEC".to_string();
+        persist_wizard_config(&fixed, &broken, true).unwrap();
+
+        let (config, warnings) = config_after_recovery(fixed, || {
+            let config = loader.load()?;
+            Ok((config, loader.load_warnings()))
+        });
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(config.station.callsign, "W1AW");
+    }
+
+    #[test]
+    fn config_after_recovery_falls_back_when_the_reload_fails() {
+        let mut fixed = Config::default();
+        fixed.station.callsign = "W1AW".to_string();
+        let (config, warnings) = config_after_recovery(fixed, || {
+            Err(pancetta_config::ConfigError::Validation(
+                "still broken".into(),
+            ))
+        });
+        assert_eq!(config.station.callsign, "W1AW");
+        // A warning, not just stderr: the TUI takes over the terminal.
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("still broken"), "{warnings:?}");
     }
 
     #[test]

@@ -433,7 +433,11 @@ a hard `missing field` error. Worse, the auto-discovery loader swallowed that er
   prompt with the real path). Non-file sources keep warn-and-continue. For a validation failure
   the prompt targets the one discovered file that fails validation on its own, and is not
   offered when no single file can be blamed. The de-brick wizard starts from defaults, so on save
-  it always keeps the file it rewrites as `<name>.bak`.
+  it always keeps the file it rewrites as `<name>.bak`. After the wizard, startup reloads every
+  discovered file, so the session starts from what the next start reads (and warns about the
+  sections where other files change the wizard's values; the first-run wizard still follows if
+  that config has no callsign). If the reload still fails, it warns and runs on the wizard's
+  values for this session only.
 - **`config --validate` contract.** Loads without any wizard, prints `Config file: <path>` for
   each file read (or the searched directories and "No config file found"), prints warnings, then
   validates. Exit 1 on any load or validation failure. Unknown keys warn but do not fail it.
