@@ -515,6 +515,14 @@ impl Config {
         format!("{}\n{}", Self::DEFAULTS_TOML_HEADER, body)
     }
 
+    /// Write [`defaults_toml`](Self::defaults_toml) to `path` (`pancetta
+    /// config --generate`) the way [`save_to_file`](Self::save_to_file)
+    /// writes: owner-only, atomic, creating missing parent directories.
+    /// Operators add credentials to this file next.
+    pub fn save_defaults_toml<P: AsRef<std::path::Path>>(path: P) -> ConfigResult<()> {
+        Self::write_secure_atomic(path.as_ref(), &Self::defaults_toml())
+    }
+
     /// `config` (metadata excluded) as a `toml::Table` with deterministic
     /// key order.
     ///

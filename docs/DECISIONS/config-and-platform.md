@@ -426,11 +426,14 @@ a hard `missing field` error. Worse, the auto-discovery loader swallowed that er
   `Config::default()` as an empty table and requires it to equal the defaults; its two allowlists
   hold at most four entries, each with a reason.
 - **Unknown keys at any depth** are load warnings (non-fatal), so a partial table never turns a
-  typo into a silent no-op. Detection walks the raw TOML against the parsed config serialized to
-  JSON (`ConfigLoader::warn_unknown_keys`).
+  typo into a silent no-op. Detection walks the raw TOML (or the key shape of a raw JSON file)
+  against the parsed config serialized to JSON (`ConfigLoader::warn_unknown_keys`, `parse_json`).
 - **Fatal file-load errors.** A discovered config *file* that exists but fails to load returns
   `ConfigError::FileLoad { path, .. }`; startup stops (interactive launches get the de-brick
-  prompt with the real path). Non-file sources keep warn-and-continue.
+  prompt with the real path). Non-file sources keep warn-and-continue. For a validation failure
+  the prompt targets the one discovered file that fails validation on its own, and is not
+  offered when no single file can be blamed. The de-brick wizard starts from defaults, so on save
+  it always keeps the file it rewrites as `<name>.bak`.
 - **`config --validate` contract.** Loads without any wizard, prints `Config file: <path>` for
   each file read (or the searched directories and "No config file found"), prints warnings, then
   validates. Exit 1 on any load or validation failure. Unknown keys warn but do not fail it.

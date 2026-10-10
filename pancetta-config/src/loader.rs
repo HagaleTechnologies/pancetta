@@ -107,6 +107,20 @@ pub fn dedup_keep_last(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     out
 }
 
+/// The shape of a raw JSON config as a TOML value, for the unknown-key
+/// sweep: objects and arrays keep their keys and positions, and every scalar
+/// (including `null`, which TOML lacks) becomes a placeholder, since the
+/// sweep never reads scalar values.
+fn json_shape(value: &serde_json::Value) -> toml::Value {
+    match value {
+        serde_json::Value::Object(o) => {
+            toml::Value::Table(o.iter().map(|(k, v)| (k.clone(), json_shape(v))).collect())
+        }
+        serde_json::Value::Array(a) => toml::Value::Array(a.iter().map(json_shape).collect()),
+        _ => toml::Value::Boolean(false),
+    }
+}
+
 /// Configuration source definition
 #[derive(Debug, Clone)]
 pub struct ConfigSource {
@@ -736,9 +750,15 @@ impl ConfigLoader {
         let Ok(raw) = content.parse::<toml::Table>() else {
             return;
         };
+        self.warn_unknown_in_table(&raw, parsed);
+    }
+
+    /// Body of [`Self::warn_unknown_keys`] over an already-parsed raw table
+    /// (TOML, or the shape of a JSON document — see [`json_shape`]).
+    fn warn_unknown_in_table(&self, raw: &toml::Table, parsed: &Config) {
         let known_top = Self::known_top_level_keys();
         let known = serde_json::to_value(parsed).unwrap_or_default();
-        for (key, value) in &raw {
+        for (key, value) in raw {
             if !known_top.contains(key) {
                 self.push_load_warning(format!(
                     "Unknown config section [{key}] — ignored (check spelling; see docs/CONFIG.md)"
@@ -781,7 +801,17 @@ impl ConfigLoader {
         // Tilde-only (`~`) expansion — see `parse_toml` and security fix I-7.
         let expanded_content = shellexpand::tilde(content);
 
-        serde_json::from_str(&expanded_content).map_err(ConfigError::Json)
+        let config: Config = serde_json::from_str(&expanded_content).map_err(ConfigError::Json)?;
+
+        // Partial tables apply to JSON too, so run the same unknown-key
+        // sweep as `parse_toml` or a misspelled key is a silent no-op.
+        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&expanded_content) {
+            if let toml::Value::Table(raw) = json_shape(&raw) {
+                self.warn_unknown_in_table(&raw, &config);
+            }
+        }
+
+        Ok(config)
     }
 
     /// Get cached configuration for a file
@@ -1799,6 +1829,26 @@ bookmarks = []
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("`enable`"), "{warnings:?}");
         assert!(warnings[0].contains("[network.wsjtx_udp]"), "{warnings:?}");
+    }
+
+    #[test]
+    fn unknown_nested_key_in_json_warns() {
+        let loader = ConfigLoader::new().unwrap();
+        let parsed = loader.parse_json(r#"{"network":{"wsjtx_udp":{"enable":true}}}"#);
+        assert!(parsed.is_ok(), "unknown keys must stay non-fatal");
+        let warnings = loader.load_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("`enable`"), "{warnings:?}");
+        assert!(warnings[0].contains("[network.wsjtx_udp]"), "{warnings:?}");
+
+        let clean = ConfigLoader::new().unwrap();
+        let full = serde_json::to_string(&Config::default()).unwrap();
+        clean.parse_json(&full).unwrap();
+        assert!(
+            clean.load_warnings().is_empty(),
+            "{:?}",
+            clean.load_warnings()
+        );
     }
 
     #[test]

@@ -266,3 +266,27 @@ fn generate_writes_the_defaults_toml_text() {
     assert_eq!(generated, checked_in);
     assert!(!generated.contains("[metadata]"));
 }
+
+/// `config --generate` into a directory that does not exist yet creates it
+/// and writes owner-only, as `save_to_file` does: operators add credentials
+/// to the generated file.
+#[test]
+fn generate_creates_missing_parent_directories_owner_only() {
+    let s = Scratch::new();
+    let out_path = s.home.path().join("new").join("dir").join("pancetta.toml");
+    let out = s
+        .command()
+        .args(["config", "--generate"])
+        .arg(&out_path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(out_path.exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&out_path), 0o600);
+        assert_eq!(mode(out_path.parent().unwrap()), 0o700);
+    }
+}
