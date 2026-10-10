@@ -99,8 +99,10 @@ composer, Diagnostics, Station Health, Recent QSOs). Each block ends in `_ => {}
 open (P0 #2 in `docs/reviews/2026-09-05-product-review/lane1-tui.md`). One check ahead of the chain
 was chosen over a `Q` arm per block (the pattern PAN-24 used for `k`) so a new modal can't forget
 it. Any modifiers are accepted: PAN-112's Ctrl/Alt guard is for keys that start TX and does not
-apply to the stop. The open dialog is left as it was: Esc closes it, a second Esc clears the
-banner. Accepted trade-off: in the composer, rig model and bookmark-name fields, Shift+Q (and
+apply to the stop. The open dialog is left as it was. Each Esc closes one dialog layer, and the
+Esc after the last layer clears the banner: two presses for the other dialogs, three from the rig
+picker's bookmark list or bookmark-name prompt, whose first Esc returns to the picker form.
+Accepted trade-off: in the composer, rig model and bookmark-name fields, Shift+Q (and
 Caps Lock + q, which crossterm also delivers as `Char('Q')`) stops the station instead of typing
 `Q`. The composer uppercases input and rig-model lookup ignores case, so lowercase `q` covers both.
 Tests: `tui_runner::key_tests::shift_q_emergency_stops_through_every_overlay` and the four

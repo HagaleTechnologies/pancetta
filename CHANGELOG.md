@@ -72,19 +72,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Saved rig-config bookmarks (PAN-61): the `i` rig picker can now save the current model/port/baud/PTT as a named bookmark (`F3`) and load one back into the form later (`F2`), without retyping. Builds on PAN-59's live rig-config switch.
 
-<<<<<<< HEAD
-### Fixed
-
-- Shift+Q emergency stop now works while a dialog or overlay is open
-  (PAN-113). Every modal's key handler swallowed keys it didn't use, so the
-  stop did nothing while quit-confirm, the out-of-band warning, help,
-  Diagnostics, Station Health, Recent QSOs, the audio or rig picker, the
-  frequency or TX-offset entry, or the composer was up. The stop is now
-  checked before any modal and leaves the open dialog as it was. In the
-  composer and the rig picker's text fields, Shift+Q (or Caps Lock + q) now
-  stops the station instead of typing a capital Q; lowercase `q` still types
-  Q in the composer.
-=======
 
 ### Fixed
 
@@ -101,6 +88,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TUI diagnostics list.
 - The TUI rig picker no longer writes a config file that fails to load on the
   next start (`missing field 'data_bits'`).
+- Shift+Q emergency stop now works while a dialog or overlay is open
+  (PAN-113). Every modal's key handler swallowed keys it didn't use, so the
+  stop did nothing while quit-confirm, the out-of-band warning, help,
+  Diagnostics, Station Health, Recent QSOs, the audio or rig picker, the
+  frequency or TX-offset entry, or the composer was up. The stop is now
+  checked before any modal and leaves the open dialog as it was. In the
+  composer and the rig picker's text fields, Shift+Q (or Caps Lock + q) now
+  stops the station instead of typing a capital Q; lowercase `q` still types
+  Q in the composer.
 
 ### Changed
 
@@ -125,7 +121,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `pancetta-config/examples/config.toml`: unreferenced, did not parse, and
   duplicated the generated, drift-tested `pancetta-config/defaults.toml`.
->>>>>>> 55d6d018a8ca30de162000f84b0ea08a29c349e3
 
 ## [0.9.6] - 2026-09-02
 
