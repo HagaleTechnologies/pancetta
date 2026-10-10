@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- In-session clock-skew monitor (PAN-114): a live session (TUI or
+  `--headless`; never `--replay`/`--wav`) sends one SNTP query to
+  pool.ntp.org 30 s after start and then every 30 minutes, plus one re-check
+  after a detected clock step (never sooner than 30 minutes after the last
+  query, per the NTP pool's SNTP client terms). When the system clock is
+  0.3 s or more off UTC — FT8's decode margin — the title bar shows
+  `⚠ CLOCK 0.42s SLOW` (or `FAST`) in the alarm slot, after `AUDIO DEAD` and
+  `DECODER STUB`, and Diagnostics (Shift+D) plus the headless console log a
+  `clock.skew` Warn with the per-OS NTP fix. Sleep/wake and NTP steps log a
+  `clock.step` entry and clear the chip until the next reading.
+  `pancetta doctor` now reports WARN (exit code unchanged) for offsets from
+  0.3 s to under 1.0 s, which it used to PASS.
+
 - Adaptive TX-offset switching (PAN-72): in `AUTO` TX-frequency mode, an
   in-progress QSO that goes `[autonomous] qso_stall_switch_after` slots (default
   4) without the DX advancing — **silence now counts, not just a repeated
@@ -75,6 +88,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Slot timing stays on UTC across clock steps and sleep/wake (PAN-114). After
+  a backward clock step (e.g. NTP correcting a fast RTC), the autonomous
+  scheduler and the decoder re-anchor to the UTC slot grid within one slot
+  instead of stalling for the size of the step (a 10-minute step meant 10
+  minutes with no decisions and no decodes). A frame waiting for PTT across a
+  clock jump is dropped with a `tx.policy` "dropping stale TX after a … clock
+  jump" entry instead of being keyed seconds late, holding PTT for the length
+  of the step, or being skipped as an "internal scheduling error"; PTT is
+  never held more than `ptt_lead_ms` + 1 s before the slot boundary. After
+  sleep/wake, decodes and audio from before the sleep are discarded rather
+  than answered or spotted.
 - Every documented minimal config block now parses on its own (PAN-90): the
   README's `[autonomous] enabled = true`, both GUIDE.md GridTracker
   `[network.wsjtx_udp]` recipes, and CONFIG.md's minimum viable config used

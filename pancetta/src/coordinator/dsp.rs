@@ -139,6 +139,36 @@ fn mode_flush_decision(cached_mode: u8, cur_mode: u8) -> bool {
     cached_mode != cur_mode
 }
 
+/// PAN-114: re-anchor the decode-window trigger after a wall-clock jump.
+///
+/// `next_window_time` is always "the next decode phase strictly after some
+/// earlier `now`", so it never sits more than one slot ahead, and the DSP
+/// thread (fed every audio batch) never passes it by a whole slot. Outside
+/// that band the wall clock jumped: a backward NTP step left it up to the
+/// size of the step in the future (measured: 613 s of silence after a 600 s
+/// step), and a sleep/wake or forward step left it far in the past.
+///
+/// Returns `(next_phase_with_period(now, decode_phase, slot_ns), Some(jump))`
+/// on a jump and `(next_window_time, None)` otherwise, so the no-jump emit
+/// path is untouched.
+fn reanchor_decode_window(
+    now: chrono::DateTime<chrono::Utc>,
+    next_window_time: chrono::DateTime<chrono::Utc>,
+    decode_phase: chrono::Duration,
+    slot_ns: i64,
+) -> (
+    chrono::DateTime<chrono::Utc>,
+    Option<pancetta_core::slot_clock::WallClockJump>,
+) {
+    match pancetta_core::slot_clock::classify_deadline_jump(now, next_window_time, slot_ns) {
+        Some(jump) => (
+            pancetta_core::slot::next_phase_with_period(now, decode_phase, slot_ns),
+            Some(jump),
+        ),
+        None => (next_window_time, None),
+    }
+}
+
 /// Manage WAV recording of 12kHz mono FT8 windows for decoder validation.
 ///
 /// Writes one WAV file per FT8 window (12.64 seconds @ 12kHz mono i16).
@@ -650,6 +680,28 @@ impl super::ApplicationCoordinator {
                         // (FT8 → 180_000 = 15s×12kHz; FT4 → 90_000 = 7.5s×12kHz).
                         let ideal_samples = dsp_overlap_samples;
                         let now = chrono::Utc::now();
+                        let (reanchored, jump) = reanchor_decode_window(
+                            now,
+                            next_window_time,
+                            dsp_decode_phase,
+                            dsp_slot_ns,
+                        );
+                        if let Some(jump) = jump {
+                            next_window_time = reanchored;
+                            if matches!(jump, pancetta_core::slot_clock::WallClockJump::Forward(_))
+                            {
+                                // Same flush as a band change (above): the
+                                // buffer spans the jump. `bin_history` (the
+                                // waterfall noise floor) is kept — the band
+                                // did not change.
+                                ft8_buffer.clear();
+                                last_live_wf_samples = 0;
+                            }
+                            warn!(
+                                target: "pancetta::slot_clock",
+                                "DSP decode window re-anchored to UTC after a wall-clock jump: {jump:?}"
+                            );
+                        }
                         if ft8_buffer.len() >= ft8_window_samples && now >= next_window_time {
                             // Scheduled slot boundary for this window: next_window_time
                             // is the decode-phase instant, `decode_phase` past the
@@ -1359,5 +1411,59 @@ mod dead_air_tests {
     fn threshold_boundary_at_threshold_is_not_dead_air() {
         // A single sample at exactly threshold is NOT dead air (strict <).
         assert!(!is_dead_air(&[DEAD_AIR_PEAK_THRESHOLD]));
+    }
+}
+
+#[cfg(test)]
+mod reanchor_decode_window_tests {
+    use super::reanchor_decode_window;
+    use pancetta_core::slot_clock::WallClockJump;
+
+    const FT8_SLOT_NS: i64 = 15_000_000_000;
+
+    fn decode_phase() -> chrono::Duration {
+        chrono::Duration::seconds(13)
+    }
+
+    fn utc(secs: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::<chrono::Utc>::UNIX_EPOCH + chrono::Duration::seconds(secs)
+    }
+
+    fn window_after(t: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+        pancetta_core::slot::next_phase_with_period(t, decode_phase(), FT8_SLOT_NS)
+    }
+
+    #[test]
+    fn decode_window_reanchors_after_backward_step() {
+        let t = utc(1_000_000_005);
+        let next_window_time = window_after(t);
+        let now = t - chrono::Duration::seconds(600);
+        let (reanchored, jump) =
+            reanchor_decode_window(now, next_window_time, decode_phase(), FT8_SLOT_NS);
+        assert_eq!(reanchored, window_after(now));
+        assert!(reanchored > now);
+        assert!(reanchored - now <= chrono::Duration::seconds(15));
+        assert!(matches!(jump, Some(WallClockJump::Backward(_))));
+    }
+
+    #[test]
+    fn decode_window_reports_forward_jump_for_flush() {
+        let next_window_time = window_after(utc(1_000_000_005));
+        let now = next_window_time + chrono::Duration::seconds(3600);
+        let (reanchored, jump) =
+            reanchor_decode_window(now, next_window_time, decode_phase(), FT8_SLOT_NS);
+        assert!(matches!(jump, Some(WallClockJump::Forward(_))));
+        assert!(reanchored > now);
+        assert!(reanchored - now <= chrono::Duration::seconds(15));
+    }
+
+    #[test]
+    fn decode_window_unchanged_without_jump() {
+        let next_window_time = window_after(utc(1_000_000_005));
+        let now = next_window_time + chrono::Duration::milliseconds(40);
+        assert_eq!(
+            reanchor_decode_window(now, next_window_time, decode_phase(), FT8_SLOT_NS),
+            (next_window_time, None)
+        );
     }
 }
