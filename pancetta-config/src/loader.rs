@@ -335,7 +335,7 @@ impl ConfigLoader {
 
         // Load and merge configurations in priority order (lowest to highest)
         let mut sorted_sources = sources.clone();
-        sorted_sources.sort_by(|a, b| a.priority.cmp(&b.priority));
+        sorted_sources.sort_by_key(|a| a.priority);
 
         for source in &sorted_sources {
             match self.load_source(source) {
