@@ -1539,7 +1539,10 @@ impl TuiRunner {
         // PAN-112: crossterm delivers Ctrl+C as Char('c') + CONTROL and
         // Ctrl+Space as Char(' ') + CONTROL. On Windows, Ctrl+Shift+T arrives
         // as Char('T') + CONTROL|SHIFT. Allow Shift for uppercase bindings;
-        // Ctrl/Alt chords on TX-starting arms fall through to `_ => {}`.
+        // Ctrl/Alt chords on TX-starting arms fall through to `_ => {}` (Enter
+        // on Callers has its own no-op arm). Ctrl+C is swallowed rather than
+        // mapped to quit-confirm (`q`); the keyboard remap spec (2026-04-29)
+        // moved bindings off Ctrl chords.
         let ctrl_or_alt_held = key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
@@ -2180,6 +2183,15 @@ impl TuiRunner {
             // Free-text TX now lives in compose mode (`/`), so outside
             // Callers/TxPlacement there's nothing for Enter to send — it
             // hints the operator toward compose instead.
+            //
+            // PAN-112: Ctrl/Alt+Enter on Callers would reply on air, so it is
+            // swallowed here. TxPlacement parking does not transmit and keeps
+            // accepting modifiers. Only chords the terminal reports are caught:
+            // legacy Unix terminals send Ctrl+Enter and Ctrl+M as a plain
+            // Enter, which no guard can tell apart.
+            KeyCode::Enter
+                if ctrl_or_alt_held
+                    && matches!(app.active_panel, crate::app::ActivePanel::Callers) => {}
             KeyCode::Enter => {
                 if matches!(app.active_panel, crate::app::ActivePanel::Callers) {
                     if let Some((callsign, frequency, dx_parity)) = app.get_selected_station() {
@@ -3089,6 +3101,56 @@ mod key_tests {
                 assert!(!a.fox_mode, "{modified_key:?}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn ctrl_or_alt_enter_on_callers_does_not_reply() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        let status_before = {
+            let mut a = app.write().await;
+            a.active_panel = crate::app::ActivePanel::Callers;
+            a.decoded_messages
+                .push_back(crate::app::DecodedMessageView {
+                    timestamp: chrono::Utc::now(),
+                    frequency: 14_074_000.0,
+                    mode: "FT8".to_string(),
+                    snr: -8,
+                    delta_time: 0.0,
+                    delta_freq: 1234.0,
+                    call_sign: Some("G8KHF".to_string()),
+                    grid_square: Some("IO91".to_string()),
+                    message: "K5ARH G8KHF IO91".to_string(),
+                    distance: None,
+                    bearing: None,
+                    slot_parity: Some(pancetta_core::slot::SlotParity::Even),
+                    is_directed_at_us: true,
+                    worked_before: false,
+                    needed: false,
+                    atno: false,
+                    band_needed: false,
+                    priority_score: None,
+                    is_own_tx: false,
+                });
+            a.callers_scroll = 0;
+            assert!(a.get_selected_station().is_some());
+            a.status_message.clone()
+        };
+        for modifier in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            let modified_key = KeyEvent::new(KeyCode::Enter, modifier);
+            r.handle_key_event(modified_key).await.unwrap();
+            assert!(
+                cmd_rx.try_recv().is_err(),
+                "{modified_key:?} on Callers must not reply"
+            );
+            assert_eq!(app.read().await.status_message, status_before);
+        }
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::RespondToCaller { .. })
+        ));
     }
 
     #[tokio::test]
