@@ -181,3 +181,58 @@ and permits nested safety holds without one clearer accidentally unmuting anothe
 ## Coordinator-level QSO sim harness
 
 `pancetta/tests/coord_sim.rs`: a durable, reusable `CoordSim` fixture that exercises the *coordinator's* TX gate + mock-rig PTT + multi-stream path, complementing the engine-level state-machine harness in `pancetta-qso/src/sim.rs`. It stands up a real `MessageBus`, a real `QsoManager`, a real `MockRig` behind a hamlib consumer (mirror of `coordinator/hamlib.rs`'s `SetPtt` handling), and the *real* shared `active_tx_qsos` set + `tx_policy` atomic. A scenario starts/advances QSOs via the manager's real entry points (`respond_to_cq_with` / `respond_to_caller` / `start_cq`), calls `pump_qso_events()` (a faithful mirror of `coordinator/qso.rs`'s populater — insert on `StateChanged→active`/`QsoCompleted`, remove on `Failed`/`QsoFailed`, forward `MessageToSend`→`TransmitRequest`), then `drive_slot(pending)` which replicates the worker's keying-decision chain — **policy hard-mute → coalesce (real `coalesce_transmit_requests`) → Step-4b gate (real `tx_qso_is_live` over the real set) → key/audio/unkey** — sending real `RigControl(SetPtt)` over the bus to the mock rig and **asserting at the rig level** (`mock.get_ptt() == On`, offset, release). **Determinism**: no `schedule_tx` UTC math and no slot sleep (that's unit-tested in `tx.rs::schedule_tx_tests`); only bounded ms `await`s — pass/fail never depends on wall-clock slot phase. A `Timeline` (keyed / dropped / per-slot offsets, mirroring `sim::Timeline`'s style + Display) carries the readable assertion helpers. Permanent scenarios: PTT-keys-for-scheduled-QSO (StateChanged-at-start fix), stale-TX-dropped-after-supersede (no PTT), coalesce-backlog (newest wins, older not keyed), two-simultaneous-QSOs on distinct freqs, TX-policy Disabled=silent / RespondOnly=in-progress-keys-but-initiation-suppressed / Full=keys, requested-offset-honored, manual-send-never-gated. Made testable by re-exporting `coalesce_transmit_requests` / `CoalesceEntry` / `resolve_required_parity` and widening `active_tx_qso_key` / `tx_qso_is_live` to `pub` from `coordinator/mod.rs` (visibility-only, behavior-preserving).
+
+## UTC re-anchoring after sleep/wake and clock steps (PAN-114, 2026-10-10)
+
+PAN-72 had already replaced the autonomous loop's one-shot `interval_at` anchor with a 250 ms poll
+that re-reads `chrono::Utc::now()`, so a **forward** jump re-anchored on the next poll. A
+**backward** step still broke three components. Measured on `0823dd2` with scratch reproductions:
+0 autonomous slot ticks in 599 s after a 600 s step (expected ~40); the next DSP decode window
+613 s away; the TX worker's Step 6 sleeping 600.08 s with PTT keyed; and after a forward jump
+during the pre-PTT wait, a frame keyed 4.50 s into its 12.64 s waveform (5 s jump) or skipped as an
+"internal scheduling error" (1 h jump).
+
+**One invariant, one classifier.** Every slot deadline is "the next boundary strictly after some
+`now`", so a healthy deadline is never more than one period ahead of the wall clock and a consumer
+polling it is never more than one period late. Anything outside that band is a wall-clock jump.
+`pancetta-core/src/slot_clock.rs::classify_deadline_jump` returns `WallClockJump::Backward`/`Forward`
+outside the band and `None` inside it, so no-jump timing stays byte-identical (FT8 invariant). The
+same module holds `ClockStepDetector` (wall-vs-monotonic divergence ≥ 250 ms; NTP slew is ≤ 0.5 ms/s)
+used by the clock-skew monitor.
+
+- **Backward threshold is exactly one period** (D2). A healthy deadline is ≤ one period ahead, so the
+  check never fires without a jump. Re-firing a wall-clock label after a backward step is harmless:
+  `AutonomousOperator::decide()` re-reads `Utc::now()` and the slot manager only checks parity.
+- **Autonomous tick** (`coordinator/autonomous.rs`): `poll_slot_deadline_mode_aware` re-anchors a
+  deadline more than one *tracked* period ahead (after the existing PAN-72 mismatch branch).
+  `SlotTicker` replaces the two loose locals and classifies against the deadline's own period, so a
+  FT8 → FT4 switch is never reported as a jump. On a forward jump the tick clears `slot_messages`
+  before the cqdx spot report and the operator feed (D3): those decodes are at least a slot old.
+- **DSP decode trigger** (`coordinator/dsp.rs::reanchor_decode_window`): re-anchors on either jump.
+  A forward jump also flushes `ft8_buffer` like a band change (D4), because the buffer spans the
+  discontinuity; `bin_history` is kept. A backward step only re-anchors (the audio is continuous).
+  Because the window (12.64 s FT8, 5.04 s FT4) is always shorter than the slot, a buffer refill after
+  a flush can never be misread as a jump; an audio start-up delay of more than (slot − window) can
+  cost one extra flush of a window whose boundary is already more than a slot stale.
+- **TX worker pre-PTT wait** (`coordinator/tx.rs::wait_for_ptt_instant` / `ptt_wait_step`, both
+  arms' Step 4): re-reads the wall clock every ≤ 50 ms chunk (D5). It drops the frame only if the
+  PTT instant is now more than two periods away (backward step; `schedule_tx` never targets
+  further), or if the wait started before the PTT instant and finished more than
+  `tx_late_max_ms_effective` past `target_slot` (forward jump). A request that was already a late
+  start when the wait began keeps the old path exactly; a forward jump that lands inside the
+  late-start policy ships as a policy late start.
+- **PTT hold bound** (`ptt_hold_exceeds_bound`, both arms' Step 6, D6): if `to_slot` exceeds
+  `ptt_lead_ms` + `PTT_HOLD_SLACK_MS` (1000 ms) with PTT keyed, PTT is released first (the
+  `AbortedByDisarm` pattern, including the pivot-tombstone cleanup) and the frame is dropped.
+  Nothing reassigns `schedule` between Step 4 and Step 6, so the bound only trips on a step.
+- **Drop reporting** (`drop_frames_for_clock_jump`, D7): target `tx.policy`, Warn, text
+  "dropping stale TX after a {±secs} s clock jump: '…' — next frame uses the current UTC slot", so it
+  counts in the TUI's session TX-drops tally next to the existing stale-TX drops, plus one failed
+  `TransmitComplete` per frame so a self-CQ rolls back. The QSO engine re-emits on its own timers.
+
+Out of scope: no QSO teardown on a clock step (the engine's timeouts retire stalled QSOs); no
+queued-call TTL change (it is `std::time::Instant`-based and immune to NTP steps); no station-wide
+median-DT clock estimate (it mixes our clock error with audio latency and other stations' errors);
+no TX inhibit on large skew (a product decision for its own ticket). The in-session skew monitor is
+recorded in `config-and-platform.md`, its title-bar chip in `tui.md`.
+

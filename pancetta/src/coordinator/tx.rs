@@ -561,6 +561,157 @@ async fn interruptible_sleep(
     false
 }
 
+/// PAN-114 (lane5 H-16): one evaluation of the pre-PTT wait, re-derived
+/// from a fresh wall-clock read each chunk. The old single monotonic sleep
+/// keyed a frame 4.5 s into its waveform after a 5 s forward jump, and held
+/// PTT 600 s after a 600 s backward step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PttWaitStep {
+    Sleep(Duration),
+    Reached,
+    ClockJumped(pancetta_core::slot_clock::WallClockJump),
+}
+
+/// Pure decision behind [`wait_for_ptt_instant`]. Drops the frame only if
+/// (a) the PTT instant is now more than two periods away (a backward step:
+/// `schedule_tx` never targets further ahead than that), or (b) the wait
+/// started before the PTT instant and `now` is more than `late_max_ms` past
+/// `target_slot` (a forward jump past the late-start policy). A request that
+/// was already late when the wait began keeps today's path exactly.
+fn ptt_wait_step(
+    now: chrono::DateTime<chrono::Utc>,
+    ptt_target: chrono::DateTime<chrono::Utc>,
+    target_slot: chrono::DateTime<chrono::Utc>,
+    waited_from_before_target: bool,
+    late_max_ms: u64,
+    slot_ns: i64,
+) -> PttWaitStep {
+    use pancetta_core::slot_clock::WallClockJump;
+    let remaining = ptt_target - now;
+    // schedule_tx never targets more than two slots ahead.
+    if remaining > chrono::Duration::nanoseconds(2 * slot_ns) {
+        return PttWaitStep::ClockJumped(WallClockJump::Backward(remaining));
+    }
+    if remaining > chrono::Duration::zero() {
+        let chunk = remaining
+            .to_std()
+            .unwrap_or(Duration::ZERO)
+            .min(Duration::from_millis(50));
+        return PttWaitStep::Sleep(chunk);
+    }
+    if waited_from_before_target
+        && now - target_slot > chrono::Duration::milliseconds(late_max_ms as i64)
+    {
+        return PttWaitStep::ClockJumped(WallClockJump::Forward(now - ptt_target));
+    }
+    PttWaitStep::Reached
+}
+
+/// Outcome of [`wait_for_ptt_instant`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PttWait {
+    /// The wall clock reached the PTT instant (or the frame ships as a
+    /// policy late start).
+    Reached,
+    /// Shutdown or F8 abort flipped; same caller handling as
+    /// `interruptible_sleep` returning `true`.
+    Interrupted,
+    /// A wall-clock jump moved the PTT instant out of reach; drop the frame.
+    ClockJumped(pancetta_core::slot_clock::WallClockJump),
+}
+
+/// PAN-114: wait for the PTT engage instant on the WALL clock (re-read via
+/// `wall_now` every <= 50 ms chunk) instead of one monotonic sleep computed
+/// up front. Checks `shutdown`/`abort` before each evaluation, exactly like
+/// [`interruptible_sleep`], so wake latency stays ~50 ms. With no clock
+/// jump this returns `Reached` at the same wall instant the old monotonic
+/// sleep ended.
+async fn wait_for_ptt_instant(
+    ptt_target: chrono::DateTime<chrono::Utc>,
+    target_slot: chrono::DateTime<chrono::Utc>,
+    late_max_ms: u64,
+    slot_ns: i64,
+    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    abort: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    wall_now: impl Fn() -> chrono::DateTime<chrono::Utc>,
+) -> PttWait {
+    use std::sync::atomic::Ordering;
+    let mut waited_from_before_target: Option<bool> = None;
+    loop {
+        if shutdown.load(Ordering::Acquire) || abort.load(Ordering::Acquire) {
+            return PttWait::Interrupted;
+        }
+        let now = wall_now();
+        let waited = *waited_from_before_target.get_or_insert(ptt_target > now);
+        match ptt_wait_step(now, ptt_target, target_slot, waited, late_max_ms, slot_ns) {
+            PttWaitStep::Sleep(chunk) => sleep(chunk).await,
+            PttWaitStep::Reached => return PttWait::Reached,
+            PttWaitStep::ClockJumped(jump) => return PttWait::ClockJumped(jump),
+        }
+    }
+}
+
+/// PAN-114 (D6): slack over `ptt_lead_ms` allowed between PTT-on (Step 5)
+/// and the slot boundary (Step 6) before the hold is treated as a clock step.
+const PTT_HOLD_SLACK_MS: u64 = 1000;
+
+/// `true` when Step 6 would hold PTT keyed (for `hold`, the Step 6
+/// `to_slot`) longer than `ptt_lead_ms` + [`PTT_HOLD_SLACK_MS`]. Nothing
+/// between Step 4 and Step 6 reassigns the schedule, so after a normal
+/// Step 4 the hold is <= `ptt_lead_ms`; anything past the bound means the
+/// wall clock stepped back in between.
+fn ptt_hold_exceeds_bound(hold: Duration, ptt_lead_ms: u64) -> bool {
+    hold > Duration::from_millis(ptt_lead_ms + PTT_HOLD_SLACK_MS)
+}
+
+/// PAN-114 (D7): drop frame(s) a wall-clock jump made unsendable. Mirrors
+/// the neighbouring stale-TX drops: one `tx.policy` tracing line and Warn
+/// diagnostic per frame (text starts "dropping stale TX" so it counts in the
+/// TUI's TX-drops tally), clear the TX strip, then one failed
+/// `TransmitComplete` per frame so a tracked self-CQ rolls back. Callers
+/// that hold PTT must release it BEFORE calling this (it awaits).
+async fn drop_frames_for_clock_jump(
+    message_bus: &MessageBus,
+    frames: &[(String, Option<String>)],
+    jump: pancetta_core::slot_clock::WallClockJump,
+) {
+    let secs = jump.signed_secs();
+    for (message_text, qso_id) in frames {
+        warn!(
+            target: "pancetta::tx.policy",
+            "dropping stale TX for QSO {} after a {secs:+.1} s clock jump: '{message_text}' — next frame uses the current UTC slot",
+            qso_id.as_deref().unwrap_or("-")
+        );
+        emit_diagnostic(
+            message_bus,
+            "tx.policy",
+            pancetta_core::DiagnosticLevel::Warn,
+            format!(
+                "dropping stale TX after a {secs:+.1} s clock jump: '{message_text}' — next frame uses the current UTC slot"
+            ),
+            qso_id.as_deref(),
+        )
+        .await;
+    }
+    send_tx_queue_status(message_bus, None, Vec::new()).await;
+    for (message_text, qso_id) in frames {
+        let complete_msg = ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Autonomous,
+            MessageType::TransmitComplete {
+                success: false,
+                message_text: message_text.clone(),
+                duration_ms: 0,
+                qso_id: qso_id.clone(),
+            },
+            Instant::now(),
+        );
+        if let Err(e) = message_bus.send_message(complete_msg).await {
+            warn!("Failed to send TransmitComplete: {}", e);
+        }
+    }
+}
+
 /// Outcome of `interruptible_sleep_or_supersede`.
 ///
 /// Deliberately does NOT derive `PartialEq`/`Eq`: `Superseded` carries the
@@ -5900,51 +6051,83 @@ impl super::ApplicationCoordinator {
                                             .await;
                                         }
 
-                                        // --- Step 4: Sleep until PTT engage instant ---
+                                        // --- Step 4: Wait until PTT engage instant ---
+                                        // PAN-114: waits on the wall clock (re-read every
+                                        // 50 ms chunk), so a clock jump during the wait is
+                                        // seen before PTT instead of keying a late or
+                                        // garbage frame — see `wait_for_ptt_instant`.
                                         let ptt_target_utc = schedule.target_slot
                                             - chrono::Duration::milliseconds(ptt_lead_ms as i64);
-                                        let to_ptt = pancetta_core::slot::duration_until(
+                                        match wait_for_ptt_instant(
                                             ptt_target_utc,
-                                            chrono::Utc::now(),
-                                        );
-                                        if interruptible_sleep(to_ptt, &shutdown, &abort_current_tx)
-                                            .await
+                                            schedule.target_slot,
+                                            tx_late_max_ms_effective(
+                                                active_protocol,
+                                                tx_late_max_ms,
+                                            ),
+                                            slot_ns,
+                                            &shutdown,
+                                            &abort_current_tx,
+                                            chrono::Utc::now,
+                                        )
+                                        .await
                                         {
-                                            if shutdown.load(Ordering::Acquire) {
-                                                info!("TX aborted before PTT engage by shutdown");
-                                                break 'worker;
-                                            }
-                                            info!("TX aborted before PTT engage by operator (F8)");
-                                            // This abort happens BEFORE the TxStatusGuard is
-                                            // constructed, so its Drop-based clear never runs.
-                                            // Clear the strip explicitly so the QUEUED row
-                                            // doesn't sit stale until the next status push.
-                                            send_tx_queue_status(&message_bus, None, Vec::new())
+                                            PttWait::Reached => {}
+                                            PttWait::ClockJumped(jump) => {
+                                                drop_frames_for_clock_jump(
+                                                    &message_bus,
+                                                    &[(message_text.clone(), qso_id.clone())],
+                                                    jump,
+                                                )
                                                 .await;
-                                            // PAN-38 round 3 (Codex): an F8 abort here is the
-                                            // one path in this worker that previously sent NO
-                                            // TransmitComplete at all -- for a self-CQ whose
-                                            // QSO was already opened (AutonomousCqOpened
-                                            // registered it in the coordinator's
-                                            // pending_self_cq_qsos map), that left the entry
-                                            // permanently leaked and the speculative "+1"
-                                            // streak never rolled back, since nothing ever
-                                            // told the autonomous operator this attempt did
-                                            // not actually transmit. Report it exactly like
-                                            // the drop-stale-TX case above.
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: message_text.clone(),
-                                                    duration_ms: 0,
-                                                    qso_id: qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
-                                            continue 'worker;
+                                                continue 'worker;
+                                            }
+                                            PttWait::Interrupted => {
+                                                if shutdown.load(Ordering::Acquire) {
+                                                    info!(
+                                                        "TX aborted before PTT engage by shutdown"
+                                                    );
+                                                    break 'worker;
+                                                }
+                                                info!(
+                                                    "TX aborted before PTT engage by operator (F8)"
+                                                );
+                                                // This abort happens BEFORE the TxStatusGuard is
+                                                // constructed, so its Drop-based clear never runs.
+                                                // Clear the strip explicitly so the QUEUED row
+                                                // doesn't sit stale until the next status push.
+                                                send_tx_queue_status(
+                                                    &message_bus,
+                                                    None,
+                                                    Vec::new(),
+                                                )
+                                                .await;
+                                                // PAN-38 round 3 (Codex): an F8 abort here is the
+                                                // one path in this worker that previously sent NO
+                                                // TransmitComplete at all -- for a self-CQ whose
+                                                // QSO was already opened (AutonomousCqOpened
+                                                // registered it in the coordinator's
+                                                // pending_self_cq_qsos map), that left the entry
+                                                // permanently leaked and the speculative "+1"
+                                                // streak never rolled back, since nothing ever
+                                                // told the autonomous operator this attempt did
+                                                // not actually transmit. Report it exactly like
+                                                // the drop-stale-TX case above.
+                                                let complete_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Autonomous,
+                                                    MessageType::TransmitComplete {
+                                                        success: false,
+                                                        message_text: message_text.clone(),
+                                                        duration_ms: 0,
+                                                        qso_id: qso_id.clone(),
+                                                    },
+                                                    Instant::now(),
+                                                );
+                                                let _ =
+                                                    message_bus.send_message(complete_msg).await;
+                                                continue 'worker;
+                                            }
                                         }
 
                                         // --- Step 4b-parity: DX-parity freshness gate (PAN-141) ---
@@ -6581,6 +6764,49 @@ impl super::ApplicationCoordinator {
                                             schedule.target_slot,
                                             chrono::Utc::now(),
                                         );
+                                        // PAN-114 (D6): a backward clock step between Step 4
+                                        // and here would hold PTT keyed for the size of the
+                                        // step (measured: 600 s). Never hold it past
+                                        // `ptt_lead_ms` + PTT_HOLD_SLACK_MS; release PTT
+                                        // FIRST, exactly like `SleepOutcome::AbortedByDisarm`.
+                                        if ptt_hold_exceeds_bound(to_slot, ptt_lead_ms) {
+                                            let ptt_off_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Hamlib,
+                                                MessageType::RigControl(
+                                                    crate::message_bus::RigControlMessage::SetPtt {
+                                                        state: false,
+                                                    },
+                                                ),
+                                                Instant::now(),
+                                            );
+                                            if let Err(e) =
+                                                message_bus.send_message(ptt_off_msg).await
+                                            {
+                                                warn!(
+                                                    "Clock-step PTT hold guard: PTT OFF failed: {}",
+                                                    e
+                                                );
+                                            }
+                                            ptt_active.store(false, Ordering::Release);
+                                            ptt_guard.disarm();
+                                            // Pre-slot abort: nothing reached the air, so a
+                                            // Step 4c pivot tombstone must go too (same as
+                                            // the AbortedByDisarm branch below).
+                                            if let Some(key) = pivoted_this_key.take() {
+                                                pivoted_once.remove(&key);
+                                            }
+                                            drop_frames_for_clock_jump(
+                                                &message_bus,
+                                                &[(message_text.clone(), qso_id.clone())],
+                                                pancetta_core::slot_clock::WallClockJump::Backward(
+                                                    chrono::Duration::from_std(to_slot)
+                                                        .unwrap_or(chrono::Duration::MAX),
+                                                ),
+                                            )
+                                            .await;
+                                            continue 'worker;
+                                        }
                                         // ptt_guard in scope — drop on any loop exit fires
                                         // PTT-off. A qualifying request arriving here supersedes
                                         // the in-flight frame (aborts + re-keys).
@@ -8254,47 +8480,67 @@ impl super::ApplicationCoordinator {
                                     // to be sent.
                                     let raw_samples = samples;
 
-                                    // --- Step 4: Sleep until PTT engage instant ---
+                                    // --- Step 4: Wait until PTT engage instant ---
+                                    // PAN-114: wall-clock wait, same as the single-TX
+                                    // arm — see `wait_for_ptt_instant`.
                                     let ptt_target_utc = schedule.target_slot
                                         - chrono::Duration::milliseconds(ptt_lead_ms as i64);
-                                    let to_ptt = pancetta_core::slot::duration_until(
+                                    match wait_for_ptt_instant(
                                         ptt_target_utc,
-                                        chrono::Utc::now(),
-                                    );
-                                    if interruptible_sleep(to_ptt, &shutdown, &abort_current_tx)
-                                        .await
+                                        schedule.target_slot,
+                                        tx_late_max_ms_effective(active_protocol, tx_late_max_ms),
+                                        slot_ns,
+                                        &shutdown,
+                                        &abort_current_tx,
+                                        chrono::Utc::now,
+                                    )
+                                    .await
                                     {
-                                        if shutdown.load(Ordering::Acquire) {
-                                            info!("Multi-TX aborted before PTT by shutdown");
-                                            break;
+                                        PttWait::Reached => {}
+                                        PttWait::ClockJumped(jump) => {
+                                            // One drop per bundle item, like the F8
+                                            // abort below.
+                                            let frames: Vec<(String, Option<String>)> = item_texts
+                                                .into_iter()
+                                                .zip(encoded_qso_ids)
+                                                .collect();
+                                            drop_frames_for_clock_jump(&message_bus, &frames, jump)
+                                                .await;
+                                            continue;
                                         }
-                                        info!("Multi-TX aborted before PTT by operator (F8)");
-                                        // PAN-38 round 3 (Codex): same gap as the single-item
-                                        // worker's F8-before-PTT path -- no TransmitComplete
-                                        // was ever sent for any bundle item, leaking a
-                                        // self-CQ's pending_self_cq_qsos entry and never
-                                        // rolling back its speculative streak/offset.
-                                        for (text, qso_id) in
-                                            item_texts.into_iter().zip(encoded_qso_ids)
-                                        {
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: text,
-                                                    duration_ms: 0,
-                                                    qso_id,
-                                                },
-                                                Instant::now(),
-                                            );
-                                            if let Err(e) =
-                                                message_bus.send_message(complete_msg).await
-                                            {
-                                                warn!("Failed to send TransmitComplete: {}", e);
+                                        PttWait::Interrupted => {
+                                            if shutdown.load(Ordering::Acquire) {
+                                                info!("Multi-TX aborted before PTT by shutdown");
+                                                break;
                                             }
+                                            info!("Multi-TX aborted before PTT by operator (F8)");
+                                            // PAN-38 round 3 (Codex): same gap as the single-item
+                                            // worker's F8-before-PTT path -- no TransmitComplete
+                                            // was ever sent for any bundle item, leaking a
+                                            // self-CQ's pending_self_cq_qsos entry and never
+                                            // rolling back its speculative streak/offset.
+                                            for (text, qso_id) in
+                                                item_texts.into_iter().zip(encoded_qso_ids)
+                                            {
+                                                let complete_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Autonomous,
+                                                    MessageType::TransmitComplete {
+                                                        success: false,
+                                                        message_text: text,
+                                                        duration_ms: 0,
+                                                        qso_id,
+                                                    },
+                                                    Instant::now(),
+                                                );
+                                                if let Err(e) =
+                                                    message_bus.send_message(complete_msg).await
+                                                {
+                                                    warn!("Failed to send TransmitComplete: {}", e);
+                                                }
+                                            }
+                                            continue;
                                         }
-                                        continue;
                                     }
 
                                     // --- Step 4b: Drop-stale-TX gate (key-time) ---
@@ -9058,6 +9304,49 @@ impl super::ApplicationCoordinator {
                                         schedule.target_slot,
                                         chrono::Utc::now(),
                                     );
+                                    // PAN-114 (D6): never hold PTT through a backward clock
+                                    // step — see the single-TX arm's identical guard.
+                                    if ptt_hold_exceeds_bound(to_slot, ptt_lead_ms) {
+                                        let ptt_off_msg = ComponentMessage::new(
+                                            ComponentId::Ft8Transmitter,
+                                            ComponentId::Hamlib,
+                                            MessageType::RigControl(
+                                                crate::message_bus::RigControlMessage::SetPtt {
+                                                    state: false,
+                                                },
+                                            ),
+                                            Instant::now(),
+                                        );
+                                        if let Err(e) = message_bus.send_message(ptt_off_msg).await
+                                        {
+                                            warn!(
+                                                "Clock-step PTT hold guard: PTT OFF failed: {}",
+                                                e
+                                            );
+                                        }
+                                        ptt_active.store(false, Ordering::Release);
+                                        ptt_guard.disarm();
+                                        // Pre-slot abort: nothing reached the air yet.
+                                        for key in &pivoted_this_bundle_keys {
+                                            pivoted_once.remove(key);
+                                        }
+                                        let frames: Vec<(String, Option<String>)> = items
+                                            .iter()
+                                            .map(|item| {
+                                                (item.message_text.clone(), item.qso_id.clone())
+                                            })
+                                            .collect();
+                                        drop_frames_for_clock_jump(
+                                            &message_bus,
+                                            &frames,
+                                            pancetta_core::slot_clock::WallClockJump::Backward(
+                                                chrono::Duration::from_std(to_slot)
+                                                    .unwrap_or(chrono::Duration::MAX),
+                                            ),
+                                        )
+                                        .await;
+                                        continue;
+                                    }
                                     match interruptible_sleep_or_supersede(
                                         to_slot,
                                         &shutdown,
@@ -10945,6 +11234,324 @@ mod schedule_tx_tests {
             pancetta_ft8::Protocol::Ft8,
         );
         assert_eq!(cap, 0);
+    }
+
+    // --- PAN-114: wall-clock pre-PTT wait and the Step 6 PTT-hold bound ---
+
+    /// Default `ptt_lead_ms` (`pancetta-config/src/station.rs`).
+    const PTT_LEAD_MS: i64 = 80;
+
+    /// `(ptt_target, target_slot)` for an FT8 frame keyed at `slot_s`.
+    fn ptt_and_slot(slot_s: f64) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) {
+        let target_slot = at(slot_s);
+        (
+            target_slot - chrono::Duration::milliseconds(PTT_LEAD_MS),
+            target_slot,
+        )
+    }
+
+    #[test]
+    fn ptt_wait_sleeps_in_chunks_until_the_target() {
+        let (ptt_target, target_slot) = ptt_and_slot(30.0);
+        let far = ptt_target - chrono::Duration::seconds(20);
+        assert_eq!(
+            ptt_wait_step(far, ptt_target, target_slot, true, 8000, SLOT_NS),
+            PttWaitStep::Sleep(Duration::from_millis(50))
+        );
+        let near = ptt_target - chrono::Duration::milliseconds(30);
+        assert_eq!(
+            ptt_wait_step(near, ptt_target, target_slot, true, 8000, SLOT_NS),
+            PttWaitStep::Sleep(Duration::from_millis(30))
+        );
+    }
+
+    #[test]
+    fn ptt_wait_reaches_on_time() {
+        let (ptt_target, target_slot) = ptt_and_slot(30.0);
+        assert_eq!(
+            ptt_wait_step(ptt_target, ptt_target, target_slot, true, 8000, SLOT_NS),
+            PttWaitStep::Reached
+        );
+    }
+
+    #[test]
+    fn ptt_wait_already_late_request_keeps_todays_path() {
+        // A request that was already a late start when the wait began keeps
+        // today's path, even past late_max: schedule_tx already decided it.
+        let (ptt_target, target_slot) = ptt_and_slot(30.0);
+        let now = target_slot + chrono::Duration::seconds(9);
+        assert_eq!(
+            ptt_wait_step(now, ptt_target, target_slot, false, 8000, SLOT_NS),
+            PttWaitStep::Reached
+        );
+    }
+
+    #[test]
+    fn ptt_wait_forward_jump_within_late_policy_ships_late() {
+        let (ptt_target, target_slot) = ptt_and_slot(30.0);
+        let now = target_slot + chrono::Duration::seconds(5);
+        assert_eq!(
+            ptt_wait_step(now, ptt_target, target_slot, true, 8000, SLOT_NS),
+            PttWaitStep::Reached
+        );
+    }
+
+    #[test]
+    fn ptt_wait_forward_jump_past_late_policy_is_dropped() {
+        let (ptt_target, target_slot) = ptt_and_slot(30.0);
+        let now = target_slot + chrono::Duration::seconds(3600);
+        match ptt_wait_step(now, ptt_target, target_slot, true, 8000, SLOT_NS) {
+            PttWaitStep::ClockJumped(pancetta_core::slot_clock::WallClockJump::Forward(d)) => {
+                assert_eq!(d, now - ptt_target);
+            }
+            other => panic!("expected ClockJumped(Forward), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ptt_wait_backward_step_beyond_two_slots_is_dropped() {
+        let (ptt_target, target_slot) = ptt_and_slot(30.0);
+        let now = ptt_target - chrono::Duration::seconds(620);
+        match ptt_wait_step(now, ptt_target, target_slot, true, 8000, SLOT_NS) {
+            PttWaitStep::ClockJumped(pancetta_core::slot_clock::WallClockJump::Backward(d)) => {
+                assert_eq!(d, chrono::Duration::seconds(620));
+            }
+            other => panic!("expected ClockJumped(Backward), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ptt_wait_small_backward_step_is_waited_out() {
+        // 25 s ahead is inside schedule_tx's two-slot horizon (30 s for FT8).
+        let (ptt_target, target_slot) = ptt_and_slot(30.0);
+        let now = ptt_target - chrono::Duration::seconds(25);
+        assert_eq!(
+            ptt_wait_step(now, ptt_target, target_slot, true, 8000, SLOT_NS),
+            PttWaitStep::Sleep(Duration::from_millis(50))
+        );
+    }
+
+    #[test]
+    fn ptt_wait_bounds_scale_with_ft4() {
+        // 16 s ahead: beyond FT4's 2 × 7.5 s horizon, inside FT8's 30 s.
+        let (ptt_target, target_slot) = ptt_and_slot(30.0);
+        let now = ptt_target - chrono::Duration::seconds(16);
+        assert!(matches!(
+            ptt_wait_step(now, ptt_target, target_slot, true, 8000, FT4_SLOT_NS),
+            PttWaitStep::ClockJumped(pancetta_core::slot_clock::WallClockJump::Backward(_))
+        ));
+        assert_eq!(
+            ptt_wait_step(now, ptt_target, target_slot, true, 8000, SLOT_NS),
+            PttWaitStep::Sleep(Duration::from_millis(50))
+        );
+    }
+
+    #[test]
+    fn ptt_hold_bound_allows_normal_lead_and_rejects_a_step() {
+        assert!(!ptt_hold_exceeds_bound(Duration::from_millis(80), 80));
+        assert!(!ptt_hold_exceeds_bound(Duration::from_millis(1080), 80));
+        assert!(ptt_hold_exceeds_bound(Duration::from_millis(1081), 80));
+        assert!(ptt_hold_exceeds_bound(Duration::from_secs(600), 80));
+    }
+
+    /// Injectable wall clock for the `wait_for_ptt_instant` tests.
+    fn test_wall_clock(
+        start: chrono::DateTime<chrono::Utc>,
+    ) -> std::sync::Arc<std::sync::Mutex<chrono::DateTime<chrono::Utc>>> {
+        std::sync::Arc::new(std::sync::Mutex::new(start))
+    }
+
+    fn shift_clock(
+        clock: &std::sync::Arc<std::sync::Mutex<chrono::DateTime<chrono::Utc>>>,
+        by: chrono::Duration,
+    ) {
+        let mut now = clock.lock().unwrap();
+        *now += by;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_ptt_instant_reaches_target_on_the_wall_clock() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let start_wall = at(10.0);
+        let clock = test_wall_clock(start_wall);
+        let ticker_clock = clock.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                shift_clock(&ticker_clock, chrono::Duration::milliseconds(20));
+            }
+        });
+        let ptt_target = start_wall + chrono::Duration::milliseconds(200);
+        let target_slot = ptt_target + chrono::Duration::milliseconds(PTT_LEAD_MS);
+        let reader = clock.clone();
+        let started = std::time::Instant::now();
+        let outcome = wait_for_ptt_instant(
+            ptt_target,
+            target_slot,
+            8000,
+            SLOT_NS,
+            &shutdown,
+            &abort,
+            move || *reader.lock().unwrap(),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        ticker.abort();
+        assert_eq!(outcome, PttWait::Reached);
+        assert!(
+            *clock.lock().unwrap() >= ptt_target,
+            "must not report Reached before the wall clock reaches the PTT instant"
+        );
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "should reach a 200 ms target within 400 ms (elapsed={elapsed:?})"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_ptt_instant_detects_a_backward_step_mid_wait() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let start_wall = at(10.0);
+        let clock = test_wall_clock(start_wall);
+        let stepper_clock = clock.clone();
+        let stepper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            shift_clock(&stepper_clock, -chrono::Duration::seconds(600));
+        });
+        let ptt_target = start_wall + chrono::Duration::milliseconds(200);
+        let target_slot = ptt_target + chrono::Duration::milliseconds(PTT_LEAD_MS);
+        let reader = clock.clone();
+        let started = std::time::Instant::now();
+        let outcome = wait_for_ptt_instant(
+            ptt_target,
+            target_slot,
+            8000,
+            SLOT_NS,
+            &shutdown,
+            &abort,
+            move || *reader.lock().unwrap(),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let _ = stepper.await;
+        match outcome {
+            PttWait::ClockJumped(pancetta_core::slot_clock::WallClockJump::Backward(d)) => {
+                assert!(d > chrono::Duration::seconds(600), "jump size {d:?}");
+            }
+            other => panic!("expected ClockJumped(Backward), got {other:?}"),
+        }
+        // Step at ~60 ms + at most one 50 ms chunk ≈ 110-150 ms; slack for jitter.
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "backward step must be seen within about one chunk (elapsed={elapsed:?})"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_ptt_instant_detects_a_forward_jump_mid_wait() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let start_wall = at(10.0);
+        let clock = test_wall_clock(start_wall);
+        let jumper_clock = clock.clone();
+        let jumper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            shift_clock(&jumper_clock, chrono::Duration::seconds(3600));
+        });
+        let ptt_target = start_wall + chrono::Duration::seconds(10);
+        let target_slot = ptt_target + chrono::Duration::milliseconds(PTT_LEAD_MS);
+        let reader = clock.clone();
+        let started = std::time::Instant::now();
+        let outcome = wait_for_ptt_instant(
+            ptt_target,
+            target_slot,
+            8000,
+            SLOT_NS,
+            &shutdown,
+            &abort,
+            move || *reader.lock().unwrap(),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let _ = jumper.await;
+        match outcome {
+            PttWait::ClockJumped(pancetta_core::slot_clock::WallClockJump::Forward(d)) => {
+                assert_eq!(d, chrono::Duration::seconds(3590));
+            }
+            other => panic!("expected ClockJumped(Forward), got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "forward jump must be seen within about one chunk (elapsed={elapsed:?})"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_ptt_instant_still_honours_shutdown_and_abort() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        // A frozen wall clock 10 s short of the target: only a flag can end
+        // the wait.
+        let start_wall = at(10.0);
+        let ptt_target = start_wall + chrono::Duration::seconds(10);
+        let target_slot = ptt_target + chrono::Duration::milliseconds(PTT_LEAD_MS);
+
+        for flip_shutdown in [false, true] {
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let abort = Arc::new(AtomicBool::new(false));
+            let flag = if flip_shutdown {
+                shutdown.clone()
+            } else {
+                abort.clone()
+            };
+            let flipper = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                flag.store(true, Ordering::Release);
+            });
+            let started = std::time::Instant::now();
+            let outcome = wait_for_ptt_instant(
+                ptt_target,
+                target_slot,
+                8000,
+                SLOT_NS,
+                &shutdown,
+                &abort,
+                move || start_wall,
+            )
+            .await;
+            let elapsed = started.elapsed();
+            let _ = flipper.await;
+            assert_eq!(outcome, PttWait::Interrupted, "shutdown={flip_shutdown}");
+            // Same ~50 ms wake-latency guarantee as `interruptible_sleep`
+            // (flag flips at ~20 ms).
+            assert!(
+                elapsed < Duration::from_millis(200),
+                "shutdown={flip_shutdown}: wake latency exceeded one chunk (elapsed={elapsed:?})"
+            );
+        }
+
+        // Already-set flags return without evaluating the clock at all.
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(true));
+        let outcome = wait_for_ptt_instant(
+            ptt_target,
+            target_slot,
+            8000,
+            SLOT_NS,
+            &shutdown,
+            &abort,
+            || -> chrono::DateTime<chrono::Utc> { panic!("clock read after abort") },
+        )
+        .await;
+        assert_eq!(outcome, PttWait::Interrupted);
     }
 }
 

@@ -781,13 +781,17 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
     // hijacked by a remote-desktop client) sees *why* nothing is decoding,
     // rather than just an empty waterfall. Driven by the existing pipeline
     // health snapshot; the bottom status bar still shows the per-stage detail.
+    //
+    // PAN-114: a clock-skew chip joins the chain at the LOWEST priority, so
+    // it never competes with a second alarm chip for title-bar width. The
+    // coordinator's clock monitor owns the threshold; this only formats.
     if let Some(ref h) = app.pipeline_health {
         let alarm = if !h.audio_alive {
-            Some(" ⚠ AUDIO DEAD — press d ")
+            Some(" ⚠ AUDIO DEAD — press d ".to_string())
         } else if !h.ft8lib_available {
-            Some(" ⚠ DECODER STUB ")
+            Some(" ⚠ DECODER STUB ".to_string())
         } else {
-            None
+            h.clock_skew_warning_s.map(clock_skew_chip_text)
         };
         if let Some(text) = alarm {
             left_spans.push(Span::raw(" "));
@@ -1843,6 +1847,20 @@ pub fn format_time_ago(timestamp: chrono::DateTime<chrono::Utc>) -> String {
     }
 }
 
+/// PAN-114: title-bar clock-skew alarm text for a signed SNTP offset
+/// (positive = local clock behind UTC = SLOW). Two decimals below 10 s,
+/// whole seconds from 10 s up (a Pi booted without an RTC can be a day off).
+fn clock_skew_chip_text(offset_s: f64) -> String {
+    let mag = offset_s.abs();
+    let mag = if mag < 10.0 {
+        format!("{mag:.2}s")
+    } else {
+        format!("{mag:.0}s")
+    };
+    let dir = if offset_s > 0.0 { "SLOW" } else { "FAST" };
+    format!(" ⚠ CLOCK {mag} {dir} ")
+}
+
 #[cfg(test)]
 mod view_render_tests {
     use super::*;
@@ -1993,6 +2011,90 @@ mod view_render_tests {
             found_policy_banner,
             "TX-policy banner (Green bg) must be untouched"
         );
+    }
+
+    // ---- PAN-114: clock-skew alarm chip ----
+
+    fn health_with_clock(
+        clock_skew_warning_s: Option<f64>,
+        audio_alive: bool,
+    ) -> crate::app::PipelineHealth {
+        crate::app::PipelineHealth {
+            audio_alive,
+            dsp_windows: 42,
+            last_rms: 0.01,
+            ft8lib_available: true,
+            total_decodes: 7,
+            last_decode_elapsed_ms: 120,
+            last_decode_budget_exhausted: false,
+            tx_attempts: 3,
+            tx_defers: 1,
+            decode_panic_count: 0,
+            wdt_panic_count: 0,
+            clock_skew_warning_s,
+        }
+    }
+
+    async fn title_row_with_clock(
+        clock_skew_warning_s: Option<f64>,
+        audio_alive: bool,
+    ) -> (ratatui::buffer::Buffer, String) {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.pipeline_health = Some(health_with_clock(clock_skew_warning_s, audio_alive));
+        let backend = TestBackend::new(160, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &app).unwrap()).unwrap();
+        let buf = term.backend().buffer().clone();
+        let row: String = (0..buf.area.width)
+            .map(|x| buf[(x, 0)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        (buf, row)
+    }
+
+    #[tokio::test]
+    async fn title_bar_shows_clock_chip_when_skewed_slow() {
+        let (_, row) = title_row_with_clock(Some(0.42), true).await;
+        assert!(row.contains("⚠ CLOCK 0.42s SLOW"), "row 0: {row}");
+    }
+
+    #[tokio::test]
+    async fn title_bar_shows_clock_chip_when_skewed_fast() {
+        let (_, row) = title_row_with_clock(Some(-1.37), true).await;
+        assert!(row.contains("⚠ CLOCK 1.37s FAST"), "row 0: {row}");
+    }
+
+    #[tokio::test]
+    async fn title_bar_clock_chip_uses_whole_seconds_past_ten() {
+        let (_, row) = title_row_with_clock(Some(86400.0), true).await;
+        assert!(row.contains("⚠ CLOCK 86400s SLOW"), "row 0: {row}");
+    }
+
+    #[tokio::test]
+    async fn title_bar_has_no_clock_chip_when_in_spec() {
+        let (_, row) = title_row_with_clock(None, true).await;
+        assert!(!row.contains("CLOCK"), "row 0: {row}");
+    }
+
+    #[tokio::test]
+    async fn audio_dead_alarm_outranks_clock_chip() {
+        let (_, row) = title_row_with_clock(Some(0.42), false).await;
+        assert!(row.contains("AUDIO DEAD"), "row 0: {row}");
+        assert!(!row.contains("CLOCK"), "row 0: {row}");
+    }
+
+    #[tokio::test]
+    async fn clock_chip_uses_the_alarm_style() {
+        let (buf, row) = title_row_with_clock(Some(0.42), true).await;
+        let chars: Vec<char> = row.chars().collect();
+        let x = (0..chars.len())
+            .find(|&i| chars[i..].iter().collect::<String>().starts_with("⚠ CLOCK"))
+            .expect("clock chip in row 0");
+        let cell = &buf[(x as u16, 0)];
+        assert_eq!(cell.fg, Color::White);
+        assert_eq!(cell.bg, Color::Red);
+        assert!(cell.modifier.contains(Modifier::BOLD));
     }
 
     #[tokio::test]
@@ -2322,6 +2424,7 @@ mod view_render_tests {
             tx_defers: 1,
             decode_panic_count: 0,
             wdt_panic_count: 0,
+            clock_skew_warning_s: None,
         });
         app.session_completed = 2;
         app.session_failed = 1;

@@ -5,6 +5,10 @@
 //! one-liner for later phases.
 
 use pancetta_config::Config;
+use pancetta_lib::clock_skew::{
+    clock_fix_hint, sntp_clock_offset, CLOCK_SKEW_FAIL_S, CLOCK_SKEW_WARN_S, NTP_SERVER,
+    NTP_SERVER_HOST, SNTP_TIMEOUT,
+};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -116,60 +120,6 @@ fn not_configured() -> CheckOutcome {
     }
 }
 
-/// Seconds between the NTP epoch (1900-01-01) and the Unix epoch (1970-01-01).
-const NTP_UNIX_EPOCH_DELTA: f64 = 2_208_988_800.0;
-
-/// Convert an 8-byte NTP timestamp (32.32 fixed point, seconds since 1900)
-/// to Unix seconds as f64.
-pub(crate) fn ntp_ts_to_unix_f64(b: &[u8]) -> f64 {
-    let secs = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f64;
-    let frac = u32::from_be_bytes([b[4], b[5], b[6], b[7]]) as f64 / 4_294_967_296.0;
-    secs + frac - NTP_UNIX_EPOCH_DELTA
-}
-
-/// RFC 4330 clock offset from the four timestamps:
-/// T1 local send, T2 server receive, T3 server transmit, T4 local receive.
-/// Positive = the local clock is BEHIND the server.
-pub(crate) fn sntp_offset(t1: f64, t2: f64, t3: f64, t4: f64) -> f64 {
-    ((t2 - t1) + (t3 - t4)) / 2.0
-}
-
-fn unix_now_f64() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
-}
-
-/// One-shot SNTP (RFC 4330) query over UDP. Returns the clock offset in
-/// seconds. Hand-rolled on purpose: a 48-byte packet is not worth a crate.
-pub(crate) fn sntp_clock_offset(server: &str, timeout: Duration) -> anyhow::Result<f64> {
-    use std::net::UdpSocket;
-    let sock = UdpSocket::bind("0.0.0.0:0")?;
-    sock.set_read_timeout(Some(timeout))?;
-    sock.set_write_timeout(Some(timeout))?;
-    sock.connect(server)?;
-
-    // 48-byte client request: LI=0, VN=4, Mode=3 (client) → first byte 0x23.
-    let mut req = [0u8; 48];
-    req[0] = 0x23;
-    let t1 = unix_now_f64();
-    sock.send(&req)?;
-    let mut resp = [0u8; 48];
-    let n = sock.recv(&mut resp)?;
-    let t4 = unix_now_f64();
-    anyhow::ensure!(n >= 48, "short SNTP response ({n} bytes)");
-    let mode = resp[0] & 0x07;
-    anyhow::ensure!(
-        mode == 4 || mode == 5,
-        "not an SNTP server response (mode {mode})"
-    );
-    let t2 = ntp_ts_to_unix_f64(&resp[32..40]); // Receive timestamp
-    let t3 = ntp_ts_to_unix_f64(&resp[40..48]); // Transmit timestamp
-    anyhow::ensure!(t3 > 0.0, "SNTP transmit timestamp is zero");
-    Ok(sntp_offset(t1, t2, t3, t4))
-}
-
 pub(crate) fn check_config() -> DoctorCheck {
     DoctorCheck {
         name: "config",
@@ -218,13 +168,32 @@ pub(crate) fn check_config() -> DoctorCheck {
     }
 }
 
-fn clock_fix_hint() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "System Settings → General → Date & Time → 'Set time automatically'"
-    } else if cfg!(target_os = "windows") {
-        "run `w32tm /resync` in an admin prompt (or Settings → Time & Language → Sync now)"
-    } else {
-        "enable an NTP daemon: `sudo apt install chrony` (or systemd-timesyncd)"
+/// Classify one SNTP result. PASS below FT8's ~0.3 s decode margin, WARN
+/// from the margin up to 1 s (PAN-114), FAIL from 1 s, WARN when the server
+/// cannot be reached. Only FAIL gates the exit code (`check_clock` is hard).
+fn clock_outcome(result: Result<f64, String>) -> CheckOutcome {
+    match result {
+        Ok(offset) if offset.abs() < CLOCK_SKEW_WARN_S => CheckOutcome {
+            status: CheckStatus::Pass,
+            detail: format!("offset {offset:+.3} s vs {NTP_SERVER_HOST}"),
+            fix: None,
+        },
+        Ok(offset) if offset.abs() < CLOCK_SKEW_FAIL_S => CheckOutcome {
+            status: CheckStatus::Warn,
+            detail: format!("offset {offset:+.2} s — over FT8's ~0.3 s decode margin"),
+            fix: Some(clock_fix_hint().to_string()),
+        },
+        // FT8 slots are UTC-aligned; past ~1 s decodes fail systematically.
+        Ok(offset) => CheckOutcome {
+            status: CheckStatus::Fail,
+            detail: format!("offset {offset:+.2} s — FT8 needs < ~1 s from UTC"),
+            fix: Some(clock_fix_hint().to_string()),
+        },
+        Err(e) => CheckOutcome {
+            status: CheckStatus::Warn,
+            detail: format!("could not reach {NTP_SERVER_HOST} ({e}) — clock unverified"),
+            fix: Some("check network; FT8 needs the clock within ~1 s of UTC".to_string()),
+        },
     }
 }
 
@@ -233,24 +202,7 @@ pub(crate) fn check_clock() -> DoctorCheck {
         name: "system clock",
         hard: true,
         run: Box::new(|_ctx| {
-            match sntp_clock_offset("pool.ntp.org:123", Duration::from_secs(2)) {
-                // FT8 slots are UTC-aligned; past ~1 s decodes fail systematically.
-                Ok(offset) if offset.abs() < 1.0 => CheckOutcome {
-                    status: CheckStatus::Pass,
-                    detail: format!("offset {offset:+.3} s vs pool.ntp.org"),
-                    fix: None,
-                },
-                Ok(offset) => CheckOutcome {
-                    status: CheckStatus::Fail,
-                    detail: format!("offset {offset:+.2} s — FT8 needs < ~1 s from UTC"),
-                    fix: Some(clock_fix_hint().to_string()),
-                },
-                Err(e) => CheckOutcome {
-                    status: CheckStatus::Warn,
-                    detail: format!("could not reach pool.ntp.org ({e}) — clock unverified"),
-                    fix: Some("check network; FT8 needs the clock within ~1 s of UTC".to_string()),
-                },
-            }
+            clock_outcome(sntp_clock_offset(NTP_SERVER, SNTP_TIMEOUT).map_err(|e| e.to_string()))
         }),
     }
 }
@@ -573,22 +525,45 @@ mod tests {
     }
 
     #[test]
-    fn ntp_timestamp_conversion_handles_epoch_and_fraction() {
-        // NTP epoch is 1900-01-01; Unix is 1970-01-01; delta 2_208_988_800 s.
-        let unix_zero: [u8; 8] = [0x83, 0xAA, 0x7E, 0x80, 0, 0, 0, 0]; // 2_208_988_800.0
-        assert_eq!(ntp_ts_to_unix_f64(&unix_zero), 0.0);
-        // +1 second and a half-fraction (0x8000_0000 / 2^32 = 0.5) → 1.5.
-        let one_and_half: [u8; 8] = [0x83, 0xAA, 0x7E, 0x81, 0x80, 0, 0, 0];
-        assert!((ntp_ts_to_unix_f64(&one_and_half) - 1.5).abs() < 1e-6);
+    fn clock_outcome_passes_inside_the_ft8_margin() {
+        let o = clock_outcome(Ok(0.12));
+        assert_eq!(o.status, CheckStatus::Pass);
+        assert_eq!(o.detail, "offset +0.120 s vs pool.ntp.org");
+        assert!(o.fix.is_none());
     }
 
     #[test]
-    fn sntp_offset_recovers_skew_independent_of_symmetric_delay() {
-        // Local clock 5 s slow, 200 ms symmetric round trip:
-        // T1=100.0 (local send), T2=T3=105.1 (server), T4=100.2 (local recv).
-        let offset = sntp_offset(100.0, 105.1, 105.1, 100.2);
-        assert!((offset - 5.0).abs() < 1e-9);
-        // Zero skew, only delay → offset 0.
-        assert!(sntp_offset(100.0, 100.1, 100.1, 100.2).abs() < 1e-9);
+    fn clock_outcome_warns_between_margin_and_one_second() {
+        let o = clock_outcome(Ok(0.45));
+        assert_eq!(o.status, CheckStatus::Warn);
+        assert_eq!(o.detail, "offset +0.45 s — over FT8's ~0.3 s decode margin");
+        assert_eq!(o.fix.as_deref(), Some(clock_fix_hint()));
+        // The margin itself is inclusive, matching the live monitor.
+        assert_eq!(clock_outcome(Ok(-0.3)).status, CheckStatus::Warn);
+        assert_eq!(clock_outcome(Ok(0.299)).status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn clock_outcome_fails_at_one_second_unchanged() {
+        let o = clock_outcome(Ok(-1.2));
+        assert_eq!(o.status, CheckStatus::Fail);
+        assert_eq!(o.detail, "offset -1.20 s — FT8 needs < ~1 s from UTC");
+        assert_eq!(o.fix.as_deref(), Some(clock_fix_hint()));
+        assert_eq!(clock_outcome(Ok(1.0)).status, CheckStatus::Fail);
+        assert!(check_clock().hard);
+    }
+
+    #[test]
+    fn clock_outcome_unreachable_is_a_warn_unchanged() {
+        let o = clock_outcome(Err("timed out".to_string()));
+        assert_eq!(o.status, CheckStatus::Warn);
+        assert_eq!(
+            o.detail,
+            "could not reach pool.ntp.org (timed out) — clock unverified"
+        );
+        assert_eq!(
+            o.fix.as_deref(),
+            Some("check network; FT8 needs the clock within ~1 s of UTC")
+        );
     }
 }

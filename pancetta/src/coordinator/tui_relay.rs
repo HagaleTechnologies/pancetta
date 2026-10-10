@@ -141,6 +141,9 @@ impl super::ApplicationCoordinator {
         let rig_conn_state_relay = self.rig_conn_state.clone();
         let audio_output_default_relay = self.audio_output_default.clone();
         let audio_input_fallback_relay = self.audio_input_fallback.clone();
+        // PAN-114: clock-skew warning published by the clock-skew monitor
+        // (`clock_monitor.rs`), read on the same 2s health tick.
+        let clock_skew_relay = self.clock_skew.clone();
         // Clone our callsign before the tui-relay thread consumes the original
         // via move. The async command-handler task below needs its own copy.
         let cmd_our_callsign = our_callsign_for_relay.clone();
@@ -702,6 +705,7 @@ impl super::ApplicationCoordinator {
                         tx_defers: super::tx::tx_defers_count(),
                         decode_panic_count: super::ft8::decode_panic_count(),
                         wdt_panic_count: super::health::panic_count(),
+                        clock_skew_warning_s: clock_skew_relay.warning(),
                     };
                     let _ = tui_msg_tx_relay.send(
                         pancetta_tui::tui_runner::TuiMessage::PipelineHealth(health),
