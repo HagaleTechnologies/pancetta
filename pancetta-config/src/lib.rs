@@ -117,6 +117,31 @@ pub enum ConfigError {
 
     #[error("Missing required configuration: {0}")]
     MissingRequired(String),
+
+    /// A config file that exists failed to load (syntax error, wrong type,
+    /// unreadable). Always fatal (PAN-90): pancetta never silently runs on
+    /// defaults in place of a file the operator wrote. The inner error is
+    /// named `reason`, not `source`, so `anyhow` doesn't print it twice.
+    #[error("config file {} failed to load: {reason}", path.display())]
+    FileLoad {
+        path: PathBuf,
+        reason: Box<ConfigError>,
+    },
+}
+
+/// What a configuration load actually read (PAN-90), so
+/// `pancetta config --validate` can say "my file parsed" rather than only
+/// "the effective config validates".
+#[derive(Debug, Clone, Default)]
+pub struct LoadReport {
+    /// Config files read, in merge order (later entries override earlier
+    /// ones). Empty when no config file was found.
+    pub files: Vec<PathBuf>,
+    /// Directories searched, lowest to highest precedence. Empty for an
+    /// explicit `--config` file.
+    pub searched: Vec<PathBuf>,
+    /// Non-fatal load warnings (unknown sections/keys, ...).
+    pub warnings: Vec<String>,
 }
 
 /// Result type for configuration operations
@@ -180,17 +205,27 @@ pub struct Config {
 
 /// Configuration metadata for tracking and debugging
 #[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Field-level `#[serde(default)]` (not a container default, and no `Default`
+/// impl) so a partial `[metadata]` table from an old example file parses
+/// instead of failing the load (PAN-90). `Config` itself deliberately has no
+/// container default: `Config::default()` mints a random `instance_id`, and a
+/// file without `[metadata]` must keep deserializing to `metadata: None`.
 pub struct ConfigMetadata {
     /// Configuration schema version
+    #[serde(default)]
     pub version: String,
 
     /// When this configuration was last modified
+    #[serde(default)]
     pub last_modified: Option<chrono::DateTime<chrono::Utc>>,
 
     /// Source files that contributed to this configuration
+    #[serde(default)]
     pub sources: Vec<PathBuf>,
 
-    /// Unique identifier for this configuration instance
+    /// Unique identifier for this configuration instance (nil when omitted)
+    #[serde(default)]
     pub instance_id: uuid::Uuid,
 }
 
@@ -237,16 +272,52 @@ impl Config {
     }
 
     /// Load configuration using the default search paths and hierarchy,
-    /// additionally returning any non-fatal load warnings (e.g. a config file
-    /// that existed but failed to parse and was skipped, silently reverting
-    /// its settings to defaults). The caller should surface these to the
-    /// operator so a partial/broken config is never invisible. A clean load
-    /// returns an empty warnings vec.
+    /// additionally returning any non-fatal load warnings (e.g. an unknown
+    /// section or key). The caller should surface these to the operator so a
+    /// typo is never invisible. A clean load returns an empty warnings vec.
+    /// A discovered config file that fails to load is an error
+    /// ([`ConfigError::FileLoad`]), never a warning.
     pub fn load_default_with_warnings() -> ConfigResult<(Self, Vec<String>)> {
         let loader = ConfigLoader::new()?;
         let config = loader.load()?;
         let warnings = loader.load_warnings();
         Ok((config, warnings))
+    }
+
+    /// Discover and merge the config files on the default search path
+    /// WITHOUT running [`validate`](Self::validate): `pancetta config
+    /// --validate` needs the report even when validation then fails. A file
+    /// that exists but fails to load is fatal ([`ConfigError::FileLoad`]).
+    pub fn load_default_unvalidated() -> ConfigResult<(Self, LoadReport)> {
+        let loader = ConfigLoader::new()?;
+        let config = loader.load_merged()?;
+        let report = LoadReport {
+            files: loader.loaded_files(),
+            searched: loader.search_paths().to_vec(),
+            warnings: loader.load_warnings(),
+        };
+        Ok((config, report))
+    }
+
+    /// Load exactly one explicit config file (no validation), reporting it.
+    /// Parse and IO errors are wrapped in [`ConfigError::FileLoad`] so the
+    /// caller can name the failing file.
+    pub fn load_from_file_with_report<P: AsRef<std::path::Path>>(
+        path: P,
+    ) -> ConfigResult<(Self, LoadReport)> {
+        let path = path.as_ref();
+        let wrap = |e: ConfigError| ConfigError::FileLoad {
+            path: path.to_path_buf(),
+            reason: Box::new(e),
+        };
+        let loader = ConfigLoader::new().map_err(wrap)?;
+        let config = loader.load_from_file(path).map_err(wrap)?;
+        let report = LoadReport {
+            files: vec![path.to_path_buf()],
+            searched: Vec::new(),
+            warnings: loader.load_warnings(),
+        };
+        Ok((config, report))
     }
 
     /// Load configuration from a specific file
@@ -621,6 +692,29 @@ pub trait ConfigSection: Default + Clone {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    /// PAN-90: the TUI rig picker writes only `[rig.interface] port/baud_rate`
+    /// and `[rig.ptt] method`. Before partial tables parsed, the next load
+    /// failed with `missing field 'data_bits'` (silently replaced by defaults
+    /// at startup); with file-load errors now fatal it would brick startup.
+    #[test]
+    fn set_rig_in_file_on_a_minimal_config_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        std::fs::write(&path, "[station]\ncallsign = \"K1ABC\"\n").unwrap();
+        Config::default()
+            .set_rig_in_file(
+                &path,
+                "FTdx10",
+                "/dev/ttyUSB0",
+                38400,
+                crate::rig::PttMethod::Cat,
+            )
+            .unwrap();
+        let reloaded = Config::load_from_file(&path).unwrap();
+        assert_eq!(reloaded.rig.interface.port, "/dev/ttyUSB0");
+        assert_eq!(reloaded.station.callsign, "K1ABC");
+    }
 
     #[test]
     fn test_default_config() {

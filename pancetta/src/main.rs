@@ -30,7 +30,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use pancetta_config::Config;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::signal;
@@ -765,23 +765,16 @@ fn list_audio_devices() {
 
 async fn config_command(args: ConfigArgs, cli: &Cli) -> Result<()> {
     if args.validate {
-        let config = load_configuration(cli).await?;
-        match config.validate() {
-            Ok(_) => {
-                println!("Configuration validation: PASS");
-                info!("Configuration is valid");
-            }
-            Err(e) => {
-                println!("Configuration validation: FAIL");
-                error!("Configuration error: {}", e);
-                return Err(e.into());
-            }
-        }
-        return Ok(());
+        return config_validate(cli);
     }
 
     if args.show {
-        let config = load_configuration(cli).await?;
+        // Same non-interactive loader as `--validate`: never runs a wizard,
+        // and a config file that fails to load is an error naming it.
+        let (config, report) = load_config_report(cli)?;
+        for w in &report.warnings {
+            eprintln!("WARNING: {w}");
+        }
         println!("{}", config.summary());
         return Ok(());
     }
@@ -923,6 +916,92 @@ async fn benchmark_decode_command(args: BenchmarkDecodeArgs) -> Result<()> {
     Ok(())
 }
 
+/// Load the effective configuration for `config --validate` / `--show`
+/// WITHOUT validating it and WITHOUT any wizard (PAN-90): the explicit
+/// `--config` file if given, else every file on the default search path.
+/// A config file that exists but fails to load is an error naming it.
+fn load_config_report(
+    cli: &Cli,
+) -> Result<(Config, pancetta_config::LoadReport), pancetta_config::ConfigError> {
+    match &cli.config {
+        Some(path) => Config::load_from_file_with_report(path),
+        None => Config::load_default_unvalidated(),
+    }
+}
+
+/// `pancetta config --validate` (PAN-90): report which file(s) were read
+/// (or that none was found), any load warnings, then validate. Exits
+/// non-zero (via `Err`) on any load or validation failure; never prompts.
+fn config_validate(cli: &Cli) -> Result<()> {
+    let (config, report) = match load_config_report(cli) {
+        Ok(pair) => pair,
+        Err(e) => {
+            if let pancetta_config::ConfigError::FileLoad { path, .. } = &e {
+                println!("Config file: {} — FAILED TO LOAD", path.display());
+            }
+            println!("Configuration validation: FAIL");
+            error!("Configuration error: {}", e);
+            return Err(e.into());
+        }
+    };
+    print!(
+        "{}",
+        format_load_report(&report, &default_pancetta_toml_path())
+    );
+    match config.validate() {
+        Ok(()) => {
+            println!("Configuration validation: PASS");
+            info!("Configuration is valid");
+            Ok(())
+        }
+        Err(e) => {
+            println!("Configuration validation: FAIL");
+            error!("Configuration error: {}", e);
+            Err(e.into())
+        }
+    }
+}
+
+/// The operator-facing "what did this load read" text printed by
+/// `config --validate`: the file(s) in merge order, or -- when none was
+/// found -- every directory searched plus a note that built-in defaults
+/// apply; then any load warnings as `WARNING:` lines.
+fn format_load_report(report: &pancetta_config::LoadReport, default_path: &Path) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    if report.files.is_empty() {
+        let _ = writeln!(
+            out,
+            "No config file found. Searched these directories (lowest to highest \
+             precedence) for pancetta.toml, config.toml, pancetta.json, config.json:"
+        );
+        let cwd = std::env::current_dir().ok();
+        for dir in &report.searched {
+            if cwd.as_deref() == Some(dir.as_path()) {
+                let _ = writeln!(out, "  {}   (current directory)", dir.display());
+            } else {
+                let _ = writeln!(out, "  {}", dir.display());
+            }
+        }
+        let _ = writeln!(
+            out,
+            "Using built-in defaults (callsign N0CALL). Run `pancetta setup` to create {}.",
+            default_path.display()
+        );
+    } else {
+        for file in &report.files {
+            let _ = writeln!(out, "Config file: {}", file.display());
+        }
+        if report.files.len() > 1 {
+            let _ = writeln!(out, "(later files override earlier ones)");
+        }
+    }
+    for w in &report.warnings {
+        let _ = writeln!(out, "WARNING: {w}");
+    }
+    out
+}
+
 async fn load_configuration(cli: &Cli) -> Result<Config> {
     let (config, _warnings) = load_configuration_with_warnings(cli).await?;
     Ok(config)
@@ -992,14 +1071,15 @@ fn config_write_is_toml(cli: &Cli) -> bool {
 }
 
 /// Like [`load_configuration`] but also returns non-fatal config-load warnings
-/// (e.g. a `pancetta.toml` that existed but failed to parse and was silently
-/// reverted to defaults). The warnings are printed to the console here and also
-/// returned so they can be surfaced in the TUI.
+/// (e.g. an unknown section or misspelled key). The warnings are printed to
+/// the console here and also returned so they can be surfaced in the TUI. A
+/// config file that fails to load is an error, never a warning (PAN-90).
 async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<String>)> {
     let (mut config, warnings) = if let Some(config_path) = &cli.config {
-        let config = Config::load_from_file(config_path)
-            .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
-        (config, Vec::new())
+        // PAN-90: the warnings-returning loader, so an explicit `--config`
+        // file's unknown-key warnings reach the console and the TUI too.
+        Config::load_from_file_with_warnings(config_path)
+            .with_context(|| format!("Failed to load config from {}", config_path.display()))?
     } else {
         match Config::load_default_with_warnings() {
             Ok(pair) => pair,
@@ -1014,7 +1094,11 @@ async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<Stri
                 eprintln!();
                 eprintln!("ERROR: your saved configuration failed to load:");
                 eprintln!("  {e}");
-                eprintln!("  (file: ~/.pancetta/pancetta.toml)");
+                let failed_path = match &e {
+                    pancetta_config::ConfigError::FileLoad { path, .. } => path.clone(),
+                    _ => default_pancetta_toml_path(),
+                };
+                eprintln!("  (file: {})", failed_path.display());
                 eprintln!();
                 if prompt_yes_no(
                     "Re-run first-time setup? (overwrites the broken config on save)",
@@ -1039,9 +1123,8 @@ async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<Stri
         }
     };
 
-    // Surface parse failures to the console at startup — a broken/partial config
-    // silently reverting to defaults (N0CALL, default audio) is exactly the trap
-    // we are closing here.
+    // Surface load warnings (unknown sections/keys) to the console at startup
+    // so a typo is never a silent no-op.
     for w in &warnings {
         eprintln!("WARNING: {w}");
         warn!("{w}");
@@ -1873,6 +1956,67 @@ mod tests {
     use super::*;
     use assert_cmd::Command;
     use predicates::prelude::*;
+
+    // ---- PAN-90: `config --validate` load report ----
+
+    #[test]
+    fn format_load_report_lists_files_in_merge_order() {
+        let report = pancetta_config::LoadReport {
+            files: vec![
+                PathBuf::from("/home/op/.pancetta/pancetta.toml"),
+                PathBuf::from("/home/op/.config/pancetta/config.toml"),
+            ],
+            searched: vec![],
+            warnings: vec![],
+        };
+        let text = format_load_report(&report, Path::new("/home/op/.pancetta/pancetta.toml"));
+        assert_eq!(
+            text,
+            "Config file: /home/op/.pancetta/pancetta.toml\n\
+             Config file: /home/op/.config/pancetta/config.toml\n\
+             (later files override earlier ones)\n"
+        );
+    }
+
+    #[test]
+    fn format_load_report_with_no_files_lists_search_dirs_and_defaults_note() {
+        let report = pancetta_config::LoadReport {
+            files: vec![],
+            searched: vec![
+                PathBuf::from("/etc/pancetta"),
+                PathBuf::from("/home/op/.pancetta"),
+            ],
+            warnings: vec![],
+        };
+        let text = format_load_report(&report, Path::new("/home/op/.pancetta/pancetta.toml"));
+        assert!(text.starts_with("No config file found. Searched these directories"));
+        assert!(
+            text.contains("\n  /etc/pancetta\n  /home/op/.pancetta\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "Using built-in defaults (callsign N0CALL). Run `pancetta setup` to create \
+                 /home/op/.pancetta/pancetta.toml."
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn format_load_report_prints_warnings_as_warning_lines() {
+        let report = pancetta_config::LoadReport {
+            files: vec![PathBuf::from("/home/op/.pancetta/pancetta.toml")],
+            searched: vec![],
+            warnings: vec!["Unknown config key `enable` in [network.wsjtx_udp]".to_string()],
+        };
+        let text = format_load_report(&report, Path::new("/x"));
+        assert_eq!(
+            text,
+            "Config file: /home/op/.pancetta/pancetta.toml\n\
+             WARNING: Unknown config key `enable` in [network.wsjtx_udp]\n"
+        );
+    }
 
     /// docs/task-supervision-plan.md item 4: a panic must be counted and
     /// logged (not just chained to the default hook silently). Uses a

@@ -59,6 +59,7 @@ pub struct UiConfig {
 
 /// Window management configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct WindowConfig {
     /// Default window width
     pub width: u32,
@@ -106,6 +107,7 @@ pub enum WindowState {
 
 /// Multi-monitor configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MultiMonitorConfig {
     /// Preferred monitor index
     pub preferred_monitor: u8,
@@ -122,6 +124,7 @@ pub struct MultiMonitorConfig {
 
 /// Session management configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SessionConfig {
     /// Restore window positions on startup
     pub restore_positions: bool,
@@ -138,6 +141,7 @@ pub struct SessionConfig {
 
 /// Typography and font configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TypographyConfig {
     /// Default font family
     pub font_family: String,
@@ -163,6 +167,7 @@ pub struct TypographyConfig {
 
 /// Font weight configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct FontWeightConfig {
     /// Normal text weight
     pub normal: u16,
@@ -179,6 +184,7 @@ pub struct FontWeightConfig {
 
 /// Text rendering configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TextRenderingConfig {
     /// Antialiasing mode
     pub antialiasing: AntialiasingMode,
@@ -217,6 +223,7 @@ pub enum HintingMode {
 
 /// Font scaling configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct FontScalingConfig {
     /// UI element font scaling
     pub ui_scale: f32,
@@ -236,6 +243,7 @@ pub struct FontScalingConfig {
 
 /// Color scheme configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ColorSchemeConfig {
     /// Primary colors
     pub primary: ColorPalette,
@@ -265,6 +273,7 @@ pub struct ColorSchemeConfig {
 
 /// Color palette definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ColorPalette {
     /// Base color
     pub base: String,
@@ -281,6 +290,7 @@ pub struct ColorPalette {
 
 /// Background color configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct BackgroundColors {
     /// Main background
     pub primary: String,
@@ -303,6 +313,7 @@ pub struct BackgroundColors {
 
 /// Text color configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TextColors {
     /// Primary text color
     pub primary: String,
@@ -325,6 +336,7 @@ pub struct TextColors {
 
 /// Border color configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct BorderColors {
     /// Normal border color
     pub normal: String,
@@ -344,6 +356,7 @@ pub struct BorderColors {
 
 /// Status and alert color configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StatusColors {
     /// Success/OK status
     pub success: String,
@@ -372,6 +385,7 @@ pub struct StatusColors {
 
 /// Spectrum display colors
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SpectrumColors {
     /// Spectrum line color
     pub spectrum_line: String,
@@ -394,6 +408,7 @@ pub struct SpectrumColors {
 
 /// Panel layout and management configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PanelConfig {
     /// Available panels
     pub available_panels: Vec<PanelDefinition>,
@@ -521,6 +536,7 @@ pub enum SizeSpec {
 
 /// Panel docking configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DockingConfig {
     /// Enable panel docking
     pub enabled: bool,
@@ -589,6 +605,7 @@ pub enum ZoneArrangement {
 
 /// Panel sizing configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PanelSizingConfig {
     /// Default panel spacing
     pub spacing: u32,
@@ -608,6 +625,7 @@ pub struct PanelSizingConfig {
 
 /// Panel visibility configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PanelVisibilityConfig {
     /// Initially visible panels
     pub initial_panels: Vec<String>,
@@ -627,6 +645,7 @@ pub struct PanelVisibilityConfig {
 
 /// Accessibility configuration
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AccessibilityConfig {
     /// High contrast mode
     pub high_contrast: bool,
@@ -652,6 +671,7 @@ pub struct AccessibilityConfig {
 
 /// Keyboard navigation configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct KeyboardNavigationConfig {
     /// Enable keyboard navigation
     pub enabled: bool,
@@ -685,6 +705,7 @@ pub enum TabOrderConfig {
 
 /// Visual indicator configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct VisualIndicatorConfig {
     /// Show status indicators
     pub show_status: bool,
@@ -704,6 +725,7 @@ pub struct VisualIndicatorConfig {
 
 /// Sound feedback configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SoundFeedbackConfig {
     /// Enable sound feedback
     pub enabled: bool,
@@ -723,6 +745,7 @@ pub struct SoundFeedbackConfig {
 
 /// Motion sensitivity configuration
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MotionSensitivityConfig {
     /// Reduce animations
     pub reduce_animations: bool,
@@ -739,6 +762,7 @@ pub struct MotionSensitivityConfig {
 
 /// Animation configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AnimationConfig {
     /// Enable animations
     pub enabled: bool,
@@ -758,6 +782,7 @@ pub struct AnimationConfig {
 
 /// Easing configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EasingConfig {
     /// Default easing function
     pub default: EasingFunction,
@@ -790,6 +815,7 @@ pub enum EasingFunction {
 
 /// Transition configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TransitionConfig {
     /// Fade transitions
     pub fade_duration_ms: u64,
@@ -809,6 +835,7 @@ pub struct TransitionConfig {
 
 /// Animation performance configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AnimationPerformanceConfig {
     /// Use hardware acceleration
     pub hardware_acceleration: bool,
@@ -825,6 +852,7 @@ pub struct AnimationPerformanceConfig {
 
 /// Toolbar configuration
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ToolbarConfig {
     /// Available toolbars
     pub toolbars: Vec<ToolbarDefinition>,
@@ -923,6 +951,7 @@ pub enum IconSize {
 
 /// Toolbar visibility configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ToolbarVisibilityConfig {
     /// Show main toolbar
     pub main_toolbar: bool,
@@ -942,6 +971,7 @@ pub struct ToolbarVisibilityConfig {
 
 /// Toolbar customization configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ToolbarCustomizationConfig {
     /// Allow toolbar customization
     pub enabled: bool,
@@ -961,6 +991,7 @@ pub struct ToolbarCustomizationConfig {
 
 /// Status bar configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StatusBarConfig {
     /// Show status bar
     pub visible: bool,
@@ -1038,6 +1069,7 @@ pub enum ItemAlignment {
 
 /// Keyboard shortcuts configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct KeyboardConfig {
     /// Keyboard shortcuts map
     pub shortcuts: HashMap<String, KeyboardShortcut>,
@@ -1110,6 +1142,7 @@ pub enum ConflictResolution {
 
 /// Logging display configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LoggingDisplayConfig {
     /// Maximum log entries to display
     pub max_entries: u32,
@@ -1135,6 +1168,7 @@ pub struct LoggingDisplayConfig {
 
 /// Log filtering configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LogFilterConfig {
     /// Minimum log level to display
     pub min_level: LogLevel,
@@ -1165,6 +1199,7 @@ pub enum LogLevel {
 
 /// Spectrum display configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SpectrumDisplayConfig {
     /// Spectrum display mode
     pub mode: SpectrumMode,
@@ -1213,6 +1248,7 @@ pub enum SpectrumMode {
 
 /// Waterfall configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct WaterfallConfig {
     /// Waterfall height in pixels
     pub height: u32,
@@ -1254,6 +1290,7 @@ pub enum FrequencyUnits {
 
 /// Frequency axis configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct FrequencyAxisConfig {
     /// Show frequency axis
     pub visible: bool,
@@ -1298,6 +1335,7 @@ pub enum AmplitudeScale {
 
 /// Amplitude axis configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AmplitudeAxisConfig {
     /// Show amplitude axis
     pub visible: bool,
@@ -1317,6 +1355,7 @@ pub struct AmplitudeAxisConfig {
 
 /// Grid configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GridConfig {
     /// Show grid lines
     pub visible: bool,
@@ -1346,6 +1385,7 @@ pub enum LineStyle {
 
 /// Marker configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MarkerConfig {
     /// Show frequency markers
     pub visible: bool,
@@ -1520,66 +1560,102 @@ impl Default for FontScalingConfig {
 impl Default for ColorSchemeConfig {
     fn default() -> Self {
         Self {
-            primary: ColorPalette {
-                base: "#3b82f6".to_string(),
-                light: "#60a5fa".to_string(),
-                dark: "#1d4ed8".to_string(),
-                contrast: "#ffffff".to_string(),
-            },
+            primary: ColorPalette::default(),
             secondary: ColorPalette {
                 base: "#6b7280".to_string(),
                 light: "#9ca3af".to_string(),
                 dark: "#374151".to_string(),
                 contrast: "#ffffff".to_string(),
             },
-            background: BackgroundColors {
-                primary: "#ffffff".to_string(),
-                secondary: "#f9fafb".to_string(),
-                panel: "#f3f4f6".to_string(),
-                input: "#ffffff".to_string(),
-                selected: "#dbeafe".to_string(),
-                hover: "#f0f9ff".to_string(),
-            },
-            text: TextColors {
-                primary: "#111827".to_string(),
-                secondary: "#6b7280".to_string(),
-                disabled: "#d1d5db".to_string(),
-                link: "#3b82f6".to_string(),
-                selected: "#1e40af".to_string(),
-                placeholder: "#9ca3af".to_string(),
-            },
-            borders: BorderColors {
-                normal: "#d1d5db".to_string(),
-                focus: "#3b82f6".to_string(),
-                error: "#ef4444".to_string(),
-                success: "#10b981".to_string(),
-                warning: "#f59e0b".to_string(),
-            },
-            status: StatusColors {
-                success: "#10b981".to_string(),
-                warning: "#f59e0b".to_string(),
-                error: "#ef4444".to_string(),
-                info: "#3b82f6".to_string(),
-                connected: "#10b981".to_string(),
-                disconnected: "#6b7280".to_string(),
-                transmitting: "#ef4444".to_string(),
-                receiving: "#10b981".to_string(),
-            },
-            spectrum: SpectrumColors {
-                spectrum_line: "#3b82f6".to_string(),
-                waterfall_gradient: vec![
-                    "#000080".to_string(),
-                    "#0000ff".to_string(),
-                    "#00ffff".to_string(),
-                    "#ffff00".to_string(),
-                    "#ff0000".to_string(),
-                ],
-                grid_lines: "#e5e7eb".to_string(),
-                frequency_markers: "#6b7280".to_string(),
-                signal_detection: "#ef4444".to_string(),
-                background_noise: "#374151".to_string(),
-            },
+            background: BackgroundColors::default(),
+            text: TextColors::default(),
+            borders: BorderColors::default(),
+            status: StatusColors::default(),
+            spectrum: SpectrumColors::default(),
             custom_colors: HashMap::new(),
+        }
+    }
+}
+
+impl Default for ColorPalette {
+    fn default() -> Self {
+        Self {
+            base: "#3b82f6".to_string(),
+            light: "#60a5fa".to_string(),
+            dark: "#1d4ed8".to_string(),
+            contrast: "#ffffff".to_string(),
+        }
+    }
+}
+
+impl Default for BackgroundColors {
+    fn default() -> Self {
+        Self {
+            primary: "#ffffff".to_string(),
+            secondary: "#f9fafb".to_string(),
+            panel: "#f3f4f6".to_string(),
+            input: "#ffffff".to_string(),
+            selected: "#dbeafe".to_string(),
+            hover: "#f0f9ff".to_string(),
+        }
+    }
+}
+
+impl Default for TextColors {
+    fn default() -> Self {
+        Self {
+            primary: "#111827".to_string(),
+            secondary: "#6b7280".to_string(),
+            disabled: "#d1d5db".to_string(),
+            link: "#3b82f6".to_string(),
+            selected: "#1e40af".to_string(),
+            placeholder: "#9ca3af".to_string(),
+        }
+    }
+}
+
+impl Default for BorderColors {
+    fn default() -> Self {
+        Self {
+            normal: "#d1d5db".to_string(),
+            focus: "#3b82f6".to_string(),
+            error: "#ef4444".to_string(),
+            success: "#10b981".to_string(),
+            warning: "#f59e0b".to_string(),
+        }
+    }
+}
+
+impl Default for StatusColors {
+    fn default() -> Self {
+        Self {
+            success: "#10b981".to_string(),
+            warning: "#f59e0b".to_string(),
+            error: "#ef4444".to_string(),
+            info: "#3b82f6".to_string(),
+            connected: "#10b981".to_string(),
+            disconnected: "#6b7280".to_string(),
+            transmitting: "#ef4444".to_string(),
+            receiving: "#10b981".to_string(),
+        }
+    }
+}
+
+impl Default for SpectrumColors {
+    fn default() -> Self {
+        Self {
+            spectrum_line: "#3b82f6".to_string(),
+            waterfall_gradient: vec![
+                "#000080".to_string(),
+                "#0000ff".to_string(),
+                "#00ffff".to_string(),
+                "#ffff00".to_string(),
+                "#ff0000".to_string(),
+            ],
+            grid_lines: "#e5e7eb".to_string(),
+            frequency_markers: "#6b7280".to_string(),
+            signal_detection: "#ef4444".to_string(),
+            background_noise: "#374151".to_string(),
         }
     }
 }
