@@ -353,6 +353,13 @@ impl ConfigLoader {
                     }
                     config.merge_with(source_config);
                 }
+                Err(e) if source.required => {
+                    error!(
+                        "Failed to load required configuration source '{}': {}",
+                        source.name, e
+                    );
+                    return Err(e);
+                }
                 Err(e)
                     if matches!(
                         e,
@@ -366,13 +373,6 @@ impl ConfigLoader {
                         "Skipped optional configuration source '{}': {}",
                         source.name, e
                     );
-                }
-                Err(e) if source.required => {
-                    error!(
-                        "Failed to load required configuration source '{}': {}",
-                        source.name, e
-                    );
-                    return Err(e);
                 }
                 Err(e) if matches!(source.source_type, SourceType::Toml | SourceType::Json) => {
                     // A config FILE that exists but fails to load (syntax
@@ -1989,5 +1989,18 @@ enabled = true
                 .starts_with("config file /home/op/.pancetta/pancetta.toml failed to load:"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn missing_required_source_is_still_an_error() {
+        let mut loader = ConfigLoader::with_search_paths(vec![]).unwrap();
+        loader.add_source(ConfigSource {
+            name: "required".to_string(),
+            path: PathBuf::from("/nonexistent/pancetta-required.toml"),
+            priority: 1,
+            required: true,
+            source_type: SourceType::Toml,
+        });
+        assert!(matches!(loader.load(), Err(ConfigError::FileNotFound(_))));
     }
 }

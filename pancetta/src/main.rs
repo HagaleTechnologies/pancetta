@@ -1108,7 +1108,16 @@ async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<Stri
                     false,
                 )? {
                     let defaults = Config::default();
-                    match run_first_time_setup(&defaults)? {
+                    // Save over the file that actually failed (it may be in
+                    // the current directory or ~/.config/pancetta), so the
+                    // next start loads. The wizard writes TOML, so a broken
+                    // JSON file falls back to the default location.
+                    let target = if pancetta_config::path_is_json_format(&failed_path) {
+                        default_pancetta_toml_path()
+                    } else {
+                        failed_path
+                    };
+                    match run_first_time_setup(&defaults, &target)? {
                         Some(fixed) => (fixed, Vec::new()),
                         None => {
                             return Err(anyhow::anyhow!(e))
@@ -1146,7 +1155,7 @@ async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<Stri
         && cli.replay.is_none()
         && is_interactive
     {
-        if let Some(updated) = run_first_time_setup(&config)? {
+        if let Some(updated) = run_first_time_setup(&config, &default_pancetta_toml_path())? {
             config = updated;
         }
     }
@@ -1168,8 +1177,9 @@ fn offer_wizard_on_load_failure(
 }
 
 /// Interactive first-run setup wizard.
-/// Prompts for callsign, grid square, and saves the config file.
-fn run_first_time_setup(config: &Config) -> Result<Option<Config>> {
+/// Prompts for callsign, grid square, and saves the config file to
+/// `config_path`.
+fn run_first_time_setup(config: &Config, config_path: &Path) -> Result<Option<Config>> {
     println!();
     println!("=== Pancetta First-Run Setup ===");
     println!();
@@ -1212,17 +1222,16 @@ fn run_first_time_setup(config: &Config) -> Result<Option<Config>> {
         return Ok(None);
     }
 
-    let config_dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".pancetta");
-    let config_path = config_dir.join("pancetta.toml");
-
     if prompt_yes_no(
         &format!("Save configuration to {}?", config_path.display()),
         true,
     )? {
-        std::fs::create_dir_all(&config_dir)?;
-        let backup = persist_wizard_config(&new_config, &config_path)?;
+        if let Some(config_dir) = config_path.parent() {
+            if !config_dir.as_os_str().is_empty() {
+                std::fs::create_dir_all(config_dir)?;
+            }
+        }
+        let backup = persist_wizard_config(&new_config, config_path)?;
         print_backup_notice(backup.as_deref());
         println!("Configuration saved to {}", config_path.display());
     }
