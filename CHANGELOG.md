@@ -72,6 +72,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Saved rig-config bookmarks (PAN-61): the `i` rig picker can now save the current model/port/baud/PTT as a named bookmark (`F3`) and load one back into the form later (`F2`), without retyping. Builds on PAN-59's live rig-config switch.
 
+### Fixed
+
+- Ctrl/Alt chords no longer trigger transmit keys at the main view (PAN-112).
+  Ctrl+C previously started a CQ because crossterm reports it as `c` with a
+  separate modifier. The same guard now covers PTT, autonomous mode, TX policy,
+  re-send, Space-to-call, tune, Fox and Hound. Bare and Shift bindings still work.
+
 ## [0.9.6] - 2026-09-02
 
 ### Added

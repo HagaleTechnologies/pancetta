@@ -1536,6 +1536,14 @@ impl TuiRunner {
             return Ok(true);
         }
 
+        // PAN-112: crossterm delivers Ctrl+C as Char('c') + CONTROL and
+        // Ctrl+Space as Char(' ') + CONTROL. On Windows, Ctrl+Shift+T arrives
+        // as Char('T') + CONTROL|SHIFT. Allow Shift for uppercase bindings;
+        // Ctrl/Alt chords on TX-starting arms fall through to `_ => {}`.
+        let ctrl_or_alt_held = key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+
         match key.code {
             // hb-161: Esc clears the operator-stop banner without re-enabling
             // anything. Re-enabling autonomous still requires `a`. Bound here
@@ -1771,7 +1779,7 @@ impl TuiRunner {
             }
 
             // === CQ + QSO actions ===
-            KeyCode::Char('c') => {
+            KeyCode::Char('c') if !ctrl_or_alt_held => {
                 self.message_tx.send(TuiCommand::StartCq {
                     frequency_offset: app.tx_frequency_offset,
                 })?;
@@ -1811,7 +1819,7 @@ impl TuiRunner {
             // Lowercase `h` is taken by StopTx (halt TX), so Hound uses H.
             // Only active when the DX Hunter panel is focused; a no-op hint
             // is shown on other panels so the operator knows to switch.
-            KeyCode::Char('H') => {
+            KeyCode::Char('H') if !ctrl_or_alt_held => {
                 if matches!(app.active_panel, crate::app::ActivePanel::DxHunter) {
                     // Pull callsign + fox_freq + parity from the selected row,
                     // and also the grid (one extra field beyond get_selected_station).
@@ -1842,11 +1850,11 @@ impl TuiRunner {
             // send ToggleFoxMode; the coordinator's SetFoxMode handler is the
             // authority (TX-policy gated on engage, starts/stops repeating CQ,
             // raises/restores the caller-answer cap).
-            KeyCode::Char('X') => {
+            KeyCode::Char('X') if !ctrl_or_alt_held => {
                 app.toggle_fox_mode();
                 self.message_tx.send(TuiCommand::ToggleFoxMode)?;
             }
-            KeyCode::Char('p') => {
+            KeyCode::Char('p') if !ctrl_or_alt_held => {
                 // TX-policy safety gate (mirror of the relay's authoritative
                 // check): refuse keying PTT while TX is Disabled. The relay
                 // can't tell a key-up from a key-down across the toggle, but
@@ -1868,7 +1876,8 @@ impl TuiRunner {
             // Band Activity or DX Hunter. Echoes the target callsign.
             // r - re-send our most recent message in the selected QSO.
             KeyCode::Char('r')
-                if matches!(app.active_panel, crate::app::ActivePanel::QsoStatus) =>
+                if !ctrl_or_alt_held
+                    && matches!(app.active_panel, crate::app::ActivePanel::QsoStatus) =>
             {
                 match (app.selected_qso_id(), app.selected_qso_callsign()) {
                     (Some(qso_id), Some(call)) => {
@@ -1909,19 +1918,19 @@ impl TuiRunner {
             // accidental-trigger foot-gun the old QsoStatus-only gating
             // existed to prevent, just via a different physical input than
             // vim-scroll. Modified k falls through to the catch-all `_ => {}`
-            // below (a no-op), matching every other unguarded single-key
-            // binding in this match — none of which are destructive, so k is
-            // the one that needed the explicit guard.
+            // below (a no-op). TX-starting arms are now guarded by
+            // `ctrl_or_alt_held` (PAN-112); remaining unguarded arms are
+            // non-TX or fail toward TX-off.
             KeyCode::Char('k') if key.modifiers.is_empty() => {
                 self.abort_selected_qso(&mut app)?;
             }
             // r pressed outside the QSO Status panel: hint, don't act.
-            KeyCode::Char('r') => {
+            KeyCode::Char('r') if !ctrl_or_alt_held => {
                 app.status_message = "Focus the QSO Status panel (2) to re-send (r)".to_string();
             }
 
             // === Tune / clear-offset (case-sensitive) ===
-            KeyCode::Char('T') => {
+            KeyCode::Char('T') if !ctrl_or_alt_held => {
                 // Shift-T: 12-second single-tone tune. Shift requirement is a
                 // small barrier against accidental TX during keyboard fumbling.
                 // TX-policy safety gate: a tune carrier is a transmission, so
@@ -1983,7 +1992,7 @@ impl TuiRunner {
             }
 
             // === Autonomous controls ===
-            KeyCode::Char('a') => {
+            KeyCode::Char('a') if !ctrl_or_alt_held => {
                 // Flip local state optimistically for immediate feedback,
                 // then send the toggle to the coordinator — it flips the
                 // authoritative `autonomous_enabled_runtime` gate (the
@@ -2006,7 +2015,7 @@ impl TuiRunner {
             // g - cycle Full → RespondOnly → Disabled → Full. Optimistically
             // flip the local banner for instant feedback; the coordinator
             // echoes the authoritative state back via TxPolicyUpdate.
-            KeyCode::Char('g') => {
+            KeyCode::Char('g') if !ctrl_or_alt_held => {
                 let next = app.tx_policy.cycle();
                 app.tx_policy = next;
                 app.status_message = format!("TX policy: {}", next.label());
@@ -2120,7 +2129,7 @@ impl TuiRunner {
             // pending, `resolve_space_action` returns `None` rather than a
             // `Call` that would supersede it — surface a specific status
             // message so the operator knows why nothing happened.
-            KeyCode::Char(' ') => match app.resolve_space_action() {
+            KeyCode::Char(' ') if !ctrl_or_alt_held => match app.resolve_space_action() {
                 Some(crate::app::SpaceAction::Reply {
                     callsign,
                     frequency,
@@ -2973,6 +2982,113 @@ mod key_tests {
     /// Same as `key_ctrl` but for Alt+<letter>.
     fn key_alt(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
+    }
+
+    fn cq_dx_station() -> crate::app::DxStation {
+        crate::app::DxStation {
+            call_sign: "VK9XX".to_string(),
+            grid_square: Some("QH30".to_string()),
+            frequency: 14.074,
+            mode: "FT8".to_string(),
+            last_seen: chrono::Utc::now(),
+            snr: -10,
+            distance: None,
+            bearing: None,
+            worked_before: false,
+            needed: true,
+            atno: false,
+            band_needed: false,
+            priority_score: 800,
+            source: crate::app::SpotSource::Local,
+            entity_name: None,
+            rarity_tier: None,
+            reporter_count: None,
+            is_notable: false,
+            notable_type: None,
+            confidence: None,
+            best_snr_network: None,
+            last_seen_network: None,
+            audio_offset_hz: Some(750),
+            slot_parity: Some(pancetta_core::slot::SlotParity::Even),
+            watchlisted: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_at_main_view_does_not_start_cq() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        let status_before = {
+            let a = app.read().await;
+            assert_eq!(a.active_view, crate::view::ActiveView::Operate);
+            assert!(!a.quit_confirm_visible);
+            assert!(!a.help_visible);
+            assert!(!a.compose_mode);
+            a.status_message.clone()
+        };
+        for modified_key in [key_ctrl('c'), key_alt('c')] {
+            r.handle_key_event(modified_key).await.unwrap();
+            assert!(
+                cmd_rx.try_recv().is_err(),
+                "{modified_key:?} must not start CQ"
+            );
+            assert_eq!(app.read().await.status_message, status_before);
+        }
+        r.handle_key_event(key('c')).await.unwrap();
+        assert!(matches!(cmd_rx.try_recv(), Ok(TuiCommand::StartCq { .. })));
+    }
+
+    #[tokio::test]
+    async fn ctrl_or_alt_chords_do_not_reach_tx_arms() {
+        use crate::app::ActivePanel;
+        use pancetta_core::TxPolicy;
+
+        for modifier in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            for (letter, panel) in [
+                ('p', ActivePanel::BandActivity),
+                ('a', ActivePanel::BandActivity),
+                ('g', ActivePanel::BandActivity),
+                ('r', ActivePanel::QsoStatus),
+                ('r', ActivePanel::BandActivity),
+                ('T', ActivePanel::BandActivity),
+                ('X', ActivePanel::BandActivity),
+                ('H', ActivePanel::DxHunter),
+                (' ', ActivePanel::DxHunter),
+            ] {
+                let modifiers = if letter.is_uppercase() {
+                    modifier | KeyModifiers::SHIFT
+                } else {
+                    modifier
+                };
+                let modified_key = KeyEvent::new(KeyCode::Char(letter), modifiers);
+                let (mut r, cmd_rx, app) = make_runner().await;
+                let status_before = {
+                    let mut a = app.write().await;
+                    a.active_panel = panel;
+                    a.tx_policy = TxPolicy::Full;
+                    a.fox_mode = false;
+                    a.apply_active_qsos(vec![banner("W1AW", "qso-1")], Vec::new());
+                    if panel == ActivePanel::DxHunter {
+                        let station = cq_dx_station();
+                        a.dx_stations.insert(station.call_sign.clone(), station);
+                        a.clamp_dx_hunter_selection();
+                        assert_eq!(a.focused_callsign().as_deref(), Some("VK9XX"));
+                    }
+                    a.status_message.clone()
+                };
+                r.handle_key_event(modified_key).await.unwrap();
+                assert!(
+                    cmd_rx.try_recv().is_err(),
+                    "{modified_key:?} on {panel:?} must not send a command"
+                );
+                let a = app.read().await;
+                assert_eq!(
+                    a.status_message, status_before,
+                    "{modified_key:?} on {panel:?}"
+                );
+                assert_eq!(a.tx_policy, TxPolicy::Full, "{modified_key:?}");
+                assert!(!a.fox_mode, "{modified_key:?}");
+            }
+        }
     }
 
     #[tokio::test]
