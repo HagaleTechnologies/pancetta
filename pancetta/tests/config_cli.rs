@@ -128,6 +128,22 @@ fn validate_fails_on_auto_discovered_type_error() {
     assert!(stdout(&out).contains("Configuration validation: FAIL"));
 }
 
+/// A file that parses but fails `Config::validate()` must fail `--show` too,
+/// as it fails `--validate` and startup.
+#[test]
+fn show_fails_on_auto_discovered_invalid_config() {
+    let s = Scratch::new();
+    s.write_default_config("[autonomous]\ncq_after_idle_cycles = 0\n");
+    let show = s.command().args(["config", "--show"]).output().unwrap();
+    assert!(!show.status.success(), "stdout: {}", stdout(&show));
+    assert!(
+        stderr(&show).contains("cq_after_idle_cycles"),
+        "stderr: {}",
+        stderr(&show)
+    );
+    assert!(!s.validate(None).status.success());
+}
+
 #[test]
 fn validate_and_doctor_agree_on_broken_file() {
     let s = Scratch::new();

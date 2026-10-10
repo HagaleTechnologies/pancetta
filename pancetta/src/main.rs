@@ -770,11 +770,14 @@ async fn config_command(args: ConfigArgs, cli: &Cli) -> Result<()> {
 
     if args.show {
         // Same non-interactive loader as `--validate`: never runs a wizard,
-        // and a config file that fails to load is an error naming it.
+        // and a config file that fails to load is an error naming it. The
+        // loader is deliberately unvalidated, so validate here: a config that
+        // startup rejects must not exit 0 from `--show` either.
         let (config, report) = load_config_report(cli)?;
         for w in &report.warnings {
             eprintln!("WARNING: {w}");
         }
+        config.validate()?;
         println!("{}", config.summary());
         return Ok(());
     }
