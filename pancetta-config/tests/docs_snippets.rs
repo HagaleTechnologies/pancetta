@@ -65,7 +65,9 @@ fn parse_inline_assignment(span: &str) -> Option<(String, String, String)> {
     if !section.split('.').all(is_ident) {
         return None;
     }
-    let rest = rest[close + 1..].strip_prefix('.').unwrap_or(&rest[close + 1..]);
+    let rest = rest[close + 1..]
+        .strip_prefix('.')
+        .unwrap_or(&rest[close + 1..]);
     let rest = rest.trim_start();
     let eq = rest.find('=')?;
     let key = rest[..eq].trim_end();
@@ -170,8 +172,9 @@ fn every_documented_config_snippet_loads_cleanly() {
         "GUIDE.md cross-machine UDP recipe not found"
     );
     assert!(
-        inline.iter().any(|s| s.origin.starts_with("README.md")
-            && s.text == "[autonomous]\nenabled = true\n"),
+        inline.iter().any(
+            |s| s.origin.starts_with("README.md") && s.text == "[autonomous]\nenabled = true\n"
+        ),
         "README.md `[autonomous] enabled = true` not found"
     );
 

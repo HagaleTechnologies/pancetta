@@ -780,8 +780,11 @@ async fn config_command(args: ConfigArgs, cli: &Cli) -> Result<()> {
     }
 
     if let Some(output_path) = args.generate {
-        let default_config = Config::default();
-        default_config.save_to_file(&output_path)?;
+        // The same header-annotated, drift-tested text as
+        // pancetta-config/defaults.toml (no random [metadata] block). The
+        // defaults contain no secrets, so a plain write is fine.
+        std::fs::write(&output_path, Config::defaults_toml())
+            .with_context(|| format!("Failed to write {}", output_path.display()))?;
         println!("Generated default configuration: {}", output_path.display());
         info!("Default configuration saved to: {}", output_path.display());
         return Ok(());
@@ -1219,9 +1222,8 @@ fn run_first_time_setup(config: &Config) -> Result<Option<Config>> {
         true,
     )? {
         std::fs::create_dir_all(&config_dir)?;
-        new_config
-            .save_to_file(&config_path)
-            .with_context(|| format!("Failed to save config to {}", config_path.display()))?;
+        let backup = persist_wizard_config(&new_config, &config_path)?;
+        print_backup_notice(backup.as_deref());
         println!("Configuration saved to {}", config_path.display());
     }
 
@@ -1599,6 +1601,47 @@ fn setup_frequency(config: &mut Config) -> Result<()> {
     Ok(())
 }
 
+/// `<path>.bak` -- where [`persist_wizard_config`] keeps a config file that
+/// does not load before writing a fresh one.
+fn backup_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".bak");
+    path.with_file_name(name)
+}
+
+/// Persist a wizard-edited config (`pancetta setup`, the first-run wizard)
+/// to `path` without destroying the operator's file (PAN-90): only keys that
+/// differ from the file / the defaults are written, and comments survive
+/// ([`Config::save_changes_to_file`]). A file that exists but does not load
+/// is first kept as `<path>.bak` (copy preserves its mode), then replaced
+/// by a fresh minimal file -- never merged blindly, never lost. Returns the
+/// backup path when one was made.
+fn persist_wizard_config(config: &Config, path: &Path) -> Result<Option<PathBuf>> {
+    let mut backup = None;
+    if path.exists() && Config::load_from_file(path).is_err() {
+        let bak = backup_path(path);
+        std::fs::copy(path, &bak).with_context(|| {
+            format!("Failed to back up {} to {}", path.display(), bak.display())
+        })?;
+        std::fs::remove_file(path)
+            .with_context(|| format!("Failed to replace {}", path.display()))?;
+        backup = Some(bak);
+    }
+    config
+        .save_changes_to_file(path)
+        .with_context(|| format!("Failed to save config to {}", path.display()))?;
+    Ok(backup)
+}
+
+fn print_backup_notice(backup: Option<&Path>) {
+    if let Some(bak) = backup {
+        println!(
+            "Your previous config did not load; it was kept as {}",
+            bak.display()
+        );
+    }
+}
+
 async fn setup_command() -> Result<()> {
     println!();
     println!("=== Pancetta Setup Wizard ===");
@@ -1611,7 +1654,21 @@ async fn setup_command() -> Result<()> {
         .join(".pancetta");
     let config_path = config_dir.join("pancetta.toml");
     let mut config = if config_path.exists() {
-        Config::load_from_file(&config_path).unwrap_or_default()
+        match Config::load_from_file(&config_path) {
+            Ok(config) => config,
+            Err(e) => {
+                println!(
+                    "Existing config at {} does not load: {e}",
+                    config_path.display()
+                );
+                println!(
+                    "Setup will start from defaults; on save the old file is kept as {}.",
+                    backup_path(&config_path).display()
+                );
+                println!();
+                Config::default()
+            }
+        }
     } else {
         Config::default()
     };
@@ -1651,10 +1708,9 @@ async fn setup_command() -> Result<()> {
 
     if prompt_yes_no(&format!("Save to {}?", config_path.display()), true)? {
         std::fs::create_dir_all(&config_dir)?;
-        config
-            .save_to_file(&config_path)
-            .with_context(|| format!("Failed to save config to {}", config_path.display()))?;
-        println!("Configuration saved.");
+        let backup = persist_wizard_config(&config, &config_path)?;
+        print_backup_notice(backup.as_deref());
+        println!("Configuration saved to {}", config_path.display());
     }
 
     println!();
@@ -1956,6 +2012,42 @@ mod tests {
     use super::*;
     use assert_cmd::Command;
     use predicates::prelude::*;
+
+    // ---- PAN-90: wizard saves keep the operator's file ----
+
+    #[test]
+    fn persist_wizard_config_backs_up_a_file_that_does_not_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        std::fs::write(&path, "[station\n").unwrap();
+        let mut config = Config::default();
+        config.station.callsign = "K1ABC".to_string();
+        let backup = persist_wizard_config(&config, &path).unwrap();
+        let bak = dir.path().join("pancetta.toml.bak");
+        assert_eq!(backup.as_deref(), Some(bak.as_path()));
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), "[station\n");
+        let reloaded = Config::load_from_file(&path).unwrap();
+        assert_eq!(reloaded.station.callsign, "K1ABC");
+    }
+
+    #[test]
+    fn persist_wizard_config_merges_when_the_file_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        let original = "# K1ABC home station\n[station]\ncallsign = \"K1ABC\"   # licensed 2019\n";
+        std::fs::write(&path, original).unwrap();
+        let mut config = Config::load_from_file(&path).unwrap();
+        config.audio.input_device = "USB Audio CODEC".to_string();
+        let backup = persist_wizard_config(&config, &path).unwrap();
+        assert!(backup.is_none());
+        assert!(!dir.path().join("pancetta.toml.bak").exists());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with(original), "{text}");
+        assert!(
+            text.contains("input_device = \"USB Audio CODEC\""),
+            "{text}"
+        );
+    }
 
     // ---- PAN-90: `config --validate` load report ----
 

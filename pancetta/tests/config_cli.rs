@@ -236,3 +236,26 @@ fn headless_startup_refuses_broken_config() {
     assert!(err.contains(&path.display().to_string()), "stderr: {err}");
     assert!(err.contains("failed to load"), "stderr: {err}");
 }
+
+/// `config --generate` writes the same header-annotated, drift-tested text
+/// as `pancetta-config/defaults.toml` -- no random `[metadata]` block.
+#[test]
+fn generate_writes_the_defaults_toml_text() {
+    let s = Scratch::new();
+    let out_path = s.home.path().join("g.toml");
+    let out = s
+        .command()
+        .args(["config", "--generate"])
+        .arg(&out_path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let generated = std::fs::read_to_string(&out_path).unwrap();
+    let checked_in = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../pancetta-config/defaults.toml"
+    ))
+    .unwrap();
+    assert_eq!(generated, checked_in);
+    assert!(!generated.contains("[metadata]"));
+}
