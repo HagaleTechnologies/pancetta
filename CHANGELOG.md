@@ -72,6 +72,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Saved rig-config bookmarks (PAN-61): the `i` rig picker can now save the current model/port/baud/PTT as a named bookmark (`F3`) and load one back into the form later (`F2`), without retyping. Builds on PAN-59's live rig-config switch.
 
+
+### Fixed
+
+- Every documented minimal config block now parses on its own (PAN-90): the
+  README's `[autonomous] enabled = true`, both GUIDE.md GridTracker
+  `[network.wsjtx_udp]` recipes, and CONFIG.md's minimum viable config used
+  to fail with `missing field …`. Every config table now accepts a partial
+  table; omitted keys keep their documented defaults.
+- A broken config file no longer silently runs the station on all-default
+  settings (callsign N0CALL): `pancetta config --validate` exits non-zero on a
+  file that fails to load, prints which file(s) it read, and never opens the
+  first-run wizard.
+- Load warnings for an explicit `--config` file now reach the console and the
+  TUI diagnostics list.
+- The TUI rig picker no longer writes a config file that fails to load on the
+  next start (`missing field 'data_bits'`).
+
+### Changed
+
+- A config file that exists but fails to load now stops startup with an error
+  naming the file, instead of being skipped with a warning. Run
+  `pancetta config --validate` to find the broken line.
+- Unknown config keys are now warned about at any depth (e.g. `enable` in
+  `[network.wsjtx_udp]`), not only unknown top-level sections.
+- The config search path is deduplicated (`~/.config/pancetta` was read twice
+  on Linux) and documented in docs/CONFIG.md.
+
+### Removed
+
+- `pancetta-config/examples/config.toml`: unreferenced, did not parse, and
+  duplicated the generated, drift-tested `pancetta-config/defaults.toml`.
+
 ## [0.9.6] - 2026-09-02
 
 ### Added

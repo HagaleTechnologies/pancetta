@@ -174,7 +174,8 @@ operator-supervised.
     The startup log line should include `Starting autonomous operator
     component`. If you see `Autonomous operator disabled in
     configuration`, the config didn't save or pancetta is reading a
-    different file (`pancetta config --show --path` prints the path).
+    different file (`pancetta config --validate` prints which file(s) it
+    loaded).
 
 11. **Watch for one cycle.** With antenna live, watch the TUI for at
     least 5 minutes. Expected behavior:
@@ -313,8 +314,20 @@ For first-run / install issues, see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
   start on a quiet band.
 - Check `~/.pancetta/logs/pancetta.log.<YYYY-MM-DD>` for `Auto-responding to CQ from`
   log lines. If absent, no CQ has cleared filters yet.
-- Check `[autonomous].response_filters.allowed_callsigns` — if set,
-  *only* those callsigns clear the filter.
+
+### pancetta exits at startup with `config file … failed to load`
+
+- A config file pancetta found exists but does not parse (syntax error,
+  wrong value type) or cannot be read. The error names the file and the
+  line.
+- Run `pancetta config --validate`: it prints which file(s) it read and
+  exits non-zero while any of them is broken. Fix the named line, or run
+  `pancetta setup`, which keeps the broken file as `pancetta.toml.bak`
+  and writes a fresh one.
+- Unattended/systemd hosts now fail to start on a broken config instead
+  of running on all-default settings (callsign N0CALL). That fallback
+  never applied the operator's file, so the station was never configured
+  as intended.
 
 ### Logged QSOs don't appear in `qsos.adi`
 

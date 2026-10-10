@@ -1478,15 +1478,10 @@ callsign = "N0CALL"
     #[test]
     fn test_known_top_level_sections_do_not_warn() {
         let loader = ConfigLoader::new().unwrap();
-        // Note: `[duplicate_checking]` is spelled out with all its fields
-        // rather than left partial. Unlike `[station]` (container-level
-        // `#[serde(default)]` on `StationConfig`, so partial tables fall back
-        // field-by-field), `DuplicateCheckingConfig` has no container-level
-        // `#[serde(default)]`, so a partial table fails typed deserialization
-        // with a "missing field" error — a pre-existing gap unrelated to this
-        // task's unknown-key sweep. `[station]` covers "known section,
-        // partial fields parse fine"; `[duplicate_checking]` here covers
-        // "the Task 5 addition is recognized as a known section".
+        // `[station]` covers "known section, partial fields parse fine";
+        // `[duplicate_checking]` covers "the Task 5 addition is recognized
+        // as a known section" (spelled out in full from before PAN-90 made
+        // every table accept a partial table).
         let toml_content = r#"
 [station]
 callsign = "N0CALL"

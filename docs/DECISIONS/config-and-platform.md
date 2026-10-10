@@ -408,3 +408,35 @@ own Dependabot-admission policy question), not resolved here. The single-collabo
 caveat above (Mergify's `author = thagale` condition needing revisiting once a second trusted
 collaborator exists) carries over unchanged to `auto-merge-trigger.yml`'s own allowlist -- same
 mechanism, same limitation, different admission path.
+
+## Partial tables, fatal file-load errors, and an honest `config --validate` (PAN-90, 2026-10-10)
+
+Every documented "just add this block" recipe failed to parse on its own (README's
+`[autonomous] enabled = true`, both GUIDE.md GridTracker recipes, CONFIG.md's minimum config):
+most config structs had no container-level `#[serde(default)]`, so a table that set one key was
+a hard `missing field` error. Worse, the auto-discovery loader swallowed that error, ran on
+`Config::default()` (N0CALL), and `pancetta config --validate` printed PASS with exit 0.
+
+- **Partial-table rule.** Every single-instance config struct carries container-level
+  `#[serde(default)]` and a `Default` impl. `Config` itself does not (its `Default` mints a random
+  `metadata.instance_id`; a file without `[metadata]` must stay `metadata: None`);
+  `ConfigMetadata` uses field-level defaults instead. Record types (`[[rig.bookmarks]]`,
+  `[[station.antennas]]`, map entries such as `ui.keyboard.shortcuts.<name>`) stay strict.
+  Guard: `pancetta-config/tests/partial_tables.rs` parses every table path of
+  `Config::default()` as an empty table and requires it to equal the defaults; its two allowlists
+  hold at most four entries, each with a reason.
+- **Unknown keys at any depth** are load warnings (non-fatal), so a partial table never turns a
+  typo into a silent no-op. Detection walks the raw TOML against the parsed config serialized to
+  JSON (`ConfigLoader::warn_unknown_keys`).
+- **Fatal file-load errors.** A discovered config *file* that exists but fails to load returns
+  `ConfigError::FileLoad { path, .. }`; startup stops (interactive launches get the de-brick
+  prompt with the real path). Non-file sources keep warn-and-continue.
+- **`config --validate` contract.** Loads without any wizard, prints `Config file: <path>` for
+  each file read (or the searched directories and "No config file found"), prints warnings, then
+  validates. Exit 1 on any load or validation failure. Unknown keys warn but do not fail it.
+- **Docs are tested.** `pancetta-config/tests/docs_snippets.rs` loads every fenced ```` ```toml ````
+  block and every inline `[section] key = value` span in `README.md` + `docs/*.md` (top level)
+  through the real loader; each must load with zero warnings.
+- **Search path** deduplicated (keep last occurrence) and documented in `docs/CONFIG.md`.
+- `pancetta-config/examples/config.toml` deleted: unreferenced, unparseable, and a duplicate of
+  the generated `defaults.toml`.
