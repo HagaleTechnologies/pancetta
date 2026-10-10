@@ -217,14 +217,25 @@ used by the clock-skew monitor.
 - **TX worker pre-PTT wait** (`coordinator/tx.rs::wait_for_ptt_instant` / `ptt_wait_step`, both
   arms' Step 4): re-reads the wall clock every ≤ 50 ms chunk (D5). It drops the frame only if the
   PTT instant is now more than two periods away (backward step; `schedule_tx` never targets
-  further), or if the wait started before the PTT instant and finished more than
-  `tx_late_max_ms_effective` past `target_slot` (forward jump). A request that was already a late
-  start when the wait began keeps the old path exactly; a forward jump that lands inside the
-  late-start policy ships as a policy late start.
+  further), or if the frame was scheduled ahead of its slot (`TxSchedule::deferred`, passed in so a
+  jump during encoding still counts) or the wait started before the PTT instant, and the wait
+  finished more than `tx_late_max_ms_effective` past `target_slot` (forward jump). That rule cannot
+  tell a jump from a slow pre-wait: with `tx_late_max_ms` lowered below the adaptive coalesce
+  ceiling (about 3.8 s for FT8), a frame deferred to a slot only milliseconds away can be dropped
+  with the clock-jump text even though no jump happened. Default settings keep the ceiling under
+  half the late limit in every mode. A late-start
+  request (`schedule_tx` chose the current slot) keeps the old path exactly; a forward jump that
+  lands inside the late-start policy ships as a policy late start.
 - **PTT hold bound** (`ptt_hold_exceeds_bound`, both arms' Step 6, D6): if `to_slot` exceeds
   `ptt_lead_ms` + `PTT_HOLD_SLACK_MS` (1000 ms) with PTT keyed, PTT is released first (the
   `AbortedByDisarm` pattern, including the pivot-tombstone cleanup) and the frame is dropped.
   Nothing reassigns `schedule` between Step 4 and Step 6, so the bound only trips on a step.
+  Step 3 aligns the waveform to one wall-clock read and the hold itself is a monotonic sleep, so
+  Step 7 calls `clock_step_since_alignment` just before logging and routing the audio: wall-clock
+  and monotonic progress since Step 3 diverging by at least `CLOCK_STEP_THRESHOLD_MS` (250 ms)
+  releases PTT first and drops the frame. A step after that check is not caught (the waveform is
+  then on the air), and a system suspend is seen only where the monotonic clock stops during
+  suspend (Linux, macOS), as with `ClockStepDetector`.
 - **Drop reporting** (`drop_frames_for_clock_jump`, D7): target `tx.policy`, Warn, text
   "dropping stale TX after a {±secs} s clock jump: '…' — next frame uses the current UTC slot", so it
   counts in the TUI's session TX-drops tally next to the existing stale-TX drops, plus one failed

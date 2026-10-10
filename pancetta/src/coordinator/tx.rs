@@ -574,10 +574,11 @@ enum PttWaitStep {
 
 /// Pure decision behind [`wait_for_ptt_instant`]. Drops the frame only if
 /// (a) the PTT instant is now more than two periods away (a backward step:
-/// `schedule_tx` never targets further ahead than that), or (b) the wait
-/// started before the PTT instant and `now` is more than `late_max_ms` past
-/// `target_slot` (a forward jump past the late-start policy). A request that
-/// was already late when the wait began keeps today's path exactly.
+/// `schedule_tx` never targets further ahead than that), or (b) the frame
+/// was scheduled ahead of its slot or the wait started before the PTT
+/// instant, and `now` is more than `late_max_ms` past `target_slot` (a
+/// forward jump past the late-start policy). A late-start request
+/// (`schedule_tx` chose the current slot) keeps today's path exactly.
 fn ptt_wait_step(
     now: chrono::DateTime<chrono::Utc>,
     ptt_target: chrono::DateTime<chrono::Utc>,
@@ -626,9 +627,20 @@ enum PttWait {
 /// [`interruptible_sleep`], so wake latency stays ~50 ms. With no clock
 /// jump this returns `Reached` at the same wall instant the old monotonic
 /// sleep ended.
+///
+/// `scheduled_ahead` is the caller's `TxSchedule::deferred` (`schedule_tx`
+/// targeted a future slot). It is passed in rather than inferred from the
+/// first reading here: a forward jump during encoding or modulation can put
+/// the PTT instant in the past before that reading, which would otherwise
+/// make the frame look like a late-start request and skip the late limit.
+/// The rule cannot tell a jump from a slow pre-wait: with `tx_late_max_ms`
+/// lowered below the adaptive coalesce ceiling, a frame deferred to a slot
+/// only milliseconds away can also be dropped here.
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_ptt_instant(
     ptt_target: chrono::DateTime<chrono::Utc>,
     target_slot: chrono::DateTime<chrono::Utc>,
+    scheduled_ahead: bool,
     late_max_ms: u64,
     slot_ns: i64,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -642,7 +654,7 @@ async fn wait_for_ptt_instant(
             return PttWait::Interrupted;
         }
         let now = wall_now();
-        let waited = *waited_from_before_target.get_or_insert(ptt_target > now);
+        let waited = *waited_from_before_target.get_or_insert(scheduled_ahead || ptt_target > now);
         match ptt_wait_step(now, ptt_target, target_slot, waited, late_max_ms, slot_ns) {
             PttWaitStep::Sleep(chunk) => sleep(chunk).await,
             PttWaitStep::Reached => return PttWait::Reached,
@@ -662,6 +674,31 @@ const PTT_HOLD_SLACK_MS: u64 = 1000;
 /// wall clock stepped back in between.
 fn ptt_hold_exceeds_bound(hold: Duration, ptt_lead_ms: u64) -> bool {
     hold > Duration::from_millis(ptt_lead_ms + PTT_HOLD_SLACK_MS)
+}
+
+/// PAN-114 (Codex P1 on PR #413): Step 3 aligns the waveform's pad/cursor
+/// to one wall-clock read, then Step 6's keyed hold is a monotonic sleep, so
+/// a wall-clock step anywhere in between would send audio on the pre-step
+/// grid. Called in Step 7 just before the frame is logged and routed:
+/// returns the step when wall-clock progress since `aligned_at` diverged
+/// from `mono_elapsed` by at least
+/// [`CLOCK_STEP_THRESHOLD_MS`](pancetta_core::slot_clock::CLOCK_STEP_THRESHOLD_MS).
+/// Slow awaits or a late wake move both clocks equally, so they never
+/// trigger a drop. Like [`ClockStepDetector`](pancetta_core::slot_clock::ClockStepDetector),
+/// it sees a system suspend only where the monotonic clock stops during
+/// suspend (Linux, macOS).
+fn clock_step_since_alignment(
+    aligned_at: chrono::DateTime<chrono::Utc>,
+    wall_now: chrono::DateTime<chrono::Utc>,
+    mono_elapsed: Duration,
+) -> Option<pancetta_core::slot_clock::WallClockJump> {
+    use pancetta_core::slot_clock::{ClockStepDetector, WallClockJump};
+    let skew = ClockStepDetector::new(aligned_at).observe(wall_now, mono_elapsed)?;
+    Some(if skew > chrono::Duration::zero() {
+        WallClockJump::Forward(skew)
+    } else {
+        WallClockJump::Backward(-skew)
+    })
 }
 
 /// PAN-114 (D7): drop frame(s) a wall-clock jump made unsendable. Mirrors
@@ -6061,6 +6098,7 @@ impl super::ApplicationCoordinator {
                                         match wait_for_ptt_instant(
                                             ptt_target_utc,
                                             schedule.target_slot,
+                                            schedule.deferred,
                                             tx_late_max_ms_effective(
                                                 active_protocol,
                                                 tx_late_max_ms,
@@ -6373,9 +6411,11 @@ impl super::ApplicationCoordinator {
                                         // real FT8 slot grid regardless of how long the steps
                                         // above took. See
                                         // docs/superpowers/specs/2026-07-21-symptom-c-adaptive-coalesce-window-design.md §2.
+                                        let aligned_at = chrono::Utc::now();
+                                        let aligned_mono = Instant::now();
                                         let (fresh_pad_samples, fresh_cursor_samples) =
                                             pad_and_cursor_for_target(
-                                                chrono::Utc::now(),
+                                                aligned_at,
                                                 schedule.target_slot,
                                                 sample_rate,
                                             );
@@ -7283,6 +7323,51 @@ impl super::ApplicationCoordinator {
                                                 Instant::now(),
                                             );
                                             let _ = message_bus.send_message(complete_msg).await;
+                                            continue 'worker;
+                                        }
+
+                                        // PAN-114 (Codex P1 on PR #413): Step 3 aligned
+                                        // this audio to one wall-clock read and Step 6's
+                                        // hold is a monotonic sleep, so a clock step since
+                                        // Step 3 would send it on the pre-step grid. Check
+                                        // just before logging/routing and release PTT
+                                        // FIRST, like the D6 guard.
+                                        if let Some(jump) = clock_step_since_alignment(
+                                            aligned_at,
+                                            chrono::Utc::now(),
+                                            aligned_mono.elapsed(),
+                                        ) {
+                                            let ptt_off_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Hamlib,
+                                                MessageType::RigControl(
+                                                    crate::message_bus::RigControlMessage::SetPtt {
+                                                        state: false,
+                                                    },
+                                                ),
+                                                Instant::now(),
+                                            );
+                                            if let Err(e) =
+                                                message_bus.send_message(ptt_off_msg).await
+                                            {
+                                                warn!(
+                                                    "Clock-step pre-audio check: PTT OFF failed: {}",
+                                                    e
+                                                );
+                                            }
+                                            ptt_active.store(false, Ordering::Release);
+                                            ptt_guard.disarm();
+                                            // Pre-audio abort: nothing reached the air, so
+                                            // the Step 4c tombstone goes too.
+                                            if let Some(key) = pivoted_this_key.take() {
+                                                pivoted_once.remove(&key);
+                                            }
+                                            drop_frames_for_clock_jump(
+                                                &message_bus,
+                                                &[(message_text.clone(), qso_id.clone())],
+                                                jump,
+                                            )
+                                            .await;
                                             continue 'worker;
                                         }
 
@@ -8488,6 +8573,7 @@ impl super::ApplicationCoordinator {
                                     match wait_for_ptt_instant(
                                         ptt_target_utc,
                                         schedule.target_slot,
+                                        schedule.deferred,
                                         tx_late_max_ms_effective(active_protocol, tx_late_max_ms),
                                         slot_ns,
                                         &shutdown,
@@ -9037,9 +9123,11 @@ impl super::ApplicationCoordinator {
                                     // above (adaptive coalesce window, encoding,
                                     // possible key-time re-encode) took. See
                                     // docs/superpowers/specs/2026-07-21-symptom-c-adaptive-coalesce-window-design.md §2.
+                                    let aligned_at = chrono::Utc::now();
+                                    let aligned_mono = Instant::now();
                                     let (fresh_pad_samples, fresh_cursor_samples) =
                                         pad_and_cursor_for_target(
-                                            chrono::Utc::now(),
+                                            aligned_at,
                                             schedule.target_slot,
                                             sample_rate,
                                         );
@@ -9584,6 +9672,47 @@ impl super::ApplicationCoordinator {
                                             );
                                             let _ = message_bus.send_message(complete_msg).await;
                                         }
+                                        continue;
+                                    }
+
+                                    // PAN-114 (Codex P1 on PR #413): same pre-audio
+                                    // clock-step check as the single-TX arm.
+                                    if let Some(jump) = clock_step_since_alignment(
+                                        aligned_at,
+                                        chrono::Utc::now(),
+                                        aligned_mono.elapsed(),
+                                    ) {
+                                        let ptt_off_msg = ComponentMessage::new(
+                                            ComponentId::Ft8Transmitter,
+                                            ComponentId::Hamlib,
+                                            MessageType::RigControl(
+                                                crate::message_bus::RigControlMessage::SetPtt {
+                                                    state: false,
+                                                },
+                                            ),
+                                            Instant::now(),
+                                        );
+                                        if let Err(e) = message_bus.send_message(ptt_off_msg).await
+                                        {
+                                            warn!(
+                                                "Clock-step pre-audio check: PTT OFF failed: {}",
+                                                e
+                                            );
+                                        }
+                                        ptt_active.store(false, Ordering::Release);
+                                        ptt_guard.disarm();
+                                        // Pre-audio abort: nothing reached the air yet.
+                                        for key in &pivoted_this_bundle_keys {
+                                            pivoted_once.remove(key);
+                                        }
+                                        let frames: Vec<(String, Option<String>)> = items
+                                            .iter()
+                                            .map(|item| {
+                                                (item.message_text.clone(), item.qso_id.clone())
+                                            })
+                                            .collect();
+                                        drop_frames_for_clock_jump(&message_bus, &frames, jump)
+                                            .await;
                                         continue;
                                     }
 
@@ -11354,6 +11483,48 @@ mod schedule_tx_tests {
         assert!(ptt_hold_exceeds_bound(Duration::from_secs(600), 80));
     }
 
+    /// Codex P1 on PR #413: a clock step after Step 3 aligned the audio,
+    /// including during Step 6's monotonic keyed hold (after the D6 bound
+    /// check), must stop Step 7 from sending that audio.
+    #[test]
+    fn clock_step_since_alignment_flags_a_step_before_audio() {
+        use pancetta_core::slot_clock::WallClockJump;
+        let start = at(29.92);
+        let hold = Duration::from_millis(80);
+        // No step; slow awaits or a late wake move both clocks together.
+        assert_eq!(
+            clock_step_since_alignment(start, start + chrono::Duration::milliseconds(80), hold),
+            None
+        );
+        assert_eq!(
+            clock_step_since_alignment(
+                start,
+                start + chrono::Duration::milliseconds(600),
+                Duration::from_millis(600)
+            ),
+            None
+        );
+        // Stepped forward 2 s during an 80 ms hold.
+        assert_eq!(
+            clock_step_since_alignment(start, start + chrono::Duration::milliseconds(2080), hold),
+            Some(WallClockJump::Forward(chrono::Duration::seconds(2)))
+        );
+        // Stepped back 600 s during the hold.
+        assert_eq!(
+            clock_step_since_alignment(
+                start,
+                start + chrono::Duration::milliseconds(80) - chrono::Duration::seconds(600),
+                hold
+            ),
+            Some(WallClockJump::Backward(chrono::Duration::seconds(600)))
+        );
+        // Below CLOCK_STEP_THRESHOLD_MS (250 ms) the frame still ships.
+        assert_eq!(
+            clock_step_since_alignment(start, start + chrono::Duration::milliseconds(329), hold),
+            None
+        );
+    }
+
     /// Injectable wall clock for the `wait_for_ptt_instant` tests.
     fn test_wall_clock(
         start: chrono::DateTime<chrono::Utc>,
@@ -11391,6 +11562,7 @@ mod schedule_tx_tests {
         let outcome = wait_for_ptt_instant(
             ptt_target,
             target_slot,
+            true,
             8000,
             SLOT_NS,
             &shutdown,
@@ -11431,6 +11603,7 @@ mod schedule_tx_tests {
         let outcome = wait_for_ptt_instant(
             ptt_target,
             target_slot,
+            true,
             8000,
             SLOT_NS,
             &shutdown,
@@ -11473,6 +11646,7 @@ mod schedule_tx_tests {
         let outcome = wait_for_ptt_instant(
             ptt_target,
             target_slot,
+            true,
             8000,
             SLOT_NS,
             &shutdown,
@@ -11492,6 +11666,55 @@ mod schedule_tx_tests {
             elapsed < Duration::from_millis(250),
             "forward jump must be seen within about one chunk (elapsed={elapsed:?})"
         );
+    }
+
+    /// Codex P1 on PR #413: a forward jump during encoding/modulation lands
+    /// BEFORE the wait's first reading, so the PTT instant already looks
+    /// past. Inferring "late-start request" from that reading (the
+    /// `scheduled_ahead == false` call below, which is the pre-fix
+    /// behaviour) keys the stale frame; the schedule's own `deferred` flag
+    /// keeps the late limit on.
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_ptt_instant_drops_a_forward_jump_before_the_first_reading() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let (ptt_target, target_slot) = ptt_and_slot(30.0);
+        let jumped = target_slot + chrono::Duration::seconds(3600);
+
+        let outcome = wait_for_ptt_instant(
+            ptt_target,
+            target_slot,
+            true,
+            8000,
+            SLOT_NS,
+            &shutdown,
+            &abort,
+            move || jumped,
+        )
+        .await;
+        match outcome {
+            PttWait::ClockJumped(pancetta_core::slot_clock::WallClockJump::Forward(d)) => {
+                assert_eq!(d, jumped - ptt_target);
+            }
+            other => panic!("expected ClockJumped(Forward), got {other:?}"),
+        }
+
+        // A late-start request (`schedule_tx` chose the current slot) still
+        // keeps today's path at the same reading.
+        let outcome = wait_for_ptt_instant(
+            ptt_target,
+            target_slot,
+            false,
+            8000,
+            SLOT_NS,
+            &shutdown,
+            &abort,
+            move || jumped,
+        )
+        .await;
+        assert_eq!(outcome, PttWait::Reached);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -11520,6 +11743,7 @@ mod schedule_tx_tests {
             let outcome = wait_for_ptt_instant(
                 ptt_target,
                 target_slot,
+                true,
                 8000,
                 SLOT_NS,
                 &shutdown,
@@ -11544,6 +11768,7 @@ mod schedule_tx_tests {
         let outcome = wait_for_ptt_instant(
             ptt_target,
             target_slot,
+            true,
             8000,
             SLOT_NS,
             &shutdown,
