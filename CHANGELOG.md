@@ -102,7 +102,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changed, merged into your existing file with its comments kept, instead of
   replacing it with the full ~960-line schema. A file that does not load, or
   that the startup recovery prompt rewrites from defaults, is kept as
-  `pancetta.toml.bak` before a fresh one is written. The TUI device
+  `pancetta.toml.bak` (or the next free `pancetta.toml.bak.N`) before a fresh
+  one is written. The TUI device
   and rig pickers also keep comments and section order.
 - `pancetta config --generate` writes the same header-annotated schema as
   `pancetta-config/defaults.toml`, without a random `[metadata]` block.

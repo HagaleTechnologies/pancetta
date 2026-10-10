@@ -10,7 +10,8 @@ line. Run `pancetta config --validate` to see which file(s) pancetta
 reads (the search order is in [`CONFIG.md`](CONFIG.md#where-pancetta-looks-for-its-config))
 and fix the named file, then validate again. `pancetta setup` repairs only
 `~/.pancetta/pancetta.toml`: on save, it keeps that broken file as
-`pancetta.toml.bak` and writes a fresh one. It does not repair files in
+`pancetta.toml.bak` (or the next free `pancetta.toml.bak.N` if that name is
+taken) and writes a fresh one. It does not repair files in
 other search locations. pancetta no longer
 falls back to all-default settings (callsign N0CALL) when a file is
 broken, so unattended/systemd hosts fail to start until it is fixed.

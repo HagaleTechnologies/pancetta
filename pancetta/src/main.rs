@@ -1689,11 +1689,62 @@ fn setup_frequency(config: &mut Config) -> Result<()> {
 }
 
 /// `<path>.bak` -- where [`persist_wizard_config`] keeps a config file that
-/// does not load before writing a fresh one.
+/// does not load before writing a fresh one ([`create_backup`] moves on to
+/// `<path>.bak.1`, `.bak.2`, ... when that name is taken).
 fn backup_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".bak");
     path.with_file_name(name)
+}
+
+/// Copy `path` to the first free name of `<path>.bak`, `<path>.bak.1`, ...
+/// `<path>.bak.99` and return it. Each name is created exclusively
+/// (`create_new`, i.e. `O_CREAT | O_EXCL`), so a file or symlink already
+/// there -- an earlier backup, or a symlink another user of a shared
+/// directory planted at the predictable name -- is never followed or
+/// overwritten. Owner-only (0600) on Unix, like the config itself
+/// (plaintext credentials); elsewhere it inherits the directory's ACL.
+fn create_backup(path: &Path) -> Result<PathBuf> {
+    use std::io::Write;
+    let contents =
+        std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let first = backup_path(path);
+    for n in 0..100 {
+        let bak = if n == 0 {
+            first.clone()
+        } else {
+            let mut name = first.clone().into_os_string();
+            name.push(format!(".{n}"));
+            PathBuf::from(name)
+        };
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = match options.open(&bak) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("Failed to create backup {}", bak.display()))
+            }
+        };
+        if let Err(e) = file.write_all(&contents).and_then(|()| file.sync_all()) {
+            // Ours: created exclusively above.
+            let _ = std::fs::remove_file(&bak);
+            return Err(e).with_context(|| {
+                format!("Failed to back up {} to {}", path.display(), bak.display())
+            });
+        }
+        return Ok(bak);
+    }
+    anyhow::bail!(
+        "Failed to back up {}: {} and .bak.1 to .bak.99 beside it all exist",
+        path.display(),
+        first.display()
+    )
 }
 
 /// The wizard writes TOML. Recover JSON beside the failed file so discovery
@@ -1711,10 +1762,10 @@ fn wizard_save_path(path: &Path) -> PathBuf {
 /// differ from the file / the defaults are written, and comments survive
 /// ([`Config::save_changes_to_file`]). A file that exists but does not load,
 /// or any existing file when `from_defaults` (merging a defaults-based config
-/// would reset every setting the file holds), is first kept as `<path>.bak`
-/// (copy preserves its mode), then replaced by a fresh minimal file. Failed
-/// JSON is removed only after its sibling TOML file is saved. Returns the
-/// backup path when one was made.
+/// would reset every setting the file holds), is first kept as a backup
+/// ([`create_backup`]: `<path>.bak`, or the next free `<path>.bak.N`), then
+/// replaced by a fresh minimal file. Failed JSON is removed only after its
+/// sibling TOML file is saved. Returns the backup path when one was made.
 fn persist_wizard_config(
     config: &Config,
     path: &Path,
@@ -1723,10 +1774,7 @@ fn persist_wizard_config(
     let save_path = wizard_save_path(path);
     let mut backup = None;
     if path.exists() && (from_defaults || Config::load_from_file(path).is_err()) {
-        let bak = backup_path(path);
-        std::fs::copy(path, &bak).with_context(|| {
-            format!("Failed to back up {} to {}", path.display(), bak.display())
-        })?;
+        let bak = create_backup(path)?;
         if save_path == path {
             std::fs::remove_file(path)
                 .with_context(|| format!("Failed to replace {}", path.display()))?;
@@ -1772,7 +1820,9 @@ async fn setup_command() -> Result<()> {
                     config_path.display()
                 );
                 println!(
-                    "Setup will start from defaults; on save the old file is kept as {}.",
+                    "Setup will start from defaults; on save the old file is kept as {} \
+                     (or {}.N if that name is taken).",
+                    backup_path(&config_path).display(),
                     backup_path(&config_path).display()
                 );
                 println!();
@@ -2162,6 +2212,50 @@ mod tests {
         let bak = dir.path().join("pancetta.toml.bak");
         assert_eq!(backup.as_deref(), Some(bak.as_path()));
         assert_eq!(std::fs::read_to_string(&bak).unwrap(), "[station\n");
+        let reloaded = Config::load_from_file(&path).unwrap();
+        assert_eq!(reloaded.station.callsign, "K1ABC");
+    }
+
+    /// PAN-90 review (Codex P1): the backup name is predictable, and the
+    /// search path includes the cwd, so another user of a shared directory
+    /// can plant `<config>.bak` as a symlink. The backup must never follow
+    /// it (writing the plaintext config into the symlink's target), and must
+    /// not be readable by anyone but the owner.
+    #[cfg(unix)]
+    #[test]
+    fn persist_wizard_config_never_follows_a_symlink_planted_at_the_backup_name() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        std::fs::write(&path, "[station\n").unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "do not touch").unwrap();
+        let planted = dir.path().join("pancetta.toml.bak");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        // A dangling symlink: following it would create a file wherever the
+        // planter chose.
+        let dangling_target = dir.path().join("created-by-pancetta.txt");
+        let dangling = dir.path().join("pancetta.toml.bak.1");
+        std::os::unix::fs::symlink(&dangling_target, &dangling).unwrap();
+
+        let mut config = Config::default();
+        config.station.callsign = "K1ABC".to_string();
+        let backup = persist_wizard_config(&config, &path, false)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "do not touch");
+        assert!(!dangling_target.exists());
+        for link in [&planted, &dangling] {
+            assert!(std::fs::symlink_metadata(link)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+        assert_eq!(backup, dir.path().join("pancetta.toml.bak.2"));
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "[station\n");
+        let mode = std::fs::metadata(&backup).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "backup mode {mode:o} is not owner-only");
         let reloaded = Config::load_from_file(&path).unwrap();
         assert_eq!(reloaded.station.callsign, "K1ABC");
     }

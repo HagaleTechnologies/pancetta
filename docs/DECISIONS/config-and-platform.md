@@ -433,7 +433,10 @@ a hard `missing field` error. Worse, the auto-discovery loader swallowed that er
   prompt with the real path). Non-file sources keep warn-and-continue. For a validation failure
   the prompt targets the one discovered file that fails validation on its own, and is not
   offered when no single file can be blamed. The de-brick wizard starts from defaults, so on save
-  it always keeps the file it rewrites as `<name>.bak`. After the wizard, startup reloads every
+  it always keeps the file it rewrites as `<name>.bak` (or the next free `<name>.bak.N`; created
+  exclusively, so a planted symlink or an earlier backup is never followed or overwritten; 0600
+  on Unix).
+  After the wizard, startup reloads every
   discovered file, so the session starts from what the next start reads (and warns about the
   sections where other files change the wizard's values; the first-run wizard still follows if
   that config has no callsign). If the reload still fails, it warns and runs on the wizard's
