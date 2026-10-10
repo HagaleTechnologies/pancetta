@@ -2,6 +2,20 @@
 
 [← Back to the README](../README.md)
 
+### pancetta exits at startup with `config file … failed to load`
+
+A config file pancetta found exists but does not parse (syntax error,
+wrong value type) or cannot be read; the error names the file and the
+line. Run `pancetta config --validate` to see which file(s) pancetta
+reads (the search order is in [`CONFIG.md`](CONFIG.md#where-pancetta-looks-for-its-config))
+and fix the named file, then validate again. `pancetta setup` repairs only
+`~/.pancetta/pancetta.toml`: on save, it keeps that broken file as
+`pancetta.toml.bak` (or the next free `pancetta.toml.bak.N` if that name is
+taken) and writes a fresh one. It does not repair files in
+other search locations. pancetta no longer
+falls back to all-default settings (callsign N0CALL) when a file is
+broken, so unattended/systemd hosts fail to start until it is fixed.
+
 ### "Audio init failed" appears in the TUI status
 
 Most often: cpal can't find the input device named in your config.

@@ -80,6 +80,7 @@ pub enum BitDepth {
 
 /// Audio processing chain configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AudioProcessingConfig {
     /// Enable/disable audio processing
     pub enabled: bool,
@@ -105,6 +106,7 @@ pub struct AudioProcessingConfig {
 
 /// Bandwidth filter configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct BandwidthConfig {
     /// Enable bandwidth filtering
     pub enabled: bool,
@@ -124,6 +126,7 @@ pub struct BandwidthConfig {
 
 /// Audio compression configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CompressionConfig {
     /// Enable audio compression
     pub enabled: bool,
@@ -149,6 +152,7 @@ pub struct CompressionConfig {
 
 /// Equalizer configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EqualizerConfig {
     /// Enable equalizer
     pub enabled: bool,
@@ -201,6 +205,7 @@ pub enum EqBandType {
 
 /// Pre-emphasis/de-emphasis configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EmphasisConfig {
     /// Enable pre-emphasis on transmission
     pub pre_emphasis_enabled: bool,
@@ -214,6 +219,7 @@ pub struct EmphasisConfig {
 
 /// AGC (Automatic Gain Control) configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AgcConfig {
     /// Enable AGC
     pub enabled: bool,
@@ -265,6 +271,7 @@ pub enum AgcMode {
 
 /// Noise reduction configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NoiseReductionConfig {
     /// Enable noise reduction
     pub enabled: bool,
@@ -307,6 +314,7 @@ pub enum NoiseReductionAlgorithm {
 
 /// Spectral subtraction configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SpectralSubtractionConfig {
     /// Over-subtraction factor
     pub alpha: f32,
@@ -323,6 +331,7 @@ pub struct SpectralSubtractionConfig {
 
 /// Wiener filter configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct WienerFilterConfig {
     /// Noise estimation window size
     pub estimation_window_ms: f32,
@@ -336,6 +345,7 @@ pub struct WienerFilterConfig {
 
 /// Audio routing configuration
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AudioRoutingConfig {
     /// Input routing matrix
     pub input_routing: Vec<AudioRoute>,
@@ -368,6 +378,7 @@ pub struct AudioRoute {
 
 /// Monitor configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MonitorConfig {
     /// Enable monitoring
     pub enabled: bool,
@@ -401,6 +412,7 @@ pub enum MonitorSource {
 
 /// Sidetone configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SidetoneConfig {
     /// Enable sidetone
     pub enabled: bool,
@@ -434,6 +446,7 @@ pub enum SidetoneShape {
 
 /// Audio recording configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RecordingConfig {
     /// Enable automatic recording
     pub auto_record: bool,
@@ -482,6 +495,7 @@ pub enum RecordingFormat {
 
 /// Audio levels and metering configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AudioLevelsConfig {
     /// Input level adjustment in dB
     pub input_gain_db: f32,
@@ -504,6 +518,7 @@ pub struct AudioLevelsConfig {
 
 /// Audio meter ballistics configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MeterBallisticsConfig {
     /// Peak meter attack time in milliseconds
     pub peak_attack_ms: f32,
