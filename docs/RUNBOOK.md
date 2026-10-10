@@ -321,9 +321,10 @@ For first-run / install issues, see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
   wrong value type) or cannot be read. The error names the file and the
   line.
 - Run `pancetta config --validate`: it prints which file(s) it read and
-  exits non-zero while any of them is broken. Fix the named line, or run
-  `pancetta setup`, which keeps the broken file as `pancetta.toml.bak`
-  and writes a fresh one.
+  exits non-zero while any of them is broken. Fix the named file, then
+  validate again. `pancetta setup` repairs only `~/.pancetta/pancetta.toml`:
+  on save, it keeps that broken file as `pancetta.toml.bak` and writes a
+  fresh one. It does not repair files in other search locations.
 - Unattended/systemd hosts now fail to start on a broken config instead
   of running on all-default settings (callsign N0CALL). That fallback
   never applied the operator's file, so the station was never configured

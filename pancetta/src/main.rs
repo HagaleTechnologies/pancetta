@@ -1108,16 +1108,10 @@ async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<Stri
                     false,
                 )? {
                     let defaults = Config::default();
-                    // Save over the file that actually failed (it may be in
-                    // the current directory or ~/.config/pancetta), so the
-                    // next start loads. The wizard writes TOML, so a broken
-                    // JSON file falls back to the default location.
-                    let target = if pancetta_config::path_is_json_format(&failed_path) {
-                        default_pancetta_toml_path()
-                    } else {
-                        failed_path
-                    };
-                    match run_first_time_setup(&defaults, &target)? {
+                    // Pass the actual failed file so saving can back it up.
+                    // JSON recovery writes a sibling TOML file that discovery
+                    // selects before JSON in the same search directory.
+                    match run_first_time_setup(&defaults, &failed_path)? {
                         Some(fixed) => (fixed, Vec::new()),
                         None => {
                             return Err(anyhow::anyhow!(e))
@@ -1178,8 +1172,9 @@ fn offer_wizard_on_load_failure(
 
 /// Interactive first-run setup wizard.
 /// Prompts for callsign, grid square, and saves the config file to
-/// `config_path`.
+/// `config_path` (a sibling TOML file when recovering JSON).
 fn run_first_time_setup(config: &Config, config_path: &Path) -> Result<Option<Config>> {
+    let save_path = wizard_save_path(config_path);
     println!();
     println!("=== Pancetta First-Run Setup ===");
     println!();
@@ -1223,17 +1218,17 @@ fn run_first_time_setup(config: &Config, config_path: &Path) -> Result<Option<Co
     }
 
     if prompt_yes_no(
-        &format!("Save configuration to {}?", config_path.display()),
+        &format!("Save configuration to {}?", save_path.display()),
         true,
     )? {
-        if let Some(config_dir) = config_path.parent() {
+        if let Some(config_dir) = save_path.parent() {
             if !config_dir.as_os_str().is_empty() {
                 std::fs::create_dir_all(config_dir)?;
             }
         }
         let backup = persist_wizard_config(&new_config, config_path)?;
         print_backup_notice(backup.as_deref());
-        println!("Configuration saved to {}", config_path.display());
+        println!("Configuration saved to {}", save_path.display());
     }
 
     println!();
@@ -1618,27 +1613,44 @@ fn backup_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// The wizard writes TOML. Recover JSON beside the failed file so discovery
+/// uses the replacement in the same search directory.
+fn wizard_save_path(path: &Path) -> PathBuf {
+    if pancetta_config::path_is_json_format(path) {
+        path.with_extension("toml")
+    } else {
+        path.to_path_buf()
+    }
+}
+
 /// Persist a wizard-edited config (`pancetta setup`, the first-run wizard)
 /// to `path` without destroying the operator's file (PAN-90): only keys that
 /// differ from the file / the defaults are written, and comments survive
 /// ([`Config::save_changes_to_file`]). A file that exists but does not load
 /// is first kept as `<path>.bak` (copy preserves its mode), then replaced
-/// by a fresh minimal file -- never merged blindly, never lost. Returns the
-/// backup path when one was made.
+/// by a fresh minimal file. Failed JSON is removed only after its sibling
+/// TOML file is saved. Returns the backup path when one was made.
 fn persist_wizard_config(config: &Config, path: &Path) -> Result<Option<PathBuf>> {
+    let save_path = wizard_save_path(path);
     let mut backup = None;
     if path.exists() && Config::load_from_file(path).is_err() {
         let bak = backup_path(path);
         std::fs::copy(path, &bak).with_context(|| {
             format!("Failed to back up {} to {}", path.display(), bak.display())
         })?;
-        std::fs::remove_file(path)
-            .with_context(|| format!("Failed to replace {}", path.display()))?;
+        if save_path == path {
+            std::fs::remove_file(path)
+                .with_context(|| format!("Failed to replace {}", path.display()))?;
+        }
         backup = Some(bak);
     }
     config
-        .save_changes_to_file(path)
-        .with_context(|| format!("Failed to save config to {}", path.display()))?;
+        .save_changes_to_file(&save_path)
+        .with_context(|| format!("Failed to save config to {}", save_path.display()))?;
+    if save_path != path && backup.is_some() {
+        std::fs::remove_file(path)
+            .with_context(|| format!("Failed to replace {}", path.display()))?;
+    }
     Ok(backup)
 }
 
@@ -2023,6 +2035,30 @@ mod tests {
     use predicates::prelude::*;
 
     // ---- PAN-90: wizard saves keep the operator's file ----
+
+    #[test]
+    fn persist_wizard_config_recovers_discovered_json() {
+        for filename in ["config.json", "pancetta.json"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(filename);
+            let broken = "{broken json";
+            std::fs::write(&path, broken).unwrap();
+            let loader =
+                pancetta_config::ConfigLoader::with_search_paths(vec![dir.path().to_path_buf()])
+                    .unwrap();
+            assert!(loader.load().is_err());
+
+            let mut config = Config::default();
+            config.station.callsign = "K1ABC".to_string();
+            let backup = persist_wizard_config(&config, &path).unwrap().unwrap();
+            assert_eq!(backup, dir.path().join(format!("{filename}.bak")));
+            assert_eq!(std::fs::read_to_string(backup).unwrap(), broken);
+            let recovered = loader.load().expect("recovery must survive discovery");
+            assert_eq!(recovered.station.callsign, "K1ABC");
+            assert_eq!(loader.loaded_files(), vec![path.with_extension("toml")]);
+            assert!(!path.exists());
+        }
+    }
 
     #[test]
     fn persist_wizard_config_backs_up_a_file_that_does_not_load() {
