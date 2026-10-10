@@ -199,9 +199,16 @@ fn validate_fails_on_broken_file_in_cwd() {
     std::fs::write(&path, SYNTAX_ERROR).unwrap();
     let out = s.validate(None);
     assert!(!out.status.success(), "stdout: {}", stdout(&out));
-    // The error names the file it could not load: the cwd copy.
+    // The error names the file it could not load: the cwd copy. The binary
+    // sees its cwd with symlinks resolved, so compare against that form.
+    let cwd_file = std::fs::canonicalize(s.cwd.path())
+        .unwrap()
+        .join("pancetta.toml");
     assert!(
-        stderr(&out).contains("pancetta.toml failed to load"),
+        stderr(&out).contains(&format!(
+            "config file {} failed to load",
+            cwd_file.display()
+        )),
         "stderr: {}",
         stderr(&out)
     );

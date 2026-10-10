@@ -78,9 +78,10 @@ pub struct ConfigLoader {
     /// Cache for parsed configurations
     config_cache: Arc<Mutex<HashMap<PathBuf, (SystemTime, Config)>>>,
 
-    /// Human-readable warnings accumulated during the last `load()` (e.g. a
-    /// config file that failed to parse and was skipped). Surfaced to the
-    /// operator (console + TUI) so a silent revert-to-defaults is visible.
+    /// Human-readable warnings accumulated during the last `load()` (e.g. an
+    /// unknown section or key, or a non-file source that failed). Surfaced to
+    /// the operator (console + TUI) so a typo is never invisible. A config
+    /// FILE that fails to load is an error, not a warning (PAN-90).
     load_warnings: Arc<Mutex<Vec<String>>>,
 
     /// Config files actually read by the last `load()`, in merge order
@@ -393,17 +394,10 @@ impl ConfigLoader {
                     // A non-file source (environment, remote) that failed:
                     // warn loudly AND record a human-readable warning the
                     // caller can surface (console + TUI), then continue.
-                    warn!(
-                        "Config source '{}' failed to load — IGNORING it and using \
-                         defaults for its settings: {}",
+                    self.push_load_warning(format!(
+                        "Config '{}' failed to parse — using defaults for it ({})",
                         source.name, e
-                    );
-                    if let Ok(mut wlist) = self.load_warnings.lock() {
-                        wlist.push(format!(
-                            "Config '{}' failed to parse — using defaults for it ({})",
-                            source.name, e
-                        ));
-                    }
+                    ));
                 }
             }
         }
@@ -411,9 +405,9 @@ impl ConfigLoader {
         Ok((config, sources))
     }
 
-    /// Warnings accumulated during the last [`load`](Self::load) call (e.g. a
-    /// config file that existed but failed to parse and was skipped, so its
-    /// settings silently reverted to defaults). Empty on a clean load.
+    /// Warnings accumulated during the last [`load`](Self::load) call (e.g. an
+    /// unknown section or key, or a non-file source that failed and was
+    /// skipped). Empty on a clean load.
     pub fn load_warnings(&self) -> Vec<String> {
         self.load_warnings
             .lock()
@@ -746,15 +740,9 @@ impl ConfigLoader {
         let known = serde_json::to_value(parsed).unwrap_or_default();
         for (key, value) in &raw {
             if !known_top.contains(key) {
-                warn!(
-                    "Unknown top-level config section [{key}] — pancetta ignores it. \
-                     Check the spelling against docs/CONFIG.md."
-                );
-                if let Ok(mut wlist) = self.load_warnings.lock() {
-                    wlist.push(format!(
-                        "Unknown config section [{key}] — ignored (check spelling; see docs/CONFIG.md)"
-                    ));
-                }
+                self.push_load_warning(format!(
+                    "Unknown config section [{key}] — ignored (check spelling; see docs/CONFIG.md)"
+                ));
                 continue;
             }
             if let (toml::Value::Table(t), Some(k)) = (value, known.get(key)) {

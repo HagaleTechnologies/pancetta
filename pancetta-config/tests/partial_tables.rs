@@ -30,8 +30,10 @@ const PARSE_ONLY: &[(&str, &str)] = &[
 ];
 
 fn defaults_table() -> toml::Table {
-    let mut c = Config::default();
-    c.metadata = None;
+    let c = Config {
+        metadata: None,
+        ..Default::default()
+    };
     toml::Table::try_from(&c).unwrap()
 }
 
