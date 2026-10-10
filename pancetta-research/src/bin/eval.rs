@@ -2968,6 +2968,7 @@ mod novel_classification_tests {
     use pancetta_research::chrono_replay::{ChronoReplayEntry, ChronoReplayManifest};
     use pancetta_research::curated::{CuratedEntry, CuratedManifest, ScoreBreakdown};
     use pancetta_research::decoder::Decode;
+    use pancetta_research::{BaselineCache, BaselineDecode};
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -3052,12 +3053,22 @@ mod novel_classification_tests {
     }
 
     fn write_baseline_cache(baselines_dir: &std::path::Path, sha: &str, decodes: &[&str]) {
-        let cache = serde_json::json!({
-            "decodes": decodes
+        let cache = BaselineCache {
+            schema_version: BaselineCache::CURRENT_SCHEMA_VERSION,
+            wav_path: format!("wavs/{sha}.wav"),
+            wav_sha256: sha.to_string(),
+            decoder_identity: "jt9 (test)".to_string(),
+            decodes: decodes
                 .iter()
-                .map(|m| serde_json::json!({"message": m}))
-                .collect::<Vec<_>>(),
-        });
+                .map(|m| BaselineDecode {
+                    message: m.to_string(),
+                    freq_hz: 1500.0,
+                    dt_s: 0.0,
+                    snr_db: -10.0,
+                })
+                .collect(),
+            elapsed_seconds: 0.1,
+        };
         std::fs::write(
             baselines_dir.join(format!("{sha}.json")),
             serde_json::to_string(&cache).unwrap(),
