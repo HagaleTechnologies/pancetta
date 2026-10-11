@@ -389,13 +389,31 @@ async fn run_application(cli: Cli) -> Result<()> {
     // Create shutdown signal handler
     let shutdown = Arc::new(AtomicBool::new(false));
 
-    // Set up Ctrl+C signal handler
+    // Register SIGTERM before coordinator startup so service stops use cleanup.
+    #[cfg(unix)]
+    let mut terminate = signal::unix::signal(signal::unix::SignalKind::terminate())
+        .context("Failed to listen for SIGTERM")?;
+
+    // Route OS signals through the coordinator's shared shutdown flag.
     let shutdown_for_signals = shutdown.clone();
     tokio::spawn(async move {
-        if let Err(e) = signal::ctrl_c().await {
-            error!("Failed to listen for ctrl+c: {}", e);
+        #[cfg(unix)]
+        tokio::select! {
+            result = signal::ctrl_c() => {
+                if let Err(e) = result {
+                    error!("Failed to listen for ctrl+c: {}", e);
+                }
+                info!("Received Ctrl+C, initiating graceful shutdown");
+            }
+            _ = terminate.recv() => {}
         }
-        info!("Received Ctrl+C, initiating graceful shutdown");
+        #[cfg(not(unix))]
+        {
+            if let Err(e) = signal::ctrl_c().await {
+                error!("Failed to listen for ctrl+c: {}", e);
+            }
+            info!("Received Ctrl+C, initiating graceful shutdown");
+        }
         shutdown_for_signals.store(true, Ordering::Release);
     });
 
