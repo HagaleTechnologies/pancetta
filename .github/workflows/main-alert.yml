@@ -1,0 +1,24 @@
+name: Main Alert
+
+# One "main is red: <workflow>" issue per workflow while it fails on main,
+# assigned so the owner gets one email; closed by the next green run. Logic
+# and filtering live in credenza's reusable main-alert.yml. Workflows that
+# already file their own alert issue are deliberately not listed.
+on:
+  workflow_run:
+    workflows:
+      - CI
+      - Docs
+      - Release
+      - Semgrep
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  alert:
+    permissions:
+      issues: write
+      actions: read
+    uses: HagaleTechnologies/credenza/.github/workflows/main-alert.yml@cbc5882e833d254d93fa8849dc3f8defaff0e9e7 # master
