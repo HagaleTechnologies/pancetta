@@ -7,10 +7,12 @@ trap 'rm -rf "$tmp"' EXIT
 export PATH="$dir/stub:$PATH" STUB_DIR="$dir/stub" REPO=example/pancetta
 export GH_TOKEN=test-workflow-token RESOLVE_TOKEN=test-user-token ONLY_PR=420
 export REPORT_MENTION=thagale RUN_URL=https://example.invalid/run/1
-# P replays B's data with only the re-arm marker comment failing.
-for scenario in A B C D E F G H I J K L M N O P; do
-  export STUB_CASE=$scenario STUB_FAIL_REARM_COMMENT=
+# P replays B's data with only the re-arm marker comment failing; Q replays B with the
+# queue handler re-pausing the PR as it is armed.
+for scenario in A B C D E F G H I J K L M N O P Q; do
+  export STUB_CASE=$scenario STUB_FAIL_REARM_COMMENT='' STUB_PAUSE_ON_ARM=''
   [[ $scenario == P ]] && export STUB_CASE=B STUB_FAIL_REARM_COMMENT=1
+  [[ $scenario == Q ]] && export STUB_CASE=B STUB_PAUSE_ON_ARM=1
   export STUB_LOG="$tmp/$scenario.log" STUB_STATE="$tmp/$scenario"
   export GITHUB_STEP_SUMMARY="$tmp/$scenario.summary"
   mkdir -p "$STUB_STATE"
@@ -38,6 +40,7 @@ when 'B'
   comment = find.call('<!-- research-scan-shepherd:rearm sha=1a2b3c400000 -->')
   raise 'rearm order' unless delete < comment && comment < arm
   raise 'arm PAT' unless calls[arm]['token'] == 'test-user-token'
+  raise 'disarmed a clean arm' if calls.any? { |c| c['args'].include?('--disable-auto') }
   raise 'delete GITHUB_TOKEN' unless calls[delete]['token'] == 'test-workflow-token'
 when 'C', 'M', 'N'
   resolves = calls.each_index.select { |i| calls[i]['args'].join(' ').include?('resolveReviewThread(') }
@@ -74,6 +77,12 @@ when 'P'
   find.call('<!-- research-scan-shepherd:rearm sha=1a2b3c400000 -->')
   raise 'armed without a recorded attempt' if calls.any? { |c| c['args'][0,2] == ['pr','merge'] }
   raise 'missing failure report' unless File.read(output).include?('mutation or refresh failed')
+when 'Q'
+  comment = find.call('<!-- research-scan-shepherd:rearm sha=1a2b3c400000 -->')
+  arm = find.call('pr merge 420 --repo example/pancetta --auto --squash')
+  disarm = find.call('pr merge 420 --repo example/pancetta --disable-auto')
+  raise 'race order' unless comment < arm && arm < disarm
+  raise 'pause override not reported' unless File.read(output).include?('producer became busy')
 when 'E'
   raise 'busy mutation' unless mutations.empty?
   raise 'missing skip notice' unless File.read(output).include?('skip')

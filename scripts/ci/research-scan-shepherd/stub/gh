@@ -15,7 +15,14 @@ case "$1 $2" in
   'run view') get '.jobs' ;;
   'run rerun') echo '{}' ;;
   'pr list') echo '[{"number":420}]' ;;
-  'pr merge') touch "$STUB_STATE/armed"; echo '{}' ;;
+  'pr merge')
+    if [[ $args == *' --disable-auto '* ]]; then rm -f "$STUB_STATE/armed"
+    else
+      touch "$STUB_STATE/armed"
+      # Simulates the Queue Retry Handler pausing the PR just as the shepherd arms it.
+      [[ -z ${STUB_PAUSE_ON_ARM:-} ]] || touch "$STUB_STATE/repaused"
+    fi
+    echo '{}' ;;
   'issue create'|'issue edit'|'issue close'|'issue comment'|'label create') echo '{}' ;;
   'api graphql')
     if [[ $args == *'resolveReviewThread('* ]]; then
@@ -57,7 +64,8 @@ case "$1 $2" in
         *'/files'*) get '.files' ;;
         *'/timeline'*) get '.timeline' ;;
         *'/comments'*) get '.comments' ;;
-        *'/labels'*) if [[ -f $STUB_STATE/cleared ]]; then echo '[]'; else get '.pr.data.repository.pullRequest.labels.nodes'; fi ;;
+        *'/labels'*) if [[ -f $STUB_STATE/repaused ]]; then echo '[{"name":"queue-needs-human-review"}]'
+          elif [[ -f $STUB_STATE/cleared ]]; then echo '[]'; else get '.pr.data.repository.pullRequest.labels.nodes'; fi ;;
         *'/commits/'*) get '.commit_files' ;;
         *'/pulls/420') get '.rest_pr' ;;
         *) echo "unstubbed API: $*" >&2; exit 2 ;;

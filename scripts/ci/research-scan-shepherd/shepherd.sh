@@ -120,6 +120,16 @@ gather_snapshot() {
     --arg head "$head" "$dir/snapshot" > "$dest" || return 1
 }
 record_action() { printf '%s\n' "$1" >> "$WORK/actions"; }
+# Return 0 when no queue producer is running and the pause label is absent, 1 when either
+# is present, 2 when unreadable.
+arm_window_clear() {
+  local quiet=0 labels
+  quiescent || quiet=$?
+  [[ $quiet == 0 ]] || { [[ $quiet == 1 ]] && return 1; return 2; }
+  labels=$(gh api "repos/$REPO/issues/$1/labels?per_page=100" --paginate | jq -s 'add // []') || return 2
+  jq -e 'type == "array"' <<< "$labels" >/dev/null || return 2
+  jq -e 'any(.[]; .name == "queue-needs-human-review") | not' <<< "$labels" >/dev/null || return 1
+}
 decide() { jq -c -L "$SCRIPT_DIR" -f "$SCRIPT_DIR/decide.jq" "$1"; }
 # A full fresh snapshot revalidates author, paths, pause provenance, queue rules and
 # dispositions at every action boundary. Return 3 for a benign stale/busy stand-down.
@@ -229,8 +239,19 @@ apply() {
       gh api -X POST "repos/$REPO/issues/$pr/comments" -f body="Re-arming auto-merge after a merge-queue removal (attempt $attempt/2 for ${head:0:12}). Notes-only scan PRs cannot cause a Rust merge-group failure; see docs/routines/pancetta-research-scan.md.
 <!-- research-scan-shepherd:rearm sha=${head:0:12} -->" >/dev/null || return 1
       record_action "recorded re-arm attempt $attempt"
+      # The queue producers serialize on auto-merge-<PR>, which this repo-wide job cannot
+      # join. Re-check them and the pause label right before arming, then again after: a
+      # handler that paused in between must win, so disarm rather than override it.
+      arm_window_clear "$pr" || { code=$?; [[ $code == 2 ]] && return 1; return 3; }
       GH_TOKEN="$RESOLVE_TOKEN" gh pr merge "$pr" --repo "$REPO" --auto --squash --match-head-commit "$head" >/dev/null || return 1
       record_action "armed auto-merge"
+      code=0; arm_window_clear "$pr" || code=$?
+      if [[ $code == 1 || $code == 2 ]]; then
+        gh pr merge "$pr" --repo "$REPO" --disable-auto >/dev/null || return 1
+        record_action "disarmed: queue producer or pause appeared while arming"
+        [[ $code == 2 ]] && return 1
+        return 3
+      fi
     fi
   fi
   if jq -e '.report' "$decision" >/dev/null; then
