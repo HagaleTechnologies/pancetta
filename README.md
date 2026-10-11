@@ -261,7 +261,7 @@ One binary, several subcommands (`pancetta <cmd> --help` for details):
 | `pancetta setup` | Interactive station/audio/rig/PTT wizard. Safe to re-run. |
 | `pancetta test-audio --list` | List audio devices exactly as pancetta sees them. |
 | `pancetta test-rig` | Test the rig link; `--ptt` keys TX for 1 s (careful!). |
-| `pancetta config --validate` | Validate config, non-zero on error (`--show`, `--generate`). |
+| `pancetta config --validate` | Check the config parses and validates, show which file(s) were read; non-zero on error (`--show`, `--generate`). |
 | `pancetta export --output log.adi` | Export logged QSOs to ADIF. |
 | `pancetta benchmark-decode <wav-or-dir>` | Native decoder vs. ft8_lib on WAV captures. |
 | `pancetta --wav <file>` | Decode one 15-s WAV and exit (no audio hardware). |

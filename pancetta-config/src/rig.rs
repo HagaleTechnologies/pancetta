@@ -135,6 +135,7 @@ pub struct RigConfig {
 
 /// CAT (Computer Aided Transceiver) interface configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CatInterfaceConfig {
     /// Serial port device (e.g., "/dev/ttyUSB0", "COM3")
     pub port: String,
@@ -229,6 +230,7 @@ pub enum CatProtocol {
 
 /// PTT (Push-To-Talk) control configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PttConfig {
     /// PTT control method
     pub method: PttMethod,
@@ -294,6 +296,7 @@ pub enum PttPolarity {
 
 /// VOX (Voice Operated eXchange) configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct VoxConfig {
     /// Enable VOX
     pub enabled: bool,
@@ -313,6 +316,7 @@ pub struct VoxConfig {
 
 /// Frequency management configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct FrequencyConfig {
     /// Enable frequency control
     pub control_enabled: bool,
@@ -335,6 +339,7 @@ pub struct FrequencyConfig {
 
 /// Memory channel configuration
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MemoryChannelConfig {
     /// Enable memory channel control
     pub enabled: bool,
@@ -376,6 +381,7 @@ pub struct MemoryChannel {
 
 /// Frequency limits configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct FrequencyLimitsConfig {
     /// Minimum frequency in Hz
     pub min_frequency: u64,
@@ -402,6 +408,7 @@ pub struct FrequencyRange {
 
 /// Band plan configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct BandPlanConfig {
     /// Region-specific band plan (ITU Region 1, 2, or 3)
     pub region: u8,
@@ -457,6 +464,7 @@ pub enum BandType {
 
 /// Band switching configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct BandSwitchingConfig {
     /// Enable automatic band switching
     pub auto_switching: bool,
@@ -499,6 +507,7 @@ pub enum BandSwitchMethod {
 
 /// Antenna switching configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AntennaSwitchingConfig {
     /// Enable antenna switching
     pub enabled: bool,
@@ -579,6 +588,7 @@ pub struct AntennaRule {
 
 /// Power control configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PowerControlConfig {
     /// Enable power control
     pub enabled: bool,
@@ -618,6 +628,7 @@ pub enum PowerControlMethod {
 
 /// Power ramping configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PowerRampingConfig {
     /// Enable power ramping
     pub enabled: bool,
@@ -644,6 +655,7 @@ pub enum RampingCurve {
 
 /// Power protection configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PowerProtectionConfig {
     /// Maximum power limit (watts)
     pub max_power_watts: u16,
@@ -663,6 +675,7 @@ pub struct PowerProtectionConfig {
 
 /// Operating mode configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ModeConfig {
     /// Supported modes
     pub supported_modes: Vec<String>,
@@ -698,6 +711,7 @@ pub struct ModeSettings {
 
 /// Filter configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct FilterConfig {
     /// Available filter widths
     pub available_widths: Vec<u32>,
@@ -727,6 +741,7 @@ pub struct CustomFilter {
 
 /// Timing configuration for rig operations
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TimingConfig {
     /// Command interval in milliseconds
     pub command_interval_ms: u64,
@@ -746,6 +761,7 @@ pub struct TimingConfig {
 
 /// Rig-specific parameters
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RigParametersConfig {
     /// Rig identification string
     pub rig_id: Option<String>,
@@ -765,6 +781,7 @@ pub struct RigParametersConfig {
 
 /// Calibration configuration
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CalibrationConfig {
     /// Frequency calibration offset in Hz
     pub frequency_offset: i32,
@@ -794,6 +811,7 @@ pub struct CalibrationPoint {
 
 /// Rig quirks and workarounds
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct QuirksConfig {
     /// Commands that need special handling
     pub special_commands: HashMap<String, String>,

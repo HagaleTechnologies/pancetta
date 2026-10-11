@@ -84,6 +84,7 @@ pub struct NetworkConfig {
 /// stay on the operator's machine (keep the config file `chmod 600`) and are
 /// never logged.
 #[derive(Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ClubLogConfig {
     /// Enable per-QSO uploads to ClubLog.
     #[serde(default)]
@@ -147,6 +148,7 @@ pub fn default_clublog_api_key() -> String {
 /// API key is per-logbook (from the logbook's Settings page) and is never
 /// logged. Keep the config file `chmod 600`.
 #[derive(Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct QrzLogbookConfig {
     /// Enable per-QSO uploads to QRZ Logbook.
     #[serde(default)]
@@ -165,6 +167,7 @@ pub struct QrzLogbookConfig {
 /// each completed QSO is signed + uploaded via `tqsl`. No credential value is
 /// ever logged; the certificate lives in the operator's TQSL install.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LotwUploadConfig {
     /// Enable per-QSO signed uploads to LoTW.
     #[serde(default)]
@@ -188,6 +191,7 @@ pub struct LotwUploadConfig {
 /// credentials stay on the operator's machine (keep the config file
 /// `chmod 600`) and are never logged.
 #[derive(Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EqslConfig {
     /// Enable per-QSO uploads to eQSL.cc.
     #[serde(default)]
@@ -220,6 +224,7 @@ pub struct EqslConfig {
 /// a scaffold: it is not yet wired into the decode/priority hot path (a later
 /// operator decision).
 #[derive(Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct QrzXmlConfig {
     /// Enable QRZ XML callsign lookups.
     #[serde(default)]
@@ -237,6 +242,7 @@ pub struct QrzXmlConfig {
 /// WSJT-X-compatible UDP companion-protocol settings (GridTracker, JTAlert,
 /// loggers). See docs/superpowers/specs/2026-07-13-wsjtx-udp-design.md.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct WsjtxUdpConfig {
     /// Master enable. Off ⇒ no socket is bound and nothing is emitted.
     pub enabled: bool,
@@ -308,6 +314,7 @@ impl ConfigSection for WsjtxUdpConfig {
 
 /// Read-only remote view gateway (Panino client). Default OFF; localhost-bound.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RemoteGatewayConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -343,6 +350,7 @@ impl Default for RemoteGatewayConfig {
 /// In this phase the remote transport is not built, so [`enabled`](Self::enabled)
 /// has no runtime effect (it is only validated as well-formed).
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StationAgentConfig {
     /// Enable the station-agent remote-control transport. No runtime effect in
     /// this phase (transport unbuilt); default OFF.
@@ -549,6 +557,7 @@ pub struct DistanceFilters {
 
 /// WSPR (Weak Signal Propagation Reporter) configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct WsprConfig {
     /// Enable WSPR integration
     pub enabled: bool,
@@ -571,6 +580,7 @@ pub struct WsprConfig {
 
 /// WSPR filtering configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct WsprFilteringConfig {
     /// Minimum SNR
     pub min_snr: f32,
@@ -590,6 +600,7 @@ pub struct WsprFilteringConfig {
 
 /// WSPR analysis configuration
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct WsprAnalysisConfig {
     /// Propagation analysis
     pub propagation_analysis: bool,
@@ -606,6 +617,7 @@ pub struct WsprAnalysisConfig {
 
 /// DX Cluster configuration
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DxClusterConfig {
     /// Enable DX cluster connection
     pub enabled: bool,
@@ -661,6 +673,7 @@ pub enum ClusterType {
 
 /// Cluster connection configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ClusterConnectionConfig {
     /// Auto-connect on startup
     pub auto_connect: bool,
@@ -680,6 +693,7 @@ pub struct ClusterConnectionConfig {
 
 /// Cluster filtering configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ClusterFilteringConfig {
     /// Band filters
     pub bands: Vec<String>,
@@ -702,6 +716,7 @@ pub struct ClusterFilteringConfig {
 
 /// Cluster alert configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ClusterAlertConfig {
     /// Enable visual alerts
     pub visual_alerts: bool,
@@ -744,6 +759,7 @@ pub enum AlertPriority {
 
 /// Alert sound configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AlertSoundConfig {
     /// Sound file for low priority
     pub low_priority_sound: Option<String>,
@@ -763,6 +779,7 @@ pub struct AlertSoundConfig {
 
 /// Web API configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct WebApiConfig {
     /// Enable web API server
     pub enabled: bool,
@@ -788,6 +805,7 @@ pub struct WebApiConfig {
 
 /// API authentication configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ApiAuthConfig {
     /// Authentication required
     pub required: bool,
@@ -834,6 +852,7 @@ pub struct ApiKey {
 
 /// JWT configuration
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct JwtConfig {
     /// JWT secret key (encrypted)
     pub secret_encrypted: String,
@@ -850,6 +869,7 @@ pub struct JwtConfig {
 
 /// CORS configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CorsConfig {
     /// Enable CORS
     pub enabled: bool,
@@ -872,6 +892,7 @@ pub struct CorsConfig {
 
 /// API rate limiting configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ApiRateLimitingConfig {
     /// Enable rate limiting
     pub enabled: bool,
@@ -891,6 +912,7 @@ pub struct ApiRateLimitingConfig {
 
 /// API documentation configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ApiDocumentationConfig {
     /// Enable documentation endpoint
     pub enabled: bool,
@@ -910,6 +932,7 @@ pub struct ApiDocumentationConfig {
 
 /// Proxy configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ProxyConfig {
     /// Enable proxy
     pub enabled: bool,
@@ -952,6 +975,7 @@ pub struct ProxyAuth {
 
 /// TLS/SSL configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TlsConfig {
     /// Verify certificates
     pub verify_certificates: bool,
@@ -994,6 +1018,7 @@ pub struct ClientCertConfig {
 
 /// Rate limiting configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RateLimitingConfig {
     /// Enable rate limiting
     pub enabled: bool,
@@ -1007,6 +1032,7 @@ pub struct RateLimitingConfig {
 
 /// Global rate limiting
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GlobalRateLimit {
     /// Requests per minute
     pub requests_per_minute: u32,
@@ -1033,6 +1059,7 @@ pub struct ServiceRateLimit {
 
 /// Reliability configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ReliabilityConfig {
     /// Connection timeout in seconds
     pub connection_timeout_seconds: u32,
@@ -1052,6 +1079,7 @@ pub struct ReliabilityConfig {
 
 /// Retry configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RetryConfig {
     /// Maximum retry attempts
     pub max_attempts: u32,
@@ -1071,6 +1099,7 @@ pub struct RetryConfig {
 
 /// Circuit breaker configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CircuitBreakerConfig {
     /// Enable circuit breaker
     pub enabled: bool,
@@ -1087,6 +1116,7 @@ pub struct CircuitBreakerConfig {
 
 /// Health check configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct HealthCheckConfig {
     /// Enable health checks
     pub enabled: bool,
@@ -1407,11 +1437,7 @@ impl Default for RateLimitingConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            global: GlobalRateLimit {
-                requests_per_minute: 300,
-                requests_per_hour: 3600,
-                requests_per_day: 86400,
-            },
+            global: GlobalRateLimit::default(),
             services: HashMap::new(),
         }
     }
@@ -1422,25 +1448,53 @@ impl Default for ReliabilityConfig {
         Self {
             connection_timeout_seconds: 30,
             request_timeout_seconds: 60,
-            retry: RetryConfig {
-                max_attempts: 3,
-                base_delay_ms: 1000,
-                max_delay_ms: 10000,
-                backoff_multiplier: 2.0,
-                jitter_factor: 0.1,
-            },
-            circuit_breaker: CircuitBreakerConfig {
-                enabled: true,
-                failure_threshold: 5,
-                success_threshold: 3,
-                timeout_ms: 60000,
-            },
-            health_check: HealthCheckConfig {
-                enabled: true,
-                interval_seconds: 300,
-                timeout_seconds: 10,
-                unhealthy_threshold: 3,
-            },
+            retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            health_check: HealthCheckConfig::default(),
+        }
+    }
+}
+
+impl Default for GlobalRateLimit {
+    fn default() -> Self {
+        Self {
+            requests_per_minute: 300,
+            requests_per_hour: 3600,
+            requests_per_day: 86400,
+        }
+    }
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            base_delay_ms: 1000,
+            max_delay_ms: 10000,
+            backoff_multiplier: 2.0,
+            jitter_factor: 0.1,
+        }
+    }
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            failure_threshold: 5,
+            success_threshold: 3,
+            timeout_ms: 60000,
+        }
+    }
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_seconds: 300,
+            timeout_seconds: 10,
+            unhealthy_threshold: 3,
         }
     }
 }

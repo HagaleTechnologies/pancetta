@@ -324,6 +324,11 @@ pub struct PipelineHealth {
     /// Total top-level process panics caught this session (already existed
     /// as `PANIC_COUNT` in `main.rs`; not previously surfaced to the TUI).
     pub wdt_panic_count: u64,
+    /// PAN-114: `Some(offset_s)` only while the coordinator's clock-skew
+    /// monitor is warning (|offset| ≥ 0.3 s vs pool.ntp.org); `None` while
+    /// the first probe is pending, the server is unreachable, or the clock
+    /// is in spec. Positive = local clock behind UTC (SLOW).
+    pub clock_skew_warning_s: Option<f64>,
 }
 
 /// Per-QSO entry for the QSO-detail panel. Batch 94: populated live

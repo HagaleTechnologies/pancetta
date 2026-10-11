@@ -1,7 +1,8 @@
-# GENERATED FILE - do not edit by hand.
-# This is the full pancetta configuration schema with every default value,
-# serialized from Config::default() (the runtime source of truth; the loader
-# never reads this file). Annotated key documentation: docs/CONFIG.md.
+# Full pancetta configuration schema with every default value — you only need the keys you change.
+# Generated from Config::default(), the runtime source of truth; any key you
+# leave out of your config keeps the default shown here. Annotated key
+# documentation: docs/CONFIG.md. (In the repo, pancetta-config/defaults.toml is
+# generated and never read by the loader; do not edit it by hand.)
 # Regenerate: PANCETTA_REGEN_DOCS=1 cargo test -p pancetta-config --test defaults_drift
 
 [audio]

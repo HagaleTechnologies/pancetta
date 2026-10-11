@@ -8,13 +8,42 @@ This document covers the keys you'll actually touch, with explanations.
 The complete schema — every section, every key, every default — is
 [`pancetta-config/defaults.toml`](../pancetta-config/defaults.toml),
 which is **generated from the code's `Config::default()`** and
-drift-tested in CI, so it can't lie. Any key you don't set in your user
-config keeps its default value from there.
+drift-tested in CI, so it can't lie. Every table only needs the keys you
+change; anything you leave out keeps its default. A misspelled key is
+reported as a warning at startup and by `pancetta config --validate`.
 
 > **Security:** the config file is plaintext on disk. If you set any
 > integration password (LoTW, eQSL, Clublog, QRZ), `chmod 600` the file
 > and don't commit it. See [`SECURITY.md`](../SECURITY.md) for the full
 > threat model.
+
+---
+
+## Where pancetta looks for its config
+
+With `--config <path>`, pancetta reads exactly that file and nothing else.
+Without it, pancetta checks these directories in order, and in each one it
+uses the first of `pancetta.toml`, `config.toml`, `pancetta.json`,
+`config.json` that exists:
+
+| # | Linux | macOS | Windows |
+|---|---|---|---|
+| 1 | current directory | current directory | current directory |
+| 2 | `$XDG_CONFIG_HOME/pancetta` (only when set to something other than `~/.config`) | `~/Library/Application Support/pancetta` | `%APPDATA%\pancetta` |
+| 3 | `/etc/pancetta` | `/etc/pancetta` | `%APPDATA%\Pancetta` |
+| 4 | `/usr/local/etc/pancetta` | `/usr/local/etc/pancetta` | — |
+| 5 | `~/.pancetta` | `~/.pancetta` | `%USERPROFILE%\.pancetta` |
+| 6 | `~/.config/pancetta` | `~/.config/pancetta` | `%USERPROFILE%\.config\pancetta` |
+
+Every file found is loaded, and later rows override earlier ones. The
+override is per file, not per key: a later file's defaults also replace
+most values an earlier file set, even in sections the later file never
+mentions. A file that exists but fails to load (syntax error, wrong
+value type, unreadable) stops pancetta with an error naming it; it is
+never silently skipped. Keep
+a single file at `~/.pancetta/pancetta.toml`, and run
+`pancetta config --validate` to see which file(s) were read. A table only
+needs the keys you change; every key you leave out keeps its default.
 
 ---
 
@@ -282,14 +311,14 @@ reputation as "the default-on spotter" — it is **off by default**
 (`PskReporterConfig::default().enabled == false`, verified by
 `test_default_network_config`). Set `enabled = true` to have your local
 copy contribute spots back to the global PSKReporter database, which
-makes you reciprocally visible for spot lookups. A partial block — just
+makes you reciprocally visible for spot lookups. As with every section,
+a partial block is enough:
 ```toml
 [network.psk_reporter]
 enabled = true
 ```
-— is enough; every field falls back to `PskReporterConfig::default()`
-(`#[serde(default)]` at the struct level, #151). See "Customizing
-PSKReporter" below if you want to see or change the other defaults.
+See "Customizing PSKReporter" below if you want to see or change the
+other defaults.
 
 LoTW has no username/password/`base_url` fields — unlike the other
 integrations, pancetta never talks to LoTW's servers directly. It shells
@@ -336,11 +365,10 @@ base_url           = "https://cqdx.io"   # not actually optional to omit — see
 poll_interval_secs = 30      # how often to poll for new priority spots
 ```
 
-> Like `psk_reporter`, `CqdxConfig` falls back to
-> `CqdxConfig::default()` for any field you omit (#151) — a partial
-> table (just `enabled`/`token`) works fine. The values shown above ARE
-> the real defaults, so copying this block verbatim and only changing
-> `token` is equally safe if you'd rather see everything explicitly.
+> As with every section, a partial table (just `enabled`/`token`) works
+> fine. The values shown above ARE the real defaults, so copying this
+> block verbatim and only changing `token` is equally safe if you'd
+> rather see everything explicitly.
 
 | Key | Service | Notes |
 |---|---|---|

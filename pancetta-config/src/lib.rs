@@ -117,6 +117,31 @@ pub enum ConfigError {
 
     #[error("Missing required configuration: {0}")]
     MissingRequired(String),
+
+    /// A config file that exists failed to load (syntax error, wrong type,
+    /// unreadable). Always fatal (PAN-90): pancetta never silently runs on
+    /// defaults in place of a file the operator wrote. The inner error is
+    /// named `reason`, not `source`, so `anyhow` doesn't print it twice.
+    #[error("config file {} failed to load: {reason}", path.display())]
+    FileLoad {
+        path: PathBuf,
+        reason: Box<ConfigError>,
+    },
+}
+
+/// What a configuration load actually read (PAN-90), so
+/// `pancetta config --validate` can say "my file parsed" rather than only
+/// "the effective config validates".
+#[derive(Debug, Clone, Default)]
+pub struct LoadReport {
+    /// Config files read, in merge order (later entries override earlier
+    /// ones). Empty when no config file was found.
+    pub files: Vec<PathBuf>,
+    /// Directories searched, lowest to highest precedence. Empty for an
+    /// explicit `--config` file.
+    pub searched: Vec<PathBuf>,
+    /// Non-fatal load warnings (unknown sections/keys, ...).
+    pub warnings: Vec<String>,
 }
 
 /// Result type for configuration operations
@@ -180,17 +205,27 @@ pub struct Config {
 
 /// Configuration metadata for tracking and debugging
 #[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Field-level `#[serde(default)]` (not a container default, and no `Default`
+/// impl) so a partial `[metadata]` table from an old example file parses
+/// instead of failing the load (PAN-90). `Config` itself deliberately has no
+/// container default: `Config::default()` mints a random `instance_id`, and a
+/// file without `[metadata]` must keep deserializing to `metadata: None`.
 pub struct ConfigMetadata {
     /// Configuration schema version
+    #[serde(default)]
     pub version: String,
 
     /// When this configuration was last modified
+    #[serde(default)]
     pub last_modified: Option<chrono::DateTime<chrono::Utc>>,
 
     /// Source files that contributed to this configuration
+    #[serde(default)]
     pub sources: Vec<PathBuf>,
 
-    /// Unique identifier for this configuration instance
+    /// Unique identifier for this configuration instance (nil when omitted)
+    #[serde(default)]
     pub instance_id: uuid::Uuid,
 }
 
@@ -237,16 +272,52 @@ impl Config {
     }
 
     /// Load configuration using the default search paths and hierarchy,
-    /// additionally returning any non-fatal load warnings (e.g. a config file
-    /// that existed but failed to parse and was skipped, silently reverting
-    /// its settings to defaults). The caller should surface these to the
-    /// operator so a partial/broken config is never invisible. A clean load
-    /// returns an empty warnings vec.
+    /// additionally returning any non-fatal load warnings (e.g. an unknown
+    /// section or key). The caller should surface these to the operator so a
+    /// typo is never invisible. A clean load returns an empty warnings vec.
+    /// A discovered config file that fails to load is an error
+    /// ([`ConfigError::FileLoad`]), never a warning.
     pub fn load_default_with_warnings() -> ConfigResult<(Self, Vec<String>)> {
         let loader = ConfigLoader::new()?;
         let config = loader.load()?;
         let warnings = loader.load_warnings();
         Ok((config, warnings))
+    }
+
+    /// Discover and merge the config files on the default search path
+    /// WITHOUT running [`validate`](Self::validate): `pancetta config
+    /// --validate` needs the report even when validation then fails. A file
+    /// that exists but fails to load is fatal ([`ConfigError::FileLoad`]).
+    pub fn load_default_unvalidated() -> ConfigResult<(Self, LoadReport)> {
+        let loader = ConfigLoader::new()?;
+        let config = loader.load_merged()?;
+        let report = LoadReport {
+            files: loader.loaded_files(),
+            searched: loader.search_paths().to_vec(),
+            warnings: loader.load_warnings(),
+        };
+        Ok((config, report))
+    }
+
+    /// Load exactly one explicit config file (no validation), reporting it.
+    /// Parse and IO errors are wrapped in [`ConfigError::FileLoad`] so the
+    /// caller can name the failing file.
+    pub fn load_from_file_with_report<P: AsRef<std::path::Path>>(
+        path: P,
+    ) -> ConfigResult<(Self, LoadReport)> {
+        let path = path.as_ref();
+        let wrap = |e: ConfigError| ConfigError::FileLoad {
+            path: path.to_path_buf(),
+            reason: Box::new(e),
+        };
+        let loader = ConfigLoader::new().map_err(wrap)?;
+        let config = loader.load_from_file(path).map_err(wrap)?;
+        let report = LoadReport {
+            files: vec![path.to_path_buf()],
+            searched: Vec::new(),
+            warnings: loader.load_warnings(),
+        };
+        Ok((config, report))
     }
 
     /// Load configuration from a specific file
@@ -415,18 +486,295 @@ impl Config {
         Ok(())
     }
 
+    /// Header of [`Config::defaults_toml`]: reads correctly both as the
+    /// checked-in `pancetta-config/defaults.toml` and as the output of
+    /// `pancetta config --generate`.
+    const DEFAULTS_TOML_HEADER: &'static str = "\
+# Full pancetta configuration schema with every default value — you only need the keys you change.
+# Generated from Config::default(), the runtime source of truth; any key you
+# leave out of your config keeps the default shown here. Annotated key
+# documentation: docs/CONFIG.md. (In the repo, pancetta-config/defaults.toml is
+# generated and never read by the loader; do not edit it by hand.)
+# Regenerate: PANCETTA_REGEN_DOCS=1 cargo test -p pancetta-config --test defaults_drift
+";
+
+    /// The full configuration schema with every default value, as
+    /// header-annotated TOML with deterministic key order and no
+    /// `[metadata]` block. This is exactly `pancetta-config/defaults.toml`
+    /// (drift-tested) and what `pancetta config --generate` writes.
+    pub fn defaults_toml() -> String {
+        // metadata carries a fresh uuid + timestamp per construction — per-run
+        // noise, not schema. Config's serde skips it when None.
+        let cfg = Config {
+            metadata: None,
+            ..Default::default()
+        };
+        let table =
+            Self::stable_toml_table(&cfg).expect("Config::default() must convert to a TOML table");
+        let body = toml::to_string_pretty(&table).expect("Config must serialize to TOML");
+        format!("{}\n{}", Self::DEFAULTS_TOML_HEADER, body)
+    }
+
+    /// Write [`defaults_toml`](Self::defaults_toml) to `path` (`pancetta
+    /// config --generate`) the way [`save_to_file`](Self::save_to_file)
+    /// writes: owner-only, atomic, creating missing parent directories.
+    /// Operators add credentials to this file next.
+    pub fn save_defaults_toml<P: AsRef<std::path::Path>>(path: P) -> ConfigResult<()> {
+        Self::write_secure_atomic(path.as_ref(), &Self::defaults_toml())
+    }
+
+    /// `config` (metadata excluded) as a `toml::Table` with deterministic
+    /// key order.
+    ///
+    /// Routed through `toml::Value` (not `toml::to_string_pretty(&cfg)`
+    /// directly): `Config::ui::keyboard::shortcuts` is a
+    /// `HashMap<String, KeyboardShortcut>` (src/ui.rs); serde's std-HashMap
+    /// `Serialize` impl iterates in the map's own randomized-hasher order, so
+    /// serializing the struct straight to TOML text renders that one table's
+    /// key order differently on every process run. `toml::map::Map` (backing
+    /// `Value::Table`; this workspace does not enable the `toml` crate's
+    /// `preserve_order` feature) is BTreeMap-backed, so bouncing through
+    /// `Value` sorts every table's keys deterministically.
+    fn stable_toml_table(config: &Config) -> ConfigResult<toml::Table> {
+        let mut config = config.clone();
+        config.metadata = None;
+        match toml::Value::try_from(&config) {
+            Ok(toml::Value::Table(t)) => Ok(t),
+            Ok(_) => Err(ConfigError::Validation(
+                "Config did not serialize to a TOML table".to_string(),
+            )),
+            Err(e) => Err(ConfigError::Validation(format!(
+                "Failed to serialize config: {}",
+                e
+            ))),
+        }
+    }
+
+    /// Persist this configuration into `path` WITHOUT rewriting the whole
+    /// file (PAN-90): only keys whose value differs from what the file
+    /// already says are touched, a key the file does not set is added only
+    /// when it differs from the default, and nothing is ever removed. The
+    /// operator's comments, key order and unknown keys survive (edited via
+    /// `toml_edit`), and defaults are not pinned into the file, so later
+    /// default changes still reach the operator. A missing file starts from
+    /// an empty document. An existing file that is not valid TOML is an
+    /// error and is left untouched (the caller decides whether to back it
+    /// up and start fresh).
+    pub fn save_changes_to_file<P: AsRef<std::path::Path>>(&self, path: P) -> ConfigResult<()> {
+        let path = path.as_ref();
+        debug!("Saving configuration changes to: {}", path.display());
+        let not_toml = |e: &dyn std::fmt::Display| {
+            ConfigError::Validation(format!(
+                "existing config at {} is not valid TOML: {}",
+                path.display(),
+                e
+            ))
+        };
+        let (mut doc, current) = match std::fs::read_to_string(path) {
+            Ok(contents) => {
+                let doc = contents
+                    .parse::<toml_edit::DocumentMut>()
+                    .map_err(|e| not_toml(&e))?;
+                let current = contents.parse::<toml::Table>().map_err(|e| not_toml(&e))?;
+                (doc, current)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                (toml_edit::DocumentMut::new(), toml::Table::new())
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let desired = Self::stable_toml_table(self)?;
+        let defaults = Self::stable_toml_table(&Config::default())?;
+        Self::merge_changes(
+            doc.as_item_mut(),
+            &desired,
+            Some(&current),
+            Some(&defaults),
+            "",
+        )?;
+        // Owner-only + atomic (this file holds plaintext credentials).
+        Self::write_secure_atomic(path, &doc.to_string())?;
+        info!("Configuration changes saved to: {}", path.display());
+        Ok(())
+    }
+
+    /// Recursive half of [`Config::save_changes_to_file`]. `doc` is the
+    /// editable table at `table_path`; `current` / `defaults` are what the
+    /// file currently says and the default at the same path. Tables recurse;
+    /// scalars and arrays (including arrays of tables) are leaves.
+    fn merge_changes(
+        doc: &mut toml_edit::Item,
+        desired: &toml::Table,
+        current: Option<&toml::Table>,
+        defaults: Option<&toml::Table>,
+        table_path: &str,
+    ) -> ConfigResult<()> {
+        for (key, want) in desired {
+            let have = current.and_then(|c| c.get(key));
+            let default = defaults.and_then(|d| d.get(key));
+            let path = if table_path.is_empty() {
+                key.clone()
+            } else {
+                format!("{table_path}.{key}")
+            };
+            if let toml::Value::Table(want_table) = want {
+                // Nothing to write below a table the file doesn't have and
+                // whose content is all-default.
+                if have.is_none() && default == Some(want) {
+                    continue;
+                }
+                let child = Self::edit_table_at(doc, &[key.as_str()], table_path)?;
+                Self::merge_changes(
+                    child,
+                    want_table,
+                    have.and_then(|v| v.as_table()),
+                    default.and_then(|v| v.as_table()),
+                    &path,
+                )?;
+                continue;
+            }
+            let write = match have {
+                Some(h) => h != want,
+                None => default != Some(want),
+            };
+            if write {
+                let table = doc.as_table_like_mut().ok_or_else(|| {
+                    ConfigError::Validation(format!("[{table_path}] in config is not a table"))
+                })?;
+                Self::set_edit_leaf(table, key, want)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The editable table at `path` below `item`, creating missing tables
+    /// (implicit standard tables, or inline tables inside an inline table).
+    /// `base` names `item` in error messages.
+    fn edit_table_at<'a>(
+        mut item: &'a mut toml_edit::Item,
+        path: &[&str],
+        base: &str,
+    ) -> ConfigResult<&'a mut toml_edit::Item> {
+        let mut name = base.to_string();
+        for key in path {
+            if !name.is_empty() {
+                name.push('.');
+            }
+            name.push_str(key);
+            let inline = item.is_inline_table();
+            let table = item.as_table_like_mut().ok_or_else(|| {
+                ConfigError::Validation(format!(
+                    "[{}] in config is not a table",
+                    name.rsplit_once('.').map_or("", |(p, _)| p)
+                ))
+            })?;
+            if !table.contains_key(key) {
+                let new = if inline {
+                    toml_edit::Item::Value(toml_edit::Value::InlineTable(Default::default()))
+                } else {
+                    let mut t = toml_edit::Table::new();
+                    t.set_implicit(true);
+                    toml_edit::Item::Table(t)
+                };
+                table.insert(key, new);
+            }
+            item = table.get_mut(key).expect("just inserted");
+            if !item.is_table_like() {
+                return Err(ConfigError::Validation(format!(
+                    "[{name}] in config is not a table"
+                )));
+            }
+        }
+        Ok(item)
+    }
+
+    /// Set `key = value` in `table`, keeping an existing value's comments
+    /// (its decor) and the key's position.
+    fn set_edit_leaf(
+        table: &mut dyn toml_edit::TableLike,
+        key: &str,
+        value: &toml::Value,
+    ) -> ConfigResult<()> {
+        let mut wrapper = toml::Table::new();
+        wrapper.insert("v".to_string(), value.clone());
+        let text = toml::to_string(&wrapper)
+            .map_err(|e| ConfigError::Validation(format!("Failed to serialize config: {}", e)))?;
+        let new = text
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| ConfigError::Validation(format!("Failed to serialize config: {}", e)))?
+            .remove("v")
+            .ok_or_else(|| ConfigError::Validation("Failed to serialize config".to_string()))?;
+        let mut new = new;
+        // Tables parsed from the scratch document carry ITS positions; clear
+        // them so they render after their parent in the operator's file.
+        Self::clear_table_positions(&mut new);
+        match table.get_mut(key) {
+            Some(existing) => {
+                if let Some(old) = existing.as_value() {
+                    // Replacing a value (possibly inside an inline table):
+                    // keep it a value (an array of tables becomes an array
+                    // of inline tables) and keep its comments.
+                    let mut new_value = new.into_value().map_err(|_| {
+                        ConfigError::Validation("Failed to serialize config".to_string())
+                    })?;
+                    *new_value.decor_mut() = old.decor().clone();
+                    *existing = toml_edit::Item::Value(new_value);
+                } else {
+                    *existing = new;
+                }
+            }
+            None => {
+                // An inline table's `insert` converts to a value itself.
+                table.insert(key, new);
+            }
+        }
+        Ok(())
+    }
+
+    /// Reset the document position of every standard table in `item`.
+    fn clear_table_positions(item: &mut toml_edit::Item) {
+        match item {
+            toml_edit::Item::Table(table) => {
+                table.set_position(None);
+                for (_, child) in table.iter_mut() {
+                    Self::clear_table_positions(child);
+                }
+            }
+            toml_edit::Item::ArrayOfTables(array) => {
+                for table in array.iter_mut() {
+                    table.set_position(None);
+                    for (_, child) in table.iter_mut() {
+                        Self::clear_table_positions(child);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Read `path` as an editable TOML document (comments and key order
+    /// kept), or an empty document when the file does not exist yet.
+    fn read_edit_doc(path: &std::path::Path) -> ConfigResult<toml_edit::DocumentMut> {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => contents
+                .parse::<toml_edit::DocumentMut>()
+                .map_err(|e| ConfigError::Validation(format!("Failed to parse config: {}", e))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(toml_edit::DocumentMut::new()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Targeted persist of the audio input/output device names into an
     /// existing config TOML, without clobbering unrelated keys.
     ///
     /// Used by the TUI device picker: the operator chooses an output (and
     /// optionally input) device and we write just `[audio] output_device`
-    /// / `input_device` back to `~/.pancetta/pancetta.toml`. We parse the
-    /// file as a generic `toml::Table`, set the two keys under the `audio`
-    /// table, and re-serialize — so every other section/value the operator
-    /// has set is preserved verbatim. `None` arguments are left untouched.
-    /// If the file does not yet exist, a minimal one is created containing
-    /// only the `[audio]` section (the loader fills the rest from
-    /// defaults).
+    /// / `input_device` back to `~/.pancetta/pancetta.toml`. The file is
+    /// edited as a `toml_edit` document, so every other section, value,
+    /// comment and the key order the operator has are preserved verbatim
+    /// (PAN-90). `None` arguments are left untouched. If the file does not
+    /// yet exist, a minimal one is created containing only the `[audio]`
+    /// section (the loader fills the rest from defaults).
     pub fn set_audio_devices_in_file<P: AsRef<std::path::Path>>(
         &self,
         path: P,
@@ -434,52 +782,30 @@ impl Config {
         output_device: Option<&str>,
     ) -> ConfigResult<()> {
         let path = path.as_ref();
-
-        // Load the existing document as a generic table, or start fresh.
-        let mut root: toml::Table = match std::fs::read_to_string(path) {
-            Ok(contents) => contents
-                .parse::<toml::Table>()
-                .map_err(|e| ConfigError::Validation(format!("Failed to parse config: {}", e)))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
-            Err(e) => return Err(e.into()),
-        };
-
-        // Ensure an [audio] table exists.
-        let audio = root
-            .entry("audio".to_string())
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-        let audio_table = audio.as_table_mut().ok_or_else(|| {
-            ConfigError::Validation("[audio] in config is not a table".to_string())
-        })?;
-
+        let mut doc = Self::read_edit_doc(path)?;
+        let audio = Self::edit_table_at(doc.as_item_mut(), &["audio"], "")?
+            .as_table_like_mut()
+            .expect("edit_table_at returns a table");
         if let Some(out) = output_device {
-            audio_table.insert(
-                "output_device".to_string(),
-                toml::Value::String(out.to_string()),
-            );
+            Self::set_edit_leaf(audio, "output_device", &toml::Value::String(out.into()))?;
         }
         if let Some(inp) = input_device {
-            audio_table.insert(
-                "input_device".to_string(),
-                toml::Value::String(inp.to_string()),
-            );
+            Self::set_edit_leaf(audio, "input_device", &toml::Value::String(inp.into()))?;
         }
 
-        let serialized = toml::to_string_pretty(&root)
-            .map_err(|e| ConfigError::Validation(format!("Failed to serialize config: {}", e)))?;
         // Owner-only + atomic — same guarantee as save_to_file, and critically
         // this path (the TUI device picker) previously re-wrote the file at
         // umask default, silently undoing any `chmod 600` the operator applied.
-        Self::write_secure_atomic(path, &serialized)?;
+        Self::write_secure_atomic(path, &doc.to_string())?;
         info!("Audio device selection persisted to: {}", path.display());
         Ok(())
     }
 
     /// Persist a live rig-config switch (model / serial port / baud rate /
     /// PTT method) into the config file at `path`, preserving every other
-    /// key. Mirrors [`Config::set_audio_devices_in_file`]'s targeted-write
-    /// pattern (PAN-59: the operator picks a new rig from the running TUI
-    /// the same way they already pick a new audio device).
+    /// key and comment. Mirrors [`Config::set_audio_devices_in_file`]'s
+    /// targeted-write pattern (PAN-59: the operator picks a new rig from the
+    /// running TUI the same way they already pick a new audio device).
     pub fn set_rig_in_file<P: AsRef<std::path::Path>>(
         &self,
         path: P,
@@ -489,88 +815,58 @@ impl Config {
         ptt_method: crate::rig::PttMethod,
     ) -> ConfigResult<()> {
         let path = path.as_ref();
-
-        let mut root: toml::Table = match std::fs::read_to_string(path) {
-            Ok(contents) => contents
-                .parse::<toml::Table>()
-                .map_err(|e| ConfigError::Validation(format!("Failed to parse config: {}", e)))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
-            Err(e) => return Err(e.into()),
-        };
-
-        let rig = root
-            .entry("rig".to_string())
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-        let rig_table = rig
-            .as_table_mut()
-            .ok_or_else(|| ConfigError::Validation("[rig] in config is not a table".to_string()))?;
-        rig_table.insert("model".to_string(), toml::Value::String(model.to_string()));
-
-        let interface = rig_table
-            .entry("interface".to_string())
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-        let interface_table = interface.as_table_mut().ok_or_else(|| {
-            ConfigError::Validation("[rig.interface] in config is not a table".to_string())
-        })?;
-        interface_table.insert("port".to_string(), toml::Value::String(port.to_string()));
-        interface_table.insert(
-            "baud_rate".to_string(),
-            toml::Value::Integer(baud_rate as i64),
-        );
-
-        let ptt = rig_table
-            .entry("ptt".to_string())
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-        let ptt_table = ptt.as_table_mut().ok_or_else(|| {
-            ConfigError::Validation("[rig.ptt] in config is not a table".to_string())
-        })?;
+        let mut doc = Self::read_edit_doc(path)?;
         let ptt_value = toml::Value::try_from(&ptt_method).map_err(|e| {
             ConfigError::Validation(format!("Failed to serialize PTT method: {}", e))
         })?;
-        ptt_table.insert("method".to_string(), ptt_value);
 
-        let serialized = toml::to_string_pretty(&root)
-            .map_err(|e| ConfigError::Validation(format!("Failed to serialize config: {}", e)))?;
-        Self::write_secure_atomic(path, &serialized)?;
+        let rig = Self::edit_table_at(doc.as_item_mut(), &["rig"], "")?;
+        Self::set_edit_leaf(
+            rig.as_table_like_mut().expect("table"),
+            "model",
+            &toml::Value::String(model.into()),
+        )?;
+        let interface = Self::edit_table_at(rig, &["interface"], "rig")?
+            .as_table_like_mut()
+            .expect("table");
+        Self::set_edit_leaf(interface, "port", &toml::Value::String(port.into()))?;
+        Self::set_edit_leaf(
+            interface,
+            "baud_rate",
+            &toml::Value::Integer(baud_rate as i64),
+        )?;
+        let rig = Self::edit_table_at(doc.as_item_mut(), &["rig"], "")?;
+        let ptt = Self::edit_table_at(rig, &["ptt"], "rig")?
+            .as_table_like_mut()
+            .expect("table");
+        Self::set_edit_leaf(ptt, "method", &ptt_value)?;
+
+        Self::write_secure_atomic(path, &doc.to_string())?;
         info!("Rig configuration persisted to: {}", path.display());
         Ok(())
     }
 
     /// Persist the operator's saved rig-config bookmarks (PAN-61) into the
-    /// config file at `path`, preserving every other key. Writes the WHOLE
-    /// given list every call (replace, not append/diff) — callers always
-    /// pass the full post-mutation list. Mirrors [`Config::set_rig_in_file`]'s
-    /// targeted-write pattern.
+    /// config file at `path`, preserving every other key and comment. Writes
+    /// the WHOLE given list every call (replace, not append/diff) — callers
+    /// always pass the full post-mutation list. Mirrors
+    /// [`Config::set_rig_in_file`]'s targeted-write pattern.
     pub fn set_rig_bookmarks_in_file<P: AsRef<std::path::Path>>(
         &self,
         path: P,
         bookmarks: &[crate::rig::RigBookmark],
     ) -> ConfigResult<()> {
         let path = path.as_ref();
-
-        let mut root: toml::Table = match std::fs::read_to_string(path) {
-            Ok(contents) => contents
-                .parse::<toml::Table>()
-                .map_err(|e| ConfigError::Validation(format!("Failed to parse config: {}", e)))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
-            Err(e) => return Err(e.into()),
-        };
-
-        let rig = root
-            .entry("rig".to_string())
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-        let rig_table = rig
-            .as_table_mut()
-            .ok_or_else(|| ConfigError::Validation("[rig] in config is not a table".to_string()))?;
-
+        let mut doc = Self::read_edit_doc(path)?;
         let bookmarks_value = toml::Value::try_from(bookmarks).map_err(|e| {
             ConfigError::Validation(format!("Failed to serialize rig bookmarks: {}", e))
         })?;
-        rig_table.insert("bookmarks".to_string(), bookmarks_value);
+        let rig = Self::edit_table_at(doc.as_item_mut(), &["rig"], "")?
+            .as_table_like_mut()
+            .expect("table");
+        Self::set_edit_leaf(rig, "bookmarks", &bookmarks_value)?;
 
-        let serialized = toml::to_string_pretty(&root)
-            .map_err(|e| ConfigError::Validation(format!("Failed to serialize config: {}", e)))?;
-        Self::write_secure_atomic(path, &serialized)?;
+        Self::write_secure_atomic(path, &doc.to_string())?;
         info!("Rig bookmarks persisted to: {}", path.display());
         Ok(())
     }
@@ -621,6 +917,29 @@ pub trait ConfigSection: Default + Clone {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    /// PAN-90: the TUI rig picker writes only `[rig.interface] port/baud_rate`
+    /// and `[rig.ptt] method`. Before partial tables parsed, the next load
+    /// failed with `missing field 'data_bits'` (silently replaced by defaults
+    /// at startup); with file-load errors now fatal it would brick startup.
+    #[test]
+    fn set_rig_in_file_on_a_minimal_config_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        std::fs::write(&path, "[station]\ncallsign = \"K1ABC\"\n").unwrap();
+        Config::default()
+            .set_rig_in_file(
+                &path,
+                "FTdx10",
+                "/dev/ttyUSB0",
+                38400,
+                crate::rig::PttMethod::Cat,
+            )
+            .unwrap();
+        let reloaded = Config::load_from_file(&path).unwrap();
+        assert_eq!(reloaded.rig.interface.port, "/dev/ttyUSB0");
+        assert_eq!(reloaded.station.callsign, "K1ABC");
+    }
 
     #[test]
     fn test_default_config() {
@@ -1086,6 +1405,212 @@ mod tests {
         let parsed: toml::Table = written.parse().unwrap();
         let rig = parsed["rig"].as_table().unwrap();
         assert_eq!(rig["bookmarks"].as_array().unwrap().len(), 0);
+    }
+
+    // ---- PAN-90: writes keep the operator's file ----
+
+    fn stable(config: &Config) -> String {
+        toml::to_string_pretty(&Config::stable_toml_table(config).unwrap()).unwrap()
+    }
+
+    fn bookmark(name: &str) -> crate::rig::RigBookmark {
+        crate::rig::RigBookmark {
+            name: name.to_string(),
+            model: "FTdx10".to_string(),
+            port: "/dev/ttyUSB0".to_string(),
+            baud_rate: 38400,
+            ptt_method: crate::rig::PttMethod::Cat,
+        }
+    }
+
+    #[test]
+    fn save_changes_to_new_file_writes_only_non_default_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        let mut config = Config::default();
+        config.station.callsign = "K1ABC".to_string();
+        config.station.grid_square = "FN31".to_string();
+        config.audio.input_device = "USB Audio CODEC".to_string();
+        config.save_changes_to_file(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("[metadata]"), "{text}");
+        let parsed: toml::Table = text.parse().unwrap();
+        let keys: Vec<String> = parsed
+            .iter()
+            .flat_map(|(section, v)| {
+                v.as_table()
+                    .unwrap()
+                    .keys()
+                    .map(move |k| format!("{section}.{k}"))
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "audio.input_device",
+                "station.callsign",
+                "station.grid_square"
+            ],
+            "{text}"
+        );
+        let reloaded = Config::load_from_file(&path).unwrap();
+        assert_eq!(stable(&reloaded), stable(&config));
+    }
+
+    #[test]
+    fn save_changes_preserves_comments_and_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        let original = "# K1ABC home station\n[station]\ncallsign = \"K1ABC\"   # licensed 2019\ngrid_square = \"FN42\"\n\n[custom]\nx = 1\n";
+        std::fs::write(&path, original).unwrap();
+        let mut config = Config::load_from_file(&path).unwrap();
+        config.audio.input_device = "USB Audio CODEC".to_string();
+        config.save_changes_to_file(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with(original), "{text}");
+        assert!(
+            text.contains("[audio]\ninput_device = \"USB Audio CODEC\""),
+            "{text}"
+        );
+        let reloaded = Config::load_from_file(&path).unwrap();
+        assert_eq!(reloaded.audio.input_device, "USB Audio CODEC");
+        assert_eq!(reloaded.station.callsign, "K1ABC");
+    }
+
+    #[test]
+    fn save_changes_updates_an_existing_key_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        std::fs::write(
+            &path,
+            "[station]\ncallsign = \"K1ABC\"   # licensed 2019\ngrid_square = \"FN42\"\n",
+        )
+        .unwrap();
+        let mut config = Config::load_from_file(&path).unwrap();
+        config.station.callsign = "W1XYZ".to_string();
+        config.save_changes_to_file(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text,
+            "[station]\ncallsign = \"W1XYZ\"   # licensed 2019\ngrid_square = \"FN42\"\n"
+        );
+    }
+
+    #[test]
+    fn save_changes_keeps_explicit_default_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        let default_power = StationConfig::default().power_watts;
+        let original = format!("[station]\ncallsign = \"K1ABC\"\npower_watts = {default_power}\n");
+        std::fs::write(&path, &original).unwrap();
+        let mut config = Config::load_from_file(&path).unwrap();
+        config.audio.output_device = "Rig CODEC".to_string();
+        config.save_changes_to_file(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with(&original), "{text}");
+        assert!(text.contains(&format!("power_watts = {default_power}")));
+    }
+
+    #[test]
+    fn save_changes_handles_arrays_of_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        std::fs::write(&path, "# my rigs\n[station]\ncallsign = \"K1ABC\"\n").unwrap();
+        let mut config = Config::load_from_file(&path).unwrap();
+        config.rig.bookmarks = Some(vec![bookmark("Shack"), bookmark("Portable")]);
+        config.save_changes_to_file(&path).unwrap();
+        let reloaded = Config::load_from_file(&path).unwrap();
+        assert_eq!(stable(&reloaded), stable(&config));
+        assert_eq!(reloaded.rig.effective_bookmarks().len(), 2);
+
+        // Changing the list again replaces it whole.
+        config.rig.bookmarks = Some(vec![bookmark("Only")]);
+        config.save_changes_to_file(&path).unwrap();
+        let reloaded = Config::load_from_file(&path).unwrap();
+        assert_eq!(stable(&reloaded), stable(&config));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# my rigs\n"), "{text}");
+    }
+
+    #[test]
+    fn save_changes_rejects_an_unparseable_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        std::fs::write(&path, "[station\n").unwrap();
+        let err = Config::default().save_changes_to_file(&path).unwrap_err();
+        assert!(err.to_string().contains("is not valid TOML"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[station\n");
+    }
+
+    const COMMENTED: &str =
+        "# K1ABC home station\n[station]\ncallsign = \"K1ABC\"   # licensed 2019\n\n[rig]\nmodel = \"FTdx10\"\n";
+
+    #[test]
+    fn set_audio_devices_in_file_preserves_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        std::fs::write(&path, COMMENTED).unwrap();
+        Config::default()
+            .set_audio_devices_in_file(&path, Some("In"), Some("Out"))
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with(COMMENTED), "{text}");
+        let reloaded = Config::load_from_file(&path).unwrap();
+        assert_eq!(reloaded.audio.input_device, "In");
+        assert_eq!(reloaded.audio.output_device, "Out");
+    }
+
+    #[test]
+    fn set_rig_in_file_preserves_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        std::fs::write(&path, COMMENTED).unwrap();
+        Config::default()
+            .set_rig_in_file(
+                &path,
+                "IC-7300",
+                "/dev/ttyUSB1",
+                19200,
+                crate::rig::PttMethod::Vox,
+            )
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.starts_with(
+                "# K1ABC home station\n[station]\ncallsign = \"K1ABC\"   # licensed 2019\n"
+            ),
+            "{text}"
+        );
+        // Section order kept: [station] still before [rig].
+        assert!(text.find("[station]").unwrap() < text.find("[rig]").unwrap());
+        let reloaded = Config::load_from_file(&path).unwrap();
+        assert_eq!(reloaded.rig.model, "IC-7300");
+        assert_eq!(reloaded.rig.interface.port, "/dev/ttyUSB1");
+    }
+
+    #[test]
+    fn set_rig_bookmarks_in_file_preserves_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        std::fs::write(&path, COMMENTED).unwrap();
+        Config::default()
+            .set_rig_bookmarks_in_file(&path, &[bookmark("Shack")])
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with(COMMENTED), "{text}");
+        let reloaded = Config::load_from_file(&path).unwrap();
+        assert_eq!(reloaded.rig.effective_bookmarks().len(), 1);
+    }
+
+    #[test]
+    fn defaults_toml_matches_checked_in_file() {
+        let checked_in =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/defaults.toml")).unwrap();
+        let generated = Config::defaults_toml();
+        assert_eq!(generated, checked_in);
+        assert!(!generated.contains("[metadata]"));
     }
 }
 

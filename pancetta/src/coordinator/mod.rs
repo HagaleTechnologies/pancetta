@@ -19,6 +19,7 @@
 mod audio;
 mod audio_recovery;
 mod autonomous;
+mod clock_monitor;
 mod dsp;
 mod dx_cluster;
 mod effort;
@@ -1147,6 +1148,15 @@ pub struct ApplicationCoordinator {
     /// TUI relay OS thread handle (joined on shutdown)
     tui_relay_handle: Option<std::thread::JoinHandle<()>>,
 
+    /// PAN-114: current clock-skew warning, written by the clock-skew
+    /// monitor task (`clock_monitor.rs`) and read by the TUI relay's 2 s
+    /// `PipelineHealth` tick.
+    clock_skew: crate::clock_skew::ClockSkewShared,
+
+    /// PAN-114: clock-skew monitor task. `None` until `run()` starts it, and
+    /// always `None` under `--replay` / `--wav`. Aborted on shutdown.
+    clock_monitor_handle: Option<JoinHandle<()>>,
+
     /// Current operating frequency in Hz, shared across components.
     /// Updated by the hamlib polling task; read by cqdx.io and PSKReporter
     /// to compute absolute RF frequency from audio offsets.
@@ -1333,6 +1343,14 @@ pub struct ApplicationCoordinator {
     /// on speakers" misconfig). Set by the audio thread once at start; read by
     /// the TUI relay to drive a persistent station-panel badge.
     audio_output_default: Arc<AtomicBool>,
+
+    /// PAN-115 TX hard-mute input: `true` = the audio OUTPUT device is healthy
+    /// **or not monitored** (`--no-audio`, stub audio, replay). The real audio
+    /// thread stores `false` before it starts and only `true` after observing
+    /// output callbacks within the last 2 s (`OutputWatchdog`); it goes `false`
+    /// again on an output stream error, a 2 s callback stall, or the thread
+    /// exiting. Read by `tx_hard_mute_reason`.
+    pub(crate) audio_output_alive: Arc<AtomicBool>,
 
     /// Latched true when the configured audio INPUT device was not found and
     /// capture fell back to another device — RX-side mirror of
@@ -2020,6 +2038,8 @@ impl ApplicationCoordinator {
                 pancetta_qso::CrossSequenceCallCache::default(),
             )),
             tui_relay_handle: None,
+            clock_skew: crate::clock_skew::ClockSkewShared::new(),
+            clock_monitor_handle: None,
             // Initialize to 0 — hamlib will read the actual rig frequency on startup.
             // If hamlib isn't available, the TUI default (14.074) takes over.
             operating_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2080,6 +2100,7 @@ impl ApplicationCoordinator {
             last_audio_timestamp: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_decode_timestamp: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             audio_output_default: Arc::new(AtomicBool::new(false)),
+            audio_output_alive: Arc::new(AtomicBool::new(true)),
             audio_input_fallback: Arc::new(AtomicBool::new(false)),
             audio_reopen_tx: None,
             hamlib_reconnect_tx,
@@ -2387,6 +2408,21 @@ impl ApplicationCoordinator {
         // Start coordinator tasks
         self.start_coordinator_tasks().await?;
 
+        // PAN-114: in-session clock-skew monitor (one SNTP query to
+        // pool.ntp.org 30 s after start, then every 30 min). Never under
+        // `--replay`: no SNTP query leaves a replay. (`--wav` returned above.)
+        if !self.replay_mode() {
+            use crate::clock_skew::{sntp_clock_offset, NTP_SERVER, SNTP_TIMEOUT};
+            self.clock_monitor_handle = Some(clock_monitor::spawn_clock_skew_monitor(
+                self.message_bus.clone(),
+                self.clock_skew.clone(),
+                self.shutdown_signal.clone(),
+                clock_monitor::ClockMonitorSchedule::default(),
+                Arc::new(|| sntp_clock_offset(NTP_SERVER, SNTP_TIMEOUT).map_err(|e| e.to_string())),
+                Arc::new(chrono::Utc::now),
+            ));
+        }
+
         let startup_duration = self.startup_time.elapsed();
         info!(
             "Application startup completed in {:.2}s",
@@ -2394,7 +2430,15 @@ impl ApplicationCoordinator {
         );
 
         // Main application loop
-        self.run_main_loop().await?;
+        let main_loop_result = self.run_main_loop().await;
+
+        // The clock-skew monitor is advisory and holds no resources; stop it
+        // before the component teardown (or an early error return) rather
+        // than waiting out its tick.
+        if let Some(handle) = self.clock_monitor_handle.take() {
+            handle.abort();
+        }
+        main_loop_result?;
 
         // Graceful shutdown
         self.shutdown().await?;
@@ -2475,6 +2519,8 @@ impl ApplicationCoordinator {
     ///   dialing the relay, so replayed decodes are never broadcast to relay
     ///   peers AND no remote peer can send control frames (QSY/QSO actions)
     ///   into a demo process.
+    /// - Clock-skew monitor (`coordinator/clock_monitor.rs`) — not started, so
+    ///   no SNTP query leaves a replay.
     ///
     /// Add new outbound integrations — and any new persistence of a
     /// "completed" contact — to that list rather than inventing a second

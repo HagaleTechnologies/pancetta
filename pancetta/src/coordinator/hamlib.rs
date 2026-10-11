@@ -680,6 +680,164 @@ impl RigConnState {
     }
 }
 
+/// Consecutive failed 500 ms polls before the link counts as lost (5 s).
+pub(crate) const RIG_POLL_FAILED_THRESHOLD: u32 = 10;
+/// First poll-loop redial after this many failed polls (2 s).
+const RIG_REDIAL_FIRST_GAP: u32 = 4;
+/// Redial gap cap, in failed polls (30 s).
+const RIG_REDIAL_MAX_GAP: u32 = 60;
+
+/// What one poll result changed, as reported by [`RigPollHealth::on_poll`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RigPollTransition {
+    /// Nothing changed: still healthy, or still failing.
+    Steady,
+    /// A poll succeeded after at least one failure. `from_polling_failed`
+    /// is `true` when the failures had already reached
+    /// [`RIG_POLL_FAILED_THRESHOLD`] (the link had been reported lost).
+    Recovered { from_polling_failed: bool },
+    /// The failure count just reached [`RIG_POLL_FAILED_THRESHOLD`]. Fires
+    /// once per outage.
+    PollingFailed,
+}
+
+/// PAN-115: the poll loop's failure counting and redial schedule, pulled out of
+/// the spawned task so it can be unit-tested.
+pub(crate) struct RigPollHealth {
+    consecutive_failures: u32,
+    next_redial_at: u32,
+    redial_gap: u32,
+}
+
+impl RigPollHealth {
+    pub(crate) fn new() -> Self {
+        Self {
+            consecutive_failures: 0,
+            next_redial_at: RIG_REDIAL_FIRST_GAP,
+            redial_gap: RIG_REDIAL_FIRST_GAP,
+        }
+    }
+
+    /// Consecutive failed polls so far (0 while healthy).
+    pub(crate) fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
+
+    /// Record one poll result and report the edge it caused, if any.
+    pub(crate) fn on_poll(&mut self, ok: bool) -> RigPollTransition {
+        if ok {
+            let failures = self.consecutive_failures;
+            *self = Self::new();
+            if failures == 0 {
+                RigPollTransition::Steady
+            } else {
+                RigPollTransition::Recovered {
+                    from_polling_failed: failures >= RIG_POLL_FAILED_THRESHOLD,
+                }
+            }
+        } else {
+            self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+            if self.consecutive_failures == RIG_POLL_FAILED_THRESHOLD {
+                RigPollTransition::PollingFailed
+            } else {
+                RigPollTransition::Steady
+            }
+        }
+    }
+
+    /// Call only while the client reports Disconnected. True when a redial is due;
+    /// advancing the schedule (gap doubles, capped at [`RIG_REDIAL_MAX_GAP`]).
+    pub(crate) fn redial_due(&mut self) -> bool {
+        if self.consecutive_failures < self.next_redial_at {
+            return false;
+        }
+        self.next_redial_at = self.consecutive_failures.saturating_add(self.redial_gap);
+        self.redial_gap = (self.redial_gap.saturating_mul(2)).min(RIG_REDIAL_MAX_GAP);
+        true
+    }
+}
+
+#[cfg(test)]
+mod rig_poll_health_tests {
+    use super::*;
+
+    #[test]
+    fn ten_consecutive_failures_report_polling_failed_exactly_once() {
+        let mut h = RigPollHealth::new();
+        for _ in 0..9 {
+            assert_eq!(h.on_poll(false), RigPollTransition::Steady);
+        }
+        assert_eq!(h.on_poll(false), RigPollTransition::PollingFailed);
+        for _ in 0..20 {
+            assert_eq!(h.on_poll(false), RigPollTransition::Steady);
+        }
+    }
+
+    #[test]
+    fn success_after_polling_failed_reports_recovery_from_polling_failed() {
+        let mut h = RigPollHealth::new();
+        for _ in 0..12 {
+            h.on_poll(false);
+        }
+        assert_eq!(
+            h.on_poll(true),
+            RigPollTransition::Recovered {
+                from_polling_failed: true
+            }
+        );
+        assert_eq!(h.on_poll(true), RigPollTransition::Steady);
+    }
+
+    #[test]
+    fn a_short_blip_recovers_without_a_polling_failed_edge() {
+        let mut h = RigPollHealth::new();
+        for _ in 0..3 {
+            assert_eq!(h.on_poll(false), RigPollTransition::Steady);
+        }
+        assert_eq!(
+            h.on_poll(true),
+            RigPollTransition::Recovered {
+                from_polling_failed: false
+            }
+        );
+    }
+
+    #[test]
+    fn steady_success_reports_steady() {
+        let mut h = RigPollHealth::new();
+        assert_eq!(h.on_poll(true), RigPollTransition::Steady);
+        assert_eq!(h.on_poll(true), RigPollTransition::Steady);
+    }
+
+    fn redial_failure_counts(h: &mut RigPollHealth, failures: u32) -> Vec<u32> {
+        let mut due_at = Vec::new();
+        for _ in 0..failures {
+            h.on_poll(false);
+            if h.redial_due() {
+                due_at.push(h.consecutive_failures());
+            }
+        }
+        due_at
+    }
+
+    #[test]
+    fn redial_backs_off_from_two_seconds_to_thirty() {
+        let mut h = RigPollHealth::new();
+        assert_eq!(
+            redial_failure_counts(&mut h, 200),
+            vec![4, 8, 16, 32, 64, 124, 184]
+        );
+    }
+
+    #[test]
+    fn a_successful_poll_resets_the_redial_schedule() {
+        let mut h = RigPollHealth::new();
+        assert_eq!(redial_failure_counts(&mut h, 40), vec![4, 8, 16, 32]);
+        h.on_poll(true);
+        assert_eq!(redial_failure_counts(&mut h, 5), vec![4]);
+    }
+}
+
 impl super::ApplicationCoordinator {
     pub(crate) async fn teardown_hamlib(&mut self) {
         for orphan in self.hamlib_orphans.drain(..) {
@@ -1515,8 +1673,9 @@ impl super::ApplicationCoordinator {
                         hamlib_generation_for_polling,
                     );
                     let mut poll_interval = interval(Duration::from_millis(500));
-                    let mut consecutive_failures: u32 = 0;
-                    const CRASH_WARN_THRESHOLD: u32 = 10; // 5 seconds of failures
+                    // PAN-115: failure counting + redial schedule (5 s to
+                    // PollingFailed; redial 2 s backing off to 30 s).
+                    let mut poll_health = RigPollHealth::new();
                     // C9 dial-poll band-change detection: the frequency this
                     // poll loop last *accepted* as the current dial. Seeded to
                     // the rig's already-read startup frequency so the first poll
@@ -1554,7 +1713,34 @@ impl super::ApplicationCoordinator {
                             &producer_marked_split_id_for_polling,
                         );
 
-                        let poll_ok = if let Ok(status) = rig_for_polling.get_status().await {
+                        // PAN-115: redial a disconnected rigctld from here.
+                        // `get_status()` only reads the client's cached
+                        // `connected` flag; before PAN-115 the only thing that
+                        // reconnected a dropped socket was the TX worker's
+                        // own `SetPtt` (`send_command_with_retry`'s reconnect,
+                        // pancetta-hamlib/src/rigctld.rs). The TX hard mute now
+                        // refuses PTT while the link is `PollingFailed`, so
+                        // without this the link (and TX) would never recover.
+                        let mut status = rig_for_polling.get_status().await;
+                        if rig_enabled
+                            && !matches!(
+                                &status,
+                                Ok(s) if s.connection_state
+                                    == pancetta_hamlib::ConnectionState::Connected
+                            )
+                            && poll_health.redial_due()
+                        {
+                            match rig_for_polling.connect().await {
+                                Ok(()) => {
+                                    info!("Rig CAT redial succeeded");
+                                    status = rig_for_polling.get_status().await;
+                                }
+                                // `connect()` already logs its own error.
+                                Err(e) => debug!("Rig CAT redial failed: {e}"),
+                            }
+                        }
+
+                        let poll_ok = if let Ok(status) = status {
                             if status.connection_state
                                 == pancetta_hamlib::ConnectionState::Connected
                             {
@@ -1715,30 +1901,50 @@ impl super::ApplicationCoordinator {
                             false
                         };
 
-                        if poll_ok {
-                            // Recovered (or steady) — reflect Connected for a
-                            // real rig so a transient blip clears the badge.
-                            if consecutive_failures > 0 && rig_enabled {
-                                rig_conn_state_poll.store(
-                                    RigConnState::Connected.as_u8(),
-                                    Ordering::Relaxed,
-                                );
+                        match poll_health.on_poll(poll_ok) {
+                            RigPollTransition::Steady => {}
+                            RigPollTransition::Recovered {
+                                from_polling_failed,
+                            } => {
+                                // Recovered — reflect Connected for a real rig
+                                // so a transient blip clears the badge (and,
+                                // PAN-115, the TX hard mute).
+                                if rig_enabled {
+                                    rig_conn_state_poll.store(
+                                        RigConnState::Connected.as_u8(),
+                                        Ordering::Release,
+                                    );
+                                    if from_polling_failed {
+                                        info!("Rig CAT connection restored — TX re-enabled");
+                                        super::tx::emit_diagnostic(
+                                            &message_bus,
+                                            "rig.cat",
+                                            pancetta_core::DiagnosticLevel::Info,
+                                            "Rig CAT connection restored — TX re-enabled".into(),
+                                            None,
+                                        )
+                                        .await;
+                                    }
+                                }
                             }
-                            consecutive_failures = 0;
-                        } else {
-                            consecutive_failures += 1;
-                            if consecutive_failures == CRASH_WARN_THRESHOLD {
+                            RigPollTransition::PollingFailed => {
                                 warn!(
                                     "Rig polling has failed {} consecutive times -- rigctld may have crashed. \
                                      Check rigctld process and restart Pancetta if needed.",
-                                    consecutive_failures
+                                    poll_health.consecutive_failures()
                                 );
-                                // Surface the degraded state to the TUI badge.
+                                // Surface the degraded state to the TUI badge
+                                // and (PAN-115) the TX hard mute.
                                 if rig_enabled {
                                     rig_conn_state_poll.store(
                                         RigConnState::PollingFailed.as_u8(),
-                                        Ordering::Relaxed,
+                                        Ordering::Release,
                                     );
+                                    report_rig_error(
+                                        &message_bus,
+                                        "Rig CAT connection lost (no reply for 5 s) — TX inhibited until it reconnects".into(),
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -1869,7 +2075,7 @@ impl super::ApplicationCoordinator {
                         // badge never claims a radio is attached when none is.
                         if rig_enabled {
                             rig_conn_state
-                                .store(RigConnState::Connected.as_u8(), Ordering::Relaxed);
+                                .store(RigConnState::Connected.as_u8(), Ordering::Release);
                         }
                         // Read the rig's current frequency immediately so we start
                         // on whatever band the radio is already tuned to, rather
@@ -1890,7 +2096,7 @@ impl super::ApplicationCoordinator {
                     }
                     Err(e) => {
                         error!("Failed to connect to rig: {}. Continuing without.", e);
-                        rig_conn_state.store(RigConnState::NotConnected.as_u8(), Ordering::Relaxed);
+                        rig_conn_state.store(RigConnState::NotConnected.as_u8(), Ordering::Release);
                         if rig_enabled {
                             report_rig_error(
                                 &message_bus_for_connect,
@@ -6044,6 +6250,10 @@ mod teardown_replay_tests {
                 &no_pending_frequency,
                 &pending_split,
                 &not_in_flight,
+                &Arc::new(std::sync::atomic::AtomicU8::new(
+                    RigConnState::Connected.as_u8()
+                )),
+                &Arc::new(std::sync::atomic::AtomicBool::new(true)),
             )
             .is_some(),
             "PTT must stay refused while the pending slot a failed CAT command repopulated is \

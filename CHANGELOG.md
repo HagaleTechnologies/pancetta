@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- In-session clock-skew monitor (PAN-114): a live session (TUI or
+  `--headless`; never `--replay`/`--wav`) sends one SNTP query to
+  pool.ntp.org 30 s after start and then every 30 minutes, plus one re-check
+  after a detected clock step (never sooner than 30 minutes after the last
+  query, per the NTP pool's SNTP client terms). When the system clock is
+  0.3 s or more off UTC — FT8's decode margin — the title bar shows
+  `⚠ CLOCK 0.42s SLOW` (or `FAST`) in the alarm slot, after `AUDIO DEAD` and
+  `DECODER STUB`, and Diagnostics (Shift+D) plus the headless console log a
+  `clock.skew` Warn with the per-OS NTP fix. Sleep/wake and NTP steps log a
+  `clock.step` entry and clear the chip until the next reading.
+  `pancetta doctor` now reports WARN (exit code unchanged) for offsets from
+  0.3 s to under 1.0 s, which it used to PASS.
+
 - Adaptive TX-offset switching (PAN-72): in `AUTO` TX-frequency mode, an
   in-progress QSO that goes `[autonomous] qso_stall_switch_after` slots (default
   4) without the DX advancing — **silence now counts, not just a repeated
@@ -72,14 +85,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Saved rig-config bookmarks (PAN-61): the `i` rig picker can now save the current model/port/baud/PTT as a named bookmark (`F3`) and load one back into the form later (`F2`), without retyping. Builds on PAN-59's live rig-config switch.
 
+
 ### Fixed
 
 - Ctrl/Alt chords no longer trigger transmit keys at the main view (PAN-112).
   Ctrl+C previously started a CQ because crossterm reports it as `c` with a
   separate modifier. The same guard now covers PTT, autonomous mode, TX policy,
-  re-send, Space-to-call, tune, Fox and Hound, plus Enter-to-reply on Callers
-  where the terminal reports the modifier (legacy Unix terminals send Ctrl+Enter
-  as a plain Enter). Bare and Shift bindings still work.
+  re-send, the `u` offset nudge (which re-keys the current frame in Auto
+  TX-frequency mode), Space-to-call, tune, Fox and Hound, plus Enter-to-reply
+  on Callers where the terminal reports the modifier (legacy Unix terminals
+  send Ctrl+Enter as a plain Enter). Bare and Shift bindings still work.
+
+- Slot timing stays on UTC across clock steps and sleep/wake (PAN-114). After
+  a backward clock step (e.g. NTP correcting a fast RTC), the autonomous
+  scheduler and the decoder re-anchor to the UTC slot grid within one slot
+  instead of stalling for the size of the step (a 10-minute step meant 10
+  minutes with no decisions and no decodes). A frame waiting for PTT across a
+  clock jump is dropped with a `tx.policy` "dropping stale TX after a … clock
+  jump" entry instead of being keyed seconds late, holding PTT for the length
+  of the step, or being skipped as an "internal scheduling error"; PTT is
+  never held more than `ptt_lead_ms` + 1 s before the slot boundary. After
+  sleep/wake, decodes and audio from before the sleep are discarded rather
+  than answered or spotted.
+
+- Autonomous and manual TX no longer key the rig while the rig's CAT link is
+  lost or the audio output device has stopped delivering samples (PAN-115).
+  The TX gate reports `rig is disconnected` (after 5 s of failed rig polls) or
+  `audio output device is dead` (on an output stream error or 2 s without an
+  output callback), and TX resumes on its own once the link or device
+  recovers. The rig poll loop now redials rigctld itself (2 s backing off to
+  30 s), so the RIG badge also recovers without a transmission. New `rig.cat`
+  and `audio.health` diagnostics mark each loss and recovery.
+
+- Every documented minimal config block now parses on its own (PAN-90): the
+  README's `[autonomous] enabled = true`, both GUIDE.md GridTracker
+  `[network.wsjtx_udp]` recipes, and CONFIG.md's minimum viable config used
+  to fail with `missing field …`. Every config table now accepts a partial
+  table; omitted keys keep their documented defaults.
+- A broken config file no longer silently runs the station on all-default
+  settings (callsign N0CALL): `pancetta config --validate` exits non-zero on a
+  file that fails to load, prints which file(s) it read, and never opens the
+  first-run wizard.
+- Load warnings for an explicit `--config` file now reach the console and the
+  TUI diagnostics list.
+- The TUI rig picker no longer writes a config file that fails to load on the
+  next start (`missing field 'data_bits'`).
+- Shift+Q emergency stop now works while a dialog or overlay is open
+  (PAN-113). Every modal's key handler swallowed keys it didn't use, so the
+  stop did nothing while quit-confirm, the out-of-band warning, help,
+  Diagnostics, Station Health, Recent QSOs, the audio or rig picker, the
+  frequency or TX-offset entry, or the composer was up. The stop is now
+  checked before any modal and leaves the open dialog as it was. In the
+  composer and the rig picker's text fields, Shift+Q (or Caps Lock + q) now
+  stops the station instead of typing a capital Q; lowercase `q` still types
+  Q in the composer.
+
+### Changed
+
+- A config file that exists but fails to load now stops startup with an error
+  naming the file, instead of being skipped with a warning. Run
+  `pancetta config --validate` to find the broken line.
+- Unknown config keys are now warned about at any depth (e.g. `enable` in
+  `[network.wsjtx_udp]`), not only unknown top-level sections.
+- The config search path is deduplicated (`~/.config/pancetta` was read twice
+  on Linux) and documented in docs/CONFIG.md.
+- `pancetta setup` and the first-run wizard now write only the keys you
+  changed, merged into your existing file with its comments kept, instead of
+  replacing it with the full ~960-line schema. A file that does not load, or
+  that the startup recovery prompt rewrites from defaults, is kept as
+  `pancetta.toml.bak` (or the next free `pancetta.toml.bak.N`) before a fresh
+  one is written. The TUI device
+  and rig pickers also keep comments and section order.
+- `pancetta config --generate` writes the same header-annotated schema as
+  `pancetta-config/defaults.toml`, without a random `[metadata]` block.
+
+### Removed
+
+- `pancetta-config/examples/config.toml`: unreferenced, did not parse, and
+  duplicated the generated, drift-tested `pancetta-config/defaults.toml`.
 
 ## [0.9.6] - 2026-09-02
 

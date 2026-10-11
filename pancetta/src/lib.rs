@@ -26,6 +26,7 @@
 #![allow(missing_docs)] // TODO: documentation pass pending — see CONTRIBUTING.md
 #![allow(dead_code, unused_imports)]
 
+pub mod clock_skew;
 pub mod coordinator;
 pub mod cqdx_bridge;
 pub mod message_bus;

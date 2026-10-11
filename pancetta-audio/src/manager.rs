@@ -322,6 +322,14 @@ impl AudioManager {
         self.shared.dropped_samples()
     }
 
+    /// PAN-115: how many times the cpal output callback has run since the
+    /// current stream was opened. Re-reads the current stream's shared state,
+    /// so it stays correct across [`reopen_devices`](Self::reopen_devices);
+    /// the count restarts at 0 on each reopen.
+    pub fn output_callback_count(&self) -> u64 {
+        self.shared.output_callbacks()
+    }
+
     /// RX sample drop rate as a percentage of (dropped + processed) since the
     /// current stream was opened. See [`dropped_samples`](Self::dropped_samples).
     pub fn drop_rate_percent(&self) -> f64 {
@@ -801,6 +809,13 @@ mod tests {
             // when flush_first is set, so by the time this call returns the
             // buffer holds only the new 2 samples, not 4+2.
             assert_eq!(manager.output_producer_occupied_len(), 2);
+        }
+    }
+
+    #[test]
+    fn output_callback_count_delegates_to_shared_state() {
+        if let Ok(manager) = AudioManager::new() {
+            assert_eq!(manager.output_callback_count(), 0);
         }
     }
 

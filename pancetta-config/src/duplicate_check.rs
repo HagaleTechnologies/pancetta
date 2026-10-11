@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 /// Duplicate-QSO checking: refuse to call a station already worked recently.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DuplicateCheckingConfig {
     /// Enable duplicate checking. When false, pancetta will happily call the
     /// same station again immediately.

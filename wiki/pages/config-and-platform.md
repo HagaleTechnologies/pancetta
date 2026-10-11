@@ -32,3 +32,9 @@ that a new field gets a merge line — this class of bug can recur; add the
 effort→budget mapping (`effort.rs`) are normative in the digest and code — cited,
 not restated. Two known limitations (S3 escalation ordering; hot-reload does not
 re-seed the effort budget) are documented there.
+
+Second gotcha (PAN-90): **a new config struct needs container-level
+`#[serde(default)]` and a `Default` impl**, or `pancetta-config/tests/partial_tables.rs`
+fails — every table must accept a partial table. Record/map entry types are the
+only allowlisted exceptions. Config snippets added to `README.md` or top-level
+`docs/*.md` are loaded by `tests/docs_snippets.rs` and must parse with zero warnings.

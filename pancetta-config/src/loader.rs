@@ -78,10 +78,47 @@ pub struct ConfigLoader {
     /// Cache for parsed configurations
     config_cache: Arc<Mutex<HashMap<PathBuf, (SystemTime, Config)>>>,
 
-    /// Human-readable warnings accumulated during the last `load()` (e.g. a
-    /// config file that failed to parse and was skipped). Surfaced to the
-    /// operator (console + TUI) so a silent revert-to-defaults is visible.
+    /// Human-readable warnings accumulated during the last `load()` (e.g. an
+    /// unknown section or key, or a non-file source that failed). Surfaced to
+    /// the operator (console + TUI) so a typo is never invisible. A config
+    /// FILE that fails to load is an error, not a warning (PAN-90).
     load_warnings: Arc<Mutex<Vec<String>>>,
+
+    /// Config files actually read by the last `load()`, in merge order
+    /// (later entries override earlier ones). Reported by
+    /// `pancetta config --validate` so the operator can see which file(s)
+    /// took effect.
+    loaded_files: Arc<Mutex<Vec<PathBuf>>>,
+}
+
+/// Remove repeated paths, keeping each path's LAST occurrence (PAN-90).
+///
+/// On Linux `dirs::config_dir()` is `~/.config`, so `~/.config/pancetta`
+/// appears twice in the default search list and an existing file there was
+/// parsed twice. Keeping the last occurrence preserves today's effective
+/// precedence (that directory stays highest).
+pub fn dedup_keep_last(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::with_capacity(paths.len());
+    for (i, p) in paths.iter().enumerate() {
+        if !paths[i + 1..].contains(p) {
+            out.push(p.clone());
+        }
+    }
+    out
+}
+
+/// The shape of a raw JSON config as a TOML value, for the unknown-key
+/// sweep: objects and arrays keep their keys and positions, and every scalar
+/// (including `null`, which TOML lacks) becomes a placeholder, since the
+/// sweep never reads scalar values.
+fn json_shape(value: &serde_json::Value) -> toml::Value {
+    match value {
+        serde_json::Value::Object(o) => {
+            toml::Value::Table(o.iter().map(|(k, v)| (k.clone(), json_shape(v))).collect())
+        }
+        serde_json::Value::Array(a) => toml::Value::Array(a.iter().map(json_shape).collect()),
+        _ => toml::Value::Boolean(false),
+    }
 }
 
 /// Configuration source definition
@@ -167,6 +204,7 @@ impl ConfigLoader {
             reload_callback: Arc::new(Mutex::new(None)),
             config_cache: Arc::new(Mutex::new(HashMap::new())),
             load_warnings: Arc::new(Mutex::new(Vec::new())),
+            loaded_files: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -181,6 +219,7 @@ impl ConfigLoader {
             reload_callback: Arc::new(Mutex::new(None)),
             config_cache: Arc::new(Mutex::new(HashMap::new())),
             load_warnings: Arc::new(Mutex::new(Vec::new())),
+            loaded_files: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -218,7 +257,30 @@ impl ConfigLoader {
             paths.push(home_dir.join(".config").join("pancetta"));
         }
 
-        Ok(paths)
+        Ok(dedup_keep_last(paths))
+    }
+
+    /// The directories this loader searches, lowest to highest precedence.
+    pub fn search_paths(&self) -> &[PathBuf] {
+        &self.search_paths
+    }
+
+    /// Config files read by the last [`load`](Self::load) /
+    /// [`load_merged`](Self::load_merged), in merge order (later wins).
+    /// Empty when no config file was found.
+    pub fn loaded_files(&self) -> Vec<PathBuf> {
+        self.loaded_files
+            .lock()
+            .map(|f| f.clone())
+            .unwrap_or_default()
+    }
+
+    /// Emit a `warn!` line and record an operator-facing load warning.
+    fn push_load_warning(&self, message: String) {
+        warn!("{message}");
+        if let Ok(mut wlist) = self.load_warnings.lock() {
+            wlist.push(message);
+        }
     }
 
     /// Add a configuration source
@@ -230,72 +292,7 @@ impl ConfigLoader {
 
     /// Load configuration from all sources using hierarchical merging
     pub fn load(&self) -> ConfigResult<Config> {
-        debug!("Loading configuration from all sources");
-
-        // Fresh warning slate for this load.
-        if let Ok(mut w) = self.load_warnings.lock() {
-            w.clear();
-        }
-
-        // Start with default configuration
-        let mut config = Config::default();
-
-        // If no sources are configured, use default search
-        let sources = if self.sources.is_empty() {
-            self.discover_sources()?
-        } else {
-            self.sources.clone()
-        };
-
-        // Load and merge configurations in priority order (lowest to highest)
-        let mut sorted_sources = sources.clone();
-        sorted_sources.sort_by(|a, b| a.priority.cmp(&b.priority));
-
-        for source in &sorted_sources {
-            match self.load_source(source) {
-                Ok(source_config) => {
-                    debug!("Loaded configuration from source: {}", source.name);
-                    config.merge_with(source_config);
-                }
-                Err(e) => {
-                    if source.required {
-                        error!(
-                            "Failed to load required configuration source '{}': {}",
-                            source.name, e
-                        );
-                        return Err(e);
-                    } else if matches!(
-                        e,
-                        ConfigError::FileNotFound(_) | ConfigError::SourceSkipped(_)
-                    ) {
-                        // A missing optional file, or an intentionally-inactive
-                        // source (CLI handled in main.rs; no PANCETTA_* env vars),
-                        // is normal — stay quiet. These are NOT parse failures and
-                        // must not raise the operator-facing "failed to parse"
-                        // warning below.
-                        debug!(
-                            "Skipped optional configuration source '{}': {}",
-                            source.name, e
-                        );
-                    } else {
-                        // The file EXISTS but failed to parse/validate. This is the
-                        // silent-revert-to-defaults trap: warn loudly AND record a
-                        // human-readable warning the caller can surface (console + TUI).
-                        warn!(
-                            "Config source '{}' failed to load — IGNORING it and using \
-                             defaults for its settings: {}",
-                            source.name, e
-                        );
-                        if let Ok(mut wlist) = self.load_warnings.lock() {
-                            wlist.push(format!(
-                                "Config '{}' failed to parse — using defaults for it ({})",
-                                source.name, e
-                            ));
-                        }
-                    }
-                }
-            }
-        }
+        let (mut config, sources) = self.load_merged_with_sources()?;
 
         // Validate the final configuration
         config.validate()?;
@@ -319,9 +316,112 @@ impl ConfigLoader {
         Ok(config)
     }
 
-    /// Warnings accumulated during the last [`load`](Self::load) call (e.g. a
-    /// config file that existed but failed to parse and was skipped, so its
-    /// settings silently reverted to defaults). Empty on a clean load.
+    /// Discover and merge every source WITHOUT running `validate()`.
+    ///
+    /// `pancetta config --validate` needs to report which file(s) were read
+    /// even when validation then fails. A config file that exists but fails
+    /// to load is fatal ([`ConfigError::FileLoad`] naming the file); only
+    /// non-file sources keep the warn-and-continue path.
+    pub fn load_merged(&self) -> ConfigResult<Config> {
+        self.load_merged_with_sources().map(|(config, _)| config)
+    }
+
+    fn load_merged_with_sources(&self) -> ConfigResult<(Config, Vec<ConfigSource>)> {
+        debug!("Loading configuration from all sources");
+
+        // Fresh warning slate and file list for this load.
+        if let Ok(mut w) = self.load_warnings.lock() {
+            w.clear();
+        }
+        if let Ok(mut f) = self.loaded_files.lock() {
+            f.clear();
+        }
+
+        // Start with default configuration
+        let mut config = Config::default();
+
+        // If no sources are configured, use default search
+        let sources = if self.sources.is_empty() {
+            self.discover_sources()?
+        } else {
+            self.sources.clone()
+        };
+
+        // Load and merge configurations in priority order (lowest to highest)
+        let mut sorted_sources = sources.clone();
+        sorted_sources.sort_by_key(|a| a.priority);
+
+        for source in &sorted_sources {
+            match self.load_source(source) {
+                Ok(source_config) => {
+                    debug!("Loaded configuration from source: {}", source.name);
+                    // Report real config files only; the built-in
+                    // "defaults" source is not an operator file.
+                    if matches!(source.source_type, SourceType::Toml | SourceType::Json)
+                        && source.name != "defaults"
+                        && source.path.exists()
+                    {
+                        if let Ok(mut f) = self.loaded_files.lock() {
+                            f.push(source.path.clone());
+                        }
+                    }
+                    config.merge_with(source_config);
+                }
+                Err(e) if source.required => {
+                    error!(
+                        "Failed to load required configuration source '{}': {}",
+                        source.name, e
+                    );
+                    return Err(e);
+                }
+                Err(e)
+                    if matches!(
+                        e,
+                        ConfigError::FileNotFound(_) | ConfigError::SourceSkipped(_)
+                    ) =>
+                {
+                    // A missing optional file, or an intentionally-inactive
+                    // source (CLI handled in main.rs; no PANCETTA_* env vars),
+                    // is normal — stay quiet. These are NOT load failures.
+                    debug!(
+                        "Skipped optional configuration source '{}': {}",
+                        source.name, e
+                    );
+                }
+                Err(e) if matches!(source.source_type, SourceType::Toml | SourceType::Json) => {
+                    // A config FILE that exists but fails to load (syntax
+                    // error, wrong type, unreadable) is fatal (PAN-90). It
+                    // used to be skipped with a warning, so the station
+                    // silently ran on all-default settings (N0CALL) and
+                    // `config --validate` still printed PASS.
+                    error!(
+                        "Config file '{}' failed to load: {}",
+                        source.path.display(),
+                        e
+                    );
+                    return Err(ConfigError::FileLoad {
+                        path: source.path.clone(),
+                        reason: Box::new(e),
+                    });
+                }
+                Err(e) => {
+                    // A non-file source (environment, remote) that failed:
+                    // warn loudly AND record a human-readable warning the
+                    // caller can surface (console + TUI), then continue.
+                    self.push_load_warning(format!(
+                        "Config '{}' failed to parse — using defaults for it ({})",
+                        source.name, e
+                    ));
+                }
+            }
+        }
+
+        Ok((config, sources))
+    }
+
+    /// Warnings accumulated during the last [`load`](Self::load) call (e.g. an
+    /// unknown section or key, or a non-file source that failed and was
+    /// skipped). Empty on a clean load.
     pub fn load_warnings(&self) -> Vec<String> {
         self.load_warnings
             .lock()
@@ -608,11 +708,13 @@ impl ConfigLoader {
         let config: Config = toml::from_str(&expanded_content).map_err(ConfigError::Toml)?;
 
         // Serde silently drops unknown keys, so a misspelled or obsolete
-        // section ([autonomous_operator], [priority_weights], ...) used to be
-        // invisibly inert. Sweep the file's top-level table keys against the
-        // sections Config actually has and record a load-warning for each
+        // section ([autonomous_operator], [priority_weights], ...) or key
+        // (`enabeld`) used to be invisibly inert — and with partial tables
+        // (every omitted key takes its default) a typo would otherwise be a
+        // silent no-op. Sweep the file's keys at every depth against what
+        // Config actually parsed and record a load-warning for each
         // stranger — load_warnings() surfaces these to console + TUI.
-        self.warn_unknown_top_level_keys(&expanded_content);
+        self.warn_unknown_keys(&expanded_content, &config);
 
         Ok(config)
     }
@@ -630,31 +732,66 @@ impl ConfigLoader {
             .unwrap_or_default()
     }
 
-    /// Compare the raw file's top-level table keys against
-    /// [`Self::known_top_level_keys`] and record one load-warning per unknown
-    /// section. Non-fatal by design; a second-parse failure here is
-    /// unreachable in practice (the typed parse already succeeded).
+    /// Compare the raw file's keys against what `Config` understands and
+    /// record one load-warning per unknown key. Top level: unknown sections,
+    /// checked against [`Self::known_top_level_keys`] (so `metadata` stays
+    /// known even when absent). Nested: every key, at any depth, checked
+    /// against `parsed` serialized to JSON — a key serde kept shows up there,
+    /// a key serde dropped does not. Map-valued fields (e.g.
+    /// `ui.keyboard.shortcuts`) carry the user's own keys into `parsed`, so
+    /// they are never reported. Non-fatal by design; a second-parse failure
+    /// here is unreachable in practice (the typed parse already succeeded).
     ///
     /// Uses `toml::Table::from_str` (not `toml::Value::from_str`) — as of the
     /// `toml` 1.x crate, `Value`'s `FromStr` parses a single bare value, not
     /// a whole document, and fails on any multi-table file. `Table::from_str`
     /// parses the full document into its top-level key/value map.
-    fn warn_unknown_top_level_keys(&self, content: &str) {
-        let Ok(table) = content.parse::<toml::Table>() else {
+    fn warn_unknown_keys(&self, content: &str, parsed: &Config) {
+        let Ok(raw) = content.parse::<toml::Table>() else {
             return;
         };
-        let known = Self::known_top_level_keys();
-        for key in table.keys() {
-            if !known.contains(key) {
-                warn!(
-                    "Unknown top-level config section [{key}] — pancetta ignores it. \
-                     Check the spelling against docs/CONFIG.md."
-                );
-                if let Ok(mut wlist) = self.load_warnings.lock() {
-                    wlist.push(format!(
-                        "Unknown config section [{key}] — ignored (check spelling; see docs/CONFIG.md)"
-                    ));
-                }
+        self.warn_unknown_in_table(&raw, parsed);
+    }
+
+    /// Body of [`Self::warn_unknown_keys`] over an already-parsed raw table
+    /// (TOML, or the shape of a JSON document — see [`json_shape`]).
+    fn warn_unknown_in_table(&self, raw: &toml::Table, parsed: &Config) {
+        let known_top = Self::known_top_level_keys();
+        let known = serde_json::to_value(parsed).unwrap_or_default();
+        for (key, value) in raw {
+            if !known_top.contains(key) {
+                self.push_load_warning(format!(
+                    "Unknown config section [{key}] — ignored (check spelling; see docs/CONFIG.md)"
+                ));
+                continue;
+            }
+            if let (toml::Value::Table(t), Some(k)) = (value, known.get(key)) {
+                self.warn_unknown_nested(t, k, key);
+            }
+        }
+    }
+
+    /// Recursive half of [`Self::warn_unknown_keys`]: `raw` is the file's
+    /// table at `[table]`, `known` the parsed config's value at that path.
+    fn warn_unknown_nested(&self, raw: &toml::Table, known: &serde_json::Value, table: &str) {
+        for (key, value) in raw {
+            match known.get(key) {
+                None => self.push_load_warning(format!(
+                    "Unknown config key `{key}` in [{table}] — ignored (check spelling; see docs/CONFIG.md)"
+                )),
+                Some(k) => match (value, k) {
+                    (toml::Value::Table(t), serde_json::Value::Object(_)) => {
+                        self.warn_unknown_nested(t, k, &format!("{table}.{key}"))
+                    }
+                    (toml::Value::Array(items), serde_json::Value::Array(known_items)) => {
+                        for (i, (item, ki)) in items.iter().zip(known_items).enumerate() {
+                            if let toml::Value::Table(t) = item {
+                                self.warn_unknown_nested(t, ki, &format!("{table}.{key}[{i}]"));
+                            }
+                        }
+                    }
+                    _ => {}
+                },
             }
         }
     }
@@ -664,7 +801,17 @@ impl ConfigLoader {
         // Tilde-only (`~`) expansion — see `parse_toml` and security fix I-7.
         let expanded_content = shellexpand::tilde(content);
 
-        serde_json::from_str(&expanded_content).map_err(ConfigError::Json)
+        let config: Config = serde_json::from_str(&expanded_content).map_err(ConfigError::Json)?;
+
+        // Partial tables apply to JSON too, so run the same unknown-key
+        // sweep as `parse_toml` or a misspelled key is a silent no-op.
+        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&expanded_content) {
+            if let toml::Value::Table(raw) = json_shape(&raw) {
+                self.warn_unknown_in_table(&raw, &config);
+            }
+        }
+
+        Ok(config)
     }
 
     /// Get cached configuration for a file
@@ -1349,15 +1496,10 @@ callsign = "N0CALL"
     #[test]
     fn test_known_top_level_sections_do_not_warn() {
         let loader = ConfigLoader::new().unwrap();
-        // Note: `[duplicate_checking]` is spelled out with all its fields
-        // rather than left partial. Unlike `[station]` (container-level
-        // `#[serde(default)]` on `StationConfig`, so partial tables fall back
-        // field-by-field), `DuplicateCheckingConfig` has no container-level
-        // `#[serde(default)]`, so a partial table fails typed deserialization
-        // with a "missing field" error — a pre-existing gap unrelated to this
-        // task's unknown-key sweep. `[station]` covers "known section,
-        // partial fields parse fine"; `[duplicate_checking]` here covers
-        // "the Task 5 addition is recognized as a known section".
+        // `[station]` covers "known section, partial fields parse fine";
+        // `[duplicate_checking]` covers "the Task 5 addition is recognized
+        // as a known section" (spelled out in full from before PAN-90 made
+        // every table accept a partial table).
         let toml_content = r#"
 [station]
 callsign = "N0CALL"
@@ -1674,5 +1816,241 @@ bookmarks = []
         )));
         assert!(!ConfigLoader::is_config_file(&PathBuf::from("readme.txt")));
         assert!(!ConfigLoader::is_config_file(&PathBuf::from("script.sh")));
+    }
+
+    // ---- PAN-90: unknown keys at any depth are warned ----
+
+    #[test]
+    fn unknown_nested_key_warns() {
+        let loader = ConfigLoader::new().unwrap();
+        let parsed = loader.parse_toml("[network.wsjtx_udp]\nenable = true\n");
+        assert!(parsed.is_ok(), "unknown keys must stay non-fatal");
+        let warnings = loader.load_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("`enable`"), "{warnings:?}");
+        assert!(warnings[0].contains("[network.wsjtx_udp]"), "{warnings:?}");
+    }
+
+    #[test]
+    fn unknown_nested_key_in_json_warns() {
+        let loader = ConfigLoader::new().unwrap();
+        let parsed = loader.parse_json(r#"{"network":{"wsjtx_udp":{"enable":true}}}"#);
+        assert!(parsed.is_ok(), "unknown keys must stay non-fatal");
+        let warnings = loader.load_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("`enable`"), "{warnings:?}");
+        assert!(warnings[0].contains("[network.wsjtx_udp]"), "{warnings:?}");
+
+        let clean = ConfigLoader::new().unwrap();
+        let full = serde_json::to_string(&Config::default()).unwrap();
+        clean.parse_json(&full).unwrap();
+        assert!(
+            clean.load_warnings().is_empty(),
+            "{:?}",
+            clean.load_warnings()
+        );
+    }
+
+    #[test]
+    fn unknown_key_in_deep_table_warns() {
+        let loader = ConfigLoader::new().unwrap();
+        loader
+            .parse_toml("[autonomous.priorities]\nneeded_dxc = 0.5\n")
+            .unwrap();
+        let warnings = loader.load_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("`needed_dxc`"), "{warnings:?}");
+        assert!(
+            warnings[0].contains("[autonomous.priorities]"),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_key_inside_array_of_tables_warns() {
+        let loader = ConfigLoader::new().unwrap();
+        loader
+            .parse_toml(
+                r#"
+[[station.antennas]]
+id            = "20m_yagi"
+name          = "20m 5-element Yagi"
+antenna_type  = "yagi"
+bands         = ["20m"]
+gain_dbi      = 9.5
+pattern       = "directional"
+height_meters = 18.0
+active        = true
+gainn         = 2.0
+"#,
+            )
+            .unwrap();
+        let warnings = loader.load_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("`gainn`"), "{warnings:?}");
+        assert!(warnings[0].contains("station.antennas[0]"), "{warnings:?}");
+    }
+
+    #[test]
+    fn obsolete_nested_section_warns() {
+        let loader = ConfigLoader::new().unwrap();
+        loader
+            .parse_toml("[network.qrz]\nenabled = true\n")
+            .unwrap();
+        let warnings = loader.load_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("`qrz`"), "{warnings:?}");
+        assert!(warnings[0].contains("[network]"), "{warnings:?}");
+    }
+
+    #[test]
+    fn defaults_toml_has_no_unknown_keys() {
+        let (_, warnings) = Config::load_from_file_with_warnings(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/defaults.toml"
+        ))
+        .unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn generated_config_with_metadata_has_no_unknown_keys() {
+        let loader = ConfigLoader::new().unwrap();
+        let text = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(text.contains("[metadata]"));
+        loader.parse_toml(&text).unwrap();
+        let warnings = loader.load_warnings();
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn map_valued_keys_are_not_unknown() {
+        let loader = ConfigLoader::new().unwrap();
+        let parsed = loader
+            .parse_toml(
+                r#"
+[ui.keyboard.shortcuts.my_custom]
+keys = "Ctrl+M"
+action = "app.custom"
+description = "My custom shortcut"
+context = "global"
+enabled = true
+"#,
+            )
+            .unwrap();
+        assert!(parsed.ui.keyboard.shortcuts.contains_key("my_custom"));
+        let warnings = loader.load_warnings();
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    // ---- PAN-90: a discovered config file that fails to load is fatal ----
+
+    fn loader_over(dir: &Path) -> ConfigLoader {
+        ConfigLoader::with_search_paths(vec![dir.to_path_buf()]).unwrap()
+    }
+
+    #[test]
+    fn discovered_file_with_syntax_error_is_fatal() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        std::fs::write(&path, "[station\n").unwrap();
+        match loader_over(dir.path()).load() {
+            Err(ConfigError::FileLoad { path: p, .. }) => assert_eq!(p, path),
+            other => panic!("expected FileLoad, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discovered_file_with_type_error_is_fatal() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        std::fs::write(&path, "[autonomous]\nenabled = \"yes\"\n").unwrap();
+        assert!(matches!(
+            loader_over(dir.path()).load(),
+            Err(ConfigError::FileLoad { .. })
+        ));
+    }
+
+    #[test]
+    fn discovered_partial_recipe_loads() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        std::fs::write(&path, "[autonomous]\nenabled = true\n").unwrap();
+        let loader = loader_over(dir.path());
+        let config = loader.load().unwrap();
+        assert!(config.autonomous.enabled);
+        assert_eq!(loader.loaded_files(), vec![path]);
+        assert!(
+            loader.load_warnings().is_empty(),
+            "{:?}",
+            loader.load_warnings()
+        );
+    }
+
+    #[test]
+    fn no_discovered_file_loads_defaults() {
+        let dir = TempDir::new().unwrap();
+        let loader = loader_over(dir.path());
+        let config = loader.load().unwrap();
+        assert_eq!(config.station.callsign, Config::default().station.callsign);
+        assert!(loader.loaded_files().is_empty());
+        assert_eq!(loader.search_paths(), &[dir.path().to_path_buf()]);
+    }
+
+    #[test]
+    fn non_file_source_failure_stays_non_fatal() {
+        let mut loader = ConfigLoader::new().unwrap();
+        loader.add_source(ConfigSource {
+            name: "remote".to_string(),
+            path: PathBuf::from("remote"),
+            priority: 1,
+            required: false,
+            source_type: SourceType::Remote("ftp://x".to_string()),
+        });
+        assert!(loader.load().is_ok());
+        let warnings = loader.load_warnings();
+        assert!(
+            warnings.iter().any(|w| w.contains("failed to parse")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn dedup_search_paths_keeps_last_occurrence() {
+        let (a, b, c) = (
+            PathBuf::from("/a"),
+            PathBuf::from("/b"),
+            PathBuf::from("/c"),
+        );
+        assert_eq!(
+            dedup_keep_last(vec![a.clone(), b.clone(), a.clone(), c.clone()]),
+            vec![b, a, c]
+        );
+    }
+
+    #[test]
+    fn file_load_error_names_the_path() {
+        let e = ConfigError::FileLoad {
+            path: PathBuf::from("/home/op/.pancetta/pancetta.toml"),
+            reason: Box::new(ConfigError::Validation("boom".into())),
+        };
+        assert!(
+            e.to_string()
+                .starts_with("config file /home/op/.pancetta/pancetta.toml failed to load:"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn missing_required_source_is_still_an_error() {
+        let mut loader = ConfigLoader::with_search_paths(vec![]).unwrap();
+        loader.add_source(ConfigSource {
+            name: "required".to_string(),
+            path: PathBuf::from("/nonexistent/pancetta-required.toml"),
+            priority: 1,
+            required: true,
+            source_type: SourceType::Toml,
+        });
+        assert!(matches!(loader.load(), Err(ConfigError::FileNotFound(_))));
     }
 }

@@ -45,6 +45,11 @@ pub struct AudioCommShared {
     flush_requested: Arc<Atomic<u64>>,
     /// See `flush_requested`.
     flush_completed: Arc<Atomic<u64>>,
+    /// PAN-115: number of times the cpal OUTPUT callback has run. Written only
+    /// by that callback, read by the coordinator's output watchdog to decide
+    /// whether the output device is still pulling samples. A liveness counter,
+    /// not a sample count.
+    output_callbacks: Arc<Atomic<u64>>,
 }
 
 impl AudioCommShared {
@@ -56,6 +61,7 @@ impl AudioCommShared {
             processed_samples: Arc::new(Atomic::new(0)),
             flush_requested: Arc::new(Atomic::new(0)),
             flush_completed: Arc::new(Atomic::new(0)),
+            output_callbacks: Arc::new(Atomic::new(0)),
         }
     }
 
@@ -101,6 +107,18 @@ impl AudioCommShared {
     /// `request_flush` call) has been carried out by the consumer side.
     pub fn is_flush_completed(&self, token: u64) -> bool {
         self.flush_completed.load(Ordering::Acquire) >= token
+    }
+
+    /// PAN-115: record one run of the cpal output callback. RT-safe: a single
+    /// relaxed increment, no allocation, lock or clock read.
+    pub fn record_output_callback(&self) {
+        self.output_callbacks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// PAN-115: how many times the output callback has run since this shared
+    /// state was created (see [`record_output_callback`](Self::record_output_callback)).
+    pub fn output_callbacks(&self) -> u64 {
+        self.output_callbacks.load(Ordering::Relaxed)
     }
 
     /// Get the number of dropped samples
@@ -328,6 +346,15 @@ impl BufferStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_callback_count_starts_at_zero_and_counts_each_record() {
+        let (_p, c) = audio_comm_pair(DEFAULT_AUDIO_BUFFER_SIZE, DEFAULT_LATENCY_BUFFER_SIZE);
+        assert_eq!(c.shared.output_callbacks(), 0);
+        c.shared.record_output_callback();
+        c.shared.record_output_callback();
+        assert_eq!(c.shared.output_callbacks(), 2);
+    }
 
     #[test]
     fn test_audio_comm_creation() {

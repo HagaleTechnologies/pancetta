@@ -601,17 +601,14 @@ impl AudioStreamManager {
         // the input side already latches into and that `process_audio()`
         // already checks unconditionally on every call — no new plumbing.
         let err_shared_output = self.shared.clone();
+        // PAN-115: the same shared state, used for the output heartbeat.
+        let heartbeat_shared = self.shared.clone();
 
         // Create the output stream — drain TX samples from the ring buffer
         let stream = output_device.build_output_stream(
             stream_config,
             move |data: &mut [f32], _info: &OutputCallbackInfo| {
-                output_consumer.drain_pending_flush();
-                let read = output_consumer.pop_audio_slice(data);
-                // Fill any remaining samples with silence (underrun is normal when not transmitting)
-                for sample in data[read..].iter_mut() {
-                    *sample = 0.0;
-                }
+                fill_output_buffer(&mut output_consumer, &heartbeat_shared, data);
             },
             move |err| {
                 eprintln!("Output stream error: {}", err);
@@ -622,6 +619,23 @@ impl AudioStreamManager {
 
         self.output_stream = Some(stream);
         Ok(())
+    }
+}
+
+/// Body of the cpal output callback: record a heartbeat for the coordinator's
+/// output watchdog (PAN-115), then drain queued TX samples into `data` and
+/// zero-fill whatever the ring buffer could not supply.
+pub(crate) fn fill_output_buffer(
+    consumer: &mut AudioConsumer,
+    shared: &AudioCommShared,
+    data: &mut [f32],
+) {
+    shared.record_output_callback();
+    consumer.drain_pending_flush();
+    let read = consumer.pop_audio_slice(data);
+    // Fill any remaining samples with silence (underrun is normal when not transmitting)
+    for sample in data[read..].iter_mut() {
+        *sample = 0.0;
     }
 }
 
@@ -681,6 +695,25 @@ impl StreamStatistics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fill_output_buffer_records_a_heartbeat_and_zero_fills_underrun() {
+        let (mut producer, mut consumer) =
+            audio_comm_pair(OUTPUT_AUDIO_BUFFER_SIZE, DEFAULT_LATENCY_BUFFER_SIZE);
+        let shared = consumer.shared.clone();
+        assert_eq!(producer.push_audio_slice(&[0.25, 0.5, 0.75]), 3);
+
+        let mut data = [9.0_f32; 8];
+        fill_output_buffer(&mut consumer, &shared, &mut data);
+        assert_eq!(&data[..3], &[0.25, 0.5, 0.75]);
+        assert!(data[3..].iter().all(|&s| s == 0.0));
+        assert_eq!(shared.output_callbacks(), 1);
+
+        let mut data = [9.0_f32; 8];
+        fill_output_buffer(&mut consumer, &shared, &mut data);
+        assert!(data.iter().all(|&s| s == 0.0));
+        assert_eq!(shared.output_callbacks(), 2);
+    }
 
     #[test]
     fn test_stream_config_defaults() {

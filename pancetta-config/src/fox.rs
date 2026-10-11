@@ -30,6 +30,7 @@ fn default_max_streams() -> usize {
 /// `MAX_RETAINED_TX_STREAMS`.  A value of 8 would require 9 streams and is
 /// rejected by [`FoxConfig::validate_section`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct FoxConfig {
     /// Maximum simultaneous Hound-answer TX streams per slot.  Must be ≥ 1
     /// and ≤ 7 (one slot is always reserved for the Fox CQ, so 7 answers +

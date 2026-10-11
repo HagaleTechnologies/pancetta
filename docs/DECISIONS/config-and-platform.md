@@ -408,3 +408,97 @@ own Dependabot-admission policy question), not resolved here. The single-collabo
 caveat above (Mergify's `author = thagale` condition needing revisiting once a second trusted
 collaborator exists) carries over unchanged to `auto-merge-trigger.yml`'s own allowlist -- same
 mechanism, same limitation, different admission path.
+
+## Partial tables, fatal file-load errors, and an honest `config --validate` (PAN-90, 2026-10-10)
+
+Every documented "just add this block" recipe failed to parse on its own (README's
+`[autonomous] enabled = true`, both GUIDE.md GridTracker recipes, CONFIG.md's minimum config):
+most config structs had no container-level `#[serde(default)]`, so a table that set one key was
+a hard `missing field` error. Worse, the auto-discovery loader swallowed that error, ran on
+`Config::default()` (N0CALL), and `pancetta config --validate` printed PASS with exit 0.
+
+- **Partial-table rule.** Every single-instance config struct carries container-level
+  `#[serde(default)]` and a `Default` impl. `Config` itself does not (its `Default` mints a random
+  `metadata.instance_id`; a file without `[metadata]` must stay `metadata: None`);
+  `ConfigMetadata` uses field-level defaults instead. Record types (`[[rig.bookmarks]]`,
+  `[[station.antennas]]`, map entries such as `ui.keyboard.shortcuts.<name>`) stay strict.
+  Guard: `pancetta-config/tests/partial_tables.rs` parses every table path of
+  `Config::default()` as an empty table and requires it to equal the defaults; its two allowlists
+  hold at most four entries, each with a reason.
+- **Unknown keys at any depth** are load warnings (non-fatal), so a partial table never turns a
+  typo into a silent no-op. Detection walks the raw TOML (or the key shape of a raw JSON file)
+  against the parsed config serialized to JSON (`ConfigLoader::warn_unknown_keys`, `parse_json`).
+- **Fatal file-load errors.** A discovered config *file* that exists but fails to load returns
+  `ConfigError::FileLoad { path, .. }`; startup stops (interactive launches get the de-brick
+  prompt with the real path). Non-file sources keep warn-and-continue. For a validation failure
+  the prompt targets the one discovered file that fails validation on its own, and is not
+  offered when no single file can be blamed. The de-brick wizard starts from defaults, so on save
+  it always keeps the file it rewrites as `<name>.bak` (or the next free `<name>.bak.N`; created
+  exclusively, so a planted symlink or an earlier backup is never followed or overwritten; 0600
+  on Unix).
+  After the wizard, startup reloads every
+  discovered file, so the session starts from what the next start reads (and warns about the
+  sections where other files change the wizard's values; the first-run wizard still follows if
+  that config has no callsign). If the reload still fails, it warns and runs on the wizard's
+  values for this session only.
+- **`config --validate` contract.** Loads without any wizard, prints `Config file: <path>` for
+  each file read (or the searched directories and "No config file found"), prints warnings, then
+  validates. Exit 1 on any load or validation failure. Unknown keys warn but do not fail it.
+- **Docs are tested.** `pancetta-config/tests/docs_snippets.rs` loads every fenced ```` ```toml ````
+  block and every inline `[section] key = value` span in `README.md` + `docs/*.md` (top level)
+  through the real loader; each must load with zero warnings.
+- **Search path** deduplicated (keep last occurrence) and documented in `docs/CONFIG.md`.
+- `pancetta-config/examples/config.toml` deleted: unreferenced, unparseable, and a duplicate of
+  the generated `defaults.toml`.
+
+## In-session clock-skew monitor (PAN-114, 2026-10-10)
+
+`pancetta/src/clock_skew.rs` (SNTP client, thresholds, pure `ClockSkewMonitorCore`),
+`pancetta/src/coordinator/clock_monitor.rs` (`spawn_clock_skew_monitor`): before this, the only clock
+check was `pancetta doctor`'s one-shot SNTP probe with a 1.0 s threshold, coarser than FT8's ~0.3 s
+decode margin (the live capture window spans DT ≈ −0.66…+0.36 s). The SNTP code moved from the
+binary-only `doctor.rs` into `pancetta_lib` so the coordinator can use it; doctor imports it back.
+
+- **Cadence.** First probe 30 s after start, then every 30 min. The NTP pool's SNTP client terms
+  ([ntppool.org/vendors](https://ntppool.org/vendors)) ask for at most one query per 30 minutes,
+  which rules out a fast "re-probe until clear" loop. 30 min of drift at a 50 ppm crystal is
+  0.09 s, well below the threshold.
+- **Steps.** A `ClockStepDetector` (wall vs monotonic, ≥ 250 ms) on the monitor's 1 s tick detects
+  NTP steps and, where the monotonic clock stops in suspend (Linux, macOS), sleep/wake. A step
+  clears the warning at once, logs a `clock.step` Warn (at most one per 60 s), and schedules a
+  re-check at `max(last_probe + 30 min, step + 30 s)`.
+- **Surfacing.** Each `clock.skew` / `clock.step` entry goes to the Diagnostics overlay through
+  `emit_diagnostic_full` **and** to `tracing` (`clock skew:` / `clock step:`), because headless mode
+  drops the TUI bus receiver. An unreachable server logs one Info entry and shows no chip.
+- **Gating.** Started in `ApplicationCoordinator::run` only when `!replay_mode()`, so no SNTP query
+  leaves a replay (`--wav` returns before it). Not registered with the supervisor: it is advisory
+  and must not trigger restart semantics. Aborted after the main loop exits.
+- **No config key.** Always on in live sessions; this avoids a new `merge_with` field. Thresholds
+  are shared with doctor: `CLOCK_SKEW_WARN_S` (0.3) and `CLOCK_SKEW_FAIL_S` (1.0). Doctor gained a
+  WARN tier for 0.3 s ≤ |offset| < 1.0 s; PASS, FAIL and unreachable texts and the exit code are
+  unchanged.
+
+## Research-scan PRs land themselves (PAN-172, 2026-10-11)
+
+- Merge groups skip the five Rust lanes only when their non-empty cumulative diff is
+  entirely under `research/notes/`. The path allowlist includes `--no-renames`, so moving
+  code into the notes directory cannot hide its deletion. Detection fails closed. Other
+  groups run every Rust lane, including Cargo Deny advisories; a note cannot repair an
+  advisory already present on main.
+- `CI` rejects commit trailer lines on PRs whose title starts with `Weekly research scan `.
+  The check covers every commit in the PR and rejects both AI attribution and session lines.
+- `research-scan-shepherd.yml` runs at 02:17 and 14:17 UTC. It handles only ready, same-repo,
+  notes-only scan PRs into main from the existing trusted authors. It uses the review PAT
+  only for thread resolution and arming. It has its own concurrency group and checks that
+  Auto-Merge Trigger and Queue Retry Handler are quiet before acting, avoiding eviction
+  of a pending run in their shared lock. Stuck scans get a PR comment, a maintainer issue,
+  and a failed workflow run.
+- The shepherd may clear a handler-attached pause at most twice per head SHA. A pause
+  attached by anyone except `github-actions[bot]` remains in force. Exhausting the budget
+  produces a report instead of another retry.
+- The [routine lifecycle](../routines/pancetta-research-scan.md) is the source for the
+  scan-only review policy. Round 1 fixes reasonable findings; rounds 2 and 3 fix P0/P1
+  and defer P2 and lower; round 4 and later defer everything without more commits.
+  This local override leaves the synced general convergence policy unchanged. The external
+  claude.ai routine must receive the documented prompt pointer, daily schedule and Linear
+  connector edits before the full lifecycle is operational.
