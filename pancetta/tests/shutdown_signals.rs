@@ -4,7 +4,7 @@
 
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -39,7 +39,7 @@ impl FakeRig {
         let server_stop = stop.clone();
         let server = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(80);
-            let mut stream = loop {
+            let stream = loop {
                 if server_stop.load(Ordering::Acquire) || Instant::now() >= deadline {
                     return Err(io::Error::new(io::ErrorKind::TimedOut, "no rig connection"));
                 }
@@ -51,31 +51,7 @@ impl FakeRig {
                     Err(e) => return Err(e),
                 }
             };
-            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-            stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-            let mut reader = BufReader::new(stream.try_clone()?);
-            let mut commands = Vec::new();
-            loop {
-                let mut line = String::new();
-                if reader.read_line(&mut line)? == 0 {
-                    // A successful server result requires connection EOF.
-                    return Ok(commands);
-                }
-                match line.trim() {
-                    "f" => stream.write_all(b"14074000\n")?,
-                    "T 0" => {
-                        server_keyed.store(false, Ordering::Release);
-                        stream.write_all(b"RPRT 0\n")?;
-                    }
-                    command => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("unexpected rig command: {command}"),
-                        ));
-                    }
-                }
-                commands.push(line.trim().to_owned());
-            }
+            serve(stream, &server_keyed)
         });
         Self {
             port,
@@ -83,6 +59,36 @@ impl FakeRig {
             stop,
             server: Some(server),
         }
+    }
+}
+
+fn serve(mut stream: TcpStream, keyed: &AtomicBool) -> io::Result<Vec<String>> {
+    // On macOS the accepted stream inherits the listener's O_NONBLOCK.
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut commands = Vec::new();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            // A successful server result requires connection EOF.
+            return Ok(commands);
+        }
+        match line.trim() {
+            "f" => stream.write_all(b"14074000\n")?,
+            "T 0" => {
+                keyed.store(false, Ordering::Release);
+                stream.write_all(b"RPRT 0\n")?;
+            }
+            command => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unexpected rig command: {command}"),
+                ));
+            }
+        }
+        commands.push(line.trim().to_owned());
     }
 }
 
@@ -208,4 +214,34 @@ fn sigterm_unkeys_rig_and_completes_shutdown() {
 #[test]
 fn sigint_unkeys_rig_and_completes_shutdown() {
     assert_signal_shutdown(libc::SIGINT);
+}
+
+#[test]
+fn fake_rig_serves_stream_that_inherited_nonblocking() {
+    // macOS accept() copies O_NONBLOCK from the listener; force it here.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (stream, _) = listener.accept().unwrap();
+    stream.set_nonblocking(true).unwrap();
+    let keyed = Arc::new(AtomicBool::new(true));
+    let server_keyed = keyed.clone();
+    let server = thread::spawn(move || serve(stream, &server_keyed));
+
+    let mut replies = BufReader::new(client.try_clone().unwrap());
+    let mut reply = String::new();
+    client.write_all(b"f\n").unwrap();
+    replies.read_line(&mut reply).unwrap();
+    assert_eq!(reply, "14074000\n");
+    // Let the server reach its next read before the command arrives.
+    thread::sleep(Duration::from_millis(200));
+    reply.clear();
+    client.write_all(b"T 0\n").unwrap();
+    replies.read_line(&mut reply).unwrap();
+    assert_eq!(reply, "RPRT 0\n");
+    drop(replies);
+    drop(client);
+
+    let commands = server.join().unwrap().unwrap();
+    assert_eq!(commands, ["f", "T 0"]);
+    assert!(!keyed.load(Ordering::Acquire));
 }
