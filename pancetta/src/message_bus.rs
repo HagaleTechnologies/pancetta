@@ -852,6 +852,9 @@ pub enum QsoMessage {
     TxFrameNotSent {
         qso_id: String,
         message_text: String,
+        /// Set when the frame was replaced by a TX pivot: its own offset and
+        /// binding, so the rollback skips the same-text frame that aired.
+        replaced: Option<pancetta_qso::UnsentAttemptPayload>,
     },
     /// Enable or disable Fox (DXpedition operator) mode.
     ///

@@ -229,7 +229,14 @@ Autonomous completion and mirrors failures with a QSO id as
 The one exception is the Step 0-dup pivot-duplicate drop
 (`report_pivot_duplicate_dropped`): its payload already aired through the
 earlier request's pivot, so the QSO keeps that attempt and the worker instead
-reports the text the pivot replaced, which never aired as itself.
+reports the text the pivot replaced, which never aired as itself. The report
+also carries the replaced frame's offset and, for single-frame requests, its
+remote binding, because a pivot can change only those and leave two same-text
+emissions. The rollback undoes the newest same-text emission that carried that
+payload. If none did (an opening call or forward advance was replaced; those
+have no ledger entry), nothing is rolled back, so the replaced frame stays
+counted rather than risk removing the frame that aired. Multi-TX bundle items
+carry no binding, which matches bundle pivots comparing only text and offset.
 If a rollback takes `stall_cycles` from the switch threshold back below it
 before the coordinator's drain commits a stall offset action that attempt
 raised, the commit is refused (`OffsetActionStallRolledBack`) until the streak

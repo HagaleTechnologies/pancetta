@@ -4913,10 +4913,10 @@ impl super::ApplicationCoordinator {
                                                 ),
                                             }
                                         }
-                                        crate::message_bus::QsoMessage::TxFrameNotSent { qso_id, message_text } => {
+                                        crate::message_bus::QsoMessage::TxFrameNotSent { qso_id, message_text, replaced } => {
                                             match qso_id.parse::<pancetta_qso::QsoId>() {
                                                 Ok(id) => {
-                                                    let outcome = qso_manager.roll_back_unsent_attempt(id, &message_text).await;
+                                                    let outcome = qso_manager.roll_back_unsent_attempt(id, &message_text, replaced.as_ref()).await;
                                                     debug!(target: "qso", "TX frame not sent for QSO {} ('{}'): {:?}", qso_id, message_text, outcome);
                                                 }
                                                 Err(e) => debug!(target: "qso", "TxFrameNotSent: bad QSO id '{}': {}", qso_id, e),
@@ -9593,6 +9593,7 @@ mod respond_to_caller_admission_tests {
                     MessageType::QsoMessage(QsoMessage::TxFrameNotSent {
                         qso_id,
                         message_text: text.clone(),
+                        replaced: None,
                     }),
                     Instant::now(),
                 ))

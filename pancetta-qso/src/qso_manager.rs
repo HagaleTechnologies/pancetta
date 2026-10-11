@@ -1005,6 +1005,8 @@ type RemoteTxPermittedSource = Arc<dyn Fn(Option<&str>) -> bool + Send + Sync>;
 // A frame may wait behind an in-flight TX and a same-parity slot (~3 slots).
 const UNSENT_ATTEMPT_RETENTION_SLOTS: i64 = 4;
 const MAX_UNSENT_ATTEMPTS_PER_QSO: usize = 8;
+// Same tolerance the TX worker's pivot check uses for "same offset".
+const UNSENT_ATTEMPT_OFFSET_EPSILON_HZ: f64 = 0.5;
 
 #[derive(Debug, Clone)]
 struct KeepCallAttempt {
@@ -1013,6 +1015,23 @@ struct KeepCallAttempt {
     prev_last_call_at: Option<DateTime<Utc>>,
     bumped_stall: bool,
     recorded_sent: bool,
+    // What the emission carried besides its text. A TX pivot can replace a
+    // frame with one that differs only in offset or remote binding.
+    frequency_hz: f64,
+    remote_origin: bool,
+    remote_client_key_id: Option<String>,
+}
+
+impl KeepCallAttempt {
+    fn carries(&self, payload: &UnsentAttemptPayload) -> bool {
+        (self.frequency_hz - payload.frequency_hz).abs() < UNSENT_ATTEMPT_OFFSET_EPSILON_HZ
+            && payload.remote_binding.as_ref().is_none_or(
+                |(remote_origin, remote_client_key_id)| {
+                    self.remote_origin == *remote_origin
+                        && self.remote_client_key_id == *remote_client_key_id
+                },
+            )
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1035,6 +1054,17 @@ pub enum UnsentAttemptRollback {
     NoMatchingAttempt,
     /// Missing or terminal QSOs have no live bookkeeping to restore.
     QsoNotActive,
+}
+
+/// The payload of a frame a TX pivot replaced (PAN-75). Text alone cannot
+/// tell that frame apart from the fresher same-text frame that aired in its
+/// place when the pivot changed only the offset or the remote binding.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnsentAttemptPayload {
+    pub frequency_hz: f64,
+    /// `(remote_origin, remote_client_key_id)`, or `None` when the reporter
+    /// cannot see the frame's binding (multi-TX bundle items).
+    pub remote_binding: Option<(bool, Option<String>)>,
 }
 
 /// QSO manager implementation
@@ -3583,12 +3613,15 @@ impl QsoManager {
 
     /// Reverse a recent keep-call emission that the TX worker reported as unsent.
     /// No events are emitted; pacing still uses the last emission (PAN-75).
+    /// `replaced` is set only for the frame a TX pivot replaced; see
+    /// [`Self::roll_back_replaced_attempt_at`].
     pub async fn roll_back_unsent_attempt(
         &self,
         qso_id: QsoId,
         message_text: &str,
+        replaced: Option<&UnsentAttemptPayload>,
     ) -> UnsentAttemptRollback {
-        self.roll_back_unsent_attempt_at(qso_id, message_text, Utc::now())
+        self.roll_back_replaced_attempt_at(qso_id, message_text, replaced, Utc::now())
             .await
     }
 
@@ -3598,6 +3631,24 @@ impl QsoManager {
         &self,
         qso_id: QsoId,
         message_text: &str,
+        now: DateTime<Utc>,
+    ) -> UnsentAttemptRollback {
+        self.roll_back_replaced_attempt_at(qso_id, message_text, None, now)
+            .await
+    }
+
+    /// Like [`Self::roll_back_unsent_attempt_at`], but with `replaced` it only
+    /// matches the newest same-text emission that also carried that payload.
+    /// A pivot that changed only the offset or the remote binding leaves two
+    /// same-text emissions, and the fresher one aired. When no emission
+    /// carries the payload (the replaced frame was an opening call or an
+    /// advance, which have no ledger entry) nothing is rolled back: every
+    /// same-text entry left may be the frame that aired.
+    pub async fn roll_back_replaced_attempt_at(
+        &self,
+        qso_id: QsoId,
+        message_text: &str,
+        replaced: Option<&UnsentAttemptPayload>,
         now: DateTime<Utc>,
     ) -> UnsentAttemptRollback {
         let mut qsos = self.qsos.write().await;
@@ -3616,11 +3667,9 @@ impl QsoManager {
         entry
             .attempts
             .retain(|attempt| attempt.emitted_at >= cutoff);
-        let Some(index) = entry
-            .attempts
-            .iter()
-            .rposition(|attempt| attempt.raw_text == message_text)
-        else {
+        let Some(index) = entry.attempts.iter().rposition(|attempt| {
+            attempt.raw_text == message_text && replaced.is_none_or(|p| attempt.carries(p))
+        }) else {
             return UnsentAttemptRollback::NoMatchingAttempt;
         };
         let Some(attempt) = entry.attempts.remove(index) else {
@@ -3712,6 +3761,9 @@ impl QsoManager {
                             prev_last_call_at,
                             bumped_stall: false,
                             recorded_sent: false,
+                            frequency_hz: frequency,
+                            remote_origin: progress.metadata.remote_origin,
+                            remote_client_key_id: progress.metadata.remote_client_key_id.clone(),
                         },
                     );
                     (message, frequency)
@@ -4150,6 +4202,9 @@ impl QsoManager {
                         prev_last_call_at,
                         bumped_stall: false,
                         recorded_sent: true,
+                        frequency_hz: progress.metadata.frequency,
+                        remote_origin: progress.metadata.remote_origin,
+                        remote_client_key_id: progress.metadata.remote_client_key_id.clone(),
                     },
                 );
                 (
@@ -7342,6 +7397,9 @@ impl QsoManager {
                         prev_last_call_at,
                         bumped_stall: true,
                         recorded_sent: true,
+                        frequency_hz: progress.metadata.frequency,
+                        remote_origin: progress.metadata.remote_origin,
+                        remote_client_key_id: progress.metadata.remote_client_key_id.clone(),
                     },
                 );
                 to_recall.push((
@@ -8021,7 +8079,7 @@ mod tests {
         assert_eq!(manager.get_qso(id).await.unwrap().metadata.call_count, 2);
         assert_eq!(
             manager
-                .roll_back_unsent_attempt(id, &before.messages.last().unwrap().raw_text)
+                .roll_back_unsent_attempt(id, &before.messages.last().unwrap().raw_text, None)
                 .await,
             UnsentAttemptRollback::RolledBack { call_count: 1 }
         );
@@ -8053,7 +8111,7 @@ mod tests {
         let emitted = manager.get_qso(id).await.unwrap();
         assert_eq!(emitted.metadata.call_count, AUTO_RESEND_MAX_CALLS + 1);
         manager
-            .roll_back_unsent_attempt(id, &emitted.messages.last().unwrap().raw_text)
+            .roll_back_unsent_attempt(id, &emitted.messages.last().unwrap().raw_text, None)
             .await;
         let after = manager.get_qso(id).await.unwrap();
         assert_eq!(after.metadata.call_count, before.metadata.call_count);
@@ -17512,6 +17570,96 @@ mod pan72_stall_detection_tests {
             .apply_tx_offset_switch(qso_id, FREQ + 300.0, OffsetRelocationOrigin::OperatorForced)
             .await
             .expect("an operator nudge is not revoked by a stall rollback");
+    }
+
+    /// PAN-75 (Codex review on PR #418): an offset move followed by a
+    /// same-text rearm leaves two emissions that differ only in offset. A TX
+    /// pivot airs the fresher one in the older one's slot, so the rollback for
+    /// the replaced frame must undo the pre-move emission and keep the one
+    /// that aired, with its stall count and its timeline entry at the new
+    /// offset.
+    #[tokio::test]
+    async fn pivot_rollback_undoes_the_replaced_offset_not_the_frame_that_aired() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        let replaced_at = opened_at + Duration::seconds(15);
+        manager.rearm_manual_calls_at(replaced_at).await;
+        manager
+            .apply_tx_offset_switch(qso_id, FREQ + 300.0, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .expect("precondition: the move commits");
+        let aired_at = opened_at + Duration::seconds(30);
+        manager.rearm_manual_calls_at(aired_at).await;
+        let before = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(before.metadata.call_count, 3);
+        assert_eq!(
+            before.metadata.stall_cycles, 1,
+            "precondition: one rearm since the move"
+        );
+        let text = before.messages.last().unwrap().raw_text.clone();
+
+        let replaced = UnsentAttemptPayload {
+            frequency_hz: FREQ,
+            remote_binding: Some((false, None)),
+        };
+        assert_eq!(
+            manager
+                .roll_back_replaced_attempt_at(
+                    qso_id,
+                    &text,
+                    Some(&replaced),
+                    aired_at + Duration::seconds(1),
+                )
+                .await,
+            UnsentAttemptRollback::RolledBack { call_count: 2 }
+        );
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.stall_cycles, 1,
+            "the frame that aired after the move still counts"
+        );
+        assert_eq!(after.metadata.last_call_at, Some(aired_at));
+        let sent: Vec<_> = after
+            .messages
+            .iter()
+            .filter(|m| m.direction == MessageDirection::Sent)
+            .collect();
+        assert!(
+            sent.iter().all(|m| m.timestamp != replaced_at),
+            "the replaced emission's Sent entry is removed"
+        );
+        let last = sent.last().unwrap();
+        assert_eq!(last.timestamp, aired_at);
+        assert!((last.frequency - (FREQ + 300.0)).abs() < f64::EPSILON);
+
+        // The opening call at FREQ has no ledger entry. A pivot that replaced
+        // it must not fall back to the same-text frame that aired.
+        assert_eq!(
+            manager
+                .roll_back_replaced_attempt_at(
+                    qso_id,
+                    &text,
+                    Some(&replaced),
+                    aired_at + Duration::seconds(2),
+                )
+                .await,
+            UnsentAttemptRollback::NoMatchingAttempt
+        );
+        let unchanged = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(unchanged.metadata.call_count, 2);
+        assert_eq!(unchanged.metadata.stall_cycles, 1);
+        assert_eq!(unchanged.metadata.last_call_at, Some(aired_at));
     }
 
     /// A REMOTE-origin QSO whose keep-calling frames the station-agent

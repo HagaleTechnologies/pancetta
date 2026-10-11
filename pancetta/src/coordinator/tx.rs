@@ -2329,13 +2329,19 @@ async fn report_transmit_complete(
     )
     .await;
     if let Some((qso_id, message_text)) = not_sent {
-        report_frame_not_sent(message_bus, qso_id, message_text).await;
+        report_frame_not_sent(message_bus, qso_id, message_text, None).await;
     }
     result
 }
 
 /// PAN-75: tell the QSO engine `message_text` never aired for `qso_id`.
-async fn report_frame_not_sent(message_bus: &MessageBus, qso_id: String, message_text: String) {
+/// `replaced` carries the payload of a frame a pivot replaced.
+async fn report_frame_not_sent(
+    message_bus: &MessageBus,
+    qso_id: String,
+    message_text: String,
+    replaced: Option<pancetta_qso::UnsentAttemptPayload>,
+) {
     let _ = message_bus
         .send_message(ComponentMessage::new(
             ComponentId::Ft8Transmitter,
@@ -2343,6 +2349,7 @@ async fn report_frame_not_sent(message_bus: &MessageBus, qso_id: String, message
             MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent {
                 qso_id,
                 message_text,
+                replaced,
             }),
             Instant::now(),
         ))
@@ -2352,12 +2359,14 @@ async fn report_frame_not_sent(message_bus: &MessageBus, qso_id: String, message
 /// Step 0-dup: this request's payload already aired through an earlier
 /// request's pivot. Autonomous gets the usual failed completion. The QSO
 /// engine keeps this request's attempt and instead rolls back the frame the
-/// pivot replaced (`pivoted_from_text`), which never aired as itself (PAN-75).
+/// pivot replaced (`pivoted_from`: its text and payload), which never aired
+/// as itself (PAN-75). The payload tells the two apart when the pivot changed
+/// only the offset or the remote binding.
 async fn report_pivot_duplicate_dropped(
     message_bus: &MessageBus,
     message_text: String,
     qso_id: Option<String>,
-    pivoted_from_text: Option<String>,
+    pivoted_from: Option<(String, pancetta_qso::UnsentAttemptPayload)>,
 ) {
     if let Err(e) =
         report_transmit_complete_to_autonomous(message_bus, false, message_text, 0, qso_id.clone())
@@ -2365,8 +2374,8 @@ async fn report_pivot_duplicate_dropped(
     {
         warn!("Failed to send TransmitComplete: {}", e);
     }
-    if let (Some(qso_id), Some(pivoted_from_text)) = (qso_id, pivoted_from_text) {
-        report_frame_not_sent(message_bus, qso_id, pivoted_from_text).await;
+    if let (Some(qso_id), Some((pivoted_from_text, replaced))) = (qso_id, pivoted_from) {
+        report_frame_not_sent(message_bus, qso_id, pivoted_from_text, Some(replaced)).await;
     }
 }
 
@@ -5614,11 +5623,14 @@ impl super::ApplicationCoordinator {
                 // (coordinator/mod.rs) for the pure membership check.
                 let mut pivoted_once: std::collections::HashMap<String, (String, f64)> =
                     std::collections::HashMap::new();
-                // PAN-75: the text each tombstoned pivot replaced. Written with
-                // every `pivoted_once` insert and read only on a Step 0-dup hit,
-                // so entries left behind when a tombstone is cleared are inert.
-                let mut pivoted_from: std::collections::HashMap<String, String> =
-                    std::collections::HashMap::new();
+                // PAN-75: the text and payload each tombstoned pivot replaced.
+                // Written with every `pivoted_once` insert and read only on a
+                // Step 0-dup hit, so entries left behind when a tombstone is
+                // cleared are inert.
+                let mut pivoted_from: std::collections::HashMap<
+                    String,
+                    (String, pancetta_qso::UnsentAttemptPayload),
+                > = std::collections::HashMap::new();
 
                 'worker: while !shutdown.load(Ordering::Acquire) {
                     // Reset the per-message abort flag at the start of every
@@ -5928,7 +5940,7 @@ impl super::ApplicationCoordinator {
                                         )
                                         .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
-                                        let pivoted_from_text = qso_id.as_deref().and_then(|id| {
+                                        let replaced = qso_id.as_deref().and_then(|id| {
                                             let key = super::active_tx_qso_key(id);
                                             pivoted_once.remove(&key);
                                             pivoted_from.remove(&key)
@@ -5937,7 +5949,7 @@ impl super::ApplicationCoordinator {
                                             &message_bus,
                                             message_text,
                                             qso_id.clone(),
-                                            pivoted_from_text,
+                                            replaced,
                                         )
                                         .await;
                                         continue;
@@ -6727,6 +6739,15 @@ impl super::ApplicationCoordinator {
                                                         new_freq,
                                                         qso_id.as_deref().unwrap_or("-")
                                                     );
+                                                    let replaced =
+                                                        pancetta_qso::UnsentAttemptPayload {
+                                                            frequency_hz: frequency_offset,
+                                                            remote_binding: Some((
+                                                                origin
+                                                                    == crate::message_bus::TxOrigin::Remote,
+                                                                remote_client_key_id.clone(),
+                                                            )),
+                                                        };
                                                     let pivoted_from_text = std::mem::replace(
                                                         &mut message_text,
                                                         new_text,
@@ -6765,8 +6786,10 @@ impl super::ApplicationCoordinator {
                                                                 frequency_offset,
                                                             ),
                                                         );
-                                                        pivoted_from
-                                                            .insert(key.clone(), pivoted_from_text);
+                                                        pivoted_from.insert(
+                                                            key.clone(),
+                                                            (pivoted_from_text, replaced),
+                                                        );
                                                         pivoted_this_key = Some(key);
                                                     }
                                                 }
@@ -8021,7 +8044,7 @@ impl super::ApplicationCoordinator {
                                                     item.qso_id.as_deref(),
                                                 )
                                                 .await;
-                                                let pivoted_from_text =
+                                                let replaced =
                                                     item.qso_id.as_deref().and_then(|id| {
                                                         let key = super::active_tx_qso_key(id);
                                                         pivoted_once.remove(&key);
@@ -8031,7 +8054,7 @@ impl super::ApplicationCoordinator {
                                                     &message_bus,
                                                     item.message_text.clone(),
                                                     item.qso_id.clone(),
-                                                    pivoted_from_text,
+                                                    replaced,
                                                 )
                                                 .await;
                                             } else {
@@ -8797,18 +8820,28 @@ impl super::ApplicationCoordinator {
                                         .filter(|(_, &live)| live)
                                         .map(|(item, _)| item.clone())
                                         .collect();
-                                    let pre_pivot_texts: std::collections::HashMap<String, String> =
-                                        live_items_pre
-                                            .iter()
-                                            .filter_map(|item| {
-                                                item.qso_id.as_deref().map(|id| {
+                                    // Bundle items carry no remote binding, and bundle
+                                    // pivots compare only text and offset.
+                                    let pre_pivot_frames: std::collections::HashMap<
+                                        String,
+                                        (String, pancetta_qso::UnsentAttemptPayload),
+                                    > = live_items_pre
+                                        .iter()
+                                        .filter_map(|item| {
+                                            item.qso_id.as_deref().map(|id| {
+                                                (
+                                                    super::active_tx_qso_key(id),
                                                     (
-                                                        super::active_tx_qso_key(id),
                                                         item.message_text.clone(),
-                                                    )
-                                                })
+                                                        pancetta_qso::UnsentAttemptPayload {
+                                                            frequency_hz: item.frequency_offset,
+                                                            remote_binding: None,
+                                                        },
+                                                    ),
+                                                )
                                             })
-                                            .collect();
+                                        })
+                                        .collect();
                                     let (pivoted_live_items, pivots) =
                                         super::pivot_bundle_items(live_items_pre, &latest_snapshot);
                                     for (qso_key, new_text, new_freq) in &pivots {
@@ -9116,8 +9149,8 @@ impl super::ApplicationCoordinator {
                                     let pivoted_this_bundle_keys: Vec<String> =
                                         pivots.iter().map(|(k, _, _)| k.clone()).collect();
                                     for (qso_key, new_text, new_freq) in pivots {
-                                        if let Some(text) = pre_pivot_texts.get(&qso_key) {
-                                            pivoted_from.insert(qso_key.clone(), text.clone());
+                                        if let Some(frame) = pre_pivot_frames.get(&qso_key) {
+                                            pivoted_from.insert(qso_key.clone(), frame.clone());
                                         }
                                         pivoted_once.insert(qso_key, (new_text, new_freq));
                                     }
@@ -14289,6 +14322,7 @@ mod coalesce_tests {
             if let MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent {
                 qso_id,
                 message_text,
+                replaced: None,
             }) = msg.message_type
             {
                 notices.push((qso_id, message_text));
@@ -14428,6 +14462,7 @@ mod coalesce_tests {
             if let MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent {
                 qso_id,
                 message_text,
+                replaced: None,
             }) = msg.message_type
             {
                 notices.push((qso_id, message_text));
@@ -15896,7 +15931,7 @@ mod pan115_worker_gate_tests {
         loop {
             if let Ok(msg) = h.qso_rx.try_recv() {
                 assert!(
-                    matches!(msg.message_type, MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { qso_id, message_text }) if qso_id == "qso-f8" && message_text == text)
+                    matches!(msg.message_type, MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { qso_id, message_text, replaced: None }) if qso_id == "qso-f8" && message_text == text)
                 );
                 break;
             }
@@ -15993,7 +16028,7 @@ mod report_transmit_complete_tests {
         assert!(autonomous.try_recv().is_err());
         if !success && qso_id.is_some() {
             assert!(
-                matches!(qso.try_recv().unwrap().message_type, MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { qso_id: id, message_text }) if Some(id.as_str()) == qso_id && message_text == "K1ABC N0CALL FN20")
+                matches!(qso.try_recv().unwrap().message_type, MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { qso_id: id, message_text, replaced: None }) if Some(id.as_str()) == qso_id && message_text == "K1ABC N0CALL FN20")
             );
         }
         assert!(qso.try_recv().is_err());
@@ -16019,11 +16054,15 @@ mod report_transmit_complete_tests {
         let bus = MessageBus::new(16).unwrap();
         let (_, autonomous) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
         let (_, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        let replaced = pancetta_qso::UnsentAttemptPayload {
+            frequency_hz: 1500.0,
+            remote_binding: Some((false, None)),
+        };
         report_pivot_duplicate_dropped(
             &bus,
             "K1ABC N0CALL R-07".into(),
             Some("q1".into()),
-            Some("K1ABC N0CALL FN20".into()),
+            Some(("K1ABC N0CALL FN20".into(), replaced.clone())),
         )
         .await;
         assert!(matches!(
@@ -16033,8 +16072,8 @@ mod report_transmit_complete_tests {
         ));
         assert!(matches!(
             qso.try_recv().unwrap().message_type,
-            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { ref qso_id, ref message_text })
-                if qso_id == "q1" && message_text == "K1ABC N0CALL FN20"
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { ref qso_id, ref message_text, replaced: Some(ref payload) })
+                if qso_id == "q1" && message_text == "K1ABC N0CALL FN20" && *payload == replaced
         ));
         assert!(qso.try_recv().is_err());
 
