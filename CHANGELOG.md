@@ -88,6 +88,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Ctrl/Alt chords no longer trigger transmit keys at the main view (PAN-112).
+  Ctrl+C previously started a CQ because crossterm reports it as `c` with a
+  separate modifier. The same guard now covers PTT, autonomous mode, TX policy,
+  re-send, the `u` offset nudge (which re-keys the current frame in Auto
+  TX-frequency mode), Space-to-call, tune, Fox and Hound, plus Enter-to-reply
+  on Callers where the terminal reports the modifier (legacy Unix terminals
+  send Ctrl+Enter as a plain Enter). Bare and Shift bindings still work.
+
 - Slot timing stays on UTC across clock steps and sleep/wake (PAN-114). After
   a backward clock step (e.g. NTP correcting a fast RTC), the autonomous
   scheduler and the decoder re-anchor to the UTC slot grid within one slot
