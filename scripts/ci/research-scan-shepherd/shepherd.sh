@@ -223,11 +223,14 @@ apply() {
         jq -e '.pause.present == false' "$WORK/live" >/dev/null || return 3
       fi
       jq -e '.arm' "$WORK/live-decision" >/dev/null || return 3
+      # Persist the attempt marker before arming: if the post fails we never arm, so a
+      # reporting failure cannot leave an uncounted arm that exceeds the per-head budget.
+      attempt=$(jq '.rearm_count_for_head + 1' "$WORK/live")
+      gh api -X POST "repos/$REPO/issues/$pr/comments" -f body="Re-arming auto-merge after a merge-queue removal (attempt $attempt/2 for ${head:0:12}). Notes-only scan PRs cannot cause a Rust merge-group failure; see docs/routines/pancetta-research-scan.md.
+<!-- research-scan-shepherd:rearm sha=${head:0:12} -->" >/dev/null || return 1
+      record_action "recorded re-arm attempt $attempt"
       GH_TOKEN="$RESOLVE_TOKEN" gh pr merge "$pr" --repo "$REPO" --auto --squash --match-head-commit "$head" >/dev/null || return 1
       record_action "armed auto-merge"
-      attempt=$(jq '.rearm_count_for_head + 1' "$WORK/live")
-      gh api -X POST "repos/$REPO/issues/$pr/comments" -f body="Re-armed auto-merge after a merge-queue removal (attempt $attempt/2 for ${head:0:12}). Notes-only scan PRs cannot cause a Rust merge-group failure; see docs/routines/pancetta-research-scan.md.
-<!-- research-scan-shepherd:rearm sha=${head:0:12} -->" >/dev/null || return 1
     fi
   fi
   if jq -e '.report' "$decision" >/dev/null; then

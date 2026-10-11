@@ -43,6 +43,8 @@ case "$1 $2" in
     fi ;;
   api*)
     if [[ $args == *' -X DELETE '* ]]; then touch "$STUB_STATE/cleared"; echo '{}'
+    elif [[ -n ${STUB_FAIL_REARM_COMMENT:-} && $args == *' -X POST '* && $args == *'research-scan-shepherd:rearm'* ]]; then
+      echo 'stub: rearm marker post failed' >&2; exit 1
     elif [[ $args == *' -X POST '* || $args == *' -X PATCH '* ]]; then echo '{}'
     else
       case "$2" in
