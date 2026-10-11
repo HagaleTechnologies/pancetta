@@ -49,18 +49,27 @@ def disposition($s):
         | select(.conclusion as $c | ["success", "skipped", "neutral"] | index($c) == null)
         | select((.name == $codex.name and $d.rerun_codex_verdict or .name == "CI" and $d.rerun_ci_failed_jobs) | not)
         | {kind: "check-failing", name}]
+    # Missing, queued and in-progress required checks have a null conclusion; list them so a
+    # PR that waits on one past the stuck threshold is still reported.
+    | .blockers += [$s.required_checks[] | select(.conclusion == null) | {kind: "check-pending", name}]
+    # Every shepherd arm records an attempt marker first, so the budget applies whether or not
+    # the pause label is still present (a failed arm after clearing the pause leaves none).
+    | ($s.rearm_count_for_head >= $s.config.rearm_budget) as $spent
     | .blockers += [
         if $s.pause.present then
           if $s.pause.attached_by != "github-actions[bot]" then {kind: "maintainer-pause"}
-          elif $s.rearm_count_for_head >= $s.config.rearm_budget then {kind: "rearm-budget-exhausted"}
-          else empty end else empty end,
+          elif $spent then {kind: "rearm-budget-exhausted"}
+          else empty end
+        elif $spent and ($s.pr.armed | not) and ($s.pr.inMergeQueue | not) then {kind: "rearm-budget-exhausted"}
+        else empty end,
         if $s.pr.mergeable == "CONFLICTING" then {kind: "merge-conflict"} else empty end,
         if $s.merge_queue_rule_present | not then {kind: "merge-queue-rule-missing"} else empty end,
         if .codex_rounds > ($s.config.round_cap + 1) then {kind: "round-cap-exceeded"} else empty end]
+    # The round cap is shepherd-only state with no native merge rule behind it, so never arm past it.
     | .arm = (($s.pr.armed | not) and ($s.pr.inMergeQueue | not) and
-        $s.merge_queue_rule_present and $s.pr.mergeable != "CONFLICTING" and
-        (($s.pause.present | not) or ($s.pause.attached_by == "github-actions[bot]" and
-          $s.rearm_count_for_head < $s.config.rearm_budget)))
+        $s.merge_queue_rule_present and $s.pr.mergeable != "CONFLICTING" and ($spent | not) and
+        (any(.blockers[]; .kind == "round-cap-exceeded") | not) and
+        (($s.pause.present | not) or $s.pause.attached_by == "github-actions[bot]"))
     | .clear_pause = (.arm and $s.pause.present)
     | .report = (($s.now | fromdateiso8601) - ($s.pr.createdAt | fromdateiso8601) >
         $s.config.stuck_after_hours * 3600 and ($s.pr.inMergeQueue | not) and (.blockers | length > 0))

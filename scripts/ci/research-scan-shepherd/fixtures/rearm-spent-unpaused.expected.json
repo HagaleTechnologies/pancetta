@@ -1,0 +1,17 @@
+{
+  "arm": false,
+  "blockers": [
+    {
+      "kind": "rearm-budget-exhausted"
+    }
+  ],
+  "clear_pause": false,
+  "codex_rounds": 1,
+  "eligible": true,
+  "ineligible_reasons": [],
+  "number": 420,
+  "report": true,
+  "rerun_ci_failed_jobs": false,
+  "rerun_codex_verdict": false,
+  "resolve": []
+}
