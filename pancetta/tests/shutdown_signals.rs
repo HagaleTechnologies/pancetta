@@ -207,6 +207,30 @@ fn assert_signal_shutdown(signal: libc::c_int) {
 }
 
 #[test]
+fn packaged_service_only_sends_initial_stop_signal_to_pancetta() {
+    // The subprocess cases below signal only Pancetta. The shipped unit must
+    // do the same so managed rigctld remains available for the PTT-off attempt.
+    let unit = include_str!("../../packaging/systemd/pancetta.service");
+    let mut in_service = false;
+    let mut kill_mode = "control-group"; // systemd's default
+    for line in unit.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_service = line == "[Service]";
+        } else if in_service {
+            if let Some((key, value)) = line.split_once('=') {
+                if key.trim() == "KillMode" {
+                    kill_mode = value.trim();
+                }
+            }
+        }
+    }
+    assert_eq!(
+        kill_mode, "mixed",
+        "keep managed rigctld alive during graceful shutdown, with group-wide forced cleanup"
+    );
+}
+
+#[test]
 fn sigterm_unkeys_rig_and_completes_shutdown() {
     assert_signal_shutdown(libc::SIGTERM);
 }
