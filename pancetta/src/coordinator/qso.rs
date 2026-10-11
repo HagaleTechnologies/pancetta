@@ -405,12 +405,15 @@ fn lookup_dx_activity(
 /// ones to keep queued.
 ///
 /// When idle we adopt the oldest queued call's desired parity as the new side;
-/// otherwise we may only add to the side already in flight. Every call matching
-/// that side (and any parity-agnostic call) starts; cross-parity calls stay
-/// queued until that side, in turn, clears.
+/// otherwise we may only add to the side already in flight. Parity decides
+/// which calls may start; capacity decides how many (PAN-78): calls matching
+/// that side (and any parity-agnostic call) start, oldest first, while
+/// `free_slots` lasts. Cross-parity calls, and matching calls left over once
+/// the free slots are used up, stay queued in their original order.
 fn partition_pending_calls(
     queue: std::collections::VecDeque<PendingManualCall>,
     current_side: Option<pancetta_core::slot::SlotParity>,
+    mut free_slots: usize,
 ) -> (
     Vec<PendingManualCall>,
     std::collections::VecDeque<PendingManualCall>,
@@ -420,12 +423,18 @@ fn partition_pending_calls(
     let mut start = Vec::new();
     let mut keep = std::collections::VecDeque::new();
     for p in queue {
-        match (p.desired_tx_parity(), adopt) {
+        let matches_side = match (p.desired_tx_parity(), adopt) {
             // Rides any side, or matches the side we're committing to.
-            (None, _) => start.push(p),
-            (Some(want), Some(side)) if want == side => start.push(p),
+            (None, _) => true,
+            (Some(want), Some(side)) => want == side,
             // Cross-parity: hold until this side clears too.
-            _ => keep.push_back(p),
+            _ => false,
+        };
+        if matches_side && free_slots > 0 {
+            free_slots -= 1;
+            start.push(p);
+        } else {
+            keep.push_back(p);
         }
     }
     (start, keep)
@@ -436,18 +445,30 @@ fn partition_pending_calls(
 ///
 /// Called from the QSO-event task after any QSO goes terminal. Determines the
 /// side we may now commit to — the side our remaining active QSOs hold, or (if
-/// idle) the parity the oldest pending call wants — and starts every pending
-/// call that matches it (concurrent, same window). Cross-parity calls stay
-/// queued until that side, in turn, clears. Never preempts a live QSO.
+/// idle) the parity the oldest pending call wants — and starts pending calls
+/// that match it (concurrent, same window), oldest first, up to the free
+/// capacity (PAN-78: `limits`' cap minus the active count, the same rule as
+/// the manual open gates). Parity decides which calls may start; capacity
+/// decides how many. Cross-parity calls, and matching calls with no free slot,
+/// stay queued in order. Never preempts a live QSO.
+///
+/// Each promoted entry consumes one slot even if it turns out to resolve to an
+/// existing QSO — conservative: it can delay a queued call by one terminal
+/// event but never exceed the cap.
 async fn promote_pending_manual_calls(
     qso_manager: &pancetta_qso::QsoManager,
     pending: &PendingManualCalls,
     message_bus: &MessageBus,
+    limits: &QsoCapacityLimits,
 ) {
     // The parity our still-active QSOs are committed to (None ⇒ idle).
     let current_side = qso_manager.current_tx_side().await;
+    // PAN-78: how many more QSOs may start (saturating: a count already above
+    // the cap, e.g. Fox QSOs left over after Fox mode disengaged, frees none).
+    let snap = limits.snapshot(qso_manager).await;
+    let free_slots = snap.cap.saturating_sub(snap.active);
 
-    let (to_start, keep_depth): (Vec<PendingManualCall>, usize) = {
+    let (to_start, keep_depth, cross_parity): (Vec<PendingManualCall>, usize, usize) = {
         let mut q = pending.lock().await;
         if q.is_empty() {
             return;
@@ -459,13 +480,36 @@ async fn promote_pending_manual_calls(
             q.len()
         );
         let queue = std::mem::take(&mut *q);
-        let (start, keep) = partition_pending_calls(queue, current_side);
+        // The side the partition commits to (for the log line below only).
+        let adopt =
+            current_side.or_else(|| queue.front().and_then(PendingManualCall::desired_tx_parity));
+        let (start, keep) = partition_pending_calls(queue, current_side, free_slots);
         let keep_depth = keep.len();
+        let cross_parity = keep
+            .iter()
+            .filter(|p| match (p.desired_tx_parity(), adopt) {
+                (None, _) => false,
+                (Some(want), Some(side)) => want != side,
+                (Some(_), None) => true,
+            })
+            .count();
         *q = keep;
-        (start, keep_depth)
+        (start, keep_depth, cross_parity)
     };
 
-    if keep_depth > 0 {
+    if keep_depth > cross_parity {
+        // PAN-78: some calls matched the window but found no free slot.
+        info!(
+            target: "qso",
+            "Promote: {} starting, {} still queued (capacity {}/{}, cross-parity {}); current_side={:?}",
+            to_start.len(),
+            keep_depth,
+            snap.active,
+            snap.cap,
+            cross_parity,
+            current_side
+        );
+    } else if keep_depth > 0 {
         info!(
             target: "qso",
             "Promote: {} call(s) starting, {} still queued (cross-parity); current_side={:?}",
@@ -1139,6 +1183,203 @@ fn caller_creation_slot_key(timestamp: std::time::SystemTime) -> u64 {
         / 15
 }
 
+/// PAN-78: the ONE concurrent-QSO capacity rule for every QSO the QSO
+/// component opens (auto-answer, manual opens, queued-call promotion).
+///
+/// Fox mode counts caller-answer QSOs against `fox_max_streams` (the Fox's own
+/// CQ is a separate stream); otherwise every active QSO counts against
+/// `max_concurrent_qsos`. Counts `QsoManager` state (non-terminal QSOs), NOT
+/// `active_tx_qsos` (which keeps completed QSOs for the 45 s TX grace), so the
+/// operator can call the next station the moment a QSO completes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CapacitySnapshot {
+    pub active: usize,
+    pub cap: usize,
+    pub fox_mode: bool,
+}
+
+/// Read the current [`CapacitySnapshot`] (see its doc for the rule).
+pub(crate) async fn capacity_snapshot(
+    qso_manager: &pancetta_qso::QsoManager,
+    max_concurrent: usize,
+    fox_mode: &std::sync::atomic::AtomicBool,
+    fox_max_streams: &std::sync::atomic::AtomicUsize,
+) -> CapacitySnapshot {
+    let is_fox = fox_mode.load(std::sync::atomic::Ordering::Relaxed);
+    let effective_cap = if is_fox {
+        fox_max_streams.load(std::sync::atomic::Ordering::Relaxed)
+    } else {
+        max_concurrent
+    };
+    let active_count = if is_fox {
+        qso_manager.active_caller_qso_count().await
+    } else {
+        qso_manager.active_qso_count().await
+    };
+    CapacitySnapshot {
+        active: active_count,
+        cap: effective_cap,
+        fox_mode: is_fox,
+    }
+}
+
+/// The inputs of [`capacity_snapshot`], bundled so they can be cloned into
+/// the QSO event task (queued-call promotion, PAN-78).
+#[derive(Clone)]
+pub(crate) struct QsoCapacityLimits {
+    pub max_concurrent: usize,
+    pub fox_mode: Arc<std::sync::atomic::AtomicBool>,
+    pub fox_max_streams: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl QsoCapacityLimits {
+    pub(crate) async fn snapshot(
+        &self,
+        qso_manager: &pancetta_qso::QsoManager,
+    ) -> CapacitySnapshot {
+        capacity_snapshot(
+            qso_manager,
+            self.max_concurrent,
+            &self.fox_mode,
+            &self.fox_max_streams,
+        )
+        .await
+    }
+}
+
+/// Which operator action a capacity refusal is for (PAN-78).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManualOpen {
+    /// `StartQso` — Space/Enter on a station, remote `callStation`.
+    Call,
+    /// `RespondToCaller` — reply from the Callers panel, remote `answerCaller`.
+    Reply,
+    /// `EngageHound` — call a Fox.
+    Hound,
+    /// `StartCq` — the `c` key, remote `startCq`.
+    Cq,
+}
+
+fn capacity_limit_label(fox_mode: bool) -> &'static str {
+    if fox_mode {
+        "Fox mode"
+    } else {
+        "max_concurrent_qsos"
+    }
+}
+
+/// "call to K2BBB" / "reply to K2BBB" / "Hound call to K2BBB" / "CQ" — the
+/// object of a capacity-refusal diagnostic or remote reason.
+fn manual_open_object(open: ManualOpen, callsign: Option<&str>) -> String {
+    let cs = callsign.unwrap_or("?");
+    match open {
+        ManualOpen::Call => format!("call to {cs}"),
+        ManualOpen::Reply => format!("reply to {cs}"),
+        ManualOpen::Hound => format!("Hound call to {cs}"),
+        ManualOpen::Cq => "CQ".to_string(),
+    }
+}
+
+/// Operator status-bar line for a manual open refused at capacity (PAN-78).
+fn manual_capacity_status(
+    open: ManualOpen,
+    callsign: Option<&str>,
+    snap: CapacitySnapshot,
+) -> String {
+    let cs = callsign.unwrap_or("?");
+    let verb = match open {
+        ManualOpen::Call => format!("calling {cs}"),
+        ManualOpen::Reply => format!("replying to {cs}"),
+        ManualOpen::Hound => format!("calling Fox {cs}"),
+        ManualOpen::Cq => "calling CQ".to_string(),
+    };
+    format!(
+        "Not {verb} — {}/{} QSOs active ({}); finish or abort one first",
+        snap.active,
+        snap.cap,
+        capacity_limit_label(snap.fox_mode)
+    )
+}
+
+/// Reason relayed to remote clients (as `TxDenied`) for a manual open refused
+/// at capacity (PAN-78).
+fn manual_capacity_remote_reason(
+    open: ManualOpen,
+    callsign: Option<&str>,
+    snap: CapacitySnapshot,
+) -> String {
+    format!(
+        "{} refused — at capacity {}/{} ({})",
+        manual_open_object(open, callsign),
+        snap.active,
+        snap.cap,
+        capacity_limit_label(snap.fox_mode)
+    )
+}
+
+/// PAN-78: is there room for a manual open that would ADD an active QSO?
+/// Returns the snapshot to refuse with when there is not.
+async fn manual_open_at_capacity(
+    qso_manager: &pancetta_qso::QsoManager,
+    max_concurrent: usize,
+    fox_mode: &std::sync::atomic::AtomicBool,
+    fox_max_streams: &std::sync::atomic::AtomicUsize,
+) -> Option<CapacitySnapshot> {
+    let snap = capacity_snapshot(qso_manager, max_concurrent, fox_mode, fox_max_streams).await;
+    match pancetta_qso::qso_manager::admit_within_capacity(snap.active, snap.cap) {
+        pancetta_qso::qso_manager::CapacityAdmission::Admit => None,
+        pancetta_qso::qso_manager::CapacityAdmission::AtCapacity { .. } => Some(snap),
+    }
+}
+
+/// PAN-78: refuse (never queue) a manual open at capacity — log it, add a
+/// Warn Diagnostics entry, put the reason on the status bar and, for a remote
+/// request, relay a `TxDenied` to the gateway (additive-only: gated on
+/// `display_feed_enabled`, like every other gateway send).
+async fn refuse_manual_open_at_capacity(
+    message_bus: &MessageBus,
+    display_feed_enabled: &std::sync::atomic::AtomicBool,
+    open: ManualOpen,
+    callsign: Option<&str>,
+    snap: CapacitySnapshot,
+    remote_origin: bool,
+) {
+    info!(
+        target: "qso",
+        "Refusing manual {:?} for {} — at capacity {}/{} (fox_mode={}, remote={})",
+        open,
+        callsign.unwrap_or("CQ"),
+        snap.active,
+        snap.cap,
+        snap.fox_mode,
+        remote_origin
+    );
+    emit_skip_diagnostic(
+        message_bus,
+        SkipSite::ManualOpenAtCapacity {
+            open,
+            callsign: callsign.map(str::to_string),
+            active: snap.active,
+            cap: snap.cap,
+            fox_mode: snap.fox_mode,
+        },
+    )
+    .await;
+    emit_status(message_bus, manual_capacity_status(open, callsign, snap)).await;
+    if remote_origin {
+        super::remote_gateway::relay_to_gateway(
+            message_bus,
+            display_feed_enabled,
+            ComponentId::Qso,
+            MessageType::TxDenied {
+                reason: manual_capacity_remote_reason(open, callsign, snap),
+                qso_id: None,
+            },
+        )
+        .await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn maybe_answer_caller(
     msg_type: &pancetta_qso::states::MessageType,
@@ -1219,26 +1460,21 @@ async fn maybe_answer_caller(
     //    this yields 5 Hounds + 1 CQ = 6 total streams (≤ MAX_RETAINED_TX_STREAMS=8).
     //    The non-Fox path is UNCHANGED (active_qso_count vs max_concurrent —
     //    regression guard).
-    let is_fox = fox_mode.load(std::sync::atomic::Ordering::Relaxed);
-    let effective_cap = if is_fox {
-        fox_max_streams.load(std::sync::atomic::Ordering::Relaxed)
-    } else {
-        max_concurrent
-    };
-    let active_count = if is_fox {
-        qso_manager.active_caller_qso_count().await
-    } else {
-        qso_manager.active_qso_count().await
-    };
-    if active_count >= effective_cap {
-        debug!(target: "qso", "Not auto-answering {} — at capacity {}/{}", answer.their_call, active_count, effective_cap);
+    //
+    //    PAN-78: the rule itself now lives in `capacity_snapshot`, shared with
+    //    the manual open gates and queued-call promotion.
+    let snap = capacity_snapshot(qso_manager, max_concurrent, fox_mode, fox_max_streams).await;
+    if let pancetta_qso::qso_manager::CapacityAdmission::AtCapacity { active, cap } =
+        pancetta_qso::qso_manager::admit_within_capacity(snap.active, snap.cap)
+    {
+        debug!(target: "qso", "Not auto-answering {} — at capacity {}/{}", answer.their_call, active, cap);
         emit_skip_diagnostic(
             message_bus,
             SkipSite::AutoAnswerAtCapacity {
                 callsign: answer.their_call.clone(),
-                active: active_count,
-                cap: effective_cap,
-                fox_mode: is_fox,
+                active,
+                cap,
+                fox_mode: snap.fox_mode,
             },
         )
         .await;
@@ -1379,6 +1615,14 @@ pub(crate) enum SkipSite {
         cap: usize,
         fox_mode: bool,
     },
+    /// PAN-78: a manual open refused because it would exceed the cap.
+    ManualOpenAtCapacity {
+        open: ManualOpen,
+        callsign: Option<String>,
+        active: usize,
+        cap: usize,
+        fox_mode: bool,
+    },
 }
 
 pub(crate) struct SkipDiagnostic {
@@ -1401,6 +1645,12 @@ pub(crate) fn skip_diagnostic(site: SkipSite) -> SkipDiagnostic {
         }
         SkipSite::AutoAnswerCrossParity { callsign, active_side } => SkipDiagnostic { target: "qso", level: L::Info, text: format!("Skipped auto-answer to {callsign} — cross-parity (active side {active_side:?}); queue manually to override"), callsign: Some(callsign) },
         SkipSite::AutoAnswerAtCapacity { callsign, active, cap, fox_mode } => SkipDiagnostic { target: "qso", level: L::Info, text: format!("Skipped auto-answer to {callsign} — at capacity {active}/{cap}{}", if fox_mode { " (Fox mode)" } else { "" }), callsign: Some(callsign) },
+        SkipSite::ManualOpenAtCapacity { open, callsign, active, cap, fox_mode } => {
+            let what = manual_open_object(open, callsign.as_deref());
+            let limit = capacity_limit_label(fox_mode);
+            let callsign = if open == ManualOpen::Cq { None } else { callsign };
+            SkipDiagnostic { target: "qso", level: L::Warn, text: format!("Refused {what} — at capacity {active}/{cap} ({limit})"), callsign }
+        }
     }
 }
 
@@ -1738,6 +1988,70 @@ mod pan6_diagnostic_tests {
         assert!(diagnostics.iter().all(|d| !d.text.starts_with("QSO with")
             && !d.text.starts_with("QSO failed:")
             && !d.text.starts_with("dropping stale")));
+    }
+
+    /// PAN-78: exact wording of the manual-open capacity refusal — the
+    /// Diagnostics entry, the status-bar line and the remote reason — for
+    /// every entry point, Fox mode on and off.
+    #[test]
+    fn manual_open_at_capacity_wording() {
+        use pancetta_core::DiagnosticLevel;
+        let cases: &[(ManualOpen, Option<&str>, &str, &str)] = &[
+            (
+                ManualOpen::Call,
+                Some("K2BBB"),
+                "call to K2BBB",
+                "calling K2BBB",
+            ),
+            (
+                ManualOpen::Reply,
+                Some("K2BBB"),
+                "reply to K2BBB",
+                "replying to K2BBB",
+            ),
+            (
+                ManualOpen::Hound,
+                Some("K2BBB"),
+                "Hound call to K2BBB",
+                "calling Fox K2BBB",
+            ),
+            (ManualOpen::Cq, None, "CQ", "calling CQ"),
+        ];
+        for &(open, callsign, what, verb) in cases {
+            for (fox_mode, limit) in [(false, "max_concurrent_qsos"), (true, "Fox mode")] {
+                let snap = CapacitySnapshot {
+                    active: 1,
+                    cap: 1,
+                    fox_mode,
+                };
+                let d = skip_diagnostic(SkipSite::ManualOpenAtCapacity {
+                    open,
+                    callsign: callsign.map(str::to_string),
+                    active: snap.active,
+                    cap: snap.cap,
+                    fox_mode,
+                });
+                assert_eq!(
+                    d.text,
+                    format!("Refused {what} — at capacity 1/1 ({limit})")
+                );
+                assert_eq!(d.level, DiagnosticLevel::Warn);
+                assert_eq!(d.target, "qso");
+                if open == ManualOpen::Cq {
+                    assert_eq!(d.callsign, None, "a CQ has no callsign to attribute");
+                } else {
+                    assert_eq!(d.callsign.as_deref(), callsign);
+                }
+                assert_eq!(
+                    manual_capacity_status(open, callsign, snap),
+                    format!("Not {verb} — 1/1 QSOs active ({limit}); finish or abort one first")
+                );
+                assert_eq!(
+                    manual_capacity_remote_reason(open, callsign, snap),
+                    format!("{what} refused — at capacity 1/1 ({limit})")
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -3039,6 +3353,11 @@ impl super::ApplicationCoordinator {
                     });
                 }
 
+                // PAN-78: the manual open handlers (message loop below) relay
+                // capacity refusals to remote clients through the same gate;
+                // cloned here because the event task shadows the original.
+                let display_feed_for_admission = display_feed_enabled.clone();
+
                 // Spawn a task to forward QSO auto-sequence TX requests to the transmitter
                 // and update AP decoding state for the FT8 decoder thread.
                 let mut qso_events = qso_manager.subscribe();
@@ -3058,6 +3377,13 @@ impl super::ApplicationCoordinator {
                 let dx_activity_for_events = dx_activity.clone();
                 let display_feed_enabled = display_feed_enabled.clone();
                 let pending_qso_offset_requests = pending_qso_offset_requests.clone();
+                // PAN-78: the capacity rule queued-call promotion applies
+                // (same inputs as the manual open gates / auto-answer).
+                let capacity_for_events = QsoCapacityLimits {
+                    max_concurrent: auto_answer_max_concurrent,
+                    fox_mode: fox_mode.clone(),
+                    fox_max_streams: fox_max_streams.clone(),
+                };
                 tokio::spawn(async move {
                     // Task 5 (gap 2/4): built once for this task's lifetime,
                     // mirroring the autonomous operator's own scorer
@@ -3126,6 +3452,7 @@ impl super::ApplicationCoordinator {
                                                 &snapshot_qso_manager,
                                                 &pending_for_events,
                                                 &snapshot_bus,
+                                                &capacity_for_events,
                                             )
                                             .await;
                                         }
@@ -3435,6 +3762,7 @@ impl super::ApplicationCoordinator {
                                     let promote_mgr = snapshot_qso_manager.clone();
                                     let promote_pending = pending_for_events.clone();
                                     let promote_bus = snapshot_bus.clone();
+                                    let promote_limits = capacity_for_events.clone();
                                     tokio::spawn(async move {
                                         tokio::time::sleep(completed_tx_grace).await;
                                         if let Ok(mut s) = set.write() {
@@ -3455,6 +3783,7 @@ impl super::ApplicationCoordinator {
                                             &promote_mgr,
                                             &promote_pending,
                                             &promote_bus,
+                                            &promote_limits,
                                         )
                                         .await;
                                     });
@@ -3642,6 +3971,7 @@ impl super::ApplicationCoordinator {
                                         &snapshot_qso_manager,
                                         &pending_for_events,
                                         &snapshot_bus,
+                                        &capacity_for_events,
                                     )
                                     .await;
                                 }
@@ -4248,6 +4578,41 @@ impl super::ApplicationCoordinator {
                                                     held, hold_mode, dx_freq, tx_off, active.len()
                                                 );
                                             }
+                                            // PAN-78: capacity gate. Refuse (never queue) a manual call
+                                            // that would ADD an active QSO while `max_concurrent_qsos`
+                                            // are already active — the TX cap only sees requests drained
+                                            // in the same cycle, so an idle active QSO is invisible to
+                                            // it. Re-calls / same-call supersedes add nothing and pass.
+                                            // Runs after the parity gate, so a cross-parity call still
+                                            // queues; promotion applies the cap when it starts.
+                                            if qso_manager
+                                                .manual_open_adds_active_qso(
+                                                    &callsign,
+                                                    tx_off,
+                                                    pancetta_core::ResponseStep::Grid,
+                                                )
+                                                .await
+                                            {
+                                                if let Some(snap) = manual_open_at_capacity(
+                                                    &qso_manager,
+                                                    auto_answer_max_concurrent,
+                                                    &fox_mode,
+                                                    &fox_max_streams,
+                                                )
+                                                .await
+                                                {
+                                                    refuse_manual_open_at_capacity(
+                                                        &message_bus,
+                                                        &display_feed_for_admission,
+                                                        ManualOpen::Call,
+                                                        Some(&callsign),
+                                                        snap,
+                                                        remote_origin,
+                                                    )
+                                                    .await;
+                                                    continue;
+                                                }
+                                            }
                                             // respond_to_cq_with (Manual) emits the first
                                             // CqResponse as a QsoEvent::MessageToSend,
                                             // which the event-forwarding task above turns
@@ -4615,6 +4980,28 @@ impl super::ApplicationCoordinator {
                                                 .await;
                                                 continue;
                                             }
+                                            // PAN-78: capacity gate. `engage_hound` always opens a new
+                                            // QSO (no reuse path), so no predicate. EngageHound carries
+                                            // no remote origin.
+                                            if let Some(snap) = manual_open_at_capacity(
+                                                &qso_manager,
+                                                auto_answer_max_concurrent,
+                                                &fox_mode,
+                                                &fox_max_streams,
+                                            )
+                                            .await
+                                            {
+                                                refuse_manual_open_at_capacity(
+                                                    &message_bus,
+                                                    &display_feed_for_admission,
+                                                    ManualOpen::Hound,
+                                                    Some(&callsign),
+                                                    snap,
+                                                    false,
+                                                )
+                                                .await;
+                                                continue;
+                                            }
                                             // Same/idle parity: start the Hound QSO now.
                                             // engage_hound sets hound=true, partner_freq,
                                             // low calling offset, and emits the opening
@@ -4834,6 +5221,33 @@ impl super::ApplicationCoordinator {
                                                     held, hold_mode, dx_freq, tx_off
                                                 );
                                             }
+                                            // PAN-78: capacity gate — same rule as StartQso. A reply
+                                            // that continues/re-keys an existing QSO (or `SeventyThree`,
+                                            // which opens at Completed) adds nothing and always passes.
+                                            if qso_manager
+                                                .manual_open_adds_active_qso(&callsign, tx_off, step)
+                                                .await
+                                            {
+                                                if let Some(snap) = manual_open_at_capacity(
+                                                    &qso_manager,
+                                                    auto_answer_max_concurrent,
+                                                    &fox_mode,
+                                                    &fox_max_streams,
+                                                )
+                                                .await
+                                                {
+                                                    refuse_manual_open_at_capacity(
+                                                        &message_bus,
+                                                        &display_feed_for_admission,
+                                                        ManualOpen::Reply,
+                                                        Some(&callsign),
+                                                        snap,
+                                                        remote_origin,
+                                                    )
+                                                    .await;
+                                                    continue;
+                                                }
+                                            }
                                             // Operator picked a station calling US from the
                                             // Callers panel and chose (or accepted the smart
                                             // default for) which sequence step to open at.
@@ -5015,6 +5429,28 @@ impl super::ApplicationCoordinator {
                                             remote_origin,
                                             remote_client_key_id,
                                         } => {
+                                            // PAN-78: capacity gate. A manual CQ always opens a new
+                                            // `CallingCq` QSO, a stream the TX cap counts. (Fox engage
+                                            // starts its CQ via `start_cq_manual` directly, not here.)
+                                            if let Some(snap) = manual_open_at_capacity(
+                                                &qso_manager,
+                                                auto_answer_max_concurrent,
+                                                &fox_mode,
+                                                &fox_max_streams,
+                                            )
+                                            .await
+                                            {
+                                                refuse_manual_open_at_capacity(
+                                                    &message_bus,
+                                                    &display_feed_for_admission,
+                                                    ManualOpen::Cq,
+                                                    None,
+                                                    snap,
+                                                    remote_origin,
+                                                )
+                                                .await;
+                                                continue;
+                                            }
                                             match qso_manager
                                                 .start_cq_manual(
                                                     frequency as f64,
@@ -5898,7 +6334,7 @@ mod pending_manual_tests {
         )]
         .into();
         // Committed to Even already: the Odd-wanting caller-response stays queued.
-        let (start, keep) = partition_pending_calls(q, Some(SlotParity::Even));
+        let (start, keep) = partition_pending_calls(q, Some(SlotParity::Even), usize::MAX);
         assert!(
             start.is_empty(),
             "opposite-parity caller-response must not start"
@@ -5917,7 +6353,7 @@ mod pending_manual_tests {
             pancetta_core::ResponseStep::Report,
         )]
         .into();
-        let (start, keep) = partition_pending_calls(q, Some(SlotParity::Odd));
+        let (start, keep) = partition_pending_calls(q, Some(SlotParity::Odd), usize::MAX);
         assert_eq!(names(&start), vec!["DX1"]);
         assert!(keep.is_empty());
     }
@@ -5932,7 +6368,7 @@ mod pending_manual_tests {
         ]
         .into();
         // Idle: adopt oldest (A wants Odd). A & C start, B stays.
-        let (start, keep) = partition_pending_calls(q, None);
+        let (start, keep) = partition_pending_calls(q, None, usize::MAX);
         assert_eq!(names(&start), vec!["A", "C"]);
         assert_eq!(names(&keep.into_iter().collect::<Vec<_>>()), vec!["B"]);
     }
@@ -5945,7 +6381,7 @@ mod pending_manual_tests {
         ]
         .into();
         // We're committed to Odd already: only A (wants Odd) joins; B waits.
-        let (start, keep) = partition_pending_calls(q, Some(SlotParity::Odd));
+        let (start, keep) = partition_pending_calls(q, Some(SlotParity::Odd), usize::MAX);
         assert_eq!(names(&start), vec!["A"]);
         assert_eq!(names(&keep.into_iter().collect::<Vec<_>>()), vec!["B"]);
     }
@@ -5954,16 +6390,62 @@ mod pending_manual_tests {
     fn committed_side_with_no_match_keeps_all() {
         let q: VecDeque<_> = [call("B", SlotParity::Odd)].into(); // wants Even
                                                                   // Committed to Odd, only an Even-wanting call queued → nothing promotes.
-        let (start, keep) = partition_pending_calls(q, Some(SlotParity::Odd));
+        let (start, keep) = partition_pending_calls(q, Some(SlotParity::Odd), usize::MAX);
         assert!(start.is_empty());
         assert_eq!(names(&keep.into_iter().collect::<Vec<_>>()), vec!["B"]);
     }
 
     #[test]
     fn empty_queue_is_noop() {
-        let (start, keep) = partition_pending_calls(VecDeque::new(), None);
+        let (start, keep) = partition_pending_calls(VecDeque::new(), None, usize::MAX);
         assert!(start.is_empty());
         assert!(keep.is_empty());
+    }
+
+    // ── PAN-78: capacity-bounded partition ───────────────────────────────
+
+    #[test]
+    fn partition_with_one_free_slot_starts_only_the_oldest_matching() {
+        let q: VecDeque<_> = [
+            call("A", SlotParity::Odd),  // want Even
+            call("B", SlotParity::Odd),  // want Even
+            call("C", SlotParity::Even), // want Odd
+        ]
+        .into();
+        // Idle: adopt A's side (Even). A and B match, but only one slot is free.
+        let (start, keep) = partition_pending_calls(q, None, 1);
+        assert_eq!(names(&start), vec!["A"]);
+        assert_eq!(names(&keep.into_iter().collect::<Vec<_>>()), vec!["B", "C"]);
+    }
+
+    #[test]
+    fn partition_with_zero_free_slots_starts_nothing_and_keeps_order() {
+        let q: VecDeque<_> = [
+            call("A", SlotParity::Odd),
+            call("B", SlotParity::Even),
+            call("C", SlotParity::Odd),
+        ]
+        .into();
+        let (start, keep) = partition_pending_calls(q, None, 0);
+        assert!(start.is_empty());
+        assert_eq!(
+            names(&keep.into_iter().collect::<Vec<_>>()),
+            vec!["A", "B", "C"]
+        );
+    }
+
+    #[test]
+    fn partition_skips_cross_parity_without_spending_slots() {
+        let q: VecDeque<_> = [
+            call("X", SlotParity::Odd),  // want Even (cross-parity)
+            call("A", SlotParity::Even), // want Odd
+            call("B", SlotParity::Even), // want Odd
+        ]
+        .into();
+        // Committed to Odd: X is skipped without consuming the one free slot.
+        let (start, keep) = partition_pending_calls(q, Some(SlotParity::Odd), 1);
+        assert_eq!(names(&start), vec!["A"]);
+        assert_eq!(names(&keep.into_iter().collect::<Vec<_>>()), vec!["X", "B"]);
     }
 
     // ── TTL / partition_expired tests ────────────────────────────────────────
@@ -6157,7 +6639,7 @@ mod pending_manual_tests {
     // `respond_to_cq_with` (which would always reopen at `RespondingToCq`
     // regardless of what step the operator actually chose).
 
-    use super::{promote_pending_manual_calls, PendingManualCalls};
+    use super::{promote_pending_manual_calls, PendingManualCalls, QsoCapacityLimits};
     use crate::message_bus::MessageBus;
     use pancetta_qso::{QsoManager, QsoManagerConfig, QsoState};
     use std::sync::Arc;
@@ -6171,6 +6653,109 @@ mod pending_manual_tests {
         });
         m.start().await.expect("manager start");
         m
+    }
+
+    /// Non-Fox capacity limits with `max_concurrent_qsos = max_concurrent`.
+    fn limits(max_concurrent: usize) -> QsoCapacityLimits {
+        QsoCapacityLimits {
+            max_concurrent,
+            fox_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fox_max_streams: Arc::new(std::sync::atomic::AtomicUsize::new(5)),
+        }
+    }
+
+    /// A StartQso-shaped queued call (DX on Even ⇒ wants Odd) at `offset_hz`.
+    fn even_dx_call_at(name: &str, offset_hz: f64) -> super::PendingManualCall {
+        let mut p = call(name, SlotParity::Even);
+        p.frequency_hz = offset_hz;
+        p
+    }
+
+    fn queued_names(q: &VecDeque<super::PendingManualCall>) -> Vec<String> {
+        q.iter().map(|p| p.callsign.clone()).collect()
+    }
+
+    /// PAN-78: the scratch reproduction (`pan78_scratch_promotion_ignores_cap`)
+    /// inverted — three same-side queued calls promoted from idle with the
+    /// default cap of 1 start exactly one QSO (the oldest); the other two
+    /// stay queued in FIFO order.
+    #[tokio::test]
+    async fn promotion_respects_cap_from_idle() {
+        let mgr = test_manager("K5ARH").await;
+        let bus = MessageBus::new(1000).expect("bus");
+        let pending: PendingManualCalls = Arc::new(TokioMutex::new(VecDeque::from([
+            even_dx_call_at("JA1AAA", 1000.0),
+            even_dx_call_at("JA2BBB", 1500.0),
+            even_dx_call_at("JA3CCC", 2000.0),
+        ])));
+
+        promote_pending_manual_calls(&mgr, &pending, &bus, &limits(1)).await;
+
+        assert_eq!(mgr.active_qso_count().await, 1, "cap 1 ⇒ one QSO starts");
+        let active = mgr.get_active_qsos().await;
+        assert_eq!(
+            active[0].1.metadata.their_callsign.as_deref(),
+            Some("JA1AAA"),
+            "the oldest queued call starts first"
+        );
+        assert_eq!(
+            queued_names(&*pending.lock().await),
+            vec!["JA2BBB", "JA3CCC"],
+            "the rest stay queued in FIFO order"
+        );
+    }
+
+    #[tokio::test]
+    async fn promotion_fills_only_free_slots() {
+        let mgr = test_manager("K5ARH").await;
+        let bus = MessageBus::new(1000).expect("bus");
+        // One same-side QSO already active (DX Even ⇒ we TX Odd).
+        mgr.respond_to_cq_manual("W9ACT".to_string(), 700.0, Some(SlotParity::Even))
+            .await
+            .expect("open active QSO");
+        let pending: PendingManualCalls = Arc::new(TokioMutex::new(VecDeque::from([
+            even_dx_call_at("JA1AAA", 1000.0),
+            even_dx_call_at("JA2BBB", 1500.0),
+            even_dx_call_at("JA3CCC", 2000.0),
+        ])));
+
+        promote_pending_manual_calls(&mgr, &pending, &bus, &limits(2)).await;
+
+        assert_eq!(
+            mgr.active_qso_count().await,
+            2,
+            "cap 2, one active ⇒ one starts"
+        );
+        assert_eq!(
+            queued_names(&*pending.lock().await),
+            vec!["JA2BBB", "JA3CCC"]
+        );
+    }
+
+    #[tokio::test]
+    async fn promotion_with_no_free_slot_keeps_queue_intact() {
+        let mgr = test_manager("K5ARH").await;
+        let bus = MessageBus::new(1000).expect("bus");
+        mgr.respond_to_cq_manual("W9ACT".to_string(), 700.0, Some(SlotParity::Even))
+            .await
+            .expect("open active QSO");
+        let pending: PendingManualCalls = Arc::new(TokioMutex::new(VecDeque::from([
+            even_dx_call_at("JA1AAA", 1000.0),
+            even_dx_call_at("JA2BBB", 1500.0),
+        ])));
+
+        promote_pending_manual_calls(&mgr, &pending, &bus, &limits(1)).await;
+
+        assert_eq!(
+            mgr.active_qso_count().await,
+            1,
+            "no free slot ⇒ nothing starts"
+        );
+        assert_eq!(
+            queued_names(&*pending.lock().await),
+            vec!["JA1AAA", "JA2BBB"],
+            "queue unchanged"
+        );
     }
 
     /// A `RespondToCaller` (step = Report) queued because it wanted the
@@ -6193,7 +6778,7 @@ mod pending_manual_tests {
         // Idle (no active QSOs) — `promote_pending_manual_calls` will adopt
         // the queue's own desired parity (Odd, opposite of Even) as the side
         // to commit to, and start it.
-        promote_pending_manual_calls(&mgr, &pending, &bus).await;
+        promote_pending_manual_calls(&mgr, &pending, &bus, &limits(1)).await;
 
         assert!(
             pending.lock().await.is_empty(),
@@ -10454,5 +11039,508 @@ mod respond_to_caller_admission_tests {
             "a late subscriber (the Autonomous task) must be seeded with the \
              stored QsoManager, or drain_pending_qso_offset_requests never runs"
         );
+    }
+}
+
+#[cfg(test)]
+mod manual_capacity_admission_tests {
+    //! PAN-78: `max_concurrent_qsos` is enforced when a MANUAL QSO is
+    //! admitted (`StartQso`, `RespondToCaller`, `EngageHound`, `StartCq`),
+    //! not only by the TX worker's coalescer — which only sees the
+    //! `TransmitRequest`s drained in one cycle, so a QSO that has
+    //! transmitted and is now idle (waiting for a reply) is invisible to it.
+    //!
+    //! Exercises the REAL `start_qso_component` message loop over the real
+    //! message bus. `test_coordinator` / the drain helpers are local copies of
+    //! `respond_to_caller_admission_tests`' (no shared helper exists); see
+    //! that module's doc for why `--replay` is set (never touch the real
+    //! logbook).
+    use super::super::ApplicationCoordinator;
+    use crate::message_bus::{ComponentId, ComponentMessage, MessageType, QsoMessage};
+    use pancetta_config::Config;
+    use pancetta_core::slot::SlotParity;
+    use pancetta_core::{DiagnosticLevel, ResponseStep};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    type Rx = crossbeam_channel::Receiver<ComponentMessage>;
+
+    async fn test_coordinator() -> ApplicationCoordinator {
+        let config = Config::default();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut coordinator = ApplicationCoordinator::new(
+            config,
+            None,
+            true,  // no_audio
+            true,  // headless
+            false, // metrics
+            9090,
+            None,                                                // no WAV
+            Some(std::path::PathBuf::from("/some/capture/dir")), // --replay: never touch the real logbook
+            None,                                                // no test-tx
+            1500.0,
+            shutdown,
+            Vec::new(),                                             // no config warnings
+            std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
+            true,                                                   // test-only: assume TOML
+        )
+        .await
+        .expect("coordinator creation should succeed");
+
+        coordinator.pancetta_home_override = Some(std::env::temp_dir().join(format!(
+            "pancetta-test-home-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        )));
+
+        coordinator
+    }
+
+    /// A started QSO component with `max_concurrent_qsos = cap`, plus the
+    /// Tui, Ft8Transmitter and RemoteGateway receivers.
+    struct Harness {
+        coordinator: ApplicationCoordinator,
+        manager: pancetta_qso::QsoManager,
+        tui: Rx,
+        tx: Rx,
+        gateway: Rx,
+        // Keep the senders alive so the channels stay registered.
+        _senders: Vec<crossbeam_channel::Sender<ComponentMessage>>,
+    }
+
+    async fn harness(cap: u32, display_feed: bool) -> Harness {
+        let mut coordinator = test_coordinator().await;
+        {
+            let mut cfg = coordinator.config.write().await;
+            cfg.station.callsign = "K1TEST".to_string();
+            cfg.station.grid_square = "FN42".to_string();
+            cfg.autonomous.max_concurrent_qsos = cap;
+        }
+        coordinator
+            .display_feed_enabled
+            .store(display_feed, Ordering::Relaxed);
+        let bus = &coordinator.message_bus;
+        let (tui_s, tui) = bus.create_channel(ComponentId::Tui).await.unwrap();
+        let (tx_s, tx) = bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        let (gw_s, gateway) = bus
+            .create_channel(ComponentId::RemoteGateway)
+            .await
+            .unwrap();
+        coordinator.start_qso_component().await.unwrap();
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        Harness {
+            coordinator,
+            manager,
+            tui,
+            tx,
+            gateway,
+            _senders: vec![tui_s, tx_s, gw_s],
+        }
+    }
+
+    impl Harness {
+        async fn send(&self, msg: QsoMessage) {
+            self.coordinator
+                .message_bus
+                .send_message(ComponentMessage::new(
+                    ComponentId::Tui,
+                    ComponentId::Qso,
+                    MessageType::QsoMessage(msg),
+                    Instant::now(),
+                ))
+                .await
+                .unwrap();
+        }
+
+        async fn start_qso(&self, call: &str, frequency: u64) {
+            self.send(QsoMessage::StartQso {
+                callsign: call.to_string(),
+                frequency,
+                dx_parity: Some(SlotParity::Even),
+                remote_origin: false,
+                remote_client_key_id: None,
+            })
+            .await;
+        }
+
+        /// Open QSO A and wait until its opening `TransmitRequest` has been
+        /// drained — A has transmitted its cycle and is now idle.
+        async fn open_idle_qso_a(&self) {
+            self.start_qso("K1AAA", 1500).await;
+            let tx = collect_until(&self.tx, |m| {
+                tx_text(m).is_some_and(|t| t.contains("K1AAA"))
+            })
+            .await;
+            let a_requests: Vec<_> = tx.iter().filter_map(tx_text).collect();
+            assert_eq!(
+                a_requests.iter().filter(|t| t.contains("K1AAA")).count(),
+                1,
+                "QSO A must emit exactly one opening TransmitRequest: {a_requests:?}"
+            );
+            assert_eq!(self.manager.active_qso_count().await, 1);
+            // Settle A's own Tui traffic (status, snapshot pushes).
+            let _ = collect_quiet(&self.tui, 300).await;
+        }
+    }
+
+    /// Collect EVERY message until one satisfies `pred` (or ~5 s pass), then
+    /// keep collecting until the channel has been quiet for 100 ms.
+    async fn collect_until(
+        rx: &Rx,
+        pred: impl Fn(&ComponentMessage) -> bool,
+    ) -> Vec<ComponentMessage> {
+        let mut out = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(m) => {
+                    let hit = pred(&m);
+                    out.push(m);
+                    if hit {
+                        out.extend(collect_quiet(rx, 100).await);
+                        return out;
+                    }
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+        out
+    }
+
+    /// Collect every message until the channel has been quiet for `quiet_ms`.
+    async fn collect_quiet(rx: &Rx, quiet_ms: u64) -> Vec<ComponentMessage> {
+        let mut out = Vec::new();
+        let mut idle_since = Instant::now();
+        loop {
+            match rx.try_recv() {
+                Ok(m) => {
+                    out.push(m);
+                    idle_since = Instant::now();
+                }
+                Err(_) => {
+                    if idle_since.elapsed() >= Duration::from_millis(quiet_ms) {
+                        return out;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+    }
+
+    fn tx_text(m: &ComponentMessage) -> Option<&str> {
+        match &m.message_type {
+            MessageType::TransmitRequest { message_text, .. } => Some(message_text.as_str()),
+            _ => None,
+        }
+    }
+
+    fn status(m: &ComponentMessage) -> Option<&str> {
+        match &m.message_type {
+            MessageType::StatusUpdate(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    fn statuses(msgs: &[ComponentMessage]) -> Vec<&str> {
+        msgs.iter().filter_map(status).collect()
+    }
+
+    fn any_tx_containing(msgs: &[ComponentMessage], needle: &str) -> bool {
+        msgs.iter().filter_map(tx_text).any(|t| t.contains(needle))
+    }
+
+    fn has_capacity_diagnostic(msgs: &[ComponentMessage], call: Option<&str>) -> bool {
+        msgs.iter().any(|m| {
+            matches!(
+                &m.message_type,
+                MessageType::DiagnosticEvent { target, level, text, callsign, .. }
+                    if *target == "qso"
+                        && *level == DiagnosticLevel::Warn
+                        && callsign.as_deref() == call
+                        && text.contains("at capacity 1/1")
+            )
+        })
+    }
+
+    fn refused_status(open: &str) -> String {
+        format!("Not {open} — 1/1 QSOs active (max_concurrent_qsos); finish or abort one first")
+    }
+
+    /// The ticket's regression test (PAN-78 acceptance criterion): QSO A has
+    /// transmitted its cycle and is idle (no pending `TransmitRequest`); with
+    /// `max_concurrent_qsos = 1`, manually starting QSO B must not transmit
+    /// while A remains active. On `14ae9f1` B was admitted (2 active) and its
+    /// `TransmitRequest` reached the TX worker.
+    #[tokio::test]
+    async fn staggered_manual_start_is_refused_while_idle_qso_is_active() {
+        let h = harness(1, false).await;
+        h.open_idle_qso_a().await;
+
+        h.start_qso("K2BBB", 2000).await;
+        let expected = refused_status("calling K2BBB");
+        let tui = collect_until(&h.tui, |m| status(m) == Some(expected.as_str())).await;
+        let tx = collect_quiet(&h.tx, 300).await;
+
+        assert!(
+            !any_tx_containing(&tx, "K2BBB"),
+            "B must never reach the TX worker while A is active: {tx:?}"
+        );
+        assert_eq!(h.manager.active_qso_count().await, 1);
+        assert!(!h.manager.has_active_qso_with("K2BBB").await);
+        assert!(
+            statuses(&tui).contains(&expected.as_str()),
+            "expected the refusal status line; observed: {:?}",
+            statuses(&tui)
+        );
+        assert!(
+            has_capacity_diagnostic(&tui, Some("K2BBB")),
+            "expected a Warn `qso` capacity diagnostic for K2BBB; observed: {tui:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_start_admitted_when_below_cap() {
+        let h = harness(2, false).await;
+        h.open_idle_qso_a().await;
+
+        h.start_qso("K2BBB", 2000).await;
+        let tx = collect_until(&h.tx, |m| tx_text(m).is_some_and(|t| t.contains("K2BBB"))).await;
+        assert!(
+            any_tx_containing(&tx, "K2BBB"),
+            "B must transmit below the cap: {tx:?}"
+        );
+        assert_eq!(h.manager.active_qso_count().await, 2);
+        let tui = collect_until(&h.tui, |m| {
+            status(m).is_some_and(|s| s.starts_with("Calling K2BBB"))
+        })
+        .await;
+        assert!(
+            statuses(&tui).contains(&"Calling K2BBB — TX queued (2000 Hz)"),
+            "observed: {:?}",
+            statuses(&tui)
+        );
+        assert!(!statuses(&tui).iter().any(|s| s.starts_with("Not calling")));
+    }
+
+    #[tokio::test]
+    async fn recall_of_active_station_is_not_refused_at_capacity() {
+        let h = harness(1, false).await;
+        h.open_idle_qso_a().await;
+
+        // FIX 1 idempotent keep-call: resolves to A, adds nothing.
+        h.start_qso("K1AAA", 1500).await;
+        let tx = collect_until(&h.tx, |m| tx_text(m).is_some_and(|t| t.contains("K1AAA"))).await;
+        assert!(
+            any_tx_containing(&tx, "K1AAA"),
+            "the re-call must re-send A's current frame: {tx:?}"
+        );
+        let tui = collect_quiet(&h.tui, 300).await;
+        assert!(
+            !statuses(&tui).iter().any(|s| s.starts_with("Not calling")),
+            "a re-call adds no QSO and must not be refused: {:?}",
+            statuses(&tui)
+        );
+        assert_eq!(h.manager.active_qso_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn capacity_frees_when_active_qso_ends() {
+        let h = harness(1, false).await;
+        h.open_idle_qso_a().await;
+
+        let (a_id, _) = h.manager.get_active_qsos().await.remove(0);
+        h.send(QsoMessage::AbortQso {
+            qso_id: a_id.to_string(),
+        })
+        .await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while h.manager.active_qso_count().await > 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(h.manager.active_qso_count().await, 0, "A must be aborted");
+
+        h.start_qso("K2BBB", 2000).await;
+        let tx = collect_until(&h.tx, |m| tx_text(m).is_some_and(|t| t.contains("K2BBB"))).await;
+        assert!(
+            any_tx_containing(&tx, "K2BBB"),
+            "with A gone a slot is free and B must start: {tx:?}"
+        );
+        assert_eq!(h.manager.active_qso_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn respond_to_caller_refused_at_capacity_except_seventy_three() {
+        let h = harness(1, false).await;
+        h.open_idle_qso_a().await;
+
+        h.send(QsoMessage::RespondToCaller {
+            callsign: "K3CCC".to_string(),
+            frequency: 1800,
+            dx_parity: Some(SlotParity::Even),
+            step: ResponseStep::Report,
+            snr: Some(-10.0),
+            remote_origin: false,
+            remote_client_key_id: None,
+        })
+        .await;
+        let expected = refused_status("replying to K3CCC");
+        let tui = collect_until(&h.tui, |m| status(m) == Some(expected.as_str())).await;
+        let tx = collect_quiet(&h.tx, 300).await;
+        assert!(
+            statuses(&tui).contains(&expected.as_str()),
+            "observed: {:?}",
+            statuses(&tui)
+        );
+        assert!(!any_tx_containing(&tx, "K3CCC"), "{tx:?}");
+        assert_eq!(h.manager.active_qso_count().await, 1);
+
+        // `SeventyThree` opens directly at Completed — adds no active QSO.
+        h.send(QsoMessage::RespondToCaller {
+            callsign: "K4DDD".to_string(),
+            frequency: 2200,
+            dx_parity: Some(SlotParity::Even),
+            step: ResponseStep::SeventyThree,
+            snr: Some(-10.0),
+            remote_origin: false,
+            remote_client_key_id: None,
+        })
+        .await;
+        let tx = collect_until(&h.tx, |m| tx_text(m).is_some_and(|t| t.contains("K4DDD"))).await;
+        assert!(
+            any_tx_containing(&tx, "K4DDD"),
+            "send 73 must not be refused at capacity: {tx:?}"
+        );
+        let tui = collect_quiet(&h.tui, 300).await;
+        assert!(
+            !statuses(&tui).iter().any(|s| s.starts_with("Not replying")),
+            "{:?}",
+            statuses(&tui)
+        );
+        assert_eq!(h.manager.active_qso_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn start_cq_refused_at_capacity() {
+        let h = harness(1, false).await;
+        h.open_idle_qso_a().await;
+
+        h.send(QsoMessage::StartCq {
+            frequency: 1200,
+            tx_parity: None,
+            remote_origin: false,
+            remote_client_key_id: None,
+        })
+        .await;
+        let expected = refused_status("calling CQ");
+        let tui = collect_until(&h.tui, |m| status(m) == Some(expected.as_str())).await;
+        let tx = collect_quiet(&h.tx, 300).await;
+        assert!(
+            statuses(&tui).contains(&expected.as_str()),
+            "observed: {:?}",
+            statuses(&tui)
+        );
+        assert!(has_capacity_diagnostic(&tui, None), "{tui:?}");
+        assert!(
+            !tx.iter()
+                .filter_map(tx_text)
+                .any(|t| t.starts_with("CQ K1TEST")),
+            "{tx:?}"
+        );
+        assert_eq!(h.manager.active_qso_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn engage_hound_refused_at_capacity() {
+        let h = harness(1, false).await;
+        h.open_idle_qso_a().await;
+
+        // Same desired parity as A (DX Even ⇒ we TX Odd): passes the parity
+        // gate and reaches the capacity gate.
+        h.send(QsoMessage::EngageHound {
+            callsign: "K5FOX".to_string(),
+            fox_freq: 600,
+            dx_parity: Some(SlotParity::Even),
+            fox_grid: None,
+        })
+        .await;
+        let expected = refused_status("calling Fox K5FOX");
+        let tui = collect_until(&h.tui, |m| status(m) == Some(expected.as_str())).await;
+        let tx = collect_quiet(&h.tx, 300).await;
+        assert!(
+            statuses(&tui).contains(&expected.as_str()),
+            "observed: {:?}",
+            statuses(&tui)
+        );
+        assert!(!any_tx_containing(&tx, "K5FOX"), "{tx:?}");
+        assert_eq!(h.manager.active_qso_count().await, 1);
+    }
+
+    fn remote_start_k2bbb() -> QsoMessage {
+        QsoMessage::StartQso {
+            callsign: "K2BBB".to_string(),
+            frequency: 2000,
+            dx_parity: Some(SlotParity::Even),
+            remote_origin: true,
+            remote_client_key_id: Some("peer".to_string()),
+        }
+    }
+
+    fn tx_denied_reasons(msgs: &[ComponentMessage]) -> Vec<String> {
+        msgs.iter()
+            .filter_map(|m| match &m.message_type {
+                MessageType::TxDenied { reason, qso_id } => {
+                    assert!(qso_id.is_none(), "no QSO exists to attribute it to");
+                    Some(reason.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn remote_start_qso_at_capacity_relays_tx_denied() {
+        let h = harness(1, true).await;
+        h.open_idle_qso_a().await;
+        let _ = collect_quiet(&h.gateway, 100).await;
+
+        h.send(remote_start_k2bbb()).await;
+        let gw = collect_until(&h.gateway, |m| {
+            matches!(m.message_type, MessageType::TxDenied { .. })
+        })
+        .await;
+        let reasons = tx_denied_reasons(&gw);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("call to K2BBB refused — at capacity 1/1")),
+            "expected a relayed TxDenied; observed: {reasons:?}"
+        );
+        assert_eq!(h.manager.active_qso_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn remote_refusal_not_relayed_when_display_feed_disabled() {
+        let h = harness(1, false).await;
+        h.open_idle_qso_a().await;
+
+        h.send(remote_start_k2bbb()).await;
+        let expected = refused_status("calling K2BBB");
+        let tui = collect_until(&h.tui, |m| status(m) == Some(expected.as_str())).await;
+        let gw = collect_quiet(&h.gateway, 300).await;
+        assert!(
+            tx_denied_reasons(&gw).is_empty(),
+            "additive-only: nothing is relayed while the display feed is off: {gw:?}"
+        );
+        assert!(
+            statuses(&tui).contains(&expected.as_str()),
+            "the local status line is unchanged; observed: {:?}",
+            statuses(&tui)
+        );
+        assert!(has_capacity_diagnostic(&tui, Some("K2BBB")), "{tui:?}");
+        assert_eq!(h.manager.active_qso_count().await, 1);
     }
 }

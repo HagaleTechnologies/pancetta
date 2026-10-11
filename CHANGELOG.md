@@ -75,6 +75,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `max_concurrent_qsos` now also limits QSOs you open by hand (PAN-78). With
+  the default of 1, calling a second station while a QSO is waiting for a
+  reply used to open it anyway and transmit it alongside the first. Now the
+  call, caller reply, Hound engage or CQ is refused with a status line such as
+  `Not calling K2BBB — 1/1 QSOs active (max_concurrent_qsos); finish or abort
+  one first`, a Warn Diagnostics entry, and an `error` event for remote
+  clients. Re-calling a station you are already working, sending 73, and RR73
+  to a station you just completed are still allowed. Calls queued for the
+  other window now start only as slots free up, oldest first, instead of all
+  at once. To work several QSOs at the same time, raise `max_concurrent_qsos`.
+
 - Autonomous and manual TX no longer key the rig while the rig's CAT link is
   lost or the audio output device has stopped delivering samples (PAN-115).
   The TX gate reports `rig is disconnected` (after 5 s of failed rig polls) or
