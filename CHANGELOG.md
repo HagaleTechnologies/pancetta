@@ -88,9 +88,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-<<<<<<< HEAD
 - A QSO whose frame the TX worker drops before it reaches the air (concurrent-QSO cap, F8 abort, supersede, arm or mute refusal) no longer spends a call from its keep-calling budget, advances the stall detector toward a TX-offset switch, or shows the unsent frame as sent (PAN-75).
-=======
+
 - Slot timing stays on UTC across clock steps and sleep/wake (PAN-114). After
   a backward clock step (e.g. NTP correcting a fast RTC), the autonomous
   scheduler and the decoder re-anchor to the UTC slot grid within one slot
@@ -102,7 +101,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never held more than `ptt_lead_ms` + 1 s before the slot boundary. After
   sleep/wake, decodes and audio from before the sleep are discarded rather
   than answered or spotted.
->>>>>>> d77d87f8411b73060e5303ae505ba4999d863aa8
 
 - Autonomous and manual TX no longer key the rig while the rig's CAT link is
   lost or the audio output device has stopped delivering samples (PAN-115).

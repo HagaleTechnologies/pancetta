@@ -487,6 +487,18 @@ pub enum QsoManagerError {
         "TX-offset action for QSO {qso_id} refused — a PTT is already keyed for the current slot"
     )]
     OffsetActionPttInFlight { qso_id: QsoId },
+
+    /// PAN-75: the rearm that raised this stall action was later reported
+    /// unsent, and rolling it back left `stall_cycles` below
+    /// `qso_stall_switch_after`. The threshold the action depended on is no
+    /// longer met, so committing it would move the QSO on the strength of a
+    /// frame that never aired. Expected, not a fault — the detector re-raises
+    /// once the streak rebuilds from frames that do air.
+    #[error(
+        "TX-offset action for QSO {qso_id} is stale — the stall attempt that \
+         raised it was rolled back as unsent"
+    )]
+    OffsetActionStallRolledBack { qso_id: QsoId },
 }
 
 impl QsoManagerError {
@@ -505,6 +517,7 @@ impl QsoManagerError {
                 | QsoManagerError::OffsetActionOutsideHoundRegion { .. }
                 | QsoManagerError::OffsetActionHeld { .. }
                 | QsoManagerError::OffsetActionPttInFlight { .. }
+                | QsoManagerError::OffsetActionStallRolledBack { .. }
         )
     }
 }
@@ -1007,6 +1020,10 @@ struct KeepCallLedger {
     // Never rolled back: keeps pacing independent of TX accounting.
     last_emitted_at: Option<DateTime<Utc>>,
     attempts: VecDeque<KeepCallAttempt>,
+    // A rollback took `stall_cycles` back below the switch threshold, so any
+    // stall action already raised is stale. Cleared when an action is raised
+    // again or the streak resets.
+    stall_action_revoked: bool,
 }
 
 /// Whether a failed TX could be matched to a recent, active keep-call emission.
@@ -3541,6 +3558,7 @@ impl QsoManager {
             for attempt in &mut entry.attempts {
                 attempt.bumped_stall = false;
             }
+            entry.stall_action_revoked = false;
         }
     }
 
@@ -3619,7 +3637,12 @@ impl QsoManager {
             progress.metadata.last_call_at = attempt.prev_last_call_at;
         }
         if attempt.bumped_stall {
+            let threshold = self.config.timeouts.qso_stall_switch_after;
+            let was_at_threshold = progress.metadata.stall_cycles >= threshold;
             progress.metadata.stall_cycles = progress.metadata.stall_cycles.saturating_sub(1);
+            if was_at_threshold && progress.metadata.stall_cycles < threshold {
+                entry.stall_action_revoked = true;
+            }
         }
         if attempt.recorded_sent {
             if let Some(index) = progress.messages.iter().rposition(|m| {
@@ -3817,6 +3840,18 @@ impl QsoManager {
                     raised_at,
                     current,
                 });
+            }
+            // PAN-75: a rollback since the action was raised may have taken
+            // the streak back below the threshold that justified it.
+            if progress.metadata.stall_cycles < self.config.timeouts.qso_stall_switch_after
+                && self
+                    .keep_call_ledger
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&qso_id)
+                    .is_some_and(|entry| entry.stall_action_revoked)
+            {
+                return Err(QsoManagerError::OffsetActionStallRolledBack { qso_id });
             }
         }
         // 3. **Outside the live Hound region** (Codex round 4 on PR #350,
@@ -7272,6 +7307,7 @@ impl QsoManager {
                     // coordinator's drain coalesces per QSO per batch (round 7,
                     // finding 1), so this costs one retry per slot, not a
                     // pile-up.
+                    ledger.entry(qso_id).or_default().stall_action_revoked = false;
                     offset_actions_to_emit.push((
                         qso_id,
                         action,
@@ -17391,6 +17427,91 @@ mod pan72_stall_detection_tests {
             0,
             "a committed relocation is what resets the streak"
         );
+    }
+
+    /// PAN-75 (Codex review): the rearm that trips the threshold raises
+    /// its action before the TX worker can report the frame unsent. Rolling
+    /// that attempt back must make the queued action stale, or the drain
+    /// still moves the QSO on a frame that never aired.
+    #[tokio::test]
+    async fn rolling_back_the_threshold_attempt_revokes_its_queued_stall_action() {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 1;
+        let manager = manager_auto(config);
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        let _ = drain(&mut rx);
+
+        let rearm_at = opened_at + Duration::seconds(15);
+        manager.rearm_manual_calls_at(rearm_at).await;
+        let raised_at_generation = drain(&mut rx)
+            .into_iter()
+            .find_map(|e| match e {
+                QsoEvent::TxOffsetActionNeeded {
+                    raised_at_generation,
+                    ..
+                } => Some(raised_at_generation),
+                _ => None,
+            })
+            .expect("precondition: the threshold-tripping rearm raised an action");
+        let text = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .messages
+            .last()
+            .unwrap()
+            .raw_text
+            .clone();
+
+        assert!(matches!(
+            manager
+                .roll_back_unsent_attempt_at(qso_id, &text, rearm_at + Duration::seconds(1))
+                .await,
+            UnsentAttemptRollback::RolledBack { .. }
+        ));
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            0
+        );
+
+        let result = manager
+            .apply_tx_offset_switch(
+                qso_id,
+                FREQ + 300.0,
+                OffsetRelocationOrigin::StallDetected {
+                    raised_at_generation,
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(QsoManagerError::OffsetActionStallRolledBack { .. })
+            ),
+            "a stall action whose threshold attempt was rolled back must be refused, got {result:?}"
+        );
+        assert!(result.unwrap_err().is_expected_offset_action_refusal());
+        assert!(
+            (manager.get_qso(qso_id).await.unwrap().metadata.frequency - FREQ).abs() < f64::EPSILON,
+            "the QSO must stay on its offset"
+        );
+
+        // An operator nudge carries no stall evidence and still commits.
+        manager
+            .apply_tx_offset_switch(qso_id, FREQ + 300.0, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .expect("an operator nudge is not revoked by a stall rollback");
     }
 
     /// A REMOTE-origin QSO whose keep-calling frames the station-agent

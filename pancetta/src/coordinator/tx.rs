@@ -668,8 +668,11 @@ fn ptt_hold_exceeds_bound(hold: Duration, ptt_lead_ms: u64) -> bool {
 /// the neighbouring stale-TX drops: one `tx.policy` tracing line and Warn
 /// diagnostic per frame (text starts "dropping stale TX" so it counts in the
 /// TUI's TX-drops tally), clear the TX strip, then one failed
-/// `TransmitComplete` per frame so a tracked self-CQ rolls back. Callers
-/// that hold PTT must release it BEFORE calling this (it awaits).
+/// `TransmitComplete` per frame (via `report_transmit_complete`) so a
+/// tracked self-CQ rolls back and the QSO engine reverses the frame's
+/// keep-call accounting (PAN-75) while the attempt is still inside its
+/// four-slot rollback window; a longer forward jump leaves it counted.
+/// Callers that hold PTT must release it BEFORE calling this (it awaits).
 async fn drop_frames_for_clock_jump(
     message_bus: &MessageBus,
     frames: &[(String, Option<String>)],
@@ -695,18 +698,10 @@ async fn drop_frames_for_clock_jump(
     }
     send_tx_queue_status(message_bus, None, Vec::new()).await;
     for (message_text, qso_id) in frames {
-        let complete_msg = ComponentMessage::new(
-            ComponentId::Ft8Transmitter,
-            ComponentId::Autonomous,
-            MessageType::TransmitComplete {
-                success: false,
-                message_text: message_text.clone(),
-                duration_ms: 0,
-                qso_id: qso_id.clone(),
-            },
-            Instant::now(),
-        );
-        if let Err(e) = message_bus.send_message(complete_msg).await {
+        if let Err(e) =
+            report_transmit_complete(message_bus, false, message_text.clone(), 0, qso_id.clone())
+                .await
+        {
             warn!("Failed to send TransmitComplete: {}", e);
         }
     }
@@ -2309,7 +2304,8 @@ async fn send_tx_queue_status(
 /// Report every TX outcome to Autonomous, preserving its self-CQ correlation.
 /// PAN-75 also mirrors failed QSO frames to the QSO engine, which reverses
 /// their keep-call accounting. Covers cap truncation, F8, supersede, denial,
-/// hard mute, PAN-141 hold, and encode/PTT failure through the same path.
+/// hard mute, PAN-141 hold, PAN-114 clock-jump drops, and encode/PTT failure
+/// through the same path.
 /// Shutdown branches deliberately send nothing: the QSO loop stops on the
 /// same flag and its in-memory accounting is discarded at exit.
 /// Returns the Autonomous send result to preserve callers' error handling.
@@ -2324,7 +2320,65 @@ async fn report_transmit_complete(
         .then(|| qso_id.clone())
         .flatten()
         .map(|id| (id, message_text.clone()));
-    let result = message_bus
+    let result = report_transmit_complete_to_autonomous(
+        message_bus,
+        success,
+        message_text,
+        duration_ms,
+        qso_id,
+    )
+    .await;
+    if let Some((qso_id, message_text)) = not_sent {
+        report_frame_not_sent(message_bus, qso_id, message_text).await;
+    }
+    result
+}
+
+/// PAN-75: tell the QSO engine `message_text` never aired for `qso_id`.
+async fn report_frame_not_sent(message_bus: &MessageBus, qso_id: String, message_text: String) {
+    let _ = message_bus
+        .send_message(ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Qso,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent {
+                qso_id,
+                message_text,
+            }),
+            Instant::now(),
+        ))
+        .await;
+}
+
+/// Step 0-dup: this request's payload already aired through an earlier
+/// request's pivot. Autonomous gets the usual failed completion. The QSO
+/// engine keeps this request's attempt and instead rolls back the frame the
+/// pivot replaced (`pivoted_from_text`), which never aired as itself (PAN-75).
+async fn report_pivot_duplicate_dropped(
+    message_bus: &MessageBus,
+    message_text: String,
+    qso_id: Option<String>,
+    pivoted_from_text: Option<String>,
+) {
+    if let Err(e) =
+        report_transmit_complete_to_autonomous(message_bus, false, message_text, 0, qso_id.clone())
+            .await
+    {
+        warn!("Failed to send TransmitComplete: {}", e);
+    }
+    if let (Some(qso_id), Some(pivoted_from_text)) = (qso_id, pivoted_from_text) {
+        report_frame_not_sent(message_bus, qso_id, pivoted_from_text).await;
+    }
+}
+
+/// The Autonomous half of [`report_transmit_complete`] alone.
+async fn report_transmit_complete_to_autonomous(
+    message_bus: &MessageBus,
+    success: bool,
+    message_text: String,
+    duration_ms: u64,
+    qso_id: Option<String>,
+) -> Result<()> {
+    message_bus
         .send_message(ComponentMessage::new(
             ComponentId::Ft8Transmitter,
             ComponentId::Autonomous,
@@ -2336,21 +2390,7 @@ async fn report_transmit_complete(
             },
             Instant::now(),
         ))
-        .await;
-    if let Some((qso_id, message_text)) = not_sent {
-        let _ = message_bus
-            .send_message(ComponentMessage::new(
-                ComponentId::Ft8Transmitter,
-                ComponentId::Qso,
-                MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent {
-                    qso_id,
-                    message_text,
-                }),
-                Instant::now(),
-            ))
-            .await;
-    }
-    result
+        .await
 }
 
 /// PAN-38 round 4 (Codex): report a failed `TransmitComplete` for a
@@ -5574,6 +5614,11 @@ impl super::ApplicationCoordinator {
                 // (coordinator/mod.rs) for the pure membership check.
                 let mut pivoted_once: std::collections::HashMap<String, (String, f64)> =
                     std::collections::HashMap::new();
+                // PAN-75: the text each tombstoned pivot replaced. Written with
+                // every `pivoted_once` insert and read only on a Step 0-dup hit,
+                // so entries left behind when a tombstone is cleared are inert.
+                let mut pivoted_from: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
 
                 'worker: while !shutdown.load(Ordering::Acquire) {
                     // Reset the per-message abort flag at the start of every
@@ -5883,15 +5928,16 @@ impl super::ApplicationCoordinator {
                                         )
                                         .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
-                                        if let Some(id) = qso_id.as_deref() {
-                                            pivoted_once.remove(&super::active_tx_qso_key(id));
-                                        }
-                                        let _ = report_transmit_complete(
+                                        let pivoted_from_text = qso_id.as_deref().and_then(|id| {
+                                            let key = super::active_tx_qso_key(id);
+                                            pivoted_once.remove(&key);
+                                            pivoted_from.remove(&key)
+                                        });
+                                        report_pivot_duplicate_dropped(
                                             &message_bus,
-                                            false,
                                             message_text,
-                                            0,
                                             qso_id.clone(),
+                                            pivoted_from_text,
                                         )
                                         .await;
                                         continue;
@@ -6263,28 +6309,6 @@ impl super::ApplicationCoordinator {
                                                     jump,
                                                 )
                                                 .await;
-<<<<<<< HEAD
-                                            // PAN-38 round 3 (Codex): an F8 abort here is the
-                                            // one path in this worker that previously sent NO
-                                            // TransmitComplete at all -- for a self-CQ whose
-                                            // QSO was already opened (AutonomousCqOpened
-                                            // registered it in the coordinator's
-                                            // pending_self_cq_qsos map), that left the entry
-                                            // permanently leaked and the speculative "+1"
-                                            // streak never rolled back, since nothing ever
-                                            // told the autonomous operator this attempt did
-                                            // not actually transmit. Report it exactly like
-                                            // the drop-stale-TX case above.
-                                            let _ = report_transmit_complete(
-                                                &message_bus,
-                                                false,
-                                                message_text.clone(),
-                                                0,
-                                                qso_id.clone(),
-                                            )
-                                            .await;
-                                            continue 'worker;
-=======
                                                 continue 'worker;
                                             }
                                             PttWait::Interrupted => {
@@ -6318,22 +6342,16 @@ impl super::ApplicationCoordinator {
                                                 // told the autonomous operator this attempt did
                                                 // not actually transmit. Report it exactly like
                                                 // the drop-stale-TX case above.
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: message_text.clone(),
-                                                        duration_ms: 0,
-                                                        qso_id: qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                let _ =
-                                                    message_bus.send_message(complete_msg).await;
+                                                let _ = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    message_text.clone(),
+                                                    0,
+                                                    qso_id.clone(),
+                                                )
+                                                .await;
                                                 continue 'worker;
                                             }
->>>>>>> d77d87f8411b73060e5303ae505ba4999d863aa8
                                         }
 
                                         // --- Step 4b-parity: DX-parity freshness gate (PAN-141) ---
@@ -6709,7 +6727,10 @@ impl super::ApplicationCoordinator {
                                                         new_freq,
                                                         qso_id.as_deref().unwrap_or("-")
                                                     );
-                                                    message_text = new_text;
+                                                    let pivoted_from_text = std::mem::replace(
+                                                        &mut message_text,
+                                                        new_text,
+                                                    );
                                                     frequency_offset = new_freq;
                                                     audio_out = rebuilt;
                                                     // Round-4 review (Codex P1): the
@@ -6744,6 +6765,8 @@ impl super::ApplicationCoordinator {
                                                                 frequency_offset,
                                                             ),
                                                         );
+                                                        pivoted_from
+                                                            .insert(key.clone(), pivoted_from_text);
                                                         pivoted_this_key = Some(key);
                                                     }
                                                 }
@@ -7998,16 +8021,17 @@ impl super::ApplicationCoordinator {
                                                     item.qso_id.as_deref(),
                                                 )
                                                 .await;
-                                                if let Some(id) = item.qso_id.as_deref() {
-                                                    pivoted_once
-                                                        .remove(&super::active_tx_qso_key(id));
-                                                }
-                                                let _ = report_transmit_complete(
+                                                let pivoted_from_text =
+                                                    item.qso_id.as_deref().and_then(|id| {
+                                                        let key = super::active_tx_qso_key(id);
+                                                        pivoted_once.remove(&key);
+                                                        pivoted_from.remove(&key)
+                                                    });
+                                                report_pivot_duplicate_dropped(
                                                     &message_bus,
-                                                    false,
                                                     item.message_text.clone(),
-                                                    0,
                                                     item.qso_id.clone(),
+                                                    pivoted_from_text,
                                                 )
                                                 .await;
                                             } else {
@@ -8615,32 +8639,10 @@ impl super::ApplicationCoordinator {
                                                 .await;
                                             continue;
                                         }
-<<<<<<< HEAD
-                                        info!("Multi-TX aborted before PTT by operator (F8)");
-                                        // PAN-38 round 3 (Codex): same gap as the single-item
-                                        // worker's F8-before-PTT path -- no TransmitComplete
-                                        // was ever sent for any bundle item, leaking a
-                                        // self-CQ's pending_self_cq_qsos entry and never
-                                        // rolling back its speculative streak/offset.
-                                        for (text, qso_id) in
-                                            item_texts.into_iter().zip(encoded_qso_ids)
-                                        {
-                                            if let Err(e) = report_transmit_complete(
-                                                &message_bus,
-                                                false,
-                                                text,
-                                                0,
-                                                qso_id,
-                                            )
-                                            .await
-                                            {
-                                                warn!("Failed to send TransmitComplete: {}", e);
-=======
                                         PttWait::Interrupted => {
                                             if shutdown.load(Ordering::Acquire) {
                                                 info!("Multi-TX aborted before PTT by shutdown");
                                                 break;
->>>>>>> d77d87f8411b73060e5303ae505ba4999d863aa8
                                             }
                                             info!("Multi-TX aborted before PTT by operator (F8)");
                                             // PAN-38 round 3 (Codex): same gap as the single-item
@@ -8651,19 +8653,14 @@ impl super::ApplicationCoordinator {
                                             for (text, qso_id) in
                                                 item_texts.into_iter().zip(encoded_qso_ids)
                                             {
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: text,
-                                                        duration_ms: 0,
-                                                        qso_id,
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                if let Err(e) =
-                                                    message_bus.send_message(complete_msg).await
+                                                if let Err(e) = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    text,
+                                                    0,
+                                                    qso_id,
+                                                )
+                                                .await
                                                 {
                                                     warn!("Failed to send TransmitComplete: {}", e);
                                                 }
@@ -8800,6 +8797,18 @@ impl super::ApplicationCoordinator {
                                         .filter(|(_, &live)| live)
                                         .map(|(item, _)| item.clone())
                                         .collect();
+                                    let pre_pivot_texts: std::collections::HashMap<String, String> =
+                                        live_items_pre
+                                            .iter()
+                                            .filter_map(|item| {
+                                                item.qso_id.as_deref().map(|id| {
+                                                    (
+                                                        super::active_tx_qso_key(id),
+                                                        item.message_text.clone(),
+                                                    )
+                                                })
+                                            })
+                                            .collect();
                                     let (pivoted_live_items, pivots) =
                                         super::pivot_bundle_items(live_items_pre, &latest_snapshot);
                                     for (qso_key, new_text, new_freq) in &pivots {
@@ -9107,6 +9116,9 @@ impl super::ApplicationCoordinator {
                                     let pivoted_this_bundle_keys: Vec<String> =
                                         pivots.iter().map(|(k, _, _)| k.clone()).collect();
                                     for (qso_key, new_text, new_freq) in pivots {
+                                        if let Some(text) = pre_pivot_texts.get(&qso_key) {
+                                            pivoted_from.insert(qso_key.clone(), text.clone());
+                                        }
                                         pivoted_once.insert(qso_key, (new_text, new_freq));
                                     }
 
@@ -15998,5 +16010,38 @@ mod report_transmit_complete_tests {
     #[tokio::test]
     async fn failed_qso_frame_also_notifies_qso() {
         check(false, Some("q1")).await;
+    }
+
+    /// A pivot-duplicate's payload already aired via the pivot, so the QSO
+    /// engine must roll back the frame the pivot replaced, never this one.
+    #[tokio::test]
+    async fn pivot_duplicate_drop_rolls_back_the_replaced_frame() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_, autonomous) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        report_pivot_duplicate_dropped(
+            &bus,
+            "K1ABC N0CALL R-07".into(),
+            Some("q1".into()),
+            Some("K1ABC N0CALL FN20".into()),
+        )
+        .await;
+        assert!(matches!(
+            autonomous.try_recv().unwrap().message_type,
+            MessageType::TransmitComplete { success: false, qso_id: Some(ref id), ref message_text, .. }
+                if id == "q1" && message_text == "K1ABC N0CALL R-07"
+        ));
+        assert!(matches!(
+            qso.try_recv().unwrap().message_type,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { ref qso_id, ref message_text })
+                if qso_id == "q1" && message_text == "K1ABC N0CALL FN20"
+        ));
+        assert!(qso.try_recv().is_err());
+
+        // No recorded pivot source: nothing reaches the QSO engine.
+        report_pivot_duplicate_dropped(&bus, "K1ABC N0CALL R-07".into(), Some("q1".into()), None)
+            .await;
+        assert!(autonomous.try_recv().is_ok());
+        assert!(qso.try_recv().is_err());
     }
 }

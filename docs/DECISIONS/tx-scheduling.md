@@ -219,8 +219,6 @@ that starts while PTT is already keyed is still ended by the existing PTT watchd
 
 `pancetta/tests/coord_sim.rs`: a durable, reusable `CoordSim` fixture that exercises the *coordinator's* TX gate + mock-rig PTT + multi-stream path, complementing the engine-level state-machine harness in `pancetta-qso/src/sim.rs`. It stands up a real `MessageBus`, a real `QsoManager`, a real `MockRig` behind a hamlib consumer (mirror of `coordinator/hamlib.rs`'s `SetPtt` handling), and the *real* shared `active_tx_qsos` set + `tx_policy` atomic. A scenario starts/advances QSOs via the manager's real entry points (`respond_to_cq_with` / `respond_to_caller` / `start_cq`), calls `pump_qso_events()` (a faithful mirror of `coordinator/qso.rs`'s populater — insert on `StateChanged→active`/`QsoCompleted`, remove on `Failed`/`QsoFailed`, forward `MessageToSend`→`TransmitRequest`), then `drive_slot(pending)` which replicates the worker's keying-decision chain — **policy hard-mute → coalesce (real `coalesce_transmit_requests`) → Step-4b gate (real `tx_qso_is_live` over the real set) → key/audio/unkey** — sending real `RigControl(SetPtt)` over the bus to the mock rig and **asserting at the rig level** (`mock.get_ptt() == On`, offset, release). **Determinism**: no `schedule_tx` UTC math and no slot sleep (that's unit-tested in `tx.rs::schedule_tx_tests`); only bounded ms `await`s — pass/fail never depends on wall-clock slot phase. A `Timeline` (keyed / dropped / per-slot offsets, mirroring `sim::Timeline`'s style + Display) carries the readable assertion helpers. Permanent scenarios: PTT-keys-for-scheduled-QSO (StateChanged-at-start fix), stale-TX-dropped-after-supersede (no PTT), coalesce-backlog (newest wins, older not keyed), two-simultaneous-QSOs on distinct freqs, TX-policy Disabled=silent / RespondOnly=in-progress-keys-but-initiation-suppressed / Full=keys, requested-offset-honored, manual-send-never-gated. Made testable by re-exporting `coalesce_transmit_requests` / `CoalesceEntry` / `resolve_required_parity` and widening `active_tx_qso_key` / `tx_qso_is_live` to `pub` from `coordinator/mod.rs` (visibility-only, behavior-preserving).
 
-<<<<<<< HEAD
-
 ## Frames that never aired hand their keep-call bookkeeping back (PAN-75)
 
 Every TX completion goes through `report_transmit_complete`. It preserves the
@@ -228,6 +226,15 @@ Autonomous completion and mirrors failures with a QSO id as
 `QsoMessage::TxFrameNotSent` to the QSO component. That component calls
 `QsoManager::roll_back_unsent_attempt`, reversing the matching keep-call's
 `call_count`, `last_call_at`, rearm `stall_cycles` increment and `Sent` entry.
+The one exception is the Step 0-dup pivot-duplicate drop
+(`report_pivot_duplicate_dropped`): its payload already aired through the
+earlier request's pivot, so the QSO keeps that attempt and the worker instead
+reports the text the pivot replaced, which never aired as itself.
+If a rollback takes `stall_cycles` from the switch threshold back below it
+before the coordinator's drain commits a stall offset action that attempt
+raised, the commit is refused (`OffsetActionStallRolledBack`) until the streak
+reaches the threshold again. A rollback that arrives after the commit cannot
+undo the move.
 Rearm, explicit resend and operator offset-switch retransmits record attempts.
 A forward advance or committed offset switch clears the remembered stall
 contributions too, so a delayed failure cannot subtract from a newer streak.
@@ -245,10 +252,11 @@ terminal QSOs are no-ops. The ledger is shared across manager clones, pruned on
 rearm and rollback, and never persisted.
 
 The same accounting rule covers cap truncation, F8 abort, supersede, arm or
-identity refusal, hard mute, PAN-141 hold, and encode/PTT failure. This supersedes
-the PAN-141 spec's accepted tradeoff that a held cycle spends a call. Existing
-time watchdogs and caps for counted calls still apply. A failure can also mean
-an interrupted, partial frame; it is not counted as a completed transmission.
+identity refusal, hard mute, PAN-141 hold, PAN-114 clock-jump drops, and
+encode/PTT failure. This supersedes the PAN-141 spec's accepted tradeoff that a
+held cycle spends a call. Existing time watchdogs and caps for counted calls
+still apply. A failure can also mean an interrupted, partial frame; it is not
+counted as a completed transmission.
 
 Shutdown aborts deliberately send no rollback. The TX and QSO loops stop on the
 same global flag, and shutdown persists no active-QSO state. Adding a bus await
@@ -256,10 +264,10 @@ on that exit path would not preserve any observable accounting.
 
 The opening call remains counted as one. Manual-regression re-sends and silently
 coalesced, duplicate, parity-excluded or frequency-excluded frames keep their
-existing accounting because those paths have no matching ledger entry or failure
-report. Rollback emits no new snapshot or QSO event; the existing status panel
+existing accounting because those paths have no matching ledger entry or QSO
+failure report. Rollback emits no new snapshot or QSO event; the existing status panel
 and remote snapshot fields show corrected values on the next normal push.
-=======
+
 ## UTC re-anchoring after sleep/wake and clock steps (PAN-114, 2026-10-10)
 
 PAN-72 had already replaced the autonomous loop's one-shot `interval_at` anchor with a 250 ms poll
@@ -306,12 +314,12 @@ used by the clock-skew monitor.
 - **Drop reporting** (`drop_frames_for_clock_jump`, D7): target `tx.policy`, Warn, text
   "dropping stale TX after a {±secs} s clock jump: '…' — next frame uses the current UTC slot", so it
   counts in the TUI's session TX-drops tally next to the existing stale-TX drops, plus one failed
-  `TransmitComplete` per frame so a self-CQ rolls back. The QSO engine re-emits on its own timers.
+  `TransmitComplete` per frame (through `report_transmit_complete`) so a self-CQ rolls back and the
+  frame's keep-call accounting is reversed (PAN-75) while the attempt is inside the four-slot
+  rollback window; a longer forward jump leaves it counted. The QSO engine re-emits on its own timers.
 
 Out of scope: no QSO teardown on a clock step (the engine's timeouts retire stalled QSOs); no
 queued-call TTL change (it is `std::time::Instant`-based and immune to NTP steps); no station-wide
 median-DT clock estimate (it mixes our clock error with audio latency and other stations' errors);
 no TX inhibit on large skew (a product decision for its own ticket). The in-session skew monitor is
 recorded in `config-and-platform.md`, its title-bar chip in `tui.md`.
-
->>>>>>> d77d87f8411b73060e5303ae505ba4999d863aa8
