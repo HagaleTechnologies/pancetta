@@ -2,8 +2,11 @@
 //!
 //! A lightweight tokio task that runs [`ClockSkewMonitorCore`]'s schedule:
 //! one SNTP probe to pool.ntp.org 30 s after start and then every 30 min
-//! (plus a re-check after a detected clock step), with the blocking UDP
-//! query on the blocking pool. It publishes the current warning through
+//! (plus a re-check after a detected clock step). The blocking query (DNS
+//! resolution included, which no socket timeout bounds) runs on a detached
+//! OS thread awaited under [`ClockMonitorSchedule::probe_deadline`], never on
+//! tokio's blocking pool: a started `spawn_blocking` task cannot be aborted
+//! and would hold runtime shutdown for as long as a stalled resolver does. It publishes the current warning through
 //! [`ClockSkewShared`] (read by the TUI relay's 2 s `PipelineHealth` tick)
 //! and emits each `clock.skew` / `clock.step` diagnostic both to the TUI
 //! Diagnostics overlay and to `tracing`, because headless mode drops the TUI
@@ -13,13 +16,19 @@
 //! trigger restart semantics) and it is never started under `--replay` or
 //! `--wav` (see `ApplicationCoordinator::replay_mode`).
 
-use crate::clock_skew::{ClockSkewMonitorCore, ClockSkewShared, ClockSkewTiming, SkewDiag};
+use crate::clock_skew::{
+    ClockSkewMonitorCore, ClockSkewShared, ClockSkewTiming, SkewDiag, SNTP_TIMEOUT,
+};
 use crate::message_bus::{ComponentId, DiagnosticLevel, MessageBus};
 use chrono::{DateTime, Utc};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
+
+/// Default [`ClockMonitorSchedule::probe_deadline`]: the SNTP send and
+/// receive timeouts plus headroom for name resolution.
+const CLOCK_PROBE_DEADLINE: Duration = Duration::from_secs(4 * SNTP_TIMEOUT.as_secs());
 
 /// Timing of the monitor task. `Default` is the production schedule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +39,10 @@ pub(crate) struct ClockMonitorSchedule {
     pub interval: Duration,
     pub step_recheck: Duration,
     pub step_diag_min_gap: Duration,
+    /// Upper bound on one probe, DNS resolution included. A probe still
+    /// running at the deadline is reported as unreachable and left to finish
+    /// on its detached thread; no new probe starts until it does.
+    pub probe_deadline: Duration,
 }
 
 impl Default for ClockMonitorSchedule {
@@ -41,6 +54,7 @@ impl Default for ClockMonitorSchedule {
             interval: timing.interval,
             step_recheck: timing.step_recheck,
             step_diag_min_gap: timing.step_diag_min_gap,
+            probe_deadline: CLOCK_PROBE_DEADLINE,
         }
     }
 }
@@ -76,6 +90,7 @@ pub(crate) fn spawn_clock_skew_monitor(
         let start = std::time::Instant::now();
         let mut last_tick = start;
         let mut core = ClockSkewMonitorCore::with_timing(wall_now(), schedule.timing());
+        let in_flight = Arc::new(AtomicBool::new(false));
         let mut ticker = tokio::time::interval(schedule.tick);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -95,10 +110,7 @@ pub(crate) fn spawn_clock_skew_monitor(
             }
 
             if outcome.probe_due {
-                let p = probe.clone();
-                let result = tokio::task::spawn_blocking(move || p())
-                    .await
-                    .unwrap_or_else(|e| Err(e.to_string()));
+                let result = run_probe(&probe, &in_flight, schedule.probe_deadline).await;
                 let diag = core.on_probe(mono_since_start, result);
                 shared.set_warning(core.warning());
                 if let Some(diag) = diag {
@@ -107,6 +119,49 @@ pub(crate) fn spawn_clock_skew_monitor(
             }
         }
     })
+}
+
+/// Clears the in-flight flag when the probe thread finishes, panics included.
+struct InFlightGuard(Arc<AtomicBool>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Run `probe` on a detached OS thread and wait at most `deadline` for it.
+///
+/// Detached so that neither aborting the monitor task nor shutting the
+/// runtime down ever waits on a hung resolver (process exit does not join
+/// it). `in_flight` caps the leak at one thread: while an earlier probe is
+/// still stuck, the next one fails fast instead of spawning another.
+async fn run_probe(
+    probe: &ClockProbe,
+    in_flight: &Arc<AtomicBool>,
+    deadline: Duration,
+) -> Result<f64, String> {
+    if in_flight.swap(true, Ordering::AcqRel) {
+        return Err("previous probe still pending".to_string());
+    }
+    let guard = InFlightGuard(in_flight.clone());
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let p = probe.clone();
+    let spawned = std::thread::Builder::new()
+        .name("clock-skew-probe".to_string())
+        .spawn(move || {
+            let _guard = guard;
+            let _ = tx.send(p());
+        });
+    if let Err(e) = spawned {
+        // The closure (and with it the guard) was dropped: flag is clear.
+        return Err(format!("probe thread failed to start: {e}"));
+    }
+    match tokio::time::timeout(deadline, rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("probe thread panicked".to_string()),
+        Err(_) => Err(format!("timed out after {} s", deadline.as_secs_f64())),
+    }
 }
 
 /// Send `diag` to the Diagnostics overlay and log it, so headless runs (no
@@ -139,7 +194,7 @@ mod tests {
     use crate::message_bus::{ComponentMessage, MessageType};
     use crossbeam_channel::Receiver;
     use std::collections::VecDeque;
-    use std::sync::atomic::AtomicI64;
+    use std::sync::atomic::{AtomicI64, AtomicUsize};
     use std::sync::Mutex;
     use std::time::Instant;
 
@@ -152,6 +207,7 @@ mod tests {
             interval: Duration::from_millis(150),
             step_recheck: Duration::from_millis(20),
             step_diag_min_gap: Duration::from_millis(50),
+            probe_deadline: Duration::from_secs(1),
         }
     }
 
@@ -171,6 +227,32 @@ mod tests {
             }
         });
         (probe, calls)
+    }
+
+    /// Probe that blocks (polling every 5 ms, not spinning) until `release`
+    /// is set, then reports +0.012 s. Counts calls.
+    fn hung_probe() -> (ClockProbe, Arc<AtomicUsize>, Arc<AtomicBool>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let (c, r) = (calls.clone(), release.clone());
+        let probe: ClockProbe = Arc::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            while !r.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(0.012)
+        });
+        (probe, calls, release)
+    }
+
+    /// Releases a [`hung_probe`] when dropped, so a failed assertion cannot
+    /// leave its thread blocked.
+    struct ReleaseOnDrop(Arc<AtomicBool>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
     }
 
     /// `Utc::now()` plus a test-controlled offset in milliseconds.
@@ -369,5 +451,100 @@ mod tests {
             .expect("monitor must exit within 3 ticks of shutdown")
             .unwrap();
         assert!(calls.lock().unwrap().is_empty());
+    }
+
+    /// A probe stuck in name resolution must time out, must not be stacked
+    /// by later probes, and must not hold runtime shutdown (Codex P2 on
+    /// #413: `spawn_blocking` work cannot be aborted).
+    #[test]
+    fn hung_probe_times_out_and_does_not_hold_runtime_shutdown() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (probe, calls, release) = hung_probe();
+        let _release = ReleaseOnDrop(release.clone());
+        let schedule = ClockMonitorSchedule {
+            probe_deadline: Duration::from_millis(50),
+            ..test_schedule()
+        };
+        let (wall, _offset) = offset_wall_clock();
+        let shared = ClockSkewShared::new();
+        let (bus, _tx, rx, handle) = rt.block_on(async {
+            let bus = MessageBus::new(16).unwrap();
+            let (tx, rx) = bus.create_channel(ComponentId::Tui).await.unwrap();
+            let handle = spawn_clock_skew_monitor(
+                bus.clone(),
+                shared.clone(),
+                Arc::new(AtomicBool::new(false)),
+                schedule,
+                probe,
+                wall,
+            );
+            (bus, tx, rx, handle)
+        });
+
+        let d = rt.block_on(next_diag(&rx));
+        assert_eq!((d.target, d.level), ("clock.skew", DiagnosticLevel::Info));
+        assert_eq!(
+            d.text,
+            "could not reach pool.ntp.org (timed out after 0.05 s) — clock unverified"
+        );
+
+        // Later probes come due while the first is still stuck; they fail
+        // fast instead of spawning another thread.
+        rt.block_on(async { tokio::time::sleep(schedule.interval * 3).await });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(shared.warning(), None);
+
+        drop(handle);
+        drop(bus);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(rt);
+            let _ = done_tx.send(());
+        });
+        let shut_down = done_rx.recv_timeout(WAIT);
+        release.store(true, Ordering::SeqCst);
+        shut_down.expect("runtime shutdown waited on the hung clock probe");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn probing_resumes_once_a_hung_probe_finishes() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_tx, rx) = bus.create_channel(ComponentId::Tui).await.unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (probe, calls, release) = hung_probe();
+        let _release = ReleaseOnDrop(release.clone());
+        let schedule = ClockMonitorSchedule {
+            probe_deadline: Duration::from_millis(50),
+            ..test_schedule()
+        };
+        let (wall, _offset) = offset_wall_clock();
+        let handle = spawn_clock_skew_monitor(
+            bus.clone(),
+            ClockSkewShared::new(),
+            shutdown.clone(),
+            schedule,
+            probe,
+            wall,
+        );
+
+        let d = next_diag(&rx).await;
+        assert!(
+            d.text
+                .starts_with("could not reach pool.ntp.org (timed out"),
+            "{}",
+            d.text
+        );
+        release.store(true, Ordering::SeqCst);
+
+        let d = next_diag(&rx).await;
+        assert_eq!(d.text, "clock check: offset +0.012 s vs pool.ntp.org — OK");
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+
+        shutdown.store(true, Ordering::Release);
+        tokio::time::timeout(WAIT, handle).await.unwrap().unwrap();
     }
 }
