@@ -8,6 +8,7 @@
   "rerun_ci_failed_jobs": false,
   "clear_pause": false,
   "arm": true,
+  "disarm": false,
   "blockers": [],
   "report": false
 }

@@ -8,6 +8,7 @@
   "rerun_ci_failed_jobs": false,
   "clear_pause": false,
   "arm": false,
+  "disarm": true,
   "blockers": [
     {
       "kind": "round-cap-exceeded"

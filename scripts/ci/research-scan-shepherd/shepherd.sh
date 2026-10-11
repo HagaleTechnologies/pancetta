@@ -130,6 +130,24 @@ arm_window_clear() {
   jq -e 'type == "array"' <<< "$labels" >/dev/null || return 2
   jq -e 'any(.[]; .name == "queue-needs-human-review") | not' <<< "$labels" >/dev/null || return 1
 }
+merge_state() {
+  gh api graphql -f query="query(\$owner: String!, \$name: String!, \$pr: Int!) { repository(owner: \$owner, name: \$name) { pullRequest(number: \$pr) { id autoMergeRequest { enabledAt } isInMergeQueue } } }" \
+    -f owner="${REPO%%/*}" -f name="${REPO##*/}" -F pr="$1" | jq -ce '.data.repository.pullRequest | select(. != null)'
+}
+# Disable auto-merge, remove any merge-queue entry (--disable-auto alone leaves one), and
+# confirm both are clear. Fails closed: unreadable state counts as still armed or queued.
+disarm_and_dequeue() {
+  local pr=$1 state id
+  gh pr merge "$pr" --repo "$REPO" --disable-auto >/dev/null 2>&1 || true
+  state=$(merge_state "$pr") || return 1
+  if jq -e '.isInMergeQueue' <<< "$state" >/dev/null; then
+    id=$(jq -er '.id' <<< "$state") || return 1
+    gh api graphql -f query="mutation(\$id: ID!) { dequeuePullRequest(input: {id: \$id}) { clientMutationId } }" -f id="$id" >/dev/null || return 1
+  fi
+  state=$(merge_state "$pr") || return 1
+  jq -e '.autoMergeRequest == null and .isInMergeQueue == false' <<< "$state" >/dev/null || {
+    echo "::error::PR #$pr is still armed or queued after disarm/dequeue" >&2; return 1; }
+}
 decide() { jq -c -L "$SCRIPT_DIR" -f "$SCRIPT_DIR/decide.jq" "$1"; }
 # A full fresh snapshot revalidates author, paths, pause provenance, queue rules and
 # dispositions at every action boundary. Return 3 for a benign stale/busy stand-down.
@@ -189,6 +207,15 @@ apply() {
   pr=$(jq -r '.pr.number' "$snapshot"); head=$(jq -r '.pr.headRefOid' "$snapshot")
   cat "$decision"
   if [[ $DRY_RUN == true ]]; then record_action "dry-run (no writes)"; return 0; fi
+  # The round cap has no native merge rule, so a PR armed or queued before crossing it
+  # would still merge; take it back out before anything else.
+  if jq -e '.disarm' "$decision" >/dev/null; then
+    refresh "$pr" "$head" || return $?
+    if jq -e '.disarm' "$WORK/live-decision" >/dev/null; then
+      disarm_and_dequeue "$pr" || return 1
+      record_action "disarmed and dequeued past the round cap"
+    fi
+  fi
   while IFS= read -r entry; do
     [[ -n $RESOLVE_TOKEN ]] || { echo '::error::Missing CODEX_REVIEW_PAT' >&2; return 1; }
     refresh "$pr" "$head" || return $?
@@ -247,8 +274,8 @@ apply() {
       record_action "armed auto-merge"
       code=0; arm_window_clear "$pr" || code=$?
       if [[ $code == 1 || $code == 2 ]]; then
-        gh pr merge "$pr" --repo "$REPO" --disable-auto >/dev/null || return 1
-        record_action "disarmed: queue producer or pause appeared while arming"
+        disarm_and_dequeue "$pr" || return 1
+        record_action "disarmed and dequeued: queue producer or pause appeared while arming"
         [[ $code == 2 ]] && return 1
         return 3
       fi

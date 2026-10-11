@@ -8,8 +8,9 @@ export PATH="$dir/stub:$PATH" STUB_DIR="$dir/stub" REPO=example/pancetta
 export GH_TOKEN=test-workflow-token RESOLVE_TOKEN=test-user-token ONLY_PR=420
 export REPORT_MENTION=thagale RUN_URL=https://example.invalid/run/1
 # P replays B's data with only the re-arm marker comment failing; Q replays B with the
-# queue handler re-pausing the PR as it is armed.
-for scenario in A B C D E F G H I J K L M N O P Q; do
+# queue handler re-pausing the PR as green checks queue it. R is armed and queued past the
+# round cap.
+for scenario in A B C D E F G H I J K L M N O P Q R; do
   export STUB_CASE=$scenario STUB_FAIL_REARM_COMMENT='' STUB_PAUSE_ON_ARM=''
   [[ $scenario == P ]] && export STUB_CASE=B STUB_FAIL_REARM_COMMENT=1
   [[ $scenario == Q ]] && export STUB_CASE=B STUB_PAUSE_ON_ARM=1
@@ -21,7 +22,7 @@ for scenario in A B C D E F G H I J K L M N O P Q; do
   [[ $scenario == A || $scenario == L ]] && export DRY_RUN=true
   status=0
   bash "$dir/shepherd.sh" > "$tmp/$scenario.out" 2>&1 || status=$?
-  expected=0; [[ $scenario == D || $scenario == H || $scenario == I || $scenario == J || $scenario == O || $scenario == P ]] && expected=1
+  expected=0; [[ $scenario == D || $scenario == H || $scenario == I || $scenario == J || $scenario == O || $scenario == P || $scenario == R ]] && expected=1
   if [[ $status != "$expected" ]]; then cat "$tmp/$scenario.out"; exit 1; fi
   ruby -rjson - "$scenario" "$STUB_LOG" "$tmp/$scenario.out" <<'RUBY'
 scenario, log, output = ARGV
@@ -81,8 +82,17 @@ when 'Q'
   comment = find.call('<!-- research-scan-shepherd:rearm sha=1a2b3c400000 -->')
   arm = find.call('pr merge 420 --repo example/pancetta --auto --squash')
   disarm = find.call('pr merge 420 --repo example/pancetta --disable-auto')
-  raise 'race order' unless comment < arm && arm < disarm
+  dequeue = find.call('dequeuePullRequest(')
+  raise 'race order' unless comment < arm && arm < disarm && disarm < dequeue
+  raise 'dequeue token' unless calls[dequeue]['args'].include?('id=PR_node_420')
   raise 'pause override not reported' unless File.read(output).include?('producer became busy')
+when 'R'
+  disarm = find.call('pr merge 420 --repo example/pancetta --disable-auto')
+  dequeue = find.call('dequeuePullRequest(')
+  report = find.call('issue create')
+  raise 'round-cap order' unless disarm < dequeue && dequeue < report
+  raise 'armed past the round cap' if calls.any? { |c| c['args'].include?('--auto') }
+  raise 'missing round-cap blocker' unless File.read(output).include?('round-cap-exceeded')
 when 'E'
   raise 'busy mutation' unless mutations.empty?
   raise 'missing skip notice' unless File.read(output).include?('skip')

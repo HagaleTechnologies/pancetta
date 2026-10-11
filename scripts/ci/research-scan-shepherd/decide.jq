@@ -25,7 +25,7 @@ def disposition($s):
 | {number: $s.pr.number, eligible: ($reasons | length == 0), ineligible_reasons: $reasons,
    codex_rounds: ($s.codex_review_commits | unique | length), resolve: [],
    rerun_codex_verdict: false, rerun_ci_failed_jobs: false, clear_pause: false,
-   arm: false, blockers: [], report: false}
+   arm: false, disarm: false, blockers: [], report: false}
 | if .eligible | not then . else
     [$s.threads[] | select(.isResolved | not) | disposition($s)] as $dispositions
     | .resolve = [$dispositions[].resolve // empty]
@@ -71,6 +71,9 @@ def disposition($s):
         (any(.blockers[]; .kind == "round-cap-exceeded") | not) and
         (($s.pause.present | not) or $s.pause.attached_by == "github-actions[bot]"))
     | .clear_pause = (.arm and $s.pause.present)
-    | .report = (($s.now | fromdateiso8601) - ($s.pr.createdAt | fromdateiso8601) >
-        $s.config.stuck_after_hours * 3600 and ($s.pr.inMergeQueue | not) and (.blockers | length > 0))
+    # A PR armed or queued before it crossed the cap is taken back out and reported at once.
+    | (any(.blockers[]; .kind == "round-cap-exceeded")) as $capped
+    | .disarm = ($capped and ($s.pr.armed or $s.pr.inMergeQueue))
+    | .report = ($capped or (($s.now | fromdateiso8601) - ($s.pr.createdAt | fromdateiso8601) >
+        $s.config.stuck_after_hours * 3600 and ($s.pr.inMergeQueue | not) and (.blockers | length > 0)))
   end

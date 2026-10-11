@@ -16,16 +16,18 @@ case "$1 $2" in
   'run rerun') echo '{}' ;;
   'pr list') echo '[{"number":420}]' ;;
   'pr merge')
-    if [[ $args == *' --disable-auto '* ]]; then rm -f "$STUB_STATE/armed"
+    if [[ $args == *' --disable-auto '* ]]; then rm -f "$STUB_STATE/armed"; touch "$STUB_STATE/disarmed"
     else
-      touch "$STUB_STATE/armed"
-      # Simulates the Queue Retry Handler pausing the PR just as the shepherd arms it.
-      [[ -z ${STUB_PAUSE_ON_ARM:-} ]] || touch "$STUB_STATE/repaused"
+      touch "$STUB_STATE/armed"; rm -f "$STUB_STATE/disarmed"
+      # Simulates the Queue Retry Handler pausing the PR just as green checks queue it.
+      [[ -z ${STUB_PAUSE_ON_ARM:-} ]] || touch "$STUB_STATE/repaused" "$STUB_STATE/queued"
     fi
     echo '{}' ;;
   'issue create'|'issue edit'|'issue close'|'issue comment'|'label create') echo '{}' ;;
   'api graphql')
-    if [[ $args == *'resolveReviewThread('* ]]; then
+    if [[ $args == *'dequeuePullRequest('* ]]; then
+      touch "$STUB_STATE/dequeued"; echo '{"data":{"dequeuePullRequest":{"clientMutationId":null}}}'
+    elif [[ $args == *'resolveReviewThread('* ]]; then
       for arg in "$@"; do [[ $arg == id=* ]] && touch "$STUB_STATE/${arg#id=}"; done
       echo '{"data":{"resolveReviewThread":{"thread":{"isResolved":true}}}}'
     elif [[ $args == *'node(id:'* ]]; then
@@ -38,9 +40,16 @@ case "$1 $2" in
         get '.pr' | jq '.data.repository.pullRequest.headRefOid = ("f" * 40)'
         exit 0
       fi
-      get '.pr' | jq --argjson cleared "$([[ -f $STUB_STATE/cleared ]] && echo true || echo false)" --argjson armed "$([[ -f $STUB_STATE/armed ]] && echo true || echo false)" '
+      get '.pr' | jq --argjson cleared "$([[ -f $STUB_STATE/cleared ]] && echo true || echo false)" --argjson armed "$([[ -f $STUB_STATE/armed ]] && echo true || echo false)" \
+        --argjson disarmed "$([[ -f $STUB_STATE/disarmed ]] && echo true || echo false)" \
+        --argjson queued "$([[ -f $STUB_STATE/queued ]] && echo true || echo false)" \
+        --argjson dequeued "$([[ -f $STUB_STATE/dequeued ]] && echo true || echo false)" '
         if $cleared then .data.repository.pullRequest.labels.nodes |= map(select(.name != "queue-needs-human-review")) else . end
-        | if $armed then .data.repository.pullRequest.autoMergeRequest = {enabledAt:"2026-10-13T18:20:00Z"} else . end' > "$STUB_STATE/live.json"
+        | if $armed then .data.repository.pullRequest.autoMergeRequest = {enabledAt:"2026-10-13T18:20:00Z"} else . end
+        | .data.repository.pullRequest.id = "PR_node_420"
+        | if $disarmed then .data.repository.pullRequest.autoMergeRequest = null else . end
+        | if $queued then .data.repository.pullRequest.isInMergeQueue = true else . end
+        | if $dequeued then .data.repository.pullRequest.isInMergeQueue = false else . end' > "$STUB_STATE/live.json"
       for f in "$STUB_STATE"/PRRT_*; do
         [[ -f $f ]] || continue
         jq --arg id "$(basename "$f")" '(.data.repository.pullRequest.reviewThreads.nodes[] | select(.id==$id)).isResolved = true' "$STUB_STATE/live.json" > "$STUB_STATE/next.json"
