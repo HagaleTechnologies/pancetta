@@ -75,6 +75,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Autonomous and manual TX no longer key the rig while the rig's CAT link is
+  lost or the audio output device has stopped delivering samples (PAN-115).
+  The TX gate reports `rig is disconnected` (after 5 s of failed rig polls) or
+  `audio output device is dead` (on an output stream error or 2 s without an
+  output callback), and TX resumes on its own once the link or device
+  recovers. The rig poll loop now redials rigctld itself (2 s backing off to
+  30 s), so the RIG badge also recovers without a transmission. New `rig.cat`
+  and `audio.health` diagnostics mark each loss and recovery.
+
 - Every documented minimal config block now parses on its own (PAN-90): the
   README's `[autonomous] enabled = true`, both GUIDE.md GridTracker
   `[network.wsjtx_udp]` recipes, and CONFIG.md's minimum viable config used

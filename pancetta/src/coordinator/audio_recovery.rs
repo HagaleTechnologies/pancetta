@@ -4,7 +4,7 @@
 //! so the backoff and watchdog-edge-detection policies are unit-testable
 //! without a real `AudioManager`.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Capped-exponential backoff for repeated `reopen_devices` attempts after a
 /// `process_audio` error. The first call after construction (or after a
@@ -131,6 +131,100 @@ impl Default for StaleWatchdog {
     }
 }
 
+/// PAN-115: no output callback for this long ⇒ the output device counts as dead.
+/// Same 2 s budget as the RX stale watchdog.
+pub(crate) const OUTPUT_STALL_AFTER: Duration = Duration::from_secs(2);
+
+/// Edge reported by [`OutputWatchdog`]; each fires once per episode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputEdge {
+    None,
+    /// The output device just stopped calling back (stall or stream error).
+    WentDead,
+    /// The first output callback after an announced `WentDead`.
+    Recovered,
+}
+
+/// PAN-115: turns the cpal output callback's run counter
+/// ([`pancetta_audio::AudioManager::output_callback_count`]) into an
+/// alive/dead verdict for the TX hard mute, with once-per-episode edges for
+/// the `audio.health` diagnostics. Pure (the caller supplies `now`), so the
+/// timing rules are unit-testable without a sound device.
+pub(crate) struct OutputWatchdog {
+    /// Count seen at the previous observation; `None` right after
+    /// construction or a rebaseline, so a fresh baseline is never progress.
+    last_count: Option<u64>,
+    /// When the count last changed; `None` until progress is observed.
+    last_progress: Option<Instant>,
+    /// Start, or the last rebaseline / stream error.
+    epoch: Instant,
+    /// A `WentDead` edge has been reported and not yet followed by `Recovered`.
+    announced_dead: bool,
+}
+
+impl OutputWatchdog {
+    pub(crate) fn new(now: Instant) -> Self {
+        Self {
+            last_count: None,
+            last_progress: None,
+            epoch: now,
+            announced_dead: false,
+        }
+    }
+
+    /// Progress = the count changed since the previous observation (a fresh
+    /// baseline is never progress). Alive = progress within OUTPUT_STALL_AFTER.
+    /// WentDead once per episode when no progress for OUTPUT_STALL_AFTER since
+    /// max(last_progress, epoch). Recovered on the first progress after WentDead.
+    pub(crate) fn observe(&mut self, count: u64, now: Instant) -> OutputEdge {
+        let progressed = self.last_count.is_some_and(|last| last != count);
+        self.last_count = Some(count);
+        if progressed {
+            self.last_progress = Some(now);
+            if self.announced_dead {
+                self.announced_dead = false;
+                return OutputEdge::Recovered;
+            }
+            return OutputEdge::None;
+        }
+        let since = self.last_progress.map_or(self.epoch, |p| p.max(self.epoch));
+        if !self.announced_dead && now.saturating_duration_since(since) >= OUTPUT_STALL_AFTER {
+            self.announced_dead = true;
+            return OutputEdge::WentDead;
+        }
+        OutputEdge::None
+    }
+
+    /// The output stream reported an error: dead immediately, announced once.
+    pub(crate) fn mark_stream_error(&mut self, now: Instant) -> OutputEdge {
+        self.last_progress = None;
+        self.epoch = now;
+        if self.announced_dead {
+            OutputEdge::None
+        } else {
+            self.announced_dead = true;
+            OutputEdge::WentDead
+        }
+    }
+
+    /// After any device reopen (auto-recovery or operator picker): drop the
+    /// baseline, not alive until new progress, no announcement.
+    pub(crate) fn rebaseline(&mut self, now: Instant) {
+        self.last_count = None;
+        self.last_progress = None;
+        self.epoch = now;
+    }
+
+    /// `true` only while an output callback has been observed within
+    /// [`OUTPUT_STALL_AFTER`] and no stall/error is outstanding.
+    pub(crate) fn is_alive(&self, now: Instant) -> bool {
+        !self.announced_dead
+            && self
+                .last_progress
+                .is_some_and(|p| now.saturating_duration_since(p) < OUTPUT_STALL_AFTER)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,5 +319,113 @@ mod tests {
             w.on_timeout(),
             "must retry after RETRY_AFTER_TICKS consecutive stale ticks with no data"
         );
+    }
+
+    // --- PAN-115: OutputWatchdog ---
+
+    fn ms(t0: Instant, millis: u64) -> Instant {
+        t0 + Duration::from_millis(millis)
+    }
+
+    /// An `OutputWatchdog` that has just seen progress at `t0 + 10 ms`.
+    fn alive_watchdog(t0: Instant) -> OutputWatchdog {
+        let mut w = OutputWatchdog::new(t0);
+        assert_eq!(w.observe(0, t0), OutputEdge::None);
+        assert_eq!(w.observe(5, ms(t0, 10)), OutputEdge::None);
+        assert!(w.is_alive(ms(t0, 10)));
+        w
+    }
+
+    #[test]
+    fn not_alive_until_the_first_progress_is_observed() {
+        let t0 = Instant::now();
+        let mut w = OutputWatchdog::new(t0);
+        assert_eq!(w.observe(0, t0), OutputEdge::None);
+        assert!(!w.is_alive(t0));
+        // Silent first-alive: nothing was announced, so no Recovered.
+        assert_eq!(w.observe(5, ms(t0, 10)), OutputEdge::None);
+        assert!(w.is_alive(ms(t0, 10)));
+    }
+
+    #[test]
+    fn stall_of_two_seconds_reports_went_dead_once() {
+        let t0 = Instant::now();
+        let mut w = alive_watchdog(t0);
+        let t = ms(t0, 10);
+        assert_eq!(w.observe(5, ms(t, 1999)), OutputEdge::None);
+        assert!(w.is_alive(ms(t, 1999)));
+        assert_eq!(w.observe(5, ms(t, 2000)), OutputEdge::WentDead);
+        assert!(!w.is_alive(ms(t, 2000)));
+        assert_eq!(w.observe(5, ms(t, 5000)), OutputEdge::None);
+        assert!(!w.is_alive(ms(t, 5000)));
+    }
+
+    #[test]
+    fn progress_after_went_dead_reports_recovered() {
+        let t0 = Instant::now();
+        let mut w = alive_watchdog(t0);
+        assert_eq!(w.observe(5, ms(t0, 2010)), OutputEdge::WentDead);
+        assert_eq!(w.observe(6, ms(t0, 3000)), OutputEdge::Recovered);
+        assert!(w.is_alive(ms(t0, 3000)));
+        assert_eq!(w.observe(7, ms(t0, 3010)), OutputEdge::None);
+    }
+
+    #[test]
+    fn never_progressing_after_start_reports_went_dead_after_two_seconds() {
+        let t0 = Instant::now();
+        let mut w = OutputWatchdog::new(t0);
+        assert_eq!(w.observe(0, t0), OutputEdge::None);
+        assert_eq!(w.observe(0, ms(t0, 1999)), OutputEdge::None);
+        assert_eq!(w.observe(0, ms(t0, 2000)), OutputEdge::WentDead);
+        assert!(!w.is_alive(ms(t0, 2000)));
+    }
+
+    #[test]
+    fn stream_error_is_immediately_dead_and_announced_once() {
+        let t0 = Instant::now();
+        let mut w = alive_watchdog(t0);
+        let t = ms(t0, 20);
+        assert_eq!(w.mark_stream_error(t), OutputEdge::WentDead);
+        assert!(!w.is_alive(t));
+        assert_eq!(w.mark_stream_error(ms(t, 5)), OutputEdge::None);
+        assert!(!w.is_alive(ms(t, 5)));
+    }
+
+    #[test]
+    fn rebaseline_is_silent_and_waits_for_progress() {
+        let t0 = Instant::now();
+        let mut w = alive_watchdog(t0);
+        let t = ms(t0, 20);
+        w.rebaseline(t);
+        assert!(!w.is_alive(t));
+        // The fresh stream's counter starts again at 0: a baseline, not progress.
+        assert_eq!(w.observe(0, ms(t, 1)), OutputEdge::None);
+        assert!(!w.is_alive(ms(t, 1)));
+        assert_eq!(w.observe(3, ms(t, 20)), OutputEdge::None);
+        assert!(w.is_alive(ms(t, 20)));
+    }
+
+    #[test]
+    fn rebaseline_after_announced_error_reports_recovered_on_progress() {
+        let t0 = Instant::now();
+        let mut w = alive_watchdog(t0);
+        assert_eq!(w.mark_stream_error(ms(t0, 20)), OutputEdge::WentDead);
+        w.rebaseline(ms(t0, 300));
+        assert_eq!(w.observe(0, ms(t0, 301)), OutputEdge::None);
+        assert!(!w.is_alive(ms(t0, 301)));
+        assert_eq!(w.observe(2, ms(t0, 320)), OutputEdge::Recovered);
+        assert!(w.is_alive(ms(t0, 320)));
+    }
+
+    #[test]
+    fn counter_reset_by_reopen_is_not_progress() {
+        let t0 = Instant::now();
+        let mut w = OutputWatchdog::new(t0);
+        w.observe(49_990, t0);
+        assert_eq!(w.observe(50_000, ms(t0, 10)), OutputEdge::None);
+        assert!(w.is_alive(ms(t0, 10)));
+        w.rebaseline(ms(t0, 20));
+        assert_eq!(w.observe(0, ms(t0, 21)), OutputEdge::None);
+        assert!(!w.is_alive(ms(t0, 21)));
     }
 }

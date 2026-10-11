@@ -2341,6 +2341,26 @@ fn current_tx_policy(
 /// a boolean -- see that field's doc comment in `coordinator/mod.rs` for
 /// why a boolean under-reported when two handoffs (frequency + split)
 /// were outstanding at once.
+///
+/// PAN-115: two hardware-health inputs, checked right after the two
+/// restart/readiness reasons (hardware faults explain more than CAT
+/// bookkeeping; the operator's own `Disabled` stays last). Like PAN-5's
+/// restart inhibit they are health-owned safety state ANDed in here, never
+/// folded into `TxPolicy`, and both clear on their own once the link or
+/// device recovers:
+/// - `rig_conn_state` ([`super::hamlib::RigConnState`], written by the Hamlib
+///   poll loop) mutes only on `PollingFailed` ("was connected, polls have
+///   failed for 5 s"). `NotConnected` is overloaded (mock rig, rig control
+///   disabled, not tried yet, initial connect failed), so it does NOT mute;
+///   a real rig that never connects still reaches `PollingFailed` after 5 s.
+///   The poll loop redials rigctld while disconnected, which is what clears
+///   this state again (PTT itself used to be the only redial).
+/// - `audio_output_alive` (written by the real audio thread's
+///   `OutputWatchdog`) is `false` from an output stream error, or 2 s without
+///   an output callback, until a (re)opened stream calls back again. It stays
+///   `true` in no-device modes (`--no-audio`, stub, replay), which have no
+///   output device to judge.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn tx_hard_mute_reason(
     tx_policy: &std::sync::Arc<std::sync::atomic::AtomicU8>,
     restart_inhibit: &std::sync::Arc<std::sync::atomic::AtomicU32>,
@@ -2350,11 +2370,19 @@ pub(crate) fn tx_hard_mute_reason(
     >,
     hamlib_pending_split: &std::sync::Arc<std::sync::Mutex<Option<ComponentMessage>>>,
     hamlib_command_in_flight: &std::sync::Arc<std::sync::atomic::AtomicU32>,
+    rig_conn_state: &std::sync::Arc<std::sync::atomic::AtomicU8>,
+    audio_output_alive: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Option<&'static str> {
     if restart_inhibit.load(Ordering::Acquire) != 0 {
         Some("rig control is restarting")
     } else if !hamlib_loop_ready.load(Ordering::Acquire) {
         Some("Hamlib command loop is not yet ready")
+    } else if super::hamlib::RigConnState::from_u8(rig_conn_state.load(Ordering::Acquire))
+        == super::hamlib::RigConnState::PollingFailed
+    {
+        Some("rig is disconnected")
+    } else if !audio_output_alive.load(Ordering::Acquire) {
+        Some("audio output device is dead")
     } else if has_undelivered_pending_hamlib_state(hamlib_pending_frequency, hamlib_pending_split) {
         Some("pending rig frequency/split state has not been delivered yet")
     } else if hamlib_command_in_flight.load(Ordering::Acquire) > 0 {
@@ -2395,6 +2423,7 @@ fn has_undelivered_pending_hamlib_state(
 #[cfg(test)]
 mod tx_hard_mute_reason_tests {
     use super::*;
+    use crate::coordinator::hamlib::RigConnState;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8};
     use std::sync::{Arc, Mutex};
 
@@ -2432,6 +2461,16 @@ mod tx_hard_mute_reason_tests {
         Arc::new(AtomicU32::new(0))
     }
 
+    /// PAN-115: a `rig_conn_state` atomic holding `state`.
+    fn rig(state: RigConnState) -> Arc<AtomicU8> {
+        Arc::new(AtomicU8::new(state.as_u8()))
+    }
+
+    /// PAN-115: an `audio_output_alive` flag.
+    fn audio_alive(alive: bool) -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(alive))
+    }
+
     #[test]
     fn permits_tx_when_everything_is_ready() {
         let policy = policy(pancetta_core::TxPolicy::Full);
@@ -2445,6 +2484,8 @@ mod tx_hard_mute_reason_tests {
                 &no_pending_frequency(),
                 &no_pending(),
                 &not_in_flight(),
+                &rig(RigConnState::Connected),
+                &audio_alive(true),
             ),
             None
         );
@@ -2462,6 +2503,8 @@ mod tx_hard_mute_reason_tests {
             &no_pending_frequency(),
             &no_pending(),
             &not_in_flight(),
+            &rig(RigConnState::Connected),
+            &audio_alive(true),
         )
         .is_some());
     }
@@ -2493,6 +2536,8 @@ mod tx_hard_mute_reason_tests {
             &no_pending_frequency(),
             &no_pending(),
             &not_in_flight(),
+            &rig(RigConnState::Connected),
+            &audio_alive(true),
         );
         assert!(
             reason.is_some(),
@@ -2525,6 +2570,8 @@ mod tx_hard_mute_reason_tests {
             &no_pending_frequency(),
             &pending_split,
             &not_in_flight(),
+            &rig(RigConnState::Connected),
+            &audio_alive(true),
         );
         assert!(
             reason.is_some(),
@@ -2544,6 +2591,8 @@ mod tx_hard_mute_reason_tests {
                 &no_pending_frequency(),
                 &pending_split,
                 &not_in_flight(),
+                &rig(RigConnState::Connected),
+                &audio_alive(true),
             ),
             None,
             "PTT-on must be permitted again once the pending SetSplit has been delivered"
@@ -2579,6 +2628,8 @@ mod tx_hard_mute_reason_tests {
             &pending_frequency,
             &no_pending(),
             &not_in_flight(),
+            &rig(RigConnState::Connected),
+            &audio_alive(true),
         )
         .is_some());
     }
@@ -2619,6 +2670,8 @@ mod tx_hard_mute_reason_tests {
                     &pending_frequency,
                     &no_pending(),
                     &not_in_flight(),
+                    &rig(RigConnState::Connected),
+                    &audio_alive(true),
                 )
                 .is_some(),
                 "a pending command for {vfo:?} alone must still mute TX"
@@ -2639,6 +2692,8 @@ mod tx_hard_mute_reason_tests {
                 &no_pending_frequency(),
                 &no_pending(),
                 &not_in_flight(),
+                &rig(RigConnState::Connected),
+                &audio_alive(true),
             ),
             Some("TX policy is Disabled")
         );
@@ -2668,6 +2723,8 @@ mod tx_hard_mute_reason_tests {
                 &no_pending_frequency(),
                 &pending_split,
                 &not_in_flight(),
+                &rig(RigConnState::Connected),
+                &audio_alive(true),
             )
             .is_some(),
             "a poisoned pending-slot lock must fail closed (still muted), not be treated as \
@@ -2698,6 +2755,8 @@ mod tx_hard_mute_reason_tests {
             &no_pending_frequency(),
             &no_pending(),
             &in_flight,
+            &rig(RigConnState::Connected),
+            &audio_alive(true),
         );
         assert!(
             reason.is_some(),
@@ -2717,9 +2776,134 @@ mod tx_hard_mute_reason_tests {
                 &no_pending_frequency(),
                 &no_pending(),
                 &in_flight,
+                &rig(RigConnState::Connected),
+                &audio_alive(true),
             ),
             None,
             "PTT-on must be permitted again once the in-flight CAT call has resolved"
+        );
+    }
+
+    /// All-healthy inputs except the two PAN-115 ones, which the caller passes.
+    fn reason_with(
+        restart: u32,
+        loop_ready: bool,
+        policy_value: pancetta_core::TxPolicy,
+        rig_state: &Arc<AtomicU8>,
+        audio: &Arc<AtomicBool>,
+    ) -> Option<&'static str> {
+        tx_hard_mute_reason(
+            &policy(policy_value),
+            &Arc::new(AtomicU32::new(restart)),
+            &Arc::new(AtomicBool::new(loop_ready)),
+            &no_pending_frequency(),
+            &no_pending(),
+            &not_in_flight(),
+            rig_state,
+            audio,
+        )
+    }
+
+    /// PAN-115 Gherkin 2: a lost rig/CAT connection mutes TX with an exact
+    /// reason, and clears as soon as the poll loop reports Connected again.
+    #[test]
+    fn rig_polling_failed_mutes_tx_as_rig_disconnected() {
+        let rig_state = rig(RigConnState::PollingFailed);
+        let audio = audio_alive(true);
+        assert_eq!(
+            reason_with(0, true, pancetta_core::TxPolicy::Full, &rig_state, &audio),
+            Some("rig is disconnected")
+        );
+        rig_state.store(RigConnState::Connected.as_u8(), Ordering::Release);
+        assert_eq!(
+            reason_with(0, true, pancetta_core::TxPolicy::Full, &rig_state, &audio),
+            None
+        );
+    }
+
+    /// `NotConnected` covers the mock rig, rig control disabled and "not
+    /// tried yet"; it must not mute.
+    #[test]
+    fn rig_not_connected_does_not_mute() {
+        assert_eq!(
+            reason_with(
+                0,
+                true,
+                pancetta_core::TxPolicy::Full,
+                &rig(RigConnState::NotConnected),
+                &audio_alive(true),
+            ),
+            None
+        );
+    }
+
+    /// PAN-115 Gherkin 1: a dead audio output mutes TX with an exact reason,
+    /// and clears once output callbacks resume.
+    #[test]
+    fn dead_audio_output_mutes_tx() {
+        let rig_state = rig(RigConnState::Connected);
+        let audio = audio_alive(false);
+        assert_eq!(
+            reason_with(0, true, pancetta_core::TxPolicy::Full, &rig_state, &audio),
+            Some("audio output device is dead")
+        );
+        audio.store(true, Ordering::Release);
+        assert_eq!(
+            reason_with(0, true, pancetta_core::TxPolicy::Full, &rig_state, &audio),
+            None
+        );
+    }
+
+    /// "not during a supervised restart": the restart reason keeps priority.
+    #[test]
+    fn restart_inhibit_outranks_rig_disconnected() {
+        assert_eq!(
+            reason_with(
+                1,
+                true,
+                pancetta_core::TxPolicy::Full,
+                &rig(RigConnState::PollingFailed),
+                &audio_alive(true),
+            ),
+            Some("rig control is restarting")
+        );
+    }
+
+    #[test]
+    fn loop_not_ready_outranks_rig_and_audio() {
+        assert_eq!(
+            reason_with(
+                0,
+                false,
+                pancetta_core::TxPolicy::Full,
+                &rig(RigConnState::PollingFailed),
+                &audio_alive(false),
+            ),
+            Some("Hamlib command loop is not yet ready")
+        );
+    }
+
+    #[test]
+    fn rig_disconnected_outranks_audio_dead_and_policy_disabled() {
+        assert_eq!(
+            reason_with(
+                0,
+                true,
+                pancetta_core::TxPolicy::Disabled,
+                &rig(RigConnState::PollingFailed),
+                &audio_alive(false),
+            ),
+            Some("rig is disconnected")
+        );
+        assert_eq!(
+            reason_with(
+                0,
+                true,
+                pancetta_core::TxPolicy::Disabled,
+                &rig(RigConnState::Connected),
+                &audio_alive(false),
+            ),
+            Some("audio output device is dead")
         );
     }
 }
@@ -5101,6 +5285,9 @@ impl super::ApplicationCoordinator {
             // pending through CAT application" -- see `tx_hard_mute_reason`'s
             // doc comment.
             let hamlib_command_in_flight = self.hamlib_command_in_flight.clone();
+            // PAN-115 -- see `tx_hard_mute_reason`'s doc comment.
+            let rig_conn_state = self.rig_conn_state.clone();
+            let audio_output_alive = self.audio_output_alive.clone();
             // Drop-stale-TX gate: the QSO component keeps this set in sync;
             // the worker refuses to key PTT for a request whose `qso_id` is no
             // longer present (superseded / cancelled / completed-past-grace).
@@ -5557,6 +5744,8 @@ impl super::ApplicationCoordinator {
                                         &hamlib_pending_frequency,
                                         &hamlib_pending_split,
                                         &hamlib_command_in_flight,
+                                        &rig_conn_state,
+                                        &audio_output_alive,
                                     ) {
                                         info!(
                                             target: "pancetta::tx.policy",
@@ -6128,6 +6317,8 @@ impl super::ApplicationCoordinator {
                                             &hamlib_pending_frequency,
                                             &hamlib_pending_split,
                                             &hamlib_command_in_flight,
+                                            &rig_conn_state,
+                                            &audio_output_alive,
                                         ) {
                                             emit_diagnostic(
                                                 &message_bus,
@@ -6464,6 +6655,61 @@ impl super::ApplicationCoordinator {
                                                 "tx.policy",
                                                 pancetta_core::DiagnosticLevel::Info,
                                                 diag_msg,
+                                                qso_id.as_deref(),
+                                            )
+                                            .await;
+                                            send_tx_queue_status(&message_bus, None, Vec::new())
+                                                .await;
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text,
+                                                    duration_ms: 0,
+                                                    qso_id: qso_id.clone(),
+                                                },
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(complete_msg).await;
+                                            continue 'worker;
+                                        }
+
+                                        // PAN-115: re-run the TX hard mute here too. The
+                                        // post-wait check above runs before Step 4c and the
+                                        // status awaits, so a rig CAT loss or dead audio
+                                        // output (or any other hard-mute reason) landing in
+                                        // that window would otherwise still key. SYNCHRONOUS
+                                        // (atomics + mutex), so "nothing else runs between
+                                        // this call and the key" still holds. Same unwind as
+                                        // Step 4d: nothing reached the air.
+                                        if let Some(reason) = tx_hard_mute_reason(
+                                            &tx_policy,
+                                            &tx_restart_inhibit,
+                                            &hamlib_command_loop_ready,
+                                            &hamlib_pending_frequency,
+                                            &hamlib_pending_split,
+                                            &hamlib_command_in_flight,
+                                            &rig_conn_state,
+                                            &audio_output_alive,
+                                        ) {
+                                            ptt_active.store(false, Ordering::Release);
+                                            ptt_guard.disarm();
+                                            if let Some(key) = pivoted_this_key.take() {
+                                                pivoted_once.remove(&key);
+                                            }
+                                            info!(
+                                                target: "pancetta::tx.policy",
+                                                "TX blocked at final pre-PTT check ({reason}): '{message_text}' (qso: {:?})",
+                                                qso_id
+                                            );
+                                            emit_diagnostic(
+                                                &message_bus,
+                                                "tx.policy",
+                                                pancetta_core::DiagnosticLevel::Info,
+                                                format!(
+                                                    "TX blocked at final pre-PTT check ({reason}): '{message_text}'"
+                                                ),
                                                 qso_id.as_deref(),
                                             )
                                             .await;
@@ -7668,6 +7914,8 @@ impl super::ApplicationCoordinator {
                                         &hamlib_pending_frequency,
                                         &hamlib_pending_split,
                                         &hamlib_command_in_flight,
+                                        &rig_conn_state,
+                                        &audio_output_alive,
                                     ) {
                                         info!(
                                             target: "pancetta::tx.policy",
@@ -8714,6 +8962,8 @@ impl super::ApplicationCoordinator {
                                         &hamlib_pending_frequency,
                                         &hamlib_pending_split,
                                         &hamlib_command_in_flight,
+                                        &rig_conn_state,
+                                        &audio_output_alive,
                                     ) {
                                         emit_diagnostic(
                                             &message_bus,
@@ -8940,6 +9190,62 @@ impl super::ApplicationCoordinator {
                                             format!(
                                                 "dropping multi-TX bundle at final pre-PTT check: {newly_stale} of {} item(s) ended or held (colliding DX parity) since the key-time check",
                                                 final_live_mask.len()
+                                            ),
+                                            None,
+                                        )
+                                        .await;
+                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                        for item in &items {
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text: item.message_text.clone(),
+                                                    duration_ms: 0,
+                                                    qso_id: item.qso_id.clone(),
+                                                },
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(complete_msg).await;
+                                        }
+                                        continue;
+                                    }
+
+                                    // PAN-115: re-run the TX hard mute here too, mirroring
+                                    // the single-TX path. The post-wait check above runs
+                                    // before Step 4b's re-encode and the status awaits, so
+                                    // a rig CAT loss or dead audio output (or any other
+                                    // hard-mute reason) landing in that window would
+                                    // otherwise still key. SYNCHRONOUS (atomics + mutex),
+                                    // so "nothing else runs between this call and the key"
+                                    // still holds. Same unwind as Step 4d.
+                                    if let Some(reason) = tx_hard_mute_reason(
+                                        &tx_policy,
+                                        &tx_restart_inhibit,
+                                        &hamlib_command_loop_ready,
+                                        &hamlib_pending_frequency,
+                                        &hamlib_pending_split,
+                                        &hamlib_command_in_flight,
+                                        &rig_conn_state,
+                                        &audio_output_alive,
+                                    ) {
+                                        ptt_active.store(false, Ordering::Release);
+                                        ptt_guard.disarm();
+                                        for key in &pivoted_this_bundle_keys {
+                                            pivoted_once.remove(key);
+                                        }
+                                        let n = items.len();
+                                        info!(
+                                            target: "pancetta::tx.policy",
+                                            "TX bundle blocked at final pre-PTT check ({reason}): {n} items"
+                                        );
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "tx.policy",
+                                            pancetta_core::DiagnosticLevel::Info,
+                                            format!(
+                                                "TX bundle blocked at final pre-PTT check ({reason}): {n} items"
                                             ),
                                             None,
                                         )
@@ -9613,6 +9919,8 @@ impl super::ApplicationCoordinator {
                                         &hamlib_pending_frequency,
                                         &hamlib_pending_split,
                                         &hamlib_command_in_flight,
+                                        &rig_conn_state,
+                                        &audio_output_alive,
                                     ) {
                                         info!(
                                             target: "pancetta::tx.policy",
@@ -14908,5 +15216,238 @@ mod classifier_tests {
             matches!(outcome, super::IncomingDuringTx::Requeue),
             "an ID-only match with no changed content must not supersede, got {outcome:?}"
         );
+    }
+}
+
+/// PAN-115: the two Gherkin scenarios end to end, through the real TX worker
+/// (`start_transmitter_component`) over a real `MessageBus`: a request made
+/// while the rig CAT link is lost, or while the audio output is dead, is
+/// refused at the key-time gate with no `SetPtt{true}` ever reaching Hamlib.
+#[cfg(test)]
+mod pan115_worker_gate_tests {
+    use super::super::hamlib::RigConnState;
+    use super::super::ApplicationCoordinator;
+    use crate::message_bus::{
+        ComponentId, ComponentMessage, MessageType, RigControlMessage, TxOrigin,
+    };
+    use crossbeam_channel::Receiver;
+    use pancetta_config::Config;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    struct Harness {
+        coordinator: ApplicationCoordinator,
+        shutdown: Arc<AtomicBool>,
+        hamlib_rx: Receiver<ComponentMessage>,
+        autonomous_rx: Receiver<ComponentMessage>,
+        tui_rx: Receiver<ComponentMessage>,
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::Release);
+        }
+    }
+
+    async fn worker_harness() -> Harness {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut coordinator = ApplicationCoordinator::new(
+            Config::default(),
+            None,
+            true,  // no_audio
+            true,  // headless
+            false, // metrics
+            9090,
+            None, // no WAV
+            None, // no replay
+            None, // no test-tx
+            1500.0,
+            shutdown.clone(),
+            Vec::new(),
+            std::env::temp_dir().join(format!(
+                "pancetta-pan115-config-{}.toml",
+                uuid::Uuid::new_v4()
+            )),
+            true,
+        )
+        .await
+        .expect("coordinator creation should succeed");
+        coordinator.pancetta_home_override = Some(std::env::temp_dir().join(format!(
+            "pancetta-pan115-home-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        )));
+        // As in a live session once the Hamlib message loop is consuming.
+        coordinator
+            .hamlib_command_loop_ready
+            .store(true, Ordering::Release);
+        let bus = coordinator.message_bus.clone();
+        let (_, hamlib_rx) = bus
+            .get_or_create_channel(ComponentId::Hamlib)
+            .await
+            .unwrap();
+        let (_, autonomous_rx) = bus
+            .get_or_create_channel(ComponentId::Autonomous)
+            .await
+            .unwrap();
+        let (_, tui_rx) = bus.get_or_create_channel(ComponentId::Tui).await.unwrap();
+        coordinator
+            .start_transmitter_component()
+            .await
+            .expect("TX worker starts");
+        Harness {
+            coordinator,
+            shutdown,
+            hamlib_rx,
+            autonomous_rx,
+            tui_rx,
+        }
+    }
+
+    async fn request(h: &Harness, text: &str) {
+        let msg = ComponentMessage::new(
+            ComponentId::Autonomous,
+            ComponentId::Ft8Transmitter,
+            MessageType::TransmitRequest {
+                message_text: text.to_string(),
+                frequency_offset: 1500.0,
+                qso_id: None,
+                tx_parity: None,
+                origin: TxOrigin::Local,
+                remote_client_key_id: None,
+            },
+            Instant::now(),
+        );
+        h.coordinator.message_bus.send_message(msg).await.unwrap();
+    }
+
+    fn is_ptt_on(msg: &ComponentMessage) -> bool {
+        matches!(
+            msg.message_type,
+            MessageType::RigControl(RigControlMessage::SetPtt { state: true })
+        )
+    }
+
+    /// Drains all three receivers until `TransmitComplete` for `text` arrives
+    /// on Autonomous (or `within` elapses). Returns that completion's
+    /// `success`, every TUI diagnostic text seen, and whether any
+    /// `SetPtt{true}` reached Hamlib.
+    async fn await_completion(
+        h: &Harness,
+        text: &str,
+        within: Duration,
+    ) -> (Option<bool>, Vec<String>, bool) {
+        let deadline = Instant::now() + within;
+        let mut diagnostics = Vec::new();
+        let mut ptt_on = false;
+        let mut completed = None;
+        while Instant::now() < deadline && completed.is_none() {
+            while let Ok(msg) = h.hamlib_rx.try_recv() {
+                ptt_on |= is_ptt_on(&msg);
+            }
+            while let Ok(msg) = h.tui_rx.try_recv() {
+                if let MessageType::DiagnosticEvent { text, .. } = msg.message_type {
+                    diagnostics.push(text);
+                }
+            }
+            while let Ok(msg) = h.autonomous_rx.try_recv() {
+                if let MessageType::TransmitComplete {
+                    success,
+                    message_text,
+                    ..
+                } = msg.message_type
+                {
+                    if message_text == text {
+                        completed = Some(success);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Anything the worker emitted alongside the completion.
+        while let Ok(msg) = h.hamlib_rx.try_recv() {
+            ptt_on |= is_ptt_on(&msg);
+        }
+        while let Ok(msg) = h.tui_rx.try_recv() {
+            if let MessageType::DiagnosticEvent { text, .. } = msg.message_type {
+                diagnostics.push(text);
+            }
+        }
+        (completed, diagnostics, ptt_on)
+    }
+
+    async fn await_ptt_on(h: &Harness, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            while let Ok(msg) = h.hamlib_rx.try_recv() {
+                if is_ptt_on(&msg) {
+                    return true;
+                }
+            }
+            while h.tui_rx.try_recv().is_ok() {}
+            while h.autonomous_rx.try_recv().is_ok() {}
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lost_rig_blocks_ptt_until_the_link_recovers() {
+        let h = worker_harness().await;
+        h.coordinator
+            .rig_conn_state
+            .store(RigConnState::PollingFailed.as_u8(), Ordering::Release);
+
+        request(&h, "CQ N0CALL FN20").await;
+        let (completed, diagnostics, ptt_on) =
+            await_completion(&h, "CQ N0CALL FN20", Duration::from_secs(5)).await;
+        assert_eq!(
+            completed,
+            Some(false),
+            "a TX requested while the rig is disconnected must complete as failed"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.contains("TX blocked (rig is disconnected)")),
+            "the key-time gate must report the rig as disconnected, got {diagnostics:?}"
+        );
+        assert!(!ptt_on, "no PTT keying while the rig is disconnected");
+
+        // The link recovers: the next request keys again (a different text,
+        // so no duplicate-suppression path can swallow it).
+        h.coordinator
+            .rig_conn_state
+            .store(RigConnState::Connected.as_u8(), Ordering::Release);
+        request(&h, "CQ N0CALL FN21").await;
+        assert!(
+            await_ptt_on(&h, Duration::from_secs(40)).await,
+            "TX must key again once the rig connection has recovered"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dead_audio_output_blocks_ptt() {
+        let h = worker_harness().await;
+        h.coordinator
+            .audio_output_alive
+            .store(false, Ordering::Release);
+
+        request(&h, "CQ N0CALL FN20").await;
+        let (completed, diagnostics, ptt_on) =
+            await_completion(&h, "CQ N0CALL FN20", Duration::from_secs(5)).await;
+        assert_eq!(
+            completed,
+            Some(false),
+            "a TX requested while the audio output is dead must complete as failed"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.contains("TX blocked (audio output device is dead)")),
+            "the key-time gate must report the dead output device, got {diagnostics:?}"
+        );
+        assert!(!ptt_on, "no PTT keying while the audio output is dead");
     }
 }
