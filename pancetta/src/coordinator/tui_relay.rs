@@ -861,6 +861,10 @@ impl super::ApplicationCoordinator {
         // pending through CAT application" -- see `tx_hard_mute_reason`'s
         // doc comment in `coordinator/tx.rs`.
         let cmd_hamlib_command_in_flight = self.hamlib_command_in_flight.clone();
+        // PAN-115: rig CAT link / audio output health -- see
+        // `tx_hard_mute_reason`'s doc comment in `coordinator/tx.rs`.
+        let cmd_rig_conn_state = self.rig_conn_state.clone();
+        let cmd_audio_output_alive = self.audio_output_alive.clone();
         // Operator Hold/Auto TX-frequency mode (`f`). The handler toggles this
         // atomic; the QSO engine and autonomous operator read it to gate
         // autonomous frequency moves.
@@ -2351,6 +2355,8 @@ impl super::ApplicationCoordinator {
                                     &cmd_hamlib_pending_frequency,
                                     &cmd_hamlib_pending_split,
                                     &cmd_hamlib_command_in_flight,
+                                    &cmd_rig_conn_state,
+                                    &cmd_audio_output_alive,
                                 ) {
                                     warn!(
                                         target: "tx.policy",
@@ -3531,6 +3537,7 @@ fn map_autonomous_status(
 /// the message loop is actively awaiting a `set_frequency`/
 /// `set_split_freq`/`set_split` CAT call, not just while a pending slot is
 /// populated (see that function's doc comment).
+#[allow(clippy::too_many_arguments)]
 fn ptt_on_refusal(
     tx_policy: &Arc<std::sync::atomic::AtomicU8>,
     tx_restart_inhibit: &Arc<std::sync::atomic::AtomicU32>,
@@ -3540,6 +3547,8 @@ fn ptt_on_refusal(
     >,
     hamlib_pending_split: &Arc<std::sync::Mutex<Option<ComponentMessage>>>,
     hamlib_command_in_flight: &Arc<std::sync::atomic::AtomicU32>,
+    rig_conn_state: &Arc<std::sync::atomic::AtomicU8>,
+    audio_output_alive: &Arc<std::sync::atomic::AtomicBool>,
 ) -> Option<String> {
     super::tx::tx_hard_mute_reason(
         tx_policy,
@@ -3548,6 +3557,8 @@ fn ptt_on_refusal(
         hamlib_pending_frequency,
         hamlib_pending_split,
         hamlib_command_in_flight,
+        rig_conn_state,
+        audio_output_alive,
     )
     .map(|reason| format!("Can't key PTT — {reason}"))
 }
@@ -4429,6 +4440,18 @@ mod tui_relay_tests {
         Arc::new(std::sync::atomic::AtomicU32::new(0))
     }
 
+    /// PAN-115: a rig CAT link that is up.
+    fn healthy_rig() -> Arc<std::sync::atomic::AtomicU8> {
+        Arc::new(std::sync::atomic::AtomicU8::new(
+            crate::coordinator::hamlib::RigConnState::Connected.as_u8(),
+        ))
+    }
+
+    /// PAN-115: an audio output that is calling back.
+    fn audio_alive() -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::new(std::sync::atomic::AtomicBool::new(true))
+    }
+
     /// PAN-67: `decode_view_dial_mhz` takes no live-state argument at all —
     /// it can only report the frequency captured with the decode's own
     /// audio window, so a live band switch happening after that window
@@ -4628,6 +4651,8 @@ mod tui_relay_tests {
             &no_pending_frequency(),
             &no_pending(),
             &not_in_flight(),
+            &healthy_rig(),
+            &audio_alive(),
         );
         assert!(
             refusal.is_some(),
@@ -4668,6 +4693,8 @@ mod tui_relay_tests {
                 &no_pending_frequency(),
                 &pending_split,
                 &not_in_flight(),
+                &healthy_rig(),
+                &audio_alive(),
             )
             .is_some(),
             "a direct PTT-on toggle must be refused while a pending SetSplit is still \
@@ -4686,6 +4713,8 @@ mod tui_relay_tests {
                 &no_pending_frequency(),
                 &pending_split,
                 &not_in_flight(),
+                &healthy_rig(),
+                &audio_alive(),
             ),
             None,
             "PTT-on must be permitted again once the pending SetSplit has been delivered"
@@ -4715,6 +4744,8 @@ mod tui_relay_tests {
                 &no_pending_frequency(),
                 &no_pending(),
                 &in_flight,
+                &healthy_rig(),
+                &audio_alive(),
             )
             .is_some(),
             "a direct PTT-on toggle must be refused while a rig frequency/split command is in \
@@ -4730,6 +4761,8 @@ mod tui_relay_tests {
                 &no_pending_frequency(),
                 &no_pending(),
                 &in_flight,
+                &healthy_rig(),
+                &audio_alive(),
             ),
             None,
             "PTT-on must be permitted again once the in-flight CAT call has resolved"
@@ -4752,6 +4785,8 @@ mod tui_relay_tests {
                 &no_pending_frequency(),
                 &no_pending(),
                 &not_in_flight(),
+                &healthy_rig(),
+                &audio_alive(),
             ),
             None,
             "PTT-on must be permitted once TX policy allows it, restart isn't inhibiting, and \
@@ -4793,11 +4828,56 @@ mod tui_relay_tests {
                     &pending_frequency,
                     &no_pending(),
                     &not_in_flight(),
+                    &healthy_rig(),
+                    &audio_alive(),
                 )
                 .is_some(),
                 "a pending command for {vfo:?} alone must still refuse a manual PTT key-up"
             );
         }
+    }
+
+    /// PAN-115 Gherkin 2, manual-PTT path: a key-up is refused with the
+    /// exact operator-facing status while the rig CAT link is lost.
+    #[test]
+    fn ptt_on_refusal_blocks_a_key_up_while_the_rig_is_disconnected() {
+        let tx_policy = Arc::new(AtomicU8::new(pancetta_core::TxPolicy::Full.as_u8()));
+        let rig_conn_state = Arc::new(AtomicU8::new(
+            crate::coordinator::hamlib::RigConnState::PollingFailed.as_u8(),
+        ));
+        assert_eq!(
+            ptt_on_refusal(
+                &tx_policy,
+                &Arc::new(AtomicU32::new(0)),
+                &Arc::new(AtomicBool::new(true)),
+                &no_pending_frequency(),
+                &no_pending(),
+                &not_in_flight(),
+                &rig_conn_state,
+                &audio_alive(),
+            ),
+            Some("Can't key PTT — rig is disconnected".to_string())
+        );
+    }
+
+    /// PAN-115 Gherkin 1, manual-PTT path: a key-up is refused with the
+    /// exact operator-facing status while the audio output is dead.
+    #[test]
+    fn ptt_on_refusal_blocks_a_key_up_while_audio_output_is_dead() {
+        let tx_policy = Arc::new(AtomicU8::new(pancetta_core::TxPolicy::Full.as_u8()));
+        assert_eq!(
+            ptt_on_refusal(
+                &tx_policy,
+                &Arc::new(AtomicU32::new(0)),
+                &Arc::new(AtomicBool::new(true)),
+                &no_pending_frequency(),
+                &no_pending(),
+                &not_in_flight(),
+                &healthy_rig(),
+                &Arc::new(AtomicBool::new(false)),
+            ),
+            Some("Can't key PTT — audio output device is dead".to_string())
+        );
     }
 
     /// Batch 94: the relay's snapshot→banner mapping must carry every

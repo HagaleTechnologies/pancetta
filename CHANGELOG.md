@@ -88,6 +88,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+<<<<<<< HEAD
 - Slot timing stays on UTC across clock steps and sleep/wake (PAN-114). After
   a backward clock step (e.g. NTP correcting a fast RTC), the autonomous
   scheduler and the decoder re-anchor to the UTC slot grid within one slot
@@ -99,6 +100,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never held more than `ptt_lead_ms` + 1 s before the slot boundary. After
   sleep/wake, decodes and audio from before the sleep are discarded rather
   than answered or spotted.
+=======
+- Autonomous and manual TX no longer key the rig while the rig's CAT link is
+  lost or the audio output device has stopped delivering samples (PAN-115).
+  The TX gate reports `rig is disconnected` (after 5 s of failed rig polls) or
+  `audio output device is dead` (on an output stream error or 2 s without an
+  output callback), and TX resumes on its own once the link or device
+  recovers. The rig poll loop now redials rigctld itself (2 s backing off to
+  30 s), so the RIG badge also recovers without a transmission. New `rig.cat`
+  and `audio.health` diagnostics mark each loss and recovery.
+
+>>>>>>> 67fb182ba25a12646e532ee55d3f86d2d07fb2a4
 - Every documented minimal config block now parses on its own (PAN-90): the
   README's `[autonomous] enabled = true`, both GUIDE.md GridTracker
   `[network.wsjtx_udp]` recipes, and CONFIG.md's minimum viable config used

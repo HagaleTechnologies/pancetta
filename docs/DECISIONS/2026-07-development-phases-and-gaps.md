@@ -12,6 +12,11 @@
   using retained `DecodePipelineHandles`. Hamlib, StationAgent, and Audio remain intentionally
   uncovered pending teardown semantics for hardware and TX safety.
 
+- **Silent audio-output stall does not auto-reopen (PAN-115):** a stall where output callbacks
+  stop without a cpal error mutes TX (`audio output device is dead`) but does not trigger an
+  automatic device reopen; the operator re-selects the device with `d`. A dead managed rigctld is
+  still only respawned by re-applying the rig (`i`) or a Hamlib restart.
+
 - **cqdx `GET /api/v1/spots?live=true` response envelope key (`groups`) unverified against live API** — a gated live test exists: `CQDX_TOKEN=pat_xxx cargo test -p pancetta-cqdx test_live_spots_envelope -- --ignored --nocapture`.
 
 - **`pancetta-research` has no CI coverage** — every workspace job passes

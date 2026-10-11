@@ -18,7 +18,44 @@ use std::time::{Duration, Instant};
 use tokio::time::interval;
 use tracing::{error, info, span, warn, Level};
 
+use crate::coordinator::audio_recovery::OutputEdge;
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
+
+/// PAN-115: clears `audio_output_alive` whenever the real audio thread exits
+/// (early return, `break`, or panic), so the TX hard mute fails closed.
+struct AudioOutputAliveGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for AudioOutputAliveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// PAN-115: store the output-liveness verdict only when it changes.
+fn publish_output_alive(flag: &std::sync::atomic::AtomicBool, published: &mut bool, alive: bool) {
+    if *published != alive {
+        flag.store(alive, Ordering::Release);
+        *published = alive;
+    }
+}
+
+/// PAN-115: log and surface an output watchdog edge as an `audio.health`
+/// diagnostic. `report` is the audio thread's `report_audio_diagnostic`.
+fn report_output_edge(edge: OutputEdge, report: &impl Fn(Level, &'static str, String)) {
+    match edge {
+        OutputEdge::None => {}
+        OutputEdge::WentDead => {
+            let text = "Audio output stopped delivering samples — TX inhibited until it recovers";
+            warn!("{text}");
+            report(Level::WARN, "audio.health", text.to_string());
+        }
+        OutputEdge::Recovered => {
+            let text = "Audio output recovered — TX re-enabled";
+            info!("{text}");
+            report(Level::INFO, "audio.health", text.to_string());
+        }
+    }
+}
 
 /// A request to switch the live audio device(s) without restarting pancetta.
 ///
@@ -188,8 +225,15 @@ impl super::ApplicationCoordinator {
             let runtime_handle = tokio::runtime::Handle::current();
             let audio_output_default = self.audio_output_default.clone();
             let audio_input_fallback = self.audio_input_fallback.clone();
+            // PAN-115: fail closed. The TX hard mute treats the output as dead
+            // until this thread has actually observed output callbacks.
+            let audio_output_alive = self.audio_output_alive.clone();
+            self.audio_output_alive.store(false, Ordering::Release);
 
             std::thread::spawn(move || {
+                // PAN-115: first statement, so every exit (init failure,
+                // `break`, panic) leaves the output marked dead.
+                let _output_alive_guard = AudioOutputAliveGuard(audio_output_alive.clone());
                 let report_audio_error = {
                     let bus = audio_bus.clone();
                     let rt = runtime_handle.clone();
@@ -322,11 +366,16 @@ impl super::ApplicationCoordinator {
                 let recovery_report_min_gap = std::time::Duration::from_secs(10);
                 let mut last_drop_report = std::time::Instant::now();
                 let drop_report_interval = std::time::Duration::from_secs(30);
+                // PAN-115: output-device liveness for the TX hard mute.
+                let mut output_watch =
+                    crate::coordinator::audio_recovery::OutputWatchdog::new(Instant::now());
+                let mut output_alive_published = false;
 
                 loop {
                     if shutdown.load(Ordering::Acquire) {
                         break;
                     }
+                    let output_edge: OutputEdge;
 
                     // Live device switch: drain any reopen requests from the TUI
                     // picker. Performed here (on the thread that owns the cpal
@@ -367,6 +416,10 @@ impl super::ApplicationCoordinator {
                                 Err(s)
                             }
                         };
+                        // PAN-115: a reopen (success or failure) replaces the
+                        // stream and restarts its callback counter; wait for
+                        // fresh progress, silently.
+                        output_watch.rebaseline(Instant::now());
                         // The receiver may have dropped (e.g. TUI gone); ignore.
                         let _ = respond.send(result);
                     }
@@ -396,17 +449,34 @@ impl super::ApplicationCoordinator {
 
                     match audio_manager.process_audio() {
                         Ok(Some(samples)) => {
+                            output_edge = output_watch
+                                .observe(audio_manager.output_callback_count(), Instant::now());
                             if result_tx.blocking_send(samples).is_err() {
                                 break;
                             }
                         }
                         Ok(None) => {
+                            output_edge = output_watch
+                                .observe(audio_manager.output_callback_count(), Instant::now());
                             std::thread::sleep(std::time::Duration::from_millis(1));
                         }
                         Err(e) => {
                             let s = e.to_string();
                             error!("Audio processing error: {}", s);
                             maybe_report_runtime("processing error", s);
+                            // PAN-115: a stream error means the output is dead
+                            // right now (it may be the output device that failed).
+                            // Published before the recovery sleep below.
+                            publish_output_alive(
+                                &audio_output_alive,
+                                &mut output_alive_published,
+                                false,
+                            );
+                            report_output_edge(
+                                output_watch.mark_stream_error(Instant::now()),
+                                &report_audio_diagnostic,
+                            );
+                            output_edge = OutputEdge::None;
 
                             // docs/audio-robustness-plan.md item 1: auto-
                             // recovery. force=true is REQUIRED — with no new
@@ -430,6 +500,7 @@ impl super::ApplicationCoordinator {
                                          successfully after {} attempt(s)",
                                         recovery.attempts()
                                     );
+                                    output_watch.rebaseline(Instant::now());
                                     if recovery.attempts() > 1 {
                                         report_audio_diagnostic(
                                             Level::INFO,
@@ -462,6 +533,13 @@ impl super::ApplicationCoordinator {
                             }
                         }
                     }
+
+                    report_output_edge(output_edge, &report_audio_diagnostic);
+                    publish_output_alive(
+                        &audio_output_alive,
+                        &mut output_alive_published,
+                        output_watch.is_alive(Instant::now()),
+                    );
 
                     if last_drop_report.elapsed() >= drop_report_interval {
                         last_drop_report = std::time::Instant::now();
