@@ -2642,6 +2642,10 @@ impl super::ApplicationCoordinator {
             let hamlib_pending_frequency_for_hard_mute = self.hamlib_pending_frequency.clone();
             let hamlib_pending_split_for_hard_mute = self.hamlib_pending_split.clone();
             let hamlib_command_in_flight_for_hard_mute = self.hamlib_command_in_flight.clone();
+            // PAN-115: a lost rig CAT link / dead audio output also keeps a
+            // frame off the air.
+            let rig_conn_state_for_hard_mute = self.rig_conn_state.clone();
+            let audio_output_alive_for_hard_mute = self.audio_output_alive.clone();
             qso_manager.set_hamlib_hard_muted_source(std::sync::Arc::new(move || {
                 crate::coordinator::tx::tx_hard_mute_reason(
                     &tx_policy_for_hard_mute,
@@ -2650,6 +2654,8 @@ impl super::ApplicationCoordinator {
                     &hamlib_pending_frequency_for_hard_mute,
                     &hamlib_pending_split_for_hard_mute,
                     &hamlib_command_in_flight_for_hard_mute,
+                    &rig_conn_state_for_hard_mute,
+                    &audio_output_alive_for_hard_mute,
                 )
                 .is_some()
             }));

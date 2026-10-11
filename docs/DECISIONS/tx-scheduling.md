@@ -178,6 +178,43 @@ restart inhibit is transient supervisor-owned safety state. Keeping them separat
 operator's `Disabled`, `RespondOnly`, or `Full` selection across both successful and failed restarts,
 and permits nested safety holds without one clearer accidentally unmuting another.
 
+## Rig CAT loss and dead audio output hard-mute TX (PAN-115), 2026-10-11
+
+`tx_hard_mute_reason` takes two more inputs: `rig_conn_state` and a coordinator-owned
+`audio_output_alive` flag. TX is refused with `rig is disconnected` while the rig state is
+`PollingFailed` (10 failed 500 ms polls, the point where the RIG badge already flips), and with
+`audio output device is dead` while the audio output is not calling back. Both follow PAN-5: they are
+health-owned safety state ANDed into the single hard mute, never written into `TxPolicy`, so the
+operator's own policy survives every loss and recovery, and both clear on their own.
+
+Priority: restart inhibit, then loop-not-ready, then rig disconnected, then audio dead, then pending
+CAT state, in-flight CAT command, and `Disabled`. A supervised Hamlib restart therefore still reads
+`rig control is restarting`. Hardware faults outrank CAT bookkeeping because they explain more.
+
+Only `PollingFailed` mutes. `NotConnected` also means mock rig, rig control disabled, and not tried yet,
+so muting on it would break mock-rig and `--no-audio --test-tx` sessions. A real rig whose first
+connect fails still reaches `PollingFailed` after 5 s, because the poll task runs regardless.
+Rejected: a new `rig_enabled` atomic, since `PollingFailed` is only ever stored under `rig_enabled`.
+
+The Hamlib poll loop now redials rigctld while the client reports Disconnected (2 s, doubling to a
+30 s cap). This is required, not a convenience. `RigctldClient::get_status()` only reads a cached
+flag, and before PAN-115 the only thing that redialled a dropped socket was the TX worker's own
+`SetPtt`. With PTT refused, nothing would ever reconnect and TX would stay muted for good. Rejected:
+a `rig_conn_state` check in the Hamlib `SetPtt` consumer, which would block that same redial during a
+race; upstream gates already cover it.
+
+Audio liveness comes from the cpal output callback, which does one relaxed `fetch_add` per run (no
+clock read or lock on the RT thread). An `OutputWatchdog` on the audio thread turns the count into
+alive/dead: dead immediately on a stream error, after 2 s without a callback (the RX watchdog's
+budget), and alive again only on observed progress after a reopen. The flag fails closed: it is stored
+`false` before the audio thread starts and a Drop guard stores `false` on any thread exit. No-device
+modes (`--no-audio`, stub, replay) have no output to judge and keep the flag `true`. Rejected:
+reusing the RX-input `health_audio_alive` flag, which says nothing about the output device.
+
+Single TX and bundles also re-run the gate synchronously just before Step 4d-arm, closing the window
+between the post-wait gate and `SetPtt` for faults that land in it. No mid-transmission abort: a fault
+that starts while PTT is already keyed is still ended by the existing PTT watchdog.
+
 ## Coordinator-level QSO sim harness
 
 `pancetta/tests/coord_sim.rs`: a durable, reusable `CoordSim` fixture that exercises the *coordinator's* TX gate + mock-rig PTT + multi-stream path, complementing the engine-level state-machine harness in `pancetta-qso/src/sim.rs`. It stands up a real `MessageBus`, a real `QsoManager`, a real `MockRig` behind a hamlib consumer (mirror of `coordinator/hamlib.rs`'s `SetPtt` handling), and the *real* shared `active_tx_qsos` set + `tx_policy` atomic. A scenario starts/advances QSOs via the manager's real entry points (`respond_to_cq_with` / `respond_to_caller` / `start_cq`), calls `pump_qso_events()` (a faithful mirror of `coordinator/qso.rs`'s populater — insert on `StateChanged→active`/`QsoCompleted`, remove on `Failed`/`QsoFailed`, forward `MessageToSend`→`TransmitRequest`), then `drive_slot(pending)` which replicates the worker's keying-decision chain — **policy hard-mute → coalesce (real `coalesce_transmit_requests`) → Step-4b gate (real `tx_qso_is_live` over the real set) → key/audio/unkey** — sending real `RigControl(SetPtt)` over the bus to the mock rig and **asserting at the rig level** (`mock.get_ptt() == On`, offset, release). **Determinism**: no `schedule_tx` UTC math and no slot sleep (that's unit-tested in `tx.rs::schedule_tx_tests`); only bounded ms `await`s — pass/fail never depends on wall-clock slot phase. A `Timeline` (keyed / dropped / per-slot offsets, mirroring `sim::Timeline`'s style + Display) carries the readable assertion helpers. Permanent scenarios: PTT-keys-for-scheduled-QSO (StateChanged-at-start fix), stale-TX-dropped-after-supersede (no PTT), coalesce-backlog (newest wins, older not keyed), two-simultaneous-QSOs on distinct freqs, TX-policy Disabled=silent / RespondOnly=in-progress-keys-but-initiation-suppressed / Full=keys, requested-offset-honored, manual-send-never-gated. Made testable by re-exporting `coalesce_transmit_requests` / `CoalesceEntry` / `resolve_required_parity` and widening `active_tx_qso_key` / `tx_qso_is_live` to `pub` from `coordinator/mod.rs` (visibility-only, behavior-preserving).

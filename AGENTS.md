@@ -64,6 +64,7 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 - Remote gateway bus sends are additive-only; `pancetta-tui` behavior stays byte-identical.
 - The armed-TX gate fails CLOSED (poisoned lock ⇒ no remote TX) and ANDs under `TxPolicy`; no remote QSO frame is ever emitted as `TxOrigin::Local`.
 - Drop-stale-TX: the worker re-checks QSO liveness at the last instant before PTT.
+- The TX hard mute (`tx_hard_mute_reason`) also refuses while the rig CAT link is `PollingFailed` or the audio output has stopped calling back (PAN-115). Both clear on their own when the link/device recovers, and the Hamlib poll loop must keep redialling rigctld while disconnected.
 - `mode=FT8` paths must remain byte-identical when FT4/FT2 features are untouched.
 - `merge_with` must carry every config field (see the §5 config-merge guardrail).
 - Every transmitted frame (single or multi-TX bundle item) reflects the freshest `MessageToSend` the QSO engine emitted for that qso_id at key-time, or at the moment of an operator-triggered mid-TX abort+re-key, whichever is later.
