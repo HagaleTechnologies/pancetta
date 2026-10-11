@@ -1,0 +1,225 @@
+{
+  "pr": {
+    "data": {
+      "repository": {
+        "pullRequest": {
+          "number": 420,
+          "title": "Weekly research scan 2026-10-12",
+          "author": {
+            "login": "thagale"
+          },
+          "isDraft": false,
+          "isCrossRepository": false,
+          "baseRefName": "main",
+          "createdAt": "2026-10-12T12:20:00Z",
+          "headRefOid": "1a2b3c4000000000000000000000000000000000",
+          "mergeable": "MERGEABLE",
+          "armed": true,
+          "inMergeQueue": false,
+          "labels": {
+            "nodes": [
+              {
+                "name": "codex-clean:1a2b3c400000"
+              }
+            ],
+            "pageInfo": {
+              "hasNextPage": false
+            }
+          },
+          "files": [
+            {
+              "path": "research/notes/web-scan-2026-10-12.md",
+              "previous_path": null
+            }
+          ],
+          "commits": {
+            "nodes": [
+              {
+                "commit": {
+                  "oid": "1a2b3c4000000000000000000000000000000000"
+                }
+              }
+            ],
+            "pageInfo": {
+              "hasPreviousPage": false
+            }
+          },
+          "state": "OPEN",
+          "autoMergeRequest": {
+            "enabledAt": "2026-10-13T18:20:00Z"
+          },
+          "isInMergeQueue": false,
+          "reviews": {
+            "nodes": [
+              {
+                "author": {
+                  "login": "chatgpt-codex-connector"
+                },
+                "commit": {
+                  "oid": "1a2b3c4000000000000000000000000000000000"
+                }
+              }
+            ],
+            "pageInfo": {
+              "hasNextPage": false
+            }
+          },
+          "reviewThreads": {
+            "nodes": [
+              {
+                "id": "PRRT_1",
+                "isResolved": false,
+                "path": "research/notes/web-scan-2026-10-12.md",
+                "opener": {
+                  "nodes": [
+                    {
+                      "author": {
+                        "login": "chatgpt-codex-connector"
+                      }
+                    }
+                  ]
+                },
+                "latest": {
+                  "nodes": [
+                    {
+                      "id": "COMMENT_PRRT_1",
+                      "author": {
+                        "login": "thagale"
+                      },
+                      "body": "Deferral blocked: Linear unavailable \u2014 needs a maintainer",
+                      "url": "https://example.invalid/thread/1"
+                    }
+                  ]
+                }
+              }
+            ],
+            "pageInfo": {
+              "hasNextPage": false,
+              "endCursor": null
+            }
+          }
+        }
+      }
+    }
+  },
+  "files": [
+    {
+      "filename": "research/notes/web-scan-2026-10-12.md",
+      "previous_filename": null
+    }
+  ],
+  "rules": [
+    {
+      "type": "merge_queue"
+    },
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "required_status_checks": [
+          {
+            "context": "CI"
+          },
+          {
+            "context": "Supply Chain"
+          },
+          {
+            "context": "Codex review clean (gate before expensive downstream jobs)"
+          }
+        ]
+      }
+    }
+  ],
+  "checks": {
+    "check_runs": [
+      {
+        "name": "CI",
+        "conclusion": "success",
+        "id": 1,
+        "started_at": "2026-10-13T18:20:00Z",
+        "external_id": "123",
+        "app": {
+          "id": 1
+        },
+        "output": {
+          "title": null
+        }
+      },
+      {
+        "name": "Supply Chain",
+        "conclusion": "success",
+        "id": 2,
+        "started_at": "2026-10-13T18:20:00Z",
+        "external_id": "123",
+        "app": {
+          "id": 1
+        },
+        "output": {
+          "title": null
+        }
+      },
+      {
+        "name": "Codex review clean (gate before expensive downstream jobs)",
+        "conclusion": "success",
+        "id": 3,
+        "started_at": "2026-10-13T18:20:00Z",
+        "external_id": "123",
+        "app": {
+          "id": 1
+        },
+        "output": {
+          "title": null
+        }
+      }
+    ]
+  },
+  "statuses": [],
+  "timeline": [],
+  "comments": [],
+  "ci_runs": [
+    {
+      "databaseId": 801,
+      "conclusion": "success",
+      "status": "completed",
+      "headSha": "1a2b3c4000000000000000000000000000000000",
+      "attempt": 1,
+      "createdAt": "2026-10-13T18:20:00Z"
+    }
+  ],
+  "jobs": {
+    "jobs": []
+  },
+  "commit_files": {
+    "files": [
+      {
+        "filename": "research/notes/web-scan-2026-10-12.md"
+      }
+    ]
+  },
+  "issues": [],
+  "rest_pr": {
+    "number": 420,
+    "state": "open",
+    "merged": false,
+    "created_at": "2026-10-12T12:20:00Z",
+    "title": "Weekly research scan 2026-10-12",
+    "user": {
+      "login": "thagale"
+    }
+  },
+  "codex_workflow_runs": {
+    "workflow_runs": [
+      {
+        "id": 802,
+        "conclusion": "success",
+        "status": "completed",
+        "head_sha": "1a2b3c4000000000000000000000000000000000",
+        "run_attempt": 1,
+        "created_at": "2026-10-13T18:20:00Z",
+        "event": "pull_request_review",
+        "actor": {
+          "login": "chatgpt-codex-connector[bot]"
+        }
+      }
+    ]
+  }
+}

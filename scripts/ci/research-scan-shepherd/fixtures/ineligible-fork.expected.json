@@ -1,0 +1,15 @@
+{
+  "number": 420,
+  "eligible": false,
+  "ineligible_reasons": [
+    "fork"
+  ],
+  "codex_rounds": 1,
+  "resolve": [],
+  "rerun_codex_verdict": false,
+  "rerun_ci_failed_jobs": false,
+  "clear_pause": false,
+  "arm": false,
+  "blockers": [],
+  "report": false
+}
