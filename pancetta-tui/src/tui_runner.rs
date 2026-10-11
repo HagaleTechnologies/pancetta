@@ -1930,9 +1930,12 @@ impl TuiRunner {
             // accidental-trigger foot-gun the old QsoStatus-only gating
             // existed to prevent, just via a different physical input than
             // vim-scroll. Modified k falls through to the catch-all `_ => {}`
-            // below (a no-op). TX-starting arms are now guarded by
-            // `ctrl_or_alt_held` (PAN-112); remaining unguarded arms are
-            // non-TX or fail toward TX-off.
+            // below (a no-op). Arms that can key the transmitter (CQ, PTT,
+            // autonomous, TX policy, re-send, the `u` nudge, tune, Fox,
+            // Hound, Space, Callers Enter) are guarded by `ctrl_or_alt_held`
+            // (PAN-112). The unguarded letter arms only open overlays, change
+            // local view state, retune or re-pick the TX offset without
+            // re-keying, or stop TX (`s`, `h`).
             KeyCode::Char('k') if key.modifiers.is_empty() => {
                 self.abort_selected_qso(&mut app)?;
             }
@@ -1996,7 +1999,11 @@ impl TuiRunner {
                     }
                 }
             }
-            KeyCode::Char('u') => {
+            // Guarded (PAN-112): in Auto TX-frequency mode with an active
+            // QSO the nudge re-arms the current frame for transmission
+            // (a CQ for a QSO still calling CQ), so Ctrl+U / Alt+U must not
+            // reach it.
+            KeyCode::Char('u') if !ctrl_or_alt_held => {
                 // PAN-72: "un-stick" — force a nudge without leaving Auto.
                 // The coordinator resolves the target (active QSO vs.
                 // CQ-hunting) since App doesn't track that state locally.
@@ -3070,6 +3077,7 @@ mod key_tests {
                 ('g', ActivePanel::BandActivity),
                 ('r', ActivePanel::QsoStatus),
                 ('r', ActivePanel::BandActivity),
+                ('u', ActivePanel::QsoStatus),
                 ('T', ActivePanel::BandActivity),
                 ('X', ActivePanel::BandActivity),
                 ('H', ActivePanel::DxHunter),
@@ -3110,6 +3118,33 @@ mod key_tests {
                 assert!(!a.fox_mode, "{modified_key:?}");
             }
         }
+    }
+
+    /// PAN-112: in Auto TX-frequency mode with an active QSO, `u`
+    /// (`NudgeTxOffset`) makes the coordinator re-key the current frame, so
+    /// Ctrl+U / Alt+U (readline kill-line muscle memory) must be no-ops.
+    #[tokio::test]
+    async fn ctrl_or_alt_u_does_not_nudge_tx_offset() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        let status_before = {
+            let mut a = app.write().await;
+            a.tx_freq_mode = pancetta_core::TxFreqMode::Auto;
+            a.active_panel = crate::app::ActivePanel::QsoStatus;
+            a.apply_active_qsos(vec![banner("W1AW", "qso-1")], Vec::new());
+            a.status_message.clone()
+        };
+        for modified_key in [key_ctrl('u'), key_alt('u')] {
+            r.handle_key_event(modified_key).await.unwrap();
+            assert!(
+                cmd_rx.try_recv().is_err(),
+                "{modified_key:?} must not nudge (and re-key) the TX offset"
+            );
+            let a = app.read().await;
+            assert_eq!(a.status_message, status_before, "{modified_key:?}");
+            assert_eq!(a.tx_freq_mode, pancetta_core::TxFreqMode::Auto);
+        }
+        r.handle_key_event(key('u')).await.unwrap();
+        assert!(matches!(cmd_rx.try_recv(), Ok(TuiCommand::NudgeTxOffset)));
     }
 
     #[tokio::test]
