@@ -88,7 +88,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+<<<<<<< HEAD
 - A QSO whose frame the TX worker drops before it reaches the air (concurrent-QSO cap, F8 abort, supersede, arm or mute refusal) no longer spends a call from its keep-calling budget, advances the stall detector toward a TX-offset switch, or shows the unsent frame as sent (PAN-75).
+=======
+- Ctrl/Alt chords no longer trigger transmit keys at the main view (PAN-112).
+  Ctrl+C previously started a CQ because crossterm reports it as `c` with a
+  separate modifier. The same guard now covers PTT, autonomous mode, TX policy,
+  re-send, the `u` offset nudge (which re-keys the current frame in Auto
+  TX-frequency mode), Space-to-call, tune, Fox and Hound, plus Enter-to-reply
+  on Callers where the terminal reports the modifier (legacy Unix terminals
+  send Ctrl+Enter as a plain Enter). Bare and Shift bindings still work.
+>>>>>>> e6b0d82b4c015ba1846e48f74f7e067d23366185
 
 - Slot timing stays on UTC across clock steps and sleep/wake (PAN-114). After
   a backward clock step (e.g. NTP correcting a fast RTC), the autonomous
