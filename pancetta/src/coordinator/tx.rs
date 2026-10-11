@@ -2155,6 +2155,53 @@ async fn send_tx_queue_status(
     }
 }
 
+/// Report every TX outcome to Autonomous, preserving its self-CQ correlation.
+/// PAN-75 also mirrors failed QSO frames to the QSO engine, which reverses
+/// their keep-call accounting. Covers cap truncation, F8, supersede, denial,
+/// hard mute, PAN-141 hold, and encode/PTT failure through the same path.
+/// Shutdown branches deliberately send nothing: the QSO loop stops on the
+/// same flag and its in-memory accounting is discarded at exit.
+/// Returns the Autonomous send result to preserve callers' error handling.
+async fn report_transmit_complete(
+    message_bus: &MessageBus,
+    success: bool,
+    message_text: String,
+    duration_ms: u64,
+    qso_id: Option<String>,
+) -> Result<()> {
+    let not_sent = (!success)
+        .then(|| qso_id.clone())
+        .flatten()
+        .map(|id| (id, message_text.clone()));
+    let result = message_bus
+        .send_message(ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Autonomous,
+            MessageType::TransmitComplete {
+                success,
+                message_text,
+                duration_ms,
+                qso_id,
+            },
+            Instant::now(),
+        ))
+        .await;
+    if let Some((qso_id, message_text)) = not_sent {
+        let _ = message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Ft8Transmitter,
+                ComponentId::Qso,
+                MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent {
+                    qso_id,
+                    message_text,
+                }),
+                Instant::now(),
+            ))
+            .await;
+    }
+    result
+}
+
 /// PAN-38 round 4 (Codex): report a failed `TransmitComplete` for a
 /// single-item `TransmitRequest` that's being abandoned before it was ever
 /// sent to the radio (operator F8 abort, shutdown-adjacent abandonment,
@@ -2174,18 +2221,10 @@ async fn emit_failed_transmit_complete_for_request(
         ..
     } = message_type
     {
-        let complete_msg = ComponentMessage::new(
-            ComponentId::Ft8Transmitter,
-            ComponentId::Autonomous,
-            MessageType::TransmitComplete {
-                success: false,
-                message_text: message_text.clone(),
-                duration_ms: 0,
-                qso_id: qso_id.clone(),
-            },
-            Instant::now(),
-        );
-        if let Err(e) = message_bus.send_message(complete_msg).await {
+        if let Err(e) =
+            report_transmit_complete(message_bus, false, message_text.clone(), 0, qso_id.clone())
+                .await
+        {
             warn!("Failed to send TransmitComplete: {}", e);
         }
     }
@@ -3773,7 +3812,8 @@ pub struct CoalesceOutcome {
     /// stream represents an ADMITTED, still-live QSO whose call-bookkeeping
     /// (call_count, last_call_at, Sent timeline) already advanced as if this
     /// frame would transmit. The caller must report a failed
-    /// `TransmitComplete` for each so that bookkeeping doesn't silently drift
+    /// completion through `report_transmit_complete`, which sends
+    /// `TxFrameNotSent` to `QsoManager::roll_back_unsent_attempt`, so it does not drift
     /// from reality (a stream that's always last in FIFO order would
     /// otherwise burn through its retry budget or time out having never
     /// actually gone on air).
@@ -4089,9 +4129,8 @@ pub fn coalesce_transmit_requests(
     // entry represents an ADMITTED, still-live QSO whose call-bookkeeping
     // has already advanced as if this frame would transmit, so its
     // `CoalesceEntry` is retained in `truncated_entries` for the caller to
-    // report a failed `TransmitComplete` — silently dropping it here would
-    // let that QSO's retry/timeout accounting drift from what actually went
-    // on air.
+    // use `report_transmit_complete`, which routes `TxFrameNotSent` to
+    // `QsoManager::roll_back_unsent_attempt` (PAN-75).
     let qso_cap = (max_concurrent_qsos.max(1) as usize).min(MAX_RETAINED_TX_STREAMS);
     outcome.qso_cap = qso_cap;
     if qso_survivors.len() > qso_cap {
@@ -4342,18 +4381,15 @@ async fn coalesce_backlog_into(
                     },
                 )
                 .await;
-                let complete_msg = ComponentMessage::new(
-                    ComponentId::Ft8Transmitter,
-                    ComponentId::Autonomous,
-                    MessageType::TransmitComplete {
-                        success: false,
-                        message_text: entry.message_text.clone(),
-                        duration_ms: 0,
-                        qso_id: entry.qso_id.clone(),
-                    },
-                    Instant::now(),
-                );
-                if let Err(e) = message_bus.send_message(complete_msg).await {
+                if let Err(e) = report_transmit_complete(
+                    &message_bus,
+                    false,
+                    entry.message_text.clone(),
+                    0,
+                    entry.qso_id.clone(),
+                )
+                .await
+                {
                     warn!(
                         "Failed to send TransmitComplete for an identity-denied stream: {}",
                         e
@@ -4423,22 +4459,18 @@ async fn coalesce_backlog_into(
 
     // A truncated entry is an ADMITTED, still-live QSO whose call-bookkeeping
     // (call_count, last_call_at, Sent timeline) already advanced as if this
-    // frame would transmit — report a failed TransmitComplete for each so
-    // that bookkeeping doesn't silently drift from what actually went on
-    // air (see `CoalesceOutcome::truncated_entries`'s doc comment).
+    // frame would transmit. report_transmit_complete mirrors each failure as
+    // TxFrameNotSent to QsoManager::roll_back_unsent_attempt (PAN-75).
     for entry in &outcome.truncated_entries {
-        let complete_msg = ComponentMessage::new(
-            ComponentId::Ft8Transmitter,
-            ComponentId::Autonomous,
-            MessageType::TransmitComplete {
-                success: false,
-                message_text: entry.message_text.clone(),
-                duration_ms: 0,
-                qso_id: entry.qso_id.clone(),
-            },
-            Instant::now(),
-        );
-        if let Err(e) = message_bus.send_message(complete_msg).await {
+        if let Err(e) = report_transmit_complete(
+            message_bus,
+            false,
+            entry.message_text.clone(),
+            0,
+            entry.qso_id.clone(),
+        )
+        .await
+        {
             warn!(
                 "Failed to send TransmitComplete for a cap-truncated stream: {}",
                 e
@@ -5124,18 +5156,15 @@ async fn supersede_multi_reenqueue(
             // collide with.
             if identity_conflict {
                 for item in in_flight_items {
-                    let complete_msg = ComponentMessage::new(
-                        ComponentId::Ft8Transmitter,
-                        ComponentId::Autonomous,
-                        MessageType::TransmitComplete {
-                            success: false,
-                            message_text: item.message_text.clone(),
-                            duration_ms: 0,
-                            qso_id: item.qso_id.clone(),
-                        },
-                        Instant::now(),
-                    );
-                    if let Err(e) = message_bus.send_message(complete_msg).await {
+                    if let Err(e) = report_transmit_complete(
+                        message_bus,
+                        false,
+                        item.message_text.clone(),
+                        0,
+                        item.qso_id.clone(),
+                    )
+                    .await
+                    {
                         warn!("Failed to send TransmitComplete: {}", e);
                     }
                 }
@@ -5213,18 +5242,9 @@ async fn supersede_multi_reenqueue(
                  behind the preserved bundle (would livelock); its own cadence will retry next cycle",
                 scratch_text
             );
-            let complete_msg = ComponentMessage::new(
-                ComponentId::Ft8Transmitter,
-                ComponentId::Autonomous,
-                MessageType::TransmitComplete {
-                    success: false,
-                    message_text: scratch_text,
-                    duration_ms: 0,
-                    qso_id: new_qso_id,
-                },
-                Instant::now(),
-            );
-            if let Err(e) = message_bus.send_message(complete_msg).await {
+            if let Err(e) =
+                report_transmit_complete(message_bus, false, scratch_text, 0, new_qso_id).await
+            {
                 warn!("Failed to send TransmitComplete: {}", e);
             }
             let _ = scratch_freq; // written by supersede_and_rekey_or_bundle, unused on this path
@@ -5715,18 +5735,14 @@ impl super::ApplicationCoordinator {
                                         if let Some(id) = qso_id.as_deref() {
                                             pivoted_once.remove(&super::active_tx_qso_key(id));
                                         }
-                                        let complete_msg = ComponentMessage::new(
-                                            ComponentId::Ft8Transmitter,
-                                            ComponentId::Autonomous,
-                                            MessageType::TransmitComplete {
-                                                success: false,
-                                                message_text,
-                                                duration_ms: 0,
-                                                qso_id: qso_id.clone(),
-                                            },
-                                            Instant::now(),
-                                        );
-                                        let _ = message_bus.send_message(complete_msg).await;
+                                        let _ = report_transmit_complete(
+                                            &message_bus,
+                                            false,
+                                            message_text,
+                                            0,
+                                            qso_id.clone(),
+                                        )
+                                        .await;
                                         continue;
                                     }
 
@@ -5763,18 +5779,14 @@ impl super::ApplicationCoordinator {
                                         )
                                         .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
-                                        let complete_msg = ComponentMessage::new(
-                                            ComponentId::Ft8Transmitter,
-                                            ComponentId::Autonomous,
-                                            MessageType::TransmitComplete {
-                                                success: false,
-                                                message_text,
-                                                duration_ms: 0,
-                                                qso_id: qso_id.clone(),
-                                            },
-                                            Instant::now(),
-                                        );
-                                        let _ = message_bus.send_message(complete_msg).await;
+                                        let _ = report_transmit_complete(
+                                            &message_bus,
+                                            false,
+                                            message_text,
+                                            0,
+                                            qso_id.clone(),
+                                        )
+                                        .await;
                                         continue;
                                     }
 
@@ -5838,18 +5850,14 @@ impl super::ApplicationCoordinator {
                                         )
                                         .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
-                                        let complete_msg = ComponentMessage::new(
-                                            ComponentId::Ft8Transmitter,
-                                            ComponentId::Autonomous,
-                                            MessageType::TransmitComplete {
-                                                success: false,
-                                                message_text,
-                                                duration_ms: 0,
-                                                qso_id: qso_id.clone(),
-                                            },
-                                            Instant::now(),
-                                        );
-                                        let _ = message_bus.send_message(complete_msg).await;
+                                        let _ = report_transmit_complete(
+                                            &message_bus,
+                                            false,
+                                            message_text,
+                                            0,
+                                            qso_id.clone(),
+                                        )
+                                        .await;
                                         continue;
                                     }
 
@@ -5912,18 +5920,14 @@ impl super::ApplicationCoordinator {
                                                 ),
                                             )
                                             .await;
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text,
-                                                    duration_ms: 0,
-                                                    qso_id: qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                message_text,
+                                                0,
+                                                qso_id.clone(),
+                                            )
+                                            .await;
                                             continue 'worker;
                                         }
                                         // Encode + modulate under the active protocol.
@@ -5969,19 +5973,14 @@ impl super::ApplicationCoordinator {
                                                     &format!("encode/modulate error ({e})"),
                                                 )
                                                 .await;
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text,
-                                                        duration_ms: 0,
-                                                        qso_id: qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                let _ =
-                                                    message_bus.send_message(complete_msg).await;
+                                                let _ = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    message_text,
+                                                    0,
+                                                    qso_id.clone(),
+                                                )
+                                                .await;
                                                 continue 'worker;
                                             }
                                         };
@@ -6061,19 +6060,14 @@ impl super::ApplicationCoordinator {
                                                     Vec::new(),
                                                 )
                                                 .await;
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text,
-                                                        duration_ms: 0,
-                                                        qso_id: qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                let _ =
-                                                    message_bus.send_message(complete_msg).await;
+                                                let _ = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    message_text,
+                                                    0,
+                                                    qso_id.clone(),
+                                                )
+                                                .await;
                                                 continue 'worker;
                                             }
                                             send_tx_queue_status(
@@ -6121,18 +6115,14 @@ impl super::ApplicationCoordinator {
                                             // told the autonomous operator this attempt did
                                             // not actually transmit. Report it exactly like
                                             // the drop-stale-TX case above.
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: message_text.clone(),
-                                                    duration_ms: 0,
-                                                    qso_id: qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                message_text.clone(),
+                                                0,
+                                                qso_id.clone(),
+                                            )
+                                            .await;
                                             continue 'worker;
                                         }
 
@@ -6185,18 +6175,14 @@ impl super::ApplicationCoordinator {
                                             .await;
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text,
-                                                    duration_ms: 0,
-                                                    qso_id: qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                message_text,
+                                                0,
+                                                qso_id.clone(),
+                                            )
+                                            .await;
                                             continue 'worker;
                                         }
 
@@ -6238,18 +6224,14 @@ impl super::ApplicationCoordinator {
                                             if let Some(id) = qso_id.as_deref() {
                                                 pivoted_once.remove(&super::active_tx_qso_key(id));
                                             }
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text,
-                                                    duration_ms: 0,
-                                                    qso_id: qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                message_text,
+                                                0,
+                                                qso_id.clone(),
+                                            )
+                                            .await;
                                             continue 'worker;
                                         }
 
@@ -6295,18 +6277,14 @@ impl super::ApplicationCoordinator {
                                             .await;
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text,
-                                                    duration_ms: 0,
-                                                    qso_id: qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                message_text,
+                                                0,
+                                                qso_id.clone(),
+                                            )
+                                            .await;
                                             continue 'worker;
                                         }
 
@@ -6330,18 +6308,14 @@ impl super::ApplicationCoordinator {
                                             .await;
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text,
-                                                    duration_ms: 0,
-                                                    qso_id: qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                message_text,
+                                                0,
+                                                qso_id.clone(),
+                                            )
+                                            .await;
                                             continue 'worker;
                                         }
 
@@ -6412,18 +6386,14 @@ impl super::ApplicationCoordinator {
                                             "internal scheduling error (cursor exceeded waveform at key-time)",
                                         )
                                         .await;
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text,
-                                                    duration_ms: 0,
-                                                    qso_id: qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                message_text,
+                                                0,
+                                                qso_id.clone(),
+                                            )
+                                            .await;
                                             continue 'worker;
                                         }
                                         let audio_duration_ms =
@@ -6660,18 +6630,14 @@ impl super::ApplicationCoordinator {
                                             .await;
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text,
-                                                    duration_ms: 0,
-                                                    qso_id: qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                message_text,
+                                                0,
+                                                qso_id.clone(),
+                                            )
+                                            .await;
                                             continue 'worker;
                                         }
 
@@ -6715,18 +6681,14 @@ impl super::ApplicationCoordinator {
                                             .await;
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text,
-                                                    duration_ms: 0,
-                                                    qso_id: qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                message_text,
+                                                0,
+                                                qso_id.clone(),
+                                            )
+                                            .await;
                                             continue 'worker;
                                         }
 
@@ -6783,18 +6745,14 @@ impl super::ApplicationCoordinator {
                                             .await;
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text,
-                                                    duration_ms: 0,
-                                                    qso_id: qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                message_text,
+                                                0,
+                                                qso_id.clone(),
+                                            )
+                                            .await;
                                             continue 'worker;
                                         }
 
@@ -6868,19 +6826,14 @@ impl super::ApplicationCoordinator {
                                                 // completion here too -- see the "aborted before
                                                 // PTT engage" comment earlier in this worker for
                                                 // the full leak this closes.
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: message_text.clone(),
-                                                        duration_ms: 0,
-                                                        qso_id: qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                if let Err(e) =
-                                                    message_bus.send_message(complete_msg).await
+                                                if let Err(e) = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    message_text.clone(),
+                                                    0,
+                                                    qso_id.clone(),
+                                                )
+                                                .await
                                                 {
                                                     warn!("Failed to send TransmitComplete: {}", e);
                                                 }
@@ -6949,19 +6902,14 @@ impl super::ApplicationCoordinator {
                                                     qso_id.as_deref(),
                                                 )
                                                 .await;
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: message_text.clone(),
-                                                        duration_ms: 0,
-                                                        qso_id: qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                if let Err(e) =
-                                                    message_bus.send_message(complete_msg).await
+                                                if let Err(e) = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    message_text.clone(),
+                                                    0,
+                                                    qso_id.clone(),
+                                                )
+                                                .await
                                                 {
                                                     warn!("Failed to send TransmitComplete: {}", e);
                                                 }
@@ -7053,24 +7001,14 @@ impl super::ApplicationCoordinator {
                                                         if let Some(abandoned) =
                                                             in_flight_items.first()
                                                         {
-                                                            let complete_msg =
-                                                                ComponentMessage::new(
-                                                                    ComponentId::Ft8Transmitter,
-                                                                    ComponentId::Autonomous,
-                                                                    MessageType::TransmitComplete {
-                                                                        success: false,
-                                                                        message_text: abandoned
-                                                                            .message_text
-                                                                            .clone(),
-                                                                        duration_ms: 0,
-                                                                        qso_id: abandoned
-                                                                            .qso_id
-                                                                            .clone(),
-                                                                    },
-                                                                    Instant::now(),
-                                                                );
-                                                            if let Err(e) = message_bus
-                                                                .send_message(complete_msg)
+                                                            if let Err(e) =
+                                                                report_transmit_complete(
+                                                                    &message_bus,
+                                                                    false,
+                                                                    abandoned.message_text.clone(),
+                                                                    0,
+                                                                    abandoned.qso_id.clone(),
+                                                                )
                                                                 .await
                                                             {
                                                                 warn!(
@@ -7182,24 +7120,14 @@ impl super::ApplicationCoordinator {
                                                         if let Some(abandoned) =
                                                             in_flight_items.first()
                                                         {
-                                                            let complete_msg =
-                                                                ComponentMessage::new(
-                                                                    ComponentId::Ft8Transmitter,
-                                                                    ComponentId::Autonomous,
-                                                                    MessageType::TransmitComplete {
-                                                                        success: false,
-                                                                        message_text: abandoned
-                                                                            .message_text
-                                                                            .clone(),
-                                                                        duration_ms: 0,
-                                                                        qso_id: abandoned
-                                                                            .qso_id
-                                                                            .clone(),
-                                                                    },
-                                                                    Instant::now(),
-                                                                );
-                                                            if let Err(e) = message_bus
-                                                                .send_message(complete_msg)
+                                                            if let Err(e) =
+                                                                report_transmit_complete(
+                                                                    &message_bus,
+                                                                    false,
+                                                                    abandoned.message_text.clone(),
+                                                                    0,
+                                                                    abandoned.qso_id.clone(),
+                                                                )
                                                                 .await
                                                             {
                                                                 warn!("Failed to send TransmitComplete: {}", e);
@@ -7291,18 +7219,14 @@ impl super::ApplicationCoordinator {
                                             .await;
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text,
-                                                    duration_ms: 0,
-                                                    qso_id: qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                message_text,
+                                                0,
+                                                qso_id.clone(),
+                                            )
+                                            .await;
                                             continue 'worker;
                                         }
 
@@ -7380,19 +7304,14 @@ impl super::ApplicationCoordinator {
                                                 // PAN-38 round 4 (Codex): report the failed
                                                 // completion here too -- see the "aborted before
                                                 // PTT engage" comment earlier in this worker.
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: message_text.clone(),
-                                                        duration_ms: 0,
-                                                        qso_id: qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                if let Err(e) =
-                                                    message_bus.send_message(complete_msg).await
+                                                if let Err(e) = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    message_text.clone(),
+                                                    0,
+                                                    qso_id.clone(),
+                                                )
+                                                .await
                                                 {
                                                     warn!("Failed to send TransmitComplete: {}", e);
                                                 }
@@ -7476,19 +7395,14 @@ impl super::ApplicationCoordinator {
                                                     qso_id.as_deref(),
                                                 )
                                                 .await;
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: message_text.clone(),
-                                                        duration_ms: 0,
-                                                        qso_id: qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                if let Err(e) =
-                                                    message_bus.send_message(complete_msg).await
+                                                if let Err(e) = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    message_text.clone(),
+                                                    0,
+                                                    qso_id.clone(),
+                                                )
+                                                .await
                                                 {
                                                     warn!("Failed to send TransmitComplete: {}", e);
                                                 }
@@ -7565,24 +7479,14 @@ impl super::ApplicationCoordinator {
                                                         if let Some(abandoned) =
                                                             in_flight_items.first()
                                                         {
-                                                            let complete_msg =
-                                                                ComponentMessage::new(
-                                                                    ComponentId::Ft8Transmitter,
-                                                                    ComponentId::Autonomous,
-                                                                    MessageType::TransmitComplete {
-                                                                        success: false,
-                                                                        message_text: abandoned
-                                                                            .message_text
-                                                                            .clone(),
-                                                                        duration_ms: 0,
-                                                                        qso_id: abandoned
-                                                                            .qso_id
-                                                                            .clone(),
-                                                                    },
-                                                                    Instant::now(),
-                                                                );
-                                                            if let Err(e) = message_bus
-                                                                .send_message(complete_msg)
+                                                            if let Err(e) =
+                                                                report_transmit_complete(
+                                                                    &message_bus,
+                                                                    false,
+                                                                    abandoned.message_text.clone(),
+                                                                    0,
+                                                                    abandoned.qso_id.clone(),
+                                                                )
                                                                 .await
                                                             {
                                                                 warn!(
@@ -7672,24 +7576,14 @@ impl super::ApplicationCoordinator {
                                                         if let Some(abandoned) =
                                                             in_flight_items.first()
                                                         {
-                                                            let complete_msg =
-                                                                ComponentMessage::new(
-                                                                    ComponentId::Ft8Transmitter,
-                                                                    ComponentId::Autonomous,
-                                                                    MessageType::TransmitComplete {
-                                                                        success: false,
-                                                                        message_text: abandoned
-                                                                            .message_text
-                                                                            .clone(),
-                                                                        duration_ms: 0,
-                                                                        qso_id: abandoned
-                                                                            .qso_id
-                                                                            .clone(),
-                                                                    },
-                                                                    Instant::now(),
-                                                                );
-                                                            if let Err(e) = message_bus
-                                                                .send_message(complete_msg)
+                                                            if let Err(e) =
+                                                                report_transmit_complete(
+                                                                    &message_bus,
+                                                                    false,
+                                                                    abandoned.message_text.clone(),
+                                                                    0,
+                                                                    abandoned.qso_id.clone(),
+                                                                )
                                                                 .await
                                                             {
                                                                 warn!(
@@ -7749,19 +7643,14 @@ impl super::ApplicationCoordinator {
                                             // pending_self_cq_qsos and, if `success` is false,
                                             // never roll back the streak) or fabricating a
                                             // failure for a CQ that may have transmitted fine.
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success,
-                                                    message_text: message_text.clone(),
-                                                    duration_ms,
-                                                    qso_id: qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            if let Err(e) =
-                                                message_bus.send_message(complete_msg).await
+                                            if let Err(e) = report_transmit_complete(
+                                                &message_bus,
+                                                success,
+                                                message_text.clone(),
+                                                duration_ms,
+                                                qso_id.clone(),
+                                            )
+                                            .await
                                             {
                                                 warn!("Failed to send TransmitComplete: {}", e);
                                             }
@@ -7787,18 +7676,14 @@ impl super::ApplicationCoordinator {
                                         ptt_guard.disarm();
 
                                         // --- Step 10: Send TransmitComplete ---
-                                        let complete_msg = ComponentMessage::new(
-                                            ComponentId::Ft8Transmitter,
-                                            ComponentId::Autonomous,
-                                            MessageType::TransmitComplete {
-                                                success,
-                                                message_text,
-                                                duration_ms,
-                                                qso_id: qso_id.clone(),
-                                            },
-                                            Instant::now(),
-                                        );
-                                        if let Err(e) = message_bus.send_message(complete_msg).await
+                                        if let Err(e) = report_transmit_complete(
+                                            &message_bus,
+                                            success,
+                                            message_text,
+                                            duration_ms,
+                                            qso_id.clone(),
+                                        )
+                                        .await
                                         {
                                             warn!("Failed to send TransmitComplete: {}", e);
                                         }
@@ -7864,19 +7749,14 @@ impl super::ApplicationCoordinator {
                                                     pivoted_once
                                                         .remove(&super::active_tx_qso_key(id));
                                                 }
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: item.message_text.clone(),
-                                                        duration_ms: 0,
-                                                        qso_id: item.qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                let _ =
-                                                    message_bus.send_message(complete_msg).await;
+                                                let _ = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    item.message_text.clone(),
+                                                    0,
+                                                    item.qso_id.clone(),
+                                                )
+                                                .await;
                                             } else {
                                                 kept.push(item);
                                             }
@@ -7935,18 +7815,14 @@ impl super::ApplicationCoordinator {
                                         .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: item.message_text.clone(),
-                                                    duration_ms: 0,
-                                                    qso_id: item.qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                item.message_text.clone(),
+                                                0,
+                                                item.qso_id.clone(),
+                                            )
+                                            .await;
                                         }
                                         continue;
                                     }
@@ -8010,18 +7886,14 @@ impl super::ApplicationCoordinator {
                                         .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: item.message_text.clone(),
-                                                    duration_ms: 0,
-                                                    qso_id: item.qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                item.message_text.clone(),
+                                                0,
+                                                item.qso_id.clone(),
+                                            )
+                                            .await;
                                         }
                                         continue;
                                     }
@@ -8059,19 +7931,14 @@ impl super::ApplicationCoordinator {
                                                     item.qso_id.as_deref(),
                                                 )
                                                 .await;
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: item.message_text.clone(),
-                                                        duration_ms: 0,
-                                                        qso_id: item.qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                let _ =
-                                                    message_bus.send_message(complete_msg).await;
+                                                let _ = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    item.message_text.clone(),
+                                                    0,
+                                                    item.qso_id.clone(),
+                                                )
+                                                .await;
                                             }
                                         }
                                         items = kept;
@@ -8141,18 +8008,14 @@ impl super::ApplicationCoordinator {
                                             "encoding error",
                                         )
                                         .await;
-                                        let complete_msg = ComponentMessage::new(
-                                            ComponentId::Ft8Transmitter,
-                                            ComponentId::Autonomous,
-                                            MessageType::TransmitComplete {
-                                                success: false,
-                                                message_text: item.message_text.clone(),
-                                                duration_ms: 0,
-                                                qso_id: item.qso_id.clone(),
-                                            },
-                                            Instant::now(),
-                                        );
-                                        let _ = message_bus.send_message(complete_msg).await;
+                                        let _ = report_transmit_complete(
+                                            &message_bus,
+                                            false,
+                                            item.message_text.clone(),
+                                            0,
+                                            item.qso_id.clone(),
+                                        )
+                                        .await;
                                     }
 
                                     // 2026-07-17 (post-review): rebind `items` itself to
@@ -8206,19 +8069,14 @@ impl super::ApplicationCoordinator {
                                             for (text, qso_id) in
                                                 item_texts.into_iter().zip(encoded_qso_ids)
                                             {
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: text,
-                                                        duration_ms: 0,
-                                                        qso_id,
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                let _ =
-                                                    message_bus.send_message(complete_msg).await;
+                                                let _ = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    text,
+                                                    0,
+                                                    qso_id,
+                                                )
+                                                .await;
                                             }
                                             continue;
                                         }
@@ -8300,19 +8158,14 @@ impl super::ApplicationCoordinator {
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
                                             for item in &items {
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: item.message_text.clone(),
-                                                        duration_ms: 0,
-                                                        qso_id: item.qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                let _ =
-                                                    message_bus.send_message(complete_msg).await;
+                                                let _ = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    item.message_text.clone(),
+                                                    0,
+                                                    item.qso_id.clone(),
+                                                )
+                                                .await;
                                             }
                                             continue;
                                         }
@@ -8342,22 +8195,14 @@ impl super::ApplicationCoordinator {
                                                             item.qso_id.as_deref(),
                                                         )
                                                         .await;
-                                                        let complete_msg = ComponentMessage::new(
-                                                            ComponentId::Ft8Transmitter,
-                                                            ComponentId::Autonomous,
-                                                            MessageType::TransmitComplete {
-                                                                success: false,
-                                                                message_text: item
-                                                                    .message_text
-                                                                    .clone(),
-                                                                duration_ms: 0,
-                                                                qso_id: item.qso_id.clone(),
-                                                            },
-                                                            Instant::now(),
-                                                        );
-                                                        let _ = message_bus
-                                                            .send_message(complete_msg)
-                                                            .await;
+                                                        let _ = report_transmit_complete(
+                                                            &message_bus,
+                                                            false,
+                                                            item.message_text.clone(),
+                                                            0,
+                                                            item.qso_id.clone(),
+                                                        )
+                                                        .await;
                                                     }
                                                 }
 
@@ -8385,20 +8230,14 @@ impl super::ApplicationCoordinator {
                                                         "defer-time re-encode error",
                                                     )
                                                     .await;
-                                                    let complete_msg = ComponentMessage::new(
-                                                        ComponentId::Ft8Transmitter,
-                                                        ComponentId::Autonomous,
-                                                        MessageType::TransmitComplete {
-                                                            success: false,
-                                                            message_text: item.message_text.clone(),
-                                                            duration_ms: 0,
-                                                            qso_id: item.qso_id.clone(),
-                                                        },
-                                                        Instant::now(),
-                                                    );
-                                                    let _ = message_bus
-                                                        .send_message(complete_msg)
-                                                        .await;
+                                                    let _ = report_transmit_complete(
+                                                        &message_bus,
+                                                        false,
+                                                        item.message_text.clone(),
+                                                        0,
+                                                        item.qso_id.clone(),
+                                                    )
+                                                    .await;
                                                 }
 
                                                 // Rebind to `rebuild.encoded_items`, not the
@@ -8447,21 +8286,14 @@ impl super::ApplicationCoordinator {
                                                             .into_iter()
                                                             .zip(rebuilt_qso_ids)
                                                         {
-                                                            let complete_msg =
-                                                                ComponentMessage::new(
-                                                                    ComponentId::Ft8Transmitter,
-                                                                    ComponentId::Autonomous,
-                                                                    MessageType::TransmitComplete {
-                                                                        success: false,
-                                                                        message_text: text,
-                                                                        duration_ms: 0,
-                                                                        qso_id,
-                                                                    },
-                                                                    Instant::now(),
-                                                                );
-                                                            let _ = message_bus
-                                                                .send_message(complete_msg)
-                                                                .await;
+                                                            let _ = report_transmit_complete(
+                                                                &message_bus,
+                                                                false,
+                                                                text,
+                                                                0,
+                                                                qso_id,
+                                                            )
+                                                            .await;
                                                         }
                                                         continue;
                                                     }
@@ -8525,19 +8357,14 @@ impl super::ApplicationCoordinator {
                                         for (text, qso_id) in
                                             item_texts.into_iter().zip(encoded_qso_ids)
                                         {
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: text,
-                                                    duration_ms: 0,
-                                                    qso_id,
-                                                },
-                                                Instant::now(),
-                                            );
-                                            if let Err(e) =
-                                                message_bus.send_message(complete_msg).await
+                                            if let Err(e) = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                text,
+                                                0,
+                                                qso_id,
+                                            )
+                                            .await
                                             {
                                                 warn!("Failed to send TransmitComplete: {}", e);
                                             }
@@ -8630,18 +8457,14 @@ impl super::ApplicationCoordinator {
                                         .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: item.message_text.clone(),
-                                                    duration_ms: 0,
-                                                    qso_id: item.qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                item.message_text.clone(),
+                                                0,
+                                                item.qso_id.clone(),
+                                            )
+                                            .await;
                                         }
                                         continue;
                                     }
@@ -8769,20 +8592,14 @@ impl super::ApplicationCoordinator {
                                                         )
                                                         .await;
                                                     }
-                                                    let complete_msg = ComponentMessage::new(
-                                                        ComponentId::Ft8Transmitter,
-                                                        ComponentId::Autonomous,
-                                                        MessageType::TransmitComplete {
-                                                            success: false,
-                                                            message_text: item.message_text.clone(),
-                                                            duration_ms: 0,
-                                                            qso_id: item.qso_id.clone(),
-                                                        },
-                                                        Instant::now(),
-                                                    );
-                                                    let _ = message_bus
-                                                        .send_message(complete_msg)
-                                                        .await;
+                                                    let _ = report_transmit_complete(
+                                                        &message_bus,
+                                                        false,
+                                                        item.message_text.clone(),
+                                                        0,
+                                                        item.qso_id.clone(),
+                                                    )
+                                                    .await;
                                                 }
                                             }
 
@@ -8810,19 +8627,14 @@ impl super::ApplicationCoordinator {
                                                     "key-time re-encode error",
                                                 )
                                                 .await;
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: item.message_text.clone(),
-                                                        duration_ms: 0,
-                                                        qso_id: item.qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                let _ =
-                                                    message_bus.send_message(complete_msg).await;
+                                                let _ = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    item.message_text.clone(),
+                                                    0,
+                                                    item.qso_id.clone(),
+                                                )
+                                                .await;
                                             }
 
                                             // Rebind to `rebuild.encoded_items`, not the
@@ -8866,20 +8678,14 @@ impl super::ApplicationCoordinator {
                                                         .into_iter()
                                                         .zip(rebuilt_qso_ids)
                                                     {
-                                                        let complete_msg = ComponentMessage::new(
-                                                            ComponentId::Ft8Transmitter,
-                                                            ComponentId::Autonomous,
-                                                            MessageType::TransmitComplete {
-                                                                success: false,
-                                                                message_text: text,
-                                                                duration_ms: 0,
-                                                                qso_id,
-                                                            },
-                                                            Instant::now(),
-                                                        );
-                                                        let _ = message_bus
-                                                            .send_message(complete_msg)
-                                                            .await;
+                                                        let _ = report_transmit_complete(
+                                                            &message_bus,
+                                                            false,
+                                                            text,
+                                                            0,
+                                                            qso_id,
+                                                        )
+                                                        .await;
                                                     }
                                                     continue;
                                                 }
@@ -8939,18 +8745,14 @@ impl super::ApplicationCoordinator {
                                         }
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: item.message_text.clone(),
-                                                    duration_ms: 0,
-                                                    qso_id: item.qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                item.message_text.clone(),
+                                                0,
+                                                item.qso_id.clone(),
+                                            )
+                                            .await;
                                         }
                                         continue;
                                     }
@@ -8978,18 +8780,14 @@ impl super::ApplicationCoordinator {
                                         .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: item.message_text.clone(),
-                                                    duration_ms: 0,
-                                                    qso_id: item.qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                item.message_text.clone(),
+                                                0,
+                                                item.qso_id.clone(),
+                                            )
+                                            .await;
                                         }
                                         continue;
                                     }
@@ -9067,18 +8865,14 @@ impl super::ApplicationCoordinator {
                                         for (text, qso_id) in
                                             item_texts.into_iter().zip(encoded_qso_ids_final)
                                         {
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: text,
-                                                    duration_ms: 0,
-                                                    qso_id,
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                text,
+                                                0,
+                                                qso_id,
+                                            )
+                                            .await;
                                         }
                                         continue;
                                     }
@@ -9196,18 +8990,14 @@ impl super::ApplicationCoordinator {
                                         .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: item.message_text.clone(),
-                                                    duration_ms: 0,
-                                                    qso_id: item.qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                item.message_text.clone(),
+                                                0,
+                                                item.qso_id.clone(),
+                                            )
+                                            .await;
                                         }
                                         continue;
                                     }
@@ -9252,18 +9042,14 @@ impl super::ApplicationCoordinator {
                                         .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: item.message_text.clone(),
-                                                    duration_ms: 0,
-                                                    qso_id: item.qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                item.message_text.clone(),
+                                                0,
+                                                item.qso_id.clone(),
+                                            )
+                                            .await;
                                         }
                                         continue;
                                     }
@@ -9320,18 +9106,14 @@ impl super::ApplicationCoordinator {
                                         }
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: item.message_text.clone(),
-                                                    duration_ms: 0,
-                                                    qso_id: item.qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                item.message_text.clone(),
+                                                0,
+                                                item.qso_id.clone(),
+                                            )
+                                            .await;
                                         }
                                         continue;
                                     }
@@ -9397,19 +9179,14 @@ impl super::ApplicationCoordinator {
                                             // "Multi-TX aborted before PTT" comment earlier
                                             // in this worker for the full leak this closes.
                                             for item in &items {
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: item.message_text.clone(),
-                                                        duration_ms: 0,
-                                                        qso_id: item.qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                if let Err(e) =
-                                                    message_bus.send_message(complete_msg).await
+                                                if let Err(e) = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    item.message_text.clone(),
+                                                    0,
+                                                    item.qso_id.clone(),
+                                                )
+                                                .await
                                                 {
                                                     warn!("Failed to send TransmitComplete: {}", e);
                                                 }
@@ -9468,19 +9245,14 @@ impl super::ApplicationCoordinator {
                                             )
                                             .await;
                                             for item in &items {
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: item.message_text.clone(),
-                                                        duration_ms: 0,
-                                                        qso_id: item.qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                if let Err(e) =
-                                                    message_bus.send_message(complete_msg).await
+                                                if let Err(e) = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    item.message_text.clone(),
+                                                    0,
+                                                    item.qso_id.clone(),
+                                                )
+                                                .await
                                                 {
                                                     warn!("Failed to send TransmitComplete: {}", e);
                                                 }
@@ -9588,18 +9360,14 @@ impl super::ApplicationCoordinator {
                                         }
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: item.message_text.clone(),
-                                                    duration_ms: 0,
-                                                    qso_id: item.qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                item.message_text.clone(),
+                                                0,
+                                                item.qso_id.clone(),
+                                            )
+                                            .await;
                                         }
                                         continue;
                                     }
@@ -9673,19 +9441,14 @@ impl super::ApplicationCoordinator {
                                             // "Multi-TX aborted before PTT" comment earlier
                                             // in this worker.
                                             for item in &items {
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: item.message_text.clone(),
-                                                        duration_ms: 0,
-                                                        qso_id: item.qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                if let Err(e) =
-                                                    message_bus.send_message(complete_msg).await
+                                                if let Err(e) = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    item.message_text.clone(),
+                                                    0,
+                                                    item.qso_id.clone(),
+                                                )
+                                                .await
                                                 {
                                                     warn!("Failed to send TransmitComplete: {}", e);
                                                 }
@@ -9760,19 +9523,14 @@ impl super::ApplicationCoordinator {
                                             )
                                             .await;
                                             for item in &items {
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: item.message_text.clone(),
-                                                        duration_ms: 0,
-                                                        qso_id: item.qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                if let Err(e) =
-                                                    message_bus.send_message(complete_msg).await
+                                                if let Err(e) = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    item.message_text.clone(),
+                                                    0,
+                                                    item.qso_id.clone(),
+                                                )
+                                                .await
                                                 {
                                                     warn!("Failed to send TransmitComplete: {}", e);
                                                 }
@@ -9841,19 +9599,14 @@ impl super::ApplicationCoordinator {
                                         for (text, qso_id) in
                                             item_texts.into_iter().zip(encoded_qso_ids_final)
                                         {
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success,
-                                                    message_text: text,
-                                                    duration_ms,
-                                                    qso_id,
-                                                },
-                                                Instant::now(),
-                                            );
-                                            if let Err(e) =
-                                                message_bus.send_message(complete_msg).await
+                                            if let Err(e) = report_transmit_complete(
+                                                &message_bus,
+                                                success,
+                                                text,
+                                                duration_ms,
+                                                qso_id,
+                                            )
+                                            .await
                                             {
                                                 warn!("Failed to send TransmitComplete: {}", e);
                                             }
@@ -9879,18 +9632,14 @@ impl super::ApplicationCoordinator {
                                     for (text, qso_id) in
                                         item_texts.into_iter().zip(encoded_qso_ids_final)
                                     {
-                                        let complete_msg = ComponentMessage::new(
-                                            ComponentId::Ft8Transmitter,
-                                            ComponentId::Autonomous,
-                                            MessageType::TransmitComplete {
-                                                success,
-                                                message_text: text,
-                                                duration_ms,
-                                                qso_id,
-                                            },
-                                            Instant::now(),
-                                        );
-                                        if let Err(e) = message_bus.send_message(complete_msg).await
+                                        if let Err(e) = report_transmit_complete(
+                                            &message_bus,
+                                            success,
+                                            text,
+                                            duration_ms,
+                                            qso_id,
+                                        )
+                                        .await
                                         {
                                             warn!("Failed to send TransmitComplete: {}", e);
                                         }
@@ -13792,6 +13541,7 @@ mod coalesce_tests {
         let bus = MessageBus::new(16).unwrap();
         let (_autonomous_tx, autonomous_rx) =
             bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_, qso_rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
         let (backlog_tx, backlog_rx) = crossbeam_channel::unbounded();
         let active_tx_qsos = Arc::new(std::sync::RwLock::new(liveset(&[
             "qso-a", "qso-b", "qso-c",
@@ -13861,6 +13611,26 @@ mod coalesce_tests {
                 other => panic!("expected TransmitComplete, got {other:?}"),
             }
         }
+        let mut notices = Vec::new();
+        while let Ok(msg) = qso_rx.try_recv() {
+            if let MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent {
+                qso_id,
+                message_text,
+            }) = msg.message_type
+            {
+                notices.push((qso_id, message_text));
+            } else {
+                panic!("unexpected QSO notification");
+            }
+        }
+        notices.sort();
+        assert_eq!(
+            notices,
+            vec![
+                ("qso-b".to_string(), "B".to_string()),
+                ("qso-c".to_string(), "C".to_string())
+            ]
+        );
     }
 
     /// PAN-91 review follow-up: a backlog containing entries bound to TWO
@@ -13877,6 +13647,7 @@ mod coalesce_tests {
         let bus = MessageBus::new(16).unwrap();
         let (_autonomous_tx, autonomous_rx) =
             bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_, qso_rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
         let (backlog_tx, backlog_rx) = crossbeam_channel::unbounded();
         let active_tx_qsos = Arc::new(std::sync::RwLock::new(liveset(&["qso-a", "qso-b"])));
 
@@ -13979,6 +13750,20 @@ mod coalesce_tests {
             }
             other => panic!("expected TransmitComplete, got {other:?}"),
         }
+        let mut notices = Vec::new();
+        while let Ok(msg) = qso_rx.try_recv() {
+            if let MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent {
+                qso_id,
+                message_text,
+            }) = msg.message_type
+            {
+                notices.push((qso_id, message_text));
+            } else {
+                panic!("unexpected QSO notification");
+            }
+        }
+        notices.sort();
+        assert_eq!(notices, vec![("qso-b".to_string(), "B".to_string())]);
     }
 }
 
@@ -15242,6 +15027,7 @@ mod pan115_worker_gate_tests {
         hamlib_rx: Receiver<ComponentMessage>,
         autonomous_rx: Receiver<ComponentMessage>,
         tui_rx: Receiver<ComponentMessage>,
+        qso_rx: Receiver<ComponentMessage>,
     }
 
     impl Drop for Harness {
@@ -15291,6 +15077,7 @@ mod pan115_worker_gate_tests {
             .get_or_create_channel(ComponentId::Autonomous)
             .await
             .unwrap();
+        let (_, qso_rx) = bus.get_or_create_channel(ComponentId::Qso).await.unwrap();
         let (_, tui_rx) = bus.get_or_create_channel(ComponentId::Tui).await.unwrap();
         coordinator
             .start_transmitter_component()
@@ -15302,6 +15089,7 @@ mod pan115_worker_gate_tests {
             hamlib_rx,
             autonomous_rx,
             tui_rx,
+            qso_rx,
         }
     }
 
@@ -15393,6 +15181,61 @@ mod pan115_worker_gate_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn operator_f8_abort_reports_frame_not_sent_to_qso() {
+        let h = worker_harness().await;
+        h.coordinator
+            .active_tx_qsos
+            .write()
+            .unwrap()
+            .insert(super::super::active_tx_qso_key("qso-f8"));
+        let text = "K1ABC N0CALL FN20";
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Qso,
+                ComponentId::Ft8Transmitter,
+                MessageType::TransmitRequest {
+                    message_text: text.into(),
+                    frequency_offset: 1500.0,
+                    qso_id: Some("qso-f8".into()),
+                    tx_parity: None,
+                    origin: TxOrigin::Local,
+                    remote_client_key_id: None,
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if h.tui_rx.try_iter().any(|msg| matches!(msg.message_type, MessageType::TxQueueStatus { queued, .. } if queued.iter().any(|item| item.text == text))) { break; }
+            assert!(Instant::now() < deadline, "worker did not queue the frame");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        h.coordinator
+            .abort_current_tx
+            .store(true, Ordering::Release);
+        assert_eq!(
+            await_completion(&h, text, Duration::from_secs(5)).await.0,
+            Some(false)
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(msg) = h.qso_rx.try_recv() {
+                assert!(
+                    matches!(msg.message_type, MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { qso_id, message_text }) if qso_id == "qso-f8" && message_text == text)
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "F8 failed to notify QSO accounting"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn lost_rig_blocks_ptt_until_the_link_recovers() {
         let h = worker_harness().await;
         h.coordinator
@@ -15413,6 +15256,7 @@ mod pan115_worker_gate_tests {
                 .any(|d| d.contains("TX blocked (rig is disconnected)")),
             "the key-time gate must report the rig as disconnected, got {diagnostics:?}"
         );
+        assert!(h.qso_rx.try_recv().is_err());
         assert!(!ptt_on, "no PTT keying while the rig is disconnected");
 
         // The link recovers: the next request keys again (a different text,
@@ -15448,6 +15292,50 @@ mod pan115_worker_gate_tests {
                 .any(|d| d.contains("TX blocked (audio output device is dead)")),
             "the key-time gate must report the dead output device, got {diagnostics:?}"
         );
+        assert!(h.qso_rx.try_recv().is_err());
         assert!(!ptt_on, "no PTT keying while the audio output is dead");
+    }
+}
+
+#[cfg(test)]
+mod report_transmit_complete_tests {
+    use super::*;
+
+    async fn check(success: bool, qso_id: Option<&str>) {
+        let bus = MessageBus::new(16).unwrap();
+        let (_, autonomous) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        report_transmit_complete(
+            &bus,
+            success,
+            "K1ABC N0CALL FN20".into(),
+            0,
+            qso_id.map(str::to_string),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(autonomous.try_recv().unwrap().message_type, MessageType::TransmitComplete { success: got, message_text, duration_ms: 0, qso_id: id } if got == success && id.as_deref() == qso_id && message_text == "K1ABC N0CALL FN20")
+        );
+        assert!(autonomous.try_recv().is_err());
+        if !success && qso_id.is_some() {
+            assert!(
+                matches!(qso.try_recv().unwrap().message_type, MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { qso_id: id, message_text }) if Some(id.as_str()) == qso_id && message_text == "K1ABC N0CALL FN20")
+            );
+        }
+        assert!(qso.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn successful_frame_only_notifies_autonomous() {
+        check(true, Some("q1")).await;
+    }
+    #[tokio::test]
+    async fn unkeyed_frame_only_notifies_autonomous() {
+        check(false, None).await;
+    }
+    #[tokio::test]
+    async fn failed_qso_frame_also_notifies_qso() {
+        check(false, Some("q1")).await;
     }
 }

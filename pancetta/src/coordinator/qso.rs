@@ -4913,6 +4913,15 @@ impl super::ApplicationCoordinator {
                                                 ),
                                             }
                                         }
+                                        crate::message_bus::QsoMessage::TxFrameNotSent { qso_id, message_text } => {
+                                            match qso_id.parse::<pancetta_qso::QsoId>() {
+                                                Ok(id) => {
+                                                    let outcome = qso_manager.roll_back_unsent_attempt(id, &message_text).await;
+                                                    debug!(target: "qso", "TX frame not sent for QSO {} ('{}'): {:?}", qso_id, message_text, outcome);
+                                                }
+                                                Err(e) => debug!(target: "qso", "TxFrameNotSent: bad QSO id '{}': {}", qso_id, e),
+                                            }
+                                        }
                                         crate::message_bus::QsoMessage::ResendQso { qso_id } => {
                                             match qso_id.parse::<pancetta_qso::QsoId>() {
                                                 Ok(id) => {
@@ -9546,6 +9555,79 @@ mod respond_to_caller_admission_tests {
         )));
 
         coordinator
+    }
+
+    async fn check_tx_frame_not_sent(malformed_first: bool) {
+        let mut coordinator = test_coordinator().await;
+        coordinator.config.write().await.station.callsign = "W1ABC".to_string();
+        coordinator.start_qso_component().await.unwrap();
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        let id = manager
+            .respond_to_cq_manual("K1ABC".into(), 1500.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        let opened = manager
+            .get_qso(id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        manager
+            .rearm_manual_calls_at(opened + chrono::Duration::seconds(15))
+            .await;
+        let before = manager.get_qso(id).await.unwrap();
+        assert_eq!(before.metadata.call_count, 2);
+        let text = before.messages.last().unwrap().raw_text.clone();
+        let ids = if malformed_first {
+            vec!["not-a-uuid".to_string(), id.to_string()]
+        } else {
+            vec![id.to_string()]
+        };
+        for qso_id in ids {
+            coordinator
+                .message_bus
+                .send_message(ComponentMessage::new(
+                    ComponentId::Ft8Transmitter,
+                    ComponentId::Qso,
+                    MessageType::QsoMessage(QsoMessage::TxFrameNotSent {
+                        qso_id,
+                        message_text: text.clone(),
+                    }),
+                    Instant::now(),
+                ))
+                .await
+                .unwrap();
+        }
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let qso = manager.get_qso(id).await.unwrap();
+            if qso.metadata.call_count == 1 {
+                assert_eq!(
+                    qso.messages
+                        .iter()
+                        .filter(|m| m.direction == pancetta_qso::MessageDirection::Sent)
+                        .count(),
+                    1
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "QSO loop did not apply rollback");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn tx_frame_not_sent_rolls_back_keep_call_bookkeeping() {
+        check_tx_frame_not_sent(false).await;
+    }
+
+    #[tokio::test]
+    async fn tx_frame_not_sent_with_malformed_qso_id_is_ignored() {
+        check_tx_frame_not_sent(true).await;
     }
 
     /// Drain the Tui channel (bounded crossbeam queue, not broadcast — a

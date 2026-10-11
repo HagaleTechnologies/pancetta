@@ -75,6 +75,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A QSO whose frame the TX worker drops before it reaches the air (concurrent-QSO cap, F8 abort, supersede, arm or mute refusal) no longer spends a call from its keep-calling budget, advances the stall detector toward a TX-offset switch, or shows the unsent frame as sent (PAN-75).
+
 - Autonomous and manual TX no longer key the rig while the rig's CAT link is
   lost or the audio output device has stopped delivering samples (PAN-115).
   The TX gate reports `rig is disconnected` (after 5 s of failed rig polls) or

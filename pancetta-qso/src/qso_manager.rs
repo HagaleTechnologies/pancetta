@@ -7,7 +7,7 @@ use crate::async_database::QsoDatabase;
 use crate::states::*;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
@@ -989,6 +989,37 @@ impl Default for DuplicateCheckConfig {
 /// doc comment.
 type RemoteTxPermittedSource = Arc<dyn Fn(Option<&str>) -> bool + Send + Sync>;
 
+// A frame may wait behind an in-flight TX and a same-parity slot (~3 slots).
+const UNSENT_ATTEMPT_RETENTION_SLOTS: i64 = 4;
+const MAX_UNSENT_ATTEMPTS_PER_QSO: usize = 8;
+
+#[derive(Debug, Clone)]
+struct KeepCallAttempt {
+    emitted_at: DateTime<Utc>,
+    raw_text: String,
+    prev_last_call_at: Option<DateTime<Utc>>,
+    bumped_stall: bool,
+    recorded_sent: bool,
+}
+
+#[derive(Debug, Default)]
+struct KeepCallLedger {
+    // Never rolled back: keeps pacing independent of TX accounting.
+    last_emitted_at: Option<DateTime<Utc>>,
+    attempts: VecDeque<KeepCallAttempt>,
+}
+
+/// Whether a failed TX could be matched to a recent, active keep-call emission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsentAttemptRollback {
+    /// One emission was reversed; includes the remaining call count.
+    RolledBack { call_count: u32 },
+    /// No matching emission remains within the retention window.
+    NoMatchingAttempt,
+    /// Missing or terminal QSOs have no live bookkeeping to restore.
+    QsoNotActive,
+}
+
 /// QSO manager implementation
 pub struct QsoManager {
     /// Configuration
@@ -996,6 +1027,9 @@ pub struct QsoManager {
 
     /// Active QSOs by ID
     qsos: Arc<RwLock<HashMap<QsoId, QsoProgress>>>,
+
+    /// PAN-75 accounting only. Lock after `qsos`, never across an await.
+    keep_call_ledger: Arc<std::sync::Mutex<HashMap<QsoId, KeepCallLedger>>>,
 
     /// QSOs by callsign for duplicate checking
     qsos_by_callsign: Arc<RwLock<HashMap<String, Vec<QsoId>>>>,
@@ -1383,6 +1417,7 @@ impl QsoManager {
         Self {
             config,
             qsos: Arc::new(RwLock::new(HashMap::new())),
+            keep_call_ledger: Arc::new(std::sync::Mutex::new(HashMap::new())),
             qsos_by_callsign: Arc::new(RwLock::new(HashMap::new())),
             event_sender,
             next_serial: Arc::new(RwLock::new(next_serial)),
@@ -3494,6 +3529,121 @@ impl QsoManager {
             .unwrap_or(snapshot)
     }
 
+    // Called under the qsos write lock at either stall-reset site. Those
+    // contributions are already gone; delayed failure must not subtract
+    // them from a later streak. Call-count and timeline eligibility remain.
+    fn clear_recorded_stall_increments(&self, qso_id: QsoId) {
+        let mut ledger = self
+            .keep_call_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = ledger.get_mut(&qso_id) {
+            for attempt in &mut entry.attempts {
+                attempt.bumped_stall = false;
+            }
+        }
+    }
+
+    fn record_keep_call_attempt(
+        &self,
+        ledger: &mut HashMap<QsoId, KeepCallLedger>,
+        qso_id: QsoId,
+        attempt: KeepCallAttempt,
+    ) {
+        let cutoff = attempt.emitted_at
+            - Duration::milliseconds(UNSENT_ATTEMPT_RETENTION_SLOTS * self.rearm_slot_millis());
+        let entry = ledger.entry(qso_id).or_default();
+        entry.last_emitted_at = Some(attempt.emitted_at);
+        entry.attempts.push_back(attempt);
+        entry
+            .attempts
+            .retain(|attempt| attempt.emitted_at >= cutoff);
+        while entry.attempts.len() > MAX_UNSENT_ATTEMPTS_PER_QSO {
+            entry.attempts.pop_front();
+        }
+    }
+
+    /// Reverse a recent keep-call emission that the TX worker reported as unsent.
+    /// No events are emitted; pacing still uses the last emission (PAN-75).
+    pub async fn roll_back_unsent_attempt(
+        &self,
+        qso_id: QsoId,
+        message_text: &str,
+    ) -> UnsentAttemptRollback {
+        self.roll_back_unsent_attempt_at(qso_id, message_text, Utc::now())
+            .await
+    }
+
+    /// Deterministic-clock rollback. Matches newest text first, within four slots.
+    /// Opening calls and manual-regression re-sends have no ledger entry.
+    pub async fn roll_back_unsent_attempt_at(
+        &self,
+        qso_id: QsoId,
+        message_text: &str,
+        now: DateTime<Utc>,
+    ) -> UnsentAttemptRollback {
+        let mut qsos = self.qsos.write().await;
+        let Some(progress) = qsos.get_mut(&qso_id).filter(|p| p.state.is_active()) else {
+            return UnsentAttemptRollback::QsoNotActive;
+        };
+        let mut ledger = self
+            .keep_call_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = ledger.get_mut(&qso_id) else {
+            return UnsentAttemptRollback::NoMatchingAttempt;
+        };
+        let cutoff =
+            now - Duration::milliseconds(UNSENT_ATTEMPT_RETENTION_SLOTS * self.rearm_slot_millis());
+        entry
+            .attempts
+            .retain(|attempt| attempt.emitted_at >= cutoff);
+        let Some(index) = entry
+            .attempts
+            .iter()
+            .rposition(|attempt| attempt.raw_text == message_text)
+        else {
+            return UnsentAttemptRollback::NoMatchingAttempt;
+        };
+        let Some(attempt) = entry.attempts.remove(index) else {
+            return UnsentAttemptRollback::NoMatchingAttempt;
+        };
+        if let Some(next) = entry.attempts.get_mut(index) {
+            // Do not relink across a forward-advance stamp.
+            if next.prev_last_call_at == Some(attempt.emitted_at) {
+                next.prev_last_call_at = attempt.prev_last_call_at;
+            }
+        }
+        progress.metadata.call_count = progress.metadata.call_count.saturating_sub(1);
+        if progress.metadata.last_call_at == Some(attempt.emitted_at) {
+            progress.metadata.last_call_at = attempt.prev_last_call_at;
+        }
+        if attempt.bumped_stall {
+            progress.metadata.stall_cycles = progress.metadata.stall_cycles.saturating_sub(1);
+        }
+        if attempt.recorded_sent {
+            if let Some(index) = progress.messages.iter().rposition(|m| {
+                m.direction == MessageDirection::Sent
+                    && m.timestamp == attempt.emitted_at
+                    && m.raw_text == attempt.raw_text
+            }) {
+                progress.messages.remove(index);
+            }
+        }
+        UnsentAttemptRollback::RolledBack {
+            call_count: progress.metadata.call_count,
+        }
+    }
+
+    #[cfg(test)]
+    fn keep_call_ledger_len(&self, qso_id: QsoId) -> usize {
+        self.keep_call_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&qso_id)
+            .map_or(0, |entry| entry.attempts.len())
+    }
+
     /// Re-send the most recent outbound message for a QSO.
     ///
     /// Looks up the QSO, finds the most-recent `Sent` message in its message
@@ -3524,8 +3674,23 @@ impl QsoManager {
                 Some(m) => {
                     let message = m.message_type.clone();
                     let frequency = progress.metadata.frequency;
+                    let prev_last_call_at = progress.metadata.last_call_at;
                     progress.metadata.call_count += 1;
                     progress.metadata.last_call_at = Some(now);
+                    self.record_keep_call_attempt(
+                        &mut self
+                            .keep_call_ledger
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()),
+                        qso_id,
+                        KeepCallAttempt {
+                            emitted_at: now,
+                            raw_text: self.render_sent_text(&message),
+                            prev_last_call_at,
+                            bumped_stall: false,
+                            recorded_sent: false,
+                        },
+                    );
                     (message, frequency)
                 }
                 None => {
@@ -3745,6 +3910,7 @@ impl QsoManager {
         progress.metadata.frequency = applied_hz;
         progress.metadata.pending_freq_drift = None;
         progress.metadata.stall_cycles = 0;
+        self.clear_recorded_stall_increments(qso_id);
         // PAN-72 (Codex round 4 on PR #350, finding 3): remember the offset we
         // are vacating, and when. The frame that triggered this move went out
         // on it — `rearm_manual_calls_at` re-sends and trips the stall
@@ -3925,6 +4091,7 @@ impl QsoManager {
                 // `CallingCq` (which DOES get a periodic rearm); it applies
                 // uniformly to whichever arm above fired — no separate
                 // bookkeeping needed per state.
+                let prev_last_call_at = progress.metadata.last_call_at;
                 progress.metadata.call_count += 1;
                 progress.metadata.last_call_at = Some(now);
                 let raw_text = self.render_sent_text(&message);
@@ -3932,10 +4099,24 @@ impl QsoManager {
                     timestamp: now,
                     direction: MessageDirection::Sent,
                     message_type: message.clone(),
-                    raw_text,
+                    raw_text: raw_text.clone(),
                     signal_strength: None,
                     frequency: progress.metadata.frequency,
                 });
+                self.record_keep_call_attempt(
+                    &mut self
+                        .keep_call_ledger
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()),
+                    qso_id,
+                    KeepCallAttempt {
+                        emitted_at: now,
+                        raw_text,
+                        prev_last_call_at,
+                        bumped_stall: false,
+                        recorded_sent: true,
+                    },
+                );
                 (
                     message,
                     progress.metadata.frequency,
@@ -4416,6 +4597,7 @@ impl QsoManager {
         if let Some(progress) = qsos.get_mut(&qso_id) {
             if dx_frame_advanced {
                 progress.metadata.stall_cycles = 0;
+                self.clear_recorded_stall_increments(qso_id);
                 // PAN-72 (Codex round 4 on PR #350, finding 3): credit the
                 // offset the DX actually heard us on. A STALL-triggered
                 // relocation is committed AFTER the frame that triggered it has
@@ -6801,6 +6983,8 @@ impl QsoManager {
     /// watchdog ([`Self::check_timeouts_at`]) reads `call_count` and
     /// `first_call_at` (Manual) or the per-state `report_timeout` (Auto) to
     /// decide when to stop.
+    /// Failed TX outcomes can reverse accounting via [`Self::roll_back_unsent_attempt_at`].
+    /// The ledger emission anchor preserves cadence even when accounting is restored.
     pub async fn rearm_manual_calls_at(&self, now: DateTime<Utc>) {
         // Re-arm only when at least one transmit slot has elapsed since the
         // last call, to keep ~one call per slot.
@@ -6879,6 +7063,16 @@ impl QsoManager {
 
         {
             let mut qsos = self.qsos.write().await;
+            let mut ledger = self
+                .keep_call_ledger
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let cutoff = now - Duration::milliseconds(UNSENT_ATTEMPT_RETENTION_SLOTS * slot_millis);
+            for entry in ledger.values_mut() {
+                entry
+                    .attempts
+                    .retain(|attempt| attempt.emitted_at >= cutoff);
+            }
             for (&qso_id, progress) in qsos.iter_mut() {
                 let is_manual = progress.metadata.initiated_by == CallInitiation::Manual;
                 let message = match &progress.state {
@@ -6985,6 +7179,7 @@ impl QsoManager {
                 let elapsed_since_last = progress
                     .metadata
                     .last_call_at
+                    .max(ledger.get(&qso_id).and_then(|entry| entry.last_emitted_at))
                     .map(|t| (now - t).num_milliseconds())
                     .unwrap_or(i64::MAX);
                 if elapsed_since_last < slot_millis {
@@ -7025,6 +7220,7 @@ impl QsoManager {
                     continue;
                 }
 
+                let prev_last_call_at = progress.metadata.last_call_at;
                 progress.metadata.call_count += 1;
                 progress.metadata.last_call_at = Some(now);
 
@@ -7096,11 +7292,22 @@ impl QsoManager {
                     timestamp: now,
                     direction: MessageDirection::Sent,
                     message_type: message.clone(),
-                    raw_text,
+                    raw_text: raw_text.clone(),
                     signal_strength: None,
                     frequency: progress.metadata.frequency,
                 });
 
+                self.record_keep_call_attempt(
+                    &mut ledger,
+                    qso_id,
+                    KeepCallAttempt {
+                        emitted_at: now,
+                        raw_text,
+                        prev_last_call_at,
+                        bumped_stall: true,
+                        recorded_sent: true,
+                    },
+                );
                 to_recall.push((
                     qso_id,
                     message,
@@ -7110,6 +7317,7 @@ impl QsoManager {
                     progress.metadata.remote_client_key_id.clone(),
                 ));
             }
+            ledger.retain(|id, _| qsos.get(id).is_some_and(|p| p.state.is_active()));
         }
 
         for (
@@ -7509,6 +7717,7 @@ impl Clone for QsoManager {
         Self {
             config: self.config.clone(),
             qsos: Arc::clone(&self.qsos),
+            keep_call_ledger: Arc::clone(&self.keep_call_ledger),
             qsos_by_callsign: Arc::clone(&self.qsos_by_callsign),
             event_sender: self.event_sender.clone(),
             next_serial: Arc::clone(&self.next_serial),
@@ -7536,6 +7745,347 @@ impl Clone for QsoManager {
 mod tests {
     use super::*;
     use tokio_test;
+
+    async fn rollback_fixture() -> (QsoManager, QsoId, DateTime<Utc>, String) {
+        let manager = QsoManager::new(test_config());
+        let id = manager
+            .respond_to_cq_manual("K1DEF".into(), 1500.0, None)
+            .await
+            .unwrap();
+        let opened = manager
+            .get_qso(id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        manager
+            .rearm_manual_calls_at(opened + Duration::seconds(15))
+            .await;
+        let text = manager
+            .get_qso(id)
+            .await
+            .unwrap()
+            .messages
+            .last()
+            .unwrap()
+            .raw_text
+            .clone();
+        (manager, id, opened, text)
+    }
+
+    #[tokio::test]
+    async fn rollback_reverses_a_rearm_attempt() {
+        let (manager, id, opened, text) = rollback_fixture().await;
+        let before = manager.get_qso(id).await.unwrap();
+        assert_eq!(before.metadata.call_count, 2);
+        assert_eq!(before.metadata.stall_cycles, 1);
+        assert_eq!(before.messages.len(), 2);
+        assert_eq!(
+            manager
+                .roll_back_unsent_attempt_at(id, &text, opened + Duration::seconds(20))
+                .await,
+            UnsentAttemptRollback::RolledBack { call_count: 1 }
+        );
+        let after = manager.get_qso(id).await.unwrap();
+        assert_eq!(after.metadata.last_call_at, Some(opened));
+        assert_eq!(after.metadata.stall_cycles, 0);
+        assert_eq!(after.messages.len(), 1);
+        assert_eq!(after.messages[0].timestamp, before.messages[0].timestamp);
+    }
+
+    #[tokio::test]
+    async fn rollback_keeps_rearm_cadence() {
+        let (manager, id, opened, text) = rollback_fixture().await;
+        let mut events = manager.subscribe();
+        manager
+            .roll_back_unsent_attempt_at(id, &text, opened + Duration::seconds(20))
+            .await;
+        manager
+            .rearm_manual_calls_at(opened + Duration::seconds(20))
+            .await;
+        assert!(drain(&mut events).is_empty());
+        manager
+            .rearm_manual_calls_at(opened + Duration::seconds(30))
+            .await;
+        assert_eq!(
+            drain(&mut events)
+                .iter()
+                .filter(|e| matches!(e, QsoEvent::MessageToSend { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_with_unmatched_text_is_noop() {
+        let (manager, id, opened, _) = rollback_fixture().await;
+        let before = format!("{:?}", manager.get_qso(id).await.unwrap());
+        assert_eq!(
+            manager
+                .roll_back_unsent_attempt_at(id, "wrong", opened + Duration::seconds(20))
+                .await,
+            UnsentAttemptRollback::NoMatchingAttempt
+        );
+        assert_eq!(before, format!("{:?}", manager.get_qso(id).await.unwrap()));
+    }
+
+    #[tokio::test]
+    async fn rollback_on_terminal_qso_is_noop() {
+        let (manager, id, opened, text) = rollback_fixture().await;
+        manager.cancel_qso(id).await.unwrap();
+        assert_eq!(
+            manager
+                .roll_back_unsent_attempt_at(id, &text, opened + Duration::seconds(20))
+                .await,
+            UnsentAttemptRollback::QsoNotActive
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_of_expired_attempt_is_noop() {
+        let (manager, id, opened, text) = rollback_fixture().await;
+        assert_eq!(
+            manager
+                .roll_back_unsent_attempt_at(
+                    id,
+                    &text,
+                    opened + Duration::seconds(75) + Duration::milliseconds(1)
+                )
+                .await,
+            UnsentAttemptRollback::NoMatchingAttempt
+        );
+        assert_eq!(manager.get_qso(id).await.unwrap().metadata.call_count, 2);
+    }
+
+    #[tokio::test]
+    async fn rollback_matches_newest_same_text_attempt_and_relinks() {
+        let (manager, id, opened, text) = rollback_fixture().await;
+        manager
+            .rearm_manual_calls_at(opened + Duration::seconds(30))
+            .await;
+        assert_eq!(
+            manager
+                .roll_back_unsent_attempt_at(id, &text, opened + Duration::seconds(35))
+                .await,
+            UnsentAttemptRollback::RolledBack { call_count: 2 }
+        );
+        let after = manager.get_qso(id).await.unwrap();
+        assert_eq!(
+            after.metadata.last_call_at,
+            Some(opened + Duration::seconds(15))
+        );
+        assert_eq!(after.messages.len(), 2);
+        assert_eq!(
+            after.messages.last().unwrap().timestamp,
+            opened + Duration::seconds(15)
+        );
+        manager
+            .roll_back_unsent_attempt_at(id, &text, opened + Duration::seconds(35))
+            .await;
+        let after = manager.get_qso(id).await.unwrap();
+        assert_eq!(after.metadata.call_count, 1);
+        assert_eq!(after.metadata.last_call_at, Some(opened));
+    }
+
+    #[tokio::test]
+    async fn rollback_after_advance_preserves_new_stall_and_stamp() {
+        let (manager, id, opened, old_text) = rollback_fixture().await;
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "W1ABC".into(),
+                    from_station: "K1DEF".into(),
+                    report: -7,
+                },
+                "W1ABC K1DEF -07".into(),
+                1500.0,
+                Some(-12.0),
+            )
+            .await
+            .unwrap();
+        let advance_stamp = manager.get_qso(id).await.unwrap().metadata.last_call_at;
+        manager
+            .rearm_manual_calls_at(opened + Duration::seconds(30))
+            .await;
+        let new_attempt = manager.get_qso(id).await.unwrap();
+        let new_text = &new_attempt.messages.last().unwrap().raw_text;
+        assert_ne!(new_text, &old_text);
+        assert_eq!(new_attempt.metadata.stall_cycles, 1);
+
+        manager
+            .roll_back_unsent_attempt_at(id, &old_text, opened + Duration::seconds(35))
+            .await;
+        let after_old = manager.get_qso(id).await.unwrap();
+        assert_eq!(
+            after_old.metadata.stall_cycles, 1,
+            "old attempt's stall increment was already cleared by the DX advance"
+        );
+        assert_eq!(
+            after_old.metadata.last_call_at,
+            new_attempt.metadata.last_call_at
+        );
+        assert_eq!(
+            after_old.metadata.call_count,
+            new_attempt.metadata.call_count - 1
+        );
+
+        manager
+            .roll_back_unsent_attempt_at(id, new_text, opened + Duration::seconds(36))
+            .await;
+        let after_new = manager.get_qso(id).await.unwrap();
+        assert_eq!(after_new.metadata.stall_cycles, 0);
+        assert_eq!(
+            after_new.metadata.last_call_at, advance_stamp,
+            "relink must preserve the intervening DX advance"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_after_forward_advance_keeps_the_advance_stamp() {
+        let (manager, id, opened, text) = rollback_fixture().await;
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "W1ABC".into(),
+                    from_station: "K1DEF".into(),
+                    report: -7,
+                },
+                "W1ABC K1DEF -07".into(),
+                1500.0,
+                Some(-12.0),
+            )
+            .await
+            .unwrap();
+        let before = manager.get_qso(id).await.unwrap();
+        assert!(matches!(before.state, QsoState::SendingReport { .. }));
+        manager
+            .roll_back_unsent_attempt_at(id, &text, opened + Duration::seconds(20))
+            .await;
+        let after = manager.get_qso(id).await.unwrap();
+        assert_eq!(after.metadata.call_count, before.metadata.call_count - 1);
+        assert_eq!(after.metadata.last_call_at, before.metadata.last_call_at);
+        assert_eq!(after.metadata.stall_cycles, 0);
+        assert!(!after
+            .messages
+            .iter()
+            .any(|m| m.direction == MessageDirection::Sent
+                && m.timestamp == opened + Duration::seconds(15)));
+    }
+
+    #[tokio::test]
+    async fn rollback_reverses_resend_last_tx() {
+        let manager = QsoManager::new(test_config());
+        let id = manager
+            .respond_to_cq_manual("K1DEF".into(), 1500.0, None)
+            .await
+            .unwrap();
+        let before = manager.get_qso(id).await.unwrap();
+        manager.resend_last_tx(id).await.unwrap();
+        assert_eq!(manager.get_qso(id).await.unwrap().metadata.call_count, 2);
+        assert_eq!(
+            manager
+                .roll_back_unsent_attempt(id, &before.messages.last().unwrap().raw_text)
+                .await,
+            UnsentAttemptRollback::RolledBack { call_count: 1 }
+        );
+        let after = manager.get_qso(id).await.unwrap();
+        assert_eq!(after.metadata.last_call_at, before.metadata.last_call_at);
+        assert_eq!(after.messages.len(), before.messages.len());
+    }
+
+    #[tokio::test]
+    async fn rollback_reverses_offset_switch_retransmit() {
+        let manager = auto_manager(test_config());
+        let id = manager
+            .respond_to_cq("K1DEF".into(), 1500.0, None)
+            .await
+            .unwrap();
+        manager
+            .qsos
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .metadata
+            .call_count = AUTO_RESEND_MAX_CALLS;
+        let before = manager.get_qso(id).await.unwrap();
+        manager
+            .apply_tx_offset_switch(id, 1900.0, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .unwrap();
+        let emitted = manager.get_qso(id).await.unwrap();
+        assert_eq!(emitted.metadata.call_count, AUTO_RESEND_MAX_CALLS + 1);
+        manager
+            .roll_back_unsent_attempt(id, &emitted.messages.last().unwrap().raw_text)
+            .await;
+        let after = manager.get_qso(id).await.unwrap();
+        assert_eq!(after.metadata.call_count, before.metadata.call_count);
+        assert_eq!(after.metadata.last_call_at, before.metadata.last_call_at);
+        assert_eq!(after.messages.len(), before.messages.len());
+    }
+
+    #[tokio::test]
+    async fn ledger_is_shared_across_clones_and_pruned_when_qso_leaves() {
+        let (manager, id, opened, text) = rollback_fixture().await;
+        assert_eq!(manager.keep_call_ledger_len(id), 1);
+        assert_eq!(
+            manager
+                .clone()
+                .roll_back_unsent_attempt_at(id, &text, opened + Duration::seconds(20))
+                .await,
+            UnsentAttemptRollback::RolledBack { call_count: 1 }
+        );
+        manager
+            .rearm_manual_calls_at(opened + Duration::seconds(30))
+            .await;
+        assert_eq!(manager.keep_call_ledger_len(id), 1);
+        manager.cancel_qso(id).await.unwrap();
+        manager
+            .rearm_manual_calls_at(opened + Duration::seconds(45))
+            .await;
+        assert_eq!(manager.keep_call_ledger_len(id), 0);
+    }
+
+    #[tokio::test]
+    async fn auto_qso_rollback_restores_its_resend() {
+        let manager = QsoManager::new(test_config());
+        let id = manager
+            .respond_to_cq("K1DEF".into(), 1500.0, None)
+            .await
+            .unwrap();
+        let opened = manager
+            .get_qso(id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        manager
+            .rearm_manual_calls_at(opened + Duration::seconds(15))
+            .await;
+        let emitted = manager.get_qso(id).await.unwrap();
+        assert_eq!(emitted.metadata.call_count, 2);
+        manager
+            .roll_back_unsent_attempt_at(
+                id,
+                &emitted.messages.last().unwrap().raw_text,
+                opened + Duration::seconds(20),
+            )
+            .await;
+        assert_eq!(manager.get_qso(id).await.unwrap().metadata.call_count, 1);
+        let mut events = manager.subscribe();
+        manager
+            .rearm_manual_calls_at(opened + Duration::seconds(30))
+            .await;
+        assert_eq!(
+            drain(&mut events)
+                .iter()
+                .filter(|e| matches!(e, QsoEvent::MessageToSend { .. }))
+                .count(),
+            1
+        );
+    }
 
     fn test_config() -> QsoManagerConfig {
         QsoManagerConfig {
@@ -19129,7 +19679,7 @@ mod has_active_or_recent_qso_tests {
     //! QSOs (fix for the ZL1UHD-style four-73 bug).
     use super::*;
     use chrono::Duration;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use uuid::Uuid;
 
     fn manager() -> QsoManager {
@@ -19380,7 +19930,7 @@ mod hound_tests {
     use crate::states::{GridSquares, SignalReports};
     use chrono::Utc;
     use pancetta_core::slot::SlotParity;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use uuid::Uuid;
 
     // ── QsoMetadata default field values ────────────────────────────────────
