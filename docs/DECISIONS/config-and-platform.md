@@ -478,3 +478,27 @@ binary-only `doctor.rs` into `pancetta_lib` so the coordinator can use it; docto
   WARN tier for 0.3 s ≤ |offset| < 1.0 s; PASS, FAIL and unreachable texts and the exit code are
   unchanged.
 
+## Research-scan PRs land themselves (PAN-172, 2026-10-11)
+
+- Merge groups skip the five Rust lanes only when their non-empty cumulative diff is
+  entirely under `research/notes/`. The path allowlist includes `--no-renames`, so moving
+  code into the notes directory cannot hide its deletion. Detection fails closed. Other
+  groups run every Rust lane, including Cargo Deny advisories; a note cannot repair an
+  advisory already present on main.
+- `CI` rejects commit trailer lines on PRs whose title starts with `Weekly research scan `.
+  The check covers every commit in the PR and rejects both AI attribution and session lines.
+- `research-scan-shepherd.yml` runs at 02:17 and 14:17 UTC. It handles only ready, same-repo,
+  notes-only scan PRs into main from the existing trusted authors. It uses the review PAT
+  only for thread resolution and arming. It has its own concurrency group and checks that
+  Auto-Merge Trigger and Queue Retry Handler are quiet before acting, avoiding eviction
+  of a pending run in their shared lock. Stuck scans get a PR comment, a maintainer issue,
+  and a failed workflow run.
+- The shepherd may clear a handler-attached pause at most twice per head SHA. A pause
+  attached by anyone except `github-actions[bot]` remains in force. Exhausting the budget
+  produces a report instead of another retry.
+- The [routine lifecycle](../routines/pancetta-research-scan.md) is the source for the
+  scan-only review policy. Round 1 fixes reasonable findings; rounds 2 and 3 fix P0/P1
+  and defer P2 and lower; round 4 and later defer everything without more commits.
+  This local override leaves the synced general convergence policy unchanged. The external
+  claude.ai routine must receive the documented prompt pointer, daily schedule and Linear
+  connector edits before the full lifecycle is operational.

@@ -1,0 +1,80 @@
+{
+  "now": "2026-10-13T18:20:00Z",
+  "config": {
+    "actors": [
+      "thagale",
+      "catalyst-cloud-connector[bot]"
+    ],
+    "title_regex": "^Weekly research scan [0-9]{4}-[0-9]{2}-[0-9]{2}$",
+    "rearm_budget": 2,
+    "stuck_after_hours": 24,
+    "round_cap": 3
+  },
+  "pr": {
+    "number": 420,
+    "title": "Weekly research scan 2026-10-12",
+    "author": "thagale",
+    "isDraft": false,
+    "isCrossRepository": false,
+    "baseRefName": "main",
+    "createdAt": "2026-10-12T12:20:00Z",
+    "headRefOid": "1a2b3c4000000000000000000000000000000000",
+    "mergeable": "MERGEABLE",
+    "armed": true,
+    "inMergeQueue": false,
+    "labels": [
+      "codex-clean:1a2b3c400000"
+    ],
+    "files": [
+      {
+        "path": "research/notes/web-scan-2026-10-12.md",
+        "previous_path": null
+      }
+    ],
+    "commits": [
+      "1a2b3c4000000000000000000000000000000000"
+    ]
+  },
+  "commit_files": {
+    "1a2b3c4000000000000000000000000000000000": [
+      "research/notes/web-scan-2026-10-12.md"
+    ]
+  },
+  "threads": [
+    {
+      "id": "PRRT_1",
+      "url": "https://example.invalid/thread/1",
+      "isResolved": false,
+      "path": "research/notes/web-scan-2026-10-12.md",
+      "opener": "chatgpt-codex-connector",
+      "latest": {
+        "author": "randomuser",
+        "body": "Fixed in 1a2b3c4"
+      }
+    }
+  ],
+  "codex_review_commits": [
+    "1a2b3c4000000000000000000000000000000000"
+  ],
+  "required_checks": [
+    {
+      "name": "CI",
+      "conclusion": "success"
+    },
+    {
+      "name": "Supply Chain",
+      "conclusion": "success"
+    },
+    {
+      "name": "Codex review clean (gate before expensive downstream jobs)",
+      "conclusion": "success"
+    }
+  ],
+  "ci_failed_jobs": [],
+  "pause": {
+    "present": false,
+    "attached_by": null
+  },
+  "rearm_count_for_head": 0,
+  "merge_queue_rule_present": true
+}

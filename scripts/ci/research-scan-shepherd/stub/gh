@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Offline GitHub API double. Only synthetic tokens are recorded by the test runner.
+set -euo pipefail
+jq -cn --arg token "$GH_TOKEN" --args '{token:$token,args:$ARGS.positional}' -- "$@" >> "$STUB_LOG"
+data="$STUB_DIR/$STUB_CASE.json"
+args=" $* "
+get() { jq "$1" "$data"; }
+case "$1 $2" in
+  'run list')
+    if [[ $args == *'auto-merge-trigger.yml'* || $args == *'queue-retry-handler.yml'* ]]; then
+      if [[ $STUB_CASE == E && $args == *'queue-retry-handler.yml'* && $args == *'in_progress'* ]]; then echo '[{"databaseId":99}]'; else echo '[]'; fi
+    elif [[ $args == *'wait-for-codex.yml'* ]]; then
+      get '.codex_workflow_runs.workflow_runs | sort_by(.created_at) | reverse | .[:1] | map({databaseId:.id,conclusion,status,headSha:.head_sha,attempt:.run_attempt,createdAt:.created_at})'
+    else get '.ci_runs'; fi ;;
+  'run view') get '.jobs' ;;
+  'run rerun') echo '{}' ;;
+  'pr list') echo '[{"number":420}]' ;;
+  'pr merge')
+    if [[ $args == *' --disable-auto '* ]]; then rm -f "$STUB_STATE/armed"; touch "$STUB_STATE/disarmed"
+    else
+      touch "$STUB_STATE/armed"; rm -f "$STUB_STATE/disarmed"
+      # Simulates the Queue Retry Handler pausing the PR just as green checks queue it.
+      [[ -z ${STUB_PAUSE_ON_ARM:-} ]] || touch "$STUB_STATE/repaused" "$STUB_STATE/queued"
+    fi
+    echo '{}' ;;
+  'issue create'|'issue edit'|'issue close'|'issue comment'|'label create') echo '{}' ;;
+  'api graphql')
+    if [[ $args == *'dequeuePullRequest('* ]]; then
+      touch "$STUB_STATE/dequeued"; echo '{"data":{"dequeuePullRequest":{"clientMutationId":null}}}'
+    elif [[ $args == *'resolveReviewThread('* ]]; then
+      for arg in "$@"; do [[ $arg == id=* ]] && touch "$STUB_STATE/${arg#id=}"; done
+      echo '{"data":{"resolveReviewThread":{"thread":{"isResolved":true}}}}'
+    elif [[ $args == *'node(id:'* ]]; then
+      id=''
+      for arg in "$@"; do [[ $arg == id=* ]] && id=${arg#id=}; done
+      jq --arg id "$id" --arg scenario "$STUB_CASE" '{data:{node:(.pr.data.repository.pullRequest.reviewThreads.nodes[] | select(.id==$id))}} | if $scenario == "G" then .data.node.latest.nodes[0].body = "Codex restated the finding" else . end' "$data"
+    else
+      if [[ $STUB_CASE == L ]]; then get '.pr_pages[]'; exit 0; fi
+      if [[ $STUB_CASE == F && -f $STUB_STATE/live.json ]]; then
+        get '.pr' | jq '.data.repository.pullRequest.headRefOid = ("f" * 40)'
+        exit 0
+      fi
+      get '.pr' | jq --argjson cleared "$([[ -f $STUB_STATE/cleared ]] && echo true || echo false)" --argjson armed "$([[ -f $STUB_STATE/armed ]] && echo true || echo false)" \
+        --argjson disarmed "$([[ -f $STUB_STATE/disarmed ]] && echo true || echo false)" \
+        --argjson queued "$([[ -f $STUB_STATE/queued ]] && echo true || echo false)" \
+        --argjson dequeued "$([[ -f $STUB_STATE/dequeued ]] && echo true || echo false)" '
+        if $cleared then .data.repository.pullRequest.labels.nodes |= map(select(.name != "queue-needs-human-review")) else . end
+        | if $armed then .data.repository.pullRequest.autoMergeRequest = {enabledAt:"2026-10-13T18:20:00Z"} else . end
+        | .data.repository.pullRequest.id = "PR_node_420"
+        | if $disarmed then .data.repository.pullRequest.autoMergeRequest = null else . end
+        | if $queued then .data.repository.pullRequest.isInMergeQueue = true else . end
+        | if $dequeued then .data.repository.pullRequest.isInMergeQueue = false else . end' > "$STUB_STATE/live.json"
+      for f in "$STUB_STATE"/PRRT_*; do
+        [[ -f $f ]] || continue
+        jq --arg id "$(basename "$f")" '(.data.repository.pullRequest.reviewThreads.nodes[] | select(.id==$id)).isResolved = true' "$STUB_STATE/live.json" > "$STUB_STATE/next.json"
+        mv "$STUB_STATE/next.json" "$STUB_STATE/live.json"
+      done
+      cat "$STUB_STATE/live.json"
+    fi ;;
+  api*)
+    if [[ $args == *' -X DELETE '* ]]; then touch "$STUB_STATE/cleared"; echo '{}'
+    elif [[ -n ${STUB_FAIL_REARM_COMMENT:-} && $args == *' -X POST '* && $args == *'research-scan-shepherd:rearm'* ]]; then
+      echo 'stub: rearm marker post failed' >&2; exit 1
+    elif [[ $args == *' -X POST '* || $args == *' -X PATCH '* ]]; then echo '{}'
+    else
+      case "$2" in
+        *'/issues?'*) get '.issues' ;;
+        *'/labels/research-scan-stuck') [[ $STUB_CASE == J ]] || exit 1; echo '{"name":"research-scan-stuck"}' ;;
+        *'/actions/workflows/wait-for-codex.yml/runs?'*) get '.codex_workflow_runs' ;;
+        *'/rules/branches/main'*) [[ $STUB_CASE != H && $STUB_CASE != O ]] || exit 1; get '.rules' ;;
+        *'/check-runs'*) get '.checks' ;;
+        *'/statuses'*) get '.statuses' ;;
+        *'/files'*) get '.files' ;;
+        *'/timeline'*) get '.timeline' ;;
+        *'/comments'*) get '.comments' ;;
+        *'/labels'*) if [[ -f $STUB_STATE/repaused ]]; then echo '[{"name":"queue-needs-human-review"}]'
+          elif [[ -f $STUB_STATE/cleared ]]; then echo '[]'; else get '.pr.data.repository.pullRequest.labels.nodes'; fi ;;
+        *'/commits/'*) get '.commit_files' ;;
+        *'/pulls/420') get '.rest_pr' ;;
+        *) echo "unstubbed API: $*" >&2; exit 2 ;;
+      esac
+    fi ;;
+  *) echo "unstubbed gh: $*" >&2; exit 2 ;;
+esac
