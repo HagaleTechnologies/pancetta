@@ -27,6 +27,9 @@ Type=simple
 # Adjust to your installed binary path (e.g. /usr/local/bin/pancetta or
 # %h/.cargo/bin/pancetta). %h expands to the user's home directory.
 ExecStart=%h/.cargo/bin/pancetta --headless
+# Send SIGTERM only to Pancetta so managed rigctld remains available for PTT-off.
+# Force-kill remaining children if Pancetta exits or the stop timeout expires.
+KillMode=mixed
 # Auto-restart on any exit (crash, panic-abort, or clean exit), with a short
 # backoff. The rate limiter stops a hard crash-loop from hammering the rig.
 Restart=always
