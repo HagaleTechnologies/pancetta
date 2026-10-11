@@ -450,3 +450,31 @@ a hard `missing field` error. Worse, the auto-discovery loader swallowed that er
 - **Search path** deduplicated (keep last occurrence) and documented in `docs/CONFIG.md`.
 - `pancetta-config/examples/config.toml` deleted: unreferenced, unparseable, and a duplicate of
   the generated `defaults.toml`.
+
+## In-session clock-skew monitor (PAN-114, 2026-10-10)
+
+`pancetta/src/clock_skew.rs` (SNTP client, thresholds, pure `ClockSkewMonitorCore`),
+`pancetta/src/coordinator/clock_monitor.rs` (`spawn_clock_skew_monitor`): before this, the only clock
+check was `pancetta doctor`'s one-shot SNTP probe with a 1.0 s threshold, coarser than FT8's ~0.3 s
+decode margin (the live capture window spans DT ≈ −0.66…+0.36 s). The SNTP code moved from the
+binary-only `doctor.rs` into `pancetta_lib` so the coordinator can use it; doctor imports it back.
+
+- **Cadence.** First probe 30 s after start, then every 30 min. The NTP pool's SNTP client terms
+  ([ntppool.org/vendors](https://ntppool.org/vendors)) ask for at most one query per 30 minutes,
+  which rules out a fast "re-probe until clear" loop. 30 min of drift at a 50 ppm crystal is
+  0.09 s, well below the threshold.
+- **Steps.** A `ClockStepDetector` (wall vs monotonic, ≥ 250 ms) on the monitor's 1 s tick detects
+  NTP steps and, where the monotonic clock stops in suspend (Linux, macOS), sleep/wake. A step
+  clears the warning at once, logs a `clock.step` Warn (at most one per 60 s), and schedules a
+  re-check at `max(last_probe + 30 min, step + 30 s)`.
+- **Surfacing.** Each `clock.skew` / `clock.step` entry goes to the Diagnostics overlay through
+  `emit_diagnostic_full` **and** to `tracing` (`clock skew:` / `clock step:`), because headless mode
+  drops the TUI bus receiver. An unreachable server logs one Info entry and shows no chip.
+- **Gating.** Started in `ApplicationCoordinator::run` only when `!replay_mode()`, so no SNTP query
+  leaves a replay (`--wav` returns before it). Not registered with the supervisor: it is advisory
+  and must not trigger restart semantics. Aborted after the main loop exits.
+- **No config key.** Always on in live sessions; this avoids a new `merge_with` field. Thresholds
+  are shared with doctor: `CLOCK_SKEW_WARN_S` (0.3) and `CLOCK_SKEW_FAIL_S` (1.0). Doctor gained a
+  WARN tier for 0.3 s ≤ |offset| < 1.0 s; PASS, FAIL and unreachable texts and the exit code are
+  unchanged.
+
