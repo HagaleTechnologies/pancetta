@@ -1334,6 +1334,14 @@ pub struct ApplicationCoordinator {
     /// the TUI relay to drive a persistent station-panel badge.
     audio_output_default: Arc<AtomicBool>,
 
+    /// PAN-115 TX hard-mute input: `true` = the audio OUTPUT device is healthy
+    /// **or not monitored** (`--no-audio`, stub audio, replay). The real audio
+    /// thread stores `false` before it starts and only `true` after observing
+    /// output callbacks within the last 2 s (`OutputWatchdog`); it goes `false`
+    /// again on an output stream error, a 2 s callback stall, or the thread
+    /// exiting. Read by `tx_hard_mute_reason`.
+    pub(crate) audio_output_alive: Arc<AtomicBool>,
+
     /// Latched true when the configured audio INPUT device was not found and
     /// capture fell back to another device — RX-side mirror of
     /// `audio_output_default`. Drives a persistent TUI badge via the relay.
@@ -2080,6 +2088,7 @@ impl ApplicationCoordinator {
             last_audio_timestamp: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_decode_timestamp: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             audio_output_default: Arc::new(AtomicBool::new(false)),
+            audio_output_alive: Arc::new(AtomicBool::new(true)),
             audio_input_fallback: Arc::new(AtomicBool::new(false)),
             audio_reopen_tx: None,
             hamlib_reconnect_tx,
