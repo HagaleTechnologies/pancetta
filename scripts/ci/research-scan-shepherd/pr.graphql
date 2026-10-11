@@ -1,7 +1,7 @@
 query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $pr) {
-      number title state author { login } isDraft isCrossRepository baseRefName
+      number title state author { __typename login } isDraft isCrossRepository baseRefName
       createdAt headRefOid mergeable autoMergeRequest { enabledAt } isInMergeQueue
       labels(first: 100) { nodes { name } pageInfo { hasNextPage } }
       commits(last: 100) { nodes { commit { oid } } pageInfo { hasPreviousPage } }
@@ -10,8 +10,8 @@ query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
         pageInfo { hasNextPage endCursor }
         nodes {
           id isResolved path
-          opener: comments(first: 1) { nodes { author { login } } }
-          latest: comments(last: 1) { nodes { id author { login } body url } }
+          opener: comments(first: 1) { nodes { author { __typename login } } }
+          latest: comments(last: 1) { nodes { id author { __typename login } body url } }
         }
       }
     }

@@ -171,8 +171,9 @@
   "issues": [
     {
       "number": 92,
-      "author": {
-        "login": "github-actions[bot]"
+      "user": {
+        "login": "github-actions[bot]",
+        "type": "Bot"
       },
       "body": "<!-- research-scan-shepherd:issue pr=420 -->"
     }

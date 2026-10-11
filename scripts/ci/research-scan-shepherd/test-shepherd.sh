@@ -7,7 +7,7 @@ trap 'rm -rf "$tmp"' EXIT
 export PATH="$dir/stub:$PATH" STUB_DIR="$dir/stub" REPO=example/pancetta
 export GH_TOKEN=test-workflow-token RESOLVE_TOKEN=test-user-token ONLY_PR=420
 export REPORT_MENTION=thagale RUN_URL=https://example.invalid/run/1
-for scenario in A B C D E F G H I J K L M; do
+for scenario in A B C D E F G H I J K L M N; do
   export STUB_CASE=$scenario STUB_LOG="$tmp/$scenario.log" STUB_STATE="$tmp/$scenario"
   export GITHUB_STEP_SUMMARY="$tmp/$scenario.summary"
   mkdir -p "$STUB_STATE"
@@ -36,13 +36,14 @@ when 'B'
   raise 'rearm order' unless delete < arm && arm < comment
   raise 'arm PAT' unless calls[arm]['token'] == 'test-user-token'
   raise 'delete GITHUB_TOKEN' unless calls[delete]['token'] == 'test-workflow-token'
-when 'C', 'M'
+when 'C', 'M', 'N'
   resolves = calls.each_index.select { |i| calls[i]['args'].join(' ').include?('resolveReviewThread(') }
   raise 'resolve count/token' unless resolves.length == 2 && resolves.all? { |i| calls[i]['token'] == 'test-user-token' }
   codex = find.call('run rerun 802'); ci = find.call('run rerun 801 --failed')
   raise 'refresh order' unless resolves.max < codex && codex < ci
   raise 'reran human review' if calls.any? { |c| c['args'][0,3] == ['run','rerun','803'] }
 when 'D'
+  find.call('label create research-scan-stuck')
   find.call('issue create')
   find.call('research-scan-stuck')
   find.call('@thagale')
@@ -57,6 +58,7 @@ when 'J'
   find.call('-X PATCH repos/example/pancetta/issues/comments/91')
   find.call('issue edit 92')
   raise 'duplicate report' if calls.any? { |c| c['args'][0,2] == ['issue','create'] || c['args'].include?('POST') }
+  raise 'restyled label' if calls.any? { |c| c['args'][0,2] == ['label','create'] }
 when 'K'
   find.call('issue comment 92')
   find.call('PR #420 is merged; closing.')

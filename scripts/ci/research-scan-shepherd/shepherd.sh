@@ -53,15 +53,15 @@ gather_snapshot() {
       (.headRefOid | test("^[0-9a-f]{40}$")) and
       .labels.pageInfo.hasNextPage == false and .commits.pageInfo.hasPreviousPage == false and
       .reviews.pageInfo.hasNextPage == false))' "$dir/pages" >/dev/null || return 1
-  jq -s '.[0].data.repository.pullRequest as $p |
-    {pr: ($p | {number,title,author:.author.login,isDraft,isCrossRepository,baseRefName,
+  jq -s -L "$SCRIPT_DIR" 'include "login"; .[0].data.repository.pullRequest as $p |
+    {pr: ($p | {number,title,author:(.author | login),isDraft,isCrossRepository,baseRefName,
       createdAt,headRefOid,mergeable,armed:(.autoMergeRequest != null),inMergeQueue:.isInMergeQueue,
       labels:[.labels.nodes[].name],commits:[.commits.nodes[].commit.oid]}),
      codex_review_commits: [$p.reviews.nodes[] | select(.author.login == "chatgpt-codex-connector" or
        .author.login == "chatgpt-codex-connector[bot]") | .commit.oid | select(. != null)] | unique,
      threads: [.[].data.repository.pullRequest.reviewThreads.nodes[] |
-       {id,isResolved,path,opener:.opener.nodes[0].author.login,url:.latest.nodes[0].url,
-        latest:(.latest.nodes[0] | {id,author:.author.login,body})}]}' "$dir/pages" > "$dir/snapshot" || return 1
+       {id,isResolved,path,opener:(.opener.nodes[0].author | login),url:.latest.nodes[0].url,
+        latest:(.latest.nodes[0] | {id,author:(.author | login),body})}]}' "$dir/pages" > "$dir/snapshot" || return 1
   head=$(jq -er '.pr.headRefOid' "$dir/snapshot") || return 1
   gh api "repos/$REPO/pulls/$pr/files?per_page=100" --paginate | jq -s 'add | map({path:.filename,previous_path:.previous_filename})' > "$dir/files" || return 1
   gh api "repos/$REPO/rules/branches/main" --paginate | jq -s 'add' > "$dir/rules" || return 1
@@ -143,6 +143,12 @@ upsert_status() {
     gh api -X POST "repos/$REPO/issues/$pr/comments" -f body="$body" >/dev/null
   fi
 }
+# REST, not `gh issue list`: gh renders a Bot author as `app/github-actions`, which never
+# equals the REST login this workflow's own issues carry.
+stuck_issues() {
+  gh api "repos/$REPO/issues?state=open&labels=research-scan-stuck&per_page=100" --paginate |
+    jq -s '[add[] | select(.pull_request == null and .user.login == "github-actions[bot]")]'
+}
 report_pr() {
   local pr=$1 decision=$2 body issues id quiet=0
   [[ $DRY_RUN != true ]] || return 0
@@ -151,9 +157,12 @@ report_pr() {
   body=$(jq -r --arg url "$RUN_URL" '.blockers | map("- " + .kind + (if .name then ": " + .name else "" end) + (if .url then " " + .url else "" end)) | join("\n") + "\n\nRun: " + $url' "$decision") || return 1
   upsert_status "$pr" "$body
 <!-- research-scan-shepherd:status -->" || return 1
-  gh label create research-scan-stuck --repo "$REPO" --color D93F0B --description 'Weekly research scan needs a maintainer' >/dev/null 2>&1 || true
-  issues=$(gh issue list --repo "$REPO" --state open --label research-scan-stuck --json number,body,author --limit 100) || return 1
-  id=$(jq -r --arg marker "<!-- research-scan-shepherd:issue pr=$pr -->" '[.[] | select(.author.login == "github-actions[bot]" and (.body | contains($marker)))][0].number // empty' <<< "$issues") || return 1
+  # Create the label only when the lookup misses; never restyle an existing one.
+  if ! gh api "repos/$REPO/labels/research-scan-stuck" >/dev/null 2>&1; then
+    gh label create research-scan-stuck --repo "$REPO" --color D93F0B --description 'Weekly research scan needs a maintainer' >/dev/null || return 1
+  fi
+  issues=$(stuck_issues) || return 1
+  id=$(jq -r --arg marker "<!-- research-scan-shepherd:issue pr=$pr -->" '[.[] | select((.body // "") | contains($marker))][0].number // empty' <<< "$issues") || return 1
   body="@$REPORT_MENTION
 https://github.com/$REPO/pull/$pr
 
@@ -179,14 +188,11 @@ apply() {
     original=$(jq -c --arg id "$id" '.threads[] | select(.id == $id) | .latest' "$snapshot")
     jq -e --arg id "$id" --argjson original "$original" 'any(.threads[]; .id == $id and .isResolved == false and .latest == $original)' "$WORK/live" >/dev/null || continue
     jq -e --argjson entry "$entry" '.resolve | index($entry) != null' "$WORK/live-decision" >/dev/null || continue
-    # GraphQL variables must reach GitHub literally.
-    # shellcheck disable=SC2016
-    live=$(gh api graphql -f query='query($id: ID!) { node(id: $id) { ... on PullRequestReviewThread { isResolved latest: comments(last: 1) { nodes { id author { login } body url } } } } }' -f id="$id") || return 1
-    jq -e --argjson original "$original" '.data.node | .isResolved == false and
-      (.latest.nodes[0] | {id,author:.author.login,body}) == $original' <<< "$live" >/dev/null || continue
-    # GraphQL variables must reach GitHub literally.
-    # shellcheck disable=SC2016
-    GH_TOKEN="$RESOLVE_TOKEN" gh api graphql -f query='mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { isResolved } } }' -f id="$id" >/dev/null || return 1
+    # GraphQL variables must reach GitHub literally, hence the escaped \$id.
+    live=$(gh api graphql -f query="query(\$id: ID!) { node(id: \$id) { ... on PullRequestReviewThread { isResolved latest: comments(last: 1) { nodes { id author { __typename login } body url } } } } }" -f id="$id") || return 1
+    jq -e -L "$SCRIPT_DIR" --argjson original "$original" 'include "login"; .data.node | .isResolved == false and
+      (.latest.nodes[0] | {id,author:(.author | login),body}) == $original' <<< "$live" >/dev/null || continue
+    GH_TOKEN="$RESOLVE_TOKEN" gh api graphql -f query="mutation(\$id: ID!) { resolveReviewThread(input: {threadId: \$id}) { thread { isResolved } } }" -f id="$id" >/dev/null || return 1
     record_action "resolved $id"
   done < <(jq -c '.resolve[]' "$decision")
   if jq -e '.rerun_codex_verdict' "$decision" >/dev/null; then
@@ -237,7 +243,7 @@ apply() {
 close_resolved_issues() {
   local issues issue pr state quiet=0
   [[ $DRY_RUN != true ]] || return 0
-  issues=$(gh issue list --repo "$REPO" --state open --label research-scan-stuck --json number,body,author --limit 100) || return 1
+  issues=$(stuck_issues) || return 1
   while IFS=$'\t' read -r issue pr; do
     [[ -z $ONLY_PR || $pr == "$ONLY_PR" ]] || continue
     quiescent || quiet=$?
@@ -248,8 +254,8 @@ close_resolved_issues() {
       gh issue comment "$issue" --repo "$REPO" --body "PR #$pr is $state; closing." >/dev/null || return 1
       gh issue close "$issue" --repo "$REPO" >/dev/null || return 1
     fi
-  done < <(jq -r '.[] | select(.author.login == "github-actions[bot]") |
-    .number as $n | .body | capture("<!-- research-scan-shepherd:issue pr=(?<pr>[0-9]+) -->") | [$n,.pr] | @tsv' <<< "$issues")
+  done < <(jq -r '.[] |
+    .number as $n | (.body // "") | capture("<!-- research-scan-shepherd:issue pr=(?<pr>[0-9]+) -->") | [$n,.pr] | @tsv' <<< "$issues")
 }
 quiet=0
 quiescent || quiet=$?
@@ -266,7 +272,8 @@ while IFS= read -r pr; do
     if [[ $code == 1 ]]; then
       echo "::error::PR #$pr mutation or refresh failed" >&2
       jq '.report = true | .blockers += [{kind:"mutation-failed"}]' "$decision" > "$WORK/error-decision"
-      report_pr "$pr" "$WORK/error-decision" || true
+      code=0; report_pr "$pr" "$WORK/error-decision" || code=$?
+      [[ $code == 0 ]] || echo "::warning::PR #$pr failure report not posted (exit $code)." >&2
       cp "$WORK/error-decision" "$decision"
       record_action "mutation failed; report attempted"
       result=1
@@ -286,7 +293,8 @@ while IFS= read -r pr; do
     if minimal=$(gh api "repos/$REPO/pulls/$pr"); then
       if jq -e --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '($now|fromdateiso8601) - (.created_at|fromdateiso8601) > 86400' <<< "$minimal" >/dev/null; then
         printf '{"blockers":[{"kind":"snapshot-unreadable"}]}' > "$WORK/error-decision"
-        report_pr "$pr" "$WORK/error-decision" || true
+        code=0; report_pr "$pr" "$WORK/error-decision" || code=$?
+        [[ $code == 0 ]] || echo "::warning::PR #$pr snapshot-unreadable report not posted (exit $code)." >&2
       fi
     fi
   fi

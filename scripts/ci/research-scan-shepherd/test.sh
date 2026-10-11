@@ -10,3 +10,7 @@ for fixture in fixtures/*.json; do
   diff -u "$tmp/expected" "$tmp/actual"
   echo "PASS: $(basename "$fixture" .json)"
 done
+logins=$(jq -cn -L . 'include "login"; [{__typename: "Bot", login: "catalyst-cloud-connector"},
+  {__typename: "User", login: "catalyst-cloud-connector"}, null] | map(login)')
+[[ $logins == '["catalyst-cloud-connector[bot]","catalyst-cloud-connector",null]' ]] || { echo "FAIL: login $logins" >&2; exit 1; }
+echo "PASS: login"

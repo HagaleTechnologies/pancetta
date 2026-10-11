@@ -16,7 +16,6 @@ case "$1 $2" in
   'run rerun') echo '{}' ;;
   'pr list') echo '[{"number":420}]' ;;
   'pr merge') touch "$STUB_STATE/armed"; echo '{}' ;;
-  'issue list') get '.issues' ;;
   'issue create'|'issue edit'|'issue close'|'issue comment'|'label create') echo '{}' ;;
   'api graphql')
     if [[ $args == *'resolveReviewThread('* ]]; then
@@ -47,6 +46,8 @@ case "$1 $2" in
     elif [[ $args == *' -X POST '* || $args == *' -X PATCH '* ]]; then echo '{}'
     else
       case "$2" in
+        *'/issues?'*) get '.issues' ;;
+        *'/labels/research-scan-stuck') [[ $STUB_CASE == J ]] || exit 1; echo '{"name":"research-scan-stuck"}' ;;
         *'/actions/workflows/wait-for-codex.yml/runs?'*) get '.codex_workflow_runs' ;;
         *'/rules/branches/main'*) [[ $STUB_CASE != H ]] || exit 1; get '.rules' ;;
         *'/check-runs'*) get '.checks' ;;
