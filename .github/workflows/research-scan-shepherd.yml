@@ -1,0 +1,62 @@
+name: Research Scan Shepherd
+
+# PAN-172: the weekly pancetta-research-scan routine opens a notes-only PR and stops.
+# This workflow owns the mechanical half of landing it: resolve Codex threads whose
+# latest reply is a verified disposition (docs/routines/pancetta-research-scan.md),
+# refresh the Codex verdict and CI after deferrals, re-arm auto-merge after a merge-queue
+# ejection, and report a PR stuck for more than a day. The judgment half (fix or defer,
+# the PAN ticket, the reply) stays in the routine. Scope: open PRs titled
+# "Weekly research scan YYYY-MM-DD", same-repo, author on auto-merge-trigger.yml's
+# allowlist, every changed path under research/notes/. Deliberately NOT under the
+# auto-merge-<PR#> lock (third-producer eviction hazard, auto-merge-trigger.yml); instead
+# it skips the whole pass while any Auto-Merge Trigger / Queue Retry Handler run is
+# queued or in progress, and re-reads live state before every mutation.
+on:
+  schedule:
+    - cron: '17 2,14 * * *'
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: 'Only this PR number (blank = every open scan PR)'
+        required: false
+        type: string
+        default: ''
+      dry_run:
+        description: 'Print decisions without changing anything'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  actions: write
+  checks: read
+
+concurrency:
+  group: research-scan-shepherd
+  cancel-in-progress: false
+
+jobs:
+  shepherd:
+    name: Shepherd weekly research-scan PRs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Shepherd
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Real-user PAT: resolveReviewThread on a Codex-started thread fails under
+          # GITHUB_TOKEN (wait-for-codex.yml), and an arm attributed to GITHUB_TOKEN would
+          # suppress push-triggered workflows on the queue-merged commit (auto-merge-trigger.yml).
+          RESOLVE_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
+          REPO: ${{ github.repository }}
+          ONLY_PR: ${{ inputs.pr }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          REPORT_MENTION: thagale
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: scripts/ci/research-scan-shepherd/shepherd.sh

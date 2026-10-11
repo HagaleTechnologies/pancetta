@@ -450,3 +450,55 @@ a hard `missing field` error. Worse, the auto-discovery loader swallowed that er
 - **Search path** deduplicated (keep last occurrence) and documented in `docs/CONFIG.md`.
 - `pancetta-config/examples/config.toml` deleted: unreferenced, unparseable, and a duplicate of
   the generated `defaults.toml`.
+
+## In-session clock-skew monitor (PAN-114, 2026-10-10)
+
+`pancetta/src/clock_skew.rs` (SNTP client, thresholds, pure `ClockSkewMonitorCore`),
+`pancetta/src/coordinator/clock_monitor.rs` (`spawn_clock_skew_monitor`): before this, the only clock
+check was `pancetta doctor`'s one-shot SNTP probe with a 1.0 s threshold, coarser than FT8's ~0.3 s
+decode margin (the live capture window spans DT ≈ −0.66…+0.36 s). The SNTP code moved from the
+binary-only `doctor.rs` into `pancetta_lib` so the coordinator can use it; doctor imports it back.
+
+- **Cadence.** First probe 30 s after start, then every 30 min. The NTP pool's SNTP client terms
+  ([ntppool.org/vendors](https://ntppool.org/vendors)) ask for at most one query per 30 minutes,
+  which rules out a fast "re-probe until clear" loop. 30 min of drift at a 50 ppm crystal is
+  0.09 s, well below the threshold.
+- **Steps.** A `ClockStepDetector` (wall vs monotonic, ≥ 250 ms) on the monitor's 1 s tick detects
+  NTP steps and, where the monotonic clock stops in suspend (Linux, macOS), sleep/wake. A step
+  clears the warning at once, logs a `clock.step` Warn (at most one per 60 s), and schedules a
+  re-check at `max(last_probe + 30 min, step + 30 s)`.
+- **Surfacing.** Each `clock.skew` / `clock.step` entry goes to the Diagnostics overlay through
+  `emit_diagnostic_full` **and** to `tracing` (`clock skew:` / `clock step:`), because headless mode
+  drops the TUI bus receiver. An unreachable server logs one Info entry and shows no chip.
+- **Gating.** Started in `ApplicationCoordinator::run` only when `!replay_mode()`, so no SNTP query
+  leaves a replay (`--wav` returns before it). Not registered with the supervisor: it is advisory
+  and must not trigger restart semantics. Aborted after the main loop exits.
+- **No config key.** Always on in live sessions; this avoids a new `merge_with` field. Thresholds
+  are shared with doctor: `CLOCK_SKEW_WARN_S` (0.3) and `CLOCK_SKEW_FAIL_S` (1.0). Doctor gained a
+  WARN tier for 0.3 s ≤ |offset| < 1.0 s; PASS, FAIL and unreachable texts and the exit code are
+  unchanged.
+
+## Research-scan PRs land themselves (PAN-172, 2026-10-11)
+
+- Merge groups skip the five Rust lanes only when their non-empty cumulative diff is
+  entirely under `research/notes/`. The path allowlist includes `--no-renames`, so moving
+  code into the notes directory cannot hide its deletion. Detection fails closed. Other
+  groups run every Rust lane, including Cargo Deny advisories; a note cannot repair an
+  advisory already present on main.
+- `CI` rejects commit trailer lines on PRs whose title starts with `Weekly research scan `.
+  The check covers every commit in the PR and rejects both AI attribution and session lines.
+- `research-scan-shepherd.yml` runs at 02:17 and 14:17 UTC. It handles only ready, same-repo,
+  notes-only scan PRs into main from the existing trusted authors. It uses the review PAT
+  only for thread resolution and arming. It has its own concurrency group and checks that
+  Auto-Merge Trigger and Queue Retry Handler are quiet before acting, avoiding eviction
+  of a pending run in their shared lock. Stuck scans get a PR comment, a maintainer issue,
+  and a failed workflow run.
+- The shepherd may clear a handler-attached pause at most twice per head SHA. A pause
+  attached by anyone except `github-actions[bot]` remains in force. Exhausting the budget
+  produces a report instead of another retry.
+- The [routine lifecycle](../routines/pancetta-research-scan.md) is the source for the
+  scan-only review policy. Round 1 fixes reasonable findings; rounds 2 and 3 fix P0/P1
+  and defer P2 and lower; round 4 and later defer everything without more commits.
+  This local override leaves the synced general convergence policy unchanged. The external
+  claude.ai routine must receive the documented prompt pointer, daily schedule and Linear
+  connector edits before the full lifecycle is operational.

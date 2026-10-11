@@ -107,3 +107,24 @@ Caps Lock + q, which crossterm also delivers as `Char('Q')`) stops the station i
 `Q`. The composer uppercases input and rig-model lookup ignores case, so lowercase `q` covers both.
 Tests: `tui_runner::key_tests::shift_q_emergency_stops_through_every_overlay` and the four
 `shift_q_*` / `modified_shift_q_*` tests beside it.
+
+## Clock-skew alarm chip (PAN-114, 2026-10-10)
+
+`pancetta-tui/src/ui/mod.rs` (title-bar alarm chain), `pancetta-tui/src/app.rs::PipelineHealth`:
+the title bar shows `⚠ CLOCK {mag} {SLOW|FAST}` while the coordinator's clock-skew monitor reports
+|offset| ≥ 0.3 s vs pool.ntp.org. `{mag}` is `{:.2}s` below 10 s and `{:.0}s` from 10 s up (a Pi
+booted with no RTC can be a day off: `⚠ CLOCK 86400s SLOW`). SLOW means the local clock is behind
+UTC (positive SNTP offset). It reuses the alarm slot and style (bold white on red) at the **lowest**
+priority, after `AUDIO DEAD` and `DECODER STUB`, so it never competes with a second alarm chip for
+width; only the highest-priority alarm shows.
+
+Contract: `PipelineHealth.clock_skew_warning_s: Option<f64>` is `Some` only while the monitor is
+warning, and `None` while the first probe is pending, when pool.ntp.org is unreachable, when the
+clock is in spec, and right after a detected clock step. The threshold and all policy live in the
+coordinator (`pancetta/src/clock_skew.rs`); the TUI only formats (`clock_skew_chip_text`), because
+`pancetta-tui` cannot depend on `pancetta_lib`. The 2 s `tui_relay` health tick copies the value.
+
+No key hint: a `— Shift+D` suffix truncated to `— S` at 120 columns. The Diagnostics overlay carries
+the full `clock.skew` / `clock.step` text and the per-OS NTP fix. At 100 columns every alarm chip is
+clipped to `⚠`; that pre-existing behaviour is unchanged.
+
