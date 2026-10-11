@@ -1,6 +1,6 @@
 include "disposition";
+include "eligibility";
 def codex_login: . == "chatgpt-codex-connector" or . == "chatgpt-codex-connector[bot]";
-def notes_path: type == "string" and startswith("research/notes/");
 def thread_blocker($kind): {kind: $kind, thread_id: .id, url: .url};
 def disposition($s):
   . as $t
@@ -21,15 +21,7 @@ def disposition($s):
       else {blocker: thread_blocker("thread-needs-disposition")} end
     end;
 . as $s
-| [if ($s.pr.title | test($s.config.title_regex) | not) then "title" else empty end,
-   if ($s.config.actors | index($s.pr.author)) == null then "author" else empty end,
-   if $s.pr.isCrossRepository then "fork" else empty end,
-   if $s.pr.isDraft then "draft" else empty end,
-   if $s.pr.baseRefName != "main" then "base" else empty end,
-   if ($s.pr.files | length) == 0 or
-      any($s.pr.files[]; (.path | notes_path | not) or
-        (.previous_path != null and (.previous_path | notes_path | not)))
-   then "non-notes-files" else empty end] as $reasons
+| ($s | ineligible_reasons) as $reasons
 | {number: $s.pr.number, eligible: ($reasons | length == 0), ineligible_reasons: $reasons,
    codex_rounds: ($s.codex_review_commits | unique | length), resolve: [],
    rerun_codex_verdict: false, rerun_ci_failed_jobs: false, clear_pause: false,

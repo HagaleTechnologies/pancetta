@@ -288,10 +288,18 @@ while IFS= read -r pr; do
     printf '| %s | unreadable | - | none | snapshot-unreadable |\n' "$pr" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
     echo "::warning::PR #$pr snapshot-unreadable; no lifecycle mutations." >&2
     result=1
-    # A failed comprehensive read may still allow a minimal age check and a report.
-    # Reporting never arms, resolves, or reruns anything based on partial evidence.
-    if minimal=$(gh api "repos/$REPO/pulls/$pr"); then
-      if jq -e --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '($now|fromdateiso8601) - (.created_at|fromdateiso8601) > 86400' <<< "$minimal" >/dev/null; then
+    # A failed comprehensive read may still allow a minimal scope and age check and a
+    # report. Reporting never arms, resolves, or reruns anything based on partial
+    # evidence, and is skipped unless this read shows an open, eligible scan PR.
+    if minimal=$(gh api "repos/$REPO/pulls/$pr") &&
+      gh api "repos/$REPO/pulls/$pr/files?per_page=100" --paginate |
+        jq -s 'add | map({path:.filename,previous_path:.previous_filename})' > "$WORK/minimal-files"; then
+      if jq -e -L "$SCRIPT_DIR" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg repo "$REPO" \
+        --argjson config "$CONFIG" --slurpfile files "$WORK/minimal-files" 'include "eligibility";
+        .state == "open" and ($now|fromdateiso8601) - (.created_at|fromdateiso8601) > 86400 and
+        ({config:$config, pr:{title, author:.user.login, isCrossRepository:(.head.repo.full_name != $repo),
+          isDraft:(.draft != false), baseRefName:.base.ref, files:$files[0]}} | ineligible_reasons == [])' \
+        <<< "$minimal" >/dev/null; then
         printf '{"blockers":[{"kind":"snapshot-unreadable"}]}' > "$WORK/error-decision"
         code=0; report_pr "$pr" "$WORK/error-decision" || code=$?
         [[ $code == 0 ]] || echo "::warning::PR #$pr snapshot-unreadable report not posted (exit $code)." >&2

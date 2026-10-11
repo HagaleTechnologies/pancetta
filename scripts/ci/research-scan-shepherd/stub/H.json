@@ -256,6 +256,18 @@
     "title": "Weekly research scan 2026-10-12",
     "user": {
       "login": "thagale"
+    },
+    "draft": false,
+    "base": {
+      "ref": "main",
+      "repo": {
+        "full_name": "example/pancetta"
+      }
+    },
+    "head": {
+      "repo": {
+        "full_name": "example/pancetta"
+      }
     }
   },
   "codex_workflow_runs": {

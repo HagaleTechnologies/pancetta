@@ -49,7 +49,7 @@ case "$1 $2" in
         *'/issues?'*) get '.issues' ;;
         *'/labels/research-scan-stuck') [[ $STUB_CASE == J ]] || exit 1; echo '{"name":"research-scan-stuck"}' ;;
         *'/actions/workflows/wait-for-codex.yml/runs?'*) get '.codex_workflow_runs' ;;
-        *'/rules/branches/main'*) [[ $STUB_CASE != H ]] || exit 1; get '.rules' ;;
+        *'/rules/branches/main'*) [[ $STUB_CASE != H && $STUB_CASE != O ]] || exit 1; get '.rules' ;;
         *'/check-runs'*) get '.checks' ;;
         *'/statuses'*) get '.statuses' ;;
         *'/files'*) get '.files' ;;
