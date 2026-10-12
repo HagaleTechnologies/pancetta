@@ -5285,6 +5285,29 @@ async fn supersede_and_rekey_or_bundle(
 ///
 /// In every case `supersede_and_rekey_or_bundle` has already deasserted PTT, so
 /// the caller safely disarms its `PttGuard` and `continue`s after this returns.
+/// In-flight bundle items a `NotViable` multi-TX supersede really abandons:
+/// every item, except those `reenqueued` (the incoming bundle put back on the
+/// queue) carries unchanged for the same QSO, which will still air (PAN-75).
+fn items_abandoned_by_supersede<'a>(
+    in_flight_items: &'a [crate::message_bus::TransmitRequestItem],
+    reenqueued: Option<&MessageType>,
+) -> Vec<&'a crate::message_bus::TransmitRequestItem> {
+    let carried: &[crate::message_bus::TransmitRequestItem] = match reenqueued {
+        Some(MessageType::MultiTransmitRequest { items, .. }) => items,
+        _ => &[],
+    };
+    in_flight_items
+        .iter()
+        .filter(|item| {
+            !carried.iter().any(|c| {
+                c.qso_id == item.qso_id
+                    && c.message_text == item.message_text
+                    && c.frequency_offset == item.frequency_offset
+            })
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn supersede_multi_reenqueue(
     new_request: MessageType,
@@ -5362,8 +5385,12 @@ async fn supersede_multi_reenqueue(
         SupersedeOutcome::NotViable => {
             // PTT already off; the in-flight bundle is abandoned by the caller.
             // PAN-75 (Codex P2 on PR #418): report each abandoned item, as the
-            // `Replace` arm does, so its keep-call accounting is reversed.
-            for item in in_flight_items {
+            // `Replace` arm does, so its keep-call accounting is reversed. Items
+            // the re-enqueued bundle carries over unchanged will still air, so
+            // they are not reported (Codex P1 on PR #419).
+            for item in
+                items_abandoned_by_supersede(in_flight_items, reenqueue_on_notviable.as_ref())
+            {
                 if let Err(e) = report_transmit_complete(
                     message_bus,
                     false,
@@ -16518,6 +16545,28 @@ mod report_transmit_complete_tests {
         assert!(take_bundle_replaced(&mut replaced, Some("qa")).is_none());
         assert!(take_bundle_replaced(&mut replaced, Some("qb")).is_none());
         assert!(take_bundle_replaced(&mut replaced, None).is_none());
+    }
+
+    /// PAN-75 (Codex P1 on PR #419): items a re-enqueued superseding bundle
+    /// carries over unchanged still air, so only the others are abandoned.
+    #[test]
+    fn notviable_supersede_skips_items_the_new_bundle_carries_over() {
+        let item = |q: &str, text: &str| crate::message_bus::TransmitRequestItem {
+            message_text: text.to_string(),
+            frequency_offset: 1500.0,
+            qso_id: Some(q.to_string()),
+        };
+        let in_flight = vec![item("qa", "K1A N0CALL -07"), item("qb", "K2B N0CALL R-10")];
+        let reenqueued = MessageType::MultiTransmitRequest {
+            items: vec![item("qa", "K1A N0CALL RR73"), item("qb", "K2B N0CALL R-10")],
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
+        };
+        let abandoned = items_abandoned_by_supersede(&in_flight, Some(&reenqueued));
+        assert_eq!(abandoned.len(), 1);
+        assert!(std::ptr::eq(abandoned[0], &in_flight[0]));
+        assert_eq!(items_abandoned_by_supersede(&in_flight, None).len(), 2);
     }
 
     /// A pivoted frame refused before PTT: its producing request is still
