@@ -243,15 +243,9 @@ pub enum MessageType {
         success: bool,
         message_text: String,
         duration_ms: u64,
-        /// PAN-38 round 1 (Codex): the QSO this transmission belongs to, when
-        /// known at the emission site — `None` for a multi-item bundle (each
-        /// item's own `qso_id` isn't threaded through the shared
-        /// `item_texts` completion loop; not needed for PAN-38's own use
-        /// case, since a self-CQ's opening transmission is always a single
-        /// item, never a bundle) or a manual/tune TX with no QSO. Lets the
-        /// autonomous coordinator correlate a downstream transmit failure
-        /// back to the self-CQ attempt that dispatched it (see
-        /// [`QsoMessage::AutonomousCqOpened`]).
+        /// QSO owning this frame, or `None` for untracked manual/tune TX.
+        /// Autonomous uses it for PAN-38 self-CQ correlation. PAN-75 mirrors
+        /// failed QSO-keyed outcomes as `QsoMessage::TxFrameNotSent` to Qso.
         qso_id: Option<String>,
     },
 
@@ -852,6 +846,16 @@ pub enum QsoMessage {
     /// `TransmitComplete` failure back to this attempt and roll it back the
     /// same way a synchronous `start_cq` failure already does.
     AutonomousCqOpened { qso_id: String, attempt_id: u64 },
+    /// PAN-75: a failed QSO frame, mirrored by Ft8Transmitter alongside the
+    /// Autonomous completion. Qso reverses its remembered keep-call emission
+    /// through `QsoManager::roll_back_unsent_attempt`.
+    TxFrameNotSent {
+        qso_id: String,
+        message_text: String,
+        /// Set when the frame was replaced by a TX pivot: its own offset and
+        /// binding, so the rollback skips the same-text frame that aired.
+        replaced: Option<pancetta_qso::UnsentAttemptPayload>,
+    },
     /// Enable or disable Fox (DXpedition operator) mode.
     ///
     /// `on: true` — sets the `fox_mode` flag, starts a repeating CQ
