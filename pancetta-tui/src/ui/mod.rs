@@ -2246,6 +2246,38 @@ mod view_render_tests {
         assert!(!row.contains("RIG CMD QUEUED"), "row 1: {row}");
     }
 
+    /// A production-length alert (the Hamlib rig-connect error) is cut to
+    /// fit with `…`, not hidden behind `+1 more · Shift+S`.
+    #[tokio::test]
+    async fn strip_truncates_a_long_alert_instead_of_hiding_it() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.pipeline_health = Some(health_with_clock(None, true));
+        app.station_readiness = Some(crate::readiness::StationReadiness {
+            clock: crate::readiness::ClockState::InSpec,
+            ..Default::default()
+        });
+        app.add_error_message(
+            "Rig connect failed (Connection refused (os error 111)). Check the radio is \
+             powered on and the USB cable; verify with `pancetta test-rig`, then restart \
+             pancetta."
+                .to_string(),
+        );
+        for (w, h) in [(80, 24), (120, 40), (160, 40)] {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| draw(f, &app).unwrap()).unwrap();
+            let row = row_text(&term.backend().buffer().clone(), 1);
+            assert!(
+                row.contains("⚠ Rig connect failed (Connection"),
+                "{w}: {row}"
+            );
+            assert!(row.contains('…'), "{w}: {row}");
+            assert!(!row.contains("more · Shift+S"), "{w}: {row}");
+            assert!(row.trim_end().ends_with("! ack"), "{w}: {row}");
+        }
+    }
+
     async fn render_health(app: &crate::app::App) -> ratatui::buffer::Buffer {
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
         term.draw(|f| render_health_panel(f, f.area(), app))

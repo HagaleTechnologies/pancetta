@@ -86,6 +86,36 @@ fn calm_details(app: &App) -> String {
     parts.join(" · ")
 }
 
+/// Narrowest truncated chip worth drawing (` ⚠ RIG C… `); with less room
+/// the item goes into `+N more · Shift+S` instead.
+const MIN_TRUNCATED_CHIP: usize = 10;
+
+/// `label` cut to at most `max` display columns, ending in `…` when cut.
+fn truncate_to_width(label: &str, max: usize) -> String {
+    if Span::raw(label).width() <= max {
+        return label.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in label.chars() {
+        let mut buf = [0u8; 4];
+        let w = Span::raw(&*ch.encode_utf8(&mut buf)).width();
+        if used + w > keep {
+            break;
+        }
+        used += w;
+        out.push(ch);
+    }
+    // Sequences like `⚠️` measure wider as a string than char by char.
+    while Span::raw(out.as_str()).width() > keep {
+        out.pop();
+    }
+    out.truncate(out.trim_end().len());
+    out.push('…');
+    out
+}
+
 pub fn render_readiness_strip(f: &mut Frame<'_>, area: Rect, app: &App) {
     let width = area.width as usize;
     let items = readiness_items(app);
@@ -146,6 +176,23 @@ pub fn render_readiness_strip(f: &mut Frame<'_>, area: Rect, app: &App) {
                 0
             };
             if used + chip.width() + reserve > budget {
+                // Too wide: cut the label to the room left (`⚠ Rig connect
+                // failed (conn…`) so a long alert still shows its text;
+                // fall back to the counter only when too little is left.
+                let room = budget.saturating_sub(used + reserve);
+                if room >= MIN_TRUNCATED_CHIP {
+                    left.push(Span::styled(
+                        format!(" {} ", truncate_to_width(&item.label, room - 2)),
+                        severity_style(item.severity, app),
+                    ));
+                    if remaining_after > 0 {
+                        left.push(Span::styled(
+                            more_text(remaining_after),
+                            Style::default().fg(app.theme.muted_color()),
+                        ));
+                    }
+                    break;
+                }
                 let more = Span::styled(
                     more_text(visible.len() - idx),
                     Style::default().fg(app.theme.muted_color()),
@@ -172,4 +219,20 @@ pub fn render_readiness_strip(f: &mut Frame<'_>, area: Rect, app: &App) {
             .fg(app.theme.foreground_color()),
     );
     f.render_widget(paragraph, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Emoji-presentation sequences (`⚠️` = U+26A0 U+FE0F) measure wider as a
+    /// string than char by char; the cut must still fit `max`.
+    #[test]
+    fn truncate_to_width_never_exceeds_max_for_emoji_sequences() {
+        let label = "⚠\u{FE0F} rig ⚠\u{FE0F} audio ⚠\u{FE0F} clock ⚠\u{FE0F} input";
+        for max in 1..Span::raw(label).width() {
+            let cut = truncate_to_width(label, max);
+            assert!(Span::raw(cut.as_str()).width() <= max, "{max}: {cut:?}");
+        }
+    }
 }
