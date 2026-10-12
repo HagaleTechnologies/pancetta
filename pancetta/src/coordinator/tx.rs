@@ -5310,31 +5310,37 @@ fn items_abandoned_by_supersede<'a>(
             !carried.iter().any(|c| {
                 c.qso_id == item.qso_id
                     && c.message_text == item.message_text
-                    && c.frequency_offset == item.frequency_offset
+                    && (c.frequency_offset - item.frequency_offset).abs()
+                        < super::PIVOT_OFFSET_EPSILON_HZ
             })
         })
         .collect()
 }
 
-/// Report an in-flight bundle item a supersede abandoned. Autonomous gets the
-/// usual failed completion; the QSO engine gets the item's own offset (and,
-/// when known, the bundle's binding) so the rollback cannot land on a newer
-/// same-text attempt at another offset or authority (PAN-75).
+/// Report an in-flight bundle item a supersede abandoned. The QSO engine gets
+/// the item's own offset (and, when known, the bundle's binding) so the
+/// rollback cannot land on a newer same-text attempt at another offset or
+/// authority (PAN-75). Autonomous gets a failed completion only when no
+/// replacement for the same QSO is queued (`replacement_queued`); otherwise
+/// the replacement's own outcome is the terminal one, as for a pivot.
 async fn report_abandoned_bundle_item(
     message_bus: &MessageBus,
     item: &crate::message_bus::TransmitRequestItem,
     remote_binding: Option<(bool, Option<String>)>,
+    replacement_queued: bool,
 ) {
-    if let Err(e) = report_transmit_complete_to_autonomous(
-        message_bus,
-        false,
-        item.message_text.clone(),
-        0,
-        item.qso_id.clone(),
-    )
-    .await
-    {
-        warn!("Failed to send TransmitComplete: {}", e);
+    if !replacement_queued {
+        if let Err(e) = report_transmit_complete_to_autonomous(
+            message_bus,
+            false,
+            item.message_text.clone(),
+            0,
+            item.qso_id.clone(),
+        )
+        .await
+        {
+            warn!("Failed to send TransmitComplete: {}", e);
+        }
     }
     if let Some(qso_id) = item.qso_id.clone() {
         report_frame_not_sent(
@@ -5448,7 +5454,19 @@ async fn supersede_multi_reenqueue(
                 (origin, remote_client_key_id.as_deref()),
                 reenqueue_on_notviable.as_ref(),
             ) {
-                report_abandoned_bundle_item(message_bus, item, binding.clone()).await;
+                let replacement_queued = item.qso_id.is_some()
+                    && matches!(
+                        &reenqueue_on_notviable,
+                        Some(MessageType::MultiTransmitRequest { items, .. })
+                            if items.iter().any(|n| n.qso_id == item.qso_id)
+                    );
+                report_abandoned_bundle_item(
+                    message_bus,
+                    item,
+                    binding.clone(),
+                    replacement_queued,
+                )
+                .await;
             }
             // If NotViable because the superseding message was itself a
             // `MultiTransmitRequest`, re-enqueue that whole bundle back to the
@@ -16618,6 +16636,15 @@ mod report_transmit_complete_tests {
             items_abandoned_by_supersede(&in_flight, local, None).len(),
             2
         );
+        // Sub-epsilon offset noise still counts as carried (Codex P2 on PR #419).
+        let mut noisy = reenqueued.clone();
+        if let MessageType::MultiTransmitRequest { items, .. } = &mut noisy {
+            items[1].frequency_offset += 0.1;
+        }
+        assert_eq!(
+            items_abandoned_by_supersede(&in_flight, local, Some(&noisy)).len(),
+            1
+        );
         // An authorization change carries nothing over (Codex P2 on PR #419).
         let remote = (crate::message_bus::TxOrigin::Remote, Some("client-a"));
         assert_eq!(
@@ -16638,7 +16665,8 @@ mod report_transmit_complete_tests {
             frequency_offset: 1250.0,
             qso_id: Some("qa".to_string()),
         };
-        report_abandoned_bundle_item(&bus, &item, Some((true, Some("client-a".into())))).await;
+        report_abandoned_bundle_item(&bus, &item, Some((true, Some("client-a".into()))), false)
+            .await;
         assert!(matches!(
             autonomous.try_recv().unwrap().message_type,
             MessageType::TransmitComplete { success: false, .. }
@@ -16650,6 +16678,13 @@ mod report_transmit_complete_tests {
                     && p.frequency_hz == 1250.0
                     && p.remote_binding == Some((true, Some("client-a".to_string())))
         ));
+
+        // A queued replacement for the same QSO owns the terminal outcome, so
+        // Autonomous hears nothing; the QSO engine still rolls back the old
+        // attempt (Codex P2 on PR #419).
+        report_abandoned_bundle_item(&bus, &item, None, true).await;
+        assert!(autonomous.try_recv().is_err());
+        assert!(qso.try_recv().is_ok());
     }
 
     /// A pivoted frame refused before PTT: its producing request is still

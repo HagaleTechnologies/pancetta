@@ -303,7 +303,9 @@ multi-TX supersede reports in-flight items it abandons as too late
 (`NotViable`) or on an identity conflict. On `NotViable` it skips items the
 re-enqueued bundle carries unchanged under the same authorization, and reports
 the rest with their own offset (plus the old binding after an authorization
-change) so the rollback cannot hit the replacement's attempt. Rollback emits no new snapshot or QSO event; the existing status panel
+change) so the rollback cannot hit the replacement's attempt. Offsets within
+0.5 Hz count as unchanged, and Autonomous hears no failure for an item whose
+QSO has a replacement in that bundle. Rollback emits no new snapshot or QSO event; the existing status panel
 and remote snapshot fields show corrected values on the next normal push.
 
 ## UTC re-anchoring after sleep/wake and clock steps (PAN-114, 2026-10-10)
