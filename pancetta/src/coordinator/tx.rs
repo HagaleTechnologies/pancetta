@@ -8989,6 +8989,17 @@ impl super::ApplicationCoordinator {
                                             new_freq
                                         );
                                     }
+                                    // PAN-75: a refusal before the tombstones below are installed leaves each
+                                    // pivoted item's own request queued, so it reports the frame the pivot
+                                    // replaced instead (Codex P2 on PR #418).
+                                    let mut early_replaced: PivotReplaced = pivots
+                                        .iter()
+                                        .filter_map(|(key, _, _)| {
+                                            pre_pivot_frames
+                                                .get(key)
+                                                .map(|frame| (key.clone(), frame.clone()))
+                                        })
+                                        .collect();
                                     let mut piv_iter = pivoted_live_items.into_iter();
                                     let items: Vec<crate::message_bus::TransmitRequestItem> = items
                                         .into_iter()
@@ -9070,12 +9081,14 @@ impl super::ApplicationCoordinator {
                                                         )
                                                         .await;
                                                     }
-                                                    let _ = report_transmit_complete(
+                                                    let _ = report_unaired_frame(
                                                         &message_bus,
-                                                        false,
                                                         item.message_text.clone(),
-                                                        0,
                                                         item.qso_id.clone(),
+                                                        take_bundle_replaced(
+                                                            &mut early_replaced,
+                                                            item.qso_id.as_deref(),
+                                                        ),
                                                     )
                                                     .await;
                                                 }
@@ -9105,12 +9118,14 @@ impl super::ApplicationCoordinator {
                                                     "key-time re-encode error",
                                                 )
                                                 .await;
-                                                let _ = report_transmit_complete(
+                                                let _ = report_unaired_frame(
                                                     &message_bus,
-                                                    false,
                                                     item.message_text.clone(),
-                                                    0,
                                                     item.qso_id.clone(),
+                                                    take_bundle_replaced(
+                                                        &mut early_replaced,
+                                                        item.qso_id.as_deref(),
+                                                    ),
                                                 )
                                                 .await;
                                             }
@@ -9156,12 +9171,14 @@ impl super::ApplicationCoordinator {
                                                         .into_iter()
                                                         .zip(rebuilt_qso_ids)
                                                     {
-                                                        let _ = report_transmit_complete(
+                                                        let _ = report_unaired_frame(
                                                             &message_bus,
-                                                            false,
                                                             text,
-                                                            0,
-                                                            qso_id,
+                                                            qso_id.clone(),
+                                                            take_bundle_replaced(
+                                                                &mut early_replaced,
+                                                                qso_id.as_deref(),
+                                                            ),
                                                         )
                                                         .await;
                                                     }
@@ -9223,12 +9240,14 @@ impl super::ApplicationCoordinator {
                                         }
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
-                                            let _ = report_transmit_complete(
+                                            let _ = report_unaired_frame(
                                                 &message_bus,
-                                                false,
                                                 item.message_text.clone(),
-                                                0,
                                                 item.qso_id.clone(),
+                                                take_bundle_replaced(
+                                                    &mut early_replaced,
+                                                    item.qso_id.as_deref(),
+                                                ),
                                             )
                                             .await;
                                         }
@@ -9258,12 +9277,14 @@ impl super::ApplicationCoordinator {
                                         .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
-                                            let _ = report_transmit_complete(
+                                            let _ = report_unaired_frame(
                                                 &message_bus,
-                                                false,
                                                 item.message_text.clone(),
-                                                0,
                                                 item.qso_id.clone(),
+                                                take_bundle_replaced(
+                                                    &mut early_replaced,
+                                                    item.qso_id.as_deref(),
+                                                ),
                                             )
                                             .await;
                                         }
