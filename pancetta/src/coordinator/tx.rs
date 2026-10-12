@@ -677,6 +677,7 @@ async fn drop_frames_for_clock_jump(
     message_bus: &MessageBus,
     frames: &[(String, Option<String>)],
     jump: pancetta_core::slot_clock::WallClockJump,
+    pivot_replaced: Option<(String, pancetta_qso::UnsentAttemptPayload)>,
 ) {
     let secs = jump.signed_secs();
     for (message_text, qso_id) in frames {
@@ -697,10 +698,15 @@ async fn drop_frames_for_clock_jump(
         .await;
     }
     send_tx_queue_status(message_bus, None, Vec::new()).await;
+    let mut pivot_replaced = pivot_replaced;
     for (message_text, qso_id) in frames {
-        if let Err(e) =
-            report_transmit_complete(message_bus, false, message_text.clone(), 0, qso_id.clone())
-                .await
+        if let Err(e) = report_unaired_frame(
+            message_bus,
+            message_text.clone(),
+            qso_id.clone(),
+            pivot_replaced.take(),
+        )
+        .await
         {
             warn!("Failed to send TransmitComplete: {}", e);
         }
@@ -2330,6 +2336,29 @@ async fn report_transmit_complete(
     .await;
     if let Some((qso_id, message_text)) = not_sent {
         report_frame_not_sent(message_bus, qso_id, message_text, None).await;
+    }
+    result
+}
+
+/// A frame that never aired after Step 4c may have pivoted to it. Then the
+/// request that produced `message_text` is still queued and accounts for
+/// itself, so the QSO engine instead rolls back the frame the pivot
+/// replaced (`pivot_replaced`), which never aired either (PAN-75).
+/// Autonomous gets the usual failed completion either way.
+async fn report_unaired_frame(
+    message_bus: &MessageBus,
+    message_text: String,
+    qso_id: Option<String>,
+    pivot_replaced: Option<(String, pancetta_qso::UnsentAttemptPayload)>,
+) -> Result<()> {
+    if pivot_replaced.is_none() {
+        return report_transmit_complete(message_bus, false, message_text, 0, qso_id).await;
+    }
+    let result =
+        report_transmit_complete_to_autonomous(message_bus, false, message_text, 0, qso_id.clone())
+            .await;
+    if let (Some(qso_id), Some((replaced_text, replaced))) = (qso_id, pivot_replaced) {
+        report_frame_not_sent(message_bus, qso_id, replaced_text, Some(replaced)).await;
     }
     result
 }
@@ -6319,6 +6348,7 @@ impl super::ApplicationCoordinator {
                                                     &message_bus,
                                                     &[(message_text.clone(), qso_id.clone())],
                                                     jump,
+                                                    None,
                                                 )
                                                 .await;
                                                 continue 'worker;
@@ -6852,9 +6882,11 @@ impl super::ApplicationCoordinator {
                                             ptt_guard.disarm();
                                             // Same tombstone cleanup as the arm-denial branch
                                             // below — nothing reached the air.
-                                            if let Some(key) = pivoted_this_key.take() {
-                                                pivoted_once.remove(&key);
-                                            }
+                                            let pivot_replaced =
+                                                pivoted_this_key.take().and_then(|key| {
+                                                    pivoted_once.remove(&key);
+                                                    pivoted_from.remove(&key)
+                                                });
                                             let (log_msg, diag_msg) = match denial {
                                                 FinalGateDenial::StaleQso => (
                                                     format!(
@@ -6886,12 +6918,11 @@ impl super::ApplicationCoordinator {
                                             .await;
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
-                                            let _ = report_transmit_complete(
+                                            let _ = report_unaired_frame(
                                                 &message_bus,
-                                                false,
                                                 message_text,
-                                                0,
                                                 qso_id.clone(),
+                                                pivot_replaced,
                                             )
                                             .await;
                                             continue 'worker;
@@ -6917,9 +6948,11 @@ impl super::ApplicationCoordinator {
                                         ) {
                                             ptt_active.store(false, Ordering::Release);
                                             ptt_guard.disarm();
-                                            if let Some(key) = pivoted_this_key.take() {
-                                                pivoted_once.remove(&key);
-                                            }
+                                            let pivot_replaced =
+                                                pivoted_this_key.take().and_then(|key| {
+                                                    pivoted_once.remove(&key);
+                                                    pivoted_from.remove(&key)
+                                                });
                                             info!(
                                                 target: "pancetta::tx.policy",
                                                 "TX blocked at final pre-PTT check ({reason}): '{message_text}' (qso: {:?})",
@@ -6937,12 +6970,11 @@ impl super::ApplicationCoordinator {
                                             .await;
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
-                                            let _ = report_transmit_complete(
+                                            let _ = report_unaired_frame(
                                                 &message_bus,
-                                                false,
                                                 message_text,
-                                                0,
                                                 qso_id.clone(),
+                                                pivot_replaced,
                                             )
                                             .await;
                                             continue 'worker;
@@ -6979,9 +7011,11 @@ impl super::ApplicationCoordinator {
                                             // this one must NOT be discarded by Step 0-dup as
                                             // an already-sent duplicate of a pivot that never
                                             // transmitted.
-                                            if let Some(key) = pivoted_this_key.take() {
-                                                pivoted_once.remove(&key);
-                                            }
+                                            let pivot_replaced =
+                                                pivoted_this_key.take().and_then(|key| {
+                                                    pivoted_once.remove(&key);
+                                                    pivoted_from.remove(&key)
+                                                });
                                             let denial_reason = format!(
                                                 "arm went stale in the pre-PTT gap: '{message_text}' at {frequency_offset:.0} Hz"
                                             );
@@ -7001,12 +7035,11 @@ impl super::ApplicationCoordinator {
                                             .await;
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
-                                            let _ = report_transmit_complete(
+                                            let _ = report_unaired_frame(
                                                 &message_bus,
-                                                false,
                                                 message_text,
-                                                0,
                                                 qso_id.clone(),
+                                                pivot_replaced,
                                             )
                                             .await;
                                             continue 'worker;
@@ -7070,9 +7103,11 @@ impl super::ApplicationCoordinator {
                                             // Pre-slot abort: nothing reached the air, so a
                                             // Step 4c pivot tombstone must go too (same as
                                             // the AbortedByDisarm branch below).
-                                            if let Some(key) = pivoted_this_key.take() {
-                                                pivoted_once.remove(&key);
-                                            }
+                                            let pivot_replaced =
+                                                pivoted_this_key.take().and_then(|key| {
+                                                    pivoted_once.remove(&key);
+                                                    pivoted_from.remove(&key)
+                                                });
                                             drop_frames_for_clock_jump(
                                                 &message_bus,
                                                 &[(message_text.clone(), qso_id.clone())],
@@ -7080,6 +7115,7 @@ impl super::ApplicationCoordinator {
                                                     chrono::Duration::from_std(to_slot)
                                                         .unwrap_or(chrono::Duration::MAX),
                                                 ),
+                                                pivot_replaced,
                                             )
                                             .await;
                                             continue 'worker;
@@ -7175,9 +7211,11 @@ impl super::ApplicationCoordinator {
                                                 // the genuinely fresh, still-queued request is
                                                 // wrongly discarded as an already-sent pivot
                                                 // duplicate.
-                                                if let Some(key) = pivoted_this_key.take() {
-                                                    pivoted_once.remove(&key);
-                                                }
+                                                let pivot_replaced =
+                                                    pivoted_this_key.take().and_then(|key| {
+                                                        pivoted_once.remove(&key);
+                                                        pivoted_from.remove(&key)
+                                                    });
                                                 // Round-9 review (Codex P1): drain HERE,
                                                 // after PTT is already off, not inside
                                                 // `interruptible_sleep_or_supersede` before
@@ -7201,12 +7239,11 @@ impl super::ApplicationCoordinator {
                                                     qso_id.as_deref(),
                                                 )
                                                 .await;
-                                                if let Err(e) = report_transmit_complete(
+                                                if let Err(e) = report_unaired_frame(
                                                     &message_bus,
-                                                    false,
                                                     message_text.clone(),
-                                                    0,
                                                     qso_id.clone(),
+                                                    pivot_replaced,
                                                 )
                                                 .await
                                                 {
@@ -7496,9 +7533,11 @@ impl super::ApplicationCoordinator {
                                             }
                                             ptt_active.store(false, Ordering::Release);
                                             ptt_guard.disarm();
-                                            if let Some(key) = pivoted_this_key.take() {
-                                                pivoted_once.remove(&key);
-                                            }
+                                            let pivot_replaced =
+                                                pivoted_this_key.take().and_then(|key| {
+                                                    pivoted_once.remove(&key);
+                                                    pivoted_from.remove(&key)
+                                                });
                                             let denial_reason = format!(
                                                 "arm went stale before audio delivery: '{message_text}' at {frequency_offset:.0} Hz"
                                             );
@@ -7518,12 +7557,11 @@ impl super::ApplicationCoordinator {
                                             .await;
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
-                                            let _ = report_transmit_complete(
+                                            let _ = report_unaired_frame(
                                                 &message_bus,
-                                                false,
                                                 message_text,
-                                                0,
                                                 qso_id.clone(),
+                                                pivot_replaced,
                                             )
                                             .await;
                                             continue 'worker;
@@ -8658,8 +8696,13 @@ impl super::ApplicationCoordinator {
                                                 .into_iter()
                                                 .zip(encoded_qso_ids)
                                                 .collect();
-                                            drop_frames_for_clock_jump(&message_bus, &frames, jump)
-                                                .await;
+                                            drop_frames_for_clock_jump(
+                                                &message_bus,
+                                                &frames,
+                                                jump,
+                                                None,
+                                            )
+                                            .await;
                                             continue;
                                         }
                                         PttWait::Interrupted => {
@@ -9530,6 +9573,7 @@ impl super::ApplicationCoordinator {
                                                 chrono::Duration::from_std(to_slot)
                                                     .unwrap_or(chrono::Duration::MAX),
                                             ),
+                                            None,
                                         )
                                         .await;
                                         continue;
@@ -16082,5 +16126,48 @@ mod report_transmit_complete_tests {
             .await;
         assert!(autonomous.try_recv().is_ok());
         assert!(qso.try_recv().is_err());
+    }
+
+    /// A pivoted frame refused before PTT: its producing request is still
+    /// queued, so the QSO engine rolls back the replaced frame instead
+    /// (Codex P2 on PR #418). Without a pivot it rolls back this frame.
+    #[tokio::test]
+    async fn unaired_pivoted_frame_rolls_back_the_replaced_frame() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_, autonomous) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        let replaced = pancetta_qso::UnsentAttemptPayload {
+            frequency_hz: 1500.0,
+            remote_binding: Some((false, None)),
+        };
+        report_unaired_frame(
+            &bus,
+            "K1ABC N0CALL R-07".into(),
+            Some("q1".into()),
+            Some(("K1ABC N0CALL FN20".into(), replaced.clone())),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            autonomous.try_recv().unwrap().message_type,
+            MessageType::TransmitComplete { success: false, qso_id: Some(ref id), ref message_text, .. }
+                if id == "q1" && message_text == "K1ABC N0CALL R-07"
+        ));
+        assert!(matches!(
+            qso.try_recv().unwrap().message_type,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { ref qso_id, ref message_text, replaced: Some(ref payload) })
+                if qso_id == "q1" && message_text == "K1ABC N0CALL FN20" && *payload == replaced
+        ));
+        assert!(qso.try_recv().is_err());
+
+        report_unaired_frame(&bus, "K1ABC N0CALL R-07".into(), Some("q1".into()), None)
+            .await
+            .unwrap();
+        assert!(autonomous.try_recv().is_ok());
+        assert!(matches!(
+            qso.try_recv().unwrap().message_type,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { ref message_text, replaced: None, .. })
+                if message_text == "K1ABC N0CALL R-07"
+        ));
     }
 }
