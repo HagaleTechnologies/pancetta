@@ -268,7 +268,11 @@ Decisions:
   expired auth once per loop and logs each peer once. If the expired peer is the controller,
   `expire_peer_auth` also disarms and releases control (fail TX-off, as on controller loss), so an
   armed controller is never left transmitting while the station sends it nothing
-  (`controller_capability_expiry_disarms_and_releases_control`).
+  (`controller_capability_expiry_disarms_and_releases_control`). A failed `hello` that clears the
+  controller's capability does the same (`clear_peer_auth`), so an expired controller cannot dodge
+  the sweep by re-sending its expired token first
+  (`failed_hello_from_controller_disarms_and_releases_control`). A controller that never held a
+  capability is unaffected (see Follow-up).
 - **D7 — no unfiltered fan-out.** `MultiPeerSession::broadcast` is replaced by `broadcast_to`,
   where the caller names who may receive.
 - **D8 — refusal reasons.** `Poll::PeerRefused` carries a `RefuseReason` (`NotAllowListed`,
