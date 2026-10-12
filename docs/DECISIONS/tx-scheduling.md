@@ -240,7 +240,9 @@ A pivoted frame or multi-TX bundle refused before it airs (pre-PTT hard mute,
 liveness or arm recheck, disarm, pre-slot clock jump) clears its pivot tombstones, so the
 request that produced each pivoted frame stays queued and accounts for
 itself; the worker reports the replaced frame instead, as Step 0-dup does. An F8 abort keeps the
-tombstone, so Step 0-dup later reports the replaced frame. Multi-TX bundle items
+tombstone, so Step 0-dup later reports the replaced frame. Backlog coalescing
+consumes pivot duplicates before it picks the newest request per QSO, so a
+duplicate superseded in the backlog still reports its replaced frame. Multi-TX bundle items
 carry no binding, which matches bundle pivots comparing only text and offset.
 If a rollback takes `stall_cycles` from the switch threshold back below it
 before the coordinator's drain commits a stall offset action that attempt

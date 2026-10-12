@@ -4465,6 +4465,10 @@ async fn coalesce_backlog_into(
     remote_tx_arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
     audit_log: &pancetta_agent::audit::AuditLog,
     display_feed_enabled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pivots: Option<(
+        &mut std::collections::HashMap<String, (String, f64)>,
+        &mut PivotReplaced,
+    )>,
 ) -> MessageType {
     // Decompose the head into a CoalesceEntry. (Caller guarantees the variant.)
     let head_entry = match head {
@@ -4555,6 +4559,55 @@ async fn coalesce_backlog_into(
     // Round-3 review (Codex P1): ONE arm snapshot for the WHOLE partition,
     // not a fresh lock per entry — see [`ArmSnapshot`]'s doc for the TOCTOU
     // this closes.
+    // PAN-75 (Codex P2 on PR #418): consume pivot duplicates BEFORE
+    // newest-per-QSO coalescing. A request whose payload already aired via an
+    // earlier pivot could otherwise be discarded here in favour of a newer
+    // same-QSO request, so Step 0-dup never sees it: its tombstone goes stale
+    // and the frame the pivot replaced, which never aired, stays counted.
+    // The newest entry is left for Step 0-dup when every entry is a duplicate.
+    if let Some((pivoted_once, pivoted_from)) = pivots {
+        if drained.len() > 1 {
+            let mut duplicates = Vec::new();
+            let mut kept = Vec::with_capacity(drained.len());
+            let last = drained.len() - 1;
+            for (i, entry) in drained.into_iter().enumerate() {
+                let spare = i < last || !kept.is_empty();
+                if spare
+                    && super::is_pivot_duplicate(
+                        entry.qso_id.as_deref(),
+                        &entry.message_text,
+                        entry.frequency_offset,
+                        pivoted_once,
+                    )
+                {
+                    let replaced = entry.qso_id.as_deref().and_then(|id| {
+                        let key = super::active_tx_qso_key(id);
+                        pivoted_once.remove(&key);
+                        pivoted_from.remove(&key)
+                    });
+                    duplicates.push((entry, replaced));
+                } else {
+                    kept.push(entry);
+                }
+            }
+            drained = kept;
+            for (entry, replaced) in duplicates {
+                info!(
+                    target: "pancetta::tx.policy",
+                    "dropping stale TX for '{}' before coalescing — already sent via pivot",
+                    entry.message_text
+                );
+                report_pivot_duplicate_dropped(
+                    message_bus,
+                    entry.message_text,
+                    entry.qso_id,
+                    replaced,
+                )
+                .await;
+            }
+        }
+    }
+
     let now_ms = chrono::Utc::now().timestamp_millis();
     let arm_snapshot = ArmSnapshot::take(remote_tx_arm, now_ms);
     let (admitted, identity_denied): (Vec<_>, Vec<_>) = drained.into_iter().partition(|e| {
@@ -5908,6 +5961,7 @@ impl super::ApplicationCoordinator {
                                     &remote_tx_arm,
                                     &audit_log,
                                     &display_feed_enabled,
+                                    Some((&mut pivoted_once, &mut pivoted_from)),
                                 )
                                 .await;
 
@@ -14399,6 +14453,7 @@ mod coalesce_tests {
             &arm,
             &audit_log,
             &display_feed_enabled,
+            None,
         )
         .await;
 
@@ -14517,6 +14572,7 @@ mod coalesce_tests {
             &arm,
             &audit_log,
             &display_feed_enabled,
+            None,
         )
         .await;
 
@@ -14577,6 +14633,77 @@ mod coalesce_tests {
         }
         notices.sort();
         assert_eq!(notices, vec![("qso-b".to_string(), "B".to_string())]);
+    }
+
+    /// PAN-75 (Codex P2 on PR #418): a pivot duplicate queued ahead of a
+    /// newer same-QSO request is consumed before coalescing, so its tombstone
+    /// clears and the frame the pivot replaced is rolled back.
+    #[tokio::test(flavor = "current_thread")]
+    async fn backlog_into_consumes_pivot_duplicates_before_coalescing() {
+        use crate::message_bus::MessageBus;
+        use std::sync::Arc;
+
+        let bus = MessageBus::new(16).unwrap();
+        let (_, _autonomous_rx) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_, qso_rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        let (backlog_tx, backlog_rx) = crossbeam_channel::unbounded();
+        let active_tx_qsos = Arc::new(std::sync::RwLock::new(liveset(&["qso-a"])));
+        let arm = Arc::new(std::sync::Mutex::new(pancetta_agent::arm::ArmState::new()));
+        let request = |text: &str| MessageType::TransmitRequest {
+            message_text: text.to_string(),
+            frequency_offset: 1000.0,
+            qso_id: Some("qso-a".to_string()),
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
+        };
+        backlog_tx
+            .send(ComponentMessage::new(
+                ComponentId::Ft8Transmitter,
+                ComponentId::Ft8Transmitter,
+                request("K1ABC N0CALL RR73"),
+                Instant::now(),
+            ))
+            .unwrap();
+
+        let key = super::super::active_tx_qso_key("qso-a");
+        let mut pivoted_once = std::collections::HashMap::new();
+        pivoted_once.insert(key.clone(), ("K1ABC N0CALL R-07".to_string(), 1000.0));
+        let replaced = pancetta_qso::UnsentAttemptPayload {
+            frequency_hz: 1000.0,
+            remote_binding: Some((false, None)),
+        };
+        let mut pivoted_from = PivotReplaced::new();
+        pivoted_from.insert(
+            key.clone(),
+            ("K1ABC N0CALL -07".to_string(), replaced.clone()),
+        );
+
+        let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp());
+        let display_feed_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let result = coalesce_backlog_into(
+            request("K1ABC N0CALL R-07"),
+            &backlog_rx,
+            &bus,
+            &active_tx_qsos,
+            2,
+            &arm,
+            &audit_log,
+            &display_feed_enabled,
+            Some((&mut pivoted_once, &mut pivoted_from)),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            MessageType::TransmitRequest { ref message_text, .. } if message_text == "K1ABC N0CALL RR73"
+        ));
+        assert!(pivoted_once.is_empty() && pivoted_from.is_empty());
+        assert!(matches!(
+            qso_rx.try_recv().unwrap().message_type,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { ref message_text, replaced: Some(ref payload), .. })
+                if message_text == "K1ABC N0CALL -07" && *payload == replaced
+        ));
     }
 }
 
