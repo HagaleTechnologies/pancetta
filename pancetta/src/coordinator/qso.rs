@@ -4980,27 +4980,40 @@ impl super::ApplicationCoordinator {
                                                 .await;
                                                 continue;
                                             }
-                                            // PAN-78: capacity gate. `engage_hound` always opens a new
-                                            // QSO (no reuse path), so no predicate. EngageHound carries
-                                            // no remote origin.
-                                            if let Some(snap) = manual_open_at_capacity(
-                                                &qso_manager,
-                                                auto_answer_max_concurrent,
-                                                &fox_mode,
-                                                &fox_max_streams,
-                                            )
-                                            .await
-                                            {
-                                                refuse_manual_open_at_capacity(
-                                                    &message_bus,
-                                                    &display_feed_for_admission,
-                                                    ManualOpen::Hound,
-                                                    Some(&callsign),
-                                                    snap,
-                                                    false,
+                                            // PAN-78: capacity gate. `engage_hound` wraps
+                                            // `respond_to_cq_with(..Manual..)`, so a re-engage of an
+                                            // active Fox (FIX 1) or a same-call supersede (FIX 3) adds
+                                            // nothing and must pass, as in StartQso. `fox_freq` stands
+                                            // in for engage_hound's low calling offset: both are audio
+                                            // offsets, so they map to the same band. EngageHound
+                                            // carries no remote origin.
+                                            if qso_manager
+                                                .manual_open_adds_active_qso(
+                                                    &callsign,
+                                                    fox_freq as f64,
+                                                    pancetta_core::ResponseStep::Grid,
                                                 )
-                                                .await;
-                                                continue;
+                                                .await
+                                            {
+                                                if let Some(snap) = manual_open_at_capacity(
+                                                    &qso_manager,
+                                                    auto_answer_max_concurrent,
+                                                    &fox_mode,
+                                                    &fox_max_streams,
+                                                )
+                                                .await
+                                                {
+                                                    refuse_manual_open_at_capacity(
+                                                        &message_bus,
+                                                        &display_feed_for_admission,
+                                                        ManualOpen::Hound,
+                                                        Some(&callsign),
+                                                        snap,
+                                                        false,
+                                                    )
+                                                    .await;
+                                                    continue;
+                                                }
                                             }
                                             // Same/idle parity: start the Hound QSO now.
                                             // engage_hound sets hound=true, partner_freq,
@@ -11476,6 +11489,42 @@ mod manual_capacity_admission_tests {
             statuses(&tui)
         );
         assert!(!any_tx_containing(&tx, "K5FOX"), "{tx:?}");
+        assert_eq!(h.manager.active_qso_count().await, 1);
+    }
+
+    /// `engage_hound` wraps `respond_to_cq_with(..Manual..)`: pressing
+    /// Shift+H again on the Fox we are already engaging is FIX 1's keep-call
+    /// (adds nothing), so it must not be refused at capacity.
+    #[tokio::test]
+    async fn reengage_of_active_fox_is_not_refused_at_capacity() {
+        let h = harness(1, false).await;
+        let engage = QsoMessage::EngageHound {
+            callsign: "K5FOX".to_string(),
+            fox_freq: 600,
+            dx_parity: Some(SlotParity::Even),
+            fox_grid: None,
+        };
+        h.send(engage.clone()).await;
+        let tx = collect_until(&h.tx, |m| tx_text(m).is_some_and(|t| t.contains("K5FOX"))).await;
+        assert!(any_tx_containing(&tx, "K5FOX"), "first engage: {tx:?}");
+        assert_eq!(h.manager.active_qso_count().await, 1);
+        let _ = collect_quiet(&h.tui, 300).await;
+
+        h.send(engage).await;
+        let tx = collect_until(&h.tx, |m| tx_text(m).is_some_and(|t| t.contains("K5FOX"))).await;
+        assert!(
+            any_tx_containing(&tx, "K5FOX"),
+            "the re-engage must re-send the Hound QSO's current frame: {tx:?}"
+        );
+        let tui = collect_quiet(&h.tui, 300).await;
+        assert!(
+            !statuses(&tui)
+                .iter()
+                .any(|s| s.starts_with("Not calling Fox")),
+            "a re-engage adds no QSO and must not be refused: {:?}",
+            statuses(&tui)
+        );
+        assert!(!has_capacity_diagnostic(&tui, Some("K5FOX")), "{tui:?}");
         assert_eq!(h.manager.active_qso_count().await, 1);
     }
 

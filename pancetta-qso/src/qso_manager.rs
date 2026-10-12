@@ -7961,6 +7961,55 @@ mod tests {
                  (before={before}, adds={adds}, after={after})"
             );
         }
+
+        // `engage_hound` wraps `respond_to_cq_with(..Manual..)` at its own low
+        // calling offset; the coordinator's gate asks the predicate with the
+        // Fox's RX offset (`fox_freq`) at Grid.
+        for (setup, call) in [
+            (Setup::Empty, PAN78_DX),
+            (Setup::ActiveManual, PAN78_DX),
+            (Setup::ActiveManual, PAN78_OTHER),
+            (Setup::ActiveAuto, PAN78_DX),
+        ] {
+            let manager = QsoManager::new(test_config());
+            match setup {
+                Setup::ActiveManual => {
+                    pan78_open_manual(&manager, PAN78_DX).await;
+                }
+                Setup::ActiveAuto => {
+                    manager
+                        .respond_to_cq(
+                            PAN78_DX.to_string(),
+                            PAN78_FREQ,
+                            Some(pancetta_core::slot::SlotParity::Even),
+                        )
+                        .await
+                        .unwrap();
+                }
+                Setup::Empty | Setup::RecentlyCompletedManual => {}
+            }
+            let fox_freq = 600.0;
+            let before = manager.active_qso_count().await;
+            let adds = manager
+                .manual_open_adds_active_qso(call, fox_freq, ResponseStep::Grid)
+                .await;
+            manager
+                .engage_hound(
+                    call,
+                    fox_freq,
+                    None,
+                    Some(pancetta_core::slot::SlotParity::Even),
+                )
+                .await
+                .unwrap();
+            let after = manager.active_qso_count().await;
+            assert_eq!(
+                after,
+                before + usize::from(adds),
+                "predicate disagrees with engage_hound for {setup:?} / {call} \
+                 (before={before}, adds={adds}, after={after})"
+            );
+        }
     }
 
     #[tokio::test]
