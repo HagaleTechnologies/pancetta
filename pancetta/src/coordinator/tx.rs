@@ -7390,6 +7390,29 @@ impl super::ApplicationCoordinator {
                                                         // explicit send failed. No competing enqueue
                                                         // here, so `pending` can go back immediately
                                                         // (PAN-73 round 4).
+                                                        // PAN-75: the abandoned frame gets the same
+                                                        // failed completion as the `Replace` arm's
+                                                        // below, so the QSO engine hands back its
+                                                        // keep-call bookkeeping.
+                                                        if let Some(abandoned) =
+                                                            in_flight_items.first()
+                                                        {
+                                                            if let Err(e) =
+                                                                report_transmit_complete(
+                                                                    &message_bus,
+                                                                    false,
+                                                                    abandoned.message_text.clone(),
+                                                                    0,
+                                                                    abandoned.qso_id.clone(),
+                                                                )
+                                                                .await
+                                                            {
+                                                                warn!(
+                                                                    "Failed to send TransmitComplete: {}",
+                                                                    e
+                                                                );
+                                                            }
+                                                        }
                                                         reenqueue_pending(&message_bus, pending)
                                                             .await;
                                                         break 'key_and_send;
@@ -7879,6 +7902,27 @@ impl super::ApplicationCoordinator {
                                                         // retry loop and fall through to next
                                                         // dequeue. No competing enqueue, so
                                                         // `pending` goes back now (PAN-73 round 4).
+                                                        // PAN-75: report the abandoned frame as
+                                                        // the Step 6 `NotViable` arm does.
+                                                        if let Some(abandoned) =
+                                                            in_flight_items.first()
+                                                        {
+                                                            if let Err(e) =
+                                                                report_transmit_complete(
+                                                                    &message_bus,
+                                                                    false,
+                                                                    abandoned.message_text.clone(),
+                                                                    0,
+                                                                    abandoned.qso_id.clone(),
+                                                                )
+                                                                .await
+                                                            {
+                                                                warn!(
+                                                                    "Failed to send TransmitComplete: {}",
+                                                                    e
+                                                                );
+                                                            }
+                                                        }
                                                         reenqueue_pending(&message_bus, pending)
                                                             .await;
                                                         break 'key_and_send;
@@ -16191,6 +16235,101 @@ mod pan115_worker_gate_tests {
             assert!(
                 Instant::now() < deadline,
                 "F8 failed to notify QSO accounting"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// PAN-75: a keyed frame superseded by fresher content the single-TX
+    /// re-key path cannot use (`SupersedeOutcome::NotViable`; here a bundle,
+    /// which that path never folds) is abandoned. It must be reported as not
+    /// sent, like the `Replace` arm's abandoned frame.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn not_viable_supersede_reports_abandoned_frame_not_sent_to_qso() {
+        assert_not_viable_supersede_reports_abandoned_frame(false).await;
+    }
+
+    /// The same, superseding only once Step 7 has routed the audio, so the
+    /// Step 8 playback wait's `NotViable` arm handles it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn not_viable_supersede_during_playback_reports_abandoned_frame_not_sent_to_qso() {
+        assert_not_viable_supersede_reports_abandoned_frame(true).await;
+    }
+
+    async fn assert_not_viable_supersede_reports_abandoned_frame(during_playback: bool) {
+        let h = worker_harness().await;
+        h.coordinator
+            .active_tx_qsos
+            .write()
+            .unwrap()
+            .insert(super::super::active_tx_qso_key("qso-sv"));
+        let text = "K1ABC N0CALL FN20";
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Qso,
+                ComponentId::Ft8Transmitter,
+                MessageType::TransmitRequest {
+                    message_text: text.into(),
+                    frequency_offset: 1500.0,
+                    qso_id: Some("qso-sv".into()),
+                    tx_parity: None,
+                    origin: TxOrigin::Local,
+                    remote_client_key_id: None,
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            await_ptt_on(&h, Duration::from_secs(20)).await,
+            "worker did not key the frame"
+        );
+        if during_playback {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !h
+                .tui_rx
+                .try_iter()
+                .any(|msg| matches!(msg.message_type, MessageType::TxFrameLogged { .. }))
+            {
+                assert!(Instant::now() < deadline, "worker did not start the audio");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Autonomous,
+                ComponentId::Ft8Transmitter,
+                MessageType::MultiTransmitRequest {
+                    items: vec![crate::message_bus::TransmitRequestItem {
+                        message_text: "K1ABC N0CALL -10".into(),
+                        frequency_offset: 1500.0,
+                        qso_id: Some("qso-sv".into()),
+                    }],
+                    tx_parity: None,
+                    origin: TxOrigin::Local,
+                    remote_client_key_id: None,
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            await_completion(&h, text, Duration::from_secs(5)).await.0,
+            Some(false)
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(msg) = h.qso_rx.try_recv() {
+                assert!(
+                    matches!(msg.message_type, MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { qso_id, message_text, replaced: None }) if qso_id == "qso-sv" && message_text == text)
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "abandoned frame was not reported to QSO accounting"
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }

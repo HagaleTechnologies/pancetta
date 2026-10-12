@@ -291,7 +291,11 @@ on that exit path would not preserve any observable accounting.
 The opening call remains counted as one. Manual-regression re-sends and silently
 coalesced, duplicate, parity-excluded or frequency-excluded frames keep their
 existing accounting because those paths have no matching ledger entry or QSO
-failure report. Rollback emits no new snapshot or QSO event; the existing status panel
+failure report. A single-frame supersede reports the frame it abandons whether
+it re-keys (`Replace`) or is too late to (`NotViable`). A superseding request a
+supersede drops (too late to re-key, a bundle a single-frame re-key cannot fold,
+or over the cap of a multi-TX bundle), and in-flight bundle items a multi-TX
+supersede drops outside an identity conflict, are not reported and stay counted. Rollback emits no new snapshot or QSO event; the existing status panel
 and remote snapshot fields show corrected values on the next normal push.
 
 ## UTC re-anchoring after sleep/wake and clock steps (PAN-114, 2026-10-10)
