@@ -4980,27 +4980,42 @@ impl super::ApplicationCoordinator {
                                                 .await;
                                                 continue;
                                             }
-                                            // PAN-78: capacity gate. `engage_hound` always opens a new
-                                            // QSO (no reuse path), so no predicate. EngageHound carries
-                                            // no remote origin.
-                                            if let Some(snap) = manual_open_at_capacity(
-                                                &qso_manager,
-                                                auto_answer_max_concurrent,
-                                                &fox_mode,
-                                                &fox_max_streams,
-                                            )
-                                            .await
-                                            {
-                                                refuse_manual_open_at_capacity(
-                                                    &message_bus,
-                                                    &display_feed_for_admission,
-                                                    ManualOpen::Hound,
-                                                    Some(&callsign),
-                                                    snap,
-                                                    false,
+                                            // PAN-78: capacity gate. `engage_hound` opens through
+                                            // `respond_to_cq_with(..Manual..)`, so a re-engage of an
+                                            // active Fox (FIX 1 keep-call) or a same-callsign
+                                            // supersede (FIX 3) adds nothing and must pass — same
+                                            // predicate as `StartQso`. `fox_freq` stands in for
+                                            // `engage_hound`'s internal low calling offset: the
+                                            // predicate only band-matches, and every audio offset
+                                            // maps to the same band. EngageHound carries no remote
+                                            // origin.
+                                            if qso_manager
+                                                .manual_open_adds_active_qso(
+                                                    &callsign,
+                                                    fox_freq as f64,
+                                                    pancetta_core::ResponseStep::Grid,
                                                 )
-                                                .await;
-                                                continue;
+                                                .await
+                                            {
+                                                if let Some(snap) = manual_open_at_capacity(
+                                                    &qso_manager,
+                                                    auto_answer_max_concurrent,
+                                                    &fox_mode,
+                                                    &fox_max_streams,
+                                                )
+                                                .await
+                                                {
+                                                    refuse_manual_open_at_capacity(
+                                                        &message_bus,
+                                                        &display_feed_for_admission,
+                                                        ManualOpen::Hound,
+                                                        Some(&callsign),
+                                                        snap,
+                                                        false,
+                                                    )
+                                                    .await;
+                                                    continue;
+                                                }
                                             }
                                             // Same/idle parity: start the Hound QSO now.
                                             // engage_hound sets hound=true, partner_freq,
@@ -11477,6 +11492,45 @@ mod manual_capacity_admission_tests {
         );
         assert!(!any_tx_containing(&tx, "K5FOX"), "{tx:?}");
         assert_eq!(h.manager.active_qso_count().await, 1);
+    }
+
+    /// `engage_hound` opens through `respond_to_cq_with(..Manual..)`, so a
+    /// second Shift+H on a Fox already being worked is a FIX 1 keep-call that
+    /// adds no QSO — it must re-send, not be refused at capacity.
+    #[tokio::test]
+    async fn reengage_of_active_fox_is_not_refused_at_capacity() {
+        let h = harness(1, false).await;
+        let engage = || QsoMessage::EngageHound {
+            callsign: "K5FOX".to_string(),
+            fox_freq: 600,
+            dx_parity: Some(SlotParity::Even),
+            fox_grid: None,
+        };
+        h.send(engage()).await;
+        let tx = collect_until(&h.tx, |m| tx_text(m).is_some_and(|t| t.contains("K5FOX"))).await;
+        assert!(any_tx_containing(&tx, "K5FOX"), "first engage: {tx:?}");
+        assert_eq!(h.manager.active_qso_count().await, 1);
+        let (fox_id, _) = h.manager.get_active_qsos().await.remove(0);
+        let _ = collect_quiet(&h.tui, 300).await;
+
+        h.send(engage()).await;
+        let tx = collect_until(&h.tx, |m| tx_text(m).is_some_and(|t| t.contains("K5FOX"))).await;
+        assert!(
+            any_tx_containing(&tx, "K5FOX"),
+            "the re-engage must re-send the Hound QSO's current frame: {tx:?}"
+        );
+        let tui = collect_quiet(&h.tui, 300).await;
+        assert!(
+            !statuses(&tui)
+                .iter()
+                .any(|s| s.starts_with("Not calling Fox")),
+            "a re-engage adds no QSO and must not be refused: {:?}",
+            statuses(&tui)
+        );
+        assert!(!has_capacity_diagnostic(&tui, Some("K5FOX")), "{tui:?}");
+        assert_eq!(h.manager.active_qso_count().await, 1);
+        let (still_id, _) = h.manager.get_active_qsos().await.remove(0);
+        assert_eq!(still_id, fox_id, "the re-engage must continue the same QSO");
     }
 
     fn remote_start_k2bbb() -> QsoMessage {

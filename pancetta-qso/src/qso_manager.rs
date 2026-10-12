@@ -1338,10 +1338,11 @@ impl QsoManager {
     ///   [`COMPLETED_QSO_REWORK_GRACE`] → no: FIX B re-keys it;
     /// - otherwise → yes.
     ///
-    /// Must stay in lockstep with [`Self::respond_to_cq_with`] /
-    /// [`Self::respond_to_caller`] (pinned by the
-    /// `manual_open_predicate_matches_real_open_effect` test). Read-only: never
-    /// takes a write lock.
+    /// Must stay in lockstep with [`Self::respond_to_cq_with`] (and
+    /// [`Self::engage_hound`], which wraps it) / [`Self::respond_to_caller`]
+    /// (pinned by the `manual_open_predicate_matches_real_open_effect` and
+    /// `manual_open_predicate_matches_engage_hound_effect` tests). Read-only:
+    /// never takes a write lock.
     pub async fn manual_open_adds_active_qso(
         &self,
         callsign: &str,
@@ -7958,6 +7959,71 @@ mod tests {
                 after,
                 before + usize::from(adds),
                 "predicate disagrees with the real open for {setup:?} / {call} / {step:?} \
+                 (before={before}, adds={adds}, after={after})"
+            );
+        }
+    }
+
+    /// `engage_hound` opens through `respond_to_cq_with(..Manual..)`, so the
+    /// `EngageHound` capacity gate asks the same `Grid` predicate — called with
+    /// the Fox's audio offset, not `engage_hound`'s internal low calling offset.
+    #[tokio::test]
+    async fn manual_open_predicate_matches_engage_hound_effect() {
+        use pancetta_core::slot::SlotParity;
+        use pancetta_core::ResponseStep;
+
+        #[derive(Debug, Clone, Copy)]
+        enum Setup {
+            Empty,
+            ActiveHound,
+            ActiveManual,
+            ActiveAuto,
+        }
+
+        const FOX_FREQ: f64 = 600.0;
+        async fn engage(manager: &QsoManager, call: &str) -> QsoId {
+            manager
+                .engage_hound(call, FOX_FREQ, None, Some(SlotParity::Even))
+                .await
+                .unwrap()
+        }
+
+        let cases: &[(Setup, &str)] = &[
+            (Setup::Empty, PAN78_DX),
+            (Setup::ActiveHound, PAN78_DX),
+            (Setup::ActiveHound, PAN78_OTHER),
+            (Setup::ActiveManual, PAN78_DX),
+            (Setup::ActiveAuto, PAN78_DX),
+        ];
+
+        for &(setup, call) in cases {
+            let manager = QsoManager::new(test_config());
+            match setup {
+                Setup::Empty => {}
+                Setup::ActiveHound => {
+                    engage(&manager, PAN78_DX).await;
+                }
+                Setup::ActiveManual => {
+                    pan78_open_manual(&manager, PAN78_DX).await;
+                }
+                Setup::ActiveAuto => {
+                    manager
+                        .respond_to_cq(PAN78_DX.to_string(), PAN78_FREQ, Some(SlotParity::Even))
+                        .await
+                        .unwrap();
+                }
+            }
+
+            let before = manager.active_qso_count().await;
+            let adds = manager
+                .manual_open_adds_active_qso(call, FOX_FREQ, ResponseStep::Grid)
+                .await;
+            engage(&manager, call).await;
+            let after = manager.active_qso_count().await;
+            assert_eq!(
+                after,
+                before + usize::from(adds),
+                "predicate disagrees with engage_hound for {setup:?} / {call} \
                  (before={before}, adds={adds}, after={after})"
             );
         }
