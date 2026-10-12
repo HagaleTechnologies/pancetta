@@ -9,5 +9,6 @@ pub mod keys;
 pub mod multi_session;
 pub mod noise;
 pub mod pairing;
+pub mod peer_identity;
 pub mod relay;
 pub mod session;

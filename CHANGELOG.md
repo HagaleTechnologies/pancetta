@@ -166,6 +166,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `pancetta-config/examples/config.toml`: unreferenced, did not parse, and
   duplicated the generated, drift-tested `pancetta-config/defaults.toml`.
 
+### Security
+
+- Station agent: a remote client must now prove its device identity inside the encrypted handshake, and it receives station data only after a valid `hello`; clients must be updated to connect (PAN-95).
+
 ## [0.9.6] - 2026-09-02
 
 ### Added

@@ -145,8 +145,11 @@ an exclusivity layer *in front of* the arm path; it never substitutes for any ch
 
 New invariants (added to the tested set):
 
-- A peer not in `tx_allow_list` never allocates handshake state, never receives the read stream,
-  and never reaches dispatch.
+- A peer is established only after proving, inside the Noise IK handshake, that it holds the keys
+  for the keyId the relay labels it with (PAN-95).
+- A peer not in `tx_allow_list` never allocates handshake state and never reaches dispatch.
+- No frame of any kind is sent to an established peer until it holds a currently-valid
+  `status`-or-higher capability from a verified `hello`.
 - Control-mutating actions execute only for the controller (or a peer becoming controller via
   rules 1/3).
 - An arm never survives a controller transition, and never transfers between peers.

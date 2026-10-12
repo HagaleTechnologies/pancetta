@@ -16,7 +16,10 @@
 //!   checked against the station-local `tx_allow_list` *before* any handshake
 //!   state is created — an unlisted peer never costs a handshake, and a full
 //!   peer map is dropped defensively (the relay's own 9th-client `CAPACITY`
-//!   terminal code is the first line of defense).
+//!   terminal code is the first line of defense). The peer must then also
+//!   prove, inside the Noise handshake, that it holds the keys for that keyId
+//!   (PAN-95: a msg1 client identity proof bound to its Noise static key);
+//!   the relay's `src` label alone never establishes a peer.
 //! - **Controller model — one controller at a time, free grab:** at most one
 //!   established peer holds `controller` (arm/QSY/split/TX-initiation)
 //!   at a time; every other connected peer is a live read-only viewer.
@@ -31,10 +34,10 @@
 //!   always has). *Precision note:* "byte-identical" here means a single
 //!   connected client's **dispatch/arm/control** behavior is byte-for-byte
 //!   what it was before this branch — NOT that every byte sent to the client is
-//!   unchanged. Its INBOUND relay stream is now a strict *superset*: it also
-//!   receives a `ControlState` greeting on session establishment plus any
-//!   read-stream events, both carried by pre-existing rig-api.v1 types (no new
-//!   wire event). A control-mutating action from a non-controller while
+//!   unchanged. Since PAN-95 an established peer's INBOUND relay stream is
+//!   EMPTY until it sends a valid `hello`; from then on it receives a
+//!   `ControlState` greeting plus any read-stream events, both carried by
+//!   pre-existing rig-api.v1 types (no new wire event). A control-mutating action from a non-controller while
 //!   someone else holds control is refused (`warn!` + audited + an error
 //!   frame back to that peer), never an implicit grab. Two **deliberate
 //!   safety asymmetries**: `Disarm` and `Heartbeat` are accepted from ANY
@@ -64,14 +67,16 @@
 //!   to the shared [`super::remote_gateway::DisplayFeed`] — the same
 //!   bus-to-`ServerEvent` translation pump the localhost `remote_gateway`
 //!   uses — and, between (timeout-bounded) control-frame reads, drains it and
-//!   `broadcast()`s each event as `ServerFrame::Event` JSON inside per-peer
-//!   encrypted `env` frames to every established peer. The feed is started
+//!   sends each event as `ServerFrame::Event` JSON inside per-peer encrypted
+//!   `env` frames to every established peer *holding a currently-valid
+//!   `status`-or-higher capability from a verified `hello`* (PAN-95,
+//!   [`peer_may_receive`]); a peer without one is sent no frame of any kind. The feed is started
 //!   when *either* the localhost gateway or the station agent is enabled
 //!   (`display_feed_enabled`); the tokio `broadcast` ring is a drop-oldest
 //!   queue (lossy by design — control frames are never queued behind it).
 //!   Per-peer `ControlState` (`controlHeldByMe`, `transmitArmed`) is sent on
-//!   every controller/arm transition and on session establishment — no new
-//!   wire event was needed; rig-api.v1 already defined it.
+//!   every controller/arm transition and as a greeting on a successful
+//!   `hello` — no new wire event was needed; rig-api.v1 already defined it.
 //! - **Boot-gated, not hot-started:** the shared display feed is started ONCE
 //!   at coordinator startup, from the config as it stands at that instant. If
 //!   the station-agent component is turned on via a config *hot-reload* after
@@ -190,8 +195,10 @@ struct ArmContext {
     /// `PeerEstablished` — that variant fires only AFTER `MultiPeerSession`'s
     /// own admission check (station-local `tx_allow_list` membership + the
     /// `MAX_PEERS` capacity gate) ran BEFORE any handshake state was
-    /// allocated, so a key in this map always names a vetted, allow-listed
-    /// peer, never a bare relay claim. Cleared at the start of every new
+    /// allocated AND the peer proved, inside the Noise handshake, that it holds
+    /// the keys for that keyId (PAN-95), so a key in this map always names a
+    /// vetted, allow-listed identity proven in the handshake, never a bare
+    /// relay claim. Cleared at the start of every new
     /// session (`run_one_session`) — no established peer or granted scope
     /// carries across a reconnect, so a different set of allow-listed clients
     /// can connect next time.
@@ -224,20 +231,97 @@ struct ArmContext {
     revocation_pending: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// A verified hello capability, kept whole enough to re-check at use time.
+struct PeerAuth {
+    /// Scopes granted by the token (rig-api tiers `status` ⊂ `qsy` ⊂ `tx`).
+    scopes: Vec<String>,
+    /// The token's expiry (ms). The capability is usable only while `now < exp_ms`.
+    exp_ms: i64,
+}
+
 /// Per-established-peer session state (Task 4: one entry per demuxed peer,
 /// replacing the single-peer-era `ArmContext::hello_scopes` scalar).
 struct PeerCtx {
-    /// Scopes granted by THIS peer's most recent verified
-    /// `hello.capabilityToken` (`None` = no scoped action served — v1
-    /// back-compat default, and the fail-closed state after any
-    /// invalid/mismatched token). A `hello`'s `capabilityToken.clientKeyId`
-    /// MUST equal the ACTUAL sending peer (the `peer` parameter threaded from
-    /// `MultiPeerSession`'s demux, never a session-global value) before its
-    /// scopes are honored (Q-0019 #5) — this is what roots read/qsy
-    /// authorization in the E2E-connected, allow-listed identity of the frame
-    /// that carried the token, rather than relay admission alone or any OTHER
-    /// peer's identity in a multi-peer session.
-    hello_scopes: Option<Vec<String>>,
+    /// The capability from THIS peer's most recent verified
+    /// `hello.capabilityToken`. `None` ⇒ the peer has proven its identity
+    /// (PAN-95, `MultiPeerSession`) but holds no currently-usable capability:
+    /// it is sent NOTHING and may run no scoped action — the state on
+    /// establishment, and the fail-closed state after any invalid/mismatched
+    /// token or an expiry sweep. A `hello`'s `capabilityToken.clientKeyId`
+    /// MUST equal the ACTUAL sending peer (the identity `MultiPeerSession`
+    /// proved in the handshake, never a session-global value) before it is
+    /// honored (Q-0019 #5).
+    auth: Option<PeerAuth>,
+}
+
+impl PeerCtx {
+    /// A freshly established peer: identity proven, nothing authorized yet.
+    fn unauthorized() -> Self {
+        Self { auth: None }
+    }
+
+    /// Whether this peer currently holds `required` (rig-api tiers) — the
+    /// capability must be unexpired at `now`.
+    fn grants(&self, required: &str, now: i64) -> bool {
+        self.auth
+            .as_ref()
+            .is_some_and(|a| now < a.exp_ms && scope_at_least(&a.scopes, required))
+    }
+}
+
+/// Whether established peer `peer` currently holds `required` at `now`.
+fn peer_grants(ctx: &ArmContext, peer: &str, required: &str, now: i64) -> bool {
+    ctx.peers.get(peer).is_some_and(|p| p.grants(required, now))
+}
+
+/// THE outbound gate (PAN-95): a peer is sent a frame — any frame — only while
+/// it holds a currently-valid `status`-or-higher capability from a verified
+/// hello. Both `deliver_sends` and `drain_read_stream` consult this; they are
+/// the only two station→client paths.
+fn peer_may_receive(ctx: &ArmContext, peer: &str, now: i64) -> bool {
+    peer_grants(ctx, peer, "status", now)
+}
+
+/// Clear the capability of every peer whose token has expired at `now`, and
+/// return those peers (each exactly once — a cleared peer is not returned
+/// again). The predicates above check `exp` on their own, so this is for
+/// diagnostics and state freshness, not safety.
+fn sweep_expired_peer_auth(ctx: &mut ArmContext, now: i64) -> Vec<String> {
+    let mut expired = Vec::new();
+    for (peer, p) in ctx.peers.iter_mut() {
+        if p.auth.as_ref().is_some_and(|a| a.exp_ms <= now) {
+            p.auth = None;
+            expired.push(peer.clone());
+        }
+    }
+    expired
+}
+
+/// Run [`sweep_expired_peer_auth`], log each newly-expired peer once, and —
+/// if the expired peer is the current controller — disarm and release control
+/// (fail TX-off, as on controller loss): a controller the station can no
+/// longer send anything to must not keep transmitting blind. Returns the
+/// updated `controlState` frames for the caller to deliver (empty when no
+/// controller expired).
+fn expire_peer_auth(ctx: &mut ArmContext, now: i64) -> Vec<PeerSend> {
+    let mut sends = Vec::new();
+    for peer in sweep_expired_peer_auth(ctx, now) {
+        info!(target: "agent.control", peer = %peer,
+            "peer capability expired — station data paused until it sends a hello with a fresh capabilityToken");
+        if ctx.controller.as_deref() == Some(peer.as_str()) {
+            let effects = match ctx.arm.lock() {
+                Ok(mut st) => st.disarm(now),
+                Err(_) => Vec::new(),
+            };
+            if !effects.is_empty() {
+                warn!(target: "agent.tx", peer = %peer, "controller capability expired with a live arm — disarming");
+            }
+            apply_arm_effects(&ctx.audit, &effects);
+            ctx.controller = None;
+            sends = control_state_sends(ctx, now, None);
+        }
+    }
+    sends
 }
 
 /// rig-api.v1 scope hierarchy (Q-0019 #5): `status` ⊂ `qsy` ⊂ `tx` — a token
@@ -378,7 +462,9 @@ enum Dispatch {
 /// Who a [`PeerSend`] is addressed to. Every dispatch-emitted frame is
 /// per-receiver ([`SendTarget::One`]) because `controlHeldByMe` differs per
 /// peer; the read-stream fan-out does NOT go through `PeerSend` — it calls
-/// [`MultiPeerSession::broadcast`] directly (see [`drain_read_stream`]).
+/// [`MultiPeerSession::broadcast_to`] directly (see [`drain_read_stream`]).
+/// Every frame, either way, is withheld from a peer [`peer_may_receive`]
+/// refuses.
 #[derive(Debug)]
 enum SendTarget {
     /// Exactly one established peer (by keyId).
@@ -422,9 +508,10 @@ impl DispatchOutcome {
 
 /// Per-receiver control/arm state frames (rig-api.v1 `controlState`). Emitted on
 /// every controller transition, every successful arm, every disarm, and as a
-/// greeting to each newly-established peer. `only = Some(p)` targets just peer
-/// `p` (the greeting case); `None` fans out one tailored frame per established
-/// peer (each with its own `controlHeldByMe`).
+/// greeting to a peer whose `hello` just verified. `only = Some(p)` targets
+/// just peer `p` (the greeting case); `None` fans out one tailored frame per
+/// established peer (each with its own `controlHeldByMe`). Frames are built
+/// for every peer; [`deliver_sends`] withholds them from unauthorized ones.
 fn control_state_sends(ctx: &ArmContext, now: i64, only: Option<&str>) -> Vec<PeerSend> {
     let armed = ctx.arm.lock().map(|s| s.tx_permitted(now)).unwrap_or(false);
     ctx.peers
@@ -614,23 +701,23 @@ async fn dispatch_action(
             DispatchOutcome::cont_with(control_state_sends(ctx, now, None))
         }
         ControlAction::Hello { capability_token } => {
-            // Rule 8: Hello scope verification is per-peer and unchanged from
-            // Task 4 — it is NOT a control-mutating action and never grabs.
-            dispatch_hello(capability_token, peer, ctx, now);
-            DispatchOutcome::cont()
+            // Rule 8: Hello scope verification is per-peer — it is NOT a
+            // control-mutating action and never grabs. A verified hello is the
+            // first moment the peer may receive anything (PAN-95), so the
+            // controlState greeting is sent here rather than on establishment.
+            if dispatch_hello(capability_token, peer, ctx, now) {
+                DispatchOutcome::cont_with(control_state_sends(ctx, now, Some(peer)))
+            } else {
+                DispatchOutcome::cont()
+            }
         }
         ControlAction::Qsy { vfo, frequency_hz } => {
             let grab = match controller_gate(ctx, peer, now) {
                 ControllerGate::Proceed(sends) => sends,
                 ControllerGate::Refused(sends) => return DispatchOutcome::cont_with(sends),
             };
-            if !ctx
-                .peers
-                .get(peer)
-                .and_then(|p| p.hello_scopes.as_deref())
-                .is_some_and(|s| scope_at_least(s, "qsy"))
-            {
-                warn!(target: "agent.control", peer = %peer, "setFrequency refused — no qsy-scoped hello token this session for this peer");
+            if !peer_grants(ctx, peer, "qsy", now) {
+                warn!(target: "agent.control", peer = %peer, "setFrequency refused — no currently-valid qsy-scoped hello capability for this peer");
                 return DispatchOutcome::cont_with(grab);
             }
             let msg = RigControlMessage::SetFrequency {
@@ -648,13 +735,8 @@ async fn dispatch_action(
                 ControllerGate::Proceed(sends) => sends,
                 ControllerGate::Refused(sends) => return DispatchOutcome::cont_with(sends),
             };
-            if !ctx
-                .peers
-                .get(peer)
-                .and_then(|p| p.hello_scopes.as_deref())
-                .is_some_and(|s| scope_at_least(s, "qsy"))
-            {
-                warn!(target: "agent.control", peer = %peer, "setSplit refused — no qsy-scoped hello token this session for this peer");
+            if !peer_grants(ctx, peer, "qsy", now) {
+                warn!(target: "agent.control", peer = %peer, "setSplit refused — no currently-valid qsy-scoped hello capability for this peer");
                 return DispatchOutcome::cont_with(grab);
             }
             let msg = RigControlMessage::SetSplit {
@@ -771,10 +853,12 @@ async fn dispatch_action(
 /// Handle a `hello.capabilityToken` (Q-0019 #5): verify it against the pinned
 /// IdP keys, bind it to the ACTUAL SENDING PEER's E2E-connected client
 /// identity (`peer` — the value `MultiPeerSession`'s demux reported alongside
-/// this specific frame, never a session-global value), and set that peer's
-/// `PeerCtx::hello_scopes` accordingly. Fail-closed: any missing/invalid/
-/// mismatched token clears scopes (served nothing scoped), never partially
-/// trusts one.
+/// this specific frame, never a session-global value — since PAN-95 the
+/// identity the peer PROVED in its Noise handshake), and set that peer's
+/// `PeerCtx::auth` (scopes + expiry) accordingly. Returns whether the peer now
+/// holds a verified capability. Fail-closed: any missing/invalid/mismatched
+/// token clears the capability (the peer is sent nothing and served nothing
+/// scoped), never partially trusts one.
 ///
 /// `capability_token: None` (a legacy hello, v1 back-compat) also clears
 /// scopes — the token is optional on the wire but required at runtime for any
@@ -787,12 +871,17 @@ async fn dispatch_action(
 /// accepted under a capabilityToken that claims to be peer A, if A happened to
 /// be the value some stale/shared field held. Binding to the per-frame `peer`
 /// parameter is what keeps each peer's authorization strictly its own.
-fn dispatch_hello(capability_token: Option<String>, peer: &str, ctx: &mut ArmContext, now: i64) {
+fn dispatch_hello(
+    capability_token: Option<String>,
+    peer: &str,
+    ctx: &mut ArmContext,
+    now: i64,
+) -> bool {
     let Some(token) = capability_token else {
         if let Some(p) = ctx.peers.get_mut(peer) {
-            p.hello_scopes = None;
+            p.auth = None;
         }
-        return;
+        return false;
     };
     match ctx.verifier.verify_capability_token(&token, now) {
         Ok(cap) if cap.client_key_id == peer => {
@@ -803,13 +892,20 @@ fn dispatch_hello(capability_token: Option<String>, peer: &str, ctx: &mut ArmCon
                 "hello capabilityToken verified — scopes granted for this peer"
             );
             match ctx.peers.get_mut(peer) {
-                Some(p) => p.hello_scopes = Some(cap.scopes),
+                Some(p) => {
+                    p.auth = Some(PeerAuth {
+                        scopes: cap.scopes,
+                        exp_ms: cap.exp_ms,
+                    });
+                    true
+                }
                 None => {
                     // Defensive: cannot happen via the demux (a Plaintext poll
                     // is only ever emitted for an established peer, and every
                     // established peer gets a PeerCtx on PeerEstablished), but
                     // fail closed rather than panic if it ever did.
                     warn!(target: "agent.control", peer = %peer, "hello verified for a peer with no PeerCtx — refusing");
+                    false
                 }
             }
         }
@@ -821,14 +917,16 @@ fn dispatch_hello(capability_token: Option<String>, peer: &str, ctx: &mut ArmCon
                 "hello capabilityToken clientKeyId does not match the sending peer's E2E-connected identity — no scope granted"
             );
             if let Some(p) = ctx.peers.get_mut(peer) {
-                p.hello_scopes = None;
+                p.auth = None;
             }
+            false
         }
         Err(e) => {
             warn!(target: "agent.control", peer = %peer, reason = %e, "hello capabilityToken invalid — no scope granted");
             if let Some(p) = ctx.peers.get_mut(peer) {
-                p.hello_scopes = None;
+                p.auth = None;
             }
+            false
         }
     }
 }
@@ -1204,8 +1302,8 @@ impl super::ApplicationCoordinator {
     /// rather than merely passing `events: None` into `run_session_loop`:
     ///
     /// - OUTBOUND: `drain_read_stream` serializes every display-feed
-    ///   `ServerEvent` and `MultiPeerSession::broadcast`s it to every
-    ///   established peer over the relay socket — real off-box network traffic
+    ///   `ServerEvent` and `MultiPeerSession::broadcast_to`s it to every
+    ///   hello-authorized established peer over the relay socket — real off-box network traffic
     ///   carrying replayed decodes, spectrum, QSO state and dial frequency
     ///   fabricated as live.
     /// - INBOUND: an established peer's control frames (`dispatch_action` →
@@ -1757,14 +1855,23 @@ fn disarm_on_loss(ctx: &mut ArmContext) {
 }
 
 /// Serialize and deliver each [`PeerSend`]. Pure-side-effect helper the session
-/// loop calls after every dispatch (and on peer-establish/-down). A failed
-/// serialize or send is `debug!`-logged and skipped (best-effort — a control
-/// frame that can't reach one peer never tears down the session).
+/// loop calls after every dispatch (and on peer-down / revocation). A frame
+/// addressed to a peer [`peer_may_receive`] refuses at `now` is withheld
+/// (PAN-95). A failed serialize or send is `debug!`-logged and skipped
+/// (best-effort — a control frame that can't reach one peer never tears down
+/// the session).
 fn deliver_sends<W: pancetta_agent::relay::WsConn>(
     sess: &mut MultiPeerSession<'_, W>,
+    ctx: &ArmContext,
     sends: &[PeerSend],
+    now: i64,
 ) {
     for send in sends {
+        let SendTarget::One(peer) = &send.to;
+        if !peer_may_receive(ctx, peer, now) {
+            debug!(target: "agent.control", peer = %peer, "frame withheld — peer holds no valid hello capability");
+            continue;
+        }
         let bytes = match serde_json::to_vec(&send.frame) {
             Ok(b) => b,
             Err(e) => {
@@ -1772,18 +1879,21 @@ fn deliver_sends<W: pancetta_agent::relay::WsConn>(
                 continue;
             }
         };
-        let SendTarget::One(peer) = &send.to;
         if let Err(e) = sess.send_to(peer, &bytes) {
             debug!(target: "agent.control", peer = %peer, "peer send failed: {e}");
         }
     }
 }
 
-/// Fan pending display events out to every established peer. Lossy by design:
+/// Fan pending display events out to every established peer that
+/// [`peer_may_receive`] admits at `now` (PAN-95 — a peer without a verified,
+/// unexpired `status`+ hello capability gets nothing). Lossy by design:
 /// Lagged means the bounded broadcast ring dropped old events — log and continue.
 fn drain_read_stream<W: pancetta_agent::relay::WsConn>(
     events: &mut Option<tokio::sync::broadcast::Receiver<pancetta_protocol::ServerEvent>>,
     sess: &mut MultiPeerSession<'_, W>,
+    ctx: &ArmContext,
+    now: i64,
 ) {
     let Some(rx) = events.as_mut() else { return };
     loop {
@@ -1792,7 +1902,7 @@ fn drain_read_stream<W: pancetta_agent::relay::WsConn>(
                 let frame = pancetta_protocol::ServerFrame::Event { event: ev };
                 match serde_json::to_vec(&frame) {
                     Ok(bytes) => {
-                        let _ = sess.broadcast(&bytes);
+                        let _ = sess.broadcast_to(&bytes, |p| peer_may_receive(ctx, p, now));
                     }
                     Err(e) => debug!(target: "agent", "read-stream serialize failed: {e}"),
                 }
@@ -1850,6 +1960,9 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
                         // suppress it for every OTHER connected peer
                         // indefinitely.
                         broadcast_pending_revocation(ctx, &mut sess);
+                        let now = now_ms();
+                        let sends = expire_peer_auth(ctx, now);
+                        deliver_sends(&mut sess, ctx, &sends, now);
                         continue;
                     }
                 };
@@ -1859,28 +1972,26 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
                 // block a grant captured on one peer's session from being
                 // replayed into another peer's.
                 let sid = sess.session_id(&peer).unwrap_or_default().to_string();
-                let outcome = dispatch_action(action, &peer, ctx, bus, &sid, now_ms()).await;
-                deliver_sends(&mut sess, &outcome.sends);
+                let now = now_ms();
+                let outcome = dispatch_action(action, &peer, ctx, bus, &sid, now).await;
+                deliver_sends(&mut sess, ctx, &outcome.sends, now);
                 // Task 6: drain the read stream after every successful dispatch
                 // too, not just on Quiet/Idle — a chatty control session
                 // (frequent Arm/Heartbeat/Qsy traffic) must never starve the
                 // display feed of a chance to fan out.
-                drain_read_stream(events, &mut sess);
+                drain_read_stream(events, &mut sess, ctx, now_ms());
                 if outcome.flow == Dispatch::Teardown {
                     return;
                 }
             }
             Ok(Poll::PeerEstablished { peer, .. }) => {
-                ctx.peers
-                    .insert(peer.clone(), PeerCtx { hello_scopes: None });
-                // Rule 7: greet the newly-established peer with its current
-                // control/arm state (targeted at just that peer).
-                let sends = control_state_sends(ctx, now_ms(), Some(&peer));
-                deliver_sends(&mut sess, &sends);
+                // The peer's identity is proven, but it holds no capability
+                // yet: it is sent nothing. The Rule-7 controlState greeting
+                // is sent on its first valid `hello` (PAN-95, D5).
+                ctx.peers.insert(peer, PeerCtx::unauthorized());
             }
-            Ok(Poll::PeerRefused { peer }) => {
-                warn!(target: "agent", peer = %peer,
-                    "relay-admitted peer refused (not allow-listed or at capacity)");
+            Ok(Poll::PeerRefused { peer, reason }) => {
+                warn!(target: "agent", peer = %peer, reason = ?reason, "remote peer refused");
             }
             Ok(Poll::PeerDown { peer }) => {
                 // Rule 6: controller loss ⇒ disarm. Remove the peer first, then —
@@ -1899,15 +2010,16 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
                     }
                     apply_arm_effects(&ctx.audit, &effects);
                     ctx.controller = None;
-                    let sends = control_state_sends(ctx, now_ms(), None);
-                    deliver_sends(&mut sess, &sends);
+                    let now = now_ms();
+                    let sends = control_state_sends(ctx, now, None);
+                    deliver_sends(&mut sess, ctx, &sends, now);
                 }
             }
             Ok(Poll::Idle) | Ok(Poll::Quiet) => {
                 // Task 6: the common case — no control traffic this tick, so
                 // this is where the read stream gets most of its chances to
                 // fan out pending display events to established peers.
-                drain_read_stream(events, &mut sess);
+                drain_read_stream(events, &mut sess, ctx, now_ms());
             }
             Ok(Poll::Closed) => return,
             Err(e) => {
@@ -1920,6 +2032,9 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
         // `broadcast_pending_revocation` (PAN-34) so the malformed-frame
         // `continue` above can't bypass it — see that fn's doc comment.
         broadcast_pending_revocation(ctx, &mut sess);
+        let now = now_ms();
+        let sends = expire_peer_auth(ctx, now);
+        deliver_sends(&mut sess, ctx, &sends, now);
     }
 }
 
@@ -1935,8 +2050,9 @@ fn broadcast_pending_revocation<W: pancetta_agent::relay::WsConn>(
     sess: &mut MultiPeerSession<'_, W>,
 ) {
     if ctx.revocation_pending.swap(false, Ordering::AcqRel) {
-        let sends = control_state_sends(ctx, now_ms(), None);
-        deliver_sends(sess, &sends);
+        let now = now_ms();
+        let sends = control_state_sends(ctx, now, None);
+        deliver_sends(sess, ctx, &sends, now);
     }
 }
 
@@ -1955,7 +2071,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     const AGENT_KEY_ID: &str = "agentKeyId000000";
-    const CLIENT_KEY_ID: &str = "clientKeyId00000";
+    /// The real pairing.v1 keyId of [`client_device`] (Ed25519 seed 0x22 —
+    /// the same key as [`client_key`]), so tokens, grants and `clientSig`
+    /// fixtures stay coherent with an identity a handshake can PROVE (PAN-95).
+    /// Pinned by `test_device_constants_match_their_keys`.
+    const CLIENT_KEY_ID: &str = "dE82zKZ-sZEssoLgjoa9L-DQkASijPbnxr1Wzda_Zao";
     const IDP_KID: &str = "idp-kid-1";
     const OPERATOR: &str = "K5ARH";
     const NOW: i64 = 1_700_000_000_000;
@@ -2065,15 +2185,28 @@ mod tests {
         }
     }
 
-    /// A `peers` map with a single established entry for `peer`, carrying
-    /// `hello_scopes` — the Task-4 replacement for the old single-scalar
-    /// `expected_client_key_id`/`hello_scopes` test setup.
+    impl PeerCtx {
+        /// Test helper: an established peer holding `scopes` until `exp_ms`.
+        fn authorized_until(scopes: Vec<String>, exp_ms: i64) -> Self {
+            Self {
+                auth: Some(PeerAuth { scopes, exp_ms }),
+            }
+        }
+    }
+
+    /// A `peers` map with a single established entry for `peer`. `Some(scopes)`
+    /// is a verified hello valid until `NOW + 600_000` (matching
+    /// `valid_token()`'s `exp`); `None` is an established, unauthorized peer.
     fn peers_with(
         peer: &str,
         hello_scopes: Option<Vec<String>>,
     ) -> std::collections::HashMap<String, PeerCtx> {
         let mut m = std::collections::HashMap::new();
-        m.insert(peer.to_string(), PeerCtx { hello_scopes });
+        let ctx = match hello_scopes {
+            Some(scopes) => PeerCtx::authorized_until(scopes, NOW + 600_000),
+            None => PeerCtx::unauthorized(),
+        };
+        m.insert(peer.to_string(), ctx);
         m
     }
 
@@ -2571,7 +2704,7 @@ mod tests {
 
     #[tokio::test]
     async fn qsy_refused_without_prior_hello_token() {
-        // No hello has been dispatched this session — ctx.hello_scopes is None
+        // No hello has been dispatched this session — the peer's auth is None
         // by construction (ctx_with's default) — so setFrequency must be a no-op.
         let mut ctx = ctx_with(true, true);
         let bus = MessageBus::new(64).unwrap();
@@ -2688,7 +2821,7 @@ mod tests {
         const ANOTHER_PEER: &str = "someOtherClientKeyId0";
         let mut ctx = ctx_with(true, true);
         ctx.peers
-            .insert(ANOTHER_PEER.to_string(), PeerCtx { hello_scopes: None });
+            .insert(ANOTHER_PEER.to_string(), PeerCtx::unauthorized());
         let bus = MessageBus::new(64).unwrap();
         let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
         dispatch_action(
@@ -2762,18 +2895,16 @@ mod tests {
     #[tokio::test]
     async fn new_session_clears_stale_hello_scope() {
         // The per-session reset in run_one_session ("ctx.peers.clear()", with a
-        // fresh `PeerCtx { hello_scopes: None }` inserted on the next
+        // fresh `PeerCtx::unauthorized()` inserted on the next
         // `PeerEstablished`) is exercised indirectly here: simulate a stale
-        // prior grant by setting the peer's hello_scopes directly, then confirm
+        // prior grant by setting the peer's auth directly, then confirm
         // the field is what gates dispatch (i.e. a reconnect-boundary reset to
         // a fresh `PeerCtx` really does deny qsy, proving the gate reads
-        // `PeerCtx::hello_scopes` and nothing else).
+        // `PeerCtx::auth` and nothing else).
         let mut ctx = ctx_with(true, true);
         ctx.peers.insert(
             CLIENT_KEY_ID.to_string(),
-            PeerCtx {
-                hello_scopes: Some(vec!["qsy".to_string()]),
-            },
+            PeerCtx::authorized_until(vec!["qsy".to_string()], NOW + 600_000),
         );
         let bus = MessageBus::new(64).unwrap();
         let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
@@ -2781,7 +2912,7 @@ mod tests {
         // performs: `ctx.peers.clear()` then a brand-new `PeerCtx` on the next
         // `PeerEstablished` — same peer keyId, but no scope carried over.
         ctx.peers
-            .insert(CLIENT_KEY_ID.to_string(), PeerCtx { hello_scopes: None });
+            .insert(CLIENT_KEY_ID.to_string(), PeerCtx::unauthorized());
         let d = dispatch_action(
             ControlAction::Qsy {
                 vfo: 0,
@@ -3301,7 +3432,8 @@ mod tests {
 
     /// A second established peer keyId used by the controller tests (distinct
     /// from `CLIENT_KEY_ID`).
-    const PEER_B: &str = "peerBkeyId000000";
+    /// The real keyId of [`peer_b_device`] (seeds 0x33/0x34).
+    const PEER_B: &str = "NTL7KxNEiKKhjyoHzW24W0wbgI3bEJcvCtVSaFYXe9Q";
 
     /// Rule 3: a single connected client that NEVER sends `takeControl` arms
     /// exactly as before — the first control-mutating action (here `Arm`)
@@ -3343,9 +3475,7 @@ mod tests {
         let mut ctx = ctx_with(true, true);
         ctx.peers.insert(
             PEER_B.to_string(),
-            PeerCtx {
-                hello_scopes: Some(vec!["qsy".to_string()]),
-            },
+            PeerCtx::authorized_until(vec!["qsy".to_string()], NOW + 600_000),
         );
         let bus = MessageBus::new(64).unwrap();
         let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
@@ -3439,7 +3569,7 @@ mod tests {
             .unwrap()
             .insert(PEER_B.to_string(), key(0x33).verifying_key());
         ctx.peers
-            .insert(PEER_B.to_string(), PeerCtx { hello_scopes: None });
+            .insert(PEER_B.to_string(), PeerCtx::unauthorized());
         // Consent ON: nothing but the sender-binding check gates this arm.
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
@@ -3487,7 +3617,7 @@ mod tests {
     async fn take_control_disarms_previous_controllers_arm() {
         let mut ctx = ctx_with(true, true);
         ctx.peers
-            .insert(PEER_B.to_string(), PeerCtx { hello_scopes: None });
+            .insert(PEER_B.to_string(), PeerCtx::unauthorized());
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
         // A arms (implicit grab → controller=A, armed).
@@ -3552,7 +3682,7 @@ mod tests {
     async fn disarm_accepted_from_non_controller() {
         let mut ctx = ctx_with(true, true);
         ctx.peers
-            .insert(PEER_B.to_string(), PeerCtx { hello_scopes: None });
+            .insert(PEER_B.to_string(), PeerCtx::unauthorized());
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
         dispatch_action(
@@ -3723,13 +3853,9 @@ mod tests {
     /// `run_one_session`'s `PeerDown` arm.
     fn scripted_ws_for_peer_down(identity: &AgentIdentity, connecting_client: &str) -> MockWs {
         let agent_static_pub = identity.agreement_public_raw();
-        let client_kp = {
-            let params: snow::params::NoiseParams =
-                "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
-            snow::Builder::new(params).generate_keypair().unwrap()
-        };
-        let mut initiator = TestInitiator::new(&client_kp.private, &agent_static_pub);
-        let msg1 = initiator.write_msg1(b"");
+        let device = device_for(connecting_client);
+        let mut initiator = initiator_for(&device, &agent_static_pub);
+        let msg1 = initiator.write_msg1(&proof_for(&device));
 
         let hello = RelayFrame::Hello {
             challenge: b64url(&[7u8; 32]),
@@ -3814,19 +3940,15 @@ mod tests {
     /// awaits). Used to simulate "a concurrent `poll_authorizations_loop`
     /// cycle disarmed the live arm and set `revocation_pending` between two
     /// specific ticks."
-    struct TriggerAfterWs {
-        inner: MockWs,
+    struct TriggerAfterWs<W: WsConn = MockWs> {
+        inner: W,
         trigger_after: usize,
         calls: usize,
         on_trigger: Option<Box<dyn FnOnce() + Send>>,
     }
 
-    impl TriggerAfterWs {
-        fn new(
-            inner: MockWs,
-            trigger_after: usize,
-            on_trigger: impl FnOnce() + Send + 'static,
-        ) -> Self {
+    impl<W: WsConn> TriggerAfterWs<W> {
+        fn new(inner: W, trigger_after: usize, on_trigger: impl FnOnce() + Send + 'static) -> Self {
             Self {
                 inner,
                 trigger_after,
@@ -3836,7 +3958,7 @@ mod tests {
         }
     }
 
-    impl WsConn for TriggerAfterWs {
+    impl<W: WsConn> WsConn for TriggerAfterWs<W> {
         fn send_text(&mut self, s: String) -> Result<(), RelayError> {
             self.inner.send_text(s)
         }
@@ -4066,18 +4188,24 @@ mod tests {
     /// the caller can inspect `ctx.peers`.
     async fn run_session_with_connecting_peer(
         identity: &AgentIdentity,
-        connecting_client: &str,
+        device: &AgentIdentity,
         allow: HashSet<String>,
     ) -> ArmContext {
         let agent_static_pub = identity.agreement_public_raw();
-        let client_kp = {
-            let params: snow::params::NoiseParams =
-                "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
-            snow::Builder::new(params).generate_keypair().unwrap()
-        };
-        let mut initiator = TestInitiator::new(&client_kp.private, &agent_static_pub);
-        let msg1 = initiator.write_msg1(b"");
+        let mut initiator = initiator_for(device, &agent_static_pub);
+        let msg1 = initiator.write_msg1(&proof_for(device));
+        let (ctx, _out) = run_session_with_msg1(identity, &device.key_id(), msg1, allow).await;
+        ctx
+    }
 
+    /// Run one session whose only peer traffic is `msg1` relay-labelled `src`.
+    /// Returns the resulting `ArmContext` and every outbound frame.
+    async fn run_session_with_msg1(
+        identity: &AgentIdentity,
+        connecting_client: &str,
+        msg1: Vec<u8>,
+        allow: HashSet<String>,
+    ) -> (ArmContext, Vec<String>) {
         let hello = RelayFrame::Hello {
             challenge: b64url(&[5u8; 32]),
         }
@@ -4098,7 +4226,7 @@ mod tests {
         .unwrap();
 
         let outbound = Arc::new(Mutex::new(Vec::new()));
-        let ws = MockWs::new(vec![hello, ready, env_msg1], outbound);
+        let ws = MockWs::new(vec![hello, ready, env_msg1], outbound.clone());
 
         let mut client_keys = std::collections::HashMap::new();
         if allow.contains(connecting_client) {
@@ -4129,7 +4257,8 @@ mod tests {
         };
         let bus = MessageBus::new(64).unwrap();
         run_one_session(ws, identity, &mut ctx, &bus, &mut None).await;
-        ctx
+        let out = outbound.lock().unwrap().clone();
+        (ctx, out)
     }
 
     /// Dynamic client selection (Q-0043 quick fix): the peer that actually
@@ -4139,12 +4268,13 @@ mod tests {
     #[tokio::test]
     async fn dynamic_selection_accepts_whichever_allowlisted_peer_connects() {
         let identity = AgentIdentity::generate();
-        let connecting_client = "zzzLastAlphabetically".to_string();
+        // PEER_B ("NTL7…") sorts AFTER "000…" — it is not the first entry.
+        let connecting_client = PEER_B.to_string();
         let mut allow = HashSet::new();
-        allow.insert("aaaFirstAlphabetically".to_string());
+        allow.insert("000FirstAlphabetically".to_string());
         allow.insert(connecting_client.clone());
 
-        let ctx = run_session_with_connecting_peer(&identity, &connecting_client, allow).await;
+        let ctx = run_session_with_connecting_peer(&identity, &peer_b_device(), allow).await;
 
         assert!(
             ctx.peers.contains_key(&connecting_client),
@@ -4168,11 +4298,13 @@ mod tests {
     #[tokio::test]
     async fn relay_admitted_peer_not_in_allow_list_is_refused() {
         let identity = AgentIdentity::generate();
-        let connecting_client = "notAllowlistedClientKeyId".to_string();
+        // A real device with a valid identity proof — but not allow-listed.
+        let device = AgentIdentity::generate();
+        let connecting_client = device.key_id();
         let mut allow = HashSet::new();
         allow.insert("someOtherAllowlistedClient".to_string());
 
-        let ctx = run_session_with_connecting_peer(&identity, &connecting_client, allow).await;
+        let ctx = run_session_with_connecting_peer(&identity, &device, allow).await;
 
         assert!(
             !ctx.peers.contains_key(&connecting_client),
@@ -4214,72 +4346,619 @@ mod tests {
         }
     }
 
-    /// A client-side Noise IK initiator with a freshly generated keypair,
-    /// against `agent_pub`. Mirrors the inline pattern used throughout this
-    /// module's other scripted tests.
-    fn fresh_initiator(agent_pub: &[u8]) -> TestInitiator {
-        let params: snow::params::NoiseParams =
-            "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
-        let kp = snow::Builder::new(params).generate_keypair().unwrap();
-        TestInitiator::new(&kp.private, agent_pub)
+    /// The test client device: Ed25519 seed 0x22 (== [`client_key`], so every
+    /// `clientSig` fixture stays valid) + X25519 secret 0x23.
+    fn client_device() -> AgentIdentity {
+        AgentIdentity::from_secret_bytes([0x22; 32], [0x23; 32])
     }
 
-    /// Task 6: a `ServerEvent` broadcast into the shared display feed BEFORE
-    /// the session runs must reach EVERY established peer, each decrypted
-    /// under its OWN independent Noise transport — proven at the
-    /// `run_one_session` level (not just `MultiPeerSession::broadcast`'s own
-    /// unit coverage in `pancetta-agent`).
-    ///
-    /// No `ready`/heartbeat frame is scripted: peer establishment does not
-    /// require the relay's `ready` first (mirrors `process_env`, which has no
-    /// `admitted` gate), and inserting a `ready` step would trigger an early
-    /// `Poll::Idle` — and therefore an early `drain_read_stream` — BEFORE any
-    /// peer is established, permanently consuming the one buffered event
-    /// with zero recipients (draining is a plain `try_recv`, oblivious to
-    /// whether anyone is listening). The trailing `presence:up` frame is inert
-    /// on its own (informational only — `state != "down"` never touches
-    /// `ctx.peers`) and exists solely to produce the `Poll::Idle` tick that
-    /// exercises the drain AFTER both peers are established.
+    /// A second real device (seeds 0x33/0x34) whose keyId is [`PEER_B`].
+    fn peer_b_device() -> AgentIdentity {
+        AgentIdentity::from_secret_bytes([0x33; 32], [0x34; 32])
+    }
+
+    /// The device whose PROVEN keyId is `kid` (one of the module constants).
+    fn device_for(kid: &str) -> AgentIdentity {
+        if kid == CLIENT_KEY_ID {
+            client_device()
+        } else if kid == PEER_B {
+            peer_b_device()
+        } else {
+            panic!("no test device for keyId {kid}")
+        }
+    }
+
+    /// `device`'s Noise msg1 client identity proof (its enrollment idSig).
+    fn proof_for(device: &AgentIdentity) -> Vec<u8> {
+        let id_sig = device.sign_domain(
+            pancetta_agent::pairing::IDSIG_TAG,
+            &device.agreement_public_raw(),
+        );
+        pancetta_agent::peer_identity::encode_client_identity_proof(
+            &device.identity_public_raw(),
+            &id_sig,
+        )
+    }
+
+    /// A client-side Noise IK initiator using `device`'s enrolled agreement
+    /// key, against `agent_pub`.
+    fn initiator_for(device: &AgentIdentity, agent_pub: &[u8]) -> TestInitiator {
+        TestInitiator::new(&device.agreement_private_bytes(), agent_pub)
+    }
+
+    /// A capabilityToken for `client_kid` minted against the REAL wall clock —
+    /// needed for any hello dispatched inside `run_one_session`, which checks
+    /// tokens at `now_ms()`, not this module's fixed `NOW`.
+    fn real_clock_token(agent_kid: &str, client_kid: &str, scopes: &[&str]) -> String {
+        let now_s = now_ms() / 1000;
+        let header = json!({ "alg": "EdDSA", "kid": IDP_KID, "typ": "JWT" });
+        let payload = json!({
+            "iss": "cqdx", "sub": "acct-1", "operatorCallsign": OPERATOR,
+            "aud": agent_kid, "clientKeyId": client_kid,
+            "scopes": scopes,
+            "iat": now_s - 10, "exp": now_s + 600, "jti": format!("hello-{client_kid}")
+        });
+        mint_jws(&header, &payload, &idp_key())
+    }
+
+    /// A `qsy`-scoped capabilityToken for CLIENT_KEY_ID with `exp = exp_s`
+    /// (epoch seconds), issued at fixed `NOW`.
+    fn token_expiring_at(exp_s: i64) -> String {
+        let header = json!({ "alg": "EdDSA", "kid": IDP_KID, "typ": "JWT" });
+        let payload = json!({
+            "iss": "cqdx", "sub": "acct-1", "operatorCallsign": OPERATOR,
+            "aud": AGENT_KEY_ID, "clientKeyId": CLIENT_KEY_ID,
+            "scopes": ["status", "qsy"],
+            "iat": NOW / 1000 - 10, "exp": exp_s, "jti": "short-lived"
+        });
+        mint_jws(&header, &payload, &idp_key())
+    }
+
+    /// The rig-api.v1 `hello` client frame carrying `token`.
+    fn hello_frame_bytes(token: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "frame": "hello",
+            "hello": { "protocolVersion": 1, "capabilityToken": token }
+        }))
+        .unwrap()
+    }
+
+    /// Client-side transport encrypt.
+    fn client_encrypt(t: &mut snow::TransportState, plaintext: &[u8]) -> Vec<u8> {
+        let mut ct = vec![0u8; plaintext.len() + 16];
+        let n = t.write_message(plaintext, &mut ct).unwrap();
+        ct.truncate(n);
+        ct
+    }
+
+    /// Client-side transport decrypt into JSON.
+    fn client_decrypt_json(t: &mut snow::TransportState, ct: &[u8]) -> Value {
+        let mut buf = vec![0u8; ct.len().max(1)];
+        let n = t.read_message(ct, &mut buf).unwrap();
+        buf.truncate(n);
+        serde_json::from_slice(&buf).unwrap()
+    }
+
+    /// Every env payload addressed to `peer` in `out`, in wire order.
+    fn envs_to(out: &[String], peer: &str) -> Vec<Vec<u8>> {
+        out.iter()
+            .filter_map(|s| match parse_frame(s).unwrap() {
+                RelayFrame::Env { dst, payload, .. } if dst == peer => Some(
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(&payload)
+                        .unwrap(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Pins the test constants to real, self-certifying keyIds.
+    #[test]
+    fn test_device_constants_match_their_keys() {
+        assert_eq!(client_device().key_id(), CLIENT_KEY_ID);
+        assert_eq!(peer_b_device().key_id(), PEER_B);
+        assert_eq!(
+            client_device().identity_public_raw(),
+            client_key().verifying_key().to_bytes(),
+            "client_device's identity key is client_key — clientSig fixtures stay valid"
+        );
+    }
+
+    /// Gherkin Scenario 1 at the `run_one_session` level: the relay labels the
+    /// env with an admitted client's id and replays that client's genuine
+    /// proof, but runs the handshake with ITS OWN static key.
     #[tokio::test]
-    async fn read_stream_events_reach_every_established_peer() {
+    async fn run_one_session_refuses_relay_keyed_impersonation() {
+        let identity = AgentIdentity::generate();
+        let mut allow = HashSet::new();
+        allow.insert(CLIENT_KEY_ID.to_string());
+        let relay = AgentIdentity::generate();
+        let mut relay_init = initiator_for(&relay, &identity.agreement_public_raw());
+        let msg1 = relay_init.write_msg1(&proof_for(&client_device()));
+
+        let (ctx, out) = run_session_with_msg1(&identity, CLIENT_KEY_ID, msg1, allow).await;
+
+        assert!(
+            !ctx.peers.contains_key(CLIENT_KEY_ID),
+            "a relay-keyed session must never be treated as the claimed client"
+        );
+        assert!(ctx.peers.is_empty());
+        assert!(
+            envs_to(&out, CLIENT_KEY_ID).is_empty(),
+            "no msg2 or any other frame may be sent to the impersonated label"
+        );
+    }
+
+    /// A hand-driven `MultiPeerSession` over the clonable `MockWs` with each of
+    /// `devices` established (real handshakes with identity proofs) and its
+    /// client transport completed. `ctx.peers` is left for the caller to set.
+    fn hand_session<'a>(
+        identity: &'a AgentIdentity,
+        devices: &[&AgentIdentity],
+    ) -> (
+        MultiPeerSession<'a, MockWs>,
+        Arc<Mutex<Vec<String>>>,
+        Vec<snow::TransportState>,
+    ) {
+        let outbound = Arc::new(Mutex::new(Vec::new()));
+        let ws = MockWs::new(Vec::new(), outbound.clone());
+        let handle = ws.clone();
+        let allow: HashSet<String> = devices.iter().map(|d| d.key_id()).collect();
+        let mut sess = MultiPeerSession::new(ws, identity, allow);
+        let mut transports = Vec::new();
+        for device in devices {
+            let kid = device.key_id();
+            let mut init = initiator_for(device, &identity.agreement_public_raw());
+            let msg1 = init.write_msg1(&proof_for(device));
+            handle.push_inbound(
+                RelayFrame::Env {
+                    dst: identity.key_id(),
+                    payload: b64url(&msg1),
+                    src: Some(kid.clone()),
+                }
+                .to_json()
+                .unwrap(),
+            );
+            match sess
+                .process_next(std::time::Duration::from_millis(1))
+                .unwrap()
+            {
+                Poll::PeerEstablished { peer, .. } => assert_eq!(peer, kid),
+                other => panic!("expected PeerEstablished, got {other:?}"),
+            }
+            let msg2 = envs_to(&outbound.lock().unwrap(), &kid)
+                .pop()
+                .expect("msg2 on the wire");
+            init.read_msg2(&msg2);
+            transports.push(init.into_transport());
+        }
+        (sess, outbound, transports)
+    }
+
+    /// A display-feed receiver with `ev` already buffered. The sender is
+    /// dropped; a tokio broadcast receiver still yields buffered values first.
+    fn feed_with(
+        ev: pancetta_protocol::ServerEvent,
+    ) -> Option<tokio::sync::broadcast::Receiver<pancetta_protocol::ServerEvent>> {
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        tx.send(ev).unwrap();
+        Some(rx)
+    }
+
+    /// Gherkin Scenario 2: a peer that established Noise but holds no verified
+    /// hello capability receives no read-stream event; a hello-authorized
+    /// peer does. (Replaces the pre-PAN-95 test that asserted every
+    /// established transport received the event.)
+    #[tokio::test]
+    async fn read_stream_events_reach_only_hello_authorized_peers() {
+        let identity = AgentIdentity::generate();
+        let mut allow = HashSet::new();
+        allow.insert(CLIENT_KEY_ID.to_string());
+        allow.insert(PEER_B.to_string());
+        let mut ctx = fresh_ctx(&identity.key_id(), allow);
+        let (dev_a, dev_b) = (client_device(), peer_b_device());
+        let (mut sess, outbound, mut transports) = hand_session(&identity, &[&dev_a, &dev_b]);
+        ctx.peers.insert(
+            CLIENT_KEY_ID.to_string(),
+            PeerCtx::authorized_until(vec!["status".to_string()], NOW + 60_000),
+        );
+        ctx.peers
+            .insert(PEER_B.to_string(), PeerCtx::unauthorized());
+
+        let mut events = feed_with(pancetta_protocol::ServerEvent::TxStatus { active: true });
+        let before = outbound.lock().unwrap().len();
+        drain_read_stream(&mut events, &mut sess, &ctx, NOW);
+
+        let out = outbound.lock().unwrap().clone();
+        let new = &out[before..];
+        assert_eq!(
+            new.len(),
+            1,
+            "exactly one env — for the authorized peer: {new:?}"
+        );
+        let envs_a = envs_to(new, CLIENT_KEY_ID);
+        assert_eq!(envs_a.len(), 1, "the one env is addressed to A");
+        let v = client_decrypt_json(&mut transports[0], &envs_a[0]);
+        assert_eq!(v["frame"], "event");
+        assert_eq!(v["event"]["event"], "txStatus");
+        assert_eq!(v["event"]["active"], true);
+        assert_eq!(
+            envs_to(&out, PEER_B).len(),
+            1,
+            "B (no hello) has only its msg2 on the wire — no event"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_stream_withheld_after_capability_expiry() {
+        let identity = AgentIdentity::generate();
+        let mut allow = HashSet::new();
+        allow.insert(CLIENT_KEY_ID.to_string());
+        let mut ctx = fresh_ctx(&identity.key_id(), allow);
+        let dev_a = client_device();
+        let (mut sess, outbound, _t) = hand_session(&identity, &[&dev_a]);
+
+        // Expired one ms ago, and expiring exactly now: both withheld.
+        for exp in [NOW - 1, NOW] {
+            ctx.peers.insert(
+                CLIENT_KEY_ID.to_string(),
+                PeerCtx::authorized_until(vec!["status".to_string(), "qsy".to_string()], exp),
+            );
+            let mut events = feed_with(pancetta_protocol::ServerEvent::TxStatus { active: true });
+            let before = outbound.lock().unwrap().len();
+            drain_read_stream(&mut events, &mut sess, &ctx, NOW);
+            assert_eq!(
+                outbound.lock().unwrap().len(),
+                before,
+                "a capability expired at exp={exp} (now={NOW}) must receive nothing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn status_scope_suffices_for_read_stream() {
+        let identity = AgentIdentity::generate();
+        let mut allow = HashSet::new();
+        allow.insert(CLIENT_KEY_ID.to_string());
+        allow.insert(PEER_B.to_string());
+        let mut ctx = fresh_ctx(&identity.key_id(), allow);
+        let (dev_a, dev_b) = (client_device(), peer_b_device());
+        let (mut sess, outbound, mut transports) = hand_session(&identity, &[&dev_a, &dev_b]);
+        // A holds only the lowest tier; B holds a verified token whose scopes
+        // name no rig-api tier at all.
+        ctx.peers.insert(
+            CLIENT_KEY_ID.to_string(),
+            PeerCtx::authorized_until(vec!["status".to_string()], NOW + 60_000),
+        );
+        ctx.peers.insert(
+            PEER_B.to_string(),
+            PeerCtx::authorized_until(vec!["bogus".to_string()], NOW + 60_000),
+        );
+
+        let mut events = feed_with(pancetta_protocol::ServerEvent::TxStatus { active: false });
+        let before = outbound.lock().unwrap().len();
+        drain_read_stream(&mut events, &mut sess, &ctx, NOW);
+        let out = outbound.lock().unwrap().clone();
+        let envs_a = envs_to(&out[before..], CLIENT_KEY_ID);
+        assert_eq!(envs_a.len(), 1, "status scope suffices for the read stream");
+        let v = client_decrypt_json(&mut transports[0], &envs_a[0]);
+        assert_eq!(v["event"]["event"], "txStatus");
+        assert!(
+            envs_to(&out[before..], PEER_B).is_empty(),
+            "a scope below `status` grants no read access"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_sends_drops_frames_for_unauthorized_peers() {
+        let identity = AgentIdentity::generate();
+        let mut allow = HashSet::new();
+        allow.insert(CLIENT_KEY_ID.to_string());
+        allow.insert(PEER_B.to_string());
+        let mut ctx = fresh_ctx(&identity.key_id(), allow);
+        let (dev_a, dev_b) = (client_device(), peer_b_device());
+        let (mut sess, outbound, mut transports) = hand_session(&identity, &[&dev_a, &dev_b]);
+        ctx.peers.insert(
+            CLIENT_KEY_ID.to_string(),
+            PeerCtx::authorized_until(vec!["status".to_string()], NOW + 60_000),
+        );
+        ctx.peers
+            .insert(PEER_B.to_string(), PeerCtx::unauthorized());
+
+        // One controlState frame per established peer, as every transition
+        // builds them — plus an error frame addressed to B.
+        let mut sends = control_state_sends(&ctx, NOW, None);
+        assert_eq!(sends.len(), 2, "frames are still BUILT for every peer");
+        sends.push(PeerSend {
+            to: SendTarget::One(PEER_B.to_string()),
+            frame: pancetta_protocol::ServerFrame::Event {
+                event: pancetta_protocol::ServerEvent::Error {
+                    component: "stationAgent".into(),
+                    message: "another client holds control — takeControl first".into(),
+                },
+            },
+        });
+        let before = outbound.lock().unwrap().len();
+        deliver_sends(&mut sess, &ctx, &sends, NOW);
+
+        let out = outbound.lock().unwrap().clone();
+        let new = &out[before..];
+        assert_eq!(
+            new.len(),
+            1,
+            "only the authorized peer's frame is delivered: {new:?}"
+        );
+        let envs_a = envs_to(new, CLIENT_KEY_ID);
+        assert_eq!(envs_a.len(), 1);
+        let v = client_decrypt_json(&mut transports[0], &envs_a[0]);
+        assert_eq!(v["event"]["event"], "controlState");
+        assert!(
+            envs_to(new, PEER_B).is_empty(),
+            "nothing, not even an error, to B"
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_hello_returns_control_state_greeting_for_that_peer_only() {
+        let mut ctx = ctx_with(true, true);
+        ctx.peers
+            .insert(PEER_B.to_string(), PeerCtx::unauthorized());
+        let bus = MessageBus::new(64).unwrap();
+        let d = dispatch_action(
+            ControlAction::Hello {
+                capability_token: Some(valid_token()),
+            },
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
+        assert_eq!(d.flow, Dispatch::Continue);
+        assert_eq!(d.sends.len(), 1, "one greeting: {:?}", d.sends);
+        let SendTarget::One(to) = &d.sends[0].to;
+        assert_eq!(to, CLIENT_KEY_ID, "greeting goes to the hello'd peer only");
+        assert!(matches!(
+            d.sends[0].frame,
+            pancetta_protocol::ServerFrame::Event {
+                event: pancetta_protocol::ServerEvent::ControlState { .. }
+            }
+        ));
+        let auth = ctx.peers[CLIENT_KEY_ID].auth.as_ref().expect("auth stored");
+        assert_eq!(auth.exp_ms, (NOW / 1000 + 600) * 1000, "token exp is kept");
+        assert!(ctx.peers[PEER_B].auth.is_none(), "B is untouched");
+    }
+
+    #[tokio::test]
+    async fn invalid_hello_returns_no_frames_and_clears_auth() {
+        let bus = MessageBus::new(64).unwrap();
+        for token in [Some("not.a.jws".to_string()), None] {
+            let mut ctx = ctx_with(true, true);
+            ctx.peers.insert(
+                CLIENT_KEY_ID.to_string(),
+                PeerCtx::authorized_until(vec!["status".to_string()], NOW + 60_000),
+            );
+            let d = dispatch_action(
+                ControlAction::Hello {
+                    capability_token: token.clone(),
+                },
+                CLIENT_KEY_ID,
+                &mut ctx,
+                &bus,
+                SESSION_ID,
+                NOW,
+            )
+            .await;
+            assert!(d.sends.is_empty(), "token {token:?}: no frames");
+            assert!(
+                ctx.peers[CLIENT_KEY_ID].auth.is_none(),
+                "token {token:?}: a failed hello clears any prior capability"
+            );
+            assert!(!peer_may_receive(&ctx, CLIENT_KEY_ID, NOW));
+        }
+    }
+
+    #[tokio::test]
+    async fn qsy_refused_after_hello_token_expires() {
+        let mut ctx = ctx_with(true, true);
+        let bus = MessageBus::new(64).unwrap();
+        let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let hello = ControlAction::Hello {
+            capability_token: Some(token_expiring_at(NOW / 1000 + 5)),
+        };
+        dispatch_action(hello, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
+        let qsy = || ControlAction::Qsy {
+            vfo: 0,
+            frequency_hz: 14_074_000.0,
+        };
+        // Sanity: within the token's lifetime the qsy is forwarded.
+        dispatch_action(qsy(), CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
+        assert!(hamlib_rx.try_recv().is_ok(), "qsy permitted before exp");
+        // A minute later the capability has expired.
+        dispatch_action(
+            qsy(),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW + 60_000,
+        )
+        .await;
+        assert!(
+            hamlib_rx.try_recv().is_err(),
+            "an expired hello capability must not drive setFrequency"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_split_refused_after_hello_token_expires() {
+        let mut ctx = ctx_with(true, true);
+        let bus = MessageBus::new(64).unwrap();
+        let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let hello = ControlAction::Hello {
+            capability_token: Some(token_expiring_at(NOW / 1000 + 5)),
+        };
+        dispatch_action(hello, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
+        let split = || ControlAction::SetSplit {
+            enabled: true,
+            tx_frequency_hz: 14_075_000.0,
+        };
+        dispatch_action(split(), CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
+        assert!(
+            hamlib_rx.try_recv().is_ok(),
+            "setSplit permitted before exp"
+        );
+        dispatch_action(
+            split(),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW + 60_000,
+        )
+        .await;
+        assert!(
+            hamlib_rx.try_recv().is_err(),
+            "an expired hello capability must not drive setSplit"
+        );
+    }
+
+    #[test]
+    fn expired_peer_auth_is_swept_once() {
+        let mut ctx = ctx_with(true, true);
+        ctx.peers.insert(
+            CLIENT_KEY_ID.to_string(),
+            PeerCtx::authorized_until(vec!["status".to_string()], NOW + 1_000),
+        );
+        ctx.peers.insert(
+            PEER_B.to_string(),
+            PeerCtx::authorized_until(vec!["status".to_string()], NOW + 600_000),
+        );
+        assert!(
+            sweep_expired_peer_auth(&mut ctx, NOW).is_empty(),
+            "nothing expired yet"
+        );
+        assert_eq!(
+            sweep_expired_peer_auth(&mut ctx, NOW + 1_000),
+            vec![CLIENT_KEY_ID.to_string()]
+        );
+        assert!(
+            ctx.peers[CLIENT_KEY_ID].auth.is_none(),
+            "expired auth cleared"
+        );
+        assert!(ctx.peers[PEER_B].auth.is_some(), "unexpired auth kept");
+        assert!(
+            sweep_expired_peer_auth(&mut ctx, NOW + 2_000).is_empty(),
+            "an already-swept peer is not reported again"
+        );
+    }
+
+    /// A controller whose hello capability expires is sent nothing from then
+    /// on, so it must not stay armed: expiry disarms it and releases control,
+    /// and the still-authorized peers are told.
+    #[tokio::test]
+    async fn controller_capability_expiry_disarms_and_releases_control() {
+        let mut ctx = ctx_with(true, true);
+        with_consent(&ctx, true);
+        let bus = MessageBus::new(64).unwrap();
+        dispatch_action(
+            arm_action("expiry-arm-jti"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
+        assert!(ctx.arm.lock().unwrap().is_armed(), "setup: armed");
+        assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
+        ctx.peers.insert(
+            CLIENT_KEY_ID.to_string(),
+            PeerCtx::authorized_until(vec!["status".to_string()], NOW + 1_000),
+        );
+        ctx.peers.insert(
+            PEER_B.to_string(),
+            PeerCtx::authorized_until(vec!["status".to_string()], NOW + 600_000),
+        );
+
+        assert!(
+            expire_peer_auth(&mut ctx, NOW).is_empty(),
+            "nothing expired yet"
+        );
+        assert!(ctx.arm.lock().unwrap().is_armed());
+
+        let sends = expire_peer_auth(&mut ctx, NOW + 1_000);
+        assert!(
+            !ctx.arm.lock().unwrap().is_armed(),
+            "an expired controller capability must disarm"
+        );
+        assert_eq!(ctx.controller, None, "and release control");
+        assert!(
+            sends
+                .iter()
+                .any(|s| matches!(&s.to, SendTarget::One(p) if p == PEER_B)),
+            "the remaining peers get the updated controlState"
+        );
+
+        // A non-controller expiring disarms nothing.
+        let mut ctx = ctx_with(true, true);
+        with_consent(&ctx, true);
+        dispatch_action(
+            arm_action("expiry-arm-jti-2"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
+        ctx.peers.insert(
+            PEER_B.to_string(),
+            PeerCtx::authorized_until(vec!["status".to_string()], NOW + 1_000),
+        );
+        assert!(expire_peer_auth(&mut ctx, NOW + 1_000).is_empty());
+        assert!(
+            ctx.arm.lock().unwrap().is_armed(),
+            "a listener expiring disarms nothing"
+        );
+        assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
+    }
+
+    /// Gherkin Scenario 2 end-to-end through `run_one_session`: two devices
+    /// establish real Noise sessions; only the one that sends a valid hello
+    /// receives anything, and its controlState greeting comes AFTER its hello.
+    #[tokio::test]
+    async fn no_frame_reaches_a_peer_until_it_sends_a_valid_hello() {
         let identity = AgentIdentity::generate();
         let agent_kid = identity.key_id();
         let agent_pub = identity.agreement_public_raw();
-        const PEER_A: &str = CLIENT_KEY_ID;
-
         let mut allow = HashSet::new();
-        allow.insert(PEER_A.to_string());
+        allow.insert(CLIENT_KEY_ID.to_string());
         allow.insert(PEER_B.to_string());
         let mut ctx = fresh_ctx(&agent_kid, allow);
         let bus = MessageBus::new(64).unwrap();
 
-        let mut init_a = fresh_initiator(&agent_pub);
-        let mut init_b = fresh_initiator(&agent_pub);
-        let msg1_a = init_a.write_msg1(b"");
-        let msg1_b = init_b.write_msg1(b"");
-
+        let (dev_a, dev_b) = (client_device(), peer_b_device());
+        let mut init_a = initiator_for(&dev_a, &agent_pub);
+        let mut init_b = initiator_for(&dev_b, &agent_pub);
+        let msg1_a = init_a.write_msg1(&proof_for(&dev_a));
+        let msg1_b = init_b.write_msg1(&proof_for(&dev_b));
+        let env = |payload: &[u8], src: &str| {
+            RelayFrame::Env {
+                dst: agent_kid.clone(),
+                payload: b64url(payload),
+                src: Some(src.to_string()),
+            }
+            .to_json()
+            .unwrap()
+        };
         let hello = RelayFrame::Hello {
-            challenge: b64url(&[11u8; 32]),
+            challenge: b64url(&[21u8; 32]),
         }
         .to_json()
         .unwrap();
-        let env_a = RelayFrame::Env {
-            dst: agent_kid.clone(),
-            payload: b64url(&msg1_a),
-            src: Some(PEER_A.to_string()),
-        }
-        .to_json()
-        .unwrap();
-        let env_b = RelayFrame::Env {
-            dst: agent_kid.clone(),
-            payload: b64url(&msg1_b),
-            src: Some(PEER_B.to_string()),
-        }
-        .to_json()
-        .unwrap();
-        // A benign relay frame that yields Poll::Idle without touching
-        // ctx.peers (see the doc comment above) — the tick that lets
-        // `drain_read_stream` run with both peers already established.
         let idle_tick = RelayFrame::Presence {
             peer: "irrelevant-peer".to_string(),
             state: "up".to_string(),
@@ -4288,86 +4967,80 @@ mod tests {
         .unwrap();
 
         let outbound = Arc::new(Mutex::new(Vec::new()));
-        let ws = MockWs::new(vec![hello, env_a, env_b, idle_tick], outbound.clone());
-
-        // Subscribe BEFORE sending so this receiver is guaranteed the event.
-        let (evt_tx, _keepalive) =
-            tokio::sync::broadcast::channel::<pancetta_protocol::ServerEvent>(16);
-        let mut events = Some(evt_tx.subscribe());
-        evt_tx
-            .send(pancetta_protocol::ServerEvent::TxStatus { active: true })
-            .unwrap();
+        // recv #1 hello, #2 env A, #3 env B. The trigger fires just before
+        // recv #4: it queues A's encrypted hello plus an idle tick and
+        // publishes one display event. The event is drained right after the
+        // hello's dispatch on #4 (and again, idle, on #5) — B, established
+        // but hello-less the whole time, must get none of it.
+        let mock = MockWs::new(
+            vec![hello, env(&msg1_a, CLIENT_KEY_ID), env(&msg1_b, PEER_B)],
+            outbound.clone(),
+        );
+        let ws_handle = mock.clone();
+        let trigger_outbound = outbound.clone();
+        let trigger_agent_kid = agent_kid.clone();
+        let (evt_tx, evt_rx) = tokio::sync::broadcast::channel(16);
+        let mut events = Some(evt_rx);
+        let trigger_evt_tx = evt_tx.clone();
+        let transport_slot: Arc<Mutex<Option<snow::TransportState>>> = Arc::new(Mutex::new(None));
+        let slot = transport_slot.clone();
+        let ws = TriggerAfterWs::new(mock, 4, move || {
+            // Both peers are established and nothing but msg2 has been sent.
+            let out = trigger_outbound.lock().unwrap().clone();
+            assert_eq!(envs_to(&out, CLIENT_KEY_ID).len(), 1, "A: only msg2 so far");
+            assert_eq!(envs_to(&out, PEER_B).len(), 1, "B: only msg2 so far");
+            let msg2_a = envs_to(&out, CLIENT_KEY_ID).remove(0);
+            init_a.read_msg2(&msg2_a);
+            let mut t = init_a.into_transport();
+            let token = real_clock_token(&trigger_agent_kid, CLIENT_KEY_ID, &["status"]);
+            let ct = client_encrypt(&mut t, &hello_frame_bytes(&token));
+            *slot.lock().unwrap() = Some(t);
+            ws_handle.push_inbound(
+                RelayFrame::Env {
+                    dst: trigger_agent_kid.clone(),
+                    payload: b64url(&ct),
+                    src: Some(CLIENT_KEY_ID.to_string()),
+                }
+                .to_json()
+                .unwrap(),
+            );
+            ws_handle.push_inbound(idle_tick);
+            trigger_evt_tx
+                .send(pancetta_protocol::ServerEvent::TxStatus { active: true })
+                .unwrap();
+        });
 
         run_one_session(ws, &identity, &mut ctx, &bus, &mut events).await;
+        drop(evt_tx);
 
-        assert!(ctx.peers.contains_key(PEER_A), "peer A must be established");
-        assert!(ctx.peers.contains_key(PEER_B), "peer B must be established");
-
-        // Collect, in wire order, every env addressed to each peer: msg2,
-        // then the PeerEstablished greet, then (from the drain) the event.
+        assert!(ctx.peers.contains_key(CLIENT_KEY_ID));
+        assert!(ctx.peers.contains_key(PEER_B));
         let out = outbound.lock().unwrap().clone();
-        let envs_for = |peer: &str| -> Vec<Vec<u8>> {
-            out.iter()
-                .filter_map(|s| match parse_frame(s).unwrap() {
-                    RelayFrame::Env { dst, payload, .. } if dst == peer => Some(
-                        base64::engine::general_purpose::URL_SAFE_NO_PAD
-                            .decode(&payload)
-                            .unwrap(),
-                    ),
-                    _ => None,
-                })
-                .collect()
-        };
-        let envs_a = envs_for(PEER_A);
-        let envs_b = envs_for(PEER_B);
-        assert_eq!(
-            envs_a.len(),
-            3,
-            "A: msg2 + PeerEstablished greet + the drained event"
-        );
+
+        let envs_b = envs_to(&out, PEER_B);
         assert_eq!(
             envs_b.len(),
-            3,
-            "B: msg2 + PeerEstablished greet + the drained event"
+            1,
+            "the peer that never sent hello gets its msg2 and NOTHING else"
         );
 
-        // Complete each initiator's client transport from its own msg2 (the
-        // first env addressed to it), then decrypt the rest IN ORDER (Noise
-        // transport nonces are sequential — skipping one desyncs the rest).
-        init_a.read_msg2(&envs_a[0]);
-        init_b.read_msg2(&envs_b[0]);
-        let mut ta = init_a.into_transport();
-        let mut tb = init_b.into_transport();
-
-        let decrypt_all = |t: &mut snow::TransportState, cts: &[Vec<u8>]| -> Vec<Vec<u8>> {
-            cts.iter()
-                .map(|ct| {
-                    let mut buf = vec![0u8; ct.len().max(1)];
-                    let n = t.read_message(ct, &mut buf).unwrap();
-                    buf.truncate(n);
-                    buf
-                })
-                .collect()
-        };
-        let plain_a = decrypt_all(&mut ta, &envs_a[1..]);
-        let plain_b = decrypt_all(&mut tb, &envs_b[1..]);
-
-        // The LAST decrypted frame for each peer must be our event, matching
-        // the wire contract exactly (parsed JSON, not string equality).
-        for plaintext in [plain_a.last().unwrap(), plain_b.last().unwrap()] {
-            let v: serde_json::Value = serde_json::from_slice(plaintext).unwrap();
-            assert_eq!(v["frame"], "event");
-            assert_eq!(v["event"]["event"], "txStatus");
-            assert_eq!(v["event"]["active"], true);
-        }
+        let envs_a = envs_to(&out, CLIENT_KEY_ID);
+        assert_eq!(envs_a.len(), 3, "A: msg2, the hello greeting, the event");
+        let mut t = transport_slot.lock().unwrap().take().unwrap();
+        let greeting = client_decrypt_json(&mut t, &envs_a[1]);
+        assert_eq!(greeting["frame"], "event");
+        assert_eq!(greeting["event"]["event"], "controlState");
+        let event = client_decrypt_json(&mut t, &envs_a[2]);
+        assert_eq!(event["event"]["event"], "txStatus");
+        assert_eq!(event["event"]["active"], true);
     }
 
     /// Task 6: with no display feed subscribed (`events: None` — the inert
     /// path when neither the localhost gateway nor `station_agent_active`
     /// started one), `drain_read_stream` must be a strict no-op: a
     /// `Poll::Idle` tick after a peer establishes sends nothing beyond the
-    /// ordinary handshake + greet traffic that peer establishment always
-    /// produces.
+    /// ordinary handshake traffic. Since PAN-95 establishment itself sends no
+    /// greeting — the peer has not sent a `hello` yet, so it gets nothing.
     #[tokio::test]
     async fn read_stream_absent_feed_is_inert() {
         let identity = AgentIdentity::generate();
@@ -4379,8 +5052,9 @@ mod tests {
         let mut ctx = fresh_ctx(&agent_kid, allow);
         let bus = MessageBus::new(64).unwrap();
 
-        let mut init = fresh_initiator(&agent_pub);
-        let msg1 = init.write_msg1(b"");
+        let device = client_device();
+        let mut init = initiator_for(&device, &agent_pub);
+        let msg1 = init.write_msg1(&proof_for(&device));
 
         let hello = RelayFrame::Hello {
             challenge: b64url(&[12u8; 32]),
@@ -4413,13 +5087,13 @@ mod tests {
             "peer must still establish normally"
         );
 
-        // auth (relay leg) + msg2 (handshake) + the PeerEstablished greet —
-        // and NOTHING else. The trailing Idle tick (from `presence:up`) must
+        // auth (relay leg) + msg2 (handshake) — and NOTHING else: no greeting
+        // (no hello yet), and the trailing Idle tick (from `presence:up`) must
         // not have added a single outbound frame.
         let out = outbound.lock().unwrap().clone();
         assert_eq!(
             out.len(),
-            3,
+            2,
             "an absent feed must add zero outbound frames beyond ordinary handshake traffic: {out:?}"
         );
     }
@@ -4868,7 +5542,7 @@ mod tests {
         let mut ctx = fresh_ctx(&agent_kid, allow);
 
         // Pre-arm as CLIENT_KEY_ID (consent + a live grant) BEFORE the
-        // session starts — so the peer's establishment greeting shows
+        // session starts — so the peer's hello greeting shows
         // `transmitArmed: true`, giving the later broadcast a real
         // true→false transition to prove. `run_one_session`'s internal
         // `control_state_sends` calls always use the REAL wall clock
@@ -4898,8 +5572,9 @@ mod tests {
         let poll_revocation_pending = ctx.revocation_pending.clone();
 
         let bus = MessageBus::new(64).unwrap();
-        let mut initiator = fresh_initiator(&agent_pub);
-        let msg1 = initiator.write_msg1(b"");
+        let device = client_device();
+        let mut initiator = initiator_for(&device, &agent_pub);
+        let msg1 = initiator.write_msg1(&proof_for(&device));
 
         let hello = RelayFrame::Hello {
             challenge: b64url(&[7u8; 32]),
@@ -4924,10 +5599,37 @@ mod tests {
         .unwrap();
 
         let outbound = Arc::new(Mutex::new(Vec::new()));
-        let mock = MockWs::new(vec![hello, env_msg1, idle_tick], outbound.clone());
-        // Fires right before the 3rd scripted frame (idle_tick) is served —
-        // i.e. AFTER CLIENT_KEY_ID has already established.
-        let ws = TriggerAfterWs::new(mock, 3, move || {
+        let mock = MockWs::new(vec![hello, env_msg1], outbound.clone());
+        // PAN-95: the peer receives nothing until it sends a valid hello, so
+        // right before recv #3 (after CLIENT_KEY_ID established) complete its
+        // client transport and queue an encrypted real-clock hello, then the
+        // idle tick. The hello yields the controlState greeting (armed=true).
+        let ws_handle = mock.clone();
+        let hello_outbound = outbound.clone();
+        let hello_agent_kid = agent_kid.clone();
+        let transport_slot: Arc<Mutex<Option<snow::TransportState>>> = Arc::new(Mutex::new(None));
+        let slot = transport_slot.clone();
+        let hello_ws = TriggerAfterWs::new(mock, 3, move || {
+            let msg2 = envs_to(&hello_outbound.lock().unwrap(), CLIENT_KEY_ID).remove(0);
+            initiator.read_msg2(&msg2);
+            let mut t = initiator.into_transport();
+            let token = real_clock_token(&hello_agent_kid, CLIENT_KEY_ID, &["status"]);
+            let ct = client_encrypt(&mut t, &hello_frame_bytes(&token));
+            *slot.lock().unwrap() = Some(t);
+            ws_handle.push_inbound(
+                RelayFrame::Env {
+                    dst: hello_agent_kid.clone(),
+                    payload: b64url(&ct),
+                    src: Some(CLIENT_KEY_ID.to_string()),
+                }
+                .to_json()
+                .unwrap(),
+            );
+            ws_handle.push_inbound(idle_tick);
+        });
+        // Fires right before recv #4 (idle_tick) is served — i.e. AFTER
+        // CLIENT_KEY_ID has established AND been greeted on its hello.
+        let ws = TriggerAfterWs::new(hello_ws, 4, move || {
             let effects = poll_arm
                 .lock()
                 .unwrap()
@@ -4951,40 +5653,24 @@ mod tests {
         );
 
         // Every env addressed to CLIENT_KEY_ID, in wire order: msg2, the
-        // establishment greeting (armed=true), then the poll-driven
-        // broadcast (armed=false).
+        // hello greeting (armed=true), then the poll-driven broadcast
+        // (armed=false).
         let out = outbound.lock().unwrap().clone();
-        let envs: Vec<Vec<u8>> = out
-            .iter()
-            .filter_map(|s| match parse_frame(s).unwrap() {
-                RelayFrame::Env { dst, payload, .. } if dst == CLIENT_KEY_ID => Some(
-                    base64::engine::general_purpose::URL_SAFE_NO_PAD
-                        .decode(&payload)
-                        .unwrap(),
-                ),
-                _ => None,
-            })
-            .collect();
+        let envs = envs_to(&out, CLIENT_KEY_ID);
         assert_eq!(
             envs.len(),
             3,
-            "msg2 + the establishment greeting + the poll-driven broadcast"
+            "msg2 + the hello greeting + the poll-driven broadcast"
         );
 
-        initiator.read_msg2(&envs[0]);
-        let mut transport = initiator.into_transport();
-        let mut decrypt = |ct: &[u8]| -> serde_json::Value {
-            let mut buf = vec![0u8; ct.len().max(1)];
-            let n = transport.read_message(ct, &mut buf).unwrap();
-            buf.truncate(n);
-            serde_json::from_slice(&buf).unwrap()
-        };
+        let mut transport = transport_slot.lock().unwrap().take().unwrap();
+        let mut decrypt = |ct: &[u8]| client_decrypt_json(&mut transport, ct);
 
         let greeting = decrypt(&envs[1]);
         assert_eq!(greeting["event"]["event"], "controlState");
         assert_eq!(
             greeting["event"]["transmitArmed"], true,
-            "the establishment greeting must reflect the pre-armed state"
+            "the hello greeting must reflect the pre-armed state"
         );
 
         let broadcast = decrypt(&envs[2]);
@@ -5025,7 +5711,7 @@ mod tests {
         allow.insert(PEER_B.to_string());
         let mut ctx = fresh_ctx(&agent_kid, allow);
 
-        // Pre-arm as CLIENT_KEY_ID (PEER_A) so its establishment greeting
+        // Pre-arm as CLIENT_KEY_ID (PEER_A) so PEER_B's hello greeting
         // shows `transmitArmed: true`, giving the later broadcast a real
         // true→false transition to prove for PEER_B.
         let real_now = now_ms();
@@ -5046,10 +5732,11 @@ mod tests {
         let revocation_pending_after = ctx.revocation_pending.clone();
 
         let bus = MessageBus::new(64).unwrap();
-        let mut init_a = fresh_initiator(&agent_pub);
-        let mut init_b = fresh_initiator(&agent_pub);
-        let msg1_a = init_a.write_msg1(b"");
-        let msg1_b = init_b.write_msg1(b"");
+        let (dev_a, dev_b) = (client_device(), peer_b_device());
+        let mut init_a = initiator_for(&dev_a, &agent_pub);
+        let mut init_b = initiator_for(&dev_b, &agent_pub);
+        let msg1_a = init_a.write_msg1(&proof_for(&dev_a));
+        let msg1_b = init_b.write_msg1(&proof_for(&dev_b));
 
         let hello = RelayFrame::Hello {
             challenge: b64url(&[13u8; 32]),
@@ -5078,9 +5765,36 @@ mod tests {
         // exists after the agent's msg2 (emitted mid-session) is observed.
         let mock = MockWs::new(vec![hello, env_a, env_b], outbound.clone());
         let ws_handle = mock.clone();
+        // PAN-95: PEER_B receives the revocation broadcast only if it holds a
+        // valid hello capability, so right before recv #4 complete its client
+        // transport and queue its encrypted real-clock hello (→ greeting,
+        // armed=true).
+        let hello_ws_handle = mock.clone();
+        let hello_outbound = outbound.clone();
+        let hello_agent_kid = agent_kid.clone();
+        let transport_b_slot: Arc<Mutex<Option<snow::TransportState>>> = Arc::new(Mutex::new(None));
+        let slot_b = transport_b_slot.clone();
+        let hello_ws = TriggerAfterWs::new(mock, 4, move || {
+            let msg2_b = envs_to(&hello_outbound.lock().unwrap(), PEER_B).remove(0);
+            init_b.read_msg2(&msg2_b);
+            let mut t = init_b.into_transport();
+            let token = real_clock_token(&hello_agent_kid, PEER_B, &["status"]);
+            let ct = client_encrypt(&mut t, &hello_frame_bytes(&token));
+            *slot_b.lock().unwrap() = Some(t);
+            hello_ws_handle.push_inbound(
+                RelayFrame::Env {
+                    dst: hello_agent_kid.clone(),
+                    payload: b64url(&ct),
+                    src: Some(PEER_B.to_string()),
+                }
+                .to_json()
+                .unwrap(),
+            );
+        });
         let trigger_outbound = outbound.clone();
         let trigger_agent_kid = agent_kid.clone();
-        let ws = TriggerAfterWs::new(mock, 4, move || {
+        // Fires right before recv #5 — after PEER_B's hello was processed.
+        let ws = TriggerAfterWs::new(hello_ws, 5, move || {
             // Simulate the concurrent poll disarming the live controller
             // between ticks, exactly like the single-peer broadcast test.
             let effects = poll_arm
@@ -5107,7 +5821,7 @@ mod tests {
                     ),
                     _ => None,
                 })
-                .expect("PEER_A's msg2 must already be on the wire by the 4th tick");
+                .expect("PEER_A's msg2 must already be on the wire by the 5th tick");
             init_a.read_msg2(&msg2_a);
             let mut client_transport_a = init_a.into_transport();
 
@@ -5148,42 +5862,31 @@ mod tests {
         );
 
         // PEER_B never sent anything malformed — its wire traffic must show
-        // msg2, the establishment greeting (armed=true), and the poll-driven
+        // msg2, the hello greeting (armed=true), and the poll-driven
         // broadcast (armed=false), proving PEER_A's malformed frame did not
         // suppress the broadcast to PEER_B.
         let out = outbound.lock().unwrap().clone();
-        let envs_b: Vec<Vec<u8>> = out
-            .iter()
-            .filter_map(|s| match parse_frame(s).unwrap() {
-                RelayFrame::Env { dst, payload, .. } if dst == PEER_B => Some(
-                    base64::engine::general_purpose::URL_SAFE_NO_PAD
-                        .decode(&payload)
-                        .unwrap(),
-                ),
-                _ => None,
-            })
-            .collect();
+        let envs_b = envs_to(&out, PEER_B);
         assert_eq!(
             envs_b.len(),
             3,
-            "PEER_B: msg2 + establishment greeting + the poll-driven broadcast \
+            "PEER_B: msg2 + hello greeting + the poll-driven broadcast \
              (PAN-34 regression: PEER_A's malformed frame must not swallow this)"
         );
+        assert_eq!(
+            envs_to(&out, CLIENT_KEY_ID).len(),
+            1,
+            "PEER_A never sent a hello — it gets its msg2 and nothing else"
+        );
 
-        init_b.read_msg2(&envs_b[0]);
-        let mut transport_b = init_b.into_transport();
-        let mut decrypt = |ct: &[u8]| -> serde_json::Value {
-            let mut buf = vec![0u8; ct.len().max(1)];
-            let n = transport_b.read_message(ct, &mut buf).unwrap();
-            buf.truncate(n);
-            serde_json::from_slice(&buf).unwrap()
-        };
+        let mut transport_b = transport_b_slot.lock().unwrap().take().unwrap();
+        let mut decrypt = |ct: &[u8]| client_decrypt_json(&mut transport_b, ct);
 
         let greeting = decrypt(&envs_b[1]);
         assert_eq!(greeting["event"]["event"], "controlState");
         assert_eq!(
             greeting["event"]["transmitArmed"], true,
-            "the establishment greeting must reflect the pre-armed state"
+            "the hello greeting must reflect the pre-armed state"
         );
 
         let broadcast = decrypt(&envs_b[2]);

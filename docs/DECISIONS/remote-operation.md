@@ -235,3 +235,81 @@ The crash invalidates only remote-origin QSOs (`QsoMetadata.remote_origin == tru
 `QsoFailureReason::ComponentCrash("StationAgent")`. Local QSOs do not depend on StationAgent and
 continue unchanged. A restarted StationAgent keeps the same shared arm object but cannot inherit an
 authorization: re-arming must pass through the normal capability and grant-verification path.
+
+## Client identity binding + hello-gated read stream (PAN-95, 2026-10-12)
+
+The station agent's multi-peer session now establishes a relay peer only under the keyId it proves
+inside the Noise IK handshake, and it sends a peer nothing until that peer holds a currently-valid
+`status`-or-higher capability from a verified `hello`. This brings pancetta in line with dispensa
+Q-0019 §5 and Q-0023. The TX-arm chain (`capabilityToken`, `txArmGrant.clientSig`,
+`tx_arm_allow_list`, `ArmState`) is unchanged. Spec, including the ready-to-file dispensa question:
+`docs/superpowers/specs/2026-10-12-client-identity-binding-design.md`.
+
+Decisions:
+
+- **D1 — proof in msg1.** The client puts a JSON identity proof in its Noise IK msg1 payload: its
+  Ed25519 identity public key and its pairing.v1 `idSig`. The station verifies `idSig` over the
+  initiator static key the handshake authenticated (`get_remote_static()`), and the peer's identity
+  is the keyId derived from the proven Ed25519 key. keyIds are self-certifying, so no registry or
+  provisioning is needed, and it works in both static-config and cqdx-poll modes. Rejected:
+  cqdx-delivered client keys on authorization edges (no static-config coverage, couples handshakes
+  to poll freshness), TOFU pinning (first contact unverified), a `cnf` claim in `capabilityToken`
+  (binds at `hello`, after per-peer state exists).
+- **D2 — `src` is routing metadata.** It stays the cheap allow-list/capacity pre-filter before any
+  handshake state is allocated, but a peer is established only if the proven keyId equals it.
+- **D3 — fail closed, no config opt-out.** No proof means refused.
+- **D4 — one outbound predicate.** `peer_may_receive` (status tier, unexpired) is applied in
+  `deliver_sends` and `drain_read_stream`, the only two station→client paths. Nothing goes to an
+  unauthorized peer, `error` frames included.
+- **D5 — greeting on hello.** The `controlState` greeting is sent on a successful `hello`, not on
+  establishment.
+- **D6 — expiry-aware scopes.** `PeerCtx` holds `PeerAuth { scopes, exp_ms }`; `qsy`/`setSplit`
+  use the same `PeerCtx::grants` predicate at the `qsy` tier. `sweep_expired_peer_auth` clears
+  expired auth once per loop and logs each peer once. If the expired peer is the controller,
+  `expire_peer_auth` also disarms and releases control (fail TX-off, as on controller loss), so an
+  armed controller is never left transmitting while the station sends it nothing
+  (`controller_capability_expiry_disarms_and_releases_control`).
+- **D7 — no unfiltered fan-out.** `MultiPeerSession::broadcast` is replaced by `broadcast_to`,
+  where the caller names who may receive.
+- **D8 — refusal reasons.** `Poll::PeerRefused` carries a `RefuseReason` (`NotAllowListed`,
+  `AtCapacity`, `Handshake`, `IdentityProofMissing`, `IdentityProofInvalid`, `IdentityMismatch`),
+  logged at WARN so operators can tell an outdated client from an unlisted one.
+- **D9 — proof format.** UTF-8 JSON `{"v":1,"identityPublicKey","idSig"}`, camelCase, at most 1024
+  bytes, unknown fields ignored, `v` must be 1. The client reuses its enrollment `idSig`.
+- **D10 — dispensa first.** The dispensa question is drafted in the spec; the PR merges only after
+  a human files it.
+
+Files touched: `pancetta-agent/src/peer_identity.rs` (new; `verify_client_identity_proof`),
+`pancetta-agent/src/noise.rs` (`ResponderHandshake::remote_static`),
+`pancetta-agent/src/multi_session.rs` (`bootstrap_peer`, `RefuseReason`, `broadcast_to`),
+`pancetta-agent/src/keys.rs` (`key_id_from_identity_public`, `AgentIdentity::from_secret_bytes`),
+`pancetta-agent/src/lib.rs`, `pancetta-agent/src/session.rs` (doc warning only: the single-peer
+reference does not bind client identity and is not the production path),
+`pancetta-agent/tests/pairing_sig_vectors.rs`, and
+`pancetta/src/coordinator/station_agent/mod.rs` (`PeerAuth`, `PeerCtx::grants`,
+`peer_may_receive`, `sweep_expired_peer_auth`).
+
+Gherkin scenarios and their tests:
+
+- **Scenario 1 — a peer is identified only by the identity it proves in the handshake.**
+  `relay_key_claiming_admitted_client_is_refused`,
+  `relay_key_with_its_own_proof_under_client_label_is_refused` (`multi_session.rs`), and
+  `run_one_session_refuses_relay_keyed_impersonation` (`station_agent/mod.rs`).
+- **Scenario 2 — station data reaches a peer only after a valid `hello`.**
+  `read_stream_events_reach_only_hello_authorized_peers`,
+  `no_frame_reaches_a_peer_until_it_sends_a_valid_hello`, and
+  `read_stream_withheld_after_capability_expiry` (`station_agent/mod.rs`).
+
+Rollout: the station enforces both rules on release (the station agent stays default-OFF).
+Clients must send the identity proof in msg1 and re-send `hello` with a fresh token before `exp`
+(non-TX tokens last at most 900 s). Until panino and cqdx `/rig` ship that, their connections are
+refused with `reason=IdentityProofMissing`. **Merge prerequisite:** file the dispensa question from
+the spec's "Proposed dispensa question" section.
+
+Coordination with PAN-96: PAN-96 (expiry and revocation of existing peers' authority) should build
+on `PeerAuth`, `PeerCtx::grants` and `sweep_expired_peer_auth` rather than add a parallel
+mechanism. PAN-95 already makes `qsy`/`setSplit` check expiry. PAN-96 still owns evicting or
+de-authorizing established peers when an authorization poll revokes them.
+
+Follow-up: `takeControl` and implicit control grabs do not yet require a currently-valid
+`status`+ capability. That is an inbound control-rule change left for a separate ticket.
