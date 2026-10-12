@@ -12,6 +12,7 @@ use crate::widgets::Waterfall;
 
 pub mod active_qsos;
 pub mod band_activity;
+pub mod bar_fit;
 pub mod callers;
 pub mod dx_hunter;
 pub mod qso_status;
@@ -22,6 +23,7 @@ pub mod tx_placement;
 
 use active_qsos::render_active_qsos;
 use band_activity::render_band_activity;
+use bar_fit::BarSegment;
 use callers::render_callers;
 use dx_hunter::render_dx_hunter;
 use qso_status::render_qso_status;
@@ -32,7 +34,7 @@ use tx_placement::{render_placement_zoom, render_tx_placement};
 /// shows a "resize the window" prompt instead. `hit_test` checks the same
 /// floor so a click on that degraded screen (no panels actually visible)
 /// never resolves to a phantom panel rect.
-const MIN_TERMINAL_WIDTH: u16 = 80;
+pub(crate) const MIN_TERMINAL_WIDTH: u16 = 80;
 const MIN_TERMINAL_HEIGHT: u16 = 20;
 
 // Task 18: `ActivePanel::StationInfo` was removed and `render_station_info`
@@ -614,62 +616,110 @@ pub fn hit_test(
     None
 }
 
-fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
-    let utc_clock = chrono::Utc::now().format("%H:%M:%S UTC").to_string();
+/// PAN-88: title-bar priority-fit ranks (see `ui/bar_fit.rs`). Lower is
+/// more important; 0 is pinned. Admit steps bring a chip in at its compact
+/// form (full form when it has none); `*_FULL` steps upgrade compact → full.
+/// When the row is too narrow the chips drop out lowest-value first; when it
+/// fits, every step succeeds and the row is byte-identical to the
+/// pre-PAN-88 row. Reorder by moving a constant — this table IS the policy.
+mod title_rank {
+    pub const CALLSIGN: u8 = 0;
+    pub const TX_POLICY: u8 = 0;
+    pub const LIVE_TX: u8 = 2;
+    pub const PAUSE: u8 = 3;
+    pub const ALARM: u8 = 4;
+    pub const MODE: u8 = 5;
+    pub const FREQ_BAND: u8 = 6;
+    pub const FOX: u8 = 7;
+    pub const SPLIT: u8 = 8;
+    pub const VIEW: u8 = 9;
+    pub const TX_OFFSET: u8 = 10;
+    pub const FREQ_MODE: u8 = 11;
+    pub const QSOS: u8 = 12;
+    pub const DECODE: u8 = 13;
+    pub const FREQ_BAND_FULL: u8 = 14;
+    pub const PAUSE_FULL: u8 = 15;
+    pub const SPLIT_FULL: u8 = 16;
+    pub const TX_OFFSET_FULL: u8 = 17;
+    pub const GRID: u8 = 18;
+    pub const DECODE_FULL: u8 = 19;
+    pub const APP_NAME: u8 = 20;
+}
 
-    let mut left_spans = vec![
-        Span::styled(
-            "Pancetta TUI",
-            Style::default()
-                .fg(app.theme.accent_color())
-                .add_modifier(Modifier::BOLD),
+/// Every title-bar chip as a [`BarSegment`], in display order. Chip text and
+/// styles are unchanged from the pre-PAN-88 row; only the composition moved
+/// into [`title_bar_left_line`]. Returns the segments plus the index of the
+/// grid segment (where #171's own-entity span attaches).
+fn title_bar_segments(app: &App) -> (Vec<BarSegment<'_>>, usize) {
+    let accent_bold = Style::default()
+        .fg(app.theme.accent_color())
+        .add_modifier(Modifier::BOLD);
+
+    let mut segs = vec![
+        BarSegment::new(
+            " | ",
+            vec![Span::styled("Pancetta TUI", accent_bold)],
+            title_rank::APP_NAME,
         ),
-        Span::raw(" | "),
-        Span::styled(
-            &app.station_info.call_sign,
-            Style::default()
-                .fg(app.theme.success_color())
-                .add_modifier(Modifier::BOLD),
+        BarSegment::new(
+            " | ",
+            vec![Span::styled(
+                &app.station_info.call_sign,
+                Style::default()
+                    .fg(app.theme.success_color())
+                    .add_modifier(Modifier::BOLD),
+            )],
+            title_rank::CALLSIGN,
         ),
-        Span::raw(" | "),
-        Span::styled(
-            &app.station_info.grid_square,
-            Style::default().fg(app.theme.foreground_color()),
+        BarSegment::new(
+            " | ",
+            vec![Span::styled(
+                &app.station_info.grid_square,
+                Style::default().fg(app.theme.foreground_color()),
+            )],
+            title_rank::GRID,
         ),
     ];
-    // #171: our own DXCC entity is inserted retroactively, right after this
-    // index, only if it fits — see the width check near the padding
-    // calculation below (the title bar has no wrap/overflow handling, so an
-    // unconditional entity span can silently clip a later chip, e.g. the
-    // QSOs counter, once several other chips are already active).
-    let entity_insert_idx = left_spans.len();
-    left_spans.extend([
-        Span::raw(" | "),
-        Span::styled(
-            format!("{:.3} MHz", app.station_info.operating_frequency),
-            Style::default().fg(app.theme.warning_color()),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            app.config
-                .get_current_band(app.station_info.operating_frequency)
-                .map(|b| b.name.as_str())
-                .unwrap_or(""),
-            Style::default()
-                .fg(app.theme.accent_color())
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" | "),
-        Span::styled(
-            &app.station_info.mode,
-            Style::default()
-                .fg(app.theme.accent_color())
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]);
+    let grid_idx = segs.len() - 1;
 
-    // Bold, color-coded global TX-policy banner chip. Always visible so
-    // the operator can tell at a glance which of the three states is
+    // Frequency + band; the compact form drops the "MHz" unit.
+    let freq_style = Style::default().fg(app.theme.warning_color());
+    let band_span = Span::styled(
+        app.config
+            .get_current_band(app.station_info.operating_frequency)
+            .map(|b| b.name.as_str())
+            .unwrap_or(""),
+        accent_bold,
+    );
+    segs.push(BarSegment::with_compact(
+        " | ",
+        vec![
+            Span::styled(
+                format!("{:.3} MHz", app.station_info.operating_frequency),
+                freq_style,
+            ),
+            Span::raw(" "),
+            band_span.clone(),
+        ],
+        vec![
+            Span::styled(
+                format!("{:.3}", app.station_info.operating_frequency),
+                freq_style,
+            ),
+            Span::raw(" "),
+            band_span,
+        ],
+        title_rank::FREQ_BAND,
+        title_rank::FREQ_BAND_FULL,
+    ));
+    segs.push(BarSegment::new(
+        " | ",
+        vec![Span::styled(&app.station_info.mode, accent_bold)],
+        title_rank::MODE,
+    ));
+
+    // Bold, color-coded global TX-policy banner chip. Always visible (pinned)
+    // so the operator can tell at a glance which of the three states is
     // active: GREEN "TX: FULL", YELLOW "TX: RESPOND-ONLY", RED
     // "TX: DISABLED — RX ONLY". Reversed/bold for visual dominance.
     let (policy_text, policy_bg) = match app.tx_policy {
@@ -677,13 +727,16 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
         pancetta_core::TxPolicy::RespondOnly => (" TX: RESPOND-ONLY ".to_string(), Color::Yellow),
         pancetta_core::TxPolicy::Disabled => (" TX: DISABLED — RX ONLY ".to_string(), Color::Red),
     };
-    left_spans.push(Span::raw(" "));
-    left_spans.push(Span::styled(
-        policy_text,
-        Style::default()
-            .fg(Color::Black)
-            .bg(policy_bg)
-            .add_modifier(Modifier::BOLD),
+    segs.push(BarSegment::new(
+        " ",
+        vec![Span::styled(
+            policy_text,
+            Style::default()
+                .fg(Color::Black)
+                .bg(policy_bg)
+                .add_modifier(Modifier::BOLD),
+        )],
+        title_rank::TX_POLICY,
     ));
 
     // TX-frequency mode chip: HOLD (operator's offset is sticky) vs AUTO
@@ -693,12 +746,10 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
         pancetta_core::TxFreqMode::Hold => " FREQ: HOLD ".to_string(),
         pancetta_core::TxFreqMode::Auto => " FREQ: AUTO ".to_string(),
     };
-    left_spans.push(Span::raw(" "));
-    left_spans.push(Span::styled(
-        freq_text,
-        Style::default()
-            .fg(app.theme.accent_color())
-            .add_modifier(Modifier::BOLD),
+    segs.push(BarSegment::new(
+        " ",
+        vec![Span::styled(freq_text, accent_bold)],
+        title_rank::FREQ_MODE,
     ));
 
     // Decode-effort chip (decoder-speed-overhaul Task 15): the live preset
@@ -708,7 +759,8 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
     // frame-1 (the coordinator seeds it at startup, not just on the
     // operator's first `e` press); `pipeline_health` is `None` only for the
     // first ~2s before the first health tick, in which case the elapsed
-    // reads as 0ms (never exhausted) rather than hiding the chip.
+    // reads as 0ms (never exhausted) rather than hiding the chip. The
+    // compact form keeps only the preset.
     let (decode_elapsed_ms, decode_exhausted) = app
         .pipeline_health
         .as_ref()
@@ -720,12 +772,15 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
         decode_elapsed_ms,
         if decode_exhausted { " ✂" } else { "" }
     );
-    left_spans.push(Span::raw(" "));
-    left_spans.push(Span::styled(
-        decode_text,
-        Style::default()
-            .fg(app.theme.accent_color())
-            .add_modifier(Modifier::BOLD),
+    segs.push(BarSegment::with_compact(
+        " ",
+        vec![Span::styled(decode_text, accent_bold)],
+        vec![Span::styled(
+            format!(" DEC: {} ", app.decode_effort),
+            accent_bold,
+        )],
+        title_rank::DECODE,
+        title_rank::DECODE_FULL,
     ));
 
     // Active-view chip (Phase 2 TUI redesign): shown only when the operator
@@ -733,25 +788,32 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
     // `None` for Operate, so the title bar is byte-identical to today until
     // the operator presses `v`/`V`.
     if let Some(label) = app.active_view.label() {
-        left_spans.push(Span::raw(" "));
-        left_spans.push(Span::styled(
-            format!(" {} ", label),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::White)
-                .add_modifier(Modifier::BOLD),
+        segs.push(BarSegment::new(
+            " ",
+            vec![Span::styled(
+                format!(" {} ", label),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )],
+            title_rank::VIEW,
         ));
     }
 
     // Split-TX chip: shown when the rig is operating split (TX ≠ RX dial).
-    // Task 20e: informational — no background.
+    // Task 20e: informational — no background. Compact form drops the
+    // TX frequency.
     if app.split_tx_hz != 0 {
-        left_spans.push(Span::raw(" "));
-        left_spans.push(Span::styled(
-            format!(" SPLIT TX {:.3} ", app.split_tx_hz as f64 / 1e6),
-            Style::default()
-                .fg(app.theme.accent_color())
-                .add_modifier(Modifier::BOLD),
+        segs.push(BarSegment::with_compact(
+            " ",
+            vec![Span::styled(
+                format!(" SPLIT TX {:.3} ", app.split_tx_hz as f64 / 1e6),
+                accent_bold,
+            )],
+            vec![Span::styled(" SPLIT ", accent_bold)],
+            title_rank::SPLIT,
+            title_rank::SPLIT_FULL,
         ));
     }
 
@@ -759,51 +821,105 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
     // Magenta/bold so it stands out from the cyan SPLIT chip and the green TX
     // chip. Off ⇒ no chip, no change to the title bar.
     if app.fox_mode {
-        left_spans.push(Span::raw(" "));
-        left_spans.push(Span::styled(
-            " FOX ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
+        segs.push(BarSegment::new(
+            " ",
+            vec![Span::styled(
+                " FOX ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            )],
+            title_rank::FOX,
         ));
     }
 
     // TX audio offset chip: shown when the operator has set a held offset.
     // "TX off: NNNN (HOLD)" when set; hidden when Auto (no noise in the bar).
-    // Task 20e: informational — no background.
+    // Task 20e: informational — no background. Compact drops "(HOLD)".
     if let Some(offset_hz) = app.tx_offset_hold_hz {
-        left_spans.push(Span::raw(" "));
-        left_spans.push(Span::styled(
-            format!(" TX off: {} (HOLD) ", offset_hz),
-            Style::default()
-                .fg(app.theme.accent_color())
-                .add_modifier(Modifier::BOLD),
+        segs.push(BarSegment::with_compact(
+            " ",
+            vec![Span::styled(
+                format!(" TX off: {} (HOLD) ", offset_hz),
+                accent_bold,
+            )],
+            vec![Span::styled(
+                format!(" TX off: {} ", offset_hz),
+                accent_bold,
+            )],
+            title_rank::TX_OFFSET,
+            title_rank::TX_OFFSET_FULL,
         ));
     }
 
+<<<<<<< HEAD
+=======
+    // Health alarm chip — prominent warning for the highest-stakes silent
+    // failures so a new operator (or one whose audio device was hijacked by
+    // a remote-desktop client) sees *why* nothing is decoding, rather than
+    // just an empty waterfall. Driven by the existing pipeline health
+    // snapshot; the bottom status bar still shows the per-stage detail.
+    // PAN-88: shown whole or dropped (admit rank 4), never clipped.
+    //
+    // PAN-114: a clock-skew chip joins the chain at the LOWEST priority, so
+    // it never competes with a second alarm chip for title-bar width. The
+    // coordinator's clock monitor owns the threshold; this only formats.
+    if let Some(ref h) = app.pipeline_health {
+        let alarm = if !h.audio_alive {
+            Some(" ⚠ AUDIO DEAD — press d ".to_string())
+        } else if !h.ft8lib_available {
+            Some(" ⚠ DECODER STUB ".to_string())
+        } else {
+            h.clock_skew_warning_s.map(clock_skew_chip_text)
+        };
+        if let Some(text) = alarm {
+            segs.push(BarSegment::new(
+                " ",
+                vec![Span::styled(
+                    text,
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(Color::Red)
+                        .add_modifier(Modifier::BOLD),
+                )],
+                title_rank::ALARM,
+            ));
+        }
+    }
+
+>>>>>>> 803779b9cc66d975d710c345945f4ae9d9aa7d73
     // FCC §97.221 presence prompt: autonomous on, but operator idle → initiation
     // (CQ/pounce) is suppressed until they prove presence with a keypress.
+    let pause_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
     if app.autonomous_init_paused {
-        left_spans.push(Span::raw(" "));
-        left_spans.push(Span::styled(
-            " ⏸ AUTO-CQ PAUSED — press a key (FCC §97.221) ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+        segs.push(BarSegment::with_compact(
+            " ",
+            vec![Span::styled(
+                " ⏸ AUTO-CQ PAUSED — press a key (FCC §97.221) ",
+                pause_style,
+            )],
+            vec![Span::styled(" ⏸ CQ PAUSED: press a key ", pause_style)],
+            title_rank::PAUSE,
+            title_rank::PAUSE_FULL,
         ));
     }
 
     // TX indicator
     if app.is_transmitting {
-        left_spans.push(Span::raw(" "));
-        left_spans.push(Span::styled(
-            " TX ",
-            Style::default()
-                .fg(Color::White)
-                .bg(Color::Red)
-                .add_modifier(Modifier::BOLD),
+        segs.push(BarSegment::new(
+            " ",
+            vec![Span::styled(
+                " TX ",
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            )],
+            title_rank::LIVE_TX,
         ));
     }
 
@@ -811,54 +927,73 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
     // actually completed one, right before the clock — quiet at session
     // start, unmissable once it matters.
     if app.session_completed > 0 {
-        left_spans.push(Span::raw(" "));
-        left_spans.push(Span::styled(
-            format!("QSOs: {} ", app.session_completed),
-            Style::default()
-                .fg(app.theme.accent_color())
-                .add_modifier(Modifier::BOLD),
+        segs.push(BarSegment::new(
+            " ",
+            vec![Span::styled(
+                format!("QSOs: {} ", app.session_completed),
+                accent_bold,
+            )],
+            title_rank::QSOS,
         ));
     }
 
-    // Calculate padding to right-align the UTC clock
-    let mut left_len: usize = left_spans.iter().map(|s| s.width()).sum();
-    let clock_len = utc_clock.len();
+    (segs, grid_idx)
+}
 
-    // #171: only insert our own entity if it actually fits alongside every
-    // other chip already committed to this row — inserted here (not up
-    // front) because whether it fits depends on which OTHER chips ended up
-    // active (TX policy, FREQ, DECODE, QSOs counter, ...), known only now.
+/// The title bar's left side (everything but the clock), priority-fitted to
+/// `width` columns. Pinned chips (callsign, TX policy) are always present.
+fn title_bar_left_line(app: &App, width: u16) -> Line<'_> {
+    let width = width as usize;
+    let (mut segs, grid_idx) = title_bar_segments(app);
+    let forms = bar_fit::fit_bar(&segs, width);
+
+    // #171: our own DXCC entity attaches after the grid only if it fits
+    // alongside every chip `fit_bar` already committed — applied last, so
+    // it never displaces another chip (e.g. the QSOs counter) and only
+    // shows when the grid itself made it in.
     if let Some(entity) = app.station_info.entity_name.as_deref() {
         let entity_span = Span::styled(
             format!(" ({entity})"),
             Style::default().fg(app.theme.muted_color()),
         );
-        let entity_width = entity_span.width();
-        if left_len + entity_width + clock_len <= area.width as usize {
-            left_spans.insert(entity_insert_idx, entity_span);
-            left_len += entity_width;
+        if forms[grid_idx] != bar_fit::SegmentForm::Hidden
+            && bar_fit::bar_width(&segs, &forms) + entity_span.width() <= width
+        {
+            segs[grid_idx].full.push(entity_span);
         }
     }
 
-    let padding = (area.width as usize).saturating_sub(left_len + clock_len);
+    Line::from(bar_fit::bar_spans(segs, &forms))
+}
 
-    left_spans.push(Span::raw(" ".repeat(padding)));
-    left_spans.push(Span::styled(
-        utc_clock,
-        Style::default()
-            .fg(app.theme.foreground_color())
-            .add_modifier(Modifier::BOLD),
-    ));
+/// PAN-88: the UTC clock gets its own reserved rectangle at the right edge
+/// of row 0, so no combination of chips (nor an over-long callsign) can push
+/// it off screen; the chips priority-fit into whatever is left (see
+/// `title_rank` for the drop order).
+fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
+    let utc_clock = chrono::Utc::now().format("%H:%M:%S UTC").to_string();
+    let clock_width = Span::raw(utc_clock.as_str()).width() as u16;
+    let [left_area, clock_area] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(clock_width)]).areas(area);
 
-    let title = Line::from(left_spans);
+    let row_style = Style::default()
+        .bg(app.theme.background_color())
+        .fg(app.theme.foreground_color());
 
-    let paragraph = Paragraph::new(title).style(
-        Style::default()
-            .bg(app.theme.background_color())
-            .fg(app.theme.foreground_color()),
+    f.render_widget(
+        Paragraph::new(title_bar_left_line(app, left_area.width)).style(row_style),
+        left_area,
     );
-
-    f.render_widget(paragraph, area);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            utc_clock,
+            Style::default()
+                .fg(app.theme.foreground_color())
+                .add_modifier(Modifier::BOLD),
+        )))
+        .style(row_style),
+        clock_area,
+    );
 }
 
 /// One-row TX strip showing what's transmitting RIGHT NOW and what's
@@ -1130,22 +1265,30 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )
     };
-    let help_line = Line::from(vec![
-        key_hint("Space"),
-        Span::raw(":Call/Reply | "),
-        key_hint("Arrows"),
-        Span::raw(":TX | "),
-        key_hint("=/-"),
-        Span::raw(":Band | "),
-        key_hint("g"),
-        Span::raw(":TX-policy | "),
-        key_hint("d"),
-        Span::raw(":Audio | "),
-        key_hint("?"),
-        Span::raw(":Help | "),
-        key_hint("q"),
-        Span::raw(":Quit"),
-    ]);
+    // PAN-88: the hints priority-fit the row (same `bar_fit` policy as the
+    // title bar) so a narrow terminal drops whole hints instead of cutting
+    // `q:Quit` mid-word. `?:Help` and `q:Quit` are pinned; `Space:Call/Reply`
+    // shrinks to `Space:Call` before anything drops.
+    let hint = |k: &'static str, label: &'static str, admit: u8| {
+        BarSegment::new(" | ", vec![key_hint(k), Span::raw(label)], admit)
+    };
+    let hint_segs = vec![
+        BarSegment::with_compact(
+            " | ",
+            vec![key_hint("Space"), Span::raw(":Call/Reply")],
+            vec![key_hint("Space"), Span::raw(":Call")],
+            1,
+            8,
+        ),
+        hint("Arrows", ":TX", 3),
+        hint("=/-", ":Band", 5),
+        hint("g", ":TX-policy", 2),
+        hint("d", ":Audio", 4),
+        hint("?", ":Help", 0),
+        hint("q", ":Quit", 0),
+    ];
+    let hint_forms = bar_fit::fit_bar(&hint_segs, area.width as usize);
+    let help_line = Line::from(bar_fit::bar_spans(hint_segs, &hint_forms));
 
     // Split status bar into two lines (Task 20c: the third row — a purely
     // decorative "─" border with no information — was dropped, along with
@@ -2908,6 +3051,346 @@ mod view_render_tests {
             buffer_contains(&buf, "QSOs: 3"),
             "omitting the entity must free up room for the QSOs counter"
         );
+    }
+
+    // ---- PAN-88: critical station state at every supported terminal size ----
+
+    /// Row `y` of `buf` as text, one symbol per cell.
+    fn row_text(buf: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buf.area.width)
+            .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+            .collect()
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn render_app(app: &App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, app).unwrap()).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    async fn default_app() -> App {
+        crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap()
+    }
+
+    /// True when `row` ends with `HH:MM:SS UTC`, checked character by
+    /// character (no regex dependency).
+    fn ends_with_utc_clock(row: &str) -> bool {
+        let chars: Vec<char> = row.chars().collect();
+        if chars.len() < 12 {
+            return false;
+        }
+        let tail = &chars[chars.len() - 12..];
+        [0, 1, 3, 4, 6, 7].iter().all(|&i| tail[i].is_ascii_digit())
+            && tail[2] == ':'
+            && tail[5] == ':'
+            && tail[8..].iter().collect::<String>() == " UTC"
+    }
+
+    const ALL_VIEWS: [crate::view::ActiveView; 4] = [
+        crate::view::ActiveView::Operate,
+        crate::view::ActiveView::Hunt,
+        crate::view::ActiveView::Run,
+        crate::view::ActiveView::Monitor,
+    ];
+
+    /// Gherkin 1: the UTC clock stays visible in the header at the
+    /// documented minimum terminal size, in all four main views.
+    #[tokio::test]
+    async fn title_bar_keeps_utc_clock_in_every_view_at_supported_sizes() {
+        let mut app = default_app().await;
+        for (w, h) in [(80, 20), (80, 24), (100, 30), (132, 40)] {
+            for view in ALL_VIEWS {
+                app.active_view = view;
+                let buf = render_app(&app, w, h);
+                let row = row_text(&buf, 0);
+                assert!(
+                    ends_with_utc_clock(&row),
+                    "{w}x{h} {view:?}: title row lost the UTC clock: [{row}]"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn title_bar_keeps_clock_callsign_and_policy_under_worst_case_load() {
+        let mut app = default_app().await;
+        app.station_info.call_sign = "VP2V/W1ABC".to_string();
+        app.tx_policy = pancetta_core::TxPolicy::Disabled;
+        app.autonomous_init_paused = true;
+        app.fox_mode = true;
+        app.split_tx_hz = 14_075_000;
+        app.tx_offset_hold_hz = Some(1520);
+        app.is_transmitting = true;
+        app.session_completed = 12;
+        app.active_view = crate::view::ActiveView::Hunt;
+        let mut health = health_with_clock(None, false);
+        health.last_decode_budget_exhausted = true;
+        app.pipeline_health = Some(health);
+        for (w, h) in [(80, 24), (100, 30)] {
+            let buf = render_app(&app, w, h);
+            let row = row_text(&buf, 0);
+            assert!(row.contains("VP2V/W1ABC"), "{w}: [{row}]");
+            assert!(row.contains("TX: DISABLED — RX ONLY"), "{w}: [{row}]");
+            assert!(ends_with_utc_clock(&row), "{w}: [{row}]");
+            let left = line_text(&title_bar_left_line(&app, w - 12));
+            assert!(
+                left.chars().count() <= (w - 12) as usize,
+                "{w}: fitted chips overflow their rect: [{left}]"
+            );
+            assert!(
+                row.starts_with(&left),
+                "{w}: a chip was clipped\n row: [{row}]\nleft: [{left}]"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn title_bar_drops_low_value_chips_in_documented_order_at_80_and_100() {
+        let mut app = default_app().await;
+        assert_eq!(
+            line_text(&title_bar_left_line(&app, 68)),
+            "N0CALL | 14.074 MHz 20M | FT8  TX: FULL   FREQ: HOLD   DEC: AUTO "
+        );
+        assert_eq!(
+            line_text(&title_bar_left_line(&app, 88)),
+            "N0CALL | FN20 | 14.074 MHz 20M | FT8  TX: FULL   FREQ: HOLD   DECODE: AUTO 0ms "
+        );
+        app.active_view = crate::view::ActiveView::Hunt;
+        assert_eq!(
+            line_text(&title_bar_left_line(&app, 68)),
+            "N0CALL | 14.074 20M | FT8  TX: FULL   FREQ: HOLD   DEC: AUTO   HUNT "
+        );
+    }
+
+    #[tokio::test]
+    async fn title_bar_is_unchanged_when_everything_fits() {
+        let mut app = default_app().await;
+        let legacy =
+            "Pancetta TUI | N0CALL | FN20 | 14.074 MHz 20M | FT8  TX: FULL   FREQ: HOLD   DECODE: AUTO 0ms ";
+        let check = |row: &str, prefix: &str| {
+            assert!(row.starts_with(prefix), "[{row}] !starts_with [{prefix}]");
+            let rest: String = row.chars().skip(prefix.chars().count()).collect();
+            let rest = rest.trim_start();
+            assert_eq!(rest.chars().count(), 12, "[{row}]");
+            assert!(ends_with_utc_clock(rest), "[{row}]");
+        };
+
+        let buf = render_app(&app, 120, 40);
+        check(&row_text(&buf, 0), legacy);
+
+        app.active_view = crate::view::ActiveView::Hunt;
+        let buf = render_app(&app, 120, 40);
+        check(&row_text(&buf, 0), &format!("{legacy}  HUNT "));
+
+        app.active_view = crate::view::ActiveView::Operate;
+        let buf = render_app(&app, 160, 40);
+        check(
+            &row_text(&buf, 0),
+            "Pancetta TUI | N0CALL | FN20 (United States) | 14.074 MHz 20M | FT8  TX: FULL   FREQ: HOLD   DECODE: AUTO 0ms",
+        );
+    }
+
+    /// Whitespace-split tokens of a bordered panel's header row (the row
+    /// right under the top border, between the side borders).
+    fn panel_header_tokens(buf: &ratatui::buffer::Buffer, rect: Rect) -> Vec<String> {
+        let y = rect.y + 1;
+        let row: String = (rect.x + 1..rect.x + rect.width - 1)
+            .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        row.split_whitespace().map(str::to_string).collect()
+    }
+
+    fn panel_rows_text(buf: &ratatui::buffer::Buffer, rect: Rect) -> String {
+        (rect.y..rect.y + rect.height)
+            .map(|y| {
+                (rect.x..rect.x + rect.width)
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn fixture_dx_station(call: &str) -> crate::app::DxStation {
+        crate::app::DxStation {
+            call_sign: call.to_string(),
+            grid_square: Some("RE78".to_string()),
+            frequency: 14.074,
+            mode: "FT8".to_string(),
+            last_seen: chrono::Utc::now(),
+            snr: -12,
+            distance: Some(14_000.0),
+            bearing: None,
+            worked_before: false,
+            needed: true,
+            atno: false,
+            band_needed: true,
+            priority_score: 3120,
+            source: crate::app::SpotSource::Both,
+            entity_name: Some("New Zealand".to_string()),
+            rarity_tier: Some("rare".to_string()),
+            reporter_count: Some(14),
+            is_notable: false,
+            notable_type: None,
+            confidence: None,
+            best_snr_network: Some(-12),
+            last_seen_network: None,
+            audio_offset_hz: None,
+            slot_parity: None,
+            watchlisted: false,
+        }
+    }
+
+    fn fixture_caller(app: &App, call: &str) -> crate::app::DecodedMessageView {
+        crate::app::DecodedMessageView {
+            timestamp: chrono::Utc::now(),
+            frequency: 14.074,
+            mode: "FT8".to_string(),
+            snr: -7,
+            delta_time: 0.1,
+            delta_freq: 1210.0,
+            call_sign: Some(call.to_string()),
+            grid_square: Some("JO62".to_string()),
+            message: format!("{} {} JO62", app.station_info.call_sign, call),
+            distance: None,
+            bearing: None,
+            slot_parity: None,
+            is_directed_at_us: true,
+            worked_before: true,
+            needed: false,
+            atno: false,
+            band_needed: false,
+            priority_score: None,
+            is_own_tx: false,
+        }
+    }
+
+    const SUPPORTED_SIZES: [(u16, u16); 3] = [(80, 24), (100, 30), (132, 40)];
+
+    /// Gherkin 2: DX Hunter column headings stay whole words at 80 columns
+    /// (and the other supported sizes), focused or not, in Operate and Hunt.
+    #[tokio::test]
+    async fn dx_hunter_headings_are_whole_words_at_supported_sizes() {
+        let full_names: Vec<&str> = dx_hunter::DxHunterColumn::ALL
+            .iter()
+            .map(|c| c.header())
+            .collect();
+        let mut app = default_app().await;
+        app.dx_stations
+            .insert("ZL1ABC".to_string(), fixture_dx_station("ZL1ABC"));
+        app.active_panel = ActivePanel::DxHunter;
+        for (w, h) in SUPPORTED_SIZES {
+            let content = content_area(Rect::new(0, 0, w, h));
+            for view in [
+                crate::view::ActiveView::Operate,
+                crate::view::ActiveView::Hunt,
+            ] {
+                app.active_view = view;
+                let rect = match view {
+                    crate::view::ActiveView::Hunt => compute_hunt_rects(content).dx_hunter,
+                    _ => compute_operate_rects(content).dx_hunter,
+                };
+                let buf = render_app(&app, w, h);
+                let tokens = panel_header_tokens(&buf, rect);
+                let expected: Vec<&str> = dx_hunter::visible_columns(rect.width)
+                    .into_iter()
+                    .map(|c| c.header())
+                    .collect();
+                assert_eq!(tokens, expected, "{w}x{h} {view:?}");
+                for t in &tokens {
+                    assert!(full_names.contains(&t.as_str()), "{w}x{h} {view:?}: {t}");
+                }
+                for must in ["Call", "Entity", "SNR"] {
+                    assert!(tokens.iter().any(|t| t == must), "{w}x{h} {view:?}");
+                }
+                assert!(
+                    !row_text(&buf, rect.y + 1).contains("G S R R L P"),
+                    "{w}x{h} {view:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn callers_headings_are_whole_words_at_supported_sizes() {
+        let full_names: Vec<&str> = callers::CallersColumn::ALL
+            .iter()
+            .map(|c| c.header())
+            .collect();
+        let mut app = default_app().await;
+        let caller = fixture_caller(&app, "DL1XYZ");
+        app.decoded_messages.push_back(caller);
+        app.active_panel = ActivePanel::Callers;
+        for (w, h) in SUPPORTED_SIZES {
+            let content = content_area(Rect::new(0, 0, w, h));
+            for view in [
+                crate::view::ActiveView::Operate,
+                crate::view::ActiveView::Run,
+            ] {
+                app.active_view = view;
+                let rect = match view {
+                    crate::view::ActiveView::Run => compute_run_rects(content).callers,
+                    _ => compute_operate_rects(content).callers,
+                };
+                let buf = render_app(&app, w, h);
+                let tokens = panel_header_tokens(&buf, rect);
+                let expected: Vec<&str> = callers::visible_columns(rect.width)
+                    .into_iter()
+                    .map(|c| c.header())
+                    .collect();
+                assert_eq!(tokens, expected, "{w}x{h} {view:?}");
+                for t in &tokens {
+                    assert!(full_names.contains(&t.as_str()), "{w}x{h} {view:?}: {t}");
+                }
+                for must in ["Call", "Msg", "SNR"] {
+                    assert!(tokens.iter().any(|t| t == must), "{w}x{h} {view:?}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dx_hunter_and_callers_empty_states_are_legible_at_80x24() {
+        let app = default_app().await;
+        let buf = render_app(&app, 80, 24);
+        let rects = compute_operate_rects(content_area(Rect::new(0, 0, 80, 24)));
+        let dx = panel_rows_text(&buf, rects.dx_hunter);
+        assert!(dx.contains("No DX") && dx.contains("stations"), "{dx}");
+        let callers = panel_rows_text(&buf, rects.callers);
+        assert!(
+            callers.contains("No one") && callers.contains("calling"),
+            "{callers}"
+        );
+    }
+
+    #[tokio::test]
+    async fn footer_key_hints_fit_at_80_columns() {
+        let app = default_app().await;
+        let buf = render_app(&app, 80, 24);
+        assert_eq!(
+            row_text(&buf, 23).trim_end(),
+            "Space:Call | Arrows:TX | =/-:Band | g:TX-policy | d:Audio | ?:Help | q:Quit"
+        );
+    }
+
+    #[tokio::test]
+    async fn footer_key_hints_unchanged_when_they_fit() {
+        let app = default_app().await;
+        let buf = render_app(&app, 100, 30);
+        assert_eq!(
+            row_text(&buf, 29).trim_end(),
+            "Space:Call/Reply | Arrows:TX | =/-:Band | g:TX-policy | d:Audio | ?:Help | q:Quit"
+        );
+        let cell = &buf[(0, 29)];
+        assert_eq!(cell.symbol(), "S");
+        assert_eq!(cell.fg, app.theme.accent_color());
+        assert!(cell.modifier.contains(Modifier::BOLD));
     }
 }
 

@@ -22,6 +22,119 @@ fn format_dx_snr(source: &SpotSource, snr: i32, best_snr_network: Option<i32>) -
     }
 }
 
+/// Row-highlight marker for the selected station. Also part of the column
+/// budget in [`visible_columns`] (PAN-88, D4).
+const HIGHLIGHT_SYMBOL: &str = "▶ ";
+
+/// Single source of truth for DX Hunter's column set (PAN-88), mirroring
+/// Band Activity's `BandActivityColumn`: the header, the widths and every
+/// row's cells derive from [`visible_columns`], so they can't drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DxHunterColumn {
+    Src,
+    Call,
+    Entity,
+    Grid,
+    Snr,
+    Rarity,
+    Rpt,
+    Last,
+    Pri,
+}
+
+impl DxHunterColumn {
+    /// Display order (left to right).
+    pub(super) const ALL: [DxHunterColumn; 9] = [
+        DxHunterColumn::Src,
+        DxHunterColumn::Call,
+        DxHunterColumn::Entity,
+        DxHunterColumn::Grid,
+        DxHunterColumn::Snr,
+        DxHunterColumn::Rarity,
+        DxHunterColumn::Rpt,
+        DxHunterColumn::Last,
+        DxHunterColumn::Pri,
+    ];
+
+    /// The order columns join as the panel widens: the call (with its need
+    /// markers), what entity it is, how strong it is and how much pancetta
+    /// wants it come first; `Src`/`Rpt` are diagnostics. Freshness is
+    /// already shown by dimming stale rows, so `Last` can wait for room.
+    const PRIORITY: [DxHunterColumn; 9] = [
+        DxHunterColumn::Call,
+        DxHunterColumn::Entity,
+        DxHunterColumn::Snr,
+        DxHunterColumn::Pri,
+        DxHunterColumn::Last,
+        DxHunterColumn::Rarity,
+        DxHunterColumn::Grid,
+        DxHunterColumn::Rpt,
+        DxHunterColumn::Src,
+    ];
+
+    pub(super) fn header(self) -> &'static str {
+        match self {
+            DxHunterColumn::Src => "Src",
+            DxHunterColumn::Call => "Call",
+            DxHunterColumn::Entity => "Entity",
+            DxHunterColumn::Grid => "Grid",
+            DxHunterColumn::Snr => "SNR",
+            DxHunterColumn::Rarity => "Rarity",
+            DxHunterColumn::Rpt => "Rpt",
+            DxHunterColumn::Last => "Last",
+            DxHunterColumn::Pri => "Pri",
+        }
+    }
+
+    fn width(self) -> Constraint {
+        match self {
+            DxHunterColumn::Src => Constraint::Length(4),
+            // !/+ need + ★ markers + up to ~8 chars.
+            DxHunterColumn::Call => Constraint::Length(12),
+            // Flexes into the freed Freq space.
+            DxHunterColumn::Entity => Constraint::Min(8),
+            DxHunterColumn::Grid => Constraint::Length(4),
+            DxHunterColumn::Snr => Constraint::Length(4),
+            DxHunterColumn::Rarity => Constraint::Length(7),
+            DxHunterColumn::Rpt => Constraint::Length(3),
+            DxHunterColumn::Last => Constraint::Length(5),
+            DxHunterColumn::Pri => Constraint::Length(4),
+        }
+    }
+
+    /// The narrowest this column is ever drawn (its `Length`/`Min`).
+    fn min_width(self) -> u16 {
+        match self.width() {
+            Constraint::Length(n) | Constraint::Min(n) => n,
+            _ => 0,
+        }
+    }
+}
+
+/// Columns shown in a DX Hunter panel `width` columns wide (PAN-88).
+///
+/// D3, prefix rule: walk [`DxHunterColumn::PRIORITY`], adding each column's
+/// minimum width plus 1 of spacing, and stop at the first that doesn't fit —
+/// monotonic, so widening never removes a column, and no heading is ever
+/// squeezed to a stub. D4: the budget always reserves the highlight marker's
+/// width (besides the 2 borders) so the set doesn't jump when the operator
+/// Tabs into the panel. `Call` is always shown. Returned in display order.
+pub(super) fn visible_columns(width: u16) -> Vec<DxHunterColumn> {
+    let budget = width
+        .saturating_sub(2)
+        .saturating_sub(Span::raw(HIGHLIGHT_SYMBOL).width() as u16);
+    let n = super::bar_fit::prefix_fit(
+        DxHunterColumn::PRIORITY.iter().map(|c| c.min_width()),
+        budget,
+    )
+    .max(1);
+    let shown = &DxHunterColumn::PRIORITY[..n];
+    DxHunterColumn::ALL
+        .into_iter()
+        .filter(|c| shown.contains(c))
+        .collect()
+}
+
 pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
     let is_active = matches!(app.active_panel, ActivePanel::DxHunter);
     let block = create_panel_block("DX Hunter", is_active, app);
@@ -29,13 +142,11 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
     // Prepare table data
     // "Freq" dropped — every DX Hunter spot is on the current band's FT8 dial,
     // so the column was always identical. Replaced with the DXCC "Entity" the
-    // operator actually wants to scan.
-    let header_cells = [
-        "Src", "Call", "Entity", "Grid", "SNR", "Rarity", "Rpt", "Last", "Pri",
-    ]
-    .iter()
-    .map(|h| {
-        Cell::from(*h).style(
+    // operator actually wants to scan. PAN-88: narrow panels show fewer,
+    // whole columns (see `visible_columns`).
+    let columns = visible_columns(area.width);
+    let header_cells = columns.iter().map(|c| {
+        Cell::from(c.header()).style(
             Style::default()
                 .fg(app.theme.accent_color())
                 .add_modifier(Modifier::BOLD),
@@ -55,42 +166,22 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
     // the selected row visible.
     let mut rows: Vec<Row> = dx_list
         .iter()
-        .map(|station| create_dx_row(station, app))
+        .map(|station| create_dx_row(station, app, &columns))
         .collect();
 
     // If no DX stations, show placeholder
     if rows.is_empty() {
-        rows.push(Row::new(
-            [
-                Cell::from(""),
-                Cell::from("No DX"),
-                Cell::from("stations"),
-                Cell::from(""),
-                Cell::from(""),
-                Cell::from(""),
-                Cell::from(""),
-                Cell::from(""),
-                Cell::from(""),
-            ]
-            .iter()
-            .map(|c| {
-                c.clone()
-                    .style(Style::default().fg(app.theme.muted_color()))
-            }),
-        ));
+        rows.push(Row::new(columns.iter().map(|c| {
+            let text = match c {
+                DxHunterColumn::Call => "No DX",
+                DxHunterColumn::Entity => "stations",
+                _ => "",
+            };
+            Cell::from(text).style(Style::default().fg(app.theme.muted_color()))
+        })));
     }
 
-    let widths = [
-        Constraint::Length(4),  // Src
-        Constraint::Length(12), // Call (!/+ need + ★ markers + up to ~8 chars)
-        Constraint::Min(8),     // Entity (flexes into the freed Freq space)
-        Constraint::Length(4),  // Grid
-        Constraint::Length(4),  // SNR
-        Constraint::Length(7),  // Rarity
-        Constraint::Length(3),  // Rpt
-        Constraint::Length(5),  // Last
-        Constraint::Length(4),  // Pri
-    ];
+    let widths: Vec<Constraint> = columns.iter().map(|c| c.width()).collect();
 
     let table = Table::new(rows, widths)
         .header(header)
@@ -105,7 +196,7 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
                 .add_modifier(Modifier::REVERSED)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▶ ");
+        .highlight_symbol(HIGHLIGHT_SYMBOL);
 
     // The selected index is `dx_hunter_scroll` into the displayed list.
     // `TableState` clamps the viewport so the selection stays on screen,
@@ -155,7 +246,7 @@ fn entity_cell_text(station: &DxStation, state: Option<&str>) -> String {
     }
 }
 
-fn create_dx_row<'a>(station: &'a DxStation, app: &App) -> Row<'a> {
+fn create_dx_row<'a>(station: &'a DxStation, app: &App, columns: &[DxHunterColumn]) -> Row<'a> {
     // Cross-panel global focus (Task 2): when some OTHER panel is active and
     // this row's callsign is the operator's current focus, flag it here too
     // — but only when DX Hunter itself is NOT the active panel, so we never
@@ -301,17 +392,36 @@ fn create_dx_row<'a>(station: &'a DxStation, app: &App) -> Row<'a> {
         _ => dim,
     };
 
-    Row::new([
-        Cell::from(src_str).style(src_style),
-        Cell::from(call_display).style(call_style),
-        Cell::from(entity_str).style(Style::default().fg(app.theme.accent_color())),
-        Cell::from(grid_str).style(dim),
-        Cell::from(snr_str).style(snr_style),
-        Cell::from(rarity_str).style(rarity_style),
-        Cell::from(rpt_str).style(dim),
-        Cell::from(last_str).style(dim),
-        Cell::from(pri_str).style(priority_style),
-    ])
+    // One cell per visible column (PAN-88), mirroring
+    // `band_activity::create_message_row`.
+    Row::new(
+        [
+            (DxHunterColumn::Src, Cell::from(src_str).style(src_style)),
+            (
+                DxHunterColumn::Call,
+                Cell::from(call_display).style(call_style),
+            ),
+            (
+                DxHunterColumn::Entity,
+                Cell::from(entity_str).style(Style::default().fg(app.theme.accent_color())),
+            ),
+            (DxHunterColumn::Grid, Cell::from(grid_str).style(dim)),
+            (DxHunterColumn::Snr, Cell::from(snr_str).style(snr_style)),
+            (
+                DxHunterColumn::Rarity,
+                Cell::from(rarity_str).style(rarity_style),
+            ),
+            (DxHunterColumn::Rpt, Cell::from(rpt_str).style(dim)),
+            (DxHunterColumn::Last, Cell::from(last_str).style(dim)),
+            (
+                DxHunterColumn::Pri,
+                Cell::from(pri_str).style(priority_style),
+            ),
+        ]
+        .into_iter()
+        .filter(|(col, _)| columns.contains(col))
+        .map(|(_, cell)| cell),
+    )
 }
 
 /// Build the full callsign cell display: need/notable markers, band-needed
@@ -433,6 +543,79 @@ fn extract_base_prefix(call_sign: &str) -> String {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    // ---- PAN-88: adaptive columns ----
+    // Canonical panel widths: Operate's 40% right column at 80/100/120/132
+    // columns, then the wide tier (160 columns, and Hunt view at 80).
+
+    #[test]
+    fn visible_columns_compact_tier_at_operate_80() {
+        use DxHunterColumn::*;
+        assert_eq!(visible_columns(32), vec![Call, Entity, Snr]);
+    }
+
+    #[test]
+    fn visible_columns_at_operate_100() {
+        use DxHunterColumn::*;
+        assert_eq!(visible_columns(40), vec![Call, Entity, Snr, Pri]);
+    }
+
+    #[test]
+    fn visible_columns_at_operate_120() {
+        use DxHunterColumn::*;
+        assert_eq!(visible_columns(48), vec![Call, Entity, Snr, Last, Pri]);
+    }
+
+    #[test]
+    fn visible_columns_at_operate_132() {
+        use DxHunterColumn::*;
+        assert_eq!(
+            visible_columns(53),
+            vec![Call, Entity, Snr, Rarity, Last, Pri]
+        );
+    }
+
+    #[test]
+    fn visible_columns_wide_tier_shows_all() {
+        assert_eq!(visible_columns(64), DxHunterColumn::ALL.to_vec());
+        assert_eq!(visible_columns(80), DxHunterColumn::ALL.to_vec());
+    }
+
+    #[test]
+    fn visible_columns_are_in_display_order_and_monotonic() {
+        for w in 16..=200u16 {
+            let cols = visible_columns(w);
+            let positions: Vec<usize> = cols
+                .iter()
+                .map(|c| DxHunterColumn::ALL.iter().position(|a| a == c).unwrap())
+                .collect();
+            assert!(
+                positions.windows(2).all(|p| p[0] < p[1]),
+                "width {w}: {cols:?} not in display order"
+            );
+            let wider = visible_columns(w + 1);
+            assert!(
+                cols.iter().all(|c| wider.contains(c)),
+                "width {w}: {cols:?} not a subset of {wider:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn visible_columns_always_fit_their_budget() {
+        for w in 16..=200u16 {
+            let cols = visible_columns(w);
+            let used: u16 = cols.iter().map(|c| c.min_width()).sum::<u16>() + cols.len() as u16 - 1;
+            assert!(used <= w - 4, "width {w}: {cols:?} needs {used}");
+        }
+    }
+
+    #[test]
+    fn every_header_is_at_least_as_narrow_as_its_column() {
+        for c in DxHunterColumn::ALL {
+            assert!(c.header().len() as u16 <= c.min_width(), "{c:?}");
+        }
+    }
 
     #[test]
     fn priority_style_thresholds_track_tier_band_width() {
