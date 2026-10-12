@@ -257,7 +257,7 @@ fn compute_operate_rects(content_area: Rect) -> OperateRects {
     // slot; a static summary of the global focus, not a navigable panel) on
     // top, DX Hunter (moved up) in the middle, Callers on the bottom —
     // aligned with QSO Status across the gutter.
-    let right_chunks = Layout::default()
+    let mut right_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Percentage(20), // Station card
@@ -265,6 +265,20 @@ fn compute_operate_rects(content_area: Rect) -> OperateRects {
             Constraint::Percentage(40), // Callers (bottom; across from QSO Status)
         ])
         .split(lower[1]);
+    // PAN-89: at 80×24 the readiness strip leaves this column 11 rows, where
+    // the card is borders only and Callers has no row below its header (an
+    // `Enter=send` hint with no visible caller). Drop the card there, as
+    // Hunt does below its own height threshold.
+    if right_chunks[0].height < 3 {
+        right_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(0),
+                Constraint::Percentage(50),
+                Constraint::Percentage(50),
+            ])
+            .split(lower[1]);
+    }
 
     OperateRects {
         banner: content[0],
@@ -627,7 +641,6 @@ mod title_rank {
     pub const TX_POLICY: u8 = 0;
     pub const LIVE_TX: u8 = 2;
     pub const PAUSE: u8 = 3;
-    pub const ALARM: u8 = 4;
     pub const MODE: u8 = 5;
     pub const FREQ_BAND: u8 = 6;
     pub const FOX: u8 = 7;
@@ -853,42 +866,6 @@ fn title_bar_segments(app: &App) -> (Vec<BarSegment<'_>>, usize) {
         ));
     }
 
-<<<<<<< HEAD
-=======
-    // Health alarm chip — prominent warning for the highest-stakes silent
-    // failures so a new operator (or one whose audio device was hijacked by
-    // a remote-desktop client) sees *why* nothing is decoding, rather than
-    // just an empty waterfall. Driven by the existing pipeline health
-    // snapshot; the bottom status bar still shows the per-stage detail.
-    // PAN-88: shown whole or dropped (admit rank 4), never clipped.
-    //
-    // PAN-114: a clock-skew chip joins the chain at the LOWEST priority, so
-    // it never competes with a second alarm chip for title-bar width. The
-    // coordinator's clock monitor owns the threshold; this only formats.
-    if let Some(ref h) = app.pipeline_health {
-        let alarm = if !h.audio_alive {
-            Some(" ⚠ AUDIO DEAD — press d ".to_string())
-        } else if !h.ft8lib_available {
-            Some(" ⚠ DECODER STUB ".to_string())
-        } else {
-            h.clock_skew_warning_s.map(clock_skew_chip_text)
-        };
-        if let Some(text) = alarm {
-            segs.push(BarSegment::new(
-                " ",
-                vec![Span::styled(
-                    text,
-                    Style::default()
-                        .fg(Color::White)
-                        .bg(Color::Red)
-                        .add_modifier(Modifier::BOLD),
-                )],
-                title_rank::ALARM,
-            ));
-        }
-    }
-
->>>>>>> 803779b9cc66d975d710c345945f4ae9d9aa7d73
     // FCC §97.221 presence prompt: autonomous on, but operator idle → initiation
     // (CQ/pounce) is suppressed until they prove presence with a keypress.
     let pause_style = Style::default()
@@ -1793,23 +1770,65 @@ pub fn render_health_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
     if area.width < 20 || area.height < 6 {
         return;
     }
-    let modal_width = area.width.saturating_sub(4).min(70);
-    let modal_height = area.height.saturating_sub(4).min(24);
-    let modal_area = Rect {
-        x: (area.width.saturating_sub(modal_width)) / 2,
-        y: (area.height.saturating_sub(modal_height)) / 2,
-        width: modal_width,
-        height: modal_height,
-    };
+    let modal_area = health_panel_rect(area);
     f.render_widget(ratatui::widgets::Clear, modal_area);
 
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .title(" Station Health — k aborts QSO, Esc/S close ")
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(modal_area);
-    f.render_widget(block, modal_area);
 
+    // PAN-89: the readiness section can push the panel past its height
+    // (80×24 fits ~4 items before the rig/audio/clock rows clip), so the
+    // body scrolls; the bottom border says so only while it overflows.
+    let paragraph =
+        Paragraph::new(health_panel_lines(app)).wrap(ratatui::widgets::Wrap { trim: false });
+    let total = u16::try_from(paragraph.line_count(inner.width)).unwrap_or(u16::MAX);
+    let max_scroll = total.saturating_sub(inner.height);
+    let scroll = app.health_scroll.min(max_scroll);
+    if max_scroll > 0 {
+        block = block.title_bottom(format!(
+            " ↑↓ PgUp PgDn scroll · {}–{} of {} ",
+            scroll + 1,
+            scroll + inner.height,
+            total
+        ));
+    }
+    f.render_widget(block, modal_area);
+    f.render_widget(paragraph.scroll((scroll, 0)), inner);
+}
+
+/// PAN-89: the Shift+S modal's rect within a full-terminal `area`.
+fn health_panel_rect(area: Rect) -> Rect {
+    let modal_width = area.width.saturating_sub(4).min(70);
+    let modal_height = area.height.saturating_sub(4).min(24);
+    Rect {
+        x: (area.width.saturating_sub(modal_width)) / 2,
+        y: (area.height.saturating_sub(modal_height)) / 2,
+        width: modal_width,
+        height: modal_height,
+    }
+}
+
+/// PAN-89: the Shift+S panel's `(max_scroll, page)` in rendered (wrapped)
+/// lines for a full-terminal `area`; `max_scroll` is 0 when everything
+/// fits. The key handler clamps with this; the renderer recomputes the
+/// same numbers.
+pub fn health_panel_scroll_bounds(area: Rect, app: &App) -> (u16, u16) {
+    let inner = Block::default()
+        .borders(Borders::ALL)
+        .inner(health_panel_rect(area));
+    let total = Paragraph::new(health_panel_lines(app))
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .line_count(inner.width);
+    let total = u16::try_from(total).unwrap_or(u16::MAX);
+    (total.saturating_sub(inner.height), inner.height.max(1))
+}
+
+/// The Shift+S panel body: readiness section, pipeline health, rig/audio/
+/// clock rows, session counts.
+fn health_panel_lines(app: &App) -> Vec<Line<'static>> {
     fn dot(ok: bool) -> Span<'static> {
         if ok {
             Span::styled("●", Style::default().fg(Color::Green))
@@ -1970,11 +1989,7 @@ pub fn render_health_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
         "  QSOs completed: {}   failed: {}   TX drops: {}",
         app.session_completed, app.session_failed, app.session_tx_drops
     ))));
-
-    f.render_widget(
-        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
-        inner,
-    );
+    lines
 }
 
 /// Render the required out-of-band acknowledgment modal.
@@ -2218,12 +2233,6 @@ mod view_render_tests {
         }
     }
 
-    fn row_text(buf: &ratatui::buffer::Buffer, y: u16) -> String {
-        (0..buf.area.width)
-            .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
-            .collect()
-    }
-
     /// PAN-89: the clock-skew chip moved from the title bar into the
     /// readiness strip (row 1).
     async fn strip_row_with_clock(
@@ -2443,6 +2452,76 @@ mod view_render_tests {
         assert!(buffer_contains(&buf, "Readiness: TX OPEN"));
         assert!(buffer_contains(&buf, "PTT may still be keyed"));
         assert!(buffer_contains(&buf, "Clock unverified (ack'd)"));
+    }
+
+    fn render_health_80x24(app: &crate::app::App) -> ratatui::buffer::Buffer {
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| render_health_panel(f, f.area(), app))
+            .unwrap();
+        term.backend().buffer().clone()
+    }
+
+    /// PAN-89 (Codex P2 on PR #420): eight readiness items push the Shift+S
+    /// panel past 80×24; every row must stay reachable by scrolling, and
+    /// the panel only advertises scrolling while it overflows.
+    #[tokio::test]
+    async fn health_panel_scrolls_to_rows_clipped_at_80x24() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        let buf = render_health_80x24(&app);
+        assert!(!buffer_contains(&buf, "scroll"), "fits: no scroll hint");
+
+        app.pipeline_health = Some(health_with_clock(None, true));
+        app.station_readiness = Some(crate::readiness::StationReadiness {
+            ptt_off_unconfirmed: true,
+            clock: crate::readiness::ClockState::Unreachable,
+            tx_mute_causes: vec![crate::readiness::TxMuteCause::RigDisconnected],
+            ..Default::default()
+        });
+        app.tx_output_default = true;
+        app.input_fallback = true;
+        for i in 0..3 {
+            app.add_error_message(format!("config warning {i}"));
+        }
+        let (max_scroll, _) = health_panel_scroll_bounds(Rect::new(0, 0, 80, 24), &app);
+        assert!(max_scroll > 0, "80x24 can't fit eight items");
+
+        let buf = render_health_80x24(&app);
+        assert!(buffer_contains(&buf, "Readiness: TX HELD"));
+        assert!(
+            !buffer_contains(&buf, "QSOs completed"),
+            "clipped at bottom"
+        );
+        assert!(buffer_contains(&buf, "↑↓ PgUp PgDn scroll · 1–18 of"));
+
+        let mut seen = String::new();
+        for scroll in 0..=max_scroll {
+            app.health_scroll = scroll;
+            let buf = render_health_80x24(&app);
+            for y in 0..buf.area.height {
+                seen.push_str(&row_text(&buf, y));
+                seen.push('\n');
+            }
+        }
+        for item in crate::readiness::readiness_items(&app) {
+            let lead = item.detail.split(" — ").next().unwrap().to_string();
+            assert!(seen.contains(&lead), "unreachable: {lead}");
+        }
+        for row in [
+            "Rig:",
+            "TX audio output:",
+            "RX input:",
+            "Clock:",
+            "QSOs completed",
+        ] {
+            assert!(seen.contains(row), "unreachable: {row}");
+        }
+
+        // The renderer clamps an offset past the end (e.g. after a resize).
+        app.health_scroll = u16::MAX;
+        let buf = render_health_80x24(&app);
+        assert!(buffer_contains(&buf, "QSOs completed"));
     }
 
     #[tokio::test]
@@ -3367,6 +3446,25 @@ mod view_render_tests {
             callers.contains("No one") && callers.contains("calling"),
             "{callers}"
         );
+    }
+
+    /// PAN-89: the readiness strip costs Operate a row; at 80×24 Callers
+    /// must still show a caller under its header (the card yields instead),
+    /// and sizes where the card has content keep it.
+    #[tokio::test]
+    async fn callers_shows_a_caller_row_at_80x24() {
+        let mut app = default_app().await;
+        let caller = fixture_caller(&app, "DL1XYZ");
+        app.decoded_messages.push_back(caller);
+        let rects = compute_operate_rects(content_area(Rect::new(0, 0, 80, 24)));
+        assert_eq!(rects.station_card.height, 0);
+        let buf = render_app(&app, 80, 24);
+        let callers = panel_rows_text(&buf, rects.callers);
+        assert!(callers.contains("DL1XYZ"), "{callers}");
+        for (w, h) in [(100, 30), (120, 40)] {
+            let rects = compute_operate_rects(content_area(Rect::new(0, 0, w, h)));
+            assert!(rects.station_card.height >= 3, "{w}x{h}");
+        }
     }
 
     #[tokio::test]

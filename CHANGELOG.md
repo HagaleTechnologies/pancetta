@@ -102,12 +102,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-<<<<<<< HEAD
 - Shift+S station health (PAN-89): the TX-audio row was inverted — routing TX
   to the system default showed green. It is now red `SYSTEM DEFAULT — check
   device`. Errors and startup config warnings are no longer erased by the next
-  decode; they stay on the readiness strip until acknowledged.
-=======
+  decode; they stay on the readiness strip until acknowledged. When the
+  readiness list outgrows the panel (80×24), Shift+S scrolls (↑/↓, PgUp/PgDn,
+  Home/End).
+
 - Narrow terminals keep the station state that matters (PAN-88). At 80×24
   and 100×30 the title bar now always shows the UTC clock, callsign and TX
   policy, and drops lower-priority chips in a documented order instead of
@@ -116,7 +117,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`G S R R L P`). The footer key hints fit at 80 columns, and `?` help
   scrolls (↑/↓, PgUp/PgDn, Home/End) and always names `Shift+Q`. Nothing
   changes at sizes where everything already fit.
->>>>>>> 803779b9cc66d975d710c345945f4ae9d9aa7d73
 
 - A QSO whose frame the TX worker drops before it reaches the air (concurrent-QSO cap, F8 abort, supersede, arm or mute refusal) no longer spends a call from its keep-calling budget, advances the stall detector toward a TX-offset switch, or shows the unsent frame as sent (PAN-75).
 
