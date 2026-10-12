@@ -67,3 +67,9 @@ Manual and Auto diverge because an operator explicitly choosing a DX has
 different duplicate/backoff semantics than unattended initiation (which also
 carries an FCC-presence obligation). Admission and keep-call are still bound by
 the half-duplex [[parity-rule]] and the [[tx-scheduling]] gate.
+
+- PAN-75 gotcha: `call_count` starts as an emission count. Reported unsent
+  keep-calls roll back by newest `(qso_id, text)` within four slots, while pacing
+  uses the ledger's last-emitted anchor. Opening calls and silently coalesced
+  emissions stay counted. Do not use the restored `last_call_at` alone to pace
+  rearm, or cap-truncated QSOs will re-enter the queue early.

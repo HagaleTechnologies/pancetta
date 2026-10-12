@@ -102,10 +102,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+<<<<<<< HEAD
 - Shift+S station health (PAN-89): the TX-audio row was inverted — routing TX
   to the system default showed green. It is now red `SYSTEM DEFAULT — check
   device`. Errors and startup config warnings are no longer erased by the next
   decode; they stay on the readiness strip until acknowledged.
+=======
+- A QSO whose frame the TX worker drops before it reaches the air (concurrent-QSO cap, F8 abort, supersede, arm or mute refusal) no longer spends a call from its keep-calling budget, advances the stall detector toward a TX-offset switch, or shows the unsent frame as sent (PAN-75).
+>>>>>>> 6e65be203d25f7b00da0387688def356de611655
 
 - Ctrl/Alt chords no longer trigger transmit keys at the main view (PAN-112).
   Ctrl+C previously started a CQ because crossterm reports it as `c` with a

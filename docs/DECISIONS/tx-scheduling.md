@@ -102,7 +102,7 @@ Separately, the autonomous collision-listen jitter (`process_collision_listen`) 
 
 ## TX-failure operator visibility (2026-07-12)
 
-`pancetta/src/coordinator/tx.rs`: every genuine TX-attempt failure (invalid frequency, encode/modulate error, defensive cursor-exceeded-waveform cases, multi-TX per-item encode error, whole-bundle multi-TX modulation error) used to only `warn!()` to the log file and send a `MessageType::TransmitComplete { success: false, .. }` that **no consumer anywhere in the codebase reads** (grepped — it's produced in `tx.rs` and matched nowhere else). From the operator's view a QSO that can never transmit looked identical to a QSO where the DX just isn't answering — it sat until the manual watchdog (5 min / 25 calls) or the autonomous per-state timeout fired, and the operator had to notice the coincidence and check the log file to learn TX never happened at all. New helper `emit_tx_failure_diagnostic` sends a `Warn`-level `DiagnosticEvent` (target `"tx.encode"`) alongside the existing log line + `TransmitComplete`, so `TX failed: <reason>` shows immediately in the TUI's Diagnostics overlay (Shift+D). Wired into 6 sites across the single-TX and multi-TX paths — including a strictly worse pre-existing gap found in the multi-TX per-item encode loop, where a failed item was silently dropped from `item_texts`/`symbol_sets` with **no** `TransmitComplete` ever sent for it (not even a delayed one). Deliberate policy/security skips (`TxPolicy::Disabled`, stale-QSO-at-defer-time drops, poisoned-arm-lock fail-closed) are deliberately NOT routed through this helper — those are intentional, already have their own operator-visible signal (TX-policy status / the emergency-stop toggle), and aren't the "invisible failure" gap this closes; see the helper's doc comment for the exact boundary. Does not touch QSO-state-machine timeout duration — shortening the wait before declaring a QSO dead (the memory's second, riskier idea) is a separate, deferred design question. Tests: `coordinator::tx::tx_failure_diagnostic_tests` (`tx.rs`).
+`pancetta/src/coordinator/tx.rs`: every genuine TX-attempt failure (invalid frequency, encode/modulate error, defensive cursor-exceeded-waveform cases, multi-TX per-item encode error, whole-bundle multi-TX modulation error) used to only `warn!()` to the log file and send a `MessageType::TransmitComplete { success: false, .. }` consumed by Autonomous for self-CQ correlation (PAN-38), with failed QSO-keyed outcomes now mirrored to the QSO engine (PAN-75). From the operator's view a QSO that can never transmit looked identical to a QSO where the DX just isn't answering — it sat until the manual watchdog (5 min / 25 calls) or the autonomous per-state timeout fired, and the operator had to notice the coincidence and check the log file to learn TX never happened at all. New helper `emit_tx_failure_diagnostic` sends a `Warn`-level `DiagnosticEvent` (target `"tx.encode"`) alongside the existing log line + `TransmitComplete`, so `TX failed: <reason>` shows immediately in the TUI's Diagnostics overlay (Shift+D). Wired into 6 sites across the single-TX and multi-TX paths — including a strictly worse pre-existing gap found in the multi-TX per-item encode loop, where a failed item was silently dropped from `item_texts`/`symbol_sets` with **no** `TransmitComplete` ever sent for it (not even a delayed one). Deliberate policy/security skips (`TxPolicy::Disabled`, stale-QSO-at-defer-time drops, poisoned-arm-lock fail-closed) are deliberately NOT routed through this helper — those are intentional, already have their own operator-visible signal (TX-policy status / the emergency-stop toggle), and aren't the "invisible failure" gap this closes; see the helper's doc comment for the exact boundary. Does not touch QSO-state-machine timeout duration — shortening the wait before declaring a QSO dead (the memory's second, riskier idea) is a separate, deferred design question. Tests: `coordinator::tx::tx_failure_diagnostic_tests` (`tx.rs`).
 
 ## QSO/TX deep-review remediation (2026-07-18) — 5 batches, all landed
 
@@ -219,6 +219,96 @@ that starts while PTT is already keyed is still ended by the existing PTT watchd
 
 `pancetta/tests/coord_sim.rs`: a durable, reusable `CoordSim` fixture that exercises the *coordinator's* TX gate + mock-rig PTT + multi-stream path, complementing the engine-level state-machine harness in `pancetta-qso/src/sim.rs`. It stands up a real `MessageBus`, a real `QsoManager`, a real `MockRig` behind a hamlib consumer (mirror of `coordinator/hamlib.rs`'s `SetPtt` handling), and the *real* shared `active_tx_qsos` set + `tx_policy` atomic. A scenario starts/advances QSOs via the manager's real entry points (`respond_to_cq_with` / `respond_to_caller` / `start_cq`), calls `pump_qso_events()` (a faithful mirror of `coordinator/qso.rs`'s populater — insert on `StateChanged→active`/`QsoCompleted`, remove on `Failed`/`QsoFailed`, forward `MessageToSend`→`TransmitRequest`), then `drive_slot(pending)` which replicates the worker's keying-decision chain — **policy hard-mute → coalesce (real `coalesce_transmit_requests`) → Step-4b gate (real `tx_qso_is_live` over the real set) → key/audio/unkey** — sending real `RigControl(SetPtt)` over the bus to the mock rig and **asserting at the rig level** (`mock.get_ptt() == On`, offset, release). **Determinism**: no `schedule_tx` UTC math and no slot sleep (that's unit-tested in `tx.rs::schedule_tx_tests`); only bounded ms `await`s — pass/fail never depends on wall-clock slot phase. A `Timeline` (keyed / dropped / per-slot offsets, mirroring `sim::Timeline`'s style + Display) carries the readable assertion helpers. Permanent scenarios: PTT-keys-for-scheduled-QSO (StateChanged-at-start fix), stale-TX-dropped-after-supersede (no PTT), coalesce-backlog (newest wins, older not keyed), two-simultaneous-QSOs on distinct freqs, TX-policy Disabled=silent / RespondOnly=in-progress-keys-but-initiation-suppressed / Full=keys, requested-offset-honored, manual-send-never-gated. Made testable by re-exporting `coalesce_transmit_requests` / `CoalesceEntry` / `resolve_required_parity` and widening `active_tx_qso_key` / `tx_qso_is_live` to `pub` from `coordinator/mod.rs` (visibility-only, behavior-preserving).
 
+## Frames that never aired hand their keep-call bookkeeping back (PAN-75)
+
+Every TX completion goes through `report_transmit_complete`. It preserves the
+Autonomous completion and mirrors failures with a QSO id as
+`QsoMessage::TxFrameNotSent` to the QSO component. That component calls
+`QsoManager::roll_back_unsent_attempt`, reversing the matching keep-call's
+`call_count`, `last_call_at`, rearm `stall_cycles` increment and `Sent` entry.
+The one exception is the Step 0-dup pivot-duplicate drop
+(`report_pivot_duplicate_dropped`): its payload already aired through the
+earlier request's pivot, so the QSO keeps that attempt and the worker instead
+reports the text the pivot replaced, which never aired as itself. The report
+also carries the replaced frame's offset and, for single-frame requests, its
+remote binding, because a pivot can change only those and leave two same-text
+emissions. The rollback undoes the newest same-text emission that carried that
+payload. If none did (an opening call or forward advance was replaced; those
+have no ledger entry), nothing is rolled back, so the replaced frame stays
+counted rather than risk removing the frame that aired.
+A pivoted frame or multi-TX bundle refused before it airs (pre-PTT hard mute,
+liveness or arm recheck, disarm, pre-slot clock jump) clears its pivot tombstones, so the
+request that produced each pivoted frame stays queued and accounts for
+itself; the worker reports the replaced frame to the QSO engine instead.
+Autonomous still gets a failed completion for the pivoted payload, as on Step
+0-dup; correlating it with the queued request's eventual outcome is PAN-185. An F8 abort keeps the
+tombstone, so Step 0-dup later reports the replaced frame. Backlog coalescing
+consumes pivot duplicates before it picks the newest request per QSO, so a
+duplicate superseded in the backlog still reports its replaced frame. Multi-TX bundle items
+carry no binding, which matches bundle pivots comparing only text and offset.
+If a rollback takes `stall_cycles` from the switch threshold back below it
+before the coordinator's drain commits a stall offset action that attempt
+raised, the commit is refused (`OffsetActionStallRolledBack`) until the streak
+reaches the threshold again. A rollback that arrives after the commit cannot
+undo the move (follow-up: PAN-182).
+Rearm, explicit resend and operator offset-switch retransmits record attempts.
+A forward advance or committed offset switch clears the remembered stall
+contributions too, so a delayed failure cannot subtract from a newer streak.
+Relinking stamps preserves any intervening forward advance.
+
+The ledger keeps a separate `last_emitted_at` anchor. Rearm pacing uses the later
+of that anchor and `last_call_at`; rollback never changes the anchor. TX cadence,
+coalescing order, parity and frequency selection therefore stay unchanged.
+
+Correlation uses the newest matching `(qso_id, message_text)` within four slots,
+with at most eight attempts per QSO. A same-text emission arriving between TX
+drain and rollback can be matched instead, so its timestamp may differ by one
+emission; the count still reverses one attempt. When the newer same-text
+entry is an explicit resend, its flags are reversed instead of the failed
+frame's (follow-up: PAN-183). Expired or unmatched reports and
+terminal QSOs are no-ops. The ledger is shared across manager clones, pruned on
+rearm and rollback, and never persisted.
+
+The same accounting rule covers cap truncation, F8 abort, supersede, arm or
+identity refusal, hard mute, PAN-141 hold, PAN-114 clock-jump drops, and
+encode/PTT failure. This supersedes the PAN-141 spec's accepted tradeoff that a
+held cycle spends a call. Existing time watchdogs and caps for counted calls
+still apply. A failure can also mean an interrupted, partial frame; it is not
+counted as a completed transmission.
+
+The manual call-count cap waits for the frame that reached it. While any
+keep-call attempt for the QSO is still inside the four-slot rollback window,
+`check_timeouts_at` does not retire it on the call cap; rearm already stops at
+the cap, so nothing new airs meanwhile and the time watchdog still applies. If
+that final frame is reported unsent, `call_count` drops below the cap and
+keep-calling resumes. Before this, the watchdog retired the QSO on the same
+tick its re-call reached the cap, so the cap-reaching frame never aired and an
+unsent report for it found no active QSO. Retirement on the call cap now lands
+up to four slots after the last call.
+
+Rollback reports are best-effort bus messages; a full or missing QSO channel
+loses them (follow-up: PAN-185).
+
+Shutdown aborts deliberately send no rollback. The TX and QSO loops stop on the
+same global flag, and shutdown persists no active-QSO state. Adding a bus await
+on that exit path would not preserve any observable accounting.
+
+The opening call remains counted as one. Manual-regression re-sends and silently
+coalesced, duplicate, parity-excluded or frequency-excluded frames keep their
+existing accounting because those paths have no matching ledger entry or QSO
+failure report. A single-frame supersede reports the frame it abandons whether
+it re-keys (`Replace`) or is too late to (`NotViable`). A superseding request a
+supersede drops (too late to re-key, a bundle a single-frame re-key cannot fold,
+or over the cap of a multi-TX bundle) is not reported and stays counted. A
+multi-TX supersede reports in-flight items it abandons as too late
+(`NotViable`) or on an identity conflict. On `NotViable` it skips items the
+re-enqueued bundle carries unchanged under the same authorization, and reports
+the rest with their own offset (plus the old binding after an authorization
+change) so the rollback cannot hit the replacement's attempt. Offsets within
+0.5 Hz count as unchanged, and items count as carried only once the
+re-enqueued bundle is confirmed queued. Rollback emits no new snapshot or QSO event; the existing status panel
+and remote snapshot fields show corrected values on the next normal push.
+
 ## UTC re-anchoring after sleep/wake and clock steps (PAN-114, 2026-10-10)
 
 PAN-72 had already replaced the autonomous loop's one-shot `interval_at` anchor with a 250 ms poll
@@ -265,11 +355,12 @@ used by the clock-skew monitor.
 - **Drop reporting** (`drop_frames_for_clock_jump`, D7): target `tx.policy`, Warn, text
   "dropping stale TX after a {±secs} s clock jump: '…' — next frame uses the current UTC slot", so it
   counts in the TUI's session TX-drops tally next to the existing stale-TX drops, plus one failed
-  `TransmitComplete` per frame so a self-CQ rolls back. The QSO engine re-emits on its own timers.
+  `TransmitComplete` per frame (through `report_transmit_complete`) so a self-CQ rolls back and the
+  frame's keep-call accounting is reversed (PAN-75) while the attempt is inside the four-slot
+  rollback window; a longer forward jump leaves it counted. The QSO engine re-emits on its own timers.
 
 Out of scope: no QSO teardown on a clock step (the engine's timeouts retire stalled QSOs); no
 queued-call TTL change (it is `std::time::Instant`-based and immune to NTP steps); no station-wide
 median-DT clock estimate (it mixes our clock error with audio latency and other stations' errors);
 no TX inhibit on large skew (a product decision for its own ticket). The in-session skew monitor is
 recorded in `config-and-platform.md`, its title-bar chip in `tui.md`.
-
