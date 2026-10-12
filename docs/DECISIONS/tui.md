@@ -127,4 +127,64 @@ coordinator (`pancetta/src/clock_skew.rs`); the TUI only formats (`clock_skew_ch
 No key hint: a `— Shift+D` suffix truncated to `— S` at 120 columns. The Diagnostics overlay carries
 the full `clock.skew` / `clock.step` text and the per-OS NTP fix. At 100 columns every alarm chip is
 clipped to `⚠`; that pre-existing behaviour is unchanged.
+Superseded by PAN-88 (below): the alarm is title-bar admit rank 4 and is shown whole or dropped,
+never clipped.
+
+## Narrow-terminal layout: reserved clock, priority-fit chips, adaptive columns, scrollable help (PAN-88, 2026-10-12)
+
+`pancetta-tui/src/ui/bar_fit.rs` (`BarSegment`, `fit_bar`, `bar_width`, `bar_spans`, `prefix_fit`),
+`pancetta-tui/src/ui/mod.rs` (`title_rank`, `title_bar_segments`, `title_bar_left_line`,
+`render_title_bar`, footer in `render_status_bar`), `ui/dx_hunter.rs` and `ui/callers.rs`
+(`visible_columns`), `pancetta-tui/src/tui_runner.rs` (`help_overlay_geometry`, `help_body_lines`,
+help key branch): at 80×24 and 100×30 the title bar lost the UTC clock, DX Hunter's headings read
+`G S R R L P`, Callers' read `SN Fr A Fl`, the footer ended in `q:Qui`, and the `?` overlay silently
+cut off every binding past row ~17, including `Shift+Q`.
+
+Title bar: the clock is drawn in its own `Length(12)` rectangle at the right edge, so geometry, not
+arithmetic, guarantees it (a 40-character callsign can't clip it). The other chips go through one
+ordered step list (`title_rank`): each chip has an admit step (compact form if it has one) and,
+with a compact form, an upgrade step; steps apply greedily by rank and a step that overflows is
+reverted without blocking later ones. Callsign and TX policy are pinned. Admit order: live `TX`,
+`⏸` pause prompt (compact `⏸ CQ PAUSED: press a key`), alarm chip, mode, frequency/band (compact
+drops `MHz`), `FOX`, `SPLIT` (compact drops the TX frequency), view chip, held TX offset (compact
+drops `(HOLD)`), `FREQ: HOLD/AUTO`, `QSOs: n`, `DEC: preset`; then restore `MHz`, the full pause
+text, the split frequency, `(HOLD)`, add the grid, restore the decode milliseconds, add
+`Pancetta TUI`. #171's own-entity rule stays the final step: shown after the grid only if the grid
+made it in and the entity still fits. When the row fits, every step succeeds and the row is
+byte-identical to before. Rejected: "full form first" dropped the frequency at 80 columns under
+load; "compact first" let `Pancetta TUI` crowd out `DECODE: AUTO 0ms` at 100 columns.
+
+Columns: DX Hunter and Callers follow Band Activity's column-enum pattern. `visible_columns(width)`
+walks a priority list, adding each column's minimum width plus 1 of spacing, and stops at the first
+that doesn't fit (prefix rule: monotonic, so widening never removes a column). The budget is
+`width − 2` borders `−` the 2-column `▶ ` highlight, reserved even when unfocused so the set doesn't
+jump on Tab. DX Hunter priority: Call, Entity, SNR, Pri, Last, Rarity, Grid, Rpt, Src (Operate panel
+32 → Call/Entity/SNR; 40 → +Pri; 48 → +Last; 53 → +Rarity; 64 and up, and Hunt view, → all nine).
+Callers priority: Call, Msg, SNR, Flags, Age, Freq (32 → Call/Msg/SNR; 40 → +Flags; 48 → +Age;
+53 → all six). Callers `Flags` narrowed 12 → 9 (`BUSY WKD` fits; the rare three-flag case reads
+`BUSY MINE`). Empty states read `No DX` / `stations` and `No one` / `calling`.
+
+Footer: the key hints use the same `fit_bar`; `?:Help` and `q:Quit` are pinned and
+`Space:Call/Reply` shrinks to `Space:Call` first, which is exactly what 80 columns needs.
+
+`?` overlay: the body scrolls by rendered line (↑/↓, PgUp/PgDn by a page, Home/End), clamped in
+the key handler against the real terminal size (80×24 when there is none, as in unit tests) and
+again in the renderer. Descriptions wrap at word boundaries with a hanging indent under the
+description column. While the list can't fit, the footer reads
+`↑↓ PgUp PgDn scroll · a–b of n · Shift+Q EMERGENCY STOP · Esc close`; when it fits, the overlay is
+unchanged (`Press Escape or ? to close`). The scroll keys are modal-only, so per `keymap.rs` they
+are documented by the modal footer, not `KEYBINDINGS`; `docs/KEYBINDINGS.md` is unchanged.
+`App::help_scroll` resets to 0 every time the overlay opens.
+
+PAN-89 rebase note: if PAN-89 moves the health alarm out of the title bar, delete the alarm segment
+(`title_rank::ALARM`) and the alarm entry in the admit order above; the readiness strip doesn't
+touch title-row fitting.
+
+Known gap: `crossterm::Event::Resize` is unhandled and `App::handle_resize` is never called, so
+`App::terminal_size` stays at its 80×24 default and mouse hit-testing maps clicks against 80×24
+geometry on every terminal size. Separate defect, not fixed here. Out of scope too: vertical
+layout tiers (idle TX-placement collapse, QSO Status/Hunt height tiers) and status-line truncation.
+Tests: `bar_fit::tests`, `ui::view_render_tests::title_bar_*` / `*_headings_are_whole_words_*` /
+`footer_key_hints_*`, `dx_hunter::tests::visible_columns_*`, `callers::tests`, and
+`tui_runner::key_tests::help_overlay_*`.
 

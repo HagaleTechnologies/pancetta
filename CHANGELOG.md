@@ -88,6 +88,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Narrow terminals keep the station state that matters (PAN-88). At 80×24
+  and 100×30 the title bar now always shows the UTC clock, callsign and TX
+  policy, and drops lower-priority chips in a documented order instead of
+  pushing the clock off the right edge. DX Hunter and Callers hide
+  lower-priority columns instead of cutting headings to single letters
+  (`G S R R L P`). The footer key hints fit at 80 columns, and `?` help
+  scrolls (↑/↓, PgUp/PgDn, Home/End) and always names `Shift+Q`. Nothing
+  changes at sizes where everything already fit.
+
 - A QSO whose frame the TX worker drops before it reaches the air (concurrent-QSO cap, F8 abort, supersede, arm or mute refusal) no longer spends a call from its keep-calling budget, advances the stall detector toward a TX-offset switch, or shows the unsent frame as sent (PAN-75).
 
 - Ctrl/Alt chords no longer trigger transmit keys at the main view (PAN-112).
