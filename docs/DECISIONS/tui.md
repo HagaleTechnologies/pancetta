@@ -128,3 +128,53 @@ No key hint: a `— Shift+D` suffix truncated to `— S` at 120 columns. The Dia
 the full `clock.skew` / `clock.step` text and the per-OS NTP fix. At 100 columns every alarm chip is
 clipped to `⚠`; that pre-existing behaviour is unchanged.
 
+
+## Readiness strip — durable blockers vs acknowledgeable warnings vs transient status (PAN-89, 2026-10-12)
+
+`pancetta-tui/src/readiness.rs` (model), `pancetta-tui/src/ui/readiness_strip.rs` (render),
+`pancetta/src/coordinator/readiness.rs` (snapshot + publisher). Supersedes the PAN-114 "title-bar
+alarm slot" placement above.
+
+**Three surfaces.** Row 1 of every view (and zoom) is the readiness strip: a TX verdict chip
+(`… CHECKING`, `✗ TX HELD`, `■ RX ONLY`, `◌ TX WAIT`, `⚠ TX OPEN`, `✓ TX READY`) followed by one chip
+per active condition, rebuilt every frame from typed `App` state. The status line stays the
+transient-activity surface; decodes no longer write it (Band Activity lists them, `Msgs: N` counts
+them, and the echo was what erased errors within a second of busy band). The Shift+D ring stays
+history.
+
+**Severities.** Blockers (red: PTT may still be keyed, rig control restarting, rig CAT link lost, TX
+audio output dead, audio input dead) stay until the condition resolves; `!` cannot hide them.
+Warnings (yellow: clock skewed/unverified, decoder stub, TX → system default, RX fallback, input
+silent, RF-but-no-decodes, supervisor degraded, sticky error alerts) stay until resolved or
+acknowledged with `!`. Notices (cyan: rig control not ready, rig command queued/applying) are
+short-lived waits. Clock skew is now a yellow, acknowledgeable warning: it does not hold TX and a
+non-dismissable red item would be permanent noise for a known-skewed portable station.
+
+**Episode-scoped acks.** `App::prune_acknowledged_readiness` drops an ack as soon as its condition is
+no longer active, so a recurrence shows again. The degraded ack is keyed by the summary text, so a
+changed summary shows again. `TuiMessage::Error` (incl. startup config warnings) becomes a sticky
+alert (dedupe by text while unacknowledged, ×N count, cap 8). Acks are session-only.
+
+**Gate parity.** The verdict reads `StationReadiness.tx_mute_causes`, built by the coordinator's
+display-only `tx::tx_mute_causes`, which lists every active cause in `tx_hard_mute_reason`'s order.
+`tx_mute_causes_first_matches_tx_hard_mute_reason_for_every_input_combination` proves the first cause
+equals the gate's reason for all 288 input combinations. `tx_hard_mute_reason` itself is unchanged.
+
+**`ptt_off_unconfirmed`.** Latched exactly where Hamlib teardown retains the PTT watchdog because
+PTT-off could not be forced; cleared only by a rig-accepted PTT-off (teardown success, the startup
+unkey, the PTT watchdog's forced off, a command-loop `SetPtt{false}`). Orphan release is not a
+confirmed unkey and does not clear it. The falling edge adds `PTT-off confirmed by the rig —
+stuck-PTT warning cleared` to Shift+D. It does not mute TX: that is a TX-safety policy change for its
+own ticket.
+
+**Other findings.** `ui/station_info.rs`'s RIG / TX→default / RX→fallback badges have been unrouted
+since Task 18, so those conditions were invisible in every view; the strip now carries them. The
+Shift+S TX-audio row was inverted (green for the misconfiguration) and is fixed; Shift+S gains a
+readiness section (acknowledged items marked `(ack'd)`), an RX-input row and a clock row. The
+supervisor's degraded summary is shared state sorted by component name instead of a 5 s overwriting
+`StatusUpdate`.
+
+**Out of scope.** Remote-operator arm/control presence (remote gateway sends stay additive-only and
+the contract lives in dispensa), the SIGTERM/quit shutdown PTT-off path (runs after the TUI exits),
+any change to the TX gate, per-command "saved / sent / confirmed / applied" tracking beyond rig
+frequency/split, and persisting acks.

@@ -237,6 +237,12 @@ pub const KEYBINDINGS: &[KeyBinding] = &[
         false,
     ),
     kb(
+        "!",
+        "Acknowledge yellow readiness warnings (red blockers stay until resolved)",
+        Category::Diagnostics,
+        false,
+    ),
+    kb(
         "Shift+R",
         "Toggle Recent-QSOs panel (retained terminal-QSO outcome history)",
         Category::Diagnostics,

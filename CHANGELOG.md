@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Readiness strip (PAN-89): row 1 of every view now answers "can I transmit,
+  and what's blocking it?" with a TX verdict chip (`✓ TX READY`, `✗ TX HELD`,
+  `■ RX ONLY`, `◌ TX WAIT`, `⚠ TX OPEN`) and one chip per active condition.
+  Red blockers (PTT may still be keyed, rig control restarting, rig CAT link
+  lost, TX audio output dead, audio input dead) stay until resolved; yellow
+  warnings (clock skewed or unverified, decoder stub, TX audio on the system
+  default, RX fallback, silent input, RF but no decodes, degraded components,
+  errors) stay until resolved or acknowledged with the new `!` key. Decodes
+  can no longer erase them. A failed Hamlib teardown that could not force PTT
+  off now shows `⚠ PTT MAY STILL BE KEYED — check radio` until the rig
+  confirms PTT off, and an unreachable pool.ntp.org shows `⚠ CLOCK
+  UNVERIFIED`. Shift+S gains a readiness section listing every item,
+  acknowledged ones included, plus RX-input and clock rows.
+
 - In-session clock-skew monitor (PAN-114): a live session (TUI or
   `--headless`; never `--replay`/`--wav`) sends one SNTP query to
   pool.ntp.org 30 s after start and then every 30 minutes, plus one re-check
@@ -88,6 +102,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Shift+S station health (PAN-89): the TX-audio row was inverted — routing TX
+  to the system default showed green. It is now red `SYSTEM DEFAULT — check
+  device`. Errors and startup config warnings are no longer erased by the next
+  decode; they stay on the readiness strip until acknowledged.
+
 - Ctrl/Alt chords no longer trigger transmit keys at the main view (PAN-112).
   Ctrl+C previously started a CQ because crossterm reports it as `c` with a
   separate modifier. The same guard now covers PTT, autonomous mode, TX policy,
@@ -141,6 +160,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Q in the composer.
 
 ### Changed
+
+- TUI status surfaces (PAN-89): the `AUDIO DEAD` / `DECODER STUB` / `CLOCK`
+  alarm chips move from the title bar to the readiness strip, where several can
+  show at once (the title bar's alarm slot showed one and was cut off at 80
+  columns). Clock skew is now a yellow, acknowledgeable warning. Decodes no
+  longer echo on the status line, and the supervisor's degraded summary moves
+  from a 5 s overwriting status-line update to the strip.
 
 - A config file that exists but fails to load now stops startup with an error
   naming the file, instead of being skipped with a warning. Run

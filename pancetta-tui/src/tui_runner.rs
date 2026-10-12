@@ -122,6 +122,9 @@ pub enum TuiMessage {
     },
     /// Error message
     Error { component: String, message: String },
+    /// PAN-89: station readiness snapshot — coordinator relay, 2 s tick,
+    /// pushed on change. Drives the readiness strip's verdict and items.
+    StationReadiness(crate::readiness::StationReadiness),
     /// Status update
     StatusUpdate { component: String, status: String },
     /// A retained, operator-facing diagnostic event (docs/observability-
@@ -813,6 +816,11 @@ impl TuiRunner {
             }
             TuiMessage::PipelineHealth(health) => {
                 app.pipeline_health = Some(health);
+                app.prune_acknowledged_readiness();
+            }
+            TuiMessage::StationReadiness(readiness) => {
+                app.station_readiness = Some(readiness);
+                app.prune_acknowledged_readiness();
             }
             TuiMessage::ActiveQsosUpdate {
                 qsos,
@@ -932,9 +940,11 @@ impl TuiRunner {
             }
             TuiMessage::AudioOutputDefault { is_default } => {
                 app.tx_output_default = is_default;
+                app.prune_acknowledged_readiness();
             }
             TuiMessage::AudioInputFallback { active } => {
                 app.input_fallback = active;
+                app.prune_acknowledged_readiness();
             }
             TuiMessage::DiagnosticEvent {
                 ts,
@@ -1593,6 +1603,24 @@ impl TuiRunner {
             KeyCode::Esc if app.zoomed => {
                 app.zoomed = false;
                 app.status_message = "Zoom cleared".to_string();
+            }
+
+            // PAN-89: acknowledge every visible yellow readiness warning (and
+            // sticky alert). Red blockers can't be acknowledged — they clear
+            // only when resolved. Not a TX key, so no Ctrl/Alt guard (PAN-112:
+            // crossterm sets SHIFT on `!`, so match the char alone).
+            KeyCode::Char('!') => {
+                let acknowledged = app.acknowledge_readiness();
+                let anything_visible = crate::readiness::readiness_items(&app)
+                    .iter()
+                    .any(|i| i.is_visible());
+                app.status_message = if acknowledged > 0 {
+                    format!("Acknowledged {acknowledged} warning(s) — Shift+S lists them")
+                } else if anything_visible {
+                    "Nothing to acknowledge — red items clear when resolved".to_string()
+                } else {
+                    "Nothing to acknowledge".to_string()
+                };
             }
 
             // Panel navigation
@@ -2997,6 +3025,230 @@ mod key_tests {
 
     fn key_shift(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT)
+    }
+
+    // ---- PAN-89: readiness strip ------------------------------------------
+
+    fn pan89_decode(i: usize) -> crate::app::DecodedMessageView {
+        crate::app::DecodedMessageView {
+            timestamp: chrono::Utc::now(),
+            frequency: 14_074_000.0,
+            mode: "FT8".to_string(),
+            snr: -10,
+            delta_time: 0.0,
+            delta_freq: 1500.0,
+            call_sign: Some(format!("K{i}ABC")),
+            grid_square: None,
+            message: format!("CQ K{i}ABC FN42"),
+            distance: None,
+            bearing: None,
+            slot_parity: None,
+            is_directed_at_us: false,
+            worked_before: false,
+            needed: false,
+            atno: false,
+            band_needed: false,
+            priority_score: None,
+            is_own_tx: false,
+        }
+    }
+
+    async fn pan89_decode_burst(r: &mut TuiRunner, n: usize) {
+        for i in 0..n {
+            r.handle_message(TuiMessage::DecodedMessage(pan89_decode(i)))
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Row 1 (the readiness strip) of a full 120x40 render.
+    async fn pan89_strip_row(app: &Arc<RwLock<App>>) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+        let app = app.read().await;
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &app).unwrap()).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.width)
+            .map(|x| buf[(x, 1)].symbol().chars().next().unwrap_or(' '))
+            .collect()
+    }
+
+    fn pan89_readiness(
+        causes: &[crate::readiness::TxMuteCause],
+        clock: crate::readiness::ClockState,
+        ptt_off_unconfirmed: bool,
+    ) -> TuiMessage {
+        TuiMessage::StationReadiness(crate::readiness::StationReadiness {
+            tx_mute_causes: causes.to_vec(),
+            ptt_off_unconfirmed,
+            clock,
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn station_readiness_message_sets_app_field() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        assert!(app.read().await.station_readiness.is_none());
+        r.handle_message(pan89_readiness(
+            &[crate::readiness::TxMuteCause::RigDisconnected],
+            crate::readiness::ClockState::InSpec,
+            false,
+        ))
+        .await
+        .unwrap();
+        let app = app.read().await;
+        let readiness = app.station_readiness.as_ref().expect("snapshot stored");
+        assert_eq!(
+            readiness.tx_mute_causes,
+            vec![crate::readiness::TxMuteCause::RigDisconnected]
+        );
+    }
+
+    #[tokio::test]
+    async fn bang_acknowledges_visible_warnings_at_main_view() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        r.handle_message(pan89_readiness(
+            &[],
+            crate::readiness::ClockState::Unreachable,
+            false,
+        ))
+        .await
+        .unwrap();
+        r.handle_key_event(key_shift('!')).await.unwrap();
+        let app = app.read().await;
+        assert_eq!(
+            app.status_message,
+            "Acknowledged 1 warning(s) — Shift+S lists them"
+        );
+        assert!(app
+            .acknowledged_readiness
+            .contains(&crate::readiness::ReadinessKey::ClockUnverified));
+    }
+
+    #[tokio::test]
+    async fn bang_with_only_blockers_reports_nothing_to_acknowledge() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        r.handle_message(pan89_readiness(
+            &[crate::readiness::TxMuteCause::RigDisconnected],
+            crate::readiness::ClockState::InSpec,
+            true,
+        ))
+        .await
+        .unwrap();
+        r.handle_key_event(key('!')).await.unwrap();
+        let app = app.read().await;
+        assert_eq!(
+            app.status_message,
+            "Nothing to acknowledge — red items clear when resolved"
+        );
+        assert!(app.acknowledged_readiness.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bang_is_inert_while_help_overlay_is_open() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        r.handle_message(pan89_readiness(
+            &[],
+            crate::readiness::ClockState::Unreachable,
+            false,
+        ))
+        .await
+        .unwrap();
+        app.write().await.help_visible = true;
+        r.handle_key_event(key_shift('!')).await.unwrap();
+        let app = app.read().await;
+        assert!(app.acknowledged_readiness.is_empty());
+        assert!(!app.status_message.contains("cknowledge"));
+    }
+
+    /// Gherkin Scenario 1: a durable blocker survives incoming decode
+    /// traffic until it is resolved (warnings: or acknowledged).
+    #[tokio::test]
+    async fn pan89_scenario1_blocker_survives_decode_burst_until_resolved() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        r.handle_message(pan89_readiness(
+            &[crate::readiness::TxMuteCause::RigDisconnected],
+            crate::readiness::ClockState::Unreachable,
+            false,
+        ))
+        .await
+        .unwrap();
+        pan89_decode_burst(&mut r, 50).await;
+        let row = pan89_strip_row(&app).await;
+        assert!(row.contains("RIG CAT LINK LOST"), "row 1: {row}");
+        assert!(row.contains("CLOCK UNVERIFIED"), "row 1: {row}");
+
+        r.handle_key_event(key_shift('!')).await.unwrap();
+        pan89_decode_burst(&mut r, 10).await;
+        let row = pan89_strip_row(&app).await;
+        assert!(row.contains("RIG CAT LINK LOST"), "row 1: {row}");
+        assert!(!row.contains("CLOCK UNVERIFIED"), "row 1: {row}");
+        assert!(row.contains("1 ack'd"), "row 1: {row}");
+
+        r.handle_message(pan89_readiness(
+            &[],
+            crate::readiness::ClockState::InSpec,
+            false,
+        ))
+        .await
+        .unwrap();
+        let row = pan89_strip_row(&app).await;
+        assert!(row.contains("✓ TX READY"), "row 1: {row}");
+        assert!(!row.contains("RIG CAT LINK LOST"), "row 1: {row}");
+    }
+
+    /// Gherkin Scenario 2: a failed PTT-off is a standing warning `!` can't
+    /// hide, and it clears only when the coordinator reports PTT confirmed off.
+    #[tokio::test]
+    async fn pan89_scenario2_ptt_warning_persists_until_cleared() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        r.handle_message(pan89_readiness(
+            &[crate::readiness::TxMuteCause::RigRestarting],
+            crate::readiness::ClockState::InSpec,
+            true,
+        ))
+        .await
+        .unwrap();
+        pan89_decode_burst(&mut r, 50).await;
+        r.handle_key_event(key_shift('!')).await.unwrap();
+        let row = pan89_strip_row(&app).await;
+        assert!(
+            row.contains("PTT MAY STILL BE KEYED — check radio"),
+            "row 1: {row}"
+        );
+        assert!(row.contains("TX HELD"), "row 1: {row}");
+
+        r.handle_message(TuiMessage::StationReadiness(
+            crate::readiness::StationReadiness {
+                ptt_off_unconfirmed: false,
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap();
+        let row = pan89_strip_row(&app).await;
+        assert!(!row.contains("PTT MAY STILL BE KEYED"), "row 1: {row}");
+    }
+
+    #[tokio::test]
+    async fn pan89_error_alert_survives_decode_burst_until_acknowledged() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        r.handle_message(TuiMessage::Error {
+            component: "Hamlib".to_string(),
+            message: "Rig connect failed (connection refused)".to_string(),
+        })
+        .await
+        .unwrap();
+        pan89_decode_burst(&mut r, 50).await;
+        let row = pan89_strip_row(&app).await;
+        assert!(row.contains("Rig connect failed"), "row 1: {row}");
+        assert!(row.contains("! ack"), "row 1: {row}");
+
+        r.handle_key_event(key_shift('!')).await.unwrap();
+        let row = pan89_strip_row(&app).await;
+        assert!(!row.contains("Rig connect failed"), "row 1: {row}");
+        assert!(row.contains("1 ack'd"), "row 1: {row}");
     }
 
     /// crossterm reports Ctrl+<letter> as the SAME `KeyCode::Char(<letter>)`

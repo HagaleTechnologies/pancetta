@@ -17,7 +17,7 @@
 //! `--wav` (see `ApplicationCoordinator::replay_mode`).
 
 use crate::clock_skew::{
-    ClockSkewMonitorCore, ClockSkewShared, ClockSkewTiming, SkewDiag, SNTP_TIMEOUT,
+    ClockSkewMonitorCore, ClockSkewShared, ClockSkewTiming, ClockStatus, SkewDiag, SNTP_TIMEOUT,
 };
 use crate::message_bus::{ComponentId, DiagnosticLevel, MessageBus};
 use chrono::{DateTime, Utc};
@@ -78,6 +78,9 @@ pub(crate) type WallClock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 
 /// Spawn the monitor task. It exits on the first tick after `shutdown` is
 /// set.
+///
+/// PAN-89: `shared`'s status reads `Pending` from the moment this returns
+/// (it was `NotMonitored`), then follows every tick and probe.
 pub(crate) fn spawn_clock_skew_monitor(
     bus: MessageBus,
     shared: ClockSkewShared,
@@ -86,6 +89,7 @@ pub(crate) fn spawn_clock_skew_monitor(
     probe: ClockProbe,
     wall_now: WallClock,
 ) -> tokio::task::JoinHandle<()> {
+    shared.set_status(ClockStatus::Pending);
     tokio::spawn(async move {
         let start = std::time::Instant::now();
         let mut last_tick = start;
@@ -104,7 +108,7 @@ pub(crate) fn spawn_clock_skew_monitor(
             last_tick = now;
 
             let outcome = core.on_tick(mono_since_start, wall_now(), mono_since_last);
-            shared.set_warning(core.warning());
+            shared.publish(&core);
             if let Some(diag) = outcome.step_diag {
                 emit(&bus, &diag).await;
             }
@@ -112,7 +116,7 @@ pub(crate) fn spawn_clock_skew_monitor(
             if outcome.probe_due {
                 let result = run_probe(&probe, &in_flight, schedule.probe_deadline).await;
                 let diag = core.on_probe(mono_since_start, result);
-                shared.set_warning(core.warning());
+                shared.publish(&core);
                 if let Some(diag) = diag {
                     emit(&bus, &diag).await;
                 }
@@ -417,6 +421,57 @@ mod tests {
             "re-check ran {:?} after the step",
             recheck_at.duration_since(stepped_at)
         );
+        assert_eq!(shared.warning(), None);
+
+        shutdown.store(true, Ordering::Release);
+        tokio::time::timeout(WAIT, handle).await.unwrap().unwrap();
+    }
+
+    async fn wait_for_status(shared: &ClockSkewShared, want: ClockStatus) {
+        let deadline = Instant::now() + WAIT;
+        while shared.status() != want {
+            assert!(
+                Instant::now() < deadline,
+                "shared status stayed {:?}, wanted {want:?}",
+                shared.status()
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    /// PAN-89: the shared status distinguishes "not probed yet", "SNTP
+    /// unreachable" (clock unverified) and "in spec", which all read as "no
+    /// warning".
+    #[tokio::test(flavor = "current_thread")]
+    async fn monitor_publishes_pending_then_unreachable_then_in_spec() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_tx, rx) = bus.create_channel(ComponentId::Tui).await.unwrap();
+        let shared = ClockSkewShared::new();
+        assert_eq!(shared.status(), ClockStatus::NotMonitored);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (probe, _calls) = scripted_probe(vec![Err("timeout".into()), Ok(0.01)]);
+        let (wall, _offset) = offset_wall_clock();
+        let handle = spawn_clock_skew_monitor(
+            bus.clone(),
+            shared.clone(),
+            shutdown.clone(),
+            test_schedule(),
+            probe,
+            wall,
+        );
+        assert_eq!(shared.status(), ClockStatus::Pending);
+
+        let d = next_diag(&rx).await;
+        assert_eq!(
+            d.text,
+            "could not reach pool.ntp.org (timeout) — clock unverified"
+        );
+        wait_for_status(&shared, ClockStatus::Unreachable).await;
+        assert_eq!(shared.warning(), None);
+
+        let d = next_diag(&rx).await;
+        assert_eq!(d.text, "clock check: offset +0.010 s vs pool.ntp.org — OK");
+        wait_for_status(&shared, ClockStatus::InSpec).await;
         assert_eq!(shared.warning(), None);
 
         shutdown.store(true, Ordering::Release);

@@ -2571,6 +2571,85 @@ fn has_undelivered_pending_hamlib_state(
             .unwrap_or(true)
 }
 
+/// PAN-89: one TX hard-mute cause, display-only. Declared in
+/// [`tx_hard_mute_reason`]'s priority order; [`TxMuteCause::as_reason`]
+/// returns the gate's string for each, byte-for-byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TxMuteCause {
+    RigRestarting,
+    HamlibLoopNotReady,
+    RigDisconnected,
+    AudioOutputDead,
+    RigStatePending,
+    RigCommandInFlight,
+    PolicyDisabled,
+}
+
+impl TxMuteCause {
+    /// The exact string [`tx_hard_mute_reason`] returns for this cause.
+    pub(crate) fn as_reason(self) -> &'static str {
+        match self {
+            TxMuteCause::RigRestarting => "rig control is restarting",
+            TxMuteCause::HamlibLoopNotReady => "Hamlib command loop is not yet ready",
+            TxMuteCause::RigDisconnected => "rig is disconnected",
+            TxMuteCause::AudioOutputDead => "audio output device is dead",
+            TxMuteCause::RigStatePending => {
+                "pending rig frequency/split state has not been delivered yet"
+            }
+            TxMuteCause::RigCommandInFlight => {
+                "a rig frequency/split command is still being applied"
+            }
+            TxMuteCause::PolicyDisabled => "TX policy is Disabled",
+        }
+    }
+}
+
+/// PAN-89: every active TX hard-mute cause, in [`tx_hard_mute_reason`]'s
+/// priority order. Display-only (the station-readiness strip): it evaluates
+/// every predicate instead of stopping at the first, and never gates TX
+/// itself. Its first element always equals the gate's verdict (parity-tested
+/// over every input combination), and it is empty exactly when the gate is
+/// open.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn tx_mute_causes(
+    tx_policy: &std::sync::Arc<std::sync::atomic::AtomicU8>,
+    restart_inhibit: &std::sync::Arc<std::sync::atomic::AtomicU32>,
+    hamlib_loop_ready: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    hamlib_pending_frequency: &std::sync::Arc<
+        std::sync::Mutex<HashMap<pancetta_hamlib::Vfo, ComponentMessage>>,
+    >,
+    hamlib_pending_split: &std::sync::Arc<std::sync::Mutex<Option<ComponentMessage>>>,
+    hamlib_command_in_flight: &std::sync::Arc<std::sync::atomic::AtomicU32>,
+    rig_conn_state: &std::sync::Arc<std::sync::atomic::AtomicU8>,
+    audio_output_alive: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Vec<TxMuteCause> {
+    let mut causes = Vec::new();
+    if restart_inhibit.load(Ordering::Acquire) != 0 {
+        causes.push(TxMuteCause::RigRestarting);
+    }
+    if !hamlib_loop_ready.load(Ordering::Acquire) {
+        causes.push(TxMuteCause::HamlibLoopNotReady);
+    }
+    if super::hamlib::RigConnState::from_u8(rig_conn_state.load(Ordering::Acquire))
+        == super::hamlib::RigConnState::PollingFailed
+    {
+        causes.push(TxMuteCause::RigDisconnected);
+    }
+    if !audio_output_alive.load(Ordering::Acquire) {
+        causes.push(TxMuteCause::AudioOutputDead);
+    }
+    if has_undelivered_pending_hamlib_state(hamlib_pending_frequency, hamlib_pending_split) {
+        causes.push(TxMuteCause::RigStatePending);
+    }
+    if hamlib_command_in_flight.load(Ordering::Acquire) > 0 {
+        causes.push(TxMuteCause::RigCommandInFlight);
+    }
+    if current_tx_policy(tx_policy) == pancetta_core::TxPolicy::Disabled {
+        causes.push(TxMuteCause::PolicyDisabled);
+    }
+    causes
+}
+
 #[cfg(test)]
 mod tx_hard_mute_reason_tests {
     use super::*;
@@ -3055,6 +3134,234 @@ mod tx_hard_mute_reason_tests {
                 &audio_alive(false),
             ),
             Some("audio output device is dead")
+        );
+    }
+
+    /// PAN-89: a frequency pending map holding one `SetFrequency` entry.
+    fn one_pending_frequency() -> Arc<Mutex<HashMap<pancetta_hamlib::Vfo, ComponentMessage>>> {
+        let mut map = HashMap::new();
+        map.insert(
+            pancetta_hamlib::Vfo::A,
+            ComponentMessage::new(
+                ComponentId::Hamlib,
+                ComponentId::Hamlib,
+                MessageType::RigControl(crate::message_bus::RigControlMessage::SetFrequency {
+                    vfo: 0,
+                    frequency: 14_074_000,
+                }),
+                std::time::Instant::now(),
+            ),
+        );
+        Arc::new(Mutex::new(map))
+    }
+
+    /// PAN-89: the display-only cause list agrees with the gate for every
+    /// combination of its inputs (2 × 2 × 3 × 2 × 2 × 2 × 3 = 288 cases).
+    #[test]
+    fn tx_mute_causes_first_matches_tx_hard_mute_reason_for_every_input_combination() {
+        let mut cases = 0;
+        for inhibit in [0u32, 1] {
+            for loop_ready in [true, false] {
+                for conn in [
+                    RigConnState::NotConnected,
+                    RigConnState::Connected,
+                    RigConnState::PollingFailed,
+                ] {
+                    for alive in [true, false] {
+                        for pending in [false, true] {
+                            for in_flight in [0u32, 1] {
+                                for p in [
+                                    pancetta_core::TxPolicy::Full,
+                                    pancetta_core::TxPolicy::RespondOnly,
+                                    pancetta_core::TxPolicy::Disabled,
+                                ] {
+                                    let tx_policy = policy(p);
+                                    let restart_inhibit = Arc::new(AtomicU32::new(inhibit));
+                                    let hamlib_loop_ready = Arc::new(AtomicBool::new(loop_ready));
+                                    let pending_frequency = if pending {
+                                        one_pending_frequency()
+                                    } else {
+                                        no_pending_frequency()
+                                    };
+                                    let pending_split = no_pending();
+                                    let command_in_flight = Arc::new(AtomicU32::new(in_flight));
+                                    let rig_conn = rig(conn);
+                                    let output_alive = audio_alive(alive);
+
+                                    let gate = tx_hard_mute_reason(
+                                        &tx_policy,
+                                        &restart_inhibit,
+                                        &hamlib_loop_ready,
+                                        &pending_frequency,
+                                        &pending_split,
+                                        &command_in_flight,
+                                        &rig_conn,
+                                        &output_alive,
+                                    );
+                                    let causes = tx_mute_causes(
+                                        &tx_policy,
+                                        &restart_inhibit,
+                                        &hamlib_loop_ready,
+                                        &pending_frequency,
+                                        &pending_split,
+                                        &command_in_flight,
+                                        &rig_conn,
+                                        &output_alive,
+                                    );
+                                    let case = format!(
+                                        "inhibit={inhibit} loop_ready={loop_ready} conn={conn:?} \
+                                         alive={alive} pending={pending} in_flight={in_flight} \
+                                         policy={p:?}"
+                                    );
+                                    assert_eq!(
+                                        causes.first().map(|c| c.as_reason()),
+                                        gate,
+                                        "{case}"
+                                    );
+                                    assert_eq!(causes.is_empty(), gate.is_none(), "{case}");
+                                    cases += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 288);
+    }
+
+    #[test]
+    fn tx_mute_causes_lists_every_active_cause_in_gate_priority_order() {
+        let causes = tx_mute_causes(
+            &policy(pancetta_core::TxPolicy::Disabled),
+            &Arc::new(AtomicU32::new(0)),
+            &Arc::new(AtomicBool::new(true)),
+            &no_pending_frequency(),
+            &no_pending(),
+            &not_in_flight(),
+            &rig(RigConnState::PollingFailed),
+            &audio_alive(false),
+        );
+        assert_eq!(
+            causes,
+            vec![
+                TxMuteCause::RigDisconnected,
+                TxMuteCause::AudioOutputDead,
+                TxMuteCause::PolicyDisabled,
+            ]
+        );
+
+        // Every predicate true at once: all seven, in the gate's order.
+        let split = no_pending();
+        *split.lock().unwrap() = Some(pending_split_msg());
+        let causes = tx_mute_causes(
+            &policy(pancetta_core::TxPolicy::Disabled),
+            &Arc::new(AtomicU32::new(1)),
+            &Arc::new(AtomicBool::new(false)),
+            &no_pending_frequency(),
+            &split,
+            &Arc::new(AtomicU32::new(2)),
+            &rig(RigConnState::PollingFailed),
+            &audio_alive(false),
+        );
+        assert_eq!(
+            causes,
+            vec![
+                TxMuteCause::RigRestarting,
+                TxMuteCause::HamlibLoopNotReady,
+                TxMuteCause::RigDisconnected,
+                TxMuteCause::AudioOutputDead,
+                TxMuteCause::RigStatePending,
+                TxMuteCause::RigCommandInFlight,
+                TxMuteCause::PolicyDisabled,
+            ]
+        );
+    }
+
+    #[test]
+    fn tx_mute_cause_reasons_are_byte_identical_to_the_gate_strings() {
+        let expected = [
+            (TxMuteCause::RigRestarting, "rig control is restarting"),
+            (
+                TxMuteCause::HamlibLoopNotReady,
+                "Hamlib command loop is not yet ready",
+            ),
+            (TxMuteCause::RigDisconnected, "rig is disconnected"),
+            (TxMuteCause::AudioOutputDead, "audio output device is dead"),
+            (
+                TxMuteCause::RigStatePending,
+                "pending rig frequency/split state has not been delivered yet",
+            ),
+            (
+                TxMuteCause::RigCommandInFlight,
+                "a rig frequency/split command is still being applied",
+            ),
+            (TxMuteCause::PolicyDisabled, "TX policy is Disabled"),
+        ];
+        for (cause, reason) in expected {
+            assert_eq!(cause.as_reason(), reason, "{cause:?}");
+        }
+
+        // And each one is what the gate itself returns when it is the only
+        // active cause.
+        let split = no_pending();
+        *split.lock().unwrap() = Some(pending_split_msg());
+        let only = |inhibit: u32,
+                    ready: bool,
+                    conn: RigConnState,
+                    alive: bool,
+                    split: &Arc<Mutex<Option<ComponentMessage>>>,
+                    in_flight: u32,
+                    p: pancetta_core::TxPolicy| {
+            tx_hard_mute_reason(
+                &policy(p),
+                &Arc::new(AtomicU32::new(inhibit)),
+                &Arc::new(AtomicBool::new(ready)),
+                &no_pending_frequency(),
+                split,
+                &Arc::new(AtomicU32::new(in_flight)),
+                &rig(conn),
+                &audio_alive(alive),
+            )
+        };
+        let full = pancetta_core::TxPolicy::Full;
+        let ok = RigConnState::Connected;
+        let none = no_pending();
+        assert_eq!(
+            only(1, true, ok, true, &none, 0, full),
+            Some(TxMuteCause::RigRestarting.as_reason())
+        );
+        assert_eq!(
+            only(0, false, ok, true, &none, 0, full),
+            Some(TxMuteCause::HamlibLoopNotReady.as_reason())
+        );
+        assert_eq!(
+            only(0, true, RigConnState::PollingFailed, true, &none, 0, full),
+            Some(TxMuteCause::RigDisconnected.as_reason())
+        );
+        assert_eq!(
+            only(0, true, ok, false, &none, 0, full),
+            Some(TxMuteCause::AudioOutputDead.as_reason())
+        );
+        assert_eq!(
+            only(0, true, ok, true, &split, 0, full),
+            Some(TxMuteCause::RigStatePending.as_reason())
+        );
+        assert_eq!(
+            only(0, true, ok, true, &none, 1, full),
+            Some(TxMuteCause::RigCommandInFlight.as_reason())
+        );
+        assert_eq!(
+            only(
+                0,
+                true,
+                ok,
+                true,
+                &none,
+                0,
+                pancetta_core::TxPolicy::Disabled
+            ),
+            Some(TxMuteCause::PolicyDisabled.as_reason())
         );
     }
 }
