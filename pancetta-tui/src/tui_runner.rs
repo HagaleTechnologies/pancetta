@@ -1553,16 +1553,37 @@ impl TuiRunner {
         }
 
         // Station-health panel (docs/observability-diagnostics-plan.md Layer
-        // 3). A read-only snapshot, so — unlike the Diagnostics overlay —
-        // there is no scroll state; just dismiss. Same as the Diagnostics/
-        // Recent-QSOs overlays, it's a read-only informational view rather
-        // than a modal the operator is editing, so `k` falls through to the
-        // global QSO-abort here too (PAN-21 round-1 remediation).
+        // 3). A read-only snapshot; PAN-89 lets it scroll when its rows don't
+        // fit (many readiness items at 80×24), clamped like the `?` overlay
+        // against the real terminal size (80×24 in unit tests). Same as the
+        // Diagnostics/Recent-QSOs overlays, it's a read-only informational
+        // view rather than a modal the operator is editing, so `k` falls
+        // through to the global QSO-abort here too (PAN-21 round-1
+        // remediation).
         if app.show_health {
+            let viewport = self
+                .terminal
+                .as_ref()
+                .and_then(|t| t.size().ok())
+                .map(|s| Rect::new(0, 0, s.width, s.height))
+                .unwrap_or(Rect::new(0, 0, crate::ui::MIN_TERMINAL_WIDTH, 24));
+            let (max_scroll, body_height) = crate::ui::health_panel_scroll_limits(&app, viewport);
+            let page = body_height.max(1);
+            app.health_scroll = app.health_scroll.min(max_scroll);
             match key.code {
                 KeyCode::Esc | KeyCode::Char('S') => {
                     app.show_health = false;
                 }
+                KeyCode::Up => app.health_scroll = app.health_scroll.saturating_sub(1),
+                KeyCode::Down => {
+                    app.health_scroll = app.health_scroll.saturating_add(1).min(max_scroll)
+                }
+                KeyCode::PageUp => app.health_scroll = app.health_scroll.saturating_sub(page),
+                KeyCode::PageDown => {
+                    app.health_scroll = app.health_scroll.saturating_add(page).min(max_scroll)
+                }
+                KeyCode::Home => app.health_scroll = 0,
+                KeyCode::End => app.health_scroll = max_scroll,
                 // Bare `k` only — see the modifier-guard comment on the
                 // global abort handler below for why.
                 KeyCode::Char('k') if key.modifiers.is_empty() => {
@@ -1870,6 +1891,7 @@ impl TuiRunner {
             // so health uses S.
             KeyCode::Char('S') => {
                 app.show_health = true;
+                app.health_scroll = 0;
             }
             // Shift+R — toggle the Recent-QSOs panel (retained terminal-QSO
             // outcome history: what happened to my last N QSOs). Lowercase
@@ -5429,6 +5451,57 @@ mod key_tests {
         assert!(!app.read().await.help_visible);
         r.handle_key_event(key('?')).await.unwrap();
         assert_eq!(app.read().await.help_scroll, 0, "reopen resets scroll");
+    }
+
+    /// PAN-89 (Codex P2): Shift+S scrolls when a long readiness list
+    /// overflows it at 80×24 (the no-terminal fallback), clamped exactly as
+    /// the renderer clamps, and reopens at the top.
+    #[tokio::test]
+    async fn health_panel_scroll_keys_are_clamped_and_reset_on_reopen() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.station_readiness = Some(crate::readiness::StationReadiness {
+                ptt_off_unconfirmed: true,
+                clock: crate::readiness::ClockState::Unreachable,
+                ..Default::default()
+            });
+            for i in 0..crate::readiness::ALERT_CAP {
+                a.add_error_message(format!("Rig control alert {i}: connection refused"));
+            }
+        }
+        let (max_scroll, body_height) =
+            crate::ui::health_panel_scroll_limits(&*app.read().await, Rect::new(0, 0, 80, 24));
+        assert!(max_scroll > 1, "the fixture must overflow at 80x24");
+        let special = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        r.handle_key_event(key('S')).await.unwrap();
+        assert!(app.read().await.show_health);
+        assert_eq!(app.read().await.health_scroll, 0);
+
+        r.handle_key_event(special(KeyCode::Down)).await.unwrap();
+        assert_eq!(app.read().await.health_scroll, 1);
+        r.handle_key_event(special(KeyCode::End)).await.unwrap();
+        assert_eq!(app.read().await.health_scroll, max_scroll);
+        r.handle_key_event(special(KeyCode::Down)).await.unwrap();
+        assert_eq!(app.read().await.health_scroll, max_scroll, "stays put");
+        r.handle_key_event(special(KeyCode::Up)).await.unwrap();
+        assert_eq!(app.read().await.health_scroll, max_scroll - 1);
+
+        r.handle_key_event(special(KeyCode::Home)).await.unwrap();
+        assert_eq!(app.read().await.health_scroll, 0);
+        r.handle_key_event(special(KeyCode::PageDown))
+            .await
+            .unwrap();
+        assert_eq!(app.read().await.health_scroll, body_height.min(max_scroll));
+        r.handle_key_event(special(KeyCode::PageUp)).await.unwrap();
+        assert_eq!(app.read().await.health_scroll, 0);
+
+        r.handle_key_event(special(KeyCode::End)).await.unwrap();
+        r.handle_key_event(special(KeyCode::Esc)).await.unwrap();
+        assert!(!app.read().await.show_health);
+        r.handle_key_event(key('S')).await.unwrap();
+        assert_eq!(app.read().await.health_scroll, 0, "reopen resets scroll");
     }
 
     /// An offset stored at a shorter terminal (End at 80×20) outlives a

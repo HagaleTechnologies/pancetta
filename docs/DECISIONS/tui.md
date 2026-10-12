@@ -128,7 +128,8 @@ No key hint: a `— Shift+D` suffix truncated to `— S` at 120 columns. The Dia
 the full `clock.skew` / `clock.step` text and the per-OS NTP fix. At 100 columns every alarm chip is
 clipped to `⚠`; that pre-existing behaviour is unchanged.
 Superseded by PAN-88 (below): the alarm is title-bar admit rank 4 and is shown whole or dropped,
-never clipped.
+never clipped. Superseded again by PAN-89 (below): the alarm left the title bar for the readiness
+strip, and `title_rank::ALARM` is gone.
 
 ## Narrow-terminal layout: reserved clock, priority-fit chips, adaptive columns, scrollable help (PAN-88, 2026-10-12)
 
@@ -145,7 +146,7 @@ arithmetic, guarantees it (a 40-character callsign can't clip it). The other chi
 ordered step list (`title_rank`): each chip has an admit step (compact form if it has one) and,
 with a compact form, an upgrade step; steps apply greedily by rank and a step that overflows is
 reverted without blocking later ones. Callsign and TX policy are pinned. Admit order: live `TX`,
-`⏸` pause prompt (compact `⏸ CQ PAUSED: press a key`), alarm chip, mode, frequency/band (compact
+`⏸` pause prompt (compact `⏸ CQ PAUSED: press a key`), mode, frequency/band (compact
 drops `MHz`), `FOX`, `SPLIT` (compact drops the TX frequency), view chip, held TX offset (compact
 drops `(HOLD)`), `FREQ: HOLD/AUTO`, `QSOs: n`, `DEC: preset`; then restore `MHz`, the full pause
 text, the split frequency, `(HOLD)`, add the grid, restore the decode milliseconds, add
@@ -176,9 +177,9 @@ unchanged (`Press Escape or ? to close`). The scroll keys are modal-only, so per
 are documented by the modal footer, not `KEYBINDINGS`; `docs/KEYBINDINGS.md` is unchanged.
 `App::help_scroll` resets to 0 every time the overlay opens.
 
-PAN-89 rebase note: if PAN-89 moves the health alarm out of the title bar, delete the alarm segment
-(`title_rank::ALARM`) and the alarm entry in the admit order above; the readiness strip doesn't
-touch title-row fitting.
+PAN-89 moved the health alarm out of the title bar onto the readiness strip, so the alarm segment
+and `title_rank::ALARM` are gone and the admit order above has no alarm step; the readiness strip
+doesn't touch title-row fitting.
 
 Known gap: `crossterm::Event::Resize` is unhandled and `App::handle_resize` is never called, so
 `App::terminal_size` stays at its 80×24 default and mouse hit-testing maps clicks against 80×24
@@ -230,8 +231,15 @@ own ticket.
 **Other findings.** `ui/station_info.rs`'s RIG / TX→default / RX→fallback badges have been unrouted
 since Task 18, so those conditions were invisible in every view; the strip now carries them. The
 Shift+S TX-audio row was inverted (green for the misconfiguration) and is fixed; Shift+S gains a
-readiness section (acknowledged items marked `(ack'd)`), an RX-input row and a clock row. The
-supervisor's degraded summary is shared state sorted by component name instead of a 5 s overwriting
+readiness section (acknowledged items marked `(ack'd)`), an RX-input row and a clock row. Shift+S
+scrolls by rendered row (↑/↓, PgUp/PgDn, Home/End; `App::health_scroll`, reset on open) when its
+rows don't fit, which at 80×24 takes only a few readiness items; the key handler
+(`ui::health_panel_scroll_limits`) and the renderer clamp it through the same `health_panel_modal`
+and `health_panel_scroll_bounds`, and the bottom border then reads
+`↑↓ PgUp PgDn scroll · a–b of n`. The strip's extra row left the Operate view's Callers panel no
+caller row at 80×24 after PAN-88, so `compute_operate_rects` collapses the station card when it
+gets under 3 rows (borders only, no content) and gives those rows to Callers; from 3 rows up the
+layout is unchanged. The supervisor's degraded summary is shared state sorted by component name instead of a 5 s overwriting
 `StatusUpdate`.
 
 **Out of scope.** Remote-operator arm/control presence (remote gateway sends stay additive-only and

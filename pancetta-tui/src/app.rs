@@ -1247,9 +1247,13 @@ pub struct App {
     pub show_diagnostics: bool,
     /// Shift+S overlay visibility for the consolidated station-health panel
     /// (docs/observability-diagnostics-plan.md Layer 3). Unlike
-    /// `show_diagnostics` (a scrollback), this is a snapshot view — no
-    /// scroll-position field needed.
+    /// `show_diagnostics` (a scrollback), this is a snapshot view; it scrolls
+    /// only when its rows don't fit (`health_scroll`).
     pub show_health: bool,
+    /// PAN-89: first visible row of the Shift+S panel (rendered rows, after
+    /// wrapping). Reset to 0 every time the panel opens; clamped by the key
+    /// handler and again by the renderer.
+    pub health_scroll: u16,
     /// Shift+R overlay visibility for `recent_qsos` (docs/observability-
     /// diagnostics-plan.md Layer 2 — the Recent-QSOs panel). Sibling toggle
     /// to `show_diagnostics`; lowercase `r` is taken (Re-send last TX), so
@@ -1637,6 +1641,7 @@ impl App {
             recent_qsos: VecDeque::with_capacity(50),
             show_diagnostics: false,
             show_health: false,
+            health_scroll: 0,
             show_recent_qsos: false,
             diagnostics_scroll: 0,
             recent_qsos_scroll: 0,
