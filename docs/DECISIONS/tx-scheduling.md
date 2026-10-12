@@ -236,10 +236,10 @@ emissions. The rollback undoes the newest same-text emission that carried that
 payload. If none did (an opening call or forward advance was replaced; those
 have no ledger entry), nothing is rolled back, so the replaced frame stays
 counted rather than risk removing the frame that aired.
-A pivoted frame refused before PTT (pre-PTT hard mute, liveness or arm
-recheck, disarm, pre-slot clock jump) clears the pivot tombstone, so the
-request that produced it stays queued and accounts for itself; the worker
-reports the replaced frame instead, as Step 0-dup does. An F8 abort keeps the
+A pivoted frame or multi-TX bundle refused before it airs (pre-PTT hard mute,
+liveness or arm recheck, disarm, pre-slot clock jump) clears its pivot tombstones, so the
+request that produced each pivoted frame stays queued and accounts for
+itself; the worker reports the replaced frame instead, as Step 0-dup does. An F8 abort keeps the
 tombstone, so Step 0-dup later reports the replaced frame. Multi-TX bundle items
 carry no binding, which matches bundle pivots comparing only text and offset.
 If a rollback takes `stall_cycles` from the switch threshold back below it

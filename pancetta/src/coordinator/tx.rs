@@ -677,7 +677,7 @@ async fn drop_frames_for_clock_jump(
     message_bus: &MessageBus,
     frames: &[(String, Option<String>)],
     jump: pancetta_core::slot_clock::WallClockJump,
-    pivot_replaced: Option<(String, pancetta_qso::UnsentAttemptPayload)>,
+    pivot_replaced: &mut PivotReplaced,
 ) {
     let secs = jump.signed_secs();
     for (message_text, qso_id) in frames {
@@ -698,13 +698,12 @@ async fn drop_frames_for_clock_jump(
         .await;
     }
     send_tx_queue_status(message_bus, None, Vec::new()).await;
-    let mut pivot_replaced = pivot_replaced;
     for (message_text, qso_id) in frames {
         if let Err(e) = report_unaired_frame(
             message_bus,
             message_text.clone(),
             qso_id.clone(),
-            pivot_replaced.take(),
+            take_bundle_replaced(pivot_replaced, qso_id.as_deref()),
         )
         .await
         {
@@ -2338,6 +2337,37 @@ async fn report_transmit_complete(
         report_frame_not_sent(message_bus, qso_id, message_text, None).await;
     }
     result
+}
+
+/// Pivot sources cleared from a refused frame or bundle, keyed by
+/// `active_tx_qso_key` (PAN-75).
+type PivotReplaced =
+    std::collections::HashMap<String, (String, pancetta_qso::UnsentAttemptPayload)>;
+
+/// A bundle refused before it aired: clear the tombstones its Step 4b pivot
+/// inserted and return the frames those pivots replaced, so each item's
+/// failure rolls back the replaced frame (see [`report_unaired_frame`]).
+fn unwind_bundle_pivots(
+    keys: &[String],
+    pivoted_once: &mut std::collections::HashMap<String, (String, f64)>,
+    pivoted_from: &mut PivotReplaced,
+) -> PivotReplaced {
+    keys.iter()
+        .filter_map(|key| {
+            pivoted_once.remove(key);
+            pivoted_from
+                .remove(key)
+                .map(|replaced| (key.clone(), replaced))
+        })
+        .collect()
+}
+
+/// The replaced frame recorded for `qso_id`'s pivot, if any.
+fn take_bundle_replaced(
+    replaced: &mut PivotReplaced,
+    qso_id: Option<&str>,
+) -> Option<(String, pancetta_qso::UnsentAttemptPayload)> {
+    qso_id.and_then(|id| replaced.remove(&super::active_tx_qso_key(id)))
 }
 
 /// A frame that never aired after Step 4c may have pivoted to it. Then the
@@ -6348,7 +6378,7 @@ impl super::ApplicationCoordinator {
                                                     &message_bus,
                                                     &[(message_text.clone(), qso_id.clone())],
                                                     jump,
-                                                    None,
+                                                    &mut PivotReplaced::new(),
                                                 )
                                                 .await;
                                                 continue 'worker;
@@ -6492,7 +6522,9 @@ impl super::ApplicationCoordinator {
                                             // can't grow unboundedly across a long-running
                                             // process.
                                             if let Some(id) = qso_id.as_deref() {
-                                                pivoted_once.remove(&super::active_tx_qso_key(id));
+                                                let key = super::active_tx_qso_key(id);
+                                                pivoted_once.remove(&key);
+                                                pivoted_from.remove(&key);
                                             }
                                             let _ = report_transmit_complete(
                                                 &message_bus,
@@ -7115,7 +7147,14 @@ impl super::ApplicationCoordinator {
                                                     chrono::Duration::from_std(to_slot)
                                                         .unwrap_or(chrono::Duration::MAX),
                                                 ),
-                                                pivot_replaced,
+                                                &mut qso_id
+                                                    .as_deref()
+                                                    .zip(pivot_replaced)
+                                                    .map(|(id, r)| {
+                                                        (super::active_tx_qso_key(id), r)
+                                                    })
+                                                    .into_iter()
+                                                    .collect(),
                                             )
                                             .await;
                                             continue 'worker;
@@ -8700,7 +8739,7 @@ impl super::ApplicationCoordinator {
                                                 &message_bus,
                                                 &frames,
                                                 jump,
-                                                None,
+                                                &mut PivotReplaced::new(),
                                             )
                                             .await;
                                             continue;
@@ -9350,9 +9389,11 @@ impl super::ApplicationCoordinator {
                                     if !final_live_mask.iter().all(|&live| live) {
                                         ptt_active.store(false, Ordering::Release);
                                         ptt_guard.disarm();
-                                        for key in &pivoted_this_bundle_keys {
-                                            pivoted_once.remove(key);
-                                        }
+                                        let mut bundle_replaced = unwind_bundle_pivots(
+                                            &pivoted_this_bundle_keys,
+                                            &mut pivoted_once,
+                                            &mut pivoted_from,
+                                        );
                                         let newly_stale =
                                             final_live_mask.iter().filter(|&&live| !live).count();
                                         let held = final_parity_hold_mask
@@ -9378,12 +9419,14 @@ impl super::ApplicationCoordinator {
                                         .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
-                                            let _ = report_transmit_complete(
+                                            let _ = report_unaired_frame(
                                                 &message_bus,
-                                                false,
                                                 item.message_text.clone(),
-                                                0,
                                                 item.qso_id.clone(),
+                                                take_bundle_replaced(
+                                                    &mut bundle_replaced,
+                                                    item.qso_id.as_deref(),
+                                                ),
                                             )
                                             .await;
                                         }
@@ -9410,9 +9453,11 @@ impl super::ApplicationCoordinator {
                                     ) {
                                         ptt_active.store(false, Ordering::Release);
                                         ptt_guard.disarm();
-                                        for key in &pivoted_this_bundle_keys {
-                                            pivoted_once.remove(key);
-                                        }
+                                        let mut bundle_replaced = unwind_bundle_pivots(
+                                            &pivoted_this_bundle_keys,
+                                            &mut pivoted_once,
+                                            &mut pivoted_from,
+                                        );
                                         let n = items.len();
                                         info!(
                                             target: "pancetta::tx.policy",
@@ -9430,12 +9475,14 @@ impl super::ApplicationCoordinator {
                                         .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
-                                            let _ = report_transmit_complete(
+                                            let _ = report_unaired_frame(
                                                 &message_bus,
-                                                false,
                                                 item.message_text.clone(),
-                                                0,
                                                 item.qso_id.clone(),
+                                                take_bundle_replaced(
+                                                    &mut bundle_replaced,
+                                                    item.qso_id.as_deref(),
+                                                ),
                                             )
                                             .await;
                                         }
@@ -9469,9 +9516,11 @@ impl super::ApplicationCoordinator {
                                         // 4b-pivot just inserted, so the genuinely fresh
                                         // request still queued behind it isn't discarded by
                                         // Step 0-dup as an already-sent duplicate.
-                                        for key in &pivoted_this_bundle_keys {
-                                            pivoted_once.remove(key);
-                                        }
+                                        let mut bundle_replaced = unwind_bundle_pivots(
+                                            &pivoted_this_bundle_keys,
+                                            &mut pivoted_once,
+                                            &mut pivoted_from,
+                                        );
                                         let operator_callsign = tx_denied_operator_attribution(
                                             &remote_tx_arm,
                                             remote_client_key_id.as_deref(),
@@ -9494,12 +9543,14 @@ impl super::ApplicationCoordinator {
                                         }
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
-                                            let _ = report_transmit_complete(
+                                            let _ = report_unaired_frame(
                                                 &message_bus,
-                                                false,
                                                 item.message_text.clone(),
-                                                0,
                                                 item.qso_id.clone(),
+                                                take_bundle_replaced(
+                                                    &mut bundle_replaced,
+                                                    item.qso_id.as_deref(),
+                                                ),
                                             )
                                             .await;
                                         }
@@ -9557,9 +9608,11 @@ impl super::ApplicationCoordinator {
                                         ptt_active.store(false, Ordering::Release);
                                         ptt_guard.disarm();
                                         // Pre-slot abort: nothing reached the air yet.
-                                        for key in &pivoted_this_bundle_keys {
-                                            pivoted_once.remove(key);
-                                        }
+                                        let mut bundle_replaced = unwind_bundle_pivots(
+                                            &pivoted_this_bundle_keys,
+                                            &mut pivoted_once,
+                                            &mut pivoted_from,
+                                        );
                                         let frames: Vec<(String, Option<String>)> = items
                                             .iter()
                                             .map(|item| {
@@ -9573,7 +9626,7 @@ impl super::ApplicationCoordinator {
                                                 chrono::Duration::from_std(to_slot)
                                                     .unwrap_or(chrono::Duration::MAX),
                                             ),
-                                            None,
+                                            &mut bundle_replaced,
                                         )
                                         .await;
                                         continue;
@@ -9654,9 +9707,11 @@ impl super::ApplicationCoordinator {
                                             // Round-7 review (Codex P2): pre-slot abort —
                                             // nothing reached the air yet (Step 7 never ran)
                                             // — see the single-TX arm's identical fix.
-                                            for key in &pivoted_this_bundle_keys {
-                                                pivoted_once.remove(key);
-                                            }
+                                            let mut bundle_replaced = unwind_bundle_pivots(
+                                                &pivoted_this_bundle_keys,
+                                                &mut pivoted_once,
+                                                &mut pivoted_from,
+                                            );
                                             // Round-9 review (Codex P1): drain HERE, after
                                             // PTT is already off — see
                                             // `drain_and_merge_pending`'s doc for why.
@@ -9677,12 +9732,14 @@ impl super::ApplicationCoordinator {
                                             )
                                             .await;
                                             for item in &items {
-                                                if let Err(e) = report_transmit_complete(
+                                                if let Err(e) = report_unaired_frame(
                                                     &message_bus,
-                                                    false,
                                                     item.message_text.clone(),
-                                                    0,
                                                     item.qso_id.clone(),
+                                                    take_bundle_replaced(
+                                                        &mut bundle_replaced,
+                                                        item.qso_id.as_deref(),
+                                                    ),
                                                 )
                                                 .await
                                                 {
@@ -9767,9 +9824,11 @@ impl super::ApplicationCoordinator {
                                         }
                                         ptt_active.store(false, Ordering::Release);
                                         ptt_guard.disarm();
-                                        for key in &pivoted_this_bundle_keys {
-                                            pivoted_once.remove(key);
-                                        }
+                                        let mut bundle_replaced = unwind_bundle_pivots(
+                                            &pivoted_this_bundle_keys,
+                                            &mut pivoted_once,
+                                            &mut pivoted_from,
+                                        );
                                         let operator_callsign = tx_denied_operator_attribution(
                                             &remote_tx_arm,
                                             remote_client_key_id.as_deref(),
@@ -9792,12 +9851,14 @@ impl super::ApplicationCoordinator {
                                         }
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
-                                            let _ = report_transmit_complete(
+                                            let _ = report_unaired_frame(
                                                 &message_bus,
-                                                false,
                                                 item.message_text.clone(),
-                                                0,
                                                 item.qso_id.clone(),
+                                                take_bundle_replaced(
+                                                    &mut bundle_replaced,
+                                                    item.qso_id.as_deref(),
+                                                ),
                                             )
                                             .await;
                                         }
@@ -16126,6 +16187,36 @@ mod report_transmit_complete_tests {
             .await;
         assert!(autonomous.try_recv().is_ok());
         assert!(qso.try_recv().is_err());
+    }
+
+    /// A refused bundle clears only its own pivots' tombstones and hands back
+    /// each replaced frame once, keyed by QSO (Codex P2 on PR #418).
+    #[test]
+    fn unwind_bundle_pivots_returns_each_replaced_frame_once() {
+        let payload = pancetta_qso::UnsentAttemptPayload {
+            frequency_hz: 1500.0,
+            remote_binding: None,
+        };
+        let a = super::super::active_tx_qso_key("qa");
+        let b = super::super::active_tx_qso_key("qb");
+        let other = super::super::active_tx_qso_key("qz");
+        let mut once = std::collections::HashMap::new();
+        let mut from = PivotReplaced::new();
+        for key in [&a, &b, &other] {
+            once.insert(key.clone(), ("NEW".to_string(), 1500.0));
+        }
+        from.insert(a.clone(), ("A OLD".to_string(), payload.clone()));
+        from.insert(other.clone(), ("Z OLD".to_string(), payload.clone()));
+        let mut replaced = unwind_bundle_pivots(&[a.clone(), b.clone()], &mut once, &mut from);
+        assert_eq!(once.keys().collect::<Vec<_>>(), vec![&other]);
+        assert_eq!(from.keys().collect::<Vec<_>>(), vec![&other]);
+        assert_eq!(
+            take_bundle_replaced(&mut replaced, Some("qa")).map(|(t, _)| t),
+            Some("A OLD".to_string())
+        );
+        assert!(take_bundle_replaced(&mut replaced, Some("qa")).is_none());
+        assert!(take_bundle_replaced(&mut replaced, Some("qb")).is_none());
+        assert!(take_bundle_replaced(&mut replaced, None).is_none());
     }
 
     /// A pivoted frame refused before PTT: its producing request is still
