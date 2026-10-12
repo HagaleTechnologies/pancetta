@@ -62,6 +62,13 @@ arrive in bursts at the end of each 15-second slot — within two slots the
 again, then `Shift+D` (diagnostics history) and `Shift+S` (station health)
 inside the TUI.
 
+**Terminal size.** Pancetta lays out its panels from 80×20; 80×24 is the
+smallest size it's tested at. Below about 120 columns the title bar keeps
+the UTC clock, callsign and TX policy, and drops lower-priority chips
+(app name, grid, decode timing) first. DX Hunter and Callers show fewer
+columns in narrow panels — call, entity/message and SNR always stay. `?`
+help scrolls with ↑/↓ when it doesn't fit.
+
 That's the whole path. With a rig configured you are now one keypress from
 transmitting.
 
