@@ -3315,9 +3315,12 @@ impl super::ApplicationCoordinator {
                                         // this exact event carries, so the intent can never
                                         // disagree with the `TransmitRequest` sent moments
                                         // below for the same event.
+                                        let intent_key =
+                                            super::active_tx_qso_key(&qso_id.to_string());
+                                        let intent_text = text.clone();
                                         if let Ok(mut m) = latest_tx_intent.write() {
                                             m.insert(
-                                                super::active_tx_qso_key(&qso_id.to_string()),
+                                                intent_key.clone(),
                                                 super::LatestTxIntent {
                                                     message_text: text.clone(),
                                                     frequency_offset: frequency,
@@ -3341,8 +3344,28 @@ impl super::ApplicationCoordinator {
                                             },
                                             Instant::now(),
                                         );
-                                        if let Err(e) = tx_bus.send_message(tx_msg).await {
-                                            warn!("Failed to send auto-sequence TX: {}", e);
+                                        // PAN-75 (Codex P2 on PR #419): the TX worker may
+                                        // pivot to this intent and then treat its request as
+                                        // queued, so withdraw the intent when the request
+                                        // was not actually delivered (unless a newer intent
+                                        // has replaced it meanwhile).
+                                        let delivered =
+                                            match tx_bus.send_message_checked(tx_msg).await {
+                                                Ok(delivered) => delivered,
+                                                Err(e) => {
+                                                    warn!("Failed to send auto-sequence TX: {}", e);
+                                                    false
+                                                }
+                                            };
+                                        if !delivered {
+                                            if let Ok(mut m) = latest_tx_intent.write() {
+                                                if m.get(&intent_key).is_some_and(|i| {
+                                                    i.message_text == intent_text
+                                                        && i.frequency_offset == frequency
+                                                }) {
+                                                    m.remove(&intent_key);
+                                                }
+                                            }
                                         }
                                     }
                                     Err(e) => {

@@ -240,7 +240,9 @@ A pivoted frame or multi-TX bundle refused before it airs (pre-PTT hard mute,
 liveness or arm recheck, disarm, pre-slot clock jump) clears its pivot tombstones, so the
 request that produced each pivoted frame stays queued and accounts for
 itself; the worker reports only the replaced frame to the QSO engine and sends
-Autonomous nothing for the still-queued payload. An F8 abort keeps the
+Autonomous nothing for the still-queued payload. The QSO component withdraws its
+latest-intent entry when the matching request fails to reach the TX worker, so a
+pivot only targets a payload whose request was actually queued. An F8 abort keeps the
 tombstone, so Step 0-dup later reports the replaced frame. Backlog coalescing
 consumes pivot duplicates before it picks the newest request per QSO, so a
 duplicate superseded in the backlog still reports its replaced frame. Multi-TX bundle items
