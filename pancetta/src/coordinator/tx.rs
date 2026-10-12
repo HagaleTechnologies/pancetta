@@ -5432,14 +5432,42 @@ async fn supersede_multi_reenqueue(
     {
         SupersedeOutcome::NotViable => {
             // PTT already off; the in-flight bundle is abandoned by the caller.
+            // If NotViable because the superseding message was itself a
+            // `MultiTransmitRequest`, re-enqueue that whole bundle back to the
+            // worker's own channel (mirroring the `Bundle` re-enqueue below) so
+            // the next dequeue transmits it via the unmodified Steps 1-10 — the
+            // newer bundle supersedes the abandoned in-flight one, so exactly
+            // one bundle stays pending (no duplicate). A `None` here is the
+            // too-late-for-slot case, which stays a drop. Delivery is checked:
+            // the reports below may lean on the re-enqueued bundle only once it
+            // is actually queued (Codex P2 on PR #419).
+            let mut reenqueued = None;
+            if let Some(bundle) = reenqueue_on_notviable {
+                let reenqueue = ComponentMessage::new(
+                    ComponentId::Ft8Transmitter,
+                    ComponentId::Ft8Transmitter,
+                    bundle.clone(),
+                    Instant::now(),
+                );
+                match message_bus.send_message_checked(reenqueue).await {
+                    Ok(true) => reenqueued = Some(bundle),
+                    Ok(false) => {
+                        warn!("supersede (multi-TX): superseding bundle was dropped on re-enqueue")
+                    }
+                    Err(e) => warn!(
+                        "supersede (multi-TX): failed to re-enqueue superseding bundle: {}",
+                        e
+                    ),
+                }
+            }
             // PAN-75 (Codex P2 on PR #418): report each abandoned item, as the
             // `Replace` arm does, so its keep-call accounting is reversed. Items
             // the re-enqueued bundle carries over unchanged will still air, so
-            // they are not reported (Codex P1 on PR #419).
-            // Each is reported with its own offset, and with the bundle's
-            // binding when the supersede changed authorization (Codex on PR #419).
+            // they are not reported (Codex P1 on PR #419). Each is reported
+            // with its own offset, and with the bundle's binding when the
+            // supersede changed authorization (Codex on PR #419).
             let auth_changed = matches!(
-                &reenqueue_on_notviable,
+                &reenqueued,
                 Some(MessageType::MultiTransmitRequest { origin: o, remote_client_key_id: k, .. })
                     if (*o, k.as_deref()) != (origin, remote_client_key_id.as_deref())
             );
@@ -5452,11 +5480,11 @@ async fn supersede_multi_reenqueue(
             for item in items_abandoned_by_supersede(
                 in_flight_items,
                 (origin, remote_client_key_id.as_deref()),
-                reenqueue_on_notviable.as_ref(),
+                reenqueued.as_ref(),
             ) {
                 let replacement_queued = item.qso_id.is_some()
                     && matches!(
-                        &reenqueue_on_notviable,
+                        &reenqueued,
                         Some(MessageType::MultiTransmitRequest { items, .. })
                             if items.iter().any(|n| n.qso_id == item.qso_id)
                     );
@@ -5467,27 +5495,6 @@ async fn supersede_multi_reenqueue(
                     replacement_queued,
                 )
                 .await;
-            }
-            // If NotViable because the superseding message was itself a
-            // `MultiTransmitRequest`, re-enqueue that whole bundle back to the
-            // worker's own channel (mirroring the `Bundle` re-enqueue below) so
-            // the next dequeue transmits it via the unmodified Steps 1-10 — the
-            // newer bundle supersedes the abandoned in-flight one, so exactly
-            // one bundle stays pending (no duplicate). A `None` here is the
-            // too-late-for-slot case, which stays a drop.
-            if let Some(bundle) = reenqueue_on_notviable {
-                let reenqueue = ComponentMessage::new(
-                    ComponentId::Ft8Transmitter,
-                    ComponentId::Ft8Transmitter,
-                    bundle,
-                    Instant::now(),
-                );
-                if let Err(e) = message_bus.send_message(reenqueue).await {
-                    warn!(
-                        "supersede (multi-TX): failed to re-enqueue superseding bundle: {}",
-                        e
-                    );
-                }
             }
         }
         SupersedeOutcome::Bundle {
