@@ -2374,7 +2374,8 @@ fn take_bundle_replaced(
 /// request that produced `message_text` is still queued and accounts for
 /// itself, so the QSO engine instead rolls back the frame the pivot
 /// replaced (`pivot_replaced`), which never aired either (PAN-75).
-/// Autonomous gets the usual failed completion either way.
+/// Autonomous gets the usual failed completion either way (follow-up:
+/// PAN-185).
 async fn report_unaired_frame(
     message_bus: &MessageBus,
     message_text: String,
@@ -5286,6 +5287,73 @@ async fn supersede_and_rekey_or_bundle(
 ///
 /// In every case `supersede_and_rekey_or_bundle` has already deasserted PTT, so
 /// the caller safely disarms its `PttGuard` and `continue`s after this returns.
+/// In-flight bundle items a `NotViable` multi-TX supersede really abandons:
+/// every item, except those `reenqueued` (the incoming bundle put back on the
+/// queue) carries unchanged for the same QSO under the same authorization,
+/// which will still air (PAN-75). An authorization change (origin or bound
+/// client) carries nothing: the old-authority attempt is abandoned.
+fn items_abandoned_by_supersede<'a>(
+    in_flight_items: &'a [crate::message_bus::TransmitRequestItem],
+    in_flight_auth: (crate::message_bus::TxOrigin, Option<&str>),
+    reenqueued: Option<&MessageType>,
+) -> Vec<&'a crate::message_bus::TransmitRequestItem> {
+    let carried: &[crate::message_bus::TransmitRequestItem] = match reenqueued {
+        Some(MessageType::MultiTransmitRequest {
+            items,
+            origin,
+            remote_client_key_id,
+            ..
+        }) if (*origin, remote_client_key_id.as_deref()) == in_flight_auth => items,
+        _ => &[],
+    };
+    in_flight_items
+        .iter()
+        .filter(|item| {
+            !carried.iter().any(|c| {
+                c.qso_id == item.qso_id
+                    && c.message_text == item.message_text
+                    && (c.frequency_offset - item.frequency_offset).abs()
+                        < super::PIVOT_OFFSET_EPSILON_HZ
+            })
+        })
+        .collect()
+}
+
+/// Report an in-flight bundle item a supersede abandoned. The QSO engine gets
+/// the item's own offset (and, when known, the bundle's binding) so the
+/// rollback cannot land on a newer same-text attempt at another offset or
+/// authority (PAN-75). Autonomous gets the usual failed completion
+/// (follow-up: PAN-185).
+async fn report_abandoned_bundle_item(
+    message_bus: &MessageBus,
+    item: &crate::message_bus::TransmitRequestItem,
+    remote_binding: Option<(bool, Option<String>)>,
+) {
+    if let Err(e) = report_transmit_complete_to_autonomous(
+        message_bus,
+        false,
+        item.message_text.clone(),
+        0,
+        item.qso_id.clone(),
+    )
+    .await
+    {
+        warn!("Failed to send TransmitComplete: {}", e);
+    }
+    if let Some(qso_id) = item.qso_id.clone() {
+        report_frame_not_sent(
+            message_bus,
+            qso_id,
+            item.message_text.clone(),
+            Some(pancetta_qso::UnsentAttemptPayload {
+                frequency_hz: item.frequency_offset,
+                remote_binding,
+            }),
+        )
+        .await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn supersede_multi_reenqueue(
     new_request: MessageType,
@@ -5368,20 +5436,51 @@ async fn supersede_multi_reenqueue(
             // the next dequeue transmits it via the unmodified Steps 1-10 — the
             // newer bundle supersedes the abandoned in-flight one, so exactly
             // one bundle stays pending (no duplicate). A `None` here is the
-            // too-late-for-slot case, which stays a drop.
+            // too-late-for-slot case, which stays a drop. Delivery is checked:
+            // the reports below may lean on the re-enqueued bundle only once it
+            // is actually queued (Codex P2 on PR #419).
+            let mut reenqueued = None;
             if let Some(bundle) = reenqueue_on_notviable {
                 let reenqueue = ComponentMessage::new(
                     ComponentId::Ft8Transmitter,
                     ComponentId::Ft8Transmitter,
-                    bundle,
+                    bundle.clone(),
                     Instant::now(),
                 );
-                if let Err(e) = message_bus.send_message(reenqueue).await {
-                    warn!(
+                match message_bus.send_message_checked(reenqueue).await {
+                    Ok(true) => reenqueued = Some(bundle),
+                    Ok(false) => {
+                        warn!("supersede (multi-TX): superseding bundle was dropped on re-enqueue")
+                    }
+                    Err(e) => warn!(
                         "supersede (multi-TX): failed to re-enqueue superseding bundle: {}",
                         e
-                    );
+                    ),
                 }
+            }
+            // PAN-75 (Codex P2 on PR #418): report each abandoned item, as the
+            // `Replace` arm does, so its keep-call accounting is reversed. Items
+            // the re-enqueued bundle carries over unchanged will still air, so
+            // they are not reported (Codex P1 on PR #419). Each is reported
+            // with its own offset, and with the bundle's binding when the
+            // supersede changed authorization (Codex on PR #419).
+            let auth_changed = matches!(
+                &reenqueued,
+                Some(MessageType::MultiTransmitRequest { origin: o, remote_client_key_id: k, .. })
+                    if (*o, k.as_deref()) != (origin, remote_client_key_id.as_deref())
+            );
+            let binding = auth_changed.then(|| {
+                (
+                    origin == crate::message_bus::TxOrigin::Remote,
+                    remote_client_key_id.clone(),
+                )
+            });
+            for item in items_abandoned_by_supersede(
+                in_flight_items,
+                (origin, remote_client_key_id.as_deref()),
+                reenqueued.as_ref(),
+            ) {
+                report_abandoned_bundle_item(message_bus, item, binding.clone()).await;
             }
         }
         SupersedeOutcome::Bundle {
@@ -16504,6 +16603,73 @@ mod report_transmit_complete_tests {
         assert!(take_bundle_replaced(&mut replaced, Some("qa")).is_none());
         assert!(take_bundle_replaced(&mut replaced, Some("qb")).is_none());
         assert!(take_bundle_replaced(&mut replaced, None).is_none());
+    }
+
+    /// PAN-75 (Codex P1 on PR #419): items a re-enqueued superseding bundle
+    /// carries over unchanged still air, so only the others are abandoned.
+    #[test]
+    fn notviable_supersede_skips_items_the_new_bundle_carries_over() {
+        let item = |q: &str, text: &str| crate::message_bus::TransmitRequestItem {
+            message_text: text.to_string(),
+            frequency_offset: 1500.0,
+            qso_id: Some(q.to_string()),
+        };
+        let in_flight = vec![item("qa", "K1A N0CALL -07"), item("qb", "K2B N0CALL R-10")];
+        let reenqueued = MessageType::MultiTransmitRequest {
+            items: vec![item("qa", "K1A N0CALL RR73"), item("qb", "K2B N0CALL R-10")],
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
+        };
+        let local = (crate::message_bus::TxOrigin::Local, None);
+        let abandoned = items_abandoned_by_supersede(&in_flight, local, Some(&reenqueued));
+        assert_eq!(abandoned.len(), 1);
+        assert!(std::ptr::eq(abandoned[0], &in_flight[0]));
+        assert_eq!(
+            items_abandoned_by_supersede(&in_flight, local, None).len(),
+            2
+        );
+        // Sub-epsilon offset noise still counts as carried (Codex P2 on PR #419).
+        let mut noisy = reenqueued.clone();
+        if let MessageType::MultiTransmitRequest { items, .. } = &mut noisy {
+            items[1].frequency_offset += 0.1;
+        }
+        assert_eq!(
+            items_abandoned_by_supersede(&in_flight, local, Some(&noisy)).len(),
+            1
+        );
+        // An authorization change carries nothing over (Codex P2 on PR #419).
+        let remote = (crate::message_bus::TxOrigin::Remote, Some("client-a"));
+        assert_eq!(
+            items_abandoned_by_supersede(&in_flight, remote, Some(&reenqueued)).len(),
+            2
+        );
+    }
+
+    /// An abandoned bundle item is rolled back by its own offset, so a newer
+    /// same-text attempt at another offset is not hit (Codex P1 on PR #419).
+    #[tokio::test]
+    async fn abandoned_bundle_item_reports_its_own_offset() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_, autonomous) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        let item = crate::message_bus::TransmitRequestItem {
+            message_text: "K1A N0CALL -07".to_string(),
+            frequency_offset: 1250.0,
+            qso_id: Some("qa".to_string()),
+        };
+        report_abandoned_bundle_item(&bus, &item, Some((true, Some("client-a".into())))).await;
+        assert!(matches!(
+            autonomous.try_recv().unwrap().message_type,
+            MessageType::TransmitComplete { success: false, .. }
+        ));
+        assert!(matches!(
+            qso.try_recv().unwrap().message_type,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { ref message_text, replaced: Some(ref p), .. })
+                if message_text == "K1A N0CALL -07"
+                    && p.frequency_hz == 1250.0
+                    && p.remote_binding == Some((true, Some("client-a".to_string())))
+        ));
     }
 
     /// A pivoted frame refused before PTT: its producing request is still
