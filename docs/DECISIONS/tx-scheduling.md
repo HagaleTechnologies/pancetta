@@ -239,10 +239,9 @@ counted rather than risk removing the frame that aired.
 A pivoted frame or multi-TX bundle refused before it airs (pre-PTT hard mute,
 liveness or arm recheck, disarm, pre-slot clock jump) clears its pivot tombstones, so the
 request that produced each pivoted frame stays queued and accounts for
-itself; the worker reports only the replaced frame to the QSO engine and sends
-Autonomous nothing for the still-queued payload. The QSO component withdraws its
-latest-intent entry when the matching request fails to reach the TX worker, so a
-pivot only targets a payload whose request was actually queued. An F8 abort keeps the
+itself; the worker reports the replaced frame to the QSO engine instead.
+Autonomous still gets a failed completion for the pivoted payload, as on Step
+0-dup; correlating it with the queued request's eventual outcome is PAN-185. An F8 abort keeps the
 tombstone, so Step 0-dup later reports the replaced frame. Backlog coalescing
 consumes pivot duplicates before it picks the newest request per QSO, so a
 duplicate superseded in the backlog still reports its replaced frame. Multi-TX bundle items
@@ -306,8 +305,8 @@ multi-TX supersede reports in-flight items it abandons as too late
 re-enqueued bundle carries unchanged under the same authorization, and reports
 the rest with their own offset (plus the old binding after an authorization
 change) so the rollback cannot hit the replacement's attempt. Offsets within
-0.5 Hz count as unchanged, and Autonomous hears no failure for an item whose
-QSO has a replacement in that bundle. Rollback emits no new snapshot or QSO event; the existing status panel
+0.5 Hz count as unchanged, and items count as carried only once the
+re-enqueued bundle is confirmed queued. Rollback emits no new snapshot or QSO event; the existing status panel
 and remote snapshot fields show corrected values on the next normal push.
 
 ## UTC re-anchoring after sleep/wake and clock steps (PAN-114, 2026-10-10)
