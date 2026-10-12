@@ -1101,6 +1101,9 @@ impl TuiRunner {
                 .unwrap_or(Rect::new(0, 0, crate::ui::MIN_TERMINAL_WIDTH, 24));
             let geom = help_overlay_geometry(viewport);
             let page = geom.body_height.max(1);
+            // A resize since the last key can leave the stored offset past
+            // the new maximum; clamp it so Up/PageUp move on the first press.
+            app.help_scroll = app.help_scroll.min(geom.max_scroll);
             match key.code {
                 KeyCode::Esc | KeyCode::Char('?') => {
                     app.toggle_help();
@@ -5174,6 +5177,30 @@ mod key_tests {
         assert!(!app.read().await.help_visible);
         r.handle_key_event(key('?')).await.unwrap();
         assert_eq!(app.read().await.help_scroll, 0, "reopen resets scroll");
+    }
+
+    /// An offset stored at a shorter terminal (End at 80×20) outlives a
+    /// resize to 80×24 (the no-terminal fallback). Up/PageUp must move from
+    /// the new maximum, not from the stale offset.
+    #[tokio::test]
+    async fn help_overlay_scroll_up_after_resize_moves_immediately() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        let small = help_overlay_geometry(Rect::new(0, 0, 80, 20));
+        let geom = help_overlay_geometry(Rect::new(0, 0, 80, 24));
+        assert!(geom.max_scroll > 0 && small.max_scroll > geom.max_scroll);
+        let special = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        r.handle_key_event(key('?')).await.unwrap();
+        app.write().await.help_scroll = small.max_scroll;
+        r.handle_key_event(special(KeyCode::Up)).await.unwrap();
+        assert_eq!(app.read().await.help_scroll, geom.max_scroll - 1);
+
+        app.write().await.help_scroll = small.max_scroll;
+        r.handle_key_event(special(KeyCode::PageUp)).await.unwrap();
+        assert_eq!(
+            app.read().await.help_scroll,
+            geom.max_scroll.saturating_sub(geom.body_height.max(1))
+        );
     }
 
     /// `r` (re-send) is still gated to the QSO Status panel — out of scope
