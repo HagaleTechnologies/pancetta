@@ -2371,26 +2371,25 @@ fn take_bundle_replaced(
 }
 
 /// A frame that never aired after Step 4c may have pivoted to it. Then the
-/// request that produced `message_text` is still queued and accounts for
-/// itself, so the QSO engine instead rolls back the frame the pivot
-/// replaced (`pivot_replaced`), which never aired either (PAN-75).
-/// Autonomous gets the usual failed completion either way.
+/// request that produced `message_text` is still queued and reports its own
+/// outcome when it is dequeued, so nothing terminal is sent for it here:
+/// neither Autonomous nor the QSO engine hears about `message_text`. The QSO
+/// engine instead rolls back the frame the pivot replaced (`pivot_replaced`),
+/// which never aired (PAN-75). Without a pivot this is a plain failed
+/// completion.
 async fn report_unaired_frame(
     message_bus: &MessageBus,
     message_text: String,
     qso_id: Option<String>,
     pivot_replaced: Option<(String, pancetta_qso::UnsentAttemptPayload)>,
 ) -> Result<()> {
-    if pivot_replaced.is_none() {
-        return report_transmit_complete(message_bus, false, message_text, 0, qso_id).await;
+    match (qso_id, pivot_replaced) {
+        (Some(qso_id), Some((replaced_text, replaced))) => {
+            report_frame_not_sent(message_bus, qso_id, replaced_text, Some(replaced)).await;
+            Ok(())
+        }
+        (qso_id, _) => report_transmit_complete(message_bus, false, message_text, 0, qso_id).await,
     }
-    let result =
-        report_transmit_complete_to_autonomous(message_bus, false, message_text, 0, qso_id.clone())
-            .await;
-    if let (Some(qso_id), Some((replaced_text, replaced))) = (qso_id, pivot_replaced) {
-        report_frame_not_sent(message_bus, qso_id, replaced_text, Some(replaced)).await;
-    }
-    result
 }
 
 /// PAN-75: tell the QSO engine `message_text` never aired for `qso_id`.
@@ -5362,6 +5361,21 @@ async fn supersede_multi_reenqueue(
     {
         SupersedeOutcome::NotViable => {
             // PTT already off; the in-flight bundle is abandoned by the caller.
+            // PAN-75 (Codex P2 on PR #418): report each abandoned item, as the
+            // `Replace` arm does, so its keep-call accounting is reversed.
+            for item in in_flight_items {
+                if let Err(e) = report_transmit_complete(
+                    message_bus,
+                    false,
+                    item.message_text.clone(),
+                    0,
+                    item.qso_id.clone(),
+                )
+                .await
+                {
+                    warn!("Failed to send TransmitComplete: {}", e);
+                }
+            }
             // If NotViable because the superseding message was itself a
             // `MultiTransmitRequest`, re-enqueue that whole bundle back to the
             // worker's own channel (mirroring the `Bundle` re-enqueue below) so
@@ -16526,11 +16540,9 @@ mod report_transmit_complete_tests {
         )
         .await
         .unwrap();
-        assert!(matches!(
-            autonomous.try_recv().unwrap().message_type,
-            MessageType::TransmitComplete { success: false, qso_id: Some(ref id), ref message_text, .. }
-                if id == "q1" && message_text == "K1ABC N0CALL R-07"
-        ));
+        // The pivoted payload's own request is still queued: no terminal
+        // failure for it reaches Autonomous (Codex P2 on PR #418).
+        assert!(autonomous.try_recv().is_err());
         assert!(matches!(
             qso.try_recv().unwrap().message_type,
             MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { ref qso_id, ref message_text, replaced: Some(ref payload) })

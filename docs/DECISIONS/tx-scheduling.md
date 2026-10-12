@@ -239,7 +239,8 @@ counted rather than risk removing the frame that aired.
 A pivoted frame or multi-TX bundle refused before it airs (pre-PTT hard mute,
 liveness or arm recheck, disarm, pre-slot clock jump) clears its pivot tombstones, so the
 request that produced each pivoted frame stays queued and accounts for
-itself; the worker reports the replaced frame instead, as Step 0-dup does. An F8 abort keeps the
+itself; the worker reports only the replaced frame to the QSO engine and sends
+Autonomous nothing for the still-queued payload. An F8 abort keeps the
 tombstone, so Step 0-dup later reports the replaced frame. Backlog coalescing
 consumes pivot duplicates before it picks the newest request per QSO, so a
 duplicate superseded in the backlog still reports its replaced frame. Multi-TX bundle items
@@ -284,6 +285,9 @@ tick its re-call reached the cap, so the cap-reaching frame never aired and an
 unsent report for it found no active QSO. Retirement on the call cap now lands
 up to four slots after the last call.
 
+Rollback reports are best-effort bus messages; a full or missing QSO channel
+loses them (follow-up: PAN-185).
+
 Shutdown aborts deliberately send no rollback. The TX and QSO loops stop on the
 same global flag, and shutdown persists no active-QSO state. Adding a bus await
 on that exit path would not preserve any observable accounting.
@@ -294,8 +298,9 @@ existing accounting because those paths have no matching ledger entry or QSO
 failure report. A single-frame supersede reports the frame it abandons whether
 it re-keys (`Replace`) or is too late to (`NotViable`). A superseding request a
 supersede drops (too late to re-key, a bundle a single-frame re-key cannot fold,
-or over the cap of a multi-TX bundle), and in-flight bundle items a multi-TX
-supersede drops outside an identity conflict, are not reported and stay counted. Rollback emits no new snapshot or QSO event; the existing status panel
+or over the cap of a multi-TX bundle) is not reported and stays counted. A
+multi-TX supersede reports in-flight items it abandons as too late
+(`NotViable`) or on an identity conflict. Rollback emits no new snapshot or QSO event; the existing status panel
 and remote snapshot fields show corrected values on the next normal push.
 
 ## UTC re-anchoring after sleep/wake and clock steps (PAN-114, 2026-10-10)
