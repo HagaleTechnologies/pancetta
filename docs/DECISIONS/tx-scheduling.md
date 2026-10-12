@@ -241,7 +241,7 @@ If a rollback takes `stall_cycles` from the switch threshold back below it
 before the coordinator's drain commits a stall offset action that attempt
 raised, the commit is refused (`OffsetActionStallRolledBack`) until the streak
 reaches the threshold again. A rollback that arrives after the commit cannot
-undo the move.
+undo the move (follow-up: PAN-182).
 Rearm, explicit resend and operator offset-switch retransmits record attempts.
 A forward advance or committed offset switch clears the remembered stall
 contributions too, so a delayed failure cannot subtract from a newer streak.
@@ -264,6 +264,16 @@ encode/PTT failure. This supersedes the PAN-141 spec's accepted tradeoff that a
 held cycle spends a call. Existing time watchdogs and caps for counted calls
 still apply. A failure can also mean an interrupted, partial frame; it is not
 counted as a completed transmission.
+
+The manual call-count cap waits for the frame that reached it. While any
+keep-call attempt for the QSO is still inside the four-slot rollback window,
+`check_timeouts_at` does not retire it on the call cap; rearm already stops at
+the cap, so nothing new airs meanwhile and the time watchdog still applies. If
+that final frame is reported unsent, `call_count` drops below the cap and
+keep-calling resumes. Before this, the watchdog retired the QSO on the same
+tick its re-call reached the cap, so the cap-reaching frame never aired and an
+unsent report for it found no active QSO. Retirement on the call cap now lands
+up to four slots after the last call.
 
 Shutdown aborts deliberately send no rollback. The TX and QSO loops stop on the
 same global flag, and shutdown persists no active-QSO state. Adding a bus await

@@ -7713,7 +7713,27 @@ impl QsoManager {
                     progress.state,
                     QsoState::CallingCq { .. } | QsoState::RespondingToCq { .. }
                 );
-                let call_cap_hit = in_initial_call && progress.metadata.call_count >= max_calls;
+                // PAN-75: the frame that reaches the cap must get its TX
+                // outcome before the cap retires the QSO, or an unsent final
+                // frame could never be given back. Hold retirement while any
+                // keep-call attempt is still inside the rollback window; a
+                // rollback drops `call_count` below the cap and re-arming
+                // resumes. Re-arming stops at the cap, so nothing new airs
+                // while we wait, and the time watchdog still applies.
+                let attempt_unresolved = {
+                    let cutoff = now
+                        - Duration::milliseconds(
+                            UNSENT_ATTEMPT_RETENTION_SLOTS * self.rearm_slot_millis(),
+                        );
+                    self.keep_call_ledger
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&qso_id)
+                        .is_some_and(|entry| entry.attempts.iter().any(|a| a.emitted_at >= cutoff))
+                };
+                let call_cap_hit = in_initial_call
+                    && progress.metadata.call_count >= max_calls
+                    && !attempt_unresolved;
                 if !progressed && (call_cap_hit || elapsed >= watchdog) {
                     timeouts.push((qso_id, QsoFailureReason::Timeout));
                 }
@@ -9045,7 +9065,8 @@ mod tests {
             t += Duration::seconds(15);
             manager.rearm_manual_calls_at(t).await;
         }
-        manager.check_timeouts_at(t).await;
+        // Past the cap-reaching frame's rollback window (PAN-75).
+        manager.check_timeouts_at(t + Duration::seconds(60)).await;
 
         // The timed-out QSO is gone from the live map AND its callsign mapping
         // is cleared (no stale entry left behind).
@@ -9190,14 +9211,78 @@ mod tests {
             progress.metadata.call_count
         );
 
-        // Watchdog must now retire it.
-        manager.check_timeouts_at(t).await;
+        // Watchdog must now retire it, once the cap-reaching frame is past
+        // the rollback window (PAN-75).
+        manager.check_timeouts_at(t + Duration::seconds(60)).await;
         let after = manager.get_qso(qso_id).await;
         assert!(
             matches!(after, Err(QsoManagerError::QsoNotFound { .. })),
             "watchdog should have removed the QSO, got {:?}",
             after.map(|p| p.state)
         );
+    }
+
+    /// PAN-75 (Codex P2 on PR #418): the cap does not retire a QSO while its
+    /// cap-reaching frame's TX outcome is still pending. If that frame is
+    /// reported unsent, the call is given back and keep-calling resumes.
+    #[tokio::test]
+    async fn manual_cap_waits_for_cap_reaching_frame_outcome() {
+        let mut config = test_config();
+        config.timeouts.manual_call_max_calls = 3;
+        config.timeouts.manual_call_watchdog_minutes = 60;
+        let manager = QsoManager::new(config);
+        let qso_id = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+
+        let t0 = Utc::now();
+        let t1 = t0 + Duration::seconds(15);
+        let t2 = t0 + Duration::seconds(30);
+        manager.rearm_manual_calls_at(t1).await;
+        manager.rearm_manual_calls_at(t2).await;
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(progress.metadata.call_count, 3, "cap reached at t2");
+
+        // Same tick as the cap-reaching re-arm: still pending, not retired.
+        manager.check_timeouts_at(t2).await;
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        let text = progress
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.direction == MessageDirection::Sent)
+            .map(|m| m.raw_text.clone())
+            .expect("cap-reaching frame recorded as sent");
+
+        // The TX worker reports the cap-reaching frame as unsent.
+        let rollback = manager
+            .roll_back_unsent_attempt_at(qso_id, &text, t2 + Duration::seconds(5))
+            .await;
+        assert_eq!(
+            rollback,
+            UnsentAttemptRollback::RolledBack { call_count: 2 }
+        );
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            progress.metadata.call_count, 2,
+            "unsent final call given back"
+        );
+
+        // Keep-calling resumes and the QSO gets its real last call.
+        let t3 = t2 + Duration::seconds(15);
+        manager.rearm_manual_calls_at(t3).await;
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(progress.metadata.call_count, 3);
+        manager.check_timeouts_at(t3).await;
+        assert!(manager.get_qso(qso_id).await.is_ok(), "still pending");
+
+        // Once that frame is past the rollback window, the cap retires it.
+        manager.check_timeouts_at(t3 + Duration::seconds(75)).await;
+        assert!(matches!(
+            manager.get_qso(qso_id).await,
+            Err(QsoManagerError::QsoNotFound { .. })
+        ));
     }
 
     /// The manual watchdog retires a RespondingToCq QSO once the elapsed

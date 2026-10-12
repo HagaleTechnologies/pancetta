@@ -118,6 +118,12 @@ async fn cap_excluded_manual_qso_keeps_its_call_budget() {
             .rearm_manual_calls_at(t + Duration::seconds(15))
             .await;
     }
+    // A and B reached the cap at slot 3; the cap retires them once that
+    // frame is past the rollback window. Rearm stops at the cap, so they
+    // emit nothing meanwhile.
+    manager
+        .check_timeouts_at(opened + Duration::seconds(15 * 3 + 75))
+        .await;
     assert!(manager.get_qso(a).await.is_err());
     assert!(manager.get_qso(b).await.is_err());
     for aired_rearms in 1..=3 {
@@ -134,6 +140,9 @@ async fn cap_excluded_manual_qso_keeps_its_call_budget() {
             .rearm_manual_calls_at(t + Duration::seconds(15))
             .await;
     }
+    manager
+        .check_timeouts_at(opened + Duration::seconds(15 * 6 + 75))
+        .await;
     assert!(manager.get_qso(c).await.is_err());
 }
 

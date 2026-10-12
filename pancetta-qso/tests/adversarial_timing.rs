@@ -273,7 +273,7 @@ async fn c4_reengage_after_watchdog_failure_fresh_qso() {
     // Call, never answered → watchdog retires it (mapping cleared).
     sim.inject_decode("CQ PY2GIG GG66", FREQ, -12.0, 0.2);
     sim.call_station(dx, FREQ).await;
-    sim.tick_n(12).await; // tick past the 10-call cap
+    sim.tick_n(16).await; // tick past the 10-call cap + the final frame's rollback window
 
     let tl_mid = sim.timeline().clone();
     assert!(
@@ -314,7 +314,7 @@ async fn c5_abandoned_then_dx_closes_is_safely_ignored() {
 
     sim.inject_decode("CQ K9HJZ EN52", FREQ, -9.0, 0.1);
     sim.call_station(dx, FREQ).await;
-    sim.tick_n(6).await; // retire by watchdog
+    sim.tick_n(10).await; // retire by watchdog (cap + final frame's rollback window)
 
     assert!(
         sim.timeline()
@@ -630,7 +630,7 @@ async fn c12_watchdog_is_per_qso_not_per_step() {
     sim.tick().await; // slot 0: grid, call_count 1
 
     // DX never answers — we keep re-calling our grid in RespondingToCq.
-    sim.tick_n(8).await;
+    sim.tick_n(12).await; // cap + the final frame's rollback window (PAN-75)
 
     let tl = sim.into_timeline();
     tl.assert_failed_with(QsoFailureReason::Timeout);
