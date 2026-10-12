@@ -18,19 +18,114 @@ use ratatui::{
 use super::{create_panel_block, format_time_ago};
 use crate::app::{ActivePanel, App, DecodedMessageView};
 
+/// Row-highlight marker for the selected caller. Also part of the column
+/// budget in [`visible_columns`] (PAN-88, D4).
+const HIGHLIGHT_SYMBOL: &str = "▶ ";
+
+/// Single source of truth for the Callers column set (PAN-88), mirroring
+/// Band Activity's `BandActivityColumn`: header, widths and row cells all
+/// derive from [`visible_columns`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CallersColumn {
+    Call,
+    Msg,
+    Snr,
+    Freq,
+    Age,
+    Flags,
+}
+
+impl CallersColumn {
+    /// Display order (left to right).
+    pub(super) const ALL: [CallersColumn; 6] = [
+        CallersColumn::Call,
+        CallersColumn::Msg,
+        CallersColumn::Snr,
+        CallersColumn::Freq,
+        CallersColumn::Age,
+        CallersColumn::Flags,
+    ];
+
+    /// The order columns join as the panel widens. `BUSY` (working someone
+    /// else) and `WKD` (a dupe) decide whether to answer; the caller's audio
+    /// offset doesn't, because Space replies on our own offset.
+    const PRIORITY: [CallersColumn; 6] = [
+        CallersColumn::Call,
+        CallersColumn::Msg,
+        CallersColumn::Snr,
+        CallersColumn::Flags,
+        CallersColumn::Age,
+        CallersColumn::Freq,
+    ];
+
+    pub(super) fn header(self) -> &'static str {
+        match self {
+            CallersColumn::Call => "Call",
+            CallersColumn::Msg => "Msg",
+            CallersColumn::Snr => "SNR",
+            CallersColumn::Freq => "Freq",
+            CallersColumn::Age => "Age",
+            CallersColumn::Flags => "Flags",
+        }
+    }
+
+    fn width(self) -> Constraint {
+        match self {
+            CallersColumn::Call => Constraint::Min(8),
+            CallersColumn::Msg => Constraint::Min(10),
+            CallersColumn::Snr => Constraint::Length(4),
+            CallersColumn::Freq => Constraint::Length(5),
+            CallersColumn::Age => Constraint::Length(4),
+            // Fits two flags ("BUSY WKD"); the rare three-flag case reads
+            // "BUSY MINE" (PAN-88 narrowed this from 12).
+            CallersColumn::Flags => Constraint::Length(9),
+        }
+    }
+
+    /// The narrowest this column is ever drawn (its `Length`/`Min`).
+    fn min_width(self) -> u16 {
+        match self.width() {
+            Constraint::Length(n) | Constraint::Min(n) => n,
+            _ => 0,
+        }
+    }
+}
+
+/// Columns shown in a Callers panel `width` columns wide (PAN-88): the same
+/// prefix rule and highlight-marker reservation as DX Hunter's
+/// `visible_columns` — walk [`CallersColumn::PRIORITY`] and stop at the first
+/// column that doesn't fit, so no heading is squeezed to a stub. `Call` is
+/// always shown. Returned in display order.
+pub(super) fn visible_columns(width: u16) -> Vec<CallersColumn> {
+    let budget = width
+        .saturating_sub(2)
+        .saturating_sub(Span::raw(HIGHLIGHT_SYMBOL).width() as u16);
+    let n = super::bar_fit::prefix_fit(
+        CallersColumn::PRIORITY.iter().map(|c| c.min_width()),
+        budget,
+    )
+    .max(1);
+    let shown = &CallersColumn::PRIORITY[..n];
+    CallersColumn::ALL
+        .into_iter()
+        .filter(|c| shown.contains(c))
+        .collect()
+}
+
 pub fn render_callers(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
     let is_active = matches!(app.active_panel, ActivePanel::Callers);
     let block = create_panel_block("Callers", is_active, app);
 
-    let header_cells = ["Call", "Msg", "SNR", "Freq", "Age", "Flags"]
-        .iter()
-        .map(|h| {
-            Cell::from(*h).style(
-                Style::default()
-                    .fg(app.theme.accent_color())
-                    .add_modifier(Modifier::BOLD),
-            )
-        });
+    // PAN-88: narrow panels show fewer, whole columns. `table_area` below
+    // has the same width as `area`.
+    let columns = visible_columns(area.width);
+    let header_cells = columns.iter().map(|c| {
+        Cell::from(c.header()).style(
+            Style::default()
+                .fg(app.theme.accent_color())
+                .add_modifier(Modifier::BOLD),
+        )
+    });
     let header = Row::new(header_cells).height(1);
 
     // Same ordering the selection resolver walks.
@@ -50,30 +145,22 @@ pub fn render_callers(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
         height: 1,
     };
 
-    let mut rows: Vec<Row> = callers.iter().map(|m| caller_row(m, app)).collect();
+    let mut rows: Vec<Row> = callers
+        .iter()
+        .map(|m| caller_row(m, app, &columns))
+        .collect();
     if rows.is_empty() {
-        rows.push(Row::new(
-            [
-                Cell::from(""),
-                Cell::from("No one calling"),
-                Cell::from(""),
-                Cell::from(""),
-                Cell::from(""),
-                Cell::from(""),
-            ]
-            .into_iter()
-            .map(|c| c.style(Style::default().fg(app.theme.muted_color()))),
-        ));
+        rows.push(Row::new(columns.iter().map(|c| {
+            let text = match c {
+                CallersColumn::Call => "No one",
+                CallersColumn::Msg => "calling",
+                _ => "",
+            };
+            Cell::from(text).style(Style::default().fg(app.theme.muted_color()))
+        })));
     }
 
-    let widths = [
-        Constraint::Min(8),     // Call
-        Constraint::Min(10),    // Msg
-        Constraint::Length(4),  // SNR
-        Constraint::Length(5),  // Freq
-        Constraint::Length(4),  // Age
-        Constraint::Length(12), // Flags
-    ];
+    let widths: Vec<Constraint> = columns.iter().map(|c| c.width()).collect();
 
     let table = Table::new(rows, widths)
         .header(header)
@@ -85,7 +172,7 @@ pub fn render_callers(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
                 .add_modifier(Modifier::REVERSED)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▶ ");
+        .highlight_symbol(HIGHLIGHT_SYMBOL);
 
     let mut table_state = TableState::default();
     if is_active && !callers.is_empty() {
@@ -138,7 +225,7 @@ fn reply_label(step: pancetta_core::ResponseStep, report: i8) -> String {
     }
 }
 
-fn caller_row<'a>(msg: &'a DecodedMessageView, app: &App) -> Row<'a> {
+fn caller_row<'a>(msg: &'a DecodedMessageView, app: &App, columns: &[CallersColumn]) -> Row<'a> {
     let call = msg.call_sign.clone().unwrap_or_default();
 
     // Cross-panel global focus (Task 2): when some OTHER panel is active and
@@ -213,12 +300,101 @@ fn caller_row<'a>(msg: &'a DecodedMessageView, app: &App) -> Row<'a> {
         Style::default().fg(app.theme.muted_color())
     };
 
-    Row::new([
-        Cell::from(call_display).style(call_style),
-        Cell::from(text).style(dim),
-        Cell::from(snr_str).style(snr_style),
-        Cell::from(freq_str).style(Style::default().fg(app.theme.accent_color())),
-        Cell::from(age_str).style(Style::default().fg(app.theme.muted_color())),
-        Cell::from(flags_str).style(flags_style),
-    ])
+    // One cell per visible column (PAN-88).
+    Row::new(
+        [
+            (
+                CallersColumn::Call,
+                Cell::from(call_display).style(call_style),
+            ),
+            (CallersColumn::Msg, Cell::from(text).style(dim)),
+            (CallersColumn::Snr, Cell::from(snr_str).style(snr_style)),
+            (
+                CallersColumn::Freq,
+                Cell::from(freq_str).style(Style::default().fg(app.theme.accent_color())),
+            ),
+            (
+                CallersColumn::Age,
+                Cell::from(age_str).style(Style::default().fg(app.theme.muted_color())),
+            ),
+            (
+                CallersColumn::Flags,
+                Cell::from(flags_str).style(flags_style),
+            ),
+        ]
+        .into_iter()
+        .filter(|(col, _)| columns.contains(col))
+        .map(|(_, cell)| cell),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visible_columns_compact_tier_at_operate_80() {
+        use CallersColumn::*;
+        assert_eq!(visible_columns(32), vec![Call, Msg, Snr]);
+    }
+
+    #[test]
+    fn visible_columns_at_operate_100() {
+        use CallersColumn::*;
+        assert_eq!(visible_columns(40), vec![Call, Msg, Snr, Flags]);
+    }
+
+    #[test]
+    fn visible_columns_at_operate_120() {
+        use CallersColumn::*;
+        assert_eq!(visible_columns(48), vec![Call, Msg, Snr, Age, Flags]);
+    }
+
+    #[test]
+    fn visible_columns_wide_tier_shows_all() {
+        assert_eq!(visible_columns(53), CallersColumn::ALL.to_vec());
+        assert_eq!(visible_columns(80), CallersColumn::ALL.to_vec());
+    }
+
+    #[test]
+    fn visible_columns_are_in_display_order_and_monotonic() {
+        for w in 16..=200u16 {
+            let cols = visible_columns(w);
+            let positions: Vec<usize> = cols
+                .iter()
+                .map(|c| CallersColumn::ALL.iter().position(|a| a == c).unwrap())
+                .collect();
+            assert!(
+                positions.windows(2).all(|p| p[0] < p[1]),
+                "width {w}: {cols:?} not in display order"
+            );
+            let wider = visible_columns(w + 1);
+            assert!(
+                cols.iter().all(|c| wider.contains(c)),
+                "width {w}: {cols:?} not a subset of {wider:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn visible_columns_always_fit_their_budget() {
+        for w in 16..=200u16 {
+            let cols = visible_columns(w);
+            let used: u16 = cols.iter().map(|c| c.min_width()).sum::<u16>() + cols.len() as u16 - 1;
+            assert!(used <= w - 4, "width {w}: {cols:?} needs {used}");
+        }
+    }
+
+    #[test]
+    fn every_header_is_at_least_as_narrow_as_its_column() {
+        for c in CallersColumn::ALL {
+            assert!(c.header().len() as u16 <= c.min_width(), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn flags_column_fits_two_flags() {
+        assert!("BUSY WKD".len() as u16 <= CallersColumn::Flags.min_width());
+        assert!("BUSY MINE".len() as u16 <= CallersColumn::Flags.min_width());
+    }
 }
