@@ -88,6 +88,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Turning Fox mode off (Shift+X) no longer cuts the Hound contacts already in
+  progress down to one transmitted stream; they keep transmitting until they
+  finish, while new QSOs wait for the normal `max_concurrent_qsos` limit
+  (PAN-76).
+
 - A QSO whose frame the TX worker drops before it reaches the air (concurrent-QSO cap, F8 abort, supersede, arm or mute refusal) no longer spends a call from its keep-calling budget, advances the stall detector toward a TX-offset switch, or shows the unsent frame as sent (PAN-75).
 
 - Ctrl/Alt chords no longer trigger transmit keys at the main view (PAN-112).

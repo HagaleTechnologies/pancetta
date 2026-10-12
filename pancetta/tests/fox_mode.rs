@@ -23,6 +23,12 @@
 //! the CQ QSO does not eat a Hound-answer slot.  These tests verify that the
 //! new counter correctly ignores `CallingCq` QSOs and that with a CQ active
 //! the cap admits exactly `fox_max_streams` ANSWERS before rejecting.
+//!
+//! **Disengage with Hounds in progress (PAN-76)** is covered next to the
+//! code it exercises: `coordinator::qso::respond_to_caller_admission_tests`
+//! (`pan76_*`, the real Qso component end to end),
+//! `coordinator::qso::fox_admitted_tracking_tests`, and the `pan76_*` tests in
+//! `coordinator::tx` (coalescer priority and supersede ceiling).
 
 #![allow(clippy::expect_used)]
 

@@ -43,8 +43,9 @@ mod wav_playback;
 pub(crate) mod wsjtx_udp;
 
 pub use tx::{
-    coalesce_transmit_requests, remote_tx_permitted, remote_tx_permitted_for,
-    resolve_required_parity, schedule_tx, CoalesceEntry, CoalesceOutcome, TxSchedule,
+    coalesce_transmit_requests, coalesce_transmit_requests_with_fox_priority, remote_tx_permitted,
+    remote_tx_permitted_for, resolve_required_parity, schedule_tx, CoalesceEntry, CoalesceOutcome,
+    TxSchedule,
 };
 
 pub use qso::compute_manual_tx_offset;
@@ -1423,6 +1424,16 @@ pub struct ApplicationCoordinator {
     /// closes that gap. Requests with `qso_id == None` (manual free-text,
     /// tune, test-TX) are never gated by this set.
     pub(crate) active_tx_qsos: Arc<std::sync::RwLock<HashSet<String>>>,
+    /// PAN-76: canonical keys (`active_tx_qso_key`) of QSOs Fox mode opened —
+    /// the Fox CQ `SetFoxMode { on: true }` starts, and every caller
+    /// `maybe_answer_caller` answers while `fox_mode` is set. Written only by
+    /// the QSO component; entries leave at the same points as
+    /// `active_tx_qsos` (including the 45 s completed grace). Read by the TX
+    /// worker so turning Fox mode off never truncates the Hound exchanges it
+    /// already admitted: the coalescer keeps Fox-admitted streams first and
+    /// raises its cap to the number actually present, and mid-TX supersede
+    /// keeps their bundle intact.
+    pub(crate) fox_admitted_qsos: Arc<std::sync::RwLock<HashSet<String>>>,
     /// FQ-F3: active QSO id -> its current TX audio-offset frequency (Hz).
     /// Maintained by the SAME QSO-event-forwarding task, at the SAME
     /// insert/remove points (including the 45s completed-grace window), as
@@ -2112,6 +2123,7 @@ impl ApplicationCoordinator {
             ft8_config,
             config_warnings,
             active_tx_qsos: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            fox_admitted_qsos: Arc::new(std::sync::RwLock::new(HashSet::new())),
             latest_tx_intent: Arc::new(std::sync::RwLock::new(HashMap::new())),
             // Station-agent remote-TX arm. Fresh (unarmed, not killed), then
             // seed the LOCAL operator consent from config. With consent OFF (the

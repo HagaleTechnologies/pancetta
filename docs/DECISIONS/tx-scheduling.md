@@ -309,6 +309,75 @@ change) so the rollback cannot hit the replacement's attempt. Offsets within
 re-enqueued bundle is confirmed queued. Rollback emits no new snapshot or QSO event; the existing status panel
 and remote snapshot fields show corrected values on the next normal push.
 
+## Fox-admitted QSOs keep their TX slots after Fox mode is turned off (PAN-76)
+
+Turning Fox mode off (`SetFoxMode { on: false }`) clears `fox_mode` and
+cancels only `CallingCq` QSOs. The Hound exchanges Fox mode admitted keep
+running, but the TX worker's base ceiling (`effective_max_concurrent_qsos`)
+falls straight back to `autonomous.max_concurrent_qsos`. Before this fix the
+next same-parity backlog kept one Hound and truncated the rest every slot
+until they timed out. A floor at `active_tx_qsos.len()` was tried and reverted
+in PR #348 rounds 4-5: that set cannot tell a Hound from an ordinary over-cap
+manual QSO, so the floor let a manual pileup through.
+
+**What the set holds.** The coordinator owns
+`fox_admitted_qsos: Arc<RwLock<HashSet<String>>>` (canonical
+`active_tx_qso_key`s). The QSO component writes it at the only two places Fox
+mode opens QSOs: the Fox CQ the engage arm starts, and every caller
+`maybe_answer_caller` answers while its capacity check saw `fox_mode` set. The
+CQ is included because a Hound calling within 15 Hz of it
+(`FREQ_TOLERANCE_HZ`) converts the CQ QSO itself into that Hound's exchange,
+and `maybe_answer_caller` then skips the Hound. No manual open path
+(`StartQso`, `RespondToCaller`, `EngageHound`, `StartCq`, `CallStation`) or
+the autonomous operator writes it.
+
+**Lifecycle.** Entries leave at exactly `active_tx_qsos`'s removal points: a
+`StateChanged` into `Failed`, `QsoFailed`, and the end of the 45 s
+completed grace (`COMPLETED_QSO_REWORK_GRACE`). The grace matters because a
+completed Hound's final RR73/73 airs inside it.
+
+**Coalescer rule.** `coalesce_backlog_into` passes the unraised ceiling plus
+the set to `coalesce_transmit_requests_with_fox_priority`. Fox-admitted
+streams are ordered before the other QSO-keyed streams, so they anchor the
+bundle parity and win frequency-conflict tie-breaks, and the QSO cap is raised
+to the number of Fox-admitted streams present in this backlog. Only ordinary
+streams are truncated (and reported unsent through PAN-75). The cap counts
+presence, never the set's size: Hounds idling in their grace window with no
+frame would otherwise lend their slots to an ordinary pileup, which is round
+5's regression in a narrower form. With no Fox-admitted stream present the
+outcome equals `coalesce_transmit_requests`.
+
+**Supersede ceiling.** The four mid-TX supersede sites pass
+`supersede_max_concurrent_qsos(effective, live_fox_admitted_count(..))`,
+where live means in both the Fox set and `active_tx_qsos`. A supersede never
+adds a QSO stream (`classify_incoming_during_tx` supersedes only for an
+in-flight QSO or a manual send), so this only stops a keyed Hound bundle from
+collapsing to the refreshed stream.
+
+**Fail toward today.** A poisoned `fox_admitted_qsos` lock reads as empty and
+`live_fox_admitted_count` returns 0 if either lock is poisoned, so TX never
+becomes more permissive than the plain cap. Stale keys (a QSO that went
+terminal before the insert, or a Qso-component restart) are inert for the
+same presence/intersection reasons and are not pruned.
+
+**Why not tear Hounds down on disengage.** A Hound that has sent its R-report
+is one RR73 from a logged contact; cancelling it costs the chaser the QSO.
+Letting the existing watchdog and grace drain each Hound needs no new
+teardown policy, and the protection ends on its own as entries leave the set.
+
+**PAN-78.** PAN-78's admission cap decides whether a new QSO may open; PAN-76
+decides which open QSOs keep their TX slots. While Hounds finish, a new
+ordinary QSO is refused at admission (with PAN-78) or held at TX by the
+coalescer rule (without it), so an ordinary pileup stays capped either way.
+
+Tests: `coordinator::tx::coalesce_tests::pan76_*`,
+`coordinator::tx::fox_admitted_ceiling_tests`,
+`coordinator::tx::supersede_rekey_tests::pan76_supersede_refresh_of_one_hound_bundles_with_the_other_two`,
+`coordinator::qso::fox_admitted_tracking_tests`, and the real-component
+`coordinator::qso::respond_to_caller_admission_tests::pan76_fox_disengage_keeps_admitted_hounds_on_air`
+(AC1), `pan76_unanswered_fox_cq_leaves_the_fox_set_on_disengage` and
+`pan76_never_fox_manual_pileup_is_still_capped` (AC2).
+
 ## UTC re-anchoring after sleep/wake and clock steps (PAN-114, 2026-10-10)
 
 PAN-72 had already replaced the autonomous loop's one-shot `interval_at` anchor with a 250 ms poll

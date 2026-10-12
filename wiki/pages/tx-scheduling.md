@@ -40,6 +40,10 @@ fixes, including the open double-PTT-for-73 bug — see that doc and
   partial mitigation — see `project_symptom_c_multi_tx_deferred` in the
   assistant's memory). Bundles now **exclude** (never coerce) a stream whose
   parity or frequency disagrees with the rest of the bundle (2026-07-18).
+  Gotcha: `active_tx_qsos` is undifferentiated, so it cannot tell a Fox Hound
+  from an ordinary over-cap QSO; Fox provenance lives in `fox_admitted_qsos`,
+  and the coalescer raises its cap to the Fox-admitted streams *present* in
+  the backlog, never the set's size (PAN-76, `docs/DECISIONS/tx-scheduling.md`).
 - **Drop-stale-TX gate** — the worker re-checks QSO liveness (`tx_qso_is_live`)
   at the last instant before PTT and drops frames whose QSO has ended, in
   **both** the single-TX and multi-TX arms (the multi-TX arm's defer-time

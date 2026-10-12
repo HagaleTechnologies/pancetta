@@ -71,6 +71,14 @@ the existing exchange), no new codec.
 - A Fox-mode indicator (title-bar chip "FOX (N max)") + the existing Callers panel / TX strip already
   show the queue + the N keyed streams. Additive.
 
+### Disengage with Hound exchanges in progress (PAN-76, 2026-10)
+- Turning Fox off cancels an unanswered CQ and restores `max_concurrent_qsos` for new
+  auto-answers, so no new Hound is admitted above the normal cap.
+- QSOs Fox mode already opened (the Fox CQ, including one a Hound converted by answering within
+  15 Hz, and every Fox auto-answer) are tracked in the coordinator's `fox_admitted_qsos` and finish
+  on the air: the TX coalescer keeps them first and never truncates them, and a new ordinary QSO
+  waits until they no longer fill the normal cap. See `docs/DECISIONS/tx-scheduling.md` (PAN-76).
+
 ## Scope / non-goals (v1)
 - **Manual-engaged Fox**, answers callers as they arrive up to `fox_max_streams` (no fancy
   priority-pick-N-best-per-slot; the caller pool + cap is sufficient for v1 — a smarter selector is a
@@ -85,7 +93,8 @@ the existing exchange), no new codec.
 1. **CQ QSO + N answer QSOs all same parity** must all admit (no parity-gate blocking) and coalesce
    into one slot. The parity-admit gate adopts the side for same-parity — verify the CQ + answers
    share the Fox's parity and don't queue each other.
-2. **Cap raise must be reversible** (turning Fox off restores `max_concurrent_qsos`).
+2. **Cap raise must be reversible** (turning Fox off restores `max_concurrent_qsos`). The
+   reversal applies to new admissions, not to exchanges already admitted (PAN-76).
 3. **MAX_RETAINED_TX_STREAMS=8** is the hard ceiling; `fox_max_streams` validated ≤ 8 (CQ stream + N
    answers ≤ 8, so default 5 answers + CQ = 6, fine).
 4. **Regression:** `fox_mode` off ⇒ everything behaves exactly as today (#39 cap unchanged). Guard.
