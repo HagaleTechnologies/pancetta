@@ -166,7 +166,8 @@ panino's operator hit this live: `armedUntil`'s v1 conservative 10-minute ceilin
 arbitrary `N` instantiation in dispensa ADR-0002 §Decision #5, never derived from a Part-97 number or
 specific threat model) forced a full re-arm ceremony every 10 minutes during any real operating
 session. Confirmed via `docs/fcc-part97-compliance.md`: §97.109(c) control-operator presence is what
-the 5-15s dead-man heartbeat already enforces on a fast, continuous cadence; `armedUntil` is a
+the dead-man heartbeat already enforces continuously (the client sends every 5-15 s; the station
+disarms after 30 s of silence); `armedUntil` is a
 coarser, independent worst-case-exposure backstop, not doing compliance work the heartbeat isn't
 already doing. cqdx concurred (2026-07-28) on 60 minutes as a fixed contract constant (not
 station-configurable — matches the existing `MIN_HEARTBEAT_SEC`/`MAX_HEARTBEAT_SEC` pattern).
@@ -235,3 +236,30 @@ The crash invalidates only remote-origin QSOs (`QsoMetadata.remote_origin == tru
 `QsoFailureReason::ComponentCrash("StationAgent")`. Local QSOs do not depend on StationAgent and
 continue unchanged. A restarted StationAgent keeps the same shared arm object but cannot inherit an
 authorization: re-arming must pass through the normal capability and grant-verification path.
+
+## Dead-man loss needs a fresh signed arm (PAN-97), 2026-10-13
+
+Normative station behaviour for heartbeat timing:
+
+- **Cadence vs. silence limit.** `heartbeatIntervalSec` (validated to [5,15] s) is how often the
+  client *sends*. The station's silence limit is the fixed `HEARTBEAT_TIMEOUT_MS` = 30 s for every
+  accepted cadence; it is not derived from the cadence. The verified cadence and the signed
+  `armedUntil` are carried on `VerifiedArmGrant` and recorded in the arm audit
+  (`armed ttl_ms=… heartbeat_interval_sec=… heartbeat_timeout_ms=30000`). Changing the limit, or
+  tying it to the cadence, is a dispensa contract question, not a local tweak.
+- **Expiry is terminal.** Once 30 s pass without an accepted heartbeat, or the arm's lifetime ends,
+  the arm is gone. `ArmState::heartbeat` runs the same expiry transition as `tick` *before* any
+  `armJti`/`seq` check, so a heartbeat at or after the deadline (`>=`) cannot refresh anything, even
+  on the same still-connected session. The only way back is a newly signed, previously unseen
+  `txArm` grant (`seen_jtis` still refuses the consumed one). Dead-man expiry removes arm authority
+  only; the Noise peer, the controller slot and `seen_jtis` stay.
+- **Independent sweep.** `run_one_session` calls `ArmState::tick` on every receive-loop iteration,
+  before acting on the received frame (valid, malformed or idle), and broadcasts the existing
+  `controlState` (`transmitArmed:false`) on a real transition. The display drain is capped at 64
+  items per iteration so a busy read stream cannot hold the sweep off. The TX worker's key-time
+  check stays independent of both.
+- **Two clocks.** Local liveness (silence, the arm's maximum lifetime) is measured on the monotonic
+  clock, so a wall-clock step cannot stretch it. The signed `armedUntil` is checked against wall
+  time. At acceptance the lifetime is `min(verified ttl, armedUntil − now)`, so a delay between
+  verification and acceptance cannot extend the grant. Production gates take their `ArmTime`
+  sample after acquiring the arm lock. A monotonic sample earlier than a stored instant denies.

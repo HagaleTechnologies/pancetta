@@ -458,14 +458,16 @@ impl CoordSim {
             pancetta_agent::arm::VerifiedArmGrant {
                 operator_callsign: "K5ARH".to_string(),
                 ttl_ms: 120_000,
+                armed_until_ms: now_ms + 120_000,
+                heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "sim-arm-jti".to_string(),
                 client_key_id: client_key_id.to_string(),
             },
-            now_ms,
+            pancetta_agent::arm::ArmTime::now(),
         );
         st.set_local_consent(true, now_ms);
-        st.heartbeat("sim-arm-jti", 1, now_ms);
+        st.heartbeat("sim-arm-jti", 1, pancetta_agent::arm::ArmTime::now());
     }
 
     /// Drain all currently-buffered `QsoEvent`s and apply the coordinator's
@@ -650,14 +652,13 @@ impl CoordSim {
         // Drop any `TxOrigin::Remote` pending item the station-agent arm gate
         // does not permit (fail-closed), exactly as the TX worker does before
         // keying PTT. `Local` items pass through untouched (byte-identical).
-        let now_ms = chrono::Utc::now().timestamp_millis();
         let pending: Vec<PendingTx> = pending
             .into_iter()
             .filter(|p| {
                 if p.origin == pancetta_lib::message_bus::TxOrigin::Remote
                     && !remote_tx_permitted_for(
                         &self.remote_tx_arm,
-                        now_ms,
+                        pancetta_agent::arm::ArmTime::now,
                         p.remote_client_key_id.as_deref(),
                     )
                 {
