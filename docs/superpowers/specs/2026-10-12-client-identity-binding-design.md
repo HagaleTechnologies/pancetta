@@ -150,10 +150,13 @@ Expiry:
 - A per-loop sweep clears expired capabilities and logs each affected peer once at INFO.
 - If the expired peer is the current controller, the sweep also disarms remote TX and releases
   control (the same fail-safe as the controller disconnecting), and the remaining authorized
-  peers get the updated `controlState`. The station never keeps transmitting for a controller it
-  can no longer send anything to.
+  peers get the updated `controlState`. The station does not keep transmitting for a controller
+  whose capability it has stopped honoring. (A controller that never sent a valid `hello` holds no
+  capability to lose; requiring one before control is a separate follow-up.)
 - A new `hello` with a fresh token restores delivery. An invalid `hello` clears the peer's
-  capability.
+  capability; if that peer held a capability and is the current controller, the station disarms
+  and releases control the same way, so a failed `hello` cannot hide an expired controller from
+  the sweep.
 
 No frame of any kind goes to a peer without a currently-valid `status`-or-higher capability:
 no events, no `controlState`, and no `error` frames, including the "another client holds
