@@ -182,6 +182,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Local gateway: clients must now authenticate with the configured `[network.remote_gateway].auth_token` (sent as `hello.gatewayToken`) before receiving any station data; browser origins must be listed in `allowed_origins`, and a non-loopback `bind_addr` requires `allow_network_exposure = true`. Enabling the gateway now requires `auth_token` (PAN-99).
 - Station agent: a remote client must now prove its device identity inside the encrypted handshake, and it receives station data only after a valid `hello`; clients must be updated to connect (PAN-95).
 - Station agent: remote clients' authority is now re-checked on every use, and an authorization refresh applies to already-connected clients immediately (PAN-96).
 - Remote-TX consent is now tracked per channel: `[network.station_agent].remote_tx_enabled` alone governs arming, TX requests and transmission over the station agent, and `[network.wsjtx_udp].allow_tx_initiation` governs only WSJT-X UDP Reply-initiated TX. With `remote_tx_enabled = false` nothing can arm, so Reply-initiated QSOs no longer transmit; set `remote_tx_enabled = true` to allow remote TX (PAN-98).

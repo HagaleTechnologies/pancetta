@@ -1,8 +1,8 @@
-//! Read-only remote-view gateway (Panino client). Default-OFF, localhost-bound.
-//! Serves the v1 read-only view (decodes + QSO progress + scalar status) to
-//! WebSocket clients using `pancetta_protocol` wire types over plain ws://.
-//! NO control / NO remote-TX in v1: inbound client frames are ignored (logged).
-//! TLS (wss) + the control/relay path are deferred to a later sub-plan.
+//! Token-gated read-only remote view for Panino. Default OFF; loopback unless
+//! explicitly exposed. Browser Origins are checked before WebSocket upgrade.
+//! Authenticated clients receive the v1 snapshot and live deltas over ws://.
+//! Inbound commands remain ignored; TLS (wss) is deferred.
+pub(crate) mod auth;
 pub(crate) mod translate;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -10,15 +10,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
-use axum::response::Response;
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::sleep;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
+use pancetta_config::ConfigSection as _;
 use pancetta_core::TxPolicy;
 use pancetta_protocol::{ServerEvent, ServerFrame, StateSnapshot, Welcome, PROTOCOL_VERSION};
 
@@ -78,6 +80,7 @@ pub(crate) struct GatewayState {
     pub snapshot: Arc<RwLock<StateSnapshot>>,
     /// Server version string embedded in the `Welcome` frame.
     pub server_version: String,
+    pub auth: auth::GatewayAuth,
 }
 
 /// Build the axum `Router` for the gateway (routes: `GET /ws`).
@@ -87,11 +90,58 @@ pub(crate) fn build_router(state: GatewayState) -> Router {
         .with_state(state)
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<GatewayState>) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    headers: HeaderMap,
+    State(state): State<GatewayState>,
+) -> Response {
+    if !state.auth.origin_allowed(headers.get(header::ORIGIN)) {
+        let origin = headers
+            .get(header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("<non-ascii>");
+        warn!("remote_gateway refused a browser connection from origin {origin:?} (not in allowed_origins)");
+        return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+    }
+    ws.max_message_size(auth::MAX_INBOUND_BYTES)
+        .max_frame_size(auth::MAX_INBOUND_BYTES)
+        .on_upgrade(move |socket| handle_socket(socket, state))
+}
+
+async fn await_authenticated_hello(
+    socket: &mut WebSocket,
+    auth: &auth::GatewayAuth,
+) -> Result<(), auth::AuthFailure> {
+    let deadline = tokio::time::Instant::now() + auth.hello_timeout;
+    loop {
+        match tokio::time::timeout_at(deadline, socket.recv()).await {
+            Err(_) => return Err(auth::AuthFailure::NoHelloInTime),
+            Ok(Some(Ok(Message::Text(text)))) => return auth.check_hello(&text),
+            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
+            Ok(Some(Ok(Message::Binary(_)))) => return Err(auth::AuthFailure::NotHello),
+            Ok(Some(Ok(Message::Close(_))) | Some(Err(_)) | None) => {
+                return Err(auth::AuthFailure::ClosedBeforeHello)
+            }
+        }
+    }
 }
 
 async fn handle_socket(mut socket: WebSocket, state: GatewayState) {
+    if let Err(why) = await_authenticated_hello(&mut socket, &state.auth).await {
+        warn!(
+            "remote_gateway closed a connection that did not authenticate ({})",
+            why.as_str()
+        );
+        if !matches!(why, auth::AuthFailure::ClosedBeforeHello) {
+            let _ = socket
+                .send(Message::Close(Some(CloseFrame {
+                    code: close_code::POLICY,
+                    reason: "authentication required".into(),
+                })))
+                .await;
+        }
+        return;
+    }
     // Subscribe BEFORE reading the snapshot so no event is missed between the
     // snapshot read and the start of the forward loop.
     let mut rx = state.evt_tx.subscribe();
@@ -427,8 +477,8 @@ impl super::ApplicationCoordinator {
         Ok(())
     }
 
-    /// Start the read-only remote-view gateway's localhost axum server
-    /// (default-OFF, localhost-bound). Consumes the shared `DisplayFeed`
+    /// Start the token-gated read-only gateway. Invalid configuration never binds.
+    /// Default OFF, loopback unless explicitly exposed. Consumes the shared `DisplayFeed`
     /// started by [`Self::start_display_feed`] — this component itself only
     /// ever gates on its OWN `[network.remote_gateway].enabled` flag (and,
     /// same as every other outbound integration, on
@@ -467,11 +517,22 @@ impl super::ApplicationCoordinator {
             return Ok(());
         };
 
-        let bind_addr = gw_cfg.bind_addr.clone();
+        if let Err(e) = gw_cfg.validate_section() {
+            error!("remote_gateway not started: {e}");
+            return Ok(());
+        }
+        let Ok(bind_addr) = gw_cfg.socket_addr() else {
+            return Ok(());
+        };
+        let exposed = !bind_addr.ip().is_loopback();
         let state = GatewayState {
             evt_tx: feed.evt_tx.clone(),
             snapshot: feed.snapshot.clone(),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
+            auth: auth::GatewayAuth::new(
+                gw_cfg.auth_token.as_deref().unwrap_or_default(),
+                &gw_cfg.allowed_origins,
+            ),
         };
 
         // ── axum WebSocket server ─────────────────────────────────────────────
@@ -479,11 +540,13 @@ impl super::ApplicationCoordinator {
             let shutdown = self.shutdown_signal.clone();
 
             tokio::spawn(async move {
-                let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-                info!(
-                    "remote_gateway listening on ws://{}/ws (read-only, localhost)",
-                    bind_addr
-                );
+                let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+                let local = listener.local_addr()?;
+                if exposed {
+                    warn!("remote_gateway listening on ws://{local}/ws (read-only, NETWORK-EXPOSED by allow_network_exposure, unencrypted, clients must authenticate)");
+                } else {
+                    info!("remote_gateway listening on ws://{local}/ws (read-only, loopback only, clients must authenticate)");
+                }
                 let router = build_router(state);
                 axum::serve(listener, router)
                     .with_graceful_shutdown(async move {
@@ -572,96 +635,235 @@ mod server_tests {
         }
     }
 
-    #[tokio::test]
-    async fn handshake_then_event_fanout() {
-        let (evt_tx, _) = broadcast::channel::<ServerEvent>(16);
-        let snapshot = Arc::new(RwLock::new(empty_snapshot()));
+    use std::net::SocketAddr;
+    use tokio_tungstenite::tungstenite::{
+        self, client::IntoClientRequest, protocol::frame::coding::CloseCode,
+        Message as ClientMessage,
+    };
+    type WsStream = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+    const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    async fn spawn_gateway(
+        snapshot: StateSnapshot,
+        allowed_origins: &[&str],
+        hello_timeout: Duration,
+    ) -> (SocketAddr, broadcast::Sender<ServerEvent>) {
+        let (evt_tx, _) = broadcast::channel(16);
+        let mut auth = auth::GatewayAuth::new(
+            TEST_TOKEN,
+            &allowed_origins
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+        );
+        auth.hello_timeout = hello_timeout;
         let state = GatewayState {
             evt_tx: evt_tx.clone(),
-            snapshot,
-            server_version: "test".into(),
+            snapshot: Arc::new(RwLock::new(snapshot)),
+            server_version: "v0.9.9-test".into(),
+            auth,
         };
-
-        // Bind on an OS-assigned ephemeral port so we never collide with
-        // another test or the running application.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, build_router(state)).await.unwrap();
         });
+        (addr, evt_tx)
+    }
 
-        // Connect via tokio-tungstenite.
-        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
-            .await
-            .unwrap();
-
-        // Send a Hello frame (server v1 is read-only so it ignores it, but
-        // this exercises the inbound-ignore path and matches the wire contract).
-        let hello = ClientFrame::hello(Hello {
+    fn hello_text(token: Option<&str>) -> String {
+        serde_json::to_string(&ClientFrame::hello(Hello {
             protocol_version: PROTOCOL_VERSION,
             client_name: "test".into(),
             client_version: "0".into(),
+            gateway_token: token.map(str::to_owned),
+        }))
+        .unwrap()
+    }
+
+    async fn connect(
+        addr: SocketAddr,
+        origin: Option<&str>,
+    ) -> Result<(WsStream, tungstenite::handshake::client::Response), tungstenite::Error> {
+        let mut request = format!("ws://{addr}/ws").into_client_request().unwrap();
+        if let Some(origin) = origin {
+            request
+                .headers_mut()
+                .insert("origin", origin.parse().unwrap());
+        }
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio_tungstenite::connect_async(request),
+        )
+        .await
+        .expect("connect deadline")
+    }
+
+    async fn next_message(ws: &mut WsStream) -> Option<Result<ClientMessage, tungstenite::Error>> {
+        tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("read deadline")
+    }
+
+    async fn assert_policy_close(ws: &mut WsStream) {
+        match next_message(ws).await.unwrap().unwrap() {
+            ClientMessage::Close(Some(frame)) => {
+                assert_eq!(frame.code, CloseCode::Policy);
+                assert_eq!(frame.reason, "authentication required");
+            }
+            other => panic!("expected policy close without station data, got {other:?}"),
+        }
+        // Drain the close handshake too: there must not be a later snapshot/event.
+        while let Some(Ok(message)) = next_message(ws).await {
+            assert!(!matches!(message, ClientMessage::Text(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn client_without_credential_gets_no_welcome() {
+        let mut snapshot = empty_snapshot();
+        snapshot.pending_calls.push(pancetta_protocol::PendingCall {
+            callsign: "W1SECRET".into(),
+            dx_parity: None,
+            waited_secs: 3,
         });
-        ws.send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::to_string(&hello).unwrap().into(),
+        let (addr, evt_tx) = spawn_gateway(snapshot, &[], Duration::from_millis(200)).await;
+        let (mut ws, _) = connect(addr, None).await.unwrap();
+        let _ = evt_tx.send(ServerEvent::TxStatus { active: true });
+        assert_eq!(
+            evt_tx.receiver_count(),
+            0,
+            "unauthenticated client subscribed"
+        );
+        assert_policy_close(&mut ws).await;
+    }
+
+    async fn assert_origin_refused(origin: &str) {
+        let (addr, _) = spawn_gateway(empty_snapshot(), &[], Duration::from_secs(5)).await;
+        match connect(addr, Some(origin)).await {
+            Err(tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status(), 403);
+                assert_eq!(
+                    response.body().as_deref(),
+                    Some(b"origin not allowed".as_slice())
+                );
+            }
+            other => panic!("expected HTTP 403, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn untrusted_browser_origin_is_refused_before_upgrade() {
+        assert_origin_refused("http://untrusted.example").await;
+    }
+
+    #[tokio::test]
+    async fn null_origin_is_refused_before_upgrade() {
+        assert_origin_refused("null").await;
+    }
+
+    async fn assert_first_text_refused(text: String) {
+        let (addr, _) = spawn_gateway(empty_snapshot(), &[], Duration::from_secs(5)).await;
+        let (mut ws, _) = connect(addr, None).await.unwrap();
+        ws.send(ClientMessage::Text(text.into())).await.unwrap();
+        assert_policy_close(&mut ws).await;
+    }
+
+    #[tokio::test]
+    async fn hello_without_token_is_closed_without_welcome() {
+        assert_first_text_refused(hello_text(None)).await;
+    }
+
+    #[tokio::test]
+    async fn hello_with_wrong_token_is_closed_without_welcome() {
+        assert_first_text_refused(hello_text(Some("wrong"))).await;
+    }
+
+    #[tokio::test]
+    async fn non_hello_first_frame_is_closed_without_welcome() {
+        let (addr, _) = spawn_gateway(empty_snapshot(), &[], Duration::from_secs(5)).await;
+        let (mut ws, _) = connect(addr, None).await.unwrap();
+        ws.send(ClientMessage::Text(
+            r#"{"frame":"command","command":{"cmd":"stopCq"}}"#.into(),
         ))
         .await
         .unwrap();
+        // A later valid hello cannot repair a rejected first frame.
+        let _ = ws
+            .send(ClientMessage::Text(hello_text(Some(TEST_TOKEN)).into()))
+            .await;
+        assert_policy_close(&mut ws).await;
+    }
 
-        // First server frame must be a Welcome containing the snapshot.
-        let msg = ws.next().await.unwrap().unwrap();
-        let frame: ServerFrame = serde_json::from_str(msg.to_text().unwrap()).unwrap();
-        assert!(
-            matches!(frame, ServerFrame::Welcome { .. }),
-            "expected Welcome as first frame, got: {frame:?}"
-        );
+    #[tokio::test]
+    async fn oversized_first_message_is_rejected_without_welcome() {
+        let (addr, _) = spawn_gateway(empty_snapshot(), &[], Duration::from_secs(5)).await;
+        let (mut ws, _) = connect(addr, None).await.unwrap();
+        let _ = ws
+            .send(ClientMessage::Text("x".repeat(128 * 1024).into()))
+            .await;
+        match next_message(&mut ws).await {
+            None | Some(Err(_)) | Some(Ok(ClientMessage::Close(_))) => {}
+            other => panic!("expected termination without station data, got {other:?}"),
+        }
+    }
 
-        // Broadcast an event from the pump side.  Because the handler
-        // subscribes BEFORE sending the Welcome, this event is guaranteed to
-        // be delivered even if it is produced very shortly after connection.
+    #[tokio::test]
+    async fn allowed_browser_origin_with_token_gets_welcome() {
+        let (addr, _) = spawn_gateway(
+            empty_snapshot(),
+            &["http://localhost:8081"],
+            Duration::from_secs(5),
+        )
+        .await;
+        let (mut ws, _) = connect(addr, Some("HTTP://LocalHost:8081")).await.unwrap();
+        ws.send(ClientMessage::Text(hello_text(Some(TEST_TOKEN)).into()))
+            .await
+            .unwrap();
+        let message = next_message(&mut ws).await.unwrap().unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ServerFrame>(message.to_text().unwrap()).unwrap(),
+            ServerFrame::Welcome { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn authenticated_client_gets_welcome_then_events() {
+        let (addr, evt_tx) = spawn_gateway(empty_snapshot(), &[], Duration::from_secs(5)).await;
+        let (mut ws, _) = connect(addr, None).await.unwrap();
+        ws.send(ClientMessage::Text(hello_text(Some(TEST_TOKEN)).into()))
+            .await
+            .unwrap();
+        let message = next_message(&mut ws).await.unwrap().unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ServerFrame>(message.to_text().unwrap()).unwrap(),
+            ServerFrame::Welcome { .. }
+        ));
         evt_tx.send(ServerEvent::TxStatus { active: true }).unwrap();
-
-        // Second frame must be the Event wrapper around TxStatus.
-        let msg2 = ws.next().await.unwrap().unwrap();
-        let frame2: ServerFrame = serde_json::from_str(msg2.to_text().unwrap()).unwrap();
-        assert!(
-            matches!(
-                frame2,
-                ServerFrame::Event {
-                    event: ServerEvent::TxStatus { active: true }
-                }
-            ),
-            "expected TxStatus event, got: {frame2:?}"
-        );
+        let message = next_message(&mut ws).await.unwrap().unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ServerFrame>(message.to_text().unwrap()).unwrap(),
+            ServerFrame::Event {
+                event: ServerEvent::TxStatus { active: true }
+            }
+        ));
     }
 
     #[tokio::test]
     async fn welcome_snapshot_reflects_initial_state() {
-        let (evt_tx, _) = broadcast::channel::<ServerEvent>(16);
         let mut snap = empty_snapshot();
         snap.frequency_hz = 7_074_000;
         snap.split_tx_hz = 7_075_500;
         snap.tx_policy = TxPolicy::RespondOnly;
-        let snapshot = Arc::new(RwLock::new(snap));
-        let state = GatewayState {
-            evt_tx,
-            snapshot,
-            server_version: "v0.9.9-test".into(),
-        };
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, build_router(state)).await.unwrap();
-        });
-
-        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        let (addr, _) = spawn_gateway(snap, &[], Duration::from_secs(5)).await;
+        let (mut ws, _) = connect(addr, None).await.unwrap();
+        ws.send(ClientMessage::Text(hello_text(Some(TEST_TOKEN)).into()))
             .await
             .unwrap();
-
-        let msg = ws.next().await.unwrap().unwrap();
-        let frame: ServerFrame = serde_json::from_str(msg.to_text().unwrap()).unwrap();
-        match frame {
+        let message = next_message(&mut ws).await.unwrap().unwrap();
+        match serde_json::from_str::<ServerFrame>(message.to_text().unwrap()).unwrap() {
             ServerFrame::Welcome { welcome } => {
                 assert_eq!(welcome.snapshot.frequency_hz, 7_074_000);
                 assert_eq!(welcome.snapshot.split_tx_hz, 7_075_500);

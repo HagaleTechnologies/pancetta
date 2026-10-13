@@ -60,7 +60,7 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub qrz_xml: QrzXmlConfig,
 
-    /// Read-only remote view gateway for the Panino client (opt-in; default disabled)
+    /// Token-gated read-only remote view for the Panino client (opt-in; default disabled)
     #[serde(default)]
     pub remote_gateway: RemoteGatewayConfig,
 
@@ -315,16 +315,27 @@ impl ConfigSection for WsjtxUdpConfig {
     }
 }
 
-/// Read-only remote view gateway (Panino client). Default OFF; localhost-bound.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Token-gated read-only local view for Panino. Default OFF; loopback unless explicitly exposed.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RemoteGatewayConfig {
+    /// Enable the read-only gateway.
     #[serde(default)]
     pub enabled: bool,
-    /// Bind address. Defaults to localhost only (no network exposure) until the
-    /// authenticated control path (Sub-plan C) exists.
+    /// IP-literal bind address and port. Defaults to loopback only.
     #[serde(default = "default_gateway_bind")]
     pub bind_addr: String,
+    /// Shared secret clients present as `hello.gatewayToken`. Required when enabled;
+    /// at least [`Self::MIN_AUTH_TOKEN_LEN`] characters, without whitespace or controls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
+    /// Bare browser origins allowed to connect. Empty means no browser pages.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+    /// Permit a non-loopback bind, serving station data over unencrypted ws://
+    /// to clients that can reach the address and hold the token.
+    #[serde(default)]
+    pub allow_network_exposure: bool,
 }
 
 fn default_gateway_bind() -> String {
@@ -336,7 +347,69 @@ impl Default for RemoteGatewayConfig {
         Self {
             enabled: false,
             bind_addr: default_gateway_bind(),
+            auth_token: None,
+            allowed_origins: Vec::new(),
+            allow_network_exposure: false,
         }
+    }
+}
+
+impl RemoteGatewayConfig {
+    /// Minimum shared-secret length in characters.
+    pub const MIN_AUTH_TOKEN_LEN: usize = 32;
+
+    /// Parse the bind address without consulting DNS.
+    pub fn socket_addr(&self) -> ConfigResult<std::net::SocketAddr> {
+        self.bind_addr.parse().map_err(|_| ConfigError::Validation(format!(
+            "network.remote_gateway.bind_addr {:?} must be an IP address and port, e.g. \"127.0.0.1:4080\" or \"[::1]:4080\"",
+            self.bind_addr
+        )))
+    }
+
+    fn origin_is_bare(origin: &str) -> bool {
+        let Some(host) = origin
+            .strip_prefix("http://")
+            .or_else(|| origin.strip_prefix("https://"))
+        else {
+            return false;
+        };
+        origin == origin.trim()
+            && !host.is_empty()
+            && !host
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '?' | '#' | '@'))
+    }
+}
+
+impl ConfigSection for RemoteGatewayConfig {
+    fn validate_section(&self) -> ConfigResult<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let addr = self.socket_addr()?;
+        if !self.auth_token.as_deref().is_some_and(|token| {
+            token.chars().count() >= Self::MIN_AUTH_TOKEN_LEN
+                && !token.chars().any(|c| c.is_whitespace() || c.is_control())
+        }) {
+            return Err(ConfigError::Validation("network.remote_gateway.auth_token must be set to a secret of at least 32 characters with no whitespace when the gateway is enabled (generate one with: openssl rand -hex 32)".into()));
+        }
+        if !addr.ip().is_loopback() && !self.allow_network_exposure {
+            return Err(ConfigError::Validation(format!("network.remote_gateway.bind_addr {addr} is not a loopback address, so station and contact data would be served unencrypted to the network; bind to 127.0.0.1 or [::1], or set network.remote_gateway.allow_network_exposure = true to accept that")));
+        }
+        for origin in &self.allowed_origins {
+            if !Self::origin_is_bare(origin) {
+                return Err(ConfigError::Validation(format!("network.remote_gateway.allowed_origins entry {origin:?} must be a bare browser origin: http:// or https:// followed by a host and optional port, with no path, query or trailing slash")));
+            }
+        }
+        Ok(())
+    }
+
+    fn merge_with(&mut self, other: Self) {
+        self.enabled = other.enabled;
+        self.bind_addr = other.bind_addr;
+        self.auth_token = other.auth_token;
+        self.allowed_origins = other.allowed_origins;
+        self.allow_network_exposure = other.allow_network_exposure;
     }
 }
 
@@ -1720,6 +1793,7 @@ impl ConfigSection for NetworkConfig {
 
         // WSJT-X UDP validation
         self.wsjtx_udp.validate_section()?;
+        self.remote_gateway.validate_section()?;
 
         Ok(())
     }
@@ -1741,7 +1815,7 @@ impl ConfigSection for NetworkConfig {
         self.lotw = other.lotw;
         self.eqsl = other.eqsl;
         self.qrz_xml = other.qrz_xml;
-        self.remote_gateway = other.remote_gateway;
+        self.remote_gateway.merge_with(other.remote_gateway);
         self.station_agent = other.station_agent;
         self.wsjtx_udp.merge_with(other.wsjtx_udp);
 
@@ -1757,6 +1831,18 @@ impl ConfigSection for NetworkConfig {
 // password / api_key / cert secret. Non-secret fields are still shown.
 // ---------------------------------------------------------------------------
 const REDACTED: &str = "<redacted>";
+
+impl std::fmt::Debug for RemoteGatewayConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteGatewayConfig")
+            .field("enabled", &self.enabled)
+            .field("bind_addr", &self.bind_addr)
+            .field("auth_token", &self.auth_token.as_ref().map(|_| REDACTED))
+            .field("allowed_origins", &self.allowed_origins)
+            .field("allow_network_exposure", &self.allow_network_exposure)
+            .finish()
+    }
+}
 
 impl std::fmt::Debug for ClubLogConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1831,8 +1917,147 @@ impl std::fmt::Debug for JwtConfig {
 mod tests {
     use super::*;
 
+    const GOOD_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn gw(enabled: bool, bind: &str, token: Option<&str>) -> RemoteGatewayConfig {
+        RemoteGatewayConfig {
+            enabled,
+            bind_addr: bind.into(),
+            auth_token: token.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn remote_gateway_enabled_requires_auth_token() {
+        for token in [
+            None,
+            Some(String::new()),
+            Some("x".repeat(31)),
+            Some(format!("{} y", "x".repeat(31))),
+            Some(format!("{}\0", "x".repeat(32))),
+        ] {
+            let err = gw(true, "127.0.0.1:4080", token.as_deref())
+                .validate_section()
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("network.remote_gateway.auth_token"));
+            assert!(err.contains("openssl rand -hex 32"));
+            if let Some(token) = token.filter(|t| !t.is_empty()) {
+                assert!(!err.contains(&token));
+            }
+        }
+        assert!(gw(true, "127.0.0.1:4080", Some(GOOD_TOKEN))
+            .validate_section()
+            .is_ok());
+    }
+
+    #[test]
+    fn remote_gateway_loopback_bind_needs_no_opt_in() {
+        for bind in ["127.0.0.1:4080", "127.0.0.2:4080", "[::1]:4080"] {
+            assert!(gw(true, bind, Some(GOOD_TOKEN)).validate_section().is_ok());
+        }
+    }
+
+    #[test]
+    fn remote_gateway_non_loopback_bind_requires_explicit_opt_in() {
+        for bind in [
+            "0.0.0.0:4080",
+            "192.168.1.50:4080",
+            "[::]:4080",
+            "[::ffff:127.0.0.1]:4080",
+        ] {
+            let mut cfg = gw(true, bind, Some(GOOD_TOKEN));
+            let err = cfg.validate_section().unwrap_err().to_string();
+            assert!(err.contains("is not a loopback address"));
+            assert!(err.contains("allow_network_exposure = true"));
+            cfg.allow_network_exposure = true;
+            assert!(cfg.validate_section().is_ok());
+            cfg.auth_token = None;
+            assert!(cfg.validate_section().is_err());
+        }
+    }
+
+    #[test]
+    fn remote_gateway_bind_addr_must_be_ip_and_port() {
+        for bind in ["localhost:4080", "not-an-address", "127.0.0.1"] {
+            assert!(gw(true, bind, Some(GOOD_TOKEN))
+                .validate_section()
+                .unwrap_err()
+                .to_string()
+                .contains("must be an IP address and port"));
+        }
+    }
+
+    #[test]
+    fn remote_gateway_allowed_origins_must_be_bare_origins() {
+        let mut cfg = gw(true, "127.0.0.1:4080", Some(GOOD_TOKEN));
+        for origins in [
+            vec![],
+            vec!["http://localhost:8081"],
+            vec!["https://cqdx.io", "http://127.0.0.1:19006"],
+        ] {
+            cfg.allowed_origins = origins.into_iter().map(str::to_owned).collect();
+            assert!(cfg.validate_section().is_ok());
+        }
+        for origin in [
+            "",
+            "*",
+            "null",
+            "cqdx.io",
+            "https://cqdx.io/",
+            "https://cqdx.io/app",
+            "https://cqdx.io?x=1",
+            "ftp://cqdx.io",
+            " https://cqdx.io",
+            "https://user@cqdx.io",
+            "https://cqdx.io#f",
+        ] {
+            cfg.allowed_origins = vec![origin.into()];
+            assert!(cfg
+                .validate_section()
+                .unwrap_err()
+                .to_string()
+                .contains("allowed_origins entry"));
+        }
+    }
+
+    #[test]
+    fn remote_gateway_disabled_is_not_validated() {
+        let mut cfg = gw(false, "garbage", None);
+        cfg.allowed_origins = vec!["*".into()];
+        assert!(cfg.validate_section().is_ok());
+        assert!(crate::Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn network_validation_covers_remote_gateway() {
+        let network = NetworkConfig {
+            remote_gateway: gw(true, "127.0.0.1:4080", None),
+            ..Default::default()
+        };
+        assert!(network.validate_section().is_err());
+        assert!(crate::Config {
+            network,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+    }
+
     #[test]
     fn credential_debug_is_redacted() {
+        let gateway = gw(true, "127.0.0.1:4080", Some(GOOD_TOKEN));
+        let debug = format!("{gateway:?}");
+        assert!(!debug.contains(GOOD_TOKEN));
+        assert!(debug.contains("<redacted>"));
+        let network = NetworkConfig {
+            remote_gateway: gateway,
+            ..Default::default()
+        };
+        let debug = format!("{network:?}");
+        assert!(!debug.contains(GOOD_TOKEN));
+        assert!(debug.contains("<redacted>"));
         // A secret must never appear in Debug output (defense-in-depth: a stray
         // debug!("{:?}", cfg) or a panic that formats config can't leak it).
         let mut cl = ClubLogConfig::default();
@@ -2084,6 +2309,10 @@ mod tests {
         file_cfg.cqdx.enabled = true;
         file_cfg.cqdx.token = Some("pat_abc".to_string());
         file_cfg.remote_gateway.enabled = true;
+        file_cfg.remote_gateway.bind_addr = "0.0.0.0:4080".into();
+        file_cfg.remote_gateway.auth_token = Some(GOOD_TOKEN.into());
+        file_cfg.remote_gateway.allowed_origins = vec!["http://localhost:8081".into()];
+        file_cfg.remote_gateway.allow_network_exposure = true;
         file_cfg.station_agent.enabled = false; // exercised via bool identity below
 
         base.merge_with(file_cfg);
@@ -2101,6 +2330,13 @@ mod tests {
         assert!(base.qrz_xml.enabled, "qrz_xml.enabled must survive merge");
         assert!(base.cqdx.enabled, "cqdx.enabled must survive merge");
         assert_eq!(base.cqdx.token.as_deref(), Some("pat_abc"));
+        assert_eq!(base.remote_gateway.bind_addr, "0.0.0.0:4080");
+        assert_eq!(base.remote_gateway.auth_token.as_deref(), Some(GOOD_TOKEN));
+        assert_eq!(
+            base.remote_gateway.allowed_origins,
+            ["http://localhost:8081"]
+        );
+        assert!(base.remote_gateway.allow_network_exposure);
         assert!(
             base.remote_gateway.enabled,
             "remote_gateway.enabled must survive merge"
@@ -2197,6 +2433,9 @@ mod tests {
             .expect("valid NetworkConfig");
         assert!(!net.remote_gateway.enabled);
         assert_eq!(net.remote_gateway.bind_addr, "127.0.0.1:4080");
+        assert!(net.remote_gateway.auth_token.is_none());
+        assert!(net.remote_gateway.allowed_origins.is_empty());
+        assert!(!net.remote_gateway.allow_network_exposure);
     }
 
     #[test]
