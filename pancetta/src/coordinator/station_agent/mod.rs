@@ -843,11 +843,15 @@ async fn dispatch_action(
             // control-mutating action and never grabs. A verified hello is the
             // first moment the peer may receive anything (PAN-95), so the
             // controlState greeting is sent here rather than on establishment.
-            if dispatch_hello(capability_token, peer, ctx, now) {
-                DispatchOutcome::cont_with(control_state_sends(ctx, now, Some(peer)))
-            } else {
-                DispatchOutcome::cont()
+            // A REFUSED hello that erased the current controller's capability
+            // disarms and releases control (PAN-96, [`clear_peer_auth`]) — its
+            // updated controlState frames for the remaining peers ride out
+            // here too.
+            let (verified, mut sends) = dispatch_hello(capability_token, peer, ctx, now);
+            if verified {
+                sends.extend(control_state_sends(ctx, now, Some(peer)));
             }
+            DispatchOutcome::cont_with(sends)
         }
         ControlAction::Qsy { vfo, frequency_hz } => {
             let grab = match controller_gate(ctx, peer, now) {
@@ -988,19 +992,53 @@ async fn dispatch_action(
     }
 }
 
+/// Clear `peer`'s cached hello capability — every refused-hello path in
+/// [`dispatch_hello`] routes through here. PAN-96: when that erases a
+/// still-live capability held by the CURRENT controller, treat the clear
+/// exactly like expiry ([`expire_peer_auth`]): disarm and release control,
+/// returning the updated `controlState` frames for the remaining peers.
+/// Without this the lapse is invisible to the expiry sweep (the old `exp_ms`
+/// is erased while still unexpired), while heartbeats — which bind only to
+/// the arm's own jti — could keep the arm alive for a controller the station
+/// can no longer send anything to.
+fn clear_peer_auth(ctx: &mut ArmContext, peer: &str, now: i64) -> Vec<PeerSend> {
+    let had_auth = ctx
+        .peers
+        .get_mut(peer)
+        .is_some_and(|p| p.auth.take().is_some());
+    if !had_auth || ctx.controller.as_deref() != Some(peer) {
+        return Vec::new();
+    }
+    let effects = match ctx.arm.lock() {
+        Ok(mut st) => st.disarm(now),
+        Err(_) => Vec::new(),
+    };
+    if !effects.is_empty() {
+        warn!(target: "agent.tx", peer = %peer,
+            "controller capability cleared by a refused hello with a live arm — disarming");
+    }
+    apply_arm_effects(&ctx.audit, &effects);
+    ctx.controller = None;
+    control_state_sends(ctx, now, None)
+}
+
 /// Handle a `hello.capabilityToken` (Q-0019 #5): verify it against the pinned
 /// IdP keys, bind it to the ACTUAL SENDING PEER's E2E-connected client
 /// identity (`peer` — the value `MultiPeerSession`'s demux reported alongside
 /// this specific frame, never a session-global value — since PAN-95 the
 /// identity the peer PROVED in its Noise handshake), and set that peer's
-/// `PeerCtx::auth` (scopes + expiry) accordingly. Returns whether the peer now
-/// holds a verified capability. Fail-closed: any missing/invalid/mismatched
-/// token clears the capability (the peer is sent nothing and served nothing
-/// scoped), never partially trusts one.
+/// `PeerCtx::auth` (scopes + expiry) accordingly. Fail-closed: any
+/// missing/invalid/mismatched token clears the capability (the peer is sent
+/// nothing and served nothing scoped), never partially trusts one.
 ///
 /// `capability_token: None` (a legacy hello, v1 back-compat) also clears
 /// scopes — the token is optional on the wire but required at runtime for any
 /// scoped action.
+///
+/// Returns whether the peer now holds a verified capability, plus any
+/// `controlState` frames a refusal must deliver: a refusal that erased a
+/// capability the CURRENT controller still held disarms it and releases
+/// control ([`clear_peer_auth`]) — the same treatment expiry gets.
 ///
 /// SECURITY (multi-peer rebinding): the comparison is `cap.client_key_id ==
 /// peer`, NOT against any field stored on `ctx` — `ctx` is shared across every
@@ -1014,12 +1052,9 @@ fn dispatch_hello(
     peer: &str,
     ctx: &mut ArmContext,
     now: i64,
-) -> bool {
+) -> (bool, Vec<PeerSend>) {
     let Some(token) = capability_token else {
-        if let Some(p) = ctx.peers.get_mut(peer) {
-            p.auth = None;
-        }
-        return false;
+        return (false, clear_peer_auth(ctx, peer, now));
     };
     match ctx.verifier.verify_capability_token(&token, now) {
         Ok(cap) if cap.client_key_id == peer && ctx.revoked_jtis.contains(&cap.jti) => {
@@ -1027,10 +1062,7 @@ fn dispatch_hello(
             // the client must fetch a fresh one.
             warn!(target: "agent.control", peer = %peer,
                 "hello capabilityToken was revoked on this station — fetch a fresh token");
-            if let Some(p) = ctx.peers.get_mut(peer) {
-                p.auth = None;
-            }
-            false
+            (false, clear_peer_auth(ctx, peer, now))
         }
         Ok(cap) if cap.client_key_id == peer => {
             debug!(
@@ -1046,7 +1078,7 @@ fn dispatch_hello(
                         exp_ms: cap.exp_ms,
                         jti: cap.jti,
                     });
-                    true
+                    (true, Vec::new())
                 }
                 None => {
                     // Defensive: cannot happen via the demux (a Plaintext poll
@@ -1054,7 +1086,7 @@ fn dispatch_hello(
                     // established peer gets a PeerCtx on PeerEstablished), but
                     // fail closed rather than panic if it ever did.
                     warn!(target: "agent.control", peer = %peer, "hello verified for a peer with no PeerCtx — refusing");
-                    false
+                    (false, Vec::new())
                 }
             }
         }
@@ -1065,17 +1097,11 @@ fn dispatch_hello(
                 peer = %peer,
                 "hello capabilityToken clientKeyId does not match the sending peer's E2E-connected identity — no scope granted"
             );
-            if let Some(p) = ctx.peers.get_mut(peer) {
-                p.auth = None;
-            }
-            false
+            (false, clear_peer_auth(ctx, peer, now))
         }
         Err(e) => {
             warn!(target: "agent.control", peer = %peer, reason = %e, "hello capabilityToken invalid — no scope granted");
-            if let Some(p) = ctx.peers.get_mut(peer) {
-                p.auth = None;
-            }
-            false
+            (false, clear_peer_auth(ctx, peer, now))
         }
     }
 }
@@ -6779,12 +6805,12 @@ mod tests {
         let mut ctx = ctx_with(true, true);
         let token = real_clock_token(AGENT_KEY_ID, CLIENT_KEY_ID, &["status", "qsy"]);
         assert!(
-            dispatch_hello(Some(token.clone()), CLIENT_KEY_ID, &mut ctx, now_ms()),
+            dispatch_hello(Some(token.clone()), CLIENT_KEY_ID, &mut ctx, now_ms()).0,
             "setup: the token is otherwise valid"
         );
         ctx.revoked_jtis.insert(format!("hello-{CLIENT_KEY_ID}"));
         assert!(
-            !dispatch_hello(Some(token), CLIENT_KEY_ID, &mut ctx, now_ms()),
+            !dispatch_hello(Some(token), CLIENT_KEY_ID, &mut ctx, now_ms()).0,
             "a deny-listed token must not re-authorize"
         );
         assert!(
@@ -6793,16 +6819,76 @@ mod tests {
         );
     }
 
+    /// Round-2 review (PR #426): an armed controller's REFUSED hello — here the
+    /// legacy `hello` with no capabilityToken — erases a still-unexpired
+    /// capability. The expiry sweep cannot see that lapse (the old `exp_ms` is
+    /// erased unexpired) and heartbeats check only the arm's own jti, so the
+    /// clear must be treated like expiry (`expire_peer_auth`): disarm, release
+    /// control, and return the updated controlState for the remaining peers.
+    #[tokio::test]
+    async fn refused_hello_releases_the_armed_controller() {
+        let mut ctx = ctx_with(true, true);
+        with_consent(&ctx, true);
+        let bus = MessageBus::new(64).unwrap();
+        // The client holds a live, unexpired capability and is the armed
+        // controller.
+        ctx.peers.insert(
+            CLIENT_KEY_ID.to_string(),
+            PeerCtx::authorized_until(vec!["tx".to_string()], NOW + 600_000),
+        );
+        dispatch_action(
+            arm_action("arm-jti-1"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
+        assert!(ctx.arm.lock().unwrap().tx_permitted(NOW), "setup: armed");
+        assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
+
+        let out = dispatch_action(
+            ControlAction::Hello {
+                capability_token: None,
+            },
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
+
+        assert_eq!(out.flow, Dispatch::Continue);
+        assert!(
+            ctx.peers[CLIENT_KEY_ID].auth.is_none(),
+            "the refused hello cleared the prior capability"
+        );
+        assert!(
+            !ctx.arm.lock().unwrap().is_armed(),
+            "clearing the controller's capability must disarm, like expiry"
+        );
+        assert_eq!(
+            ctx.controller, None,
+            "clearing the controller's capability must release control, like expiry"
+        );
+        assert!(
+            out.sends.iter().any(|s| matches!(
+                &s.frame,
+                pancetta_protocol::ServerFrame::Event {
+                    event: pancetta_protocol::ServerEvent::ControlState { .. }
+                }
+            )),
+            "the updated controlState is returned for the remaining peers"
+        );
+    }
+
     #[tokio::test]
     async fn hello_stores_token_jti() {
         let mut ctx = ctx_with(true, true);
         let token = real_clock_token(AGENT_KEY_ID, CLIENT_KEY_ID, &["status"]);
-        assert!(dispatch_hello(
-            Some(token),
-            CLIENT_KEY_ID,
-            &mut ctx,
-            now_ms()
-        ));
+        assert!(dispatch_hello(Some(token), CLIENT_KEY_ID, &mut ctx, now_ms()).0);
         assert_eq!(
             ctx.peers[CLIENT_KEY_ID].auth.as_ref().unwrap().jti,
             format!("hello-{CLIENT_KEY_ID}")
@@ -7230,12 +7316,7 @@ mod tests {
         ctx.peers
             .insert(CLIENT_KEY_ID.to_string(), PeerCtx::unauthorized());
         let old_token = real_clock_token(&agent_kid, CLIENT_KEY_ID, &["status", "qsy"]);
-        assert!(dispatch_hello(
-            Some(old_token.clone()),
-            CLIENT_KEY_ID,
-            &mut ctx,
-            now_ms()
-        ));
+        assert!(dispatch_hello(Some(old_token.clone()), CLIENT_KEY_ID, &mut ctx, now_ms()).0);
 
         // Revoked and evicted.
         revoke_admission(&ctx, CLIENT_KEY_ID);
@@ -7280,21 +7361,11 @@ mod tests {
         assert!(!peer_may_receive(&ctx, CLIENT_KEY_ID, now_ms()));
 
         // The old token stays refused; a freshly minted one is accepted.
-        assert!(!dispatch_hello(
-            Some(old_token),
-            CLIENT_KEY_ID,
-            &mut ctx,
-            now_ms()
-        ));
+        assert!(!dispatch_hello(Some(old_token), CLIENT_KEY_ID, &mut ctx, now_ms()).0);
         assert!(ctx.peers[CLIENT_KEY_ID].auth.is_none());
         let fresh =
             real_clock_token_with_jti(&agent_kid, CLIENT_KEY_ID, &["status"], "hello-fresh");
-        assert!(dispatch_hello(
-            Some(fresh),
-            CLIENT_KEY_ID,
-            &mut ctx,
-            now_ms()
-        ));
+        assert!(dispatch_hello(Some(fresh), CLIENT_KEY_ID, &mut ctx, now_ms()).0);
         assert!(peer_may_receive(&ctx, CLIENT_KEY_ID, now_ms()));
     }
 
@@ -7307,12 +7378,7 @@ mod tests {
         ctx.peers
             .insert(CLIENT_KEY_ID.to_string(), PeerCtx::unauthorized());
         let token = real_clock_token(&agent_kid, CLIENT_KEY_ID, &["status", "qsy"]);
-        assert!(dispatch_hello(
-            Some(token),
-            CLIENT_KEY_ID,
-            &mut ctx,
-            now_ms()
-        ));
+        assert!(dispatch_hello(Some(token), CLIENT_KEY_ID, &mut ctx, now_ms()).0);
         let bus = MessageBus::new(64).unwrap();
         let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
 
