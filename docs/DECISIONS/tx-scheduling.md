@@ -382,8 +382,11 @@ or while Fox-admitted Hounds already number `fox.max_streams` or more. Those
 Hounds are the active ones plus completed ones still in their 45 s grace:
 they have left `get_active_qsos()`, but their final RR73/73 may not have aired,
 so a fresh set of Hounds on top of them could still hit the clamp.
-Only keys still in `active_tx_qsos` count, so a stale Fox-set key cannot hold
-the CQ off. `fox_mode` still turns on, and the status line says no new CQ was
+`fox_grace_hound_count` reads the grace from the QSO manager's own record (a
+completed QSO stays in its map with `completed_at`; cancelled and failed ones
+leave it), not from `active_tx_qsos`: a Hound opened already complete counts
+the moment it opens, before the event forwarder runs, and a stale Fox-set key
+cannot hold the CQ off. `fox_mode` still turns on, and the status line says no new CQ was
 started. `maybe_answer_caller`'s Fox capacity check counts the same
 grace-period Hounds (`fox_grace_hound_count`) on top of
 `active_caller_qso_count`, so a CQ started while some are finishing cannot be
@@ -405,8 +408,8 @@ Tests: `coordinator::tx::coalesce_tests::pan76_*`,
 `pan76_never_fox_manual_pileup_is_still_capped` (AC2),
 `pan76_fox_reengage_starts_no_cq_while_finishing_hounds_fill_the_cap`,
 `pan76_fox_reengage_counts_hounds_in_their_completed_grace`,
-`coordinator::qso::fox_admitted_split_tests`,
-`fox_admitted_tracking_tests::pan76_hounds_in_their_completed_grace_fill_the_fox_cap`
+`fox_admitted_tracking_tests::pan76_hounds_in_their_completed_grace_fill_the_fox_cap`,
+`pan76_stale_fox_keys_do_not_fill_the_fox_cap`
 `supersede_rekey_tests::pan76_supersede_refresh_of_a_hound_in_a_mixed_bundle_keeps_every_stream`
 and `pan76_fox_off_and_straight_on_starts_a_fresh_cq`.
 
