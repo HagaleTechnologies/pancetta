@@ -83,6 +83,11 @@ control (no relay `seq`, per our concurrence). This layer is schema-independent 
   **explicitly armed**, **time-boxed** (`armed for N minutes`), **re-auth-gated**, and **dead-man bound**:
   - (a) **Dead-man / heartbeat:** armed-TX requires a live authenticated operator session with a heartbeat;
     on heartbeat/idle timeout or channel loss → **auto-disarm (fail TX-off)**. §97.109(c).
+    The client sends heartbeats at its signed `heartbeatIntervalSec` cadence (5–15 s); the station
+    disarms after 30 s without an accepted one, measured on the monotonic clock, and also at the
+    signed `armedUntil` (wall clock). Expiry is final: a heartbeat at or after the deadline cannot
+    revive the arm, even on the same session, and the station loop sweeps for expiry on its own.
+    Only a fresh signed arm restores TX.
   - (b) **No unattended remote origination:** the remote path exposes *human-driven* TX only; autonomous CQ
     origination is never remotely armable. §97.221.
   - (c) **Operator-callsign attribution + append-only audit log:** record who armed TX and what was sent.

@@ -657,6 +657,8 @@ impl CapabilityVerifier {
         Ok(VerifiedArmGrant {
             operator_callsign,
             ttl_ms,
+            armed_until_ms: armed_until,
+            heartbeat_interval_sec: heartbeat,
             scope_tx: true,
             jti,
             client_key_id: client_key_id.to_string(),

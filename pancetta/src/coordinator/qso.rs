@@ -801,7 +801,7 @@ async fn maybe_auto_resend_73(
     if entry_remote_origin
         && !crate::coordinator::tx::remote_tx_permitted_for(
             remote_tx_arm,
-            chrono::Utc::now().timestamp_millis(),
+            pancetta_agent::arm::ArmTime::now,
             entry_remote_client_key_id.as_deref(),
         )
     {
@@ -2712,7 +2712,7 @@ impl super::ApplicationCoordinator {
                 move |remote_client_key_id: Option<&str>| {
                     crate::coordinator::tx::remote_tx_permitted_for(
                         &arm_for_stall_evidence,
-                        chrono::Utc::now().timestamp_millis(),
+                        pancetta_agent::arm::ArmTime::now,
                         remote_client_key_id,
                     )
                 },
@@ -7818,11 +7818,13 @@ mod auto_73_tests {
             pancetta_agent::arm::VerifiedArmGrant {
                 operator_callsign: "W1AW".to_string(),
                 ttl_ms: 120_000,
+                armed_until_ms: now_ms + 120_000,
+                heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "auto73-rollback-test-jti".to_string(),
                 client_key_id: "client-b".to_string(),
             },
-            now_ms,
+            pancetta_agent::arm::ArmTime::now(),
         );
         st.set_local_consent(true, now_ms);
         let arm = Arc::new(std::sync::Mutex::new(st));

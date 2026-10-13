@@ -888,11 +888,7 @@ async fn interruptible_sleep_or_supersede(
             // heartbeat-lost, TTL-expired, or local-kill) must stop a
             // transmission ALREADY keyed, not just block the next one.
             if let Some((arm, client_key_id)) = remote_tx_arm {
-                if !remote_tx_permitted_for(
-                    arm,
-                    chrono::Utc::now().timestamp_millis(),
-                    client_key_id,
-                ) {
+                if !remote_tx_permitted_for(arm, pancetta_agent::arm::ArmTime::now, client_key_id) {
                     return Some(SleepOutcome::AbortedByDisarm(std::mem::take(siphoned)));
                 }
             }
@@ -1195,11 +1191,13 @@ mod interruptible_sleep_tests {
             pancetta_agent::arm::VerifiedArmGrant {
                 operator_callsign: "K5ARH".to_string(),
                 ttl_ms: 120_000,
+                armed_until_ms: now_ms + 120_000,
+                heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "disarm-preserves-siphoned-jti".to_string(),
                 client_key_id: "client-a".to_string(),
             },
-            now_ms,
+            pancetta_agent::arm::ArmTime::now(),
         );
         st.set_local_consent(true, now_ms);
         let arm = Arc::new(std::sync::Mutex::new(st));
@@ -1288,11 +1286,13 @@ mod interruptible_sleep_tests {
             pancetta_agent::arm::VerifiedArmGrant {
                 operator_callsign: "K5ARH".to_string(),
                 ttl_ms: 120_000,
+                armed_until_ms: now_ms + 120_000,
+                heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "disarm-preserves-fifo-jti".to_string(),
                 client_key_id: "client-a".to_string(),
             },
-            now_ms,
+            pancetta_agent::arm::ArmTime::now(),
         );
         st.set_local_consent(true, now_ms);
         let arm = Arc::new(std::sync::Mutex::new(st));
@@ -1434,11 +1434,13 @@ mod interruptible_sleep_tests {
             pancetta_agent::arm::VerifiedArmGrant {
                 operator_callsign: "K5ARH".to_string(),
                 ttl_ms: 120_000,
+                armed_until_ms: now_ms + 120_000,
+                heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "disarm-mid-sleep-jti".to_string(),
                 client_key_id: "client-a".to_string(),
             },
-            now_ms,
+            pancetta_agent::arm::ArmTime::now(),
         );
         st.set_local_consent(true, now_ms);
         let arm = Arc::new(std::sync::Mutex::new(st));
@@ -3682,18 +3684,20 @@ fn encode_and_modulate_multi_tx(
 /// This is the safety gate for `TxOrigin::Remote` requests only — the worker
 /// never calls it for `TxOrigin::Local` (local TX is byte-identical). It reads
 /// the shared [`ArmState`](pancetta_agent::arm::ArmState) and returns
-/// `arm.tx_permitted(now_ms)`.
+/// `arm.tx_permitted(now())`.
 ///
 /// **Fail-CLOSED on a poisoned lock** — the OPPOSITE of [`tx_qso_is_live`]'s
 /// fail-open. This is a safety gate: if the arm mutex is poisoned we can no
-/// longer prove the station consented, so remote TX is DENIED. `now_ms` is unix
-/// milliseconds (the one clock read; `ArmState` itself is pure).
+/// longer prove the station consented, so remote TX is DENIED. `now` is the
+/// one clock read (`ArmState` itself is pure); it runs only AFTER the lock is
+/// acquired, so a lock wait cannot make the sample stale. Production passes
+/// [`ArmTime::now`](pancetta_agent::arm::ArmTime::now).
 pub fn remote_tx_permitted(
     arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
-    now_ms: i64,
+    now: impl FnOnce() -> pancetta_agent::arm::ArmTime,
 ) -> bool {
     match arm.lock() {
-        Ok(state) => state.tx_permitted(now_ms),
+        Ok(state) => state.tx_permitted(now()),
         Err(_) => false,
     }
 }
@@ -3720,12 +3724,12 @@ pub fn remote_tx_permitted(
 /// mismatch (including "armed, but by someone else") denies fail-closed.
 pub fn remote_tx_permitted_for(
     arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
-    now_ms: i64,
+    now: impl FnOnce() -> pancetta_agent::arm::ArmTime,
     remote_client_key_id: Option<&str>,
 ) -> bool {
     match arm.lock() {
         Ok(state) => {
-            if !state.tx_permitted(now_ms) {
+            if !state.tx_permitted(now()) {
                 return false;
             }
             match remote_client_key_id {
@@ -3761,23 +3765,33 @@ struct ArmSnapshot {
     /// task finally runs, not whoever was (or wasn't) armed when the
     /// denial was actually decided.
     operator_callsign: Option<String>,
+    /// The wall-clock instant (unix ms) the permission was decided at, taken
+    /// with the lock held — the timestamp for any audit this snapshot feeds.
+    decided_at_unix_ms: i64,
 }
 
 impl ArmSnapshot {
+    /// `now` is sampled only after the lock is acquired (see
+    /// [`remote_tx_permitted`]).
     fn take(
         arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
-        now_ms: i64,
+        now: impl FnOnce() -> pancetta_agent::arm::ArmTime,
     ) -> Self {
         match arm.lock() {
-            Ok(state) => Self {
-                tx_permitted: state.tx_permitted(now_ms),
-                armed_client_key_id: state.armed_client_key_id().map(str::to_string),
-                operator_callsign: state.operator_callsign().map(str::to_string),
-            },
+            Ok(state) => {
+                let now = now();
+                Self {
+                    tx_permitted: state.tx_permitted(now),
+                    armed_client_key_id: state.armed_client_key_id().map(str::to_string),
+                    operator_callsign: state.operator_callsign().map(str::to_string),
+                    decided_at_unix_ms: now.unix_ms,
+                }
+            }
             Err(_) => Self {
                 tx_permitted: false,
                 armed_client_key_id: None,
                 operator_callsign: None,
+                decided_at_unix_ms: now().unix_ms,
             },
         }
     }
@@ -4740,8 +4754,8 @@ pub(crate) async fn coalesce_backlog_into(
         }
     }
 
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let arm_snapshot = ArmSnapshot::take(remote_tx_arm, now_ms);
+    let arm_snapshot = ArmSnapshot::take(remote_tx_arm, pancetta_agent::arm::ArmTime::now);
+    let now_ms = arm_snapshot.decided_at_unix_ms;
     let (admitted, identity_denied): (Vec<_>, Vec<_>) = drained.into_iter().partition(|e| {
         e.origin != crate::message_bus::TxOrigin::Remote
             || arm_snapshot.permits(e.remote_client_key_id.as_deref())
@@ -6370,7 +6384,7 @@ impl super::ApplicationCoordinator {
                                     if origin == crate::message_bus::TxOrigin::Remote
                                         && !remote_tx_permitted_for(
                                             &remote_tx_arm,
-                                            chrono::Utc::now().timestamp_millis(),
+                                            pancetta_agent::arm::ArmTime::now,
                                             remote_client_key_id.as_deref(),
                                         )
                                     {
@@ -6849,7 +6863,7 @@ impl super::ApplicationCoordinator {
                                         if origin == crate::message_bus::TxOrigin::Remote
                                             && !remote_tx_permitted_for(
                                                 &remote_tx_arm,
-                                                chrono::Utc::now().timestamp_millis(),
+                                                pancetta_agent::arm::ArmTime::now,
                                                 remote_client_key_id.as_deref(),
                                             )
                                         {
@@ -7329,7 +7343,7 @@ impl super::ApplicationCoordinator {
                                         if origin == crate::message_bus::TxOrigin::Remote
                                             && !remote_tx_permitted_for(
                                                 &remote_tx_arm,
-                                                chrono::Utc::now().timestamp_millis(),
+                                                pancetta_agent::arm::ArmTime::now,
                                                 remote_client_key_id.as_deref(),
                                             )
                                         {
@@ -7876,7 +7890,7 @@ impl super::ApplicationCoordinator {
                                         if origin == crate::message_bus::TxOrigin::Remote
                                             && !remote_tx_permitted_for(
                                                 &remote_tx_arm,
-                                                chrono::Utc::now().timestamp_millis(),
+                                                pancetta_agent::arm::ArmTime::now,
                                                 remote_client_key_id.as_deref(),
                                             )
                                         {
@@ -8568,7 +8582,7 @@ impl super::ApplicationCoordinator {
                                     if origin == crate::message_bus::TxOrigin::Remote
                                         && !remote_tx_permitted_for(
                                             &remote_tx_arm,
-                                            chrono::Utc::now().timestamp_millis(),
+                                            pancetta_agent::arm::ArmTime::now,
                                             remote_client_key_id.as_deref(),
                                         )
                                     {
@@ -9512,7 +9526,7 @@ impl super::ApplicationCoordinator {
                                     if origin == crate::message_bus::TxOrigin::Remote
                                         && !remote_tx_permitted_for(
                                             &remote_tx_arm,
-                                            chrono::Utc::now().timestamp_millis(),
+                                            pancetta_agent::arm::ArmTime::now,
                                             remote_client_key_id.as_deref(),
                                         )
                                     {
@@ -9881,7 +9895,7 @@ impl super::ApplicationCoordinator {
                                     if origin == crate::message_bus::TxOrigin::Remote
                                         && !remote_tx_permitted_for(
                                             &remote_tx_arm,
-                                            chrono::Utc::now().timestamp_millis(),
+                                            pancetta_agent::arm::ArmTime::now,
                                             remote_client_key_id.as_deref(),
                                         )
                                     {
@@ -10183,7 +10197,7 @@ impl super::ApplicationCoordinator {
                                     if origin == crate::message_bus::TxOrigin::Remote
                                         && !remote_tx_permitted_for(
                                             &remote_tx_arm,
-                                            chrono::Utc::now().timestamp_millis(),
+                                            pancetta_agent::arm::ArmTime::now,
                                             remote_client_key_id.as_deref(),
                                         )
                                     {
@@ -12438,11 +12452,13 @@ mod disarm_interrupt_signal_tests {
             pancetta_agent::arm::VerifiedArmGrant {
                 operator_callsign: "K5ARH".to_string(),
                 ttl_ms: 120_000,
+                armed_until_ms: now_ms + 120_000,
+                heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "pre-ptt-recheck-jti".to_string(),
                 client_key_id: "client-a".to_string(),
             },
-            now_ms,
+            pancetta_agent::arm::ArmTime::now(),
         );
         st.set_local_consent(true, now_ms);
         let arm = Arc::new(std::sync::Mutex::new(st));
@@ -15036,11 +15052,13 @@ mod coalesce_tests {
             pancetta_agent::arm::VerifiedArmGrant {
                 operator_callsign: "K5ARH".to_string(),
                 ttl_ms: 120_000,
+                armed_until_ms: now_ms + 120_000,
+                heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "mixed-bundle-jti".to_string(),
                 client_key_id: "client-a".to_string(),
             },
-            now_ms,
+            pancetta_agent::arm::ArmTime::now(),
         );
         st.set_local_consent(true, now_ms);
         let arm = Arc::new(std::sync::Mutex::new(st));
@@ -15927,10 +15945,23 @@ mod remote_arm_gate_tests {
 
     const NOW: i64 = 1_000_000;
 
+    /// Both clocks at `ms`: wall = `ms` unix ms, monotonic = a shared origin + `ms`.
+    fn at(ms: i64) -> pancetta_agent::arm::ArmTime {
+        static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let base = *BASE.get_or_init(std::time::Instant::now);
+        pancetta_agent::arm::ArmTime {
+            unix_ms: ms,
+            monotonic: base + std::time::Duration::from_millis(ms.unsigned_abs()),
+            suspend_aware_ms: ms,
+        }
+    }
+
     fn grant() -> VerifiedArmGrant {
         VerifiedArmGrant {
             operator_callsign: "K5ARH".to_string(),
             ttl_ms: 120_000,
+            armed_until_ms: NOW + 120_000,
+            heartbeat_interval_sec: 10,
             scope_tx: true,
             jti: "tx-test-arm-jti".to_string(),
             client_key_id: "tx-test-client-key-id".to_string(),
@@ -15941,7 +15972,7 @@ mod remote_arm_gate_tests {
     fn fresh_unarmed_state_denies() {
         let arm = Arc::new(Mutex::new(ArmState::new()));
         assert!(
-            !remote_tx_permitted(&arm, NOW),
+            !remote_tx_permitted(&arm, || at(NOW)),
             "a fresh (unarmed) ArmState must deny remote TX"
         );
     }
@@ -15949,11 +15980,11 @@ mod remote_arm_gate_tests {
     #[test]
     fn armed_consented_fresh_heartbeat_permits() {
         let mut st = ArmState::new();
-        st.arm(grant(), NOW);
+        st.arm(grant(), at(NOW));
         st.set_local_consent(true, NOW);
         let arm = Arc::new(Mutex::new(st));
         assert!(
-            remote_tx_permitted(&arm, NOW),
+            remote_tx_permitted(&arm, || at(NOW)),
             "armed + tx-scope + consent + fresh heartbeat must permit"
         );
     }
@@ -15962,11 +15993,11 @@ mod remote_arm_gate_tests {
     fn armed_without_local_consent_denies() {
         // Consent (remote_tx_enabled) is the LOCAL operator gate: default OFF.
         let mut st = ArmState::new();
-        st.arm(grant(), NOW);
+        st.arm(grant(), at(NOW));
         // no set_local_consent(true)
         let arm = Arc::new(Mutex::new(st));
         assert!(
-            !remote_tx_permitted(&arm, NOW),
+            !remote_tx_permitted(&arm, || at(NOW)),
             "armed but no local consent must deny"
         );
     }
@@ -15975,7 +16006,7 @@ mod remote_arm_gate_tests {
     fn poisoned_lock_fails_closed() {
         // Arm + consent so that IF the lock were readable, it would permit.
         let mut st = ArmState::new();
-        st.arm(grant(), NOW);
+        st.arm(grant(), at(NOW));
         st.set_local_consent(true, NOW);
         let arm = Arc::new(Mutex::new(st));
 
@@ -15990,9 +16021,58 @@ mod remote_arm_gate_tests {
         // Even though the underlying state WOULD permit, the poisoned lock must
         // fail CLOSED (deny) — the opposite of tx_qso_is_live's fail-open.
         assert!(
-            !remote_tx_permitted(&arm, NOW),
+            !remote_tx_permitted(&arm, || at(NOW)),
             "SAFETY: a poisoned arm lock must fail CLOSED (deny remote TX)"
         );
+    }
+
+    /// Wall clock rolled back `back_ms`, monotonic clock at `mono_ms`.
+    fn wall_rolled_back(mono_ms: i64, back_ms: i64) -> pancetta_agent::arm::ArmTime {
+        pancetta_agent::arm::ArmTime {
+            unix_ms: NOW - back_ms,
+            monotonic: at(mono_ms).monotonic,
+            suspend_aware_ms: at(mono_ms).suspend_aware_ms,
+        }
+    }
+
+    /// PAN-97: a wall-clock step backwards cannot keep a silent arm alive —
+    /// heartbeat silence is measured on the monotonic clock.
+    #[test]
+    fn wall_rollback_cannot_extend_the_heartbeat_window() {
+        use pancetta_agent::arm::HEARTBEAT_TIMEOUT_MS;
+        let mut st = ArmState::new();
+        st.arm(grant(), at(NOW));
+        st.set_local_consent(true, NOW);
+        let arm = Arc::new(Mutex::new(st));
+        assert!(remote_tx_permitted(&arm, || wall_rolled_back(
+            NOW + HEARTBEAT_TIMEOUT_MS - 1,
+            60_000
+        )));
+        assert!(
+            !remote_tx_permitted(&arm, || wall_rolled_back(
+                NOW + HEARTBEAT_TIMEOUT_MS,
+                60_000
+            )),
+            "monotonic silence expires the arm whatever the wall clock says"
+        );
+    }
+
+    /// PAN-97: the gate samples the clock only once it holds the arm lock, so
+    /// a lock wait cannot leave it judging an older instant.
+    #[test]
+    fn clock_is_sampled_with_the_lock_held() {
+        let mut st = ArmState::new();
+        st.arm(grant(), at(NOW));
+        st.set_local_consent(true, NOW);
+        let arm = Arc::new(Mutex::new(st));
+        let probe = arm.clone();
+        assert!(remote_tx_permitted(&arm, || {
+            assert!(
+                probe.try_lock().is_err(),
+                "clock read before the lock was taken"
+            );
+            at(NOW)
+        }));
     }
 }
 
@@ -16010,10 +16090,23 @@ mod remote_arm_gate_identity_tests {
 
     const NOW: i64 = 1_000_000;
 
+    /// Both clocks at `ms`: wall = `ms` unix ms, monotonic = a shared origin + `ms`.
+    fn at(ms: i64) -> pancetta_agent::arm::ArmTime {
+        static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let base = *BASE.get_or_init(std::time::Instant::now);
+        pancetta_agent::arm::ArmTime {
+            unix_ms: ms,
+            monotonic: base + std::time::Duration::from_millis(ms.unsigned_abs()),
+            suspend_aware_ms: ms,
+        }
+    }
+
     fn grant_for(client_key_id: &str) -> VerifiedArmGrant {
         VerifiedArmGrant {
             operator_callsign: "K5ARH".to_string(),
             ttl_ms: 120_000,
+            armed_until_ms: NOW + 120_000,
+            heartbeat_interval_sec: 10,
             scope_tx: true,
             jti: "tx-test-arm-jti".to_string(),
             client_key_id: client_key_id.to_string(),
@@ -16022,7 +16115,7 @@ mod remote_arm_gate_identity_tests {
 
     fn armed_and_consented(client_key_id: &str) -> Arc<Mutex<ArmState>> {
         let mut st = ArmState::new();
-        st.arm(grant_for(client_key_id), NOW);
+        st.arm(grant_for(client_key_id), at(NOW));
         st.set_local_consent(true, NOW);
         Arc::new(Mutex::new(st))
     }
@@ -16031,7 +16124,7 @@ mod remote_arm_gate_identity_tests {
     fn matching_client_is_permitted() {
         let arm = armed_and_consented("client-a");
         assert!(
-            remote_tx_permitted_for(&arm, NOW, Some("client-a")),
+            remote_tx_permitted_for(&arm, || at(NOW), Some("client-a")),
             "the client that is actually armed must be permitted to TX"
         );
     }
@@ -16042,7 +16135,7 @@ mod remote_arm_gate_identity_tests {
         // authorized just because client-a happens to be armed right now.
         let arm = armed_and_consented("client-a");
         assert!(
-            !remote_tx_permitted_for(&arm, NOW, Some("client-b")),
+            !remote_tx_permitted_for(&arm, || at(NOW), Some("client-b")),
             "PAN-91: a frame bound to a different client than the one \
              currently armed must be denied, not authorized by proxy"
         );
@@ -16055,7 +16148,7 @@ mod remote_arm_gate_identity_tests {
         // boolean-only check.
         let arm = armed_and_consented("client-a");
         assert!(
-            remote_tx_permitted_for(&arm, NOW, None),
+            remote_tx_permitted_for(&arm, || at(NOW), None),
             "a frame with no bound client identity must fall back to the \
              plain armed/permitted check, preserving pre-PAN-91 behavior"
         );
@@ -16065,9 +16158,35 @@ mod remote_arm_gate_identity_tests {
     fn bound_identity_denied_when_nobody_armed() {
         let arm = Arc::new(Mutex::new(ArmState::new()));
         assert!(
-            !remote_tx_permitted_for(&arm, NOW, Some("client-a")),
+            !remote_tx_permitted_for(&arm, || at(NOW), Some("client-a")),
             "an unarmed station must deny regardless of the frame's bound identity"
         );
+    }
+
+    /// Wall clock rolled back `back_ms`, monotonic clock at `mono_ms`.
+    fn wall_rolled_back(mono_ms: i64, back_ms: i64) -> pancetta_agent::arm::ArmTime {
+        pancetta_agent::arm::ArmTime {
+            unix_ms: NOW - back_ms,
+            monotonic: at(mono_ms).monotonic,
+            suspend_aware_ms: at(mono_ms).suspend_aware_ms,
+        }
+    }
+
+    /// PAN-97: the identity-bound gate also measures liveness monotonically.
+    #[test]
+    fn wall_rollback_cannot_extend_the_heartbeat_window_for_a_bound_client() {
+        use pancetta_agent::arm::HEARTBEAT_TIMEOUT_MS;
+        let arm = armed_and_consented("client-a");
+        assert!(remote_tx_permitted_for(
+            &arm,
+            || wall_rolled_back(NOW + HEARTBEAT_TIMEOUT_MS - 1, 60_000),
+            Some("client-a")
+        ));
+        assert!(!remote_tx_permitted_for(
+            &arm,
+            || wall_rolled_back(NOW + HEARTBEAT_TIMEOUT_MS, 60_000),
+            Some("client-a")
+        ));
     }
 }
 
@@ -16079,10 +16198,23 @@ mod arm_snapshot_attribution_tests {
 
     const NOW: i64 = 1_000_000;
 
+    /// Both clocks at `ms`: wall = `ms` unix ms, monotonic = a shared origin + `ms`.
+    fn at(ms: i64) -> pancetta_agent::arm::ArmTime {
+        static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let base = *BASE.get_or_init(std::time::Instant::now);
+        pancetta_agent::arm::ArmTime {
+            unix_ms: ms,
+            monotonic: base + std::time::Duration::from_millis(ms.unsigned_abs()),
+            suspend_aware_ms: ms,
+        }
+    }
+
     fn grant_for(operator_callsign: &str, client_key_id: &str) -> VerifiedArmGrant {
         VerifiedArmGrant {
             operator_callsign: operator_callsign.to_string(),
             ttl_ms: 120_000,
+            armed_until_ms: NOW + 120_000,
+            heartbeat_interval_sec: 10,
             scope_tx: true,
             jti: "tx-snapshot-test-jti".to_string(),
             client_key_id: client_key_id.to_string(),
@@ -16095,18 +16227,18 @@ mod arm_snapshot_attribution_tests {
     #[test]
     fn attribution_reflects_the_snapshot_instant_not_a_later_live_lock() {
         let mut st = ArmState::new();
-        st.arm(grant_for("K5ARH", "client-a"), NOW);
+        st.arm(grant_for("K5ARH", "client-a"), at(NOW));
         st.set_local_consent(true, NOW);
         let arm = Arc::new(Mutex::new(st));
 
-        let snapshot = ArmSnapshot::take(&arm, NOW);
+        let snapshot = ArmSnapshot::take(&arm, || at(NOW));
 
         // A DIFFERENT operator arms the live state AFTER the snapshot was
         // taken — simulating the race a detached spawn's later re-lock
         // would be vulnerable to.
         arm.lock()
             .unwrap()
-            .arm(grant_for("W1AW", "client-b"), NOW + 10);
+            .arm(grant_for("W1AW", "client-b"), at(NOW + 10));
 
         assert_eq!(
             snapshot.operator_attribution(Some("client-a")).as_deref(),
@@ -16119,10 +16251,10 @@ mod arm_snapshot_attribution_tests {
     #[test]
     fn identity_mismatch_never_attributes_to_the_armed_operator() {
         let mut st = ArmState::new();
-        st.arm(grant_for("K5ARH", "client-a"), NOW);
+        st.arm(grant_for("K5ARH", "client-a"), at(NOW));
         st.set_local_consent(true, NOW);
         let arm = Arc::new(Mutex::new(st));
-        let snapshot = ArmSnapshot::take(&arm, NOW);
+        let snapshot = ArmSnapshot::take(&arm, || at(NOW));
 
         assert_eq!(
             snapshot.operator_attribution(Some("client-b")),
@@ -16135,10 +16267,10 @@ mod arm_snapshot_attribution_tests {
     #[test]
     fn unbound_frame_attributes_to_whoever_is_armed() {
         let mut st = ArmState::new();
-        st.arm(grant_for("K5ARH", "client-a"), NOW);
+        st.arm(grant_for("K5ARH", "client-a"), at(NOW));
         st.set_local_consent(true, NOW);
         let arm = Arc::new(Mutex::new(st));
-        let snapshot = ArmSnapshot::take(&arm, NOW);
+        let snapshot = ArmSnapshot::take(&arm, || at(NOW));
 
         assert_eq!(
             snapshot.operator_attribution(None).as_deref(),
@@ -16159,12 +16291,12 @@ mod arm_snapshot_attribution_tests {
     #[test]
     fn identity_mismatch_refuses_attribution_even_when_tx_is_not_permitted_for_another_reason() {
         let mut st = ArmState::new();
-        st.arm(grant_for("K5ARH", "client-b"), NOW);
+        st.arm(grant_for("K5ARH", "client-b"), at(NOW));
         // Local consent OFF: tx_permitted is false for an UNRELATED reason,
         // not because of the identity mismatch below.
         st.set_local_consent(false, NOW);
         let arm = Arc::new(Mutex::new(st));
-        let snapshot = ArmSnapshot::take(&arm, NOW);
+        let snapshot = ArmSnapshot::take(&arm, || at(NOW));
         assert!(
             !snapshot.tx_permitted,
             "test setup: tx must not be permitted here"
@@ -16176,6 +16308,42 @@ mod arm_snapshot_attribution_tests {
             "a frame bound to client-a must never be attributed to client-b's \
              operator, even when the denial's proximate cause is something \
              else entirely (local consent off)"
+        );
+    }
+
+    /// Wall clock rolled back `back_ms`, monotonic clock at `mono_ms`.
+    fn wall_rolled_back(mono_ms: i64, back_ms: i64) -> pancetta_agent::arm::ArmTime {
+        pancetta_agent::arm::ArmTime {
+            unix_ms: NOW - back_ms,
+            monotonic: at(mono_ms).monotonic,
+            suspend_aware_ms: at(mono_ms).suspend_aware_ms,
+        }
+    }
+
+    /// PAN-97: the snapshot's permission bit uses the monotonic dead-man
+    /// window, and its audit timestamp is the wall time sampled under the
+    /// same lock.
+    #[test]
+    fn snapshot_denies_after_monotonic_expiry_despite_wall_rollback() {
+        use pancetta_agent::arm::HEARTBEAT_TIMEOUT_MS;
+        let mut st = ArmState::new();
+        st.arm(grant_for("K5ARH", "client-a"), at(NOW));
+        st.set_local_consent(true, NOW);
+        let arm = Arc::new(Mutex::new(st));
+
+        let fresh = ArmSnapshot::take(&arm, || wall_rolled_back(NOW + 1_000, 60_000));
+        assert!(fresh.permits(Some("client-a")));
+        assert_eq!(fresh.decided_at_unix_ms, NOW - 60_000);
+
+        let lapsed = ArmSnapshot::take(&arm, || {
+            wall_rolled_back(NOW + HEARTBEAT_TIMEOUT_MS, 60_000)
+        });
+        assert!(!lapsed.permits(Some("client-a")));
+        assert!(!lapsed.permits(None));
+        // Attribution is still frozen under the same lock.
+        assert_eq!(
+            lapsed.operator_attribution(Some("client-a")).as_deref(),
+            Some("K5ARH")
         );
     }
 }

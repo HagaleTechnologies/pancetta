@@ -7,9 +7,10 @@ maintainer: agent
 sources:
   - pancetta-agent/src/arm.rs
   - pancetta/src/coordinator/tx.rs
+  - pancetta/src/coordinator/station_agent/mod.rs
 verified:
-  commit: eac7aab
-  date: 2026-07-07
+  commit: 6e65be2
+  date: 2026-10-13
 links:
   - remote-operation
 ---
@@ -30,13 +31,34 @@ mixing up which gate you are near.
 
 ## Where the invariant lives
 
-- `pancetta-agent/src/arm.rs:436` — `ArmState::tx_permitted`, the pure clock-free
+- `pancetta-agent/src/arm.rs:577` — `ArmState::tx_permitted`, the pure clock-free
   AND (armed ∧ scope ∧ TTL ∧ heartbeat-fresh ∧ consent ∧ ¬kill). Adding a
   conjunct can only make it *more* restrictive.
-- `pancetta/src/coordinator/tx.rs:337` — `remote_tx_permitted`, the coordinator
+- `pancetta/src/coordinator/tx.rs:3699` — `remote_tx_permitted`, the coordinator
   gate that **fails closed** before keying PTT.
-- `pancetta/src/coordinator/tx.rs:315` — `tx_qso_is_live`, the neighboring
+- `pancetta/src/coordinator/tx.rs:3222` — `tx_qso_is_live`, the neighboring
   liveness gate that **fails open** — the one you must NOT mirror for safety.
+
+## A lapsed arm stays lapsed
+
+`ArmState::heartbeat` (`arm.rs:436`) expires the arm *before* checking
+`armJti`/`seq`, and the station session loop runs `tick` on every iteration
+(`station_agent/mod.rs:1910`). A heartbeat at or after the 30 s deadline can
+never revive the arm; only a fresh signed `txArm` can. The 5–15 s
+`heartbeatIntervalSec` is the client's send cadence, not the station's timeout.
+
+Timing-sensitive calls take an `ArmTime` (wall ms + monotonic `Instant` +
+suspend-aware ms): silence and lifetime use both the monotonic and the
+suspend-aware clock (either reaching a limit expires the arm, so a host suspend
+longer than 30 s needs a fresh arm), the signed `armedUntil` uses wall time. The gate helpers take a closure (`ArmTime::now` in production) and call it
+only after locking the arm, so a lock wait cannot make the sample stale.
+
+Testing gotchas: build `ArmTime`s from one shared `Instant` origin plus explicit
+offsets; `tokio::time::pause` does not move `std::time::Instant`. Session-loop
+tests inject `ArmContext::clock` instead of sleeping, and must arm on that same
+timeline. A `MockWs` with an empty queue reports *Closed*, not *Quiet*, so an
+established-but-silent session needs a transport that returns
+`RecvOutcome::Quiet` (see the `Pan97Ws` harness in the station-agent tests).
 
 Rationale, TTL/heartbeat constants, and the `e2e-auth.v1` contract are normative
 in `docs/DECISIONS/remote-operation.md` and the code; see [[remote-operation]].
