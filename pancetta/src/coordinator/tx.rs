@@ -1191,6 +1191,8 @@ mod interruptible_sleep_tests {
 
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut st = pancetta_agent::arm::ArmState::new();
+        st.set_channel_consent(pancetta_agent::arm::ConsentChannel::StationAgent, true, now_ms);
+        st.set_channel_consent(pancetta_agent::arm::ConsentChannel::WsjtxUdp, true, now_ms);
         st.arm(
             pancetta_agent::arm::VerifiedArmGrant {
                 operator_callsign: "K5ARH".to_string(),
@@ -1201,7 +1203,6 @@ mod interruptible_sleep_tests {
             },
             now_ms,
         );
-        st.set_local_consent(true, now_ms);
         let arm = Arc::new(std::sync::Mutex::new(st));
 
         let arm_clone = arm.clone();
@@ -1284,6 +1285,8 @@ mod interruptible_sleep_tests {
 
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut st = pancetta_agent::arm::ArmState::new();
+        st.set_channel_consent(pancetta_agent::arm::ConsentChannel::StationAgent, true, now_ms);
+        st.set_channel_consent(pancetta_agent::arm::ConsentChannel::WsjtxUdp, true, now_ms);
         st.arm(
             pancetta_agent::arm::VerifiedArmGrant {
                 operator_callsign: "K5ARH".to_string(),
@@ -1294,7 +1297,6 @@ mod interruptible_sleep_tests {
             },
             now_ms,
         );
-        st.set_local_consent(true, now_ms);
         let arm = Arc::new(std::sync::Mutex::new(st));
 
         // Newer message: arrives at ~10ms, after the pre-sleep poll already
@@ -1430,6 +1432,8 @@ mod interruptible_sleep_tests {
 
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut st = pancetta_agent::arm::ArmState::new();
+        st.set_channel_consent(pancetta_agent::arm::ConsentChannel::StationAgent, true, now_ms);
+        st.set_channel_consent(pancetta_agent::arm::ConsentChannel::WsjtxUdp, true, now_ms);
         st.arm(
             pancetta_agent::arm::VerifiedArmGrant {
                 operator_callsign: "K5ARH".to_string(),
@@ -1440,7 +1444,6 @@ mod interruptible_sleep_tests {
             },
             now_ms,
         );
-        st.set_local_consent(true, now_ms);
         let arm = Arc::new(std::sync::Mutex::new(st));
 
         let arm_clone = arm.clone();
@@ -3676,13 +3679,15 @@ fn encode_and_modulate_multi_tx(
     }
 }
 
-/// Whether a **remote-originated** TX request is permitted to key PTT right now,
-/// per the station-agent arm gate.
+/// Whether a **remote-originated** TX request from `channel` is permitted to
+/// key PTT right now, per the shared arm gate.
 ///
 /// This is the safety gate for `TxOrigin::Remote` requests only — the worker
 /// never calls it for `TxOrigin::Local` (local TX is byte-identical). It reads
 /// the shared [`ArmState`](pancetta_agent::arm::ArmState) and returns
-/// `arm.tx_permitted(now_ms)`.
+/// `arm.tx_permitted(now_ms, channel)` — `channel`'s own consent bit, never
+/// another channel's. A diagnostic entry point: production gates go through
+/// [`remote_tx_permitted_for`], which derives the channel from the frame.
 ///
 /// **Fail-CLOSED on a poisoned lock** — the OPPOSITE of [`tx_qso_is_live`]'s
 /// fail-open. This is a safety gate: if the arm mutex is poisoned we can no
@@ -3691,10 +3696,23 @@ fn encode_and_modulate_multi_tx(
 pub fn remote_tx_permitted(
     arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
     now_ms: i64,
+    channel: pancetta_agent::arm::ConsentChannel,
 ) -> bool {
     match arm.lock() {
-        Ok(state) => state.tx_permitted(now_ms),
+        Ok(state) => state.tx_permitted(now_ms, channel),
         Err(_) => false,
+    }
+}
+
+/// The remote-TX channel a frame originated on, derived from its bound client
+/// identity: every station-agent producer binds `Some(peer)`
+/// (`tx_kind_to_qso_message`), while the WSJT-X UDP bridge — which has no
+/// client identity concept — binds `None`. Selects which channel's own
+/// consent bit the TX-time gate requires.
+fn consent_channel_for(remote_client_key_id: Option<&str>) -> pancetta_agent::arm::ConsentChannel {
+    match remote_client_key_id {
+        Some(_) => pancetta_agent::arm::ConsentChannel::StationAgent,
+        None => pancetta_agent::arm::ConsentChannel::WsjtxUdp,
     }
 }
 
@@ -3711,13 +3729,21 @@ pub fn remote_tx_permitted(
 /// FIRST peer, because the old gate only checked "is the shared `ArmState`
 /// armed", never "armed by the same client this frame is bound to".
 ///
-/// `remote_client_key_id` is `None` for every producer that predates PAN-91
-/// (or has no client identity concept — e.g. the WSJT-X UDP bridge's own
-/// remote-TX path) and for those frames this degrades to exactly
-/// [`remote_tx_permitted`]'s boolean-only check, so existing non-station-agent
-/// remote-TX integrations are unaffected. `Some(id)` requires that `id` is
-/// the client `ArmState::armed_client_key_id()` currently reports — a
-/// mismatch (including "armed, but by someone else") denies fail-closed.
+/// `remote_client_key_id` also names the ORIGINATING channel, whose own
+/// current consent is required (PAN-98; one channel's consent never permits
+/// another channel's TX):
+///
+/// - `None` — the WSJT-X UDP bridge (no client identity concept): requires
+///   the WSJT-X UDP channel's consent ([`ConsentChannel::WsjtxUdp`]) plus the
+///   rest of the boolean arm gate, with no identity binding.
+/// - `Some(id)` — the station-agent channel: requires the station-agent
+///   channel's consent ([`ConsentChannel::StationAgent`]) plus the rest of the
+///   boolean arm gate, AND that `id` is the client
+///   `ArmState::armed_client_key_id()` currently reports — a mismatch
+///   (including "armed, but by someone else") denies fail-closed.
+///
+/// [`ConsentChannel::WsjtxUdp`]: pancetta_agent::arm::ConsentChannel::WsjtxUdp
+/// [`ConsentChannel::StationAgent`]: pancetta_agent::arm::ConsentChannel::StationAgent
 pub fn remote_tx_permitted_for(
     arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
     now_ms: i64,
@@ -3725,7 +3751,7 @@ pub fn remote_tx_permitted_for(
 ) -> bool {
     match arm.lock() {
         Ok(state) => {
-            if !state.tx_permitted(now_ms) {
+            if !state.tx_permitted(now_ms, consent_channel_for(remote_client_key_id)) {
                 return false;
             }
             match remote_client_key_id {
@@ -3748,7 +3774,12 @@ pub fn remote_tx_permitted_for(
 /// authorizing the other under a mismatched identity.
 #[derive(Clone)]
 struct ArmSnapshot {
-    tx_permitted: bool,
+    /// The boolean arm gate for a station-agent-originated frame (`Some`
+    /// client identity) — reads the station-agent channel's consent.
+    station_agent_permitted: bool,
+    /// The boolean arm gate for a WSJT-X-UDP-originated frame (`None` client
+    /// identity) — reads the WSJT-X UDP channel's consent.
+    wsjtx_permitted: bool,
     armed_client_key_id: Option<String>,
     /// Round-10 review (Codex P2): captured under the SAME lock as the
     /// other two fields, so audit attribution for a denial this snapshot
@@ -3770,22 +3801,35 @@ impl ArmSnapshot {
     ) -> Self {
         match arm.lock() {
             Ok(state) => Self {
-                tx_permitted: state.tx_permitted(now_ms),
+                station_agent_permitted: state
+                    .tx_permitted(now_ms, pancetta_agent::arm::ConsentChannel::StationAgent),
+                wsjtx_permitted: state
+                    .tx_permitted(now_ms, pancetta_agent::arm::ConsentChannel::WsjtxUdp),
                 armed_client_key_id: state.armed_client_key_id().map(str::to_string),
                 operator_callsign: state.operator_callsign().map(str::to_string),
             },
             Err(_) => Self {
-                tx_permitted: false,
+                station_agent_permitted: false,
+                wsjtx_permitted: false,
                 armed_client_key_id: None,
                 operator_callsign: None,
             },
         }
     }
 
+    /// The boolean arm gate (no identity binding) for the channel
+    /// `remote_client_key_id` originated on — see [`consent_channel_for`].
+    fn channel_permitted(&self, remote_client_key_id: Option<&str>) -> bool {
+        match consent_channel_for(remote_client_key_id) {
+            pancetta_agent::arm::ConsentChannel::StationAgent => self.station_agent_permitted,
+            pancetta_agent::arm::ConsentChannel::WsjtxUdp => self.wsjtx_permitted,
+        }
+    }
+
     /// Mirrors [`remote_tx_permitted_for`]'s logic against this frozen
     /// snapshot instead of a fresh lock.
     fn permits(&self, remote_client_key_id: Option<&str>) -> bool {
-        if !self.tx_permitted {
+        if !self.channel_permitted(remote_client_key_id) {
             return false;
         }
         match remote_client_key_id {
@@ -3801,7 +3845,7 @@ impl ArmSnapshot {
     /// TTL expired, local consent/kill), which is not an identity problem
     /// at all and must not be reported as one.
     fn is_identity_mismatch(&self, remote_client_key_id: Option<&str>) -> bool {
-        self.tx_permitted
+        self.channel_permitted(remote_client_key_id)
             && remote_client_key_id
                 .is_some_and(|id| self.armed_client_key_id.as_deref() != Some(id))
     }
@@ -12434,6 +12478,8 @@ mod disarm_interrupt_signal_tests {
         // pre-PTT gap.
         let mut st = pancetta_agent::arm::ArmState::new();
         let now_ms = chrono::Utc::now().timestamp_millis();
+        st.set_channel_consent(pancetta_agent::arm::ConsentChannel::StationAgent, true, now_ms);
+        st.set_channel_consent(pancetta_agent::arm::ConsentChannel::WsjtxUdp, true, now_ms);
         st.arm(
             pancetta_agent::arm::VerifiedArmGrant {
                 operator_callsign: "K5ARH".to_string(),
@@ -12444,7 +12490,6 @@ mod disarm_interrupt_signal_tests {
             },
             now_ms,
         );
-        st.set_local_consent(true, now_ms);
         let arm = Arc::new(std::sync::Mutex::new(st));
 
         let denial_reason =
@@ -15032,6 +15077,8 @@ mod coalesce_tests {
         // client-a is armed; client-b is not.
         let mut st = pancetta_agent::arm::ArmState::new();
         let now_ms = chrono::Utc::now().timestamp_millis();
+        st.set_channel_consent(pancetta_agent::arm::ConsentChannel::StationAgent, true, now_ms);
+        st.set_channel_consent(pancetta_agent::arm::ConsentChannel::WsjtxUdp, true, now_ms);
         st.arm(
             pancetta_agent::arm::VerifiedArmGrant {
                 operator_callsign: "K5ARH".to_string(),
@@ -15042,7 +15089,6 @@ mod coalesce_tests {
             },
             now_ms,
         );
-        st.set_local_consent(true, now_ms);
         let arm = Arc::new(std::sync::Mutex::new(st));
 
         // Head entry: bound to client-a (armed) — must survive.
@@ -15922,7 +15968,7 @@ mod protocol_tx_tests {
 #[cfg(test)]
 mod remote_arm_gate_tests {
     use super::remote_tx_permitted;
-    use pancetta_agent::arm::{ArmState, VerifiedArmGrant};
+    use pancetta_agent::arm::{ArmState, ConsentChannel, VerifiedArmGrant};
     use std::sync::{Arc, Mutex};
 
     const NOW: i64 = 1_000_000;
@@ -15941,7 +15987,7 @@ mod remote_arm_gate_tests {
     fn fresh_unarmed_state_denies() {
         let arm = Arc::new(Mutex::new(ArmState::new()));
         assert!(
-            !remote_tx_permitted(&arm, NOW),
+            !remote_tx_permitted(&arm, NOW, ConsentChannel::StationAgent),
             "a fresh (unarmed) ArmState must deny remote TX"
         );
     }
@@ -15949,25 +15995,32 @@ mod remote_arm_gate_tests {
     #[test]
     fn armed_consented_fresh_heartbeat_permits() {
         let mut st = ArmState::new();
+        st.set_channel_consent(ConsentChannel::StationAgent, true, NOW);
+        st.set_channel_consent(ConsentChannel::WsjtxUdp, true, NOW);
         st.arm(grant(), NOW);
-        st.set_local_consent(true, NOW);
         let arm = Arc::new(Mutex::new(st));
         assert!(
-            remote_tx_permitted(&arm, NOW),
+            remote_tx_permitted(&arm, NOW, ConsentChannel::StationAgent),
             "armed + tx-scope + consent + fresh heartbeat must permit"
         );
     }
 
     #[test]
     fn armed_without_local_consent_denies() {
-        // Consent (remote_tx_enabled) is the LOCAL operator gate: default OFF.
+        // Consent is the LOCAL operator gate, per channel: default OFF. Arm
+        // with only the station-agent channel's consent on; the WSJT-X UDP
+        // channel (no consent of its own) must still be denied.
         let mut st = ArmState::new();
+        st.set_channel_consent(ConsentChannel::StationAgent, true, NOW);
         st.arm(grant(), NOW);
-        // no set_local_consent(true)
         let arm = Arc::new(Mutex::new(st));
         assert!(
-            !remote_tx_permitted(&arm, NOW),
-            "armed but no local consent must deny"
+            !remote_tx_permitted(&arm, NOW, ConsentChannel::WsjtxUdp),
+            "armed but no local consent on the queried channel must deny"
+        );
+        assert!(
+            remote_tx_permitted(&arm, NOW, ConsentChannel::StationAgent),
+            "the channel whose own consent is on stays permitted"
         );
     }
 
@@ -15975,8 +16028,9 @@ mod remote_arm_gate_tests {
     fn poisoned_lock_fails_closed() {
         // Arm + consent so that IF the lock were readable, it would permit.
         let mut st = ArmState::new();
+        st.set_channel_consent(ConsentChannel::StationAgent, true, NOW);
+        st.set_channel_consent(ConsentChannel::WsjtxUdp, true, NOW);
         st.arm(grant(), NOW);
-        st.set_local_consent(true, NOW);
         let arm = Arc::new(Mutex::new(st));
 
         // Poison the mutex by panicking while holding the guard.
@@ -15990,7 +16044,7 @@ mod remote_arm_gate_tests {
         // Even though the underlying state WOULD permit, the poisoned lock must
         // fail CLOSED (deny) — the opposite of tx_qso_is_live's fail-open.
         assert!(
-            !remote_tx_permitted(&arm, NOW),
+            !remote_tx_permitted(&arm, NOW, ConsentChannel::StationAgent),
             "SAFETY: a poisoned arm lock must fail CLOSED (deny remote TX)"
         );
     }
@@ -16005,7 +16059,7 @@ mod remote_arm_gate_tests {
 #[cfg(test)]
 mod remote_arm_gate_identity_tests {
     use super::remote_tx_permitted_for;
-    use pancetta_agent::arm::{ArmState, VerifiedArmGrant};
+    use pancetta_agent::arm::{ArmState, ConsentChannel, VerifiedArmGrant};
     use std::sync::{Arc, Mutex};
 
     const NOW: i64 = 1_000_000;
@@ -16022,8 +16076,9 @@ mod remote_arm_gate_identity_tests {
 
     fn armed_and_consented(client_key_id: &str) -> Arc<Mutex<ArmState>> {
         let mut st = ArmState::new();
+        st.set_channel_consent(ConsentChannel::StationAgent, true, NOW);
+        st.set_channel_consent(ConsentChannel::WsjtxUdp, true, NOW);
         st.arm(grant_for(client_key_id), NOW);
-        st.set_local_consent(true, NOW);
         Arc::new(Mutex::new(st))
     }
 
@@ -16069,12 +16124,56 @@ mod remote_arm_gate_identity_tests {
             "an unarmed station must deny regardless of the frame's bound identity"
         );
     }
+
+    /// PAN-98: a `None`-identity frame originates on the WSJT-X UDP channel
+    /// and requires THAT channel's own consent — the station-agent channel's
+    /// consent (which the arm itself needed) never satisfies it.
+    #[test]
+    fn none_origin_requires_wsjtx_channel_consent() {
+        let mut st = ArmState::new();
+        st.set_channel_consent(ConsentChannel::StationAgent, true, NOW);
+        st.arm(grant_for("client-a"), NOW);
+        let arm = Arc::new(Mutex::new(st));
+        assert!(
+            !remote_tx_permitted_for(&arm, NOW, None),
+            "a WSJT-X-UDP-origin frame must be denied while that channel's own \
+             consent is off, even though the arm is live"
+        );
+        arm.lock()
+            .unwrap()
+            .set_channel_consent(ConsentChannel::WsjtxUdp, true, NOW);
+        assert!(
+            remote_tx_permitted_for(&arm, NOW, None),
+            "with the WSJT-X UDP channel's own consent on, its frame is permitted"
+        );
+    }
+
+    /// PAN-98: transmission-time re-checks the ORIGINATING channel's own
+    /// CURRENT consent — revoking the station-agent channel's consent after
+    /// a valid arm denies that channel's frames even though the WSJT-X UDP
+    /// channel's consent is still on.
+    #[test]
+    fn some_origin_denied_when_station_agent_consent_revoked_after_arm() {
+        let arm = armed_and_consented("client-a");
+        assert!(remote_tx_permitted_for(&arm, NOW, Some("client-a")));
+        arm.lock()
+            .unwrap()
+            .set_channel_consent(ConsentChannel::StationAgent, false, NOW);
+        assert!(
+            !remote_tx_permitted_for(&arm, NOW, Some("client-a")),
+            "transmission-time must re-check the ORIGINATING channel's own current consent"
+        );
+        assert!(
+            remote_tx_permitted_for(&arm, NOW, None),
+            "the WSJT-X UDP channel's own consent still governs its frames"
+        );
+    }
 }
 
 #[cfg(test)]
 mod arm_snapshot_attribution_tests {
     use super::ArmSnapshot;
-    use pancetta_agent::arm::{ArmState, VerifiedArmGrant};
+    use pancetta_agent::arm::{ArmState, ConsentChannel, VerifiedArmGrant};
     use std::sync::{Arc, Mutex};
 
     const NOW: i64 = 1_000_000;
@@ -16095,8 +16194,9 @@ mod arm_snapshot_attribution_tests {
     #[test]
     fn attribution_reflects_the_snapshot_instant_not_a_later_live_lock() {
         let mut st = ArmState::new();
+        st.set_channel_consent(ConsentChannel::StationAgent, true, NOW);
+        st.set_channel_consent(ConsentChannel::WsjtxUdp, true, NOW);
         st.arm(grant_for("K5ARH", "client-a"), NOW);
-        st.set_local_consent(true, NOW);
         let arm = Arc::new(Mutex::new(st));
 
         let snapshot = ArmSnapshot::take(&arm, NOW);
@@ -16119,8 +16219,9 @@ mod arm_snapshot_attribution_tests {
     #[test]
     fn identity_mismatch_never_attributes_to_the_armed_operator() {
         let mut st = ArmState::new();
+        st.set_channel_consent(ConsentChannel::StationAgent, true, NOW);
+        st.set_channel_consent(ConsentChannel::WsjtxUdp, true, NOW);
         st.arm(grant_for("K5ARH", "client-a"), NOW);
-        st.set_local_consent(true, NOW);
         let arm = Arc::new(Mutex::new(st));
         let snapshot = ArmSnapshot::take(&arm, NOW);
 
@@ -16135,8 +16236,9 @@ mod arm_snapshot_attribution_tests {
     #[test]
     fn unbound_frame_attributes_to_whoever_is_armed() {
         let mut st = ArmState::new();
+        st.set_channel_consent(ConsentChannel::StationAgent, true, NOW);
+        st.set_channel_consent(ConsentChannel::WsjtxUdp, true, NOW);
         st.arm(grant_for("K5ARH", "client-a"), NOW);
-        st.set_local_consent(true, NOW);
         let arm = Arc::new(Mutex::new(st));
         let snapshot = ArmSnapshot::take(&arm, NOW);
 
@@ -16159,15 +16261,21 @@ mod arm_snapshot_attribution_tests {
     #[test]
     fn identity_mismatch_refuses_attribution_even_when_tx_is_not_permitted_for_another_reason() {
         let mut st = ArmState::new();
+        st.set_channel_consent(ConsentChannel::StationAgent, true, NOW);
         st.arm(grant_for("K5ARH", "client-b"), NOW);
-        // Local consent OFF: tx_permitted is false for an UNRELATED reason,
-        // not because of the identity mismatch below.
-        st.set_local_consent(false, NOW);
+        // Local consent OFF (revoked after the arm): tx_permitted is false
+        // for an UNRELATED reason, not because of the identity mismatch below.
+        st.set_channel_consent(ConsentChannel::StationAgent, false, NOW);
         let arm = Arc::new(Mutex::new(st));
         let snapshot = ArmSnapshot::take(&arm, NOW);
         assert!(
-            !snapshot.tx_permitted,
+            !snapshot.station_agent_permitted,
             "test setup: tx must not be permitted here"
+        );
+        assert_eq!(
+            snapshot.armed_client_key_id.as_deref(),
+            Some("client-b"),
+            "test setup: client-b holds the arm"
         );
 
         assert_eq!(
@@ -16177,6 +16285,42 @@ mod arm_snapshot_attribution_tests {
              operator, even when the denial's proximate cause is something \
              else entirely (local consent off)"
         );
+    }
+
+    /// PAN-98: the snapshot mirrors `remote_tx_permitted_for`'s channel
+    /// selection — a `None`-identity frame reads the WSJT-X UDP channel's
+    /// consent, a `Some` frame the station-agent channel's.
+    #[test]
+    fn snapshot_permits_none_uses_wsjtx_bit_and_some_uses_station_agent_bit() {
+        let mut st = ArmState::new();
+        st.set_channel_consent(ConsentChannel::StationAgent, true, NOW);
+        st.arm(grant_for("K5ARH", "client-a"), NOW);
+        let arm = Arc::new(Mutex::new(st));
+
+        // SA consent on, wsjtx consent off.
+        let snapshot = ArmSnapshot::take(&arm, NOW);
+        assert!(snapshot.permits(Some("client-a")));
+        assert!(
+            !snapshot.permits(None),
+            "a None-origin frame needs the WSJT-X UDP channel's own consent"
+        );
+
+        // Revoke SA consent, grant wsjtx consent.
+        {
+            let mut st = arm.lock().unwrap();
+            st.set_channel_consent(ConsentChannel::StationAgent, false, NOW);
+            st.set_channel_consent(ConsentChannel::WsjtxUdp, true, NOW);
+        }
+        let snapshot = ArmSnapshot::take(&arm, NOW);
+        assert!(
+            !snapshot.permits(Some("client-a")),
+            "a Some-origin frame needs the station-agent channel's own consent"
+        );
+        assert!(
+            !snapshot.is_identity_mismatch(Some("client-a")),
+            "a consent denial is not an identity problem"
+        );
+        assert!(snapshot.permits(None));
     }
 }
 

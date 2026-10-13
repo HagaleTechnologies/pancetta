@@ -454,6 +454,8 @@ impl CoordSim {
     pub fn arm_remote_tx_as(&self, client_key_id: &str) {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut st = self.remote_tx_arm.lock().expect("arm lock");
+        st.set_channel_consent(pancetta_agent::arm::ConsentChannel::StationAgent, true, now_ms);
+        st.set_channel_consent(pancetta_agent::arm::ConsentChannel::WsjtxUdp, true, now_ms);
         st.arm(
             pancetta_agent::arm::VerifiedArmGrant {
                 operator_callsign: "K5ARH".to_string(),
@@ -464,7 +466,6 @@ impl CoordSim {
             },
             now_ms,
         );
-        st.set_local_consent(true, now_ms);
         st.heartbeat("sim-arm-jti", 1, now_ms);
     }
 
