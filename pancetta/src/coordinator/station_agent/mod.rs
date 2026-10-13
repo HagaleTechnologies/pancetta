@@ -177,13 +177,17 @@ struct ArmContext {
     /// today's original behavior byte-for-byte for non-cqdx-integrated
     /// stations).
     tx_arm_allow_list: Arc<std::sync::RwLock<HashSet<String>>>,
-    /// Arm-time **best-effort** revocation deny-list, keyed by the
-    /// capabilityToken's `jti` (frozen e2e-auth.v1 §6-revocation). **EMPTY in
-    /// v1** — the station-local TX-allow-list is the authoritative revoke, and
-    /// an empty deny-list is inert (never blocks). SEAM: a future cqdx-fed
-    /// deny-list (fetched/pushed over the station's cqdx link) would populate
-    /// this set so a leaked long-lived enabled token can be fast-revoked; it
-    /// fails OPEN (stays empty) when the station is offline, per the contract's
+    /// **Best-effort** revocation deny-list, keyed by the capabilityToken's
+    /// `jti` (frozen e2e-auth.v1 §6-revocation). The station-local
+    /// TX-allow-list stays the authoritative revoke; this set only ever
+    /// narrows it. Populated (PAN-96) by [`reconcile_authorizations`] with the
+    /// hello-token `jti` of every peer an authorization refresh evicts, so the
+    /// same token is refused at `hello` ([`dispatch_hello`]), at use
+    /// ([`PeerCtx::grants`]) and at arm (`verify_arm_grant` → `CapError::Revoked`)
+    /// until the client fetches a fresh one. Process-lifetime: a StationAgent
+    /// restart clears it (the token's own `exp` still bounds it). SEAM: a
+    /// future cqdx-fed deny-list would also populate this set; it fails OPEN
+    /// (stays as-is) when the station is offline, per the contract's
     /// "best-effort" posture.
     revoked_jtis: HashSet<String>,
     seen_jtis: HashSet<String>,
@@ -202,6 +206,12 @@ struct ArmContext {
     /// session (`run_one_session`) — no established peer or granted scope
     /// carries across a reconnect, so a different set of allow-listed clients
     /// can connect next time.
+    ///
+    /// An entry does NOT imply the peer is still admitted: the admission list
+    /// can change under a live session (PAN-96). [`peer_admitted`] is the live
+    /// check every scoped action and outbound frame goes through, and
+    /// [`reconcile_authorizations`] removes the entry of a peer an
+    /// authorization refresh dropped.
     peers: std::collections::HashMap<String, PeerCtx>,
     /// The single peer (by keyId) currently allowed to DRIVE the radio (arm TX,
     /// change frequency, initiate a QSO). At most one at a time (Task 5). `None`
@@ -229,14 +239,28 @@ struct ArmContext {
     /// `ArmState::tx_permitted` live, so this flag never affects whether TX
     /// is actually permitted, only how promptly connected peers are told.
     revocation_pending: Arc<std::sync::atomic::AtomicBool>,
+    /// The authorization generation (PAN-96): bumped by
+    /// `poll_authorizations_loop`, after it publishes them, whenever a poll
+    /// changes `tx_allow_list` or `tx_arm_allow_list`. Shared with the poll
+    /// task (a SEPARATE tokio task, like `revocation_pending`); never bumped in
+    /// static-config mode.
+    authz_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// The generation THIS session last reconciled to. When it lags
+    /// `authz_generation`, [`reconcile_authorizations`] applies the refresh to
+    /// the live session on the next tick.
+    authz_generation_seen: u64,
 }
 
-/// A verified hello capability, kept whole enough to re-check at use time.
+/// A verified hello capability, kept whole enough to re-check at use time:
+/// every use re-checks admission ([`peer_admitted`]), expiry, the revocation
+/// deny-list and scope (PAN-96).
 struct PeerAuth {
     /// Scopes granted by the token (rig-api tiers `status` ⊂ `qsy` ⊂ `tx`).
     scopes: Vec<String>,
     /// The token's expiry (ms). The capability is usable only while `now < exp_ms`.
     exp_ms: i64,
+    /// The token's `jti` — its identity, for the station's revocation deny-list.
+    jti: String,
 }
 
 /// Per-established-peer session state (Task 4: one entry per demuxed peer,
@@ -260,23 +284,42 @@ impl PeerCtx {
         Self { auth: None }
     }
 
-    /// Whether this peer currently holds `required` (rig-api tiers) — the
-    /// capability must be unexpired at `now`.
-    fn grants(&self, required: &str, now: i64) -> bool {
-        self.auth
-            .as_ref()
-            .is_some_and(|a| now < a.exp_ms && scope_at_least(&a.scopes, required))
+    /// Whether this peer's capability currently holds `required` (rig-api
+    /// tiers) — it must be unexpired at `now` and its `jti` must not be on the
+    /// station's revocation deny-list. Admission is checked separately, live,
+    /// by [`peer_grants`].
+    fn grants(&self, required: &str, now: i64, revoked: &HashSet<String>) -> bool {
+        self.auth.as_ref().is_some_and(|a| {
+            now < a.exp_ms && !revoked.contains(&a.jti) && scope_at_least(&a.scopes, required)
+        })
     }
 }
 
-/// Whether established peer `peer` currently holds `required` at `now`.
+/// Whether `peer` is CURRENTLY on the station's connection-admission list — a
+/// live read, fail closed on a poisoned lock (PAN-96).
+fn peer_admitted(ctx: &ArmContext, peer: &str) -> bool {
+    ctx.tx_allow_list
+        .read()
+        .map(|l| l.contains(peer))
+        .unwrap_or(false)
+}
+
+/// Whether established peer `peer` currently holds `required` at `now`: it is
+/// still admitted, and its capability is unexpired, not deny-listed and
+/// scoped for `required`.
 fn peer_grants(ctx: &ArmContext, peer: &str, required: &str, now: i64) -> bool {
-    ctx.peers.get(peer).is_some_and(|p| p.grants(required, now))
+    peer_admitted(ctx, peer)
+        && ctx
+            .peers
+            .get(peer)
+            .is_some_and(|p| p.grants(required, now, &ctx.revoked_jtis))
 }
 
 /// THE outbound gate (PAN-95): a peer is sent a frame — any frame — only while
-/// it holds a currently-valid `status`-or-higher capability from a verified
-/// hello. Both `deliver_sends` and `drain_read_stream` consult this; they are
+/// it is still admitted and holds a currently-valid `status`-or-higher
+/// capability from a verified hello (PAN-96: re-checked per frame, so a peer
+/// an authorization refresh dropped is sent nothing even before its eviction
+/// runs). Both `deliver_sends` and `drain_read_stream` consult this; they are
 /// the only two station→client paths.
 fn peer_may_receive(ctx: &ArmContext, peer: &str, now: i64) -> bool {
     peer_grants(ctx, peer, "status", now)
@@ -321,6 +364,84 @@ fn expire_peer_auth(ctx: &mut ArmContext, now: i64) -> Vec<PeerSend> {
             sends = control_state_sends(ctx, now, None);
         }
     }
+    sends
+}
+
+/// PAN-96: apply a live authorization refresh to THIS session. A no-op until
+/// `poll_authorizations_loop` bumps `authz_generation` (it does so only when an
+/// admission list actually changed, and only after publishing it). Then, in one
+/// synchronous step on the task that owns the session:
+/// - the demux's admission set is replaced with the live `tx_allow_list` (a
+///   poisoned lock reads as empty: fail closed, everyone is evicted), so a
+///   newly authorized client can establish without a reconnect;
+/// - every peer the live list no longer holds is evicted: its Noise transport
+///   is dropped (re-admission needs a fresh handshake), its `PeerCtx` is
+///   removed, and its hello token's `jti` is deny-listed (it must fetch a
+///   fresh token);
+/// - if an evicted peer held control or the live arm, the arm is disarmed
+///   (`authorization-revoked`; a no-op when the poll task already did), a
+///   revoked controller is released, and the updated `controlState` frames
+///   for the remaining peers are returned for the caller to deliver.
+///
+/// There is no `.await` here, so no frame from an evicted peer can be
+/// processed between its demux eviction and its `PeerCtx` removal.
+fn reconcile_authorizations<W: pancetta_agent::relay::WsConn>(
+    ctx: &mut ArmContext,
+    sess: &mut MultiPeerSession<'_, W>,
+    now: i64,
+) -> Vec<PeerSend> {
+    let current = ctx.authz_generation.load(Ordering::Acquire);
+    if current == ctx.authz_generation_seen {
+        return Vec::new();
+    }
+    let allow = ctx
+        .tx_allow_list
+        .read()
+        .map(|l| l.clone())
+        .unwrap_or_default();
+    let mut evicted = sess.replace_allowed(allow.clone());
+    let mut stale: Vec<String> = ctx
+        .peers
+        .keys()
+        .filter(|p| !allow.contains(*p) && !evicted.contains(*p))
+        .cloned()
+        .collect();
+    stale.sort();
+    evicted.extend(stale);
+    for peer in &evicted {
+        if let Some(auth) = ctx.peers.remove(peer).and_then(|pc| pc.auth) {
+            ctx.revoked_jtis.insert(auth.jti);
+        }
+        warn!(target: "agent.control", peer = %peer,
+            "remote peer evicted — its authorization was revoked; it must be re-authorized and reconnect");
+    }
+
+    let controller_evicted = ctx.controller.as_ref().is_some_and(|c| evicted.contains(c));
+    let armer_evicted = {
+        let mut st = match ctx.arm.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let armer_evicted = st
+            .armed_client_key_id()
+            .is_some_and(|k| evicted.iter().any(|p| p == k));
+        if controller_evicted || armer_evicted {
+            let effects = st.disarm_with_reason(DisarmReason::AuthorizationRevoked, now);
+            if !effects.is_empty() {
+                warn!(target: "agent.tx", "controller evicted with a live arm — disarming");
+            }
+            apply_arm_effects(&ctx.audit, &effects);
+        }
+        armer_evicted
+    };
+    let mut sends = Vec::new();
+    if controller_evicted || armer_evicted {
+        if controller_evicted {
+            ctx.controller = None;
+        }
+        sends = control_state_sends(ctx, now, None);
+    }
+    ctx.authz_generation_seen = current;
     sends
 }
 
@@ -617,6 +738,18 @@ async fn dispatch_action(
     session_id: &str,
     now: i64,
 ) -> DispatchOutcome {
+    // PAN-96: a peer no longer on the live admission list may only give up
+    // authority (Disarm / ReleaseControl — fail-safe). Everything else, even a
+    // fresh hello or a control grab, is refused before any gate below runs.
+    if !matches!(
+        action,
+        ControlAction::Disarm { .. } | ControlAction::ReleaseControl
+    ) && !peer_admitted(ctx, peer)
+    {
+        warn!(target: "agent.control", peer = %peer,
+            "control frame refused — peer is no longer authorized on this station");
+        return DispatchOutcome::cont();
+    }
     match action {
         ControlAction::Arm {
             capability_token,
@@ -884,6 +1017,16 @@ fn dispatch_hello(
         return false;
     };
     match ctx.verifier.verify_capability_token(&token, now) {
+        Ok(cap) if cap.client_key_id == peer && ctx.revoked_jtis.contains(&cap.jti) => {
+            // PAN-96: a token deny-listed by an eviction never re-authorizes —
+            // the client must fetch a fresh one.
+            warn!(target: "agent.control", peer = %peer,
+                "hello capabilityToken was revoked on this station — fetch a fresh token");
+            if let Some(p) = ctx.peers.get_mut(peer) {
+                p.auth = None;
+            }
+            false
+        }
         Ok(cap) if cap.client_key_id == peer => {
             debug!(
                 target: "agent.control",
@@ -896,6 +1039,7 @@ fn dispatch_hello(
                     p.auth = Some(PeerAuth {
                         scopes: cap.scopes,
                         exp_ms: cap.exp_ms,
+                        jti: cap.jti,
                     });
                     true
                 }
@@ -1471,6 +1615,10 @@ impl super::ApplicationCoordinator {
         // so a poll-driven disarm can flag the session loop to broadcast the
         // updated control state (see `ArmContext::revocation_pending`).
         let revocation_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // PAN-96: bumped by the poll task when an authorization refresh
+        // changes the admission lists; the session loop reconciles on it (see
+        // `ArmContext::authz_generation`).
+        let authz_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         // Task 6: subscribe to the shared display feed (if the localhost
         // gateway or this component's own gating started it — see
@@ -1502,6 +1650,7 @@ impl super::ApplicationCoordinator {
             let poll_arm = arm.clone();
             let poll_audit = audit.clone();
             let poll_revocation_pending = revocation_pending.clone();
+            let poll_authz_generation = authz_generation.clone();
             let poll_shutdown = self.shutdown_signal.clone();
             let poll_interval = Duration::from_secs(cqdx_cfg.authorizations_poll_interval_secs);
             let poll_handle = tokio::spawn(async move {
@@ -1517,6 +1666,7 @@ impl super::ApplicationCoordinator {
                     poll_revocation_pending,
                     poll_shutdown,
                     poll_interval,
+                    poll_authz_generation,
                 )
                 .await;
             });
@@ -1536,6 +1686,7 @@ impl super::ApplicationCoordinator {
                 events,
                 arm,
                 revocation_pending,
+                authz_generation,
                 shutdown,
             })
             .await;
@@ -1653,6 +1804,12 @@ fn load_client_device_keys(
 /// clears once per tick, broadcasting the updated control state to every
 /// established peer then — matching this module's existing rule that every
 /// arm transition fans `control_state_sends` out immediately.
+///
+/// PAN-96: when a successful poll changes either list's contents, this task
+/// bumps `authz_generation` after publishing them. The session loop notices
+/// within one `RECV_TICK` and runs [`reconcile_authorizations`], which evicts
+/// already-connected peers the new lists dropped and admits newly listed ones.
+/// A poll that changes nothing, or fails, bumps nothing.
 #[allow(clippy::too_many_arguments)]
 async fn poll_authorizations_loop(
     cqdx_cfg: pancetta_config::network::CqdxConfig,
@@ -1666,6 +1823,7 @@ async fn poll_authorizations_loop(
     revocation_pending: Arc<std::sync::atomic::AtomicBool>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     interval: Duration,
+    authz_generation: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let Some(token) = cqdx_cfg.token.clone() else {
         return; // Defensive — caller already checked this before spawning.
@@ -1709,6 +1867,7 @@ async fn poll_authorizations_loop(
                 // doc above. Poisoned-lock handling mirrors
                 // `RemoteTxDisarmGuard::drop` — a poisoned arm mutex must
                 // never block publishing the refreshed TX-arm-eligible set.
+                let arm_changed;
                 {
                     let mut st = match arm.lock() {
                         Ok(g) => g,
@@ -1736,11 +1895,23 @@ async fn poll_authorizations_loop(
                     // Published WHILE STILL HOLDING `arm`'s lock — this is
                     // the atomicity guarantee `verify_and_arm`'s re-check
                     // relies on.
-                    *tx_arm_allow_list.write().unwrap() = new_tx_arm_allow;
+                    let mut g = tx_arm_allow_list.write().unwrap();
+                    arm_changed = *g != new_tx_arm_allow;
+                    *g = new_tx_arm_allow;
                 }
 
-                *tx_allow_list.write().unwrap() = new_allow;
+                let allow_changed = {
+                    let mut g = tx_allow_list.write().unwrap();
+                    let changed = *g != new_allow;
+                    *g = new_allow;
+                    changed
+                };
                 *client_keys.write().unwrap() = new_keys;
+                if arm_changed || allow_changed {
+                    // PAN-96: bumped AFTER publishing, so a session that
+                    // observes the new generation reads the new lists.
+                    authz_generation.fetch_add(1, Ordering::AcqRel);
+                }
                 debug!(
                     target: "agent",
                     "authorizations poll: refreshed tx_allow_list ({} client(s) admitted for this agent, {} TX-arm-eligible)",
@@ -1778,6 +1949,8 @@ struct RunConfig {
     arm: Arc<Mutex<ArmState>>,
     /// Threaded into `ArmContext::revocation_pending` — see there.
     revocation_pending: Arc<std::sync::atomic::AtomicBool>,
+    /// Threaded into `ArmContext::authz_generation` — see there.
+    authz_generation: Arc<std::sync::atomic::AtomicU64>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -1813,6 +1986,9 @@ async fn run_session_loop(mut cfg: RunConfig) {
         // No controller until a peer grabs it (explicitly or implicitly).
         controller: None,
         revocation_pending: cfg.revocation_pending,
+        authz_generation: cfg.authz_generation,
+        // Set from the live generation at the start of every session.
+        authz_generation_seen: 0,
     };
 
     while !cfg.shutdown.load(Ordering::Acquire) {
@@ -1932,7 +2108,10 @@ fn drain_read_stream<W: pancetta_agent::relay::WsConn>(
 /// refused peer (`PeerRefused`) is isolated to itself: it never tears down the
 /// whole session, so other already-established peers are unaffected. `ctx.peers`
 /// is cleared at the start of every new session — no established peer or
-/// granted scope carries across a reconnect.
+/// granted scope carries across a reconnect. Within a session, the demux's
+/// admission set is refreshed on every authorization-generation change
+/// (PAN-96, [`reconcile_authorizations`]): a peer the refresh dropped is
+/// evicted at once, and a newly listed one may connect without a reconnect.
 async fn run_one_session<W: pancetta_agent::relay::WsConn>(
     ws: W,
     identity: &AgentIdentity,
@@ -1941,6 +2120,10 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
     events: &mut Option<tokio::sync::broadcast::Receiver<pancetta_protocol::ServerEvent>>,
 ) {
     ctx.peers.clear();
+    // D8 (PAN-96): record the generation BEFORE snapshotting the list. A poll
+    // that publishes after the snapshot bumps afterwards and triggers a
+    // reconcile; one landing between the two costs one harmless extra one.
+    ctx.authz_generation_seen = ctx.authz_generation.load(Ordering::Acquire);
     let allow_snapshot = ctx.tx_allow_list.read().unwrap().clone();
     let mut sess = MultiPeerSession::new(ws, identity, allow_snapshot);
     if let Err(e) = sess.authenticate() {
@@ -1955,14 +2138,12 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
                     Err(e) => {
                         debug!(target: "agent.control", "malformed control frame: {e}");
                         // PAN-34: this `continue` must not skip the
-                        // end-of-loop revocation broadcast below, or a
-                        // client that keeps resending bad frames can
+                        // end-of-loop housekeeping below (authorization
+                        // reconcile, revocation broadcast, expiry sweep), or
+                        // a client that keeps resending bad frames can
                         // suppress it for every OTHER connected peer
                         // indefinitely.
-                        broadcast_pending_revocation(ctx, &mut sess);
-                        let now = now_ms();
-                        let sends = expire_peer_auth(ctx, now);
-                        deliver_sends(&mut sess, ctx, &sends, now);
+                        session_housekeeping(ctx, &mut sess);
                         continue;
                     }
                 };
@@ -2029,20 +2210,35 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
         }
 
         // Round-1 review fix (PR #261), broadcast now factored into
-        // `broadcast_pending_revocation` (PAN-34) so the malformed-frame
+        // `session_housekeeping` (PAN-34, PAN-96) so the malformed-frame
         // `continue` above can't bypass it — see that fn's doc comment.
-        broadcast_pending_revocation(ctx, &mut sess);
-        let now = now_ms();
-        let sends = expire_peer_auth(ctx, now);
-        deliver_sends(&mut sess, ctx, &sends, now);
+        session_housekeeping(ctx, &mut sess);
     }
+}
+
+/// Per-tick housekeeping, run at the end of every loop iteration AND on the
+/// malformed-frame `continue` path (PAN-34: a misbehaving peer must not be
+/// able to suppress it for the others). Applies any authorization refresh
+/// first (PAN-96, [`reconcile_authorizations`]), so the poll-flagged
+/// rebroadcast and the expiry sweep both run on the post-eviction peer set.
+fn session_housekeeping<W: pancetta_agent::relay::WsConn>(
+    ctx: &mut ArmContext,
+    sess: &mut MultiPeerSession<'_, W>,
+) {
+    let now = now_ms();
+    let sends = reconcile_authorizations(ctx, sess, now);
+    deliver_sends(sess, ctx, &sends, now);
+    broadcast_pending_revocation(ctx, sess);
+    let now = now_ms();
+    let sends = expire_peer_auth(ctx, now);
+    deliver_sends(sess, ctx, &sends, now);
 }
 
 /// Broadcast the current (already-disarmed) control state to every
 /// established peer if a concurrent `poll_authorizations_loop` cycle flagged
-/// `ctx.revocation_pending` since the last check. Factored out of
-/// `run_one_session` so both the normal end-of-tick path AND the
-/// malformed-control-frame `continue` (PAN-34) run it — a persistently
+/// `ctx.revocation_pending` since the last check. Called from
+/// [`session_housekeeping`], which both the normal end-of-tick path AND the
+/// malformed-control-frame `continue` (PAN-34) run — a persistently
 /// misbehaving client must not be able to suppress the broadcast to other
 /// connected peers by never reaching the bottom of the loop.
 fn broadcast_pending_revocation<W: pancetta_agent::relay::WsConn>(
@@ -2189,7 +2385,11 @@ mod tests {
         /// Test helper: an established peer holding `scopes` until `exp_ms`.
         fn authorized_until(scopes: Vec<String>, exp_ms: i64) -> Self {
             Self {
-                auth: Some(PeerAuth { scopes, exp_ms }),
+                auth: Some(PeerAuth {
+                    scopes,
+                    exp_ms,
+                    jti: "test-jti".to_string(),
+                }),
             }
         }
     }
@@ -2245,6 +2445,8 @@ mod tests {
             peers: peers_with(CLIENT_KEY_ID, None),
             controller: None,
             revocation_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            authz_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            authz_generation_seen: 0,
         }
     }
 
@@ -2820,6 +3022,10 @@ mod tests {
         // check did in the single-peer world.
         const ANOTHER_PEER: &str = "someOtherClientKeyId0";
         let mut ctx = ctx_with(true, true);
+        ctx.tx_allow_list
+            .write()
+            .unwrap()
+            .insert(ANOTHER_PEER.to_string());
         ctx.peers
             .insert(ANOTHER_PEER.to_string(), PeerCtx::unauthorized());
         let bus = MessageBus::new(64).unwrap();
@@ -3473,6 +3679,10 @@ mod tests {
     #[tokio::test]
     async fn non_controller_qsy_refused_with_error_frame() {
         let mut ctx = ctx_with(true, true);
+        ctx.tx_allow_list
+            .write()
+            .unwrap()
+            .insert(PEER_B.to_string());
         ctx.peers.insert(
             PEER_B.to_string(),
             PeerCtx::authorized_until(vec!["qsy".to_string()], NOW + 600_000),
@@ -3616,6 +3826,10 @@ mod tests {
     #[tokio::test]
     async fn take_control_disarms_previous_controllers_arm() {
         let mut ctx = ctx_with(true, true);
+        ctx.tx_allow_list
+            .write()
+            .unwrap()
+            .insert(PEER_B.to_string());
         ctx.peers
             .insert(PEER_B.to_string(), PeerCtx::unauthorized());
         with_consent(&ctx, true);
@@ -4254,6 +4468,8 @@ mod tests {
             peers: std::collections::HashMap::new(),
             controller: None,
             revocation_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            authz_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            authz_generation_seen: 0,
         };
         let bus = MessageBus::new(64).unwrap();
         run_one_session(ws, identity, &mut ctx, &bus, &mut None).await;
@@ -4343,6 +4559,8 @@ mod tests {
             peers: std::collections::HashMap::new(),
             controller: None,
             revocation_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            authz_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            authz_generation_seen: 0,
         }
     }
 
@@ -4390,13 +4608,29 @@ mod tests {
     /// needed for any hello dispatched inside `run_one_session`, which checks
     /// tokens at `now_ms()`, not this module's fixed `NOW`.
     fn real_clock_token(agent_kid: &str, client_kid: &str, scopes: &[&str]) -> String {
+        real_clock_token_with_jti(
+            agent_kid,
+            client_kid,
+            scopes,
+            &format!("hello-{client_kid}"),
+        )
+    }
+
+    /// [`real_clock_token`] minted under an explicit `jti` (PAN-96: a freshly
+    /// minted token after a revocation carries a new one).
+    fn real_clock_token_with_jti(
+        agent_kid: &str,
+        client_kid: &str,
+        scopes: &[&str],
+        jti: &str,
+    ) -> String {
         let now_s = now_ms() / 1000;
         let header = json!({ "alg": "EdDSA", "kid": IDP_KID, "typ": "JWT" });
         let payload = json!({
             "iss": "cqdx", "sub": "acct-1", "operatorCallsign": OPERATOR,
             "aud": agent_kid, "clientKeyId": client_kid,
             "scopes": scopes,
-            "iat": now_s - 10, "exp": now_s + 600, "jti": format!("hello-{client_kid}")
+            "iat": now_s - 10, "exp": now_s + 600, "jti": jti
         });
         mint_jws(&header, &payload, &idp_key())
     }
@@ -4501,6 +4735,22 @@ mod tests {
         Arc<Mutex<Vec<String>>>,
         Vec<snow::TransportState>,
     ) {
+        let (sess, outbound, transports, _ws) = hand_session_ws(identity, devices);
+        (sess, outbound, transports)
+    }
+
+    /// [`hand_session`], also returning a handle to the session's `MockWs` so
+    /// a test can push further inbound frames.
+    #[allow(clippy::type_complexity)]
+    fn hand_session_ws<'a>(
+        identity: &'a AgentIdentity,
+        devices: &[&AgentIdentity],
+    ) -> (
+        MultiPeerSession<'a, MockWs>,
+        Arc<Mutex<Vec<String>>>,
+        Vec<snow::TransportState>,
+        MockWs,
+    ) {
         let outbound = Arc::new(Mutex::new(Vec::new()));
         let ws = MockWs::new(Vec::new(), outbound.clone());
         let handle = ws.clone();
@@ -4533,7 +4783,7 @@ mod tests {
             init.read_msg2(&msg2);
             transports.push(init.into_transport());
         }
-        (sess, outbound, transports)
+        (sess, outbound, transports, handle)
     }
 
     /// A display-feed receiver with `ev` already buffered. The sender is
@@ -5128,6 +5378,8 @@ mod tests {
             peers: peers_with(CLIENT_KEY_ID, None),
             controller: None,
             revocation_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            authz_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            authz_generation_seen: 0,
         }
     }
 
@@ -5266,6 +5518,7 @@ mod tests {
             revocation_pending,
             shutdown_clone,
             Duration::from_millis(50),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ));
         tokio::time::sleep(Duration::from_millis(150)).await;
         shutdown.store(true, Ordering::Release);
@@ -5473,6 +5726,7 @@ mod tests {
             revocation_pending.clone(),
             shutdown_clone,
             Duration::from_millis(50),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ));
         // Give the poll loop time to complete at least one successful cycle
         // against the mock server.
@@ -5985,6 +6239,7 @@ mod tests {
             poll_revocation_pending,
             shutdown_clone,
             Duration::from_millis(5),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ));
 
         let bus = MessageBus::new(64).unwrap();
@@ -6024,5 +6279,1036 @@ mod tests {
             "regardless of how the arm-attempt loop interleaved with the poll's \
              revocation, the client must never be left armed once both settle"
         );
+    }
+
+    // ── PAN-96: live authority checks on every use ──────────────────────────
+
+    /// Drop `peer` from the live connection-admission list, as a successful
+    /// authorization poll that revoked it would.
+    fn revoke_admission(ctx: &ArmContext, peer: &str) {
+        ctx.tx_allow_list.write().unwrap().remove(peer);
+    }
+
+    /// The `Qsy` used by the PAN-96 tests.
+    fn qsy_action() -> ControlAction {
+        ControlAction::Qsy {
+            vfo: 0,
+            frequency_hz: 14_074_000.0,
+        }
+    }
+
+    /// The `SetSplit` used by the PAN-96 tests.
+    fn split_action() -> ControlAction {
+        ControlAction::SetSplit {
+            enabled: true,
+            tx_frequency_hz: 14_075_000.0,
+        }
+    }
+
+    /// Ticket evidence `security_review_expired_hello_still_controls_rig`: a
+    /// hello token verified as expired must not yield a `SetFrequency` (or a
+    /// `SetSplit`) from dispatch on the still-connected socket.
+    #[tokio::test]
+    async fn expired_hello_capability_cannot_qsy_or_split() {
+        let mut ctx = ctx_with(true, true);
+        let bus = MessageBus::new(64).unwrap();
+        let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let tok = token_expiring_at(NOW / 1000 + 5);
+        let hello = ControlAction::Hello {
+            capability_token: Some(tok.clone()),
+        };
+        dispatch_action(hello, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
+        assert!(
+            ctx.peers[CLIENT_KEY_ID].auth.is_some(),
+            "setup: the hello verified at NOW"
+        );
+        let later = NOW + 60_000;
+        assert!(
+            matches!(
+                ctx.verifier.verify_capability_token(&tok, later),
+                Err(pancetta_agent::capability::CapError::Expired)
+            ),
+            "setup: the same token verifies as expired a minute later"
+        );
+        dispatch_action(
+            qsy_action(),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            later,
+        )
+        .await;
+        dispatch_action(
+            split_action(),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            later,
+        )
+        .await;
+        assert!(
+            hamlib_rx.try_recv().is_err(),
+            "an expired hello capability must forward no RigControl message"
+        );
+    }
+
+    #[tokio::test]
+    async fn qsy_refused_once_peer_is_dropped_from_admission_list() {
+        let mut ctx = ctx_with(true, true);
+        let bus = MessageBus::new(64).unwrap();
+        let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let hello = ControlAction::Hello {
+            capability_token: Some(valid_token()),
+        };
+        dispatch_action(hello, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
+        dispatch_action(qsy_action(), CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
+        assert!(
+            hamlib_rx.try_recv().is_ok(),
+            "setup: qsy permitted while admitted"
+        );
+
+        revoke_admission(&ctx, CLIENT_KEY_ID);
+        dispatch_action(qsy_action(), CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
+        assert!(
+            hamlib_rx.try_recv().is_err(),
+            "a peer dropped from the admission list must not drive setFrequency"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_split_refused_once_peer_is_dropped_from_admission_list() {
+        let mut ctx = ctx_with(true, true);
+        let bus = MessageBus::new(64).unwrap();
+        let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let hello = ControlAction::Hello {
+            capability_token: Some(valid_token()),
+        };
+        dispatch_action(hello, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
+        dispatch_action(
+            split_action(),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
+        assert!(
+            hamlib_rx.try_recv().is_ok(),
+            "setup: setSplit permitted while admitted"
+        );
+
+        revoke_admission(&ctx, CLIENT_KEY_ID);
+        dispatch_action(
+            split_action(),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
+        assert!(
+            hamlib_rx.try_recv().is_err(),
+            "a peer dropped from the admission list must not drive setSplit"
+        );
+    }
+
+    /// An armed controller with a hello capability, then dropped from the
+    /// admission list. Returns the context and the bus receiver for Hamlib.
+    async fn armed_controller_then_revoked(
+        bus: &MessageBus,
+    ) -> (ArmContext, crossbeam_channel::Receiver<ComponentMessage>) {
+        let mut ctx = ctx_with(true, true);
+        with_consent(&ctx, true);
+        let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let hello = ControlAction::Hello {
+            capability_token: Some(valid_token()),
+        };
+        dispatch_action(hello, CLIENT_KEY_ID, &mut ctx, bus, SESSION_ID, NOW).await;
+        dispatch_action(
+            arm_action("revoked-arm-jti"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
+        assert!(ctx.arm.lock().unwrap().tx_permitted(NOW), "setup: armed");
+        assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
+        revoke_admission(&ctx, CLIENT_KEY_ID);
+        (ctx, hamlib_rx)
+    }
+
+    #[tokio::test]
+    async fn revoked_peer_can_only_disarm_or_release() {
+        let bus = MessageBus::new(64).unwrap();
+        let (mut ctx, hamlib_rx) = armed_controller_then_revoked(&bus).await;
+        let at = NOW + 20_000;
+        let refused = [
+            ControlAction::TakeControl,
+            ControlAction::Hello {
+                // A different, valid token: were it honored, `auth.jti` would change.
+                capability_token: Some(token_expiring_at(NOW / 1000 + 300)),
+            },
+            ControlAction::Heartbeat {
+                arm_jti: "revoked-arm-jti".into(),
+                seq: 1,
+            },
+            ControlAction::StopCq,
+            qsy_action(),
+        ];
+        for action in refused {
+            let label = format!("{action:?}");
+            let out = dispatch_action(action, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, at).await;
+            assert!(out.sends.is_empty(), "{label}: no frames");
+            assert_eq!(
+                ctx.controller.as_deref(),
+                Some(CLIENT_KEY_ID),
+                "{label}: controller unchanged"
+            );
+            assert!(hamlib_rx.try_recv().is_err(), "{label}: no bus message");
+            assert_eq!(
+                ctx.peers[CLIENT_KEY_ID].auth.as_ref().unwrap().jti,
+                "cap-jti-1",
+                "{label}: the cached capability is not refreshed"
+            );
+        }
+        assert!(
+            !ctx.arm
+                .lock()
+                .unwrap()
+                .tx_permitted(at + HEARTBEAT_TIMEOUT_MS - 1),
+            "the refused heartbeat must not have slid the dead-man window"
+        );
+
+        // Disarm still works: it only reduces authority.
+        dispatch_action(
+            ControlAction::Disarm {
+                arm_jti: String::new(),
+            },
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW + 1_000,
+        )
+        .await;
+        assert!(
+            !ctx.arm.lock().unwrap().tx_permitted(NOW + 1_000),
+            "a revoked peer may still disarm"
+        );
+
+        // ReleaseControl still works too.
+        let bus = MessageBus::new(64).unwrap();
+        let (mut ctx, _rx) = armed_controller_then_revoked(&bus).await;
+        dispatch_action(
+            ControlAction::ReleaseControl,
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW + 1_000,
+        )
+        .await;
+        assert!(
+            ctx.controller.is_none(),
+            "a revoked peer may still release control"
+        );
+        assert!(!ctx.arm.lock().unwrap().tx_permitted(NOW + 1_000));
+    }
+
+    #[tokio::test]
+    async fn revoked_peer_cannot_grab_control() {
+        let mut ctx = ctx_with(true, true);
+        let bus = MessageBus::new(64).unwrap();
+        let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let hello = ControlAction::Hello {
+            capability_token: Some(valid_token()),
+        };
+        dispatch_action(hello, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
+        revoke_admission(&ctx, CLIENT_KEY_ID);
+        assert!(ctx.controller.is_none());
+        dispatch_action(qsy_action(), CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
+        assert!(
+            ctx.controller.is_none(),
+            "a revoked peer's qsy must not implicitly grab control"
+        );
+        assert!(hamlib_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn outbound_withheld_once_peer_is_dropped_from_admission_list() {
+        let identity = AgentIdentity::generate();
+        let mut allow = HashSet::new();
+        allow.insert(CLIENT_KEY_ID.to_string());
+        allow.insert(PEER_B.to_string());
+        let mut ctx = fresh_ctx(&identity.key_id(), allow);
+        let (dev_a, dev_b) = (client_device(), peer_b_device());
+        let (mut sess, outbound, mut transports) = hand_session(&identity, &[&dev_a, &dev_b]);
+        for p in [CLIENT_KEY_ID, PEER_B] {
+            ctx.peers.insert(
+                p.to_string(),
+                PeerCtx::authorized_until(vec!["status".to_string()], NOW + 60_000),
+            );
+        }
+        revoke_admission(&ctx, CLIENT_KEY_ID);
+
+        let before_a = envs_to(&outbound.lock().unwrap(), CLIENT_KEY_ID).len();
+        let before = outbound.lock().unwrap().len();
+        let mut events = feed_with(pancetta_protocol::ServerEvent::TxStatus { active: true });
+        drain_read_stream(&mut events, &mut sess, &ctx, NOW);
+        let out = outbound.lock().unwrap().clone();
+        assert!(
+            envs_to(&out[before..], CLIENT_KEY_ID).is_empty(),
+            "no read-stream event to the dropped peer"
+        );
+        let envs_b = envs_to(&out[before..], PEER_B);
+        assert_eq!(envs_b.len(), 1, "B still gets the event");
+        let v = client_decrypt_json(&mut transports[1], &envs_b[0]);
+        assert_eq!(v["event"]["event"], "txStatus");
+
+        let sends = control_state_sends(&ctx, NOW, None);
+        let before = outbound.lock().unwrap().len();
+        deliver_sends(&mut sess, &ctx, &sends, NOW);
+        let out = outbound.lock().unwrap().clone();
+        assert_eq!(
+            envs_to(&out[before..], PEER_B).len(),
+            1,
+            "B still gets controlState"
+        );
+        assert_eq!(
+            envs_to(&out, CLIENT_KEY_ID).len(),
+            before_a,
+            "the dropped peer is sent nothing at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn hello_with_deny_listed_jti_grants_nothing() {
+        let mut ctx = ctx_with(true, true);
+        let token = real_clock_token(AGENT_KEY_ID, CLIENT_KEY_ID, &["status", "qsy"]);
+        assert!(
+            dispatch_hello(Some(token.clone()), CLIENT_KEY_ID, &mut ctx, now_ms()),
+            "setup: the token is otherwise valid"
+        );
+        ctx.revoked_jtis.insert(format!("hello-{CLIENT_KEY_ID}"));
+        assert!(
+            !dispatch_hello(Some(token), CLIENT_KEY_ID, &mut ctx, now_ms()),
+            "a deny-listed token must not re-authorize"
+        );
+        assert!(
+            ctx.peers[CLIENT_KEY_ID].auth.is_none(),
+            "the refused hello clears any prior capability"
+        );
+    }
+
+    #[tokio::test]
+    async fn hello_stores_token_jti() {
+        let mut ctx = ctx_with(true, true);
+        let token = real_clock_token(AGENT_KEY_ID, CLIENT_KEY_ID, &["status"]);
+        assert!(dispatch_hello(
+            Some(token),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            now_ms()
+        ));
+        assert_eq!(
+            ctx.peers[CLIENT_KEY_ID].auth.as_ref().unwrap().jti,
+            format!("hello-{CLIENT_KEY_ID}")
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_admitted_fails_closed_on_poisoned_lock() {
+        let mut ctx = ctx_with(true, true);
+        let bus = MessageBus::new(64).unwrap();
+        let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let hello = ControlAction::Hello {
+            capability_token: Some(valid_token()),
+        };
+        dispatch_action(hello, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
+        assert!(peer_admitted(&ctx, CLIENT_KEY_ID), "setup: admitted");
+
+        let list = ctx.tx_allow_list.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = list.write().unwrap();
+            panic!("poison the admission list");
+        })
+        .join();
+        assert!(ctx.tx_allow_list.is_poisoned(), "setup: poisoned");
+
+        assert!(
+            !peer_admitted(&ctx, CLIENT_KEY_ID),
+            "a poisoned admission list admits nobody"
+        );
+        dispatch_action(qsy_action(), CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
+        assert!(hamlib_rx.try_recv().is_err(), "and authorizes nothing");
+    }
+
+    // ── PAN-96: authorization generation + reconcile/evict ──────────────────
+
+    /// A cqdx mock serving `body` (which the test may swap) at the
+    /// authorizations endpoint and counting the polls it serves.
+    async fn authorizations_mock(
+        body: Arc<Mutex<Value>>,
+        served: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> std::net::SocketAddr {
+        let app = axum::Router::new().route(
+            "/api/v1/authorizations",
+            axum::routing::get(move || {
+                let body = body.clone();
+                let served = served.clone();
+                async move {
+                    served.fetch_add(1, Ordering::SeqCst);
+                    let v = body.lock().unwrap().clone();
+                    axum::Json(v)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
+    /// An owner (non-delegated) edge for `client_kid` on agent `agent_this`.
+    fn owner_edge(client_kid: &str) -> Value {
+        json!({
+            "id": format!("auth_{client_kid}"),
+            "agentKeyId": "agent_this",
+            "clientKeyId": client_kid,
+            "scopes": ["status", "qsy"],
+            "createdAt": "2026-08-15T00:00:00Z",
+            "role": "owner"
+        })
+    }
+
+    fn cqdx_cfg_at(base_url: String) -> pancetta_config::network::CqdxConfig {
+        pancetta_config::network::CqdxConfig {
+            enabled: true,
+            base_url,
+            token: Some("pat_test_token_0000000000".to_string()),
+            poll_interval_secs: 30,
+            authorizations_poll_interval_secs: 45,
+        }
+    }
+
+    /// Poll `cond` every 5 ms for up to 2 s; returns its final value.
+    async fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..400 {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        cond()
+    }
+
+    /// Spawn the real poll loop over `ctx`'s shared lists, arm, audit and
+    /// generation, polling `base_url` every 10 ms.
+    fn spawn_poll_for(
+        ctx: &ArmContext,
+        base_url: String,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(poll_authorizations_loop(
+            cqdx_cfg_at(base_url),
+            "agent_this".to_string(),
+            std::env::temp_dir(),
+            ctx.tx_allow_list.clone(),
+            ctx.tx_arm_allow_list.clone(),
+            ctx.client_keys.clone(),
+            ctx.arm.clone(),
+            ctx.audit.clone(),
+            ctx.revocation_pending.clone(),
+            shutdown,
+            Duration::from_millis(10),
+            ctx.authz_generation.clone(),
+        ))
+    }
+
+    /// Bump the authorization generation, as a list-changing poll does.
+    fn bump_generation(ctx: &ArmContext) {
+        ctx.authz_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// An established peer holding a `status`+`qsy` hello capability whose
+    /// `jti` is `hello-<kid>` (what `real_clock_token` mints).
+    fn hello_authorized(kid: &str, exp_ms: i64) -> PeerCtx {
+        PeerCtx {
+            auth: Some(PeerAuth {
+                scopes: vec!["status".to_string(), "qsy".to_string()],
+                exp_ms,
+                jti: format!("hello-{kid}"),
+            }),
+        }
+    }
+
+    /// A (CLIENT_KEY_ID) and B (PEER_B) both admitted, established over real
+    /// handshakes, and hello-authorized until `NOW + 60_000`.
+    #[allow(clippy::type_complexity)]
+    fn two_authorized_peers(
+        identity: &AgentIdentity,
+    ) -> (
+        ArmContext,
+        MultiPeerSession<'_, MockWs>,
+        Arc<Mutex<Vec<String>>>,
+        Vec<snow::TransportState>,
+        MockWs,
+    ) {
+        let allow = HashSet::from([CLIENT_KEY_ID.to_string(), PEER_B.to_string()]);
+        let mut ctx = fresh_ctx(&identity.key_id(), allow);
+        let (sess, outbound, transports, ws) =
+            hand_session_ws(identity, &[&client_device(), &peer_b_device()]);
+        for kid in [CLIENT_KEY_ID, PEER_B] {
+            ctx.peers
+                .insert(kid.to_string(), hello_authorized(kid, NOW + 60_000));
+        }
+        (ctx, sess, outbound, transports, ws)
+    }
+
+    /// The relay `env` carrying `payload` from `src` to `agent_kid`.
+    fn env_from(agent_kid: &str, src: &str, payload: &[u8]) -> String {
+        RelayFrame::Env {
+            dst: agent_kid.to_string(),
+            payload: b64url(payload),
+            src: Some(src.to_string()),
+        }
+        .to_json()
+        .unwrap()
+    }
+
+    /// Every `Disarmed` record in `ctx`'s audit log.
+    fn disarmed_records(ctx: &ArmContext) -> Vec<AuditEvent> {
+        std::fs::read_to_string(ctx.audit.path())
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<AuditEvent>(l).ok())
+            .filter(|ev| ev.kind == AuditKind::Disarmed)
+            .collect()
+    }
+
+    /// Arm `ctx` live for `kid` at `NOW` and make it the controller.
+    fn arm_controller(ctx: &mut ArmContext, kid: &str) {
+        let mut st = ctx.arm.lock().unwrap();
+        st.set_local_consent(true, NOW);
+        st.arm(
+            pancetta_agent::arm::VerifiedArmGrant {
+                operator_callsign: OPERATOR.to_string(),
+                ttl_ms: 300_000,
+                scope_tx: true,
+                jti: "reconcile-arm-jti".to_string(),
+                client_key_id: kid.to_string(),
+            },
+            NOW,
+        );
+        assert!(st.tx_permitted(NOW), "setup: armed");
+        drop(st);
+        ctx.controller = Some(kid.to_string());
+    }
+
+    #[tokio::test]
+    async fn poll_authorizations_loop_bumps_generation_only_when_lists_change() {
+        let body = Arc::new(Mutex::new(
+            json!({ "authorizations": [owner_edge(CLIENT_KEY_ID)] }),
+        ));
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = authorizations_mock(body.clone(), served.clone()).await;
+        let ctx = fresh_ctx(AGENT_KEY_ID, HashSet::from([CLIENT_KEY_ID.to_string()]));
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = spawn_poll_for(&ctx, format!("http://{addr}"), shutdown.clone());
+        let generation = ctx.authz_generation.clone();
+
+        assert!(
+            wait_until(|| served.load(Ordering::SeqCst) >= 3).await,
+            "setup: the mock served at least 3 polls"
+        );
+        assert_eq!(
+            generation.load(Ordering::Acquire),
+            0,
+            "polls that change neither list bump nothing"
+        );
+
+        *body.lock().unwrap() = json!({ "authorizations": [] });
+        assert!(
+            wait_until(|| generation.load(Ordering::Acquire) >= 1).await,
+            "a poll that changes the lists bumps the generation"
+        );
+        assert!(ctx.tx_allow_list.read().unwrap().is_empty());
+        assert!(ctx.tx_arm_allow_list.read().unwrap().is_empty());
+
+        let after = served.load(Ordering::SeqCst);
+        assert!(wait_until(|| served.load(Ordering::SeqCst) >= after + 3).await);
+        assert_eq!(
+            generation.load(Ordering::Acquire),
+            1,
+            "further unchanged polls bump nothing"
+        );
+        shutdown.store(true, Ordering::Release);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn poll_failure_never_bumps_generation() {
+        let ctx = fresh_ctx(AGENT_KEY_ID, HashSet::from(["seed".to_string()]));
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Nothing listens on port 1: every poll fails.
+        let handle = spawn_poll_for(&ctx, "http://127.0.0.1:1".to_string(), shutdown.clone());
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        shutdown.store(true, Ordering::Release);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert_eq!(
+            ctx.authz_generation.load(Ordering::Acquire),
+            0,
+            "a failed poll publishes nothing and bumps nothing"
+        );
+        assert_eq!(
+            *ctx.tx_allow_list.read().unwrap(),
+            HashSet::from(["seed".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_is_a_noop_when_generation_unchanged() {
+        let identity = AgentIdentity::generate();
+        let (mut ctx, mut sess, _out, _t, _ws) = two_authorized_peers(&identity);
+        revoke_admission(&ctx, CLIENT_KEY_ID);
+
+        assert!(reconcile_authorizations(&mut ctx, &mut sess, NOW).is_empty());
+        assert_eq!(sess.established_peers().count(), 2, "nobody evicted");
+        assert!(ctx.peers.contains_key(CLIENT_KEY_ID));
+        assert!(ctx.peers.contains_key(PEER_B));
+        assert!(ctx.revoked_jtis.is_empty());
+        assert!(
+            !peer_may_receive(&ctx, CLIENT_KEY_ID, NOW),
+            "the live admission check still refuses A before any reconcile"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_evicts_revoked_peer_and_deny_lists_its_token() {
+        let identity = AgentIdentity::generate();
+        let (mut ctx, mut sess, outbound, mut transports, ws) = two_authorized_peers(&identity);
+        revoke_admission(&ctx, CLIENT_KEY_ID);
+        bump_generation(&ctx);
+
+        let sends = reconcile_authorizations(&mut ctx, &mut sess, NOW);
+        assert!(
+            sends.is_empty(),
+            "no controller was evicted: nothing to tell"
+        );
+        let established: Vec<&str> = sess.established_peers().collect();
+        assert_eq!(established, vec![PEER_B], "A evicted from the demux");
+        assert!(
+            !ctx.peers.contains_key(CLIENT_KEY_ID),
+            "A's PeerCtx removed"
+        );
+        assert!(
+            ctx.revoked_jtis.contains(&format!("hello-{CLIENT_KEY_ID}")),
+            "A's hello token is deny-listed"
+        );
+        assert!(ctx.peers[PEER_B].auth.is_some(), "B untouched");
+        assert_eq!(ctx.authz_generation_seen, 1);
+
+        // A's next frame, under its old transport, is refused with no reply.
+        let before = outbound.lock().unwrap().len();
+        let ct = client_encrypt(&mut transports[0], &hello_frame_bytes("stale"));
+        ws.push_inbound(env_from(&identity.key_id(), CLIENT_KEY_ID, &ct));
+        assert_eq!(
+            sess.process_next(Duration::from_millis(1)).unwrap(),
+            Poll::PeerRefused {
+                peer: CLIENT_KEY_ID.to_string(),
+                reason: pancetta_agent::multi_session::RefuseReason::NotAllowListed,
+            }
+        );
+        assert_eq!(outbound.lock().unwrap().len(), before, "no reply");
+    }
+
+    #[tokio::test]
+    async fn reconcile_evicting_the_controller_disarms_and_releases_control() {
+        let identity = AgentIdentity::generate();
+        let (mut ctx, mut sess, outbound, mut transports, _ws) = two_authorized_peers(&identity);
+        arm_controller(&mut ctx, CLIENT_KEY_ID);
+        let disarmed_before = disarmed_records(&ctx).len();
+        revoke_admission(&ctx, CLIENT_KEY_ID);
+        bump_generation(&ctx);
+
+        let sends = reconcile_authorizations(&mut ctx, &mut sess, NOW);
+        assert_eq!(ctx.controller, None, "a revoked controller is released");
+        assert!(!ctx.arm.lock().unwrap().tx_permitted(NOW), "and disarmed");
+        let disarmed = disarmed_records(&ctx);
+        assert_eq!(
+            disarmed.len(),
+            disarmed_before + 1,
+            "exactly one Disarmed record"
+        );
+        assert!(disarmed
+            .last()
+            .unwrap()
+            .detail
+            .contains("authorization-revoked"));
+        assert!(!sends.is_empty(), "the remaining peers are told");
+        assert!(
+            sends
+                .iter()
+                .all(|s| matches!(&s.to, SendTarget::One(p) if p == PEER_B)),
+            "only B is addressed: {sends:?}"
+        );
+        let before = outbound.lock().unwrap().len();
+        deliver_sends(&mut sess, &ctx, &sends, NOW);
+        let out = outbound.lock().unwrap().clone();
+        let envs_b = envs_to(&out[before..], PEER_B);
+        assert_eq!(envs_b.len(), 1);
+        let v = client_decrypt_json(&mut transports[1], &envs_b[0]);
+        assert_eq!(v["event"]["event"], "controlState");
+        assert_eq!(v["event"]["transmitArmed"], false);
+        assert_eq!(v["event"]["controlHeldByMe"], false);
+
+        // The poll task already disarmed: reconcile still releases control
+        // and writes no second Disarmed record.
+        let identity = AgentIdentity::generate();
+        let (mut ctx, mut sess, _out, _t, _ws) = two_authorized_peers(&identity);
+        arm_controller(&mut ctx, CLIENT_KEY_ID);
+        let effects = ctx
+            .arm
+            .lock()
+            .unwrap()
+            .disarm_with_reason(DisarmReason::AuthorizationRevoked, NOW);
+        apply_arm_effects(&ctx.audit, &effects);
+        let disarmed_before = disarmed_records(&ctx).len();
+        assert_eq!(disarmed_before, 1, "setup: the poll task's disarm");
+        revoke_admission(&ctx, CLIENT_KEY_ID);
+        bump_generation(&ctx);
+        reconcile_authorizations(&mut ctx, &mut sess, NOW);
+        assert_eq!(ctx.controller, None);
+        assert_eq!(
+            disarmed_records(&ctx).len(),
+            disarmed_before,
+            "no duplicate Disarmed record"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_admits_newly_listed_client_mid_session() {
+        let identity = AgentIdentity::generate();
+        let agent_kid = identity.key_id();
+        let mut ctx = fresh_ctx(&agent_kid, HashSet::from([CLIENT_KEY_ID.to_string()]));
+        let (mut sess, _out, _t, ws) = hand_session_ws(&identity, &[&client_device()]);
+        let dev_c = peer_b_device();
+        let msg1_from_c = || {
+            let mut init = initiator_for(&dev_c, &identity.agreement_public_raw());
+            env_from(&agent_kid, PEER_B, &init.write_msg1(&proof_for(&dev_c)))
+        };
+
+        ws.push_inbound(msg1_from_c());
+        assert_eq!(
+            sess.process_next(Duration::from_millis(1)).unwrap(),
+            Poll::PeerRefused {
+                peer: PEER_B.to_string(),
+                reason: pancetta_agent::multi_session::RefuseReason::NotAllowListed,
+            },
+            "setup: C is not admitted yet"
+        );
+
+        ctx.tx_allow_list
+            .write()
+            .unwrap()
+            .insert(PEER_B.to_string());
+        bump_generation(&ctx);
+        assert!(reconcile_authorizations(&mut ctx, &mut sess, NOW).is_empty());
+
+        ws.push_inbound(msg1_from_c());
+        assert!(
+            matches!(
+                sess.process_next(Duration::from_millis(1)).unwrap(),
+                Poll::PeerEstablished { ref peer, .. } if peer == PEER_B
+            ),
+            "a newly authorized client establishes without a reconnect"
+        );
+        assert!(sess.session_id(CLIENT_KEY_ID).is_some(), "A untouched");
+    }
+
+    #[tokio::test]
+    async fn revoked_peer_must_reauthenticate_after_readmission() {
+        let identity = AgentIdentity::generate();
+        let agent_kid = identity.key_id();
+        let mut ctx = fresh_ctx(&agent_kid, HashSet::from([CLIENT_KEY_ID.to_string()]));
+        let (mut sess, _out, mut transports, ws) = hand_session_ws(&identity, &[&client_device()]);
+        ctx.peers
+            .insert(CLIENT_KEY_ID.to_string(), PeerCtx::unauthorized());
+        let old_token = real_clock_token(&agent_kid, CLIENT_KEY_ID, &["status", "qsy"]);
+        assert!(dispatch_hello(
+            Some(old_token.clone()),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            now_ms()
+        ));
+
+        // Revoked and evicted.
+        revoke_admission(&ctx, CLIENT_KEY_ID);
+        bump_generation(&ctx);
+        reconcile_authorizations(&mut ctx, &mut sess, now_ms());
+        assert!(!ctx.peers.contains_key(CLIENT_KEY_ID));
+
+        // Re-authorized.
+        ctx.tx_allow_list
+            .write()
+            .unwrap()
+            .insert(CLIENT_KEY_ID.to_string());
+        bump_generation(&ctx);
+        assert!(reconcile_authorizations(&mut ctx, &mut sess, now_ms()).is_empty());
+
+        // The old transport cannot resume: its frame is not a msg1.
+        let ct = client_encrypt(&mut transports[0], &hello_frame_bytes(&old_token));
+        ws.push_inbound(env_from(&agent_kid, CLIENT_KEY_ID, &ct));
+        assert_eq!(
+            sess.process_next(Duration::from_millis(1)).unwrap(),
+            Poll::PeerRefused {
+                peer: CLIENT_KEY_ID.to_string(),
+                reason: pancetta_agent::multi_session::RefuseReason::Handshake,
+            }
+        );
+
+        // A fresh handshake establishes it with no capability.
+        let dev_a = client_device();
+        let mut init = initiator_for(&dev_a, &identity.agreement_public_raw());
+        ws.push_inbound(env_from(
+            &agent_kid,
+            CLIENT_KEY_ID,
+            &init.write_msg1(&proof_for(&dev_a)),
+        ));
+        match sess.process_next(Duration::from_millis(1)).unwrap() {
+            // What `run_one_session` does on establishment.
+            Poll::PeerEstablished { peer, .. } => {
+                ctx.peers.insert(peer, PeerCtx::unauthorized());
+            }
+            other => panic!("expected PeerEstablished, got {other:?}"),
+        }
+        assert!(!peer_may_receive(&ctx, CLIENT_KEY_ID, now_ms()));
+
+        // The old token stays refused; a freshly minted one is accepted.
+        assert!(!dispatch_hello(
+            Some(old_token),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            now_ms()
+        ));
+        assert!(ctx.peers[CLIENT_KEY_ID].auth.is_none());
+        let fresh =
+            real_clock_token_with_jti(&agent_kid, CLIENT_KEY_ID, &["status"], "hello-fresh");
+        assert!(dispatch_hello(
+            Some(fresh),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            now_ms()
+        ));
+        assert!(peer_may_receive(&ctx, CLIENT_KEY_ID, now_ms()));
+    }
+
+    #[tokio::test]
+    async fn real_poll_revocation_stops_qsy_split_and_reads() {
+        let identity = AgentIdentity::generate();
+        let agent_kid = identity.key_id();
+        let mut ctx = fresh_ctx(&agent_kid, HashSet::from([CLIENT_KEY_ID.to_string()]));
+        let (mut sess, outbound, _t) = hand_session(&identity, &[&client_device()]);
+        ctx.peers
+            .insert(CLIENT_KEY_ID.to_string(), PeerCtx::unauthorized());
+        let token = real_clock_token(&agent_kid, CLIENT_KEY_ID, &["status", "qsy"]);
+        assert!(dispatch_hello(
+            Some(token),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            now_ms()
+        ));
+        let bus = MessageBus::new(64).unwrap();
+        let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+
+        // The real poll loop sees the client's authorization revoked.
+        let body = Arc::new(Mutex::new(json!({ "authorizations": [] })));
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = authorizations_mock(body, served).await;
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = spawn_poll_for(&ctx, format!("http://{addr}"), shutdown.clone());
+        let generation = ctx.authz_generation.clone();
+        assert!(
+            wait_until(|| generation.load(Ordering::Acquire) >= 1).await,
+            "the poll published the revocation"
+        );
+        shutdown.store(true, Ordering::Release);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(!ctx.tx_allow_list.read().unwrap().contains(CLIENT_KEY_ID));
+
+        reconcile_authorizations(&mut ctx, &mut sess, now_ms());
+
+        let now = now_ms();
+        dispatch_action(qsy_action(), CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, now).await;
+        dispatch_action(
+            split_action(),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            now,
+        )
+        .await;
+        assert!(
+            hamlib_rx.try_recv().is_err(),
+            "no QSY or split after revocation"
+        );
+        let before = envs_to(&outbound.lock().unwrap(), CLIENT_KEY_ID).len();
+        let mut events = feed_with(pancetta_protocol::ServerEvent::TxStatus { active: true });
+        drain_read_stream(&mut events, &mut sess, &ctx, now_ms());
+        assert_eq!(
+            envs_to(&outbound.lock().unwrap(), CLIENT_KEY_ID).len(),
+            before,
+            "no read-stream event after revocation"
+        );
+        assert!(
+            !sess.established_peers().any(|p| p == CLIENT_KEY_ID),
+            "evicted from the demux"
+        );
+        assert!(!ctx.peers.contains_key(CLIENT_KEY_ID), "PeerCtx removed");
+    }
+
+    /// Gherkin Scenario 2 end-to-end through `run_one_session`: A and B are
+    /// connected and hello-authorized; a refresh drops A (as the poll task
+    /// would). A's next QSY reaches nothing, A is sent nothing more, and its
+    /// session state is gone, while B keeps receiving the display stream.
+    #[tokio::test]
+    async fn revoking_a_connected_client_evicts_its_live_session() {
+        let identity = AgentIdentity::generate();
+        let agent_kid = identity.key_id();
+        let agent_pub = identity.agreement_public_raw();
+        let allow = HashSet::from([CLIENT_KEY_ID.to_string(), PEER_B.to_string()]);
+        let mut ctx = fresh_ctx(&agent_kid, allow);
+        let bus = MessageBus::new(64).unwrap();
+        let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+
+        let (dev_a, dev_b) = (client_device(), peer_b_device());
+        let mut init_a = initiator_for(&dev_a, &agent_pub);
+        let mut init_b = initiator_for(&dev_b, &agent_pub);
+        let msg1_a = init_a.write_msg1(&proof_for(&dev_a));
+        let msg1_b = init_b.write_msg1(&proof_for(&dev_b));
+        let relay_hello = RelayFrame::Hello {
+            challenge: b64url(&[23u8; 32]),
+        }
+        .to_json()
+        .unwrap();
+        let idle_tick = || {
+            RelayFrame::Presence {
+                peer: "irrelevant-peer".to_string(),
+                state: "up".to_string(),
+            }
+            .to_json()
+            .unwrap()
+        };
+
+        let outbound = Arc::new(Mutex::new(Vec::new()));
+        let mock = MockWs::new(
+            vec![
+                relay_hello,
+                env_from(&agent_kid, CLIENT_KEY_ID, &msg1_a),
+                env_from(&agent_kid, PEER_B, &msg1_b),
+            ],
+            outbound.clone(),
+        );
+        let (evt_tx, evt_rx) = tokio::sync::broadcast::channel(16);
+        let mut events = Some(evt_rx);
+        let slot_a: Arc<Mutex<Option<snow::TransportState>>> = Arc::new(Mutex::new(None));
+        let slot_b: Arc<Mutex<Option<snow::TransportState>>> = Arc::new(Mutex::new(None));
+
+        // Trigger 1, before recv #4: both peers are established. Complete both
+        // client transports and queue each peer's encrypted hello + a tick.
+        let (ws1, out1, kid1) = (mock.clone(), outbound.clone(), agent_kid.clone());
+        let (sa, sb) = (slot_a.clone(), slot_b.clone());
+        let hellos_ws = TriggerAfterWs::new(mock, 4, move || {
+            let out = out1.lock().unwrap().clone();
+            init_a.read_msg2(&envs_to(&out, CLIENT_KEY_ID).remove(0));
+            init_b.read_msg2(&envs_to(&out, PEER_B).remove(0));
+            let mut ta = init_a.into_transport();
+            let mut tb = init_b.into_transport();
+            let tok_a = real_clock_token(&kid1, CLIENT_KEY_ID, &["status", "qsy"]);
+            let tok_b = real_clock_token(&kid1, PEER_B, &["status"]);
+            ws1.push_inbound(env_from(
+                &kid1,
+                CLIENT_KEY_ID,
+                &client_encrypt(&mut ta, &hello_frame_bytes(&tok_a)),
+            ));
+            ws1.push_inbound(env_from(
+                &kid1,
+                PEER_B,
+                &client_encrypt(&mut tb, &hello_frame_bytes(&tok_b)),
+            ));
+            ws1.push_inbound(idle_tick());
+            *sa.lock().unwrap() = Some(ta);
+            *sb.lock().unwrap() = Some(tb);
+        });
+
+        // Trigger 2, before recv #7 (after both hellos were dispatched): the
+        // refresh drops A. Then A sends a QSY and a display event goes out.
+        let (ws2, out2, kid2) = (hellos_ws.inner.clone(), outbound.clone(), agent_kid.clone());
+        let (poll_allow, poll_generation) =
+            (ctx.tx_allow_list.clone(), ctx.authz_generation.clone());
+        let sa2 = slot_a.clone();
+        let envs_to_a_at_revocation = Arc::new(Mutex::new(None));
+        let snapshot = envs_to_a_at_revocation.clone();
+        let evt_tx2 = evt_tx.clone();
+        let ws = TriggerAfterWs::new(hellos_ws, 7, move || {
+            poll_allow.write().unwrap().remove(CLIENT_KEY_ID);
+            poll_generation.fetch_add(1, Ordering::AcqRel);
+            let qsy = serde_json::to_vec(&json!({
+                "frame": "command",
+                "command": { "cmd": "setFrequency", "vfo": 0, "frequencyHz": 7074000 }
+            }))
+            .unwrap();
+            let ct = client_encrypt(sa2.lock().unwrap().as_mut().unwrap(), &qsy);
+            ws2.push_inbound(idle_tick());
+            ws2.push_inbound(env_from(&kid2, CLIENT_KEY_ID, &ct));
+            ws2.push_inbound(idle_tick());
+            evt_tx2
+                .send(pancetta_protocol::ServerEvent::TxStatus { active: true })
+                .unwrap();
+            *snapshot.lock().unwrap() = Some(envs_to(&out2.lock().unwrap(), CLIENT_KEY_ID).len());
+        });
+
+        run_one_session(ws, &identity, &mut ctx, &bus, &mut events).await;
+        drop(evt_tx);
+
+        let at_revocation = envs_to_a_at_revocation
+            .lock()
+            .unwrap()
+            .expect("trigger 2 fired");
+        let out = outbound.lock().unwrap().clone();
+        assert_eq!(at_revocation, 2, "setup: A had its msg2 and hello greeting");
+        assert_eq!(
+            envs_to(&out, CLIENT_KEY_ID).len(),
+            at_revocation,
+            "A is sent nothing after its revocation"
+        );
+        assert!(
+            hamlib_rx.try_recv().is_err(),
+            "A's QSY after revocation reaches no rig"
+        );
+        assert!(
+            !ctx.peers.contains_key(CLIENT_KEY_ID),
+            "A's PeerCtx is gone"
+        );
+        assert!(ctx.revoked_jtis.contains(&format!("hello-{CLIENT_KEY_ID}")));
+        assert!(ctx.peers.contains_key(PEER_B), "B stays");
+
+        let envs_b = envs_to(&out, PEER_B);
+        assert_eq!(envs_b.len(), 3, "B: msg2, hello greeting, the event");
+        let mut tb = slot_b.lock().unwrap().take().unwrap();
+        let greeting = client_decrypt_json(&mut tb, &envs_b[1]);
+        assert_eq!(greeting["event"]["event"], "controlState");
+        let event = client_decrypt_json(&mut tb, &envs_b[2]);
+        assert_eq!(event["event"]["event"], "txStatus");
+        assert_eq!(event["event"]["active"], true);
     }
 }

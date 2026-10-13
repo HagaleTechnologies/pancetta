@@ -18,7 +18,10 @@
 //! - **Admission before allocation.** For an `env` from an unknown `src`, the
 //!   allow-list membership + [`MAX_PEERS`] capacity checks run BEFORE any
 //!   `ResponderHandshake` is built, so an unlisted or 9th peer never costs a
-//!   handshake allocation or a reply.
+//!   handshake allocation or a reply. Admission is re-applied to established
+//!   peers whenever the set is replaced ([`MultiPeerSession::replace_allowed`],
+//!   PAN-96): a peer the new set no longer lists is evicted, its transport is
+//!   dropped, and its next frame is refused like any unlisted `src`.
 //! - **Unattributable drop.** An `env` with no `src` (the DO stamps `src` on
 //!   every forward) is never trusted — it is dropped ([`Poll::Idle`]).
 //! - **Identity before establishment.** A peer is established only when its
@@ -138,6 +141,7 @@ pub struct MultiPeerSession<'a, W: WsConn> {
     identity: &'a AgentIdentity,
     /// The set of client keyIds this agent will admit. An `env` from a `src`
     /// outside this set is refused before any handshake state is allocated.
+    /// Refreshed via [`Self::replace_allowed`] on a live authorization refresh.
     allowed: HashSet<String>,
     /// Established (or in-transport) peers, keyed by the keyId each PROVED in
     /// its Noise msg1. Each entry owns an INDEPENDENT Noise transport.
@@ -418,6 +422,26 @@ impl<'a, W: WsConn> MultiPeerSession<'a, W> {
     /// Iterate the keyIds of currently established peers.
     pub fn established_peers(&self) -> impl Iterator<Item = &str> {
         self.peers.keys().map(|k| k.as_str())
+    }
+
+    /// Replace the admission set (a live authorization refresh) and evict every
+    /// established peer it no longer contains, dropping that peer's transport: its
+    /// next frame is treated as an unknown `src` and refused `NotAllowListed`, and
+    /// re-admission needs a fresh handshake. Newly listed peers may now establish.
+    /// Returns the evicted keyIds, sorted.
+    pub fn replace_allowed(&mut self, allowed: HashSet<String>) -> Vec<String> {
+        let mut evicted: Vec<String> = self
+            .peers
+            .keys()
+            .filter(|p| !allowed.contains(*p))
+            .cloned()
+            .collect();
+        for p in &evicted {
+            self.peers.remove(p);
+        }
+        evicted.sort();
+        self.allowed = allowed;
+        evicted
     }
 
     /// Map an `error` frame to keep-waiting (transient) or stop (terminal).
@@ -1076,5 +1100,111 @@ mod tests {
                 plaintext: b"unaffected".to_vec()
             }
         );
+    }
+
+    #[test]
+    fn replace_allowed_evicts_established_peers_no_longer_admitted() {
+        let identity = AgentIdentity::generate();
+        let agent_pub = identity.agreement_public_raw();
+        let (dev_a, dev_b) = (TestDevice::new(0xAA), TestDevice::new(0xBB));
+        let (kid_a, kid_b) = (dev_a.kid(), dev_b.kid());
+        let mut sess = admit(&identity, allow(&[&dev_a, &dev_b]));
+
+        let mut a = dev_a.initiator(&agent_pub);
+        let mut b = dev_b.initiator(&agent_pub);
+        bootstrap(&mut sess, &mut a, &dev_a, &identity.key_id());
+        bootstrap(&mut sess, &mut b, &dev_b, &identity.key_id());
+        let mut ta = a.into_transport();
+        let mut tb = b.into_transport();
+
+        // A live authorization refresh drops B: B is evicted, A stays.
+        assert_eq!(sess.replace_allowed(allow(&[&dev_a])), vec![kid_b.clone()]);
+        let established: Vec<&str> = sess.established_peers().collect();
+        assert_eq!(
+            established,
+            vec![kid_a.as_str()],
+            "only A stays established"
+        );
+        assert!(sess.session_id(&kid_b).is_none(), "B's state is gone");
+
+        // B's next frame, still under its old client transport, is now an
+        // unknown `src` that is no longer admitted: refused, no reply.
+        let outbound_before = sess.ws.outbound.len();
+        let ct_b = ts_encrypt(&mut tb, b"still-here");
+        sess.ws
+            .push_inbound(env_json(&identity.key_id(), &ct_b, Some(&kid_b)));
+        assert_eq!(
+            sess.process_next(TIMEOUT).unwrap(),
+            Poll::PeerRefused {
+                peer: kid_b.clone(),
+                reason: RefuseReason::NotAllowListed,
+            }
+        );
+        assert_eq!(
+            sess.ws.outbound.len(),
+            outbound_before,
+            "an evicted peer's frame costs no reply"
+        );
+
+        // A is untouched.
+        let ct_a = ts_encrypt(&mut ta, b"from-a");
+        sess.ws
+            .push_inbound(env_json(&identity.key_id(), &ct_a, Some(&kid_a)));
+        assert_eq!(
+            sess.process_next(TIMEOUT).unwrap(),
+            Poll::Plaintext {
+                peer: kid_a.clone(),
+                plaintext: b"from-a".to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn replace_allowed_admits_newly_listed_peer_without_reconnect() {
+        let identity = AgentIdentity::generate();
+        let agent_pub = identity.agreement_public_raw();
+        let (dev_a, dev_c) = (TestDevice::new(0xAA), TestDevice::new(0xCC));
+        let mut sess = admit(&identity, allow(&[&dev_a]));
+
+        // C is not listed yet: refused before any handshake state.
+        let mut c_refused = dev_c.initiator(&agent_pub);
+        let msg1 = c_refused.write_msg1(&dev_c.proof());
+        assert_refused(
+            &mut sess,
+            &msg1,
+            &dev_c.kid(),
+            &identity.key_id(),
+            RefuseReason::NotAllowListed,
+        );
+
+        // A refresh that adds C evicts nobody and admits C mid-session.
+        assert!(sess.replace_allowed(allow(&[&dev_a, &dev_c])).is_empty());
+        let mut c = dev_c.initiator(&agent_pub);
+        bootstrap(&mut sess, &mut c, &dev_c, &identity.key_id());
+        assert!(sess.session_id(&dev_c.kid()).is_some(), "C established");
+    }
+
+    #[test]
+    fn replace_allowed_with_unchanged_set_evicts_nothing() {
+        let identity = AgentIdentity::generate();
+        let agent_pub = identity.agreement_public_raw();
+        let (dev_a, dev_b) = (TestDevice::new(0xAA), TestDevice::new(0xBB));
+        let mut sess = admit(&identity, allow(&[&dev_a, &dev_b]));
+
+        let mut a = dev_a.initiator(&agent_pub);
+        let mut b = dev_b.initiator(&agent_pub);
+        bootstrap(&mut sess, &mut a, &dev_a, &identity.key_id());
+        bootstrap(&mut sess, &mut b, &dev_b, &identity.key_id());
+
+        assert!(sess.replace_allowed(allow(&[&dev_a, &dev_b])).is_empty());
+        assert!(
+            sess.session_id(&dev_a.kid()).is_some(),
+            "A still established"
+        );
+        assert!(
+            sess.session_id(&dev_b.kid()).is_some(),
+            "B still established"
+        );
+        assert_eq!(sess.established_peers().count(), 2);
     }
 }
