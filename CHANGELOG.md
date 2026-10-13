@@ -88,6 +88,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Turning Fox mode off (Shift+X) no longer cuts the Hound contacts already in
+  progress down to one transmitted stream; they keep transmitting until they
+  finish, while new QSOs wait for the normal `max_concurrent_qsos` limit
+  (PAN-76).
+
 - Narrow terminals keep the station state that matters (PAN-88). At 80×24
   and 100×30 the title bar now always shows the UTC clock, callsign and TX
   policy, and drops lower-priority chips in a documented order instead of

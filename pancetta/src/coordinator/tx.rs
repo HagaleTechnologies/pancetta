@@ -4051,8 +4051,11 @@ pub struct CoalesceEntry {
 pub struct CoalesceOutcome {
     /// The requests to actually transmit, after coalescing per `qso_id`
     /// (newest wins), dropping terminal-QSO requests, and capping the
-    /// distinct-stream count. Order is the order each retained key was first
-    /// seen, so the head entry is the oldest-surviving stream.
+    /// distinct-stream count. QSO-keyed streams Fox mode opened come first
+    /// (PAN-76, see [`coalesce_transmit_requests_with_fox_priority`]), then
+    /// the other QSO-keyed streams, then manual sends; each group keeps the
+    /// order its keys were first seen, so with no Fox-admitted stream present
+    /// the head entry is the oldest-surviving stream.
     pub retained: Vec<CoalesceEntry>,
     /// How many requests were superseded by a newer request for the SAME
     /// `qso_id` (i.e. older keep-call frames dropped in favor of the latest).
@@ -4079,7 +4082,8 @@ pub struct CoalesceOutcome {
     /// actually gone on air).
     pub truncated_entries: Vec<CoalesceEntry>,
     /// The effective concurrent-QSO cap actually applied to QSO-keyed
-    /// streams this cycle (`max_concurrent_qsos`, clamped into
+    /// streams this cycle (`max_concurrent_qsos`, raised to the number of
+    /// Fox-admitted streams present in this backlog (PAN-76), clamped into
     /// `1..=MAX_RETAINED_TX_STREAMS`) — exposed so a truncation diagnostic
     /// can report the cap that actually did the truncating instead of always
     /// citing the (possibly much larger) hard backstop.
@@ -4138,20 +4142,19 @@ impl CoalesceOutcome {
 /// limit would truncate its own intended multi-stream Hound-answer bundle
 /// down to one signal.
 ///
-/// PR #348 review round 4 (Codex P1) proposed additionally flooring this at
-/// `active_tx_qsos.len()`, to protect active Hound exchanges left running
-/// after `SetFoxMode(false)` (which only cancels the `CallingCq` QSO —
-/// `coordinator/qso.rs`'s Fox-disengage handling). Round 5 review found that
-/// floor defeats the cap entirely for ordinary manual QSOs: `StartQso`
-/// inserts a QSO into `active_tx_qsos` before its first `TransmitRequest` is
-/// even coalesced, so simply opening `max_concurrent_qsos + N` manual QSOs
-/// in quick succession would raise `active_count` to admit all of them —
-/// exactly the pileup this cap exists to prevent. The floor was reverted;
-/// the Fox-disengage gap is tracked separately (a real fix needs `qso.rs` to
-/// distinguish Fox-admitted QSOs from ordinary ones, e.g. by explicitly
-/// tearing them down on disengage or tracking them in a dedicated set — not
-/// something `active_tx_qsos`'s undifferentiated membership can answer).
-fn effective_max_concurrent_qsos(
+/// Hound exchanges still running after `SetFoxMode(false)` (PAN-76): a floor
+/// at `active_tx_qsos.len()` was tried and reverted in PR #348 rounds 4-5,
+/// because `active_tx_qsos` cannot tell a Fox-admitted Hound from an
+/// ordinary over-cap manual QSO, so that floor let a manual pileup through.
+/// The QSO component now records the QSOs Fox mode opened in the
+/// coordinator's `fox_admitted_qsos`. The backlog coalescer gets this
+/// UNRAISED value plus that set, and
+/// [`coalesce_transmit_requests_with_fox_priority`] raises its cap only to
+/// the Fox-admitted streams actually present in the backlog — never the
+/// set's size, which would lend the slots of Hounds idling in their 45 s
+/// completed grace to ordinary QSOs. The mid-TX supersede sites use
+/// [`supersede_max_concurrent_qsos`] over [`live_fox_admitted_count`].
+pub(crate) fn effective_max_concurrent_qsos(
     max_concurrent_qsos: u32,
     fox_mode: &std::sync::atomic::AtomicBool,
     fox_max_streams: &std::sync::atomic::AtomicUsize,
@@ -4162,6 +4165,30 @@ fn effective_max_concurrent_qsos(
     } else {
         max_concurrent_qsos
     }
+}
+
+/// PAN-76: Fox-admitted QSOs that are still TX-live (in `active_tx_qsos`).
+/// Either lock poisoned → 0, i.e. no raise over today's ceiling.
+pub(crate) fn live_fox_admitted_count(
+    fox_admitted_qsos: &std::sync::RwLock<std::collections::HashSet<String>>,
+    active_tx_qsos: &std::sync::RwLock<std::collections::HashSet<String>>,
+) -> u32 {
+    let (Ok(fox), Ok(active)) = (fox_admitted_qsos.read(), active_tx_qsos.read()) else {
+        return 0;
+    };
+    fox.iter().filter(|k| active.contains(*k)).count() as u32
+}
+
+/// PAN-76: ceiling for the mid-TX supersede paths: the live Fox-admitted
+/// streams on top of the normal cap, the same shape as the coalescer's rule
+/// (Fox-admitted streams are never truncated; ordinary ones are capped). A
+/// mixed in-flight bundle of Hounds plus ordinary QSOs therefore stays under
+/// it, so a Hound's fresh frame folds in instead of collapsing the bundle
+/// (PR #421 review). A supersede never adds a QSO stream
+/// (`classify_incoming_during_tx` only supersedes on an in-flight QSO or a
+/// manual send), so this never admits more than the coalescer already did.
+pub(crate) fn supersede_max_concurrent_qsos(effective: u32, live_fox_admitted: u32) -> u32 {
+    effective.saturating_add(live_fox_admitted)
 }
 
 #[cfg(test)]
@@ -4208,6 +4235,61 @@ mod effective_max_concurrent_qsos_tests {
     }
 }
 
+#[cfg(test)]
+mod fox_admitted_ceiling_tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::RwLock;
+
+    fn set(ids: &[&str]) -> RwLock<HashSet<String>> {
+        RwLock::new(
+            ids.iter()
+                .map(|s| super::super::active_tx_qso_key(s))
+                .collect(),
+        )
+    }
+
+    fn poison(lock: &RwLock<HashSet<String>>) {
+        std::thread::scope(|scope| {
+            let _ = scope
+                .spawn(|| {
+                    let _guard = lock.write().unwrap();
+                    panic!("poisoning the lock on purpose");
+                })
+                .join();
+        });
+        assert!(lock.is_poisoned());
+    }
+
+    #[test]
+    fn pan76_live_fox_admitted_count_ignores_keys_no_longer_tx_live() {
+        let fox = set(&["A", "B", "C", "STALE"]);
+        let active = set(&["A", "B", "C", "X"]);
+        assert_eq!(live_fox_admitted_count(&fox, &active), 3);
+    }
+
+    #[test]
+    fn pan76_live_fox_admitted_count_is_zero_when_either_lock_is_poisoned() {
+        let fox = set(&["A", "B"]);
+        let active = set(&["A", "B"]);
+        poison(&fox);
+        assert_eq!(live_fox_admitted_count(&fox, &active), 0);
+
+        let fox = set(&["A", "B"]);
+        let active = set(&["A", "B"]);
+        poison(&active);
+        assert_eq!(live_fox_admitted_count(&fox, &active), 0);
+    }
+
+    #[test]
+    fn pan76_supersede_ceiling_covers_live_fox_admitted_qsos() {
+        assert_eq!(supersede_max_concurrent_qsos(1, 3), 4);
+        assert_eq!(supersede_max_concurrent_qsos(6, 3), 9);
+        assert_eq!(supersede_max_concurrent_qsos(1, 0), 1);
+        assert_eq!(supersede_max_concurrent_qsos(u32::MAX, 3), u32::MAX);
+    }
+}
+
 /// Pure backlog coalescer for the single-threaded TX worker.
 ///
 /// Given the requests drained from the channel (oldest first — the channel is
@@ -4248,10 +4330,37 @@ mod effective_max_concurrent_qsos_tests {
 /// supersede path (`supersede_and_rekey_or_bundle`) enforces. Without this,
 /// several manual QSOs opened in the same pre-PTT window bundled unconditionally
 /// up to [`MAX_RETAINED_TX_STREAMS`], silently exceeding the configured cap.
+///
+/// Equivalent to [`coalesce_transmit_requests_with_fox_priority`] with no
+/// Fox-admitted QSOs.
 pub fn coalesce_transmit_requests(
     drained: Vec<CoalesceEntry>,
     max_concurrent_qsos: u32,
+    qso_is_live: impl FnMut(Option<&str>) -> bool,
+) -> CoalesceOutcome {
+    coalesce_transmit_requests_with_fox_priority(drained, max_concurrent_qsos, qso_is_live, |_| {
+        false
+    })
+}
+
+/// [`coalesce_transmit_requests`] plus one rule for QSOs Fox mode opened:
+///
+/// 6. **Fox-admitted streams go first and are never cap-truncated (PAN-76).**
+///    `is_fox_admitted` receives the canonical [`super::active_tx_qso_key`]
+///    of each QSO-keyed stream. Fox-admitted streams are ordered before the
+///    other QSO-keyed streams (each group keeps first-seen order), so they
+///    anchor the bundle parity and win frequency-conflict tie-breaks, and the
+///    QSO cap is raised to the number of Fox-admitted streams that survive
+///    into this cycle's bundle. Only ordinary streams are truncated, and only
+///    to the room `max_concurrent_qsos` leaves. A Fox-admitted QSO with no
+///    frame in this backlog (e.g. a completed Hound in its grace window)
+///    lends no slot to anyone. With no Fox-admitted stream present the
+///    outcome is identical to [`coalesce_transmit_requests`].
+pub fn coalesce_transmit_requests_with_fox_priority(
+    drained: Vec<CoalesceEntry>,
+    max_concurrent_qsos: u32,
     mut qso_is_live: impl FnMut(Option<&str>) -> bool,
+    mut is_fox_admitted: impl FnMut(&str) -> bool,
 ) -> CoalesceOutcome {
     use std::collections::HashMap;
 
@@ -4294,12 +4403,21 @@ pub fn coalesce_transmit_requests(
     // conflict, leaving just A; filtering conflicts first correctly leaves
     // [A, C] as the surviving two-stream bundle). Manual sends go last so a
     // single-stream QSO backlog keeps the QSO as the headline item.
+    // Fox-admitted streams go before the other QSO-keyed streams (PAN-76) so
+    // the cap below truncates only ordinary streams and a Hound anchors the
+    // bundle parity whenever one is present.
     let mut retained: Vec<CoalesceEntry> = Vec::with_capacity(order.len() + manual.len());
+    let mut ordinary: Vec<CoalesceEntry> = Vec::new();
     for key in order {
         if let Some(e) = by_qso.remove(&key) {
-            retained.push(e);
+            if is_fox_admitted(&key) {
+                retained.push(e);
+            } else {
+                ordinary.push(e);
+            }
         }
     }
+    retained.append(&mut ordinary);
     retained.append(&mut manual);
 
     // Bundle-parity conflict check. When ≥2 distinct streams survive, they may
@@ -4391,7 +4509,19 @@ pub fn coalesce_transmit_requests(
     // `CoalesceEntry` is retained in `truncated_entries` for the caller to
     // use `report_transmit_complete`, which routes `TxFrameNotSent` to
     // `QsoManager::roll_back_unsent_attempt` (PAN-75).
-    let qso_cap = (max_concurrent_qsos.max(1) as usize).min(MAX_RETAINED_TX_STREAMS);
+    // PAN-76: raise the cap to the Fox-admitted streams present — they sit at
+    // the front, so `split_off` only ever truncates ordinary streams.
+    let fox_present = qso_survivors
+        .iter()
+        .filter(|e| {
+            e.qso_id
+                .as_deref()
+                .is_some_and(|id| is_fox_admitted(&super::active_tx_qso_key(id)))
+        })
+        .count();
+    let qso_cap = (max_concurrent_qsos.max(1) as usize)
+        .max(fox_present)
+        .min(MAX_RETAINED_TX_STREAMS);
     outcome.qso_cap = qso_cap;
     if qso_survivors.len() > qso_cap {
         let overflow = qso_survivors.split_off(qso_cap);
@@ -4457,11 +4587,12 @@ pub fn coalesce_transmit_requests(
 /// A `tx.policy` warning is logged whenever anything was coalesced, dropped, or
 /// truncated, so silent backlog reduction is always operator-visible.
 #[allow(clippy::too_many_arguments)]
-async fn coalesce_backlog_into(
+pub(crate) async fn coalesce_backlog_into(
     head: MessageType,
     tx_rx: &crossbeam_channel::Receiver<ComponentMessage>,
     message_bus: &MessageBus,
     active_tx_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    fox_admitted_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
     max_concurrent_qsos: u32,
     remote_tx_arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
     audit_log: &pancetta_agent::audit::AuditLog,
@@ -4739,9 +4870,18 @@ async fn coalesce_backlog_into(
     }
 
     let backlog_total = admitted.len();
-    let outcome = coalesce_transmit_requests(admitted, max_concurrent_qsos, |id| {
-        tx_qso_is_live(id, active_tx_qsos)
-    });
+    // PAN-76: snapshot the Fox-admitted set (poisoned → empty, i.e. today's
+    // cap) so the coalescer keeps Hound exchanges Fox mode already opened.
+    let fox_admitted: std::collections::HashSet<String> = fox_admitted_qsos
+        .read()
+        .map(|s| s.clone())
+        .unwrap_or_default();
+    let outcome = coalesce_transmit_requests_with_fox_priority(
+        admitted,
+        max_concurrent_qsos,
+        |id| tx_qso_is_live(id, active_tx_qsos),
+        |key| fox_admitted.contains(key),
+    );
 
     if !outcome.is_noop() {
         let text = format!(
@@ -5723,6 +5863,8 @@ impl super::ApplicationCoordinator {
             // the worker refuses to key PTT for a request whose `qso_id` is no
             // longer present (superseded / cancelled / completed-past-grace).
             let active_tx_qsos = self.active_tx_qsos.clone();
+            // PAN-76: QSOs Fox mode opened keep their TX slots after Fox mode is turned off.
+            let fox_admitted_qsos = self.fox_admitted_qsos.clone();
             // PAN-141: DX-parity freshness check (Step 4b-adjacent, see
             // `dx_parity_conflict_for_qso`). `cross_time_state` is coordinator-
             // owned and outlives a supervised Qso-component restart, so a plain
@@ -6052,6 +6194,10 @@ impl super::ApplicationCoordinator {
                                     &tx_rx,
                                     &message_bus,
                                     &active_tx_qsos,
+                                    &fox_admitted_qsos,
+                                    // Deliberately the UNRAISED ceiling (PAN-76): the
+                                    // coalescer raises it only to the Fox-admitted
+                                    // streams present in this backlog.
                                     effective_max_concurrent_qsos(
                                         max_concurrent_qsos,
                                         &fox_mode,
@@ -7469,10 +7615,16 @@ impl super::ApplicationCoordinator {
                                                     slot_ns,
                                                     tx_self_parity,
                                                     request_received_at,
-                                                    effective_max_concurrent_qsos(
-                                                        max_concurrent_qsos,
-                                                        &fox_mode,
-                                                        &fox_max_streams,
+                                                    supersede_max_concurrent_qsos(
+                                                        effective_max_concurrent_qsos(
+                                                            max_concurrent_qsos,
+                                                            &fox_mode,
+                                                            &fox_max_streams,
+                                                        ),
+                                                        live_fox_admitted_count(
+                                                            &fox_admitted_qsos,
+                                                            &active_tx_qsos,
+                                                        ),
                                                     ),
                                                     origin,
                                                     remote_client_key_id.clone(),
@@ -7984,10 +8136,16 @@ impl super::ApplicationCoordinator {
                                                     slot_ns,
                                                     tx_self_parity,
                                                     request_received_at,
-                                                    effective_max_concurrent_qsos(
-                                                        max_concurrent_qsos,
-                                                        &fox_mode,
-                                                        &fox_max_streams,
+                                                    supersede_max_concurrent_qsos(
+                                                        effective_max_concurrent_qsos(
+                                                            max_concurrent_qsos,
+                                                            &fox_mode,
+                                                            &fox_max_streams,
+                                                        ),
+                                                        live_fox_admitted_count(
+                                                            &fox_admitted_qsos,
+                                                            &active_tx_qsos,
+                                                        ),
                                                     ),
                                                     origin,
                                                     remote_client_key_id.clone(),
@@ -9987,10 +10145,16 @@ impl super::ApplicationCoordinator {
                                                 slot_ns,
                                                 tx_self_parity,
                                                 request_received_at,
-                                                effective_max_concurrent_qsos(
-                                                    max_concurrent_qsos,
-                                                    &fox_mode,
-                                                    &fox_max_streams,
+                                                supersede_max_concurrent_qsos(
+                                                    effective_max_concurrent_qsos(
+                                                        max_concurrent_qsos,
+                                                        &fox_mode,
+                                                        &fox_max_streams,
+                                                    ),
+                                                    live_fox_admitted_count(
+                                                        &fox_admitted_qsos,
+                                                        &active_tx_qsos,
+                                                    ),
                                                 ),
                                             )
                                             .await;
@@ -10269,10 +10433,16 @@ impl super::ApplicationCoordinator {
                                                 slot_ns,
                                                 tx_self_parity,
                                                 request_received_at,
-                                                effective_max_concurrent_qsos(
-                                                    max_concurrent_qsos,
-                                                    &fox_mode,
-                                                    &fox_max_streams,
+                                                supersede_max_concurrent_qsos(
+                                                    effective_max_concurrent_qsos(
+                                                        max_concurrent_qsos,
+                                                        &fox_mode,
+                                                        &fox_max_streams,
+                                                    ),
+                                                    live_fox_admitted_count(
+                                                        &fox_admitted_qsos,
+                                                        &active_tx_qsos,
+                                                    ),
                                                 ),
                                             )
                                             .await;
@@ -13934,6 +14104,182 @@ mod supersede_rekey_tests {
             "expected the frequency collision to be rejected"
         );
     }
+
+    /// PAN-76: a fresher frame for one of three in-flight Hounds after Fox
+    /// mode is turned off. With the supersede ceiling raised to the live
+    /// Fox-admitted count it folds into the bundle; with the restored cap of
+    /// 1 the whole bundle collapses to the refreshed Hound (the old bug).
+    #[tokio::test(flavor = "current_thread")]
+    async fn pan76_supersede_refresh_of_one_hound_bundles_with_the_other_two() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+
+        let now = chrono::Utc::now();
+        let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
+            pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
+            pancetta_core::slot::SLOT_NS,
+        );
+
+        let in_flight = [
+            crate::message_bus::TransmitRequestItem {
+                message_text: "W1AAA K5ARH -10".to_string(),
+                frequency_offset: 1000.0,
+                qso_id: Some("hound-1".to_string()),
+            },
+            crate::message_bus::TransmitRequestItem {
+                message_text: "W2BBB K5ARH -12".to_string(),
+                frequency_offset: 1300.0,
+                qso_id: Some("hound-2".to_string()),
+            },
+            crate::message_bus::TransmitRequestItem {
+                message_text: "W3CCC K5ARH -08".to_string(),
+                frequency_offset: 1600.0,
+                qso_id: Some("hound-3".to_string()),
+            },
+        ];
+        let refresh = || MessageType::TransmitRequest {
+            message_text: "W1AAA K5ARH RR73".to_string(),
+            frequency_offset: 1000.0,
+            qso_id: Some("hound-1".to_string()),
+            tx_parity: Some(cur_parity),
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
+        };
+
+        let mut outcomes = Vec::new();
+        for max_concurrent_qsos in [super::supersede_max_concurrent_qsos(1, 3), 1] {
+            let mut message_text = "W1AAA K5ARH -10".to_string();
+            let mut frequency_offset = 1000.0;
+            let mut schedule = super::schedule_tx(
+                now,
+                cur_parity,
+                20_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+            );
+            let ptt_active = Arc::new(AtomicBool::new(true));
+            let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+            outcomes.push(
+                super::supersede_and_rekey_or_bundle(
+                    refresh(),
+                    &mut message_text,
+                    &mut frequency_offset,
+                    &mut schedule,
+                    &bus,
+                    &ptt_active,
+                    &last_ptt_on_ms,
+                    20_000,
+                    12_000,
+                    pancetta_core::slot::SLOT_NS,
+                    pancetta_config::station::TxSelfParity::Auto,
+                    now,
+                    max_concurrent_qsos,
+                    crate::message_bus::TxOrigin::Local,
+                    None,
+                    &in_flight,
+                )
+                .await,
+            );
+        }
+
+        match &outcomes[0] {
+            super::SupersedeOutcome::Bundle { items, .. } => {
+                assert_eq!(
+                    items.len(),
+                    3,
+                    "all three Hounds stay in the bundle: {items:?}"
+                );
+                let hound1 = items
+                    .iter()
+                    .find(|it| it.qso_id.as_deref() == Some("hound-1"))
+                    .expect("hound-1 must still be present");
+                assert_eq!(hound1.message_text, "W1AAA K5ARH RR73");
+            }
+            other => panic!("expected Bundle under the raised ceiling, got {other:?}"),
+        }
+        assert!(
+            matches!(outcomes[1], super::SupersedeOutcome::Replace { .. }),
+            "under the restored cap of 1 the bundle collapses (today's behaviour), got {:?}",
+            outcomes[1]
+        );
+    }
+
+    /// PR #421 review (Codex P1): an in-flight bundle of two Hounds plus one
+    /// ordinary QSO (admitted under the restored cap of 1) after Fox mode is
+    /// turned off. The coalescer kept all three: the Fox-admitted streams on
+    /// top of the normal cap. A fresher frame for one Hound must fold into
+    /// that bundle, not trip a ceiling of only the live Fox count (2) and
+    /// collapse the bundle to the refreshed Hound, keying it stale later.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pan76_supersede_refresh_of_a_hound_in_a_mixed_bundle_keeps_every_stream() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+
+        let now = chrono::Utc::now();
+        let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
+            pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
+            pancetta_core::slot::SLOT_NS,
+        );
+        let item = |text: &str, freq: f64, id: &str| crate::message_bus::TransmitRequestItem {
+            message_text: text.to_string(),
+            frequency_offset: freq,
+            qso_id: Some(id.to_string()),
+        };
+        let in_flight = [
+            item("W1AAA K5ARH -10", 1000.0, "hound-1"),
+            item("W2BBB K5ARH -12", 1300.0, "hound-2"),
+            item("W9ZZZ K5ARH R-05", 1600.0, "ordinary"),
+        ];
+
+        let mut message_text = "W1AAA K5ARH -10".to_string();
+        let mut frequency_offset = 1000.0;
+        let mut schedule = super::schedule_tx(
+            now,
+            cur_parity,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+        );
+        let outcome = super::supersede_and_rekey_or_bundle(
+            MessageType::TransmitRequest {
+                message_text: "W1AAA K5ARH RR73".to_string(),
+                frequency_offset: 1000.0,
+                qso_id: Some("hound-1".to_string()),
+                tx_parity: Some(cur_parity),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
+            },
+            &mut message_text,
+            &mut frequency_offset,
+            &mut schedule,
+            &bus,
+            &Arc::new(AtomicBool::new(true)),
+            &Arc::new(AtomicU64::new(0)),
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+            pancetta_config::station::TxSelfParity::Auto,
+            now,
+            // Fox off: normal cap 1, two Hounds still live.
+            super::supersede_max_concurrent_qsos(1, 2),
+            crate::message_bus::TxOrigin::Local,
+            None,
+            &in_flight,
+        )
+        .await;
+
+        match &outcome {
+            super::SupersedeOutcome::Bundle { items, .. } => {
+                assert_eq!(items.len(), 3, "every in-flight stream stays: {items:?}");
+                let hound1 = items
+                    .iter()
+                    .find(|it| it.qso_id.as_deref() == Some("hound-1"))
+                    .expect("hound-1 must still be present");
+                assert_eq!(hound1.message_text, "W1AAA K5ARH RR73");
+            }
+            other => panic!("expected the refresh to bundle, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -14613,6 +14959,7 @@ mod coalesce_tests {
             &backlog_rx,
             &bus,
             &active_tx_qsos,
+            &Arc::new(std::sync::RwLock::new(HashSet::new())),
             1,
             &arm,
             &audit_log,
@@ -14732,6 +15079,7 @@ mod coalesce_tests {
             &backlog_rx,
             &bus,
             &active_tx_qsos,
+            &Arc::new(std::sync::RwLock::new(HashSet::new())),
             2,
             &arm,
             &audit_log,
@@ -14850,6 +15198,7 @@ mod coalesce_tests {
             &backlog_rx,
             &bus,
             &active_tx_qsos,
+            &Arc::new(std::sync::RwLock::new(HashSet::new())),
             2,
             &arm,
             &audit_log,
@@ -14868,6 +15217,298 @@ mod coalesce_tests {
             MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { ref message_text, replaced: Some(ref payload), .. })
                 if message_text == "K1ABC N0CALL -07" && *payload == replaced
         ));
+    }
+
+    // ── PAN-76: Fox-admitted streams keep their slots after Fox mode is off ──
+
+    fn texts(entries: &[CoalesceEntry]) -> Vec<&str> {
+        entries.iter().map(|e| e.message_text.as_str()).collect()
+    }
+
+    /// The ticket's bug: Fox mode is off again, so the effective cap is back
+    /// to 1, but the three Hound exchanges Fox mode admitted are still live.
+    /// None of them may be truncated.
+    #[test]
+    fn pan76_fox_admitted_streams_survive_the_restored_normal_cap() {
+        let live = liveset(&["h1", "h2", "h3"]);
+        let fox = liveset(&["h1", "h2", "h3"]);
+        let out = coalesce_transmit_requests_with_fox_priority(
+            vec![
+                entry_freq("H1", Some("h1"), 1000.0),
+                entry_freq("H2", Some("h2"), 1300.0),
+                entry_freq("H3", Some("h3"), 1600.0),
+            ],
+            1,
+            live_in(&live),
+            |k: &str| fox.contains(k),
+        );
+        assert_eq!(texts(&out.retained), vec!["H1", "H2", "H3"]);
+        assert_eq!(out.truncated, 0);
+        assert!(out.truncated_entries.is_empty());
+        assert_eq!(out.qso_cap, 3);
+    }
+
+    /// An ordinary stream seen before the Hounds must not take a Hound's slot:
+    /// the Hounds are ordered first, so the cap truncates the ordinary one.
+    #[test]
+    fn pan76_ordinary_stream_seen_first_is_truncated_not_a_hound() {
+        let live = liveset(&["o", "h1", "h2", "h3"]);
+        let fox = liveset(&["h1", "h2", "h3"]);
+        let out = coalesce_transmit_requests_with_fox_priority(
+            vec![
+                entry_freq("O", Some("o"), 700.0),
+                entry_freq("H1", Some("h1"), 1000.0),
+                entry_freq("H2", Some("h2"), 1300.0),
+                entry_freq("H3", Some("h3"), 1600.0),
+            ],
+            1,
+            live_in(&live),
+            |k: &str| fox.contains(k),
+        );
+        assert_eq!(texts(&out.retained), vec!["H1", "H2", "H3"]);
+        assert_eq!(out.truncated, 1);
+        assert_eq!(texts(&out.truncated_entries), vec!["O"]);
+        assert_eq!(out.qso_cap, 3);
+    }
+
+    /// Round 5's regression in its narrower form: Hounds idling in their
+    /// completed grace (in the Fox set, no frames this cycle) must lend no
+    /// capacity to an ordinary pileup.
+    #[test]
+    fn pan76_fox_admitted_without_frames_lend_no_slots_to_ordinary_streams() {
+        let live = liveset(&["h1", "h2", "h3", "o1", "o2", "o3"]);
+        let fox = liveset(&["h1", "h2", "h3"]);
+        let out = coalesce_transmit_requests_with_fox_priority(
+            vec![
+                entry_freq("O1", Some("o1"), 1000.0),
+                entry_freq("O2", Some("o2"), 1300.0),
+                entry_freq("O3", Some("o3"), 1600.0),
+            ],
+            1,
+            live_in(&live),
+            |k: &str| fox.contains(k),
+        );
+        assert_eq!(texts(&out.retained), vec!["O1"]);
+        assert_eq!(out.truncated, 2);
+        assert_eq!(out.qso_cap, 1);
+    }
+
+    /// Present Hounds take their slots; ordinary streams get only what the
+    /// configured cap has left over.
+    #[test]
+    fn pan76_ordinary_streams_fill_only_the_room_present_hounds_leave() {
+        let live = liveset(&["h1", "o1", "o2", "o3"]);
+        let fox = liveset(&["h1"]);
+        let out = coalesce_transmit_requests_with_fox_priority(
+            vec![
+                entry_freq("O1", Some("o1"), 700.0),
+                entry_freq("H1", Some("h1"), 1000.0),
+                entry_freq("O2", Some("o2"), 1300.0),
+                entry_freq("O3", Some("o3"), 1600.0),
+            ],
+            2,
+            live_in(&live),
+            |k: &str| fox.contains(k),
+        );
+        assert_eq!(texts(&out.retained), vec!["H1", "O1"]);
+        assert_eq!(out.truncated, 2);
+        assert_eq!(texts(&out.truncated_entries), vec!["O2", "O3"]);
+        assert_eq!(out.qso_cap, 2);
+    }
+
+    /// With a Hound present, the bundle parity anchor is a Hound, so an
+    /// ordinary stream on the other parity is the one excluded.
+    #[test]
+    fn pan76_fox_admitted_stream_anchors_bundle_parity() {
+        use pancetta_core::slot::SlotParity;
+
+        let live = liveset(&["o", "h1", "h2"]);
+        let fox = liveset(&["h1", "h2"]);
+        let out = coalesce_transmit_requests_with_fox_priority(
+            vec![
+                entry_with_parity_freq("O", Some("o"), Some(SlotParity::Odd), 700.0),
+                entry_with_parity_freq("H1", Some("h1"), Some(SlotParity::Even), 1000.0),
+                entry_with_parity_freq("H2", Some("h2"), Some(SlotParity::Even), 1300.0),
+            ],
+            1,
+            live_in(&live),
+            |k: &str| fox.contains(k),
+        );
+        assert_eq!(texts(&out.retained), vec!["H1", "H2"]);
+        assert_eq!(out.retained[0].tx_parity, Some(SlotParity::Even));
+        assert_eq!(out.parity_excluded, 1);
+        assert_eq!(out.truncated, 0);
+    }
+
+    #[test]
+    fn pan76_manual_sends_still_bypass_the_cap_with_fox_priority() {
+        let live = liveset(&["h1"]);
+        let fox = liveset(&["h1"]);
+        let out = coalesce_transmit_requests_with_fox_priority(
+            vec![
+                entry_freq("H1", Some("h1"), 1000.0),
+                entry_freq("M", None, 1600.0),
+            ],
+            1,
+            live_in(&live),
+            |k: &str| fox.contains(k),
+        );
+        assert_eq!(texts(&out.retained), vec!["H1", "M"]);
+        assert_eq!(out.truncated, 0);
+    }
+
+    /// A Fox set that names none of the backlog's QSOs leaves the outcome
+    /// exactly as the plain coalescer's.
+    #[test]
+    fn pan76_unrelated_fox_keys_change_nothing() {
+        use pancetta_core::slot::SlotParity;
+
+        let cases: Vec<(Vec<CoalesceEntry>, u32, HashSet<String>)> = vec![
+            (
+                vec![
+                    entry_freq("A", Some("qso-a"), 1000.0),
+                    entry_freq("B", Some("qso-b"), 1300.0),
+                    entry_freq("C", Some("qso-c"), 1600.0),
+                ],
+                2,
+                liveset(&["qso-a", "qso-b", "qso-c"]),
+            ),
+            (
+                vec![
+                    entry_freq("QSO", Some("qso-a"), 1000.0),
+                    entry_freq("MANUAL-1", None, 1300.0),
+                    entry_freq("MANUAL-2", None, 1600.0),
+                ],
+                1,
+                liveset(&["qso-a"]),
+            ),
+            (
+                vec![
+                    entry_with_parity("A", Some("qso-a"), Some(SlotParity::Even)),
+                    entry_with_parity_freq("B", Some("qso-b"), Some(SlotParity::Even), 3000.0),
+                    entry_with_parity("C", Some("qso-c"), Some(SlotParity::Odd)),
+                ],
+                UNBOUNDED,
+                liveset(&["qso-a", "qso-b", "qso-c"]),
+            ),
+            (
+                vec![
+                    entry_freq("A", Some("qso-a"), 1000.0),
+                    entry_freq("B", Some("qso-b"), 1050.0),
+                    entry_freq("C", Some("qso-c"), 1300.0),
+                ],
+                2,
+                liveset(&["qso-a", "qso-b", "qso-c"]),
+            ),
+        ];
+        for (drained, cap, live) in cases {
+            let plain = coalesce_transmit_requests(drained.clone(), cap, live_in(&live));
+            let with_fox = coalesce_transmit_requests_with_fox_priority(
+                drained,
+                cap,
+                live_in(&live),
+                |k: &str| k == "SOMEONE-ELSE",
+            );
+            assert_eq!(with_fox, plain);
+        }
+    }
+
+    /// End to end through the real backlog drain: an ordinary head request
+    /// plus three Hound frames under the restored cap of 1. The Hounds are
+    /// bundled; the ordinary frame is reported as not sent (PAN-75).
+    #[tokio::test(flavor = "current_thread")]
+    async fn pan76_coalesce_backlog_into_keeps_fox_admitted_hounds_and_reports_the_ordinary_stream()
+    {
+        use crate::message_bus::MessageBus;
+        use std::sync::Arc;
+
+        let bus = MessageBus::new(16).unwrap();
+        let (_autonomous_tx, autonomous_rx) =
+            bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_, qso_rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        let (backlog_tx, backlog_rx) = crossbeam_channel::unbounded();
+        let active_tx_qsos = Arc::new(std::sync::RwLock::new(liveset(&[
+            "qso-o", "hound-1", "hound-2", "hound-3",
+        ])));
+        let fox_admitted_qsos = Arc::new(std::sync::RwLock::new(liveset(&[
+            "hound-1", "hound-2", "hound-3",
+        ])));
+
+        let head = MessageType::TransmitRequest {
+            message_text: "O".to_string(),
+            frequency_offset: 700.0,
+            qso_id: Some("qso-o".to_string()),
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
+        };
+        for (text, id, freq) in [
+            ("H1", "hound-1", 1000.0),
+            ("H2", "hound-2", 1300.0),
+            ("H3", "hound-3", 1600.0),
+        ] {
+            backlog_tx
+                .send(ComponentMessage::new(
+                    ComponentId::Ft8Transmitter,
+                    ComponentId::Ft8Transmitter,
+                    MessageType::TransmitRequest {
+                        message_text: text.to_string(),
+                        frequency_offset: freq,
+                        qso_id: Some(id.to_string()),
+                        tx_parity: None,
+                        origin: crate::message_bus::TxOrigin::Local,
+                        remote_client_key_id: None,
+                    },
+                    Instant::now(),
+                ))
+                .unwrap();
+        }
+
+        let arm = Arc::new(std::sync::Mutex::new(pancetta_agent::arm::ArmState::new()));
+        let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp());
+        let display_feed_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let result = coalesce_backlog_into(
+            head,
+            &backlog_rx,
+            &bus,
+            &active_tx_qsos,
+            &fox_admitted_qsos,
+            1,
+            &arm,
+            &audit_log,
+            &display_feed_enabled,
+            None,
+        )
+        .await;
+
+        match result {
+            MessageType::MultiTransmitRequest { items, .. } => {
+                let ids: Vec<Option<&str>> = items.iter().map(|it| it.qso_id.as_deref()).collect();
+                assert_eq!(ids, vec![Some("hound-1"), Some("hound-2"), Some("hound-3")]);
+            }
+            other => panic!("expected a MultiTransmitRequest of the three Hounds, got {other:?}"),
+        }
+
+        let mut completes = Vec::new();
+        while let Ok(msg) = autonomous_rx.try_recv() {
+            completes.push(msg);
+        }
+        assert_eq!(completes.len(), 1);
+        assert!(matches!(
+            completes[0].message_type,
+            MessageType::TransmitComplete { success: false, .. }
+        ));
+        let mut notices = Vec::new();
+        while let Ok(msg) = qso_rx.try_recv() {
+            if let MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent {
+                qso_id,
+                ..
+            }) = msg.message_type
+            {
+                notices.push(qso_id);
+            }
+        }
+        assert_eq!(notices, vec!["qso-o".to_string()]);
     }
 }
 
