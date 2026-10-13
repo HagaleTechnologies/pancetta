@@ -1151,29 +1151,44 @@ fn record_fox_admitted(
     }
 }
 
-/// PAN-76: of the `active` (non-terminal) QSOs, whether a Fox-admitted CQ is
-/// still calling, and how many Fox-admitted Hound exchanges are still running.
-/// A poisoned set reads as empty, like the TX worker's reads of it.
-fn active_fox_admitted_split(
+/// PAN-76: whether a Fox-admitted CQ is still calling, and how many
+/// Fox-admitted Hounds still hold a TX stream. That is the `active`
+/// (non-terminal) Hounds plus the completed ones still inside their 45 s
+/// completed grace: those have left `active` but stay in both the Fox set and
+/// `active_tx_qsos` until the grace elapses, so their final RR73/73 can air.
+/// Only keys still in `active_tx_qsos` count, so stale Fox-set keys (which
+/// are never pruned) cannot hold Fox's CQ off forever. A poisoned Fox set
+/// reads as empty, like the TX worker's reads of it; a poisoned
+/// `active_tx_qsos` drops only the grace-period Hounds from the count.
+fn fox_admitted_split(
     active: &[(pancetta_qso::QsoId, pancetta_qso::QsoProgress)],
     fox_admitted_qsos: &std::sync::RwLock<std::collections::HashSet<String>>,
+    active_tx_qsos: &std::sync::RwLock<std::collections::HashSet<String>>,
 ) -> (bool, usize) {
-    let Ok(set) = fox_admitted_qsos.read() else {
+    let Ok(fox) = fox_admitted_qsos.read() else {
         return (false, 0);
     };
-    let mut cq_calling = false;
-    let mut hounds = 0usize;
+    let mut calling_cq_keys = std::collections::HashSet::new();
+    let mut hounds = std::collections::HashSet::new();
     for (id, progress) in active {
-        if !set.contains(&super::active_tx_qso_key(&id.to_string())) {
+        let key = super::active_tx_qso_key(&id.to_string());
+        if !fox.contains(&key) {
             continue;
         }
         if matches!(progress.state, pancetta_qso::QsoState::CallingCq { .. }) {
-            cq_calling = true;
+            calling_cq_keys.insert(key);
         } else {
-            hounds += 1;
+            hounds.insert(key);
         }
     }
-    (cq_calling, hounds)
+    if let Ok(live) = active_tx_qsos.read() {
+        for key in fox.iter().filter(|k| live.contains(*k)) {
+            if !calling_cq_keys.contains(key) {
+                hounds.insert(key.clone());
+            }
+        }
+    }
+    (!calling_cq_keys.is_empty(), hounds.len())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3096,6 +3111,9 @@ impl super::ApplicationCoordinator {
                 let ap_state = active_qso_ap;
                 let qso_freq_state = active_qso_freq_hz;
                 let qso_freq_slot_ns = qso_freq_slot_ns.clone();
+                // PAN-76: the Fox engage arm below reads which Fox-admitted
+                // Hounds are still TX-live (grace included).
+                let active_tx_qsos_for_fox = active_tx_qsos.clone();
                 let active_tx_qsos = active_tx_qsos.clone();
                 let fox_admitted_for_events = fox_admitted_qsos.clone();
                 let active_tx_offsets = active_tx_offsets.clone();
@@ -5221,16 +5239,19 @@ impl super::ApplicationCoordinator {
                                                 // skips maybe_answer_caller's cap. Start no
                                                 // CQ while a Fox CQ is still calling, or while
                                                 // Hounds an earlier engage admitted still fill
-                                                // fox_max_streams. That holds active
-                                                // Fox-admitted QSOs to fox_max_streams + 1,
-                                                // as for a single engage. fox_mode stays on.
+                                                // fox_max_streams, counting completed Hounds
+                                                // whose final RR73/73 is still inside its 45 s
+                                                // grace. That holds TX-live Fox-admitted QSOs
+                                                // to fox_max_streams + 1, as for a single
+                                                // engage. fox_mode stays on.
                                                 let n = fox_max_streams.load(
                                                     std::sync::atomic::Ordering::Relaxed,
                                                 );
                                                 let (fox_cq_calling, finishing) =
-                                                    active_fox_admitted_split(
+                                                    fox_admitted_split(
                                                         &qso_manager.get_active_qsos().await,
                                                         &fox_admitted_qsos,
+                                                        &active_tx_qsos_for_fox,
                                                     );
                                                 if fox_cq_calling || finishing >= n {
                                                     info!(
@@ -11298,6 +11319,122 @@ mod respond_to_caller_admission_tests {
         coordinator
             .shutdown_signal
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// PR #421 review (Codex P2): a completed Hound keeps its Fox-admitted
+    /// TX slot for the 45 s completed grace so its final RR73/73 can air, but
+    /// it has already left `get_active_qsos()`. Re-engaging Fox mode while
+    /// such Hounds fill `fox_max_streams` must start no CQ, or the old closing
+    /// frames plus a fresh set of Hounds can exceed `MAX_RETAINED_TX_STREAMS`
+    /// and the hard clamp cuts exactly those closing frames.
+    #[tokio::test]
+    async fn pan76_fox_reengage_counts_hounds_in_their_completed_grace() {
+        let (coordinator, manager, tui_rx) = pan76_station().await;
+        coordinator
+            .fox_max_streams
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+
+        pan76_set_fox_mode(&coordinator, &tui_rx, true).await;
+        assert_eq!(pan76_calling_cqs(&manager).await.len(), 1);
+        let mut known = coordinator.fox_admitted_qsos.read().unwrap().clone();
+
+        // Two Hounds send RR73 straight to us: the real auto-answer path
+        // opens each at its close, so it completes at once and enters grace.
+        let mut hound_keys = Vec::new();
+        for (call, freq) in [("W1AAA", 1200.0), ("W2BBB", 1800.0)] {
+            let side = manager.current_tx_side().await;
+            super::maybe_answer_caller(
+                &pancetta_qso::states::MessageType::FinalConfirmation {
+                    to_station: "K5ARH".to_string(),
+                    from_station: call.to_string(),
+                },
+                "K5ARH",
+                freq,
+                side.map(|s| s.opposite()),
+                -12.0,
+                &manager,
+                &coordinator.tx_policy,
+                1,
+                &coordinator.message_bus,
+                &coordinator.fox_mode,
+                &coordinator.fox_max_streams,
+                &coordinator.fox_admitted_qsos,
+            )
+            .await;
+            let now = coordinator.fox_admitted_qsos.read().unwrap().clone();
+            let new: Vec<String> = now.difference(&known).cloned().collect();
+            assert_eq!(new.len(), 1, "{call} must be recorded as Fox-admitted");
+            hound_keys.push(new[0].clone());
+            known = now;
+        }
+        for key in &hound_keys {
+            assert!(
+                pan76_poll(|| coordinator.active_tx_qsos.read().unwrap().contains(key)).await,
+                "a completed Hound stays TX-live through its grace"
+            );
+        }
+        assert_eq!(
+            manager.active_caller_qso_count().await,
+            0,
+            "both Hounds are completed, not active"
+        );
+
+        // Off (cancels the unanswered Fox CQ) and on again inside the grace.
+        pan76_set_fox_mode(&coordinator, &tui_rx, false).await;
+        assert!(pan76_calling_cqs(&manager).await.is_empty());
+        let statuses = pan76_engage_fox_statuses(&coordinator, &tui_rx).await;
+        assert!(
+            pan76_calling_cqs(&manager).await.is_empty(),
+            "re-engage must not start a CQ while grace-period Hounds fill fox_max_streams"
+        );
+        assert!(
+            statuses.iter().any(|s| s.contains("no new CQ")),
+            "the operator must be told no CQ was started, got {statuses:?}"
+        );
+
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod fox_admitted_split_tests {
+    //! PAN-76: which Fox-admitted Hounds count against a Fox re-engage.
+    use super::fox_admitted_split;
+    use std::collections::HashSet;
+    use std::sync::RwLock;
+
+    fn set(keys: &[&str]) -> RwLock<HashSet<String>> {
+        RwLock::new(keys.iter().map(|k| k.to_string()).collect())
+    }
+
+    #[test]
+    fn a_completed_hound_in_its_grace_counts() {
+        // Terminal, so absent from `active`, but still TX-live.
+        let fox = set(&["Q1", "Q2"]);
+        let live = set(&["Q1", "Q2"]);
+        assert_eq!(fox_admitted_split(&[], &fox, &live), (false, 2));
+    }
+
+    #[test]
+    fn a_stale_fox_key_no_longer_tx_live_does_not_count() {
+        // A key that went terminal before its insert is never pruned from the
+        // Fox set; it must not hold Fox's CQ off forever.
+        let fox = set(&["STALE", "Q1"]);
+        let live = set(&["Q1"]);
+        assert_eq!(fox_admitted_split(&[], &fox, &live), (false, 1));
+    }
+
+    #[test]
+    fn a_poisoned_fox_set_reads_as_empty() {
+        let fox = set(&["Q1"]);
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = fox.write().unwrap();
+            panic!("poison");
+        });
+        let live = set(&["Q1"]);
+        assert_eq!(fox_admitted_split(&[], &fox, &live), (false, 0));
     }
 }
 
