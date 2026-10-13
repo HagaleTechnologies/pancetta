@@ -705,10 +705,11 @@ async fn dispatch_action(
             // control-mutating action and never grabs. A verified hello is the
             // first moment the peer may receive anything (PAN-95), so the
             // controlState greeting is sent here rather than on establishment.
-            if dispatch_hello(capability_token, peer, ctx, now) {
-                DispatchOutcome::cont_with(control_state_sends(ctx, now, Some(peer)))
-            } else {
-                DispatchOutcome::cont()
+            // A failed hello that clears the controller's capability disarms
+            // and releases control (`clear_peer_auth`).
+            match dispatch_hello(capability_token, peer, ctx, now) {
+                Ok(()) => DispatchOutcome::cont_with(control_state_sends(ctx, now, Some(peer))),
+                Err(sends) => DispatchOutcome::cont_with(sends),
             }
         }
         ControlAction::Qsy { vfo, frequency_hz } => {
@@ -855,10 +856,11 @@ async fn dispatch_action(
 /// identity (`peer` — the value `MultiPeerSession`'s demux reported alongside
 /// this specific frame, never a session-global value — since PAN-95 the
 /// identity the peer PROVED in its Noise handshake), and set that peer's
-/// `PeerCtx::auth` (scopes + expiry) accordingly. Returns whether the peer now
-/// holds a verified capability. Fail-closed: any missing/invalid/mismatched
+/// `PeerCtx::auth` (scopes + expiry) accordingly. Returns `Ok` when the peer
+/// now holds a verified capability. Fail-closed: any missing/invalid/mismatched
 /// token clears the capability (the peer is sent nothing and served nothing
-/// scoped), never partially trusts one.
+/// scoped), never partially trusts one — via [`clear_peer_auth`], whose
+/// `controlState` frames come back as `Err`.
 ///
 /// `capability_token: None` (a legacy hello, v1 back-compat) also clears
 /// scopes — the token is optional on the wire but required at runtime for any
@@ -876,12 +878,9 @@ fn dispatch_hello(
     peer: &str,
     ctx: &mut ArmContext,
     now: i64,
-) -> bool {
+) -> Result<(), Vec<PeerSend>> {
     let Some(token) = capability_token else {
-        if let Some(p) = ctx.peers.get_mut(peer) {
-            p.auth = None;
-        }
-        return false;
+        return Err(clear_peer_auth(ctx, peer, now));
     };
     match ctx.verifier.verify_capability_token(&token, now) {
         Ok(cap) if cap.client_key_id == peer => {
@@ -897,7 +896,7 @@ fn dispatch_hello(
                         scopes: cap.scopes,
                         exp_ms: cap.exp_ms,
                     });
-                    true
+                    Ok(())
                 }
                 None => {
                     // Defensive: cannot happen via the demux (a Plaintext poll
@@ -905,7 +904,7 @@ fn dispatch_hello(
                     // established peer gets a PeerCtx on PeerEstablished), but
                     // fail closed rather than panic if it ever did.
                     warn!(target: "agent.control", peer = %peer, "hello verified for a peer with no PeerCtx — refusing");
-                    false
+                    Err(Vec::new())
                 }
             }
         }
@@ -916,19 +915,40 @@ fn dispatch_hello(
                 peer = %peer,
                 "hello capabilityToken clientKeyId does not match the sending peer's E2E-connected identity — no scope granted"
             );
-            if let Some(p) = ctx.peers.get_mut(peer) {
-                p.auth = None;
-            }
-            false
+            Err(clear_peer_auth(ctx, peer, now))
         }
         Err(e) => {
             warn!(target: "agent.control", peer = %peer, reason = %e, "hello capabilityToken invalid — no scope granted");
-            if let Some(p) = ctx.peers.get_mut(peer) {
-                p.auth = None;
-            }
-            false
+            Err(clear_peer_auth(ctx, peer, now))
         }
     }
+}
+
+/// Clear `peer`'s capability after a failed `hello`. If that strips a
+/// capability from the current controller, disarm and release control as
+/// [`expire_peer_auth`] does on expiry: otherwise a controller that re-sends
+/// its just-expired token before the sweep runs would leave the sweep nothing
+/// to find, and stay armed while the station sends it nothing. Returns the
+/// updated `controlState` frames (empty when no controller was released).
+fn clear_peer_auth(ctx: &mut ArmContext, peer: &str, now: i64) -> Vec<PeerSend> {
+    let had_auth = ctx
+        .peers
+        .get_mut(peer)
+        .and_then(|p| p.auth.take())
+        .is_some();
+    if !had_auth || ctx.controller.as_deref() != Some(peer) {
+        return Vec::new();
+    }
+    let effects = match ctx.arm.lock() {
+        Ok(mut st) => st.disarm(now),
+        Err(_) => Vec::new(),
+    };
+    if !effects.is_empty() {
+        warn!(target: "agent.tx", peer = %peer, "controller capability cleared by a failed hello with a live arm — disarming");
+    }
+    apply_arm_effects(&ctx.audit, &effects);
+    ctx.controller = None;
+    control_state_sends(ctx, now, None)
 }
 
 /// Whether `client_key_id` is CURRENTLY present in `tx_arm_allow_list` — a
@@ -4922,6 +4942,127 @@ mod tests {
         assert!(
             ctx.arm.lock().unwrap().is_armed(),
             "a listener expiring disarms nothing"
+        );
+        assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
+    }
+
+    /// An armed controller that re-sends its just-expired token in a `hello`
+    /// before the end-of-loop sweep must still be disarmed: the failed hello
+    /// clears its capability, so the sweep no longer sees an expiry to act on.
+    #[tokio::test]
+    async fn failed_hello_clearing_controller_capability_disarms_and_releases_control() {
+        let mut ctx = ctx_with(true, true);
+        with_consent(&ctx, true);
+        let bus = MessageBus::new(64).unwrap();
+        let token = token_expiring_at(NOW / 1000 + 1);
+        let hello = || ControlAction::Hello {
+            capability_token: Some(token.clone()),
+        };
+        dispatch_action(hello(), CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
+        dispatch_action(
+            arm_action("failed-hello-arm-jti"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
+        assert!(ctx.arm.lock().unwrap().is_armed(), "setup: armed");
+        assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
+        ctx.peers.insert(
+            PEER_B.to_string(),
+            PeerCtx::authorized_until(vec!["status".to_string()], NOW + 600_000),
+        );
+
+        // The same token, now expired, arrives before the sweep runs.
+        let outcome = dispatch_action(
+            hello(),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW + 1_000,
+        )
+        .await;
+        let swept = expire_peer_auth(&mut ctx, NOW + 1_000);
+        assert!(
+            !ctx.arm.lock().unwrap().is_armed(),
+            "a controller whose capability a failed hello cleared must disarm"
+        );
+        assert_eq!(ctx.controller, None, "and release control");
+        assert!(
+            outcome
+                .sends
+                .iter()
+                .chain(swept.iter())
+                .any(|s| matches!(&s.to, SendTarget::One(p) if p == PEER_B)),
+            "the remaining peers get the updated controlState"
+        );
+
+        // So does an invalid hello that clears a still-valid capability.
+        let mut ctx = ctx_with(true, true);
+        with_consent(&ctx, true);
+        dispatch_action(hello(), CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
+        dispatch_action(
+            arm_action("failed-hello-arm-jti-3"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
+        assert!(ctx.arm.lock().unwrap().is_armed(), "setup: armed");
+        dispatch_action(
+            ControlAction::Hello {
+                capability_token: Some("not.a.jws".to_string()),
+            },
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
+        assert!(!ctx.arm.lock().unwrap().is_armed());
+        assert_eq!(ctx.controller, None);
+
+        // A listener's failed hello disarms nothing.
+        let mut ctx = ctx_with(true, true);
+        with_consent(&ctx, true);
+        dispatch_action(
+            arm_action("failed-hello-arm-jti-2"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
+        ctx.peers.insert(
+            PEER_B.to_string(),
+            PeerCtx::authorized_until(vec!["status".to_string()], NOW + 600_000),
+        );
+        let outcome = dispatch_action(
+            ControlAction::Hello {
+                capability_token: Some(token_expiring_at(NOW / 1000 + 1)),
+            },
+            PEER_B,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW + 1_000,
+        )
+        .await;
+        assert!(outcome.sends.is_empty());
+        assert!(
+            ctx.peers[PEER_B].auth.is_none(),
+            "the failed hello clears B"
+        );
+        assert!(
+            ctx.arm.lock().unwrap().is_armed(),
+            "a listener's failed hello disarms nothing"
         );
         assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
     }
