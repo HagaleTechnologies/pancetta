@@ -2038,7 +2038,8 @@ fn disarm_on_loss(ctx: &mut ArmContext) {
 
 /// Serialize and deliver each [`PeerSend`]. Pure-side-effect helper the session
 /// loop calls after every dispatch (and on peer-down / revocation). A frame
-/// addressed to a peer [`peer_may_receive`] refuses at `now` is withheld
+/// addressed to a peer [`peer_may_receive`] refuses is withheld. The clock is
+/// read for each frame, since earlier sends can block across token expiry.
 /// (PAN-95). A failed serialize or send is `debug!`-logged and skipped
 /// (best-effort — a control frame that can't reach one peer never tears down
 /// the session).
@@ -2046,11 +2047,11 @@ fn deliver_sends<W: pancetta_agent::relay::WsConn>(
     sess: &mut MultiPeerSession<'_, W>,
     ctx: &ArmContext,
     sends: &[PeerSend],
-    now: i64,
+    clock: impl Fn() -> i64,
 ) {
     for send in sends {
         let SendTarget::One(peer) = &send.to;
-        if !peer_may_receive(ctx, peer, now) {
+        if !peer_may_receive(ctx, peer, clock()) {
             debug!(target: "agent.control", peer = %peer, "frame withheld — peer holds no valid hello capability");
             continue;
         }
@@ -2068,23 +2069,27 @@ fn deliver_sends<W: pancetta_agent::relay::WsConn>(
 }
 
 /// Fan pending display events out to every established peer that
-/// [`peer_may_receive`] admits at `now` (PAN-95 — a peer without a verified,
-/// unexpired `status`+ hello capability gets nothing). Lossy by design:
-/// Lagged means the bounded broadcast ring dropped old events — log and continue.
+/// [`peer_may_receive`] admits, reading the clock for each recipient check
+/// (PAN-95: a peer without an unexpired `status`+ hello capability gets nothing).
+/// Each call consumes at most 64 events or lag notifications before returning
+/// to session housekeeping. Lossy by design: Lagged means the bounded broadcast
+/// ring dropped old events; log and continue within the same batch limit.
 fn drain_read_stream<W: pancetta_agent::relay::WsConn>(
     events: &mut Option<tokio::sync::broadcast::Receiver<pancetta_protocol::ServerEvent>>,
     sess: &mut MultiPeerSession<'_, W>,
     ctx: &ArmContext,
-    now: i64,
+    clock: impl Fn() -> i64,
 ) {
     let Some(rx) = events.as_mut() else { return };
-    loop {
+    // Bound work even when producers keep the receiver nonempty, so the
+    // session loop returns to authorization and controller-expiry housekeeping.
+    for _ in 0..64 {
         match rx.try_recv() {
             Ok(ev) => {
                 let frame = pancetta_protocol::ServerFrame::Event { event: ev };
                 match serde_json::to_vec(&frame) {
                     Ok(bytes) => {
-                        let _ = sess.broadcast_to(&bytes, |p| peer_may_receive(ctx, p, now));
+                        let _ = sess.broadcast_to(&bytes, |p| peer_may_receive(ctx, p, clock()));
                     }
                     Err(e) => debug!(target: "agent", "read-stream serialize failed: {e}"),
                 }
@@ -2160,13 +2165,17 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
                 // replayed into another peer's.
                 let sid = sess.session_id(&peer).unwrap_or_default().to_string();
                 let now = now_ms();
+                // A receive can cross expiry. Retire the previous authority
+                // before a fresh hello can replace it and hide the lapse.
+                let mut sends = expire_peer_auth(ctx, now);
                 let outcome = dispatch_action(action, &peer, ctx, bus, &sid, now).await;
-                deliver_sends(&mut sess, ctx, &outcome.sends, now);
+                sends.extend(outcome.sends);
+                deliver_sends(&mut sess, ctx, &sends, now_ms);
                 // Task 6: drain the read stream after every successful dispatch
                 // too, not just on Quiet/Idle — a chatty control session
                 // (frequent Arm/Heartbeat/Qsy traffic) must never starve the
                 // display feed of a chance to fan out.
-                drain_read_stream(events, &mut sess, ctx, now_ms());
+                drain_read_stream(events, &mut sess, ctx, now_ms);
                 if outcome.flow == Dispatch::Teardown {
                     return;
                 }
@@ -2199,14 +2208,14 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
                     ctx.controller = None;
                     let now = now_ms();
                     let sends = control_state_sends(ctx, now, None);
-                    deliver_sends(&mut sess, ctx, &sends, now);
+                    deliver_sends(&mut sess, ctx, &sends, now_ms);
                 }
             }
             Ok(Poll::Idle) | Ok(Poll::Quiet) => {
                 // Task 6: the common case — no control traffic this tick, so
                 // this is where the read stream gets most of its chances to
                 // fan out pending display events to established peers.
-                drain_read_stream(events, &mut sess, ctx, now_ms());
+                drain_read_stream(events, &mut sess, ctx, now_ms);
             }
             Ok(Poll::Closed) => return,
             Err(e) => {
@@ -2233,11 +2242,11 @@ fn session_housekeeping<W: pancetta_agent::relay::WsConn>(
 ) {
     let now = now_ms();
     let sends = reconcile_authorizations(ctx, sess, now);
-    deliver_sends(sess, ctx, &sends, now);
+    deliver_sends(sess, ctx, &sends, now_ms);
     broadcast_pending_revocation(ctx, sess);
     let now = now_ms();
     let sends = expire_peer_auth(ctx, now);
-    deliver_sends(sess, ctx, &sends, now);
+    deliver_sends(sess, ctx, &sends, now_ms);
 }
 
 /// Broadcast the current (already-disarmed) control state to every
@@ -2254,7 +2263,7 @@ fn broadcast_pending_revocation<W: pancetta_agent::relay::WsConn>(
     if ctx.revocation_pending.swap(false, Ordering::AcqRel) {
         let now = now_ms();
         let sends = control_state_sends(ctx, now, None);
-        deliver_sends(sess, ctx, &sends, now);
+        deliver_sends(sess, ctx, &sends, now_ms);
     }
 }
 
@@ -4802,6 +4811,172 @@ mod tests {
         Some(rx)
     }
 
+    #[tokio::test]
+    async fn pan96_hello_renewal_after_expiry_disarms_before_replacement() {
+        let identity = AgentIdentity::generate();
+        let agent_kid = identity.key_id();
+        let mut ctx = fresh_ctx(&agent_kid, HashSet::from([CLIENT_KEY_ID.to_string()]));
+        let real_now = now_ms();
+        ctx.arm.lock().unwrap().set_local_consent(true, real_now);
+        ctx.arm.lock().unwrap().arm(
+            pancetta_agent::arm::VerifiedArmGrant {
+                operator_callsign: OPERATOR.to_string(),
+                ttl_ms: 3_600_000,
+                scope_tx: true,
+                jti: "renewal-arm".to_string(),
+                client_key_id: CLIENT_KEY_ID.to_string(),
+            },
+            real_now,
+        );
+        ctx.controller = Some(CLIENT_KEY_ID.to_string());
+        let device = client_device();
+        let mut initiator = initiator_for(&device, &identity.agreement_public_raw());
+        let msg1 = initiator.write_msg1(&proof_for(&device));
+        let outbound = Arc::new(Mutex::new(Vec::new()));
+        let mock = MockWs::new(
+            vec![
+                RelayFrame::Hello {
+                    challenge: b64url(&[7; 32]),
+                }
+                .to_json()
+                .unwrap(),
+                RelayFrame::Env {
+                    dst: agent_kid.clone(),
+                    payload: b64url(&msg1),
+                    src: Some(CLIENT_KEY_ID.to_string()),
+                }
+                .to_json()
+                .unwrap(),
+            ],
+            outbound.clone(),
+        );
+        let handle = mock.clone();
+        let expires = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let expiry = expires.clone();
+        let hello_outbound = outbound.clone();
+        let hello_ws = TriggerAfterWs::new(mock, 3, move || {
+            let msg2 = envs_to(&hello_outbound.lock().unwrap(), CLIENT_KEY_ID).remove(0);
+            initiator.read_msg2(&msg2);
+            let mut transport = initiator.into_transport();
+            let exp_s = now_ms() / 1000 + 2;
+            expiry.store(exp_s * 1000, Ordering::Release);
+            let short_token = mint_jws(
+                &json!({"alg": "EdDSA", "kid": IDP_KID, "typ": "JWT"}),
+                &json!({
+                    "iss": "cqdx", "sub": "acct-1", "operatorCallsign": OPERATOR,
+                    "aud": agent_kid, "clientKeyId": CLIENT_KEY_ID,
+                    "scopes": ["status"], "iat": exp_s - 10, "exp": exp_s,
+                    "jti": "renewal-old",
+                }),
+                &idp_key(),
+            );
+            let fresh_token =
+                real_clock_token_with_jti(&agent_kid, CLIENT_KEY_ID, &["status"], "renewal-new");
+            for token in [short_token, fresh_token] {
+                let ct = client_encrypt(&mut transport, &hello_frame_bytes(&token));
+                handle.push_inbound(
+                    RelayFrame::Env {
+                        dst: agent_kid.clone(),
+                        payload: b64url(&ct),
+                        src: Some(CLIENT_KEY_ID.to_string()),
+                    }
+                    .to_json()
+                    .unwrap(),
+                );
+            }
+        });
+        let arm = ctx.arm.clone();
+        let ws = TriggerAfterWs::new(hello_ws, 4, move || {
+            assert!(
+                arm.lock().unwrap().tx_permitted(now_ms()),
+                "old hello retained the live arm"
+            );
+            let wait_ms = expires.load(Ordering::Acquire) - now_ms();
+            if wait_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(wait_ms as u64));
+            }
+        });
+        let bus = MessageBus::new(64).unwrap();
+        run_one_session(ws, &identity, &mut ctx, &bus, &mut None).await;
+        assert_eq!(
+            ctx.peers[CLIENT_KEY_ID].auth.as_ref().unwrap().jti,
+            "renewal-new"
+        );
+        assert!(
+            !ctx.arm.lock().unwrap().is_armed(),
+            "renewal must not preserve an arm across expiry"
+        );
+        assert_eq!(
+            ctx.controller, None,
+            "expiry must release the controller before renewal"
+        );
+    }
+
+    #[tokio::test]
+    async fn pan96_outbound_rechecks_time_for_each_frame() {
+        // Exercise both outbound paths. The first check is before expiry;
+        // every later check is at expiry, without wall-clock scheduling races.
+        let mut sent = Vec::new();
+        for (display_feed, two_peers) in
+            [(true, false), (false, false), (true, true), (false, true)]
+        {
+            let identity = AgentIdentity::generate();
+            let devices = [client_device(), peer_b_device()];
+            let peers: Vec<_> = devices.iter().take(if two_peers { 2 } else { 1 }).collect();
+            let allow = peers.iter().map(|p| p.key_id()).collect();
+            let mut ctx = fresh_ctx(&identity.key_id(), allow);
+            let (mut sess, outbound, _transports) = hand_session(&identity, &peers);
+            for peer in &peers {
+                ctx.peers.insert(
+                    peer.key_id(),
+                    PeerCtx::authorized_until(vec!["status".to_string()], NOW + 1),
+                );
+            }
+            let time = std::cell::Cell::new(NOW);
+            let clock = || {
+                let now = time.get();
+                time.set(NOW + 1);
+                now
+            };
+            let before = outbound.lock().unwrap().len();
+            if display_feed {
+                let (tx, rx) = tokio::sync::broadcast::channel(16);
+                tx.send(pancetta_protocol::ServerEvent::TxStatus { active: true })
+                    .unwrap();
+                if !two_peers {
+                    tx.send(pancetta_protocol::ServerEvent::TxStatus { active: false })
+                        .unwrap();
+                }
+                drain_read_stream(&mut Some(rx), &mut sess, &ctx, clock);
+            } else {
+                let mut sends = control_state_sends(&ctx, NOW, None);
+                if !two_peers {
+                    sends.extend(control_state_sends(&ctx, NOW, None));
+                }
+                deliver_sends(&mut sess, &ctx, &sends, clock);
+            }
+            sent.push(outbound.lock().unwrap().len() - before);
+        }
+        assert_eq!(
+            sent,
+            vec![1, 1, 1, 1],
+            "each outbound path must withhold frames at expiry"
+        );
+
+        // A full display backlog must yield to housekeeping with work left.
+        let identity = AgentIdentity::generate();
+        let ctx = fresh_ctx(&identity.key_id(), HashSet::new());
+        let (mut sess, _outbound, _transports) = hand_session(&identity, &[]);
+        let (tx, rx) = tokio::sync::broadcast::channel(1024);
+        for _ in 0..1024 {
+            tx.send(pancetta_protocol::ServerEvent::TxStatus { active: true })
+                .unwrap();
+        }
+        let mut events = Some(rx);
+        drain_read_stream(&mut events, &mut sess, &ctx, || NOW);
+        assert_eq!(events.as_ref().unwrap().len(), 1024 - 64);
+    }
+
     /// Gherkin Scenario 2: a peer that established Noise but holds no verified
     /// hello capability receives no read-stream event; a hello-authorized
     /// peer does. (Replaces the pre-PAN-95 test that asserted every
@@ -4824,7 +4999,7 @@ mod tests {
 
         let mut events = feed_with(pancetta_protocol::ServerEvent::TxStatus { active: true });
         let before = outbound.lock().unwrap().len();
-        drain_read_stream(&mut events, &mut sess, &ctx, NOW);
+        drain_read_stream(&mut events, &mut sess, &ctx, || NOW);
 
         let out = outbound.lock().unwrap().clone();
         let new = &out[before..];
@@ -4863,7 +5038,7 @@ mod tests {
             );
             let mut events = feed_with(pancetta_protocol::ServerEvent::TxStatus { active: true });
             let before = outbound.lock().unwrap().len();
-            drain_read_stream(&mut events, &mut sess, &ctx, NOW);
+            drain_read_stream(&mut events, &mut sess, &ctx, || NOW);
             assert_eq!(
                 outbound.lock().unwrap().len(),
                 before,
@@ -4894,7 +5069,7 @@ mod tests {
 
         let mut events = feed_with(pancetta_protocol::ServerEvent::TxStatus { active: false });
         let before = outbound.lock().unwrap().len();
-        drain_read_stream(&mut events, &mut sess, &ctx, NOW);
+        drain_read_stream(&mut events, &mut sess, &ctx, || NOW);
         let out = outbound.lock().unwrap().clone();
         let envs_a = envs_to(&out[before..], CLIENT_KEY_ID);
         assert_eq!(envs_a.len(), 1, "status scope suffices for the read stream");
@@ -4936,7 +5111,7 @@ mod tests {
             },
         });
         let before = outbound.lock().unwrap().len();
-        deliver_sends(&mut sess, &ctx, &sends, NOW);
+        deliver_sends(&mut sess, &ctx, &sends, || NOW);
 
         let out = outbound.lock().unwrap().clone();
         let new = &out[before..];
@@ -6572,7 +6747,7 @@ mod tests {
         let before_a = envs_to(&outbound.lock().unwrap(), CLIENT_KEY_ID).len();
         let before = outbound.lock().unwrap().len();
         let mut events = feed_with(pancetta_protocol::ServerEvent::TxStatus { active: true });
-        drain_read_stream(&mut events, &mut sess, &ctx, NOW);
+        drain_read_stream(&mut events, &mut sess, &ctx, || NOW);
         let out = outbound.lock().unwrap().clone();
         assert!(
             envs_to(&out[before..], CLIENT_KEY_ID).is_empty(),
@@ -6585,7 +6760,7 @@ mod tests {
 
         let sends = control_state_sends(&ctx, NOW, None);
         let before = outbound.lock().unwrap().len();
-        deliver_sends(&mut sess, &ctx, &sends, NOW);
+        deliver_sends(&mut sess, &ctx, &sends, || NOW);
         let out = outbound.lock().unwrap().clone();
         assert_eq!(
             envs_to(&out[before..], PEER_B).len(),
@@ -6973,7 +7148,7 @@ mod tests {
             "only B is addressed: {sends:?}"
         );
         let before = outbound.lock().unwrap().len();
-        deliver_sends(&mut sess, &ctx, &sends, NOW);
+        deliver_sends(&mut sess, &ctx, &sends, || NOW);
         let out = outbound.lock().unwrap().clone();
         let envs_b = envs_to(&out[before..], PEER_B);
         assert_eq!(envs_b.len(), 1);
@@ -7175,7 +7350,7 @@ mod tests {
         );
         let before = envs_to(&outbound.lock().unwrap(), CLIENT_KEY_ID).len();
         let mut events = feed_with(pancetta_protocol::ServerEvent::TxStatus { active: true });
-        drain_read_stream(&mut events, &mut sess, &ctx, now_ms());
+        drain_read_stream(&mut events, &mut sess, &ctx, now_ms);
         assert_eq!(
             envs_to(&outbound.lock().unwrap(), CLIENT_KEY_ID).len(),
             before,
