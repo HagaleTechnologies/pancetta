@@ -304,9 +304,9 @@ fn arm_transition_sends(ctx: &ArmContext, effects: &[ArmEffect], now: ArmTime) -
     }
 }
 
-/// A fresh [`ArmTime`] for an arm mutation, taken with the arm lock already
-/// held so verification or a lock wait cannot make it stale. Never earlier
-/// than `floor` (the loop's pre-dispatch sample) on either clock.
+/// A fresh [`ArmTime`] for an arm mutation or state read, taken with the arm
+/// lock already held so verification or a lock wait cannot make it stale.
+/// Never earlier than `floor` (the loop's pre-dispatch sample) on either clock.
 fn fresh_arm_time(ctx: &ArmContext, floor: ArmTime) -> ArmTime {
     let fresh = (ctx.clock)();
     ArmTime {
@@ -319,10 +319,11 @@ fn fresh_arm_time(ctx: &ArmContext, floor: ArmTime) -> ArmTime {
 /// even when no heartbeat or TX request arrives. Dead-man expiry removes arm
 /// authority only — the controller slot, the peers and `seen_jtis` stay, so
 /// recovery is a fresh signed arm on the same session. A poisoned lock is left
-/// to the read-only gate, which already denies.
+/// to the read-only gate, which already denies. Expiry is judged on a sample
+/// taken under the arm lock, so a lock wait cannot postpone it.
 fn sweep_arm_expiry(ctx: &ArmContext, now: ArmTime) -> Vec<PeerSend> {
     let effects = match ctx.arm.lock() {
-        Ok(mut st) => st.tick(now),
+        Ok(mut st) => st.tick(fresh_arm_time(ctx, now)),
         Err(_) => Vec::new(),
     };
     if !effects.is_empty() {
@@ -476,9 +477,15 @@ impl DispatchOutcome {
 /// every controller transition, every successful arm, every disarm, and as a
 /// greeting to each newly-established peer. `only = Some(p)` targets just peer
 /// `p` (the greeting case); `None` fans out one tailored frame per established
-/// peer (each with its own `controlHeldByMe`).
+/// peer (each with its own `controlHeldByMe`). `transmitArmed` is judged on a
+/// clock sample taken under the arm lock, so it matches an arm accepted after
+/// `now` was sampled.
 fn control_state_sends(ctx: &ArmContext, now: ArmTime, only: Option<&str>) -> Vec<PeerSend> {
-    let armed = ctx.arm.lock().map(|s| s.tx_permitted(now)).unwrap_or(false);
+    let armed = ctx
+        .arm
+        .lock()
+        .map(|s| s.tx_permitted(fresh_arm_time(ctx, now)))
+        .unwrap_or(false);
     ctx.peers
         .keys()
         .filter(|p| only.is_none_or(|o| o == p.as_str()))
@@ -5452,6 +5459,9 @@ mod tests {
     // PAN-97: a lapsed arm needs a fresh signed arm — real session loop
     // ========================================================================
 
+    /// Builds one control frame's plaintext for a [`Pan97Client`].
+    type Pan97Build = Box<dyn FnOnce(&Pan97Client) -> Vec<u8> + Send>;
+
     /// One scripted receive for [`Pan97Ws`].
     enum Pan97Step {
         /// Deliver a pre-built relay frame (clock unchanged).
@@ -5460,7 +5470,7 @@ mod tests {
         QuietAt(i64),
         /// Set the clock to `ms`, then deliver the plaintext built by the
         /// closure, encrypted under client `idx`'s live Noise transport.
-        SendAt(i64, usize, Box<dyn FnOnce(&Pan97Client) -> Vec<u8> + Send>),
+        SendAt(i64, usize, Pan97Build),
         /// Run a check between ticks (clock unchanged), then report quiet.
         Check(Box<dyn FnOnce() + Send>),
     }
@@ -5685,27 +5695,21 @@ mod tests {
         }
     }
 
-    fn pan97_arm(
-        jti: &'static str,
-        armed_until: i64,
-    ) -> Box<dyn FnOnce(&Pan97Client) -> Vec<u8> + Send> {
+    fn pan97_arm(jti: &'static str, armed_until: i64) -> Pan97Build {
         Box::new(move |c: &Pan97Client| {
             serde_json::to_vec(&tx_arm_frame(&c.agent_kid, &c.session_id, jti, armed_until))
                 .unwrap()
         })
     }
 
-    fn pan97_heartbeat(
-        jti: &'static str,
-        seq: u64,
-    ) -> Box<dyn FnOnce(&Pan97Client) -> Vec<u8> + Send> {
+    fn pan97_heartbeat(jti: &'static str, seq: u64) -> Pan97Build {
         Box::new(move |_: &Pan97Client| {
             serde_json::to_vec(&json!({"type": "txHeartbeat", "armJti": jti, "seq": seq})).unwrap()
         })
     }
 
     /// A valid control frame that touches neither the arm nor control.
-    fn pan97_benign() -> Box<dyn FnOnce(&Pan97Client) -> Vec<u8> + Send> {
+    fn pan97_benign() -> Pan97Build {
         Box::new(|_: &Pan97Client| {
             serde_json::to_vec(&json!({
                 "frame": "hello",
@@ -5830,6 +5834,45 @@ mod tests {
             .collect();
         states.sort();
         states
+    }
+
+    /// The clock keeps moving after the loop's pre-dispatch sample. A
+    /// successful arm's `controlState` must agree with the live gate, and the
+    /// sweep must judge expiry on the time it holds the arm lock, not on the
+    /// loop's older sample.
+    #[tokio::test]
+    async fn arm_state_reads_use_a_sample_taken_under_the_arm_lock() {
+        let bus = MessageBus::new(64).unwrap();
+        let mut ctx = ctx_with(true, true);
+        with_consent(&ctx, true);
+        ctx.clock = fixed_clock(NOW + 1);
+        let d = dispatch_action(
+            arm_action("arm-jti-1"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(ctx.arm.lock().unwrap().tx_permitted((ctx.clock)()));
+        // The implicit grab (not yet armed), then the arm itself.
+        assert_eq!(
+            pan97_states(&d.sends),
+            vec![
+                (CLIENT_KEY_ID.to_string(), true, false),
+                (CLIENT_KEY_ID.to_string(), true, true),
+            ],
+            "the arm response must report the arm it just accepted"
+        );
+
+        ctx.clock = fixed_clock(NOW + 1 + HEARTBEAT_TIMEOUT_MS);
+        assert_eq!(
+            pan97_states(&sweep_arm_expiry(&ctx, at(NOW + 1))),
+            vec![(CLIENT_KEY_ID.to_string(), true, false)],
+            "the deadline passed before the sweep took the lock"
+        );
+        assert!(!ctx.arm.lock().unwrap().is_armed());
     }
 
     /// A late heartbeat reaching dispatch before any sweep expires the arm
