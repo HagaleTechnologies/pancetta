@@ -349,10 +349,14 @@ outcome equals `coalesce_transmit_requests`.
 
 **Supersede ceiling.** The four mid-TX supersede sites pass
 `supersede_max_concurrent_qsos(effective, live_fox_admitted_count(..))`,
-where live means in both the Fox set and `active_tx_qsos`. A supersede never
-adds a QSO stream (`classify_incoming_during_tx` supersedes only for an
-in-flight QSO or a manual send), so this only stops a keyed Hound bundle from
-collapsing to the refreshed stream.
+where live means in both the Fox set and `active_tx_qsos`. The ceiling is the
+live Fox-admitted count on top of the normal cap, the coalescer rule's shape,
+so a mixed in-flight bundle (Hounds plus ordinary QSOs admitted under the
+normal cap) stays under it and a Hound's fresh frame folds in. A ceiling of
+only the larger of the two collapsed that bundle to the refreshed stream and
+later keyed the stale Hound frame. A supersede never adds a QSO stream
+(`classify_incoming_during_tx` supersedes only for an in-flight QSO or a
+manual send), so the ceiling never admits more than the coalescer already did.
 
 **Fail toward today.** A poisoned `fox_admitted_qsos` lock reads as empty and
 `live_fox_admitted_count` returns 0 if either lock is poisoned, so TX never
@@ -378,8 +382,12 @@ they have left `get_active_qsos()`, but their final RR73/73 may not have aired,
 so a fresh set of Hounds on top of them could still hit the clamp.
 Only keys still in `active_tx_qsos` count, so a stale Fox-set key cannot hold
 the CQ off. `fox_mode` still turns on, and the status line says no new CQ was
-started. This holds TX-live Fox-admitted QSOs to `fox.max_streams + 1` (at
-most 8), the same as a single engage.
+started. `maybe_answer_caller`'s Fox capacity check counts the same
+grace-period Hounds (`fox_grace_hound_count`) on top of
+`active_caller_qso_count`, so a CQ started while some are finishing cannot be
+followed by a full fresh set of Hounds. Together these hold TX-live
+Fox-admitted QSOs to `fox.max_streams + 1` (at most 8), the same as a single
+engage.
 
 **PAN-78.** PAN-78's admission cap decides whether a new QSO may open; PAN-76
 decides which open QSOs keep their TX slots. While Hounds finish, a new
@@ -394,8 +402,10 @@ Tests: `coordinator::tx::coalesce_tests::pan76_*`,
 (AC1), `pan76_unanswered_fox_cq_leaves_the_fox_set_on_disengage`,
 `pan76_never_fox_manual_pileup_is_still_capped` (AC2),
 `pan76_fox_reengage_starts_no_cq_while_finishing_hounds_fill_the_cap`,
-`pan76_fox_reengage_counts_hounds_in_their_completed_grace`, and
-`coordinator::qso::fox_admitted_split_tests`.
+`pan76_fox_reengage_counts_hounds_in_their_completed_grace`,
+`coordinator::qso::fox_admitted_split_tests`,
+`fox_admitted_tracking_tests::pan76_hounds_in_their_completed_grace_fill_the_fox_cap`
+and `supersede_rekey_tests::pan76_supersede_refresh_of_a_hound_in_a_mixed_bundle_keeps_every_stream`.
 
 ## UTC re-anchoring after sleep/wake and clock steps (PAN-114, 2026-10-10)
 

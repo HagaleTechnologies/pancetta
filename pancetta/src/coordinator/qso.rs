@@ -1151,44 +1151,60 @@ fn record_fox_admitted(
     }
 }
 
+/// PAN-76: completed Fox-admitted Hounds still inside their 45 s completed
+/// grace. They have left `active` (terminal), but stay in both the Fox set
+/// and `active_tx_qsos` until the grace elapses so their final RR73/73 can
+/// air, so they still hold a TX stream. Only keys still in `active_tx_qsos`
+/// count: stale Fox-set keys (never pruned) are inert. Either lock poisoned
+/// reads as 0, i.e. no tighter than the count without them.
+fn fox_grace_hound_count(
+    active: &[(pancetta_qso::QsoId, pancetta_qso::QsoProgress)],
+    fox_admitted_qsos: &std::sync::RwLock<std::collections::HashSet<String>>,
+    active_tx_qsos: &std::sync::RwLock<std::collections::HashSet<String>>,
+) -> usize {
+    let (Ok(fox), Ok(live)) = (fox_admitted_qsos.read(), active_tx_qsos.read()) else {
+        return 0;
+    };
+    let active_keys: std::collections::HashSet<String> = active
+        .iter()
+        .map(|(id, _)| super::active_tx_qso_key(&id.to_string()))
+        .collect();
+    fox.iter()
+        .filter(|k| live.contains(*k) && !active_keys.contains(*k))
+        .count()
+}
+
 /// PAN-76: whether a Fox-admitted CQ is still calling, and how many
-/// Fox-admitted Hounds still hold a TX stream. That is the `active`
-/// (non-terminal) Hounds plus the completed ones still inside their 45 s
-/// completed grace: those have left `active` but stay in both the Fox set and
-/// `active_tx_qsos` until the grace elapses, so their final RR73/73 can air.
-/// Only keys still in `active_tx_qsos` count, so stale Fox-set keys (which
-/// are never pruned) cannot hold Fox's CQ off forever. A poisoned Fox set
-/// reads as empty, like the TX worker's reads of it; a poisoned
-/// `active_tx_qsos` drops only the grace-period Hounds from the count.
+/// Fox-admitted Hounds still hold a TX stream: the `active` (non-terminal)
+/// ones plus those in their completed grace ([`fox_grace_hound_count`]).
+/// A poisoned Fox set reads as empty, like the TX worker's reads of it.
 fn fox_admitted_split(
     active: &[(pancetta_qso::QsoId, pancetta_qso::QsoProgress)],
     fox_admitted_qsos: &std::sync::RwLock<std::collections::HashSet<String>>,
     active_tx_qsos: &std::sync::RwLock<std::collections::HashSet<String>>,
 ) -> (bool, usize) {
-    let Ok(fox) = fox_admitted_qsos.read() else {
-        return (false, 0);
-    };
-    let mut calling_cq_keys = std::collections::HashSet::new();
-    let mut hounds = std::collections::HashSet::new();
-    for (id, progress) in active {
-        let key = super::active_tx_qso_key(&id.to_string());
-        if !fox.contains(&key) {
-            continue;
-        }
-        if matches!(progress.state, pancetta_qso::QsoState::CallingCq { .. }) {
-            calling_cq_keys.insert(key);
-        } else {
-            hounds.insert(key);
-        }
-    }
-    if let Ok(live) = active_tx_qsos.read() {
-        for key in fox.iter().filter(|k| live.contains(*k)) {
-            if !calling_cq_keys.contains(key) {
-                hounds.insert(key.clone());
+    let (cq_calling, active_hounds) = {
+        let Ok(fox) = fox_admitted_qsos.read() else {
+            return (false, 0);
+        };
+        let mut cq_calling = false;
+        let mut hounds = 0usize;
+        for (id, progress) in active {
+            if !fox.contains(&super::active_tx_qso_key(&id.to_string())) {
+                continue;
+            }
+            if matches!(progress.state, pancetta_qso::QsoState::CallingCq { .. }) {
+                cq_calling = true;
+            } else {
+                hounds += 1;
             }
         }
-    }
-    (!calling_cq_keys.is_empty(), hounds.len())
+        (cq_calling, hounds)
+    };
+    (
+        cq_calling,
+        active_hounds + fox_grace_hound_count(active, fox_admitted_qsos, active_tx_qsos),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1205,6 +1221,7 @@ async fn maybe_answer_caller(
     fox_mode: &std::sync::atomic::AtomicBool,
     fox_max_streams: &std::sync::atomic::AtomicUsize,
     fox_admitted_qsos: &std::sync::RwLock<std::collections::HashSet<String>>,
+    active_tx_qsos: &std::sync::RwLock<std::collections::HashSet<String>>,
 ) {
     // 1. TX policy: DISABLED blocks; RESPOND-ONLY / FULL allow responses.
     let policy =
@@ -1278,8 +1295,17 @@ async fn maybe_answer_caller(
     } else {
         max_concurrent
     };
+    // PAN-76: Fox-admitted Hounds in their 45 s completed grace still hold a
+    // TX stream for their final RR73/73, so they count against the Fox cap
+    // too; otherwise a full fresh set of Hounds on top of them could reach
+    // the coalescer's hard clamp and cut those closing frames.
     let active_count = if is_fox {
         qso_manager.active_caller_qso_count().await
+            + fox_grace_hound_count(
+                &qso_manager.get_active_qsos().await,
+                fox_admitted_qsos,
+                active_tx_qsos,
+            )
     } else {
         qso_manager.active_qso_count().await
     };
@@ -4099,6 +4125,7 @@ impl super::ApplicationCoordinator {
                                                 &fox_mode,
                                                 &fox_max_streams,
                                                 &fox_admitted_qsos,
+                                                &active_tx_qsos_for_fox,
                                             )
                                             .await;
                                         }
@@ -10925,6 +10952,7 @@ mod respond_to_caller_admission_tests {
                 &coordinator.fox_mode,
                 &coordinator.fox_max_streams,
                 &coordinator.fox_admitted_qsos,
+                &coordinator.active_tx_qsos,
             )
             .await;
             let id = manager
@@ -10990,7 +11018,8 @@ mod respond_to_caller_admission_tests {
             other => panic!("expected a three-Hound MultiTransmitRequest, got {other:?}"),
         }
 
-        // 7. A mid-TX refresh keeps the three-stream bundle too.
+        // 7. A mid-TX refresh keeps the three-stream bundle too: the three
+        //    live Hounds on top of the restored cap of 1.
         assert_eq!(
             supersede_max_concurrent_qsos(
                 cap,
@@ -10999,7 +11028,7 @@ mod respond_to_caller_admission_tests {
                     &coordinator.active_tx_qsos
                 )
             ),
-            3
+            4
         );
 
         coordinator
@@ -11273,6 +11302,7 @@ mod respond_to_caller_admission_tests {
             &coordinator.fox_mode,
             &coordinator.fox_max_streams,
             &coordinator.fox_admitted_qsos,
+            &coordinator.active_tx_qsos,
         )
         .await;
         let w2_id = manager
@@ -11359,6 +11389,7 @@ mod respond_to_caller_admission_tests {
                 &coordinator.fox_mode,
                 &coordinator.fox_max_streams,
                 &coordinator.fox_admitted_qsos,
+                &coordinator.active_tx_qsos,
             )
             .await;
             let now = coordinator.fox_admitted_qsos.read().unwrap().clone();
@@ -11479,6 +11510,7 @@ mod fox_admitted_tracking_tests {
         fox_mode: AtomicBool,
         fox_max_streams: AtomicUsize,
         fox_admitted_qsos: RwLock<HashSet<String>>,
+        active_tx_qsos: RwLock<HashSet<String>>,
     }
 
     impl Station {
@@ -11490,6 +11522,7 @@ mod fox_admitted_tracking_tests {
                 fox_mode: AtomicBool::new(fox_mode),
                 fox_max_streams: AtomicUsize::new(fox_max_streams),
                 fox_admitted_qsos: RwLock::new(HashSet::new()),
+                active_tx_qsos: RwLock::new(HashSet::new()),
             }
         }
 
@@ -11507,6 +11540,7 @@ mod fox_admitted_tracking_tests {
                 &self.fox_mode,
                 &self.fox_max_streams,
                 &self.fox_admitted_qsos,
+                &self.active_tx_qsos,
             )
             .await;
         }
@@ -11555,5 +11589,38 @@ mod fox_admitted_tracking_tests {
         );
         let key = st.key_of("W1AAA").await;
         assert_eq!(st.fox_set(), HashSet::from([key]));
+    }
+
+    /// PR #421 review (Codex P2): completed Hounds in their 45 s grace still
+    /// hold a TX stream for their final RR73/73, so they fill Fox capacity;
+    /// a stale Fox-set key that is no longer TX-live does not.
+    #[tokio::test]
+    async fn pan76_hounds_in_their_completed_grace_fill_the_fox_cap() {
+        let st = Station::new(true, 2).await;
+        // Two completed Hounds: terminal (no active QSO), still TX-live.
+        for key in ["GRACE-1", "GRACE-2"] {
+            st.fox_admitted_qsos
+                .write()
+                .unwrap()
+                .insert(key.to_string());
+            st.active_tx_qsos.write().unwrap().insert(key.to_string());
+        }
+        st.answer("W1AAA", 1200.0, 1).await;
+        assert_eq!(
+            st.manager.active_caller_qso_count().await,
+            0,
+            "W1AAA must be refused: two grace-period Hounds fill the Fox cap of 2"
+        );
+
+        // One grace Hound's window elapses; the other key goes stale.
+        st.active_tx_qsos.write().unwrap().remove("GRACE-1");
+        st.active_tx_qsos.write().unwrap().remove("GRACE-2");
+        st.fox_admitted_qsos.write().unwrap().remove("GRACE-1");
+        st.answer("W1AAA", 1200.0, 1).await;
+        assert_eq!(
+            st.manager.active_caller_qso_count().await,
+            1,
+            "W1AAA must be admitted once the grace has elapsed"
+        );
     }
 }

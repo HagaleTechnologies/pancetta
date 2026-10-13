@@ -4179,12 +4179,16 @@ pub(crate) fn live_fox_admitted_count(
     fox.iter().filter(|k| active.contains(*k)).count() as u32
 }
 
-/// PAN-76: ceiling for the mid-TX supersede paths. A supersede never adds a
-/// QSO stream (`classify_incoming_during_tx` only supersedes on an in-flight
-/// QSO or a manual send), so raising it to the live Fox-admitted count only
-/// stops an already-keyed Hound bundle from collapsing to one stream.
+/// PAN-76: ceiling for the mid-TX supersede paths: the live Fox-admitted
+/// streams on top of the normal cap, the same shape as the coalescer's rule
+/// (Fox-admitted streams are never truncated; ordinary ones are capped). A
+/// mixed in-flight bundle of Hounds plus ordinary QSOs therefore stays under
+/// it, so a Hound's fresh frame folds in instead of collapsing the bundle
+/// (PR #421 review). A supersede never adds a QSO stream
+/// (`classify_incoming_during_tx` only supersedes on an in-flight QSO or a
+/// manual send), so this never admits more than the coalescer already did.
 pub(crate) fn supersede_max_concurrent_qsos(effective: u32, live_fox_admitted: u32) -> u32 {
-    effective.max(live_fox_admitted)
+    effective.saturating_add(live_fox_admitted)
 }
 
 #[cfg(test)]
@@ -4279,9 +4283,10 @@ mod fox_admitted_ceiling_tests {
 
     #[test]
     fn pan76_supersede_ceiling_covers_live_fox_admitted_qsos() {
-        assert_eq!(supersede_max_concurrent_qsos(1, 3), 3);
-        assert_eq!(supersede_max_concurrent_qsos(6, 3), 6);
+        assert_eq!(supersede_max_concurrent_qsos(1, 3), 4);
+        assert_eq!(supersede_max_concurrent_qsos(6, 3), 9);
         assert_eq!(supersede_max_concurrent_qsos(1, 0), 1);
+        assert_eq!(supersede_max_concurrent_qsos(u32::MAX, 3), u32::MAX);
     }
 }
 
@@ -14197,6 +14202,83 @@ mod supersede_rekey_tests {
             "under the restored cap of 1 the bundle collapses (today's behaviour), got {:?}",
             outcomes[1]
         );
+    }
+
+    /// PR #421 review (Codex P1): an in-flight bundle of two Hounds plus one
+    /// ordinary QSO (admitted under the restored cap of 1) after Fox mode is
+    /// turned off. The coalescer kept all three: the Fox-admitted streams on
+    /// top of the normal cap. A fresher frame for one Hound must fold into
+    /// that bundle, not trip a ceiling of only the live Fox count (2) and
+    /// collapse the bundle to the refreshed Hound, keying it stale later.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pan76_supersede_refresh_of_a_hound_in_a_mixed_bundle_keeps_every_stream() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+
+        let now = chrono::Utc::now();
+        let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
+            pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
+            pancetta_core::slot::SLOT_NS,
+        );
+        let item = |text: &str, freq: f64, id: &str| crate::message_bus::TransmitRequestItem {
+            message_text: text.to_string(),
+            frequency_offset: freq,
+            qso_id: Some(id.to_string()),
+        };
+        let in_flight = [
+            item("W1AAA K5ARH -10", 1000.0, "hound-1"),
+            item("W2BBB K5ARH -12", 1300.0, "hound-2"),
+            item("W9ZZZ K5ARH R-05", 1600.0, "ordinary"),
+        ];
+
+        let mut message_text = "W1AAA K5ARH -10".to_string();
+        let mut frequency_offset = 1000.0;
+        let mut schedule = super::schedule_tx(
+            now,
+            cur_parity,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+        );
+        let outcome = super::supersede_and_rekey_or_bundle(
+            MessageType::TransmitRequest {
+                message_text: "W1AAA K5ARH RR73".to_string(),
+                frequency_offset: 1000.0,
+                qso_id: Some("hound-1".to_string()),
+                tx_parity: Some(cur_parity),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
+            },
+            &mut message_text,
+            &mut frequency_offset,
+            &mut schedule,
+            &bus,
+            &Arc::new(AtomicBool::new(true)),
+            &Arc::new(AtomicU64::new(0)),
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+            pancetta_config::station::TxSelfParity::Auto,
+            now,
+            // Fox off: normal cap 1, two Hounds still live.
+            super::supersede_max_concurrent_qsos(1, 2),
+            crate::message_bus::TxOrigin::Local,
+            None,
+            &in_flight,
+        )
+        .await;
+
+        match &outcome {
+            super::SupersedeOutcome::Bundle { items, .. } => {
+                assert_eq!(items.len(), 3, "every in-flight stream stays: {items:?}");
+                let hound1 = items
+                    .iter()
+                    .find(|it| it.qso_id.as_deref() == Some("hound-1"))
+                    .expect("hound-1 must still be present");
+                assert_eq!(hound1.message_text, "W1AAA K5ARH RR73");
+            }
+            other => panic!("expected the refresh to bundle, got {other:?}"),
+        }
     }
 }
 
