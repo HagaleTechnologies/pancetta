@@ -523,6 +523,7 @@ fn fresh_arm_time(ctx: &ArmContext, floor: ArmTime) -> ArmTime {
     ArmTime {
         unix_ms: fresh.unix_ms.max(floor.unix_ms),
         monotonic: fresh.monotonic.max(floor.monotonic),
+        suspend_aware_ms: fresh.suspend_aware_ms.max(floor.suspend_aware_ms),
     }
 }
 
@@ -2414,11 +2415,13 @@ mod tests {
         *BASE.get_or_init(std::time::Instant::now)
     }
 
-    /// Both arm clocks at `ms`: wall = `ms` unix ms, monotonic = origin + `ms`.
+    /// Every arm clock at `ms`: wall = `ms` unix ms, monotonic = origin + `ms`,
+    /// suspend-aware = `ms`.
     fn at(ms: i64) -> ArmTime {
         ArmTime {
             unix_ms: ms,
             monotonic: mono_base() + Duration::from_millis(ms.unsigned_abs()),
+            suspend_aware_ms: ms,
         }
     }
 

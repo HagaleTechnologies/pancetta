@@ -15952,6 +15952,7 @@ mod remote_arm_gate_tests {
         pancetta_agent::arm::ArmTime {
             unix_ms: ms,
             monotonic: base + std::time::Duration::from_millis(ms.unsigned_abs()),
+            suspend_aware_ms: ms,
         }
     }
 
@@ -16030,6 +16031,7 @@ mod remote_arm_gate_tests {
         pancetta_agent::arm::ArmTime {
             unix_ms: NOW - back_ms,
             monotonic: at(mono_ms).monotonic,
+            suspend_aware_ms: at(mono_ms).suspend_aware_ms,
         }
     }
 
@@ -16095,6 +16097,7 @@ mod remote_arm_gate_identity_tests {
         pancetta_agent::arm::ArmTime {
             unix_ms: ms,
             monotonic: base + std::time::Duration::from_millis(ms.unsigned_abs()),
+            suspend_aware_ms: ms,
         }
     }
 
@@ -16165,6 +16168,7 @@ mod remote_arm_gate_identity_tests {
         pancetta_agent::arm::ArmTime {
             unix_ms: NOW - back_ms,
             monotonic: at(mono_ms).monotonic,
+            suspend_aware_ms: at(mono_ms).suspend_aware_ms,
         }
     }
 
@@ -16201,6 +16205,7 @@ mod arm_snapshot_attribution_tests {
         pancetta_agent::arm::ArmTime {
             unix_ms: ms,
             monotonic: base + std::time::Duration::from_millis(ms.unsigned_abs()),
+            suspend_aware_ms: ms,
         }
     }
 
@@ -16311,6 +16316,7 @@ mod arm_snapshot_attribution_tests {
         pancetta_agent::arm::ArmTime {
             unix_ms: NOW - back_ms,
             monotonic: at(mono_ms).monotonic,
+            suspend_aware_ms: at(mono_ms).suspend_aware_ms,
         }
     }
 

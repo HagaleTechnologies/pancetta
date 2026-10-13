@@ -35,7 +35,11 @@
 //! Timing (PAN-97):
 //! - Local liveness (dead-man silence, the arm's maximum lifetime) is measured
 //!   on the **monotonic** clock ([`ArmTime::monotonic`]), so a wall-clock step
-//!   can never stretch the heartbeat window.
+//!   can never stretch the heartbeat window. It is also measured on a
+//!   **suspend-aware** clock ([`ArmTime::suspend_aware_ms`]), because the
+//!   standard monotonic clock stops while the host sleeps: an operator silent
+//!   through a suspend longer than the window must re-arm on wake. Either
+//!   clock reaching a limit expires the arm.
 //! - The grant's signed absolute deadline (`armedUntil`) is checked against
 //!   **wall** time ([`ArmTime::unix_ms`]). Either clock expiring denies TX.
 //! - `heartbeatIntervalSec` is the client's *sending* cadence ([5,15] s). The
@@ -83,8 +87,14 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(HEARTBEAT_TIMEOUT_MS a
 pub struct ArmTime {
     /// Unix milliseconds (wall clock).
     pub unix_ms: i64,
-    /// Monotonic instant taken alongside `unix_ms`.
+    /// Monotonic instant taken alongside `unix_ms`. On Linux and macOS this
+    /// clock does not advance while the host is suspended.
     pub monotonic: Instant,
+    /// Milliseconds on a clock that keeps counting through system suspend and
+    /// never steps with wall time (Linux `CLOCK_BOOTTIME`, Apple
+    /// `CLOCK_MONOTONIC`). Elsewhere it follows [`Self::monotonic`]. Only
+    /// differences between samples are meaningful.
+    pub suspend_aware_ms: i64,
 }
 
 impl ArmTime {
@@ -95,8 +105,53 @@ impl ArmTime {
             Ok(d) => i64::try_from(d.as_millis()).unwrap_or(i64::MAX),
             Err(e) => i64::try_from(e.duration().as_millis()).map_or(i64::MIN, |ms| -ms),
         };
-        Self { unix_ms, monotonic }
+        Self {
+            unix_ms,
+            monotonic,
+            suspend_aware_ms: suspend_aware_now_ms(),
+        }
     }
+}
+
+/// Read the suspend-aware clock behind [`ArmTime::suspend_aware_ms`].
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn suspend_aware_now_ms() -> i64 {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const CLOCK: libc::clockid_t = libc::CLOCK_BOOTTIME;
+    // Apple's CLOCK_MONOTONIC keeps counting while asleep (unlike the
+    // CLOCK_UPTIME_RAW that `Instant` uses there).
+    #[cfg(target_vendor = "apple")]
+    const CLOCK: libc::clockid_t = libc::CLOCK_MONOTONIC;
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, writable timespec, and CLOCK is supported on
+    // every target this branch compiles for.
+    let rc = unsafe { libc::clock_gettime(CLOCK, &mut ts) };
+    if rc != 0 {
+        return fallback_suspend_aware_ms();
+    }
+    // `time_t`/`c_long` are i64 on 64-bit targets but narrower on some 32-bit
+    // ones, so the widening conversions stay.
+    #[allow(clippy::useless_conversion)]
+    let ms = i64::from(ts.tv_sec)
+        .saturating_mul(1_000)
+        .saturating_add(i64::from(ts.tv_nsec) / 1_000_000);
+    ms
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn suspend_aware_now_ms() -> i64 {
+    fallback_suspend_aware_ms()
+}
+
+/// Monotonic milliseconds since a process-wide origin: no suspend awareness,
+/// but never worse than [`ArmTime::monotonic`].
+fn fallback_suspend_aware_ms() -> i64 {
+    static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let origin = *ORIGIN.get_or_init(Instant::now);
+    i64::try_from(origin.elapsed().as_millis()).unwrap_or(i64::MAX)
 }
 
 /// A grant whose token has already been cryptographically verified in an
@@ -232,6 +287,8 @@ struct ArmedSession {
     operator_callsign: String,
     /// Monotonic instant the arm was accepted.
     armed_at: Instant,
+    /// Suspend-aware clock reading when the arm was accepted.
+    armed_at_suspend_aware_ms: i64,
     /// Maximum monotonic lifetime: the smaller of the verified `ttl_ms` and
     /// the time left to `armed_until_ms` when the arm was accepted.
     lifetime: Duration,
@@ -239,6 +296,8 @@ struct ArmedSession {
     armed_until_ms: i64,
     /// Monotonic instant of the last accepted heartbeat (seeded by `arm`).
     last_heartbeat: Instant,
+    /// Suspend-aware clock reading of the last accepted heartbeat.
+    last_heartbeat_suspend_aware_ms: i64,
     /// Verified sending cadence (audit only; see [`HEARTBEAT_TIMEOUT_MS`]).
     heartbeat_interval_sec: i64,
     scope_tx: bool,
@@ -257,22 +316,41 @@ struct ArmedSession {
 impl ArmedSession {
     /// The deadline that has passed at `now`, if any. TTL (wall `armedUntil`
     /// or monotonic lifetime) wins over heartbeat loss. Deadlines are
-    /// exclusive (`>=`). A monotonic sample earlier than a stored instant
-    /// cannot be measured, so it counts as expired (fail closed).
+    /// exclusive (`>=`). Elapsed time is measured on both the monotonic and
+    /// the suspend-aware clock, and either one reaching a limit expires the
+    /// arm. A sample earlier than a stored reading on either clock cannot be
+    /// measured, so it counts as expired (fail closed).
     fn expired_reason(&self, now: ArmTime) -> Option<DisarmReason> {
+        let lifetime_ms = i64::try_from(self.lifetime.as_millis()).unwrap_or(i64::MAX);
         let lifetime_over = now
             .monotonic
             .checked_duration_since(self.armed_at)
-            .is_none_or(|elapsed| elapsed >= self.lifetime);
+            .is_none_or(|elapsed| elapsed >= self.lifetime)
+            || suspend_aware_elapsed_reaches(
+                now.suspend_aware_ms,
+                self.armed_at_suspend_aware_ms,
+                lifetime_ms,
+            );
         if now.unix_ms >= self.armed_until_ms || lifetime_over {
             return Some(DisarmReason::TtlExpired);
         }
         let silence_over = now
             .monotonic
             .checked_duration_since(self.last_heartbeat)
-            .is_none_or(|silence| silence >= HEARTBEAT_TIMEOUT);
+            .is_none_or(|silence| silence >= HEARTBEAT_TIMEOUT)
+            || suspend_aware_elapsed_reaches(
+                now.suspend_aware_ms,
+                self.last_heartbeat_suspend_aware_ms,
+                HEARTBEAT_TIMEOUT_MS,
+            );
         silence_over.then_some(DisarmReason::HeartbeatLost)
     }
+}
+
+/// Whether `now - since` on the suspend-aware clock has reached `limit_ms`; a
+/// reading earlier than `since` fails closed.
+fn suspend_aware_elapsed_reaches(now: i64, since: i64, limit_ms: i64) -> bool {
+    now < since || now.saturating_sub(since) >= limit_ms
 }
 
 /// The armed-TX safety state machine.
@@ -385,9 +463,11 @@ impl ArmState {
         let session = ArmedSession {
             operator_callsign: grant.operator_callsign,
             armed_at: now.monotonic,
+            armed_at_suspend_aware_ms: now.suspend_aware_ms,
             lifetime: Duration::from_millis(lifetime_ms.unsigned_abs()),
             armed_until_ms: grant.armed_until_ms,
             last_heartbeat: now.monotonic,
+            last_heartbeat_suspend_aware_ms: now.suspend_aware_ms,
             heartbeat_interval_sec: grant.heartbeat_interval_sec,
             scope_tx: true,
             current_jti: grant.jti,
@@ -480,6 +560,7 @@ impl ArmState {
         // Accept: advance the high-water seq and slide the dead-man window.
         s.last_heartbeat_seq = Some(seq);
         s.last_heartbeat = now.monotonic;
+        s.last_heartbeat_suspend_aware_ms = now.suspend_aware_ms;
         Vec::new()
     }
 
@@ -630,11 +711,19 @@ mod tests {
         at2(ms, ms)
     }
 
-    /// Independent clocks: wall `unix_ms`, monotonic origin + `mono_ms`.
+    /// Independent clocks: wall `unix_ms`, monotonic origin + `mono_ms`; the
+    /// suspend-aware clock matches monotonic (no suspend).
     fn at2(unix_ms: i64, mono_ms: i64) -> ArmTime {
+        at3(unix_ms, mono_ms, mono_ms)
+    }
+
+    /// All three clocks independent: `suspend_ms` runs ahead of `mono_ms` by
+    /// however long the host has been suspended.
+    fn at3(unix_ms: i64, mono_ms: i64, suspend_ms: i64) -> ArmTime {
         ArmTime {
             unix_ms,
             monotonic: mono_base() + Duration::from_millis(mono_ms.unsigned_abs()),
+            suspend_aware_ms: suspend_ms,
         }
     }
 
@@ -1020,6 +1109,102 @@ mod tests {
         // Wall jumps 100 s forward (still before armedUntil = T0 + TTL); the
         // monotonic heartbeat age is only 1 s.
         assert!(st.tx_permitted(at2(T0 + 100_000, T0 + 1_000)));
+    }
+
+    #[test]
+    fn suspend_past_the_dead_man_window_expires_the_arm() {
+        let mut st = armed_consented();
+        // The host slept 30 s: the monotonic clock advanced only 1 s, the
+        // suspend-aware clock the full window. Wall time stays before
+        // armedUntil, so only the silence check can catch it.
+        let now = at3(
+            T0 + HEARTBEAT_TIMEOUT_MS,
+            T0 + 1_000,
+            T0 + HEARTBEAT_TIMEOUT_MS,
+        );
+        assert_eq!(
+            st.tx_permit_reason(now),
+            TxPermit::Denied(DenyReason::HeartbeatLost)
+        );
+        // A heartbeat on wake is too late: it expires the arm, then a fresh
+        // heartbeat cannot revive it.
+        let effects = st.heartbeat(JTI, 1, now);
+        assert_eq!(disarm_counts(&effects, DisarmReason::HeartbeatLost), (1, 1));
+        assert!(!st.is_armed());
+        assert!(st.heartbeat(JTI, 2, now).is_empty());
+        assert!(!st.tx_permitted(now));
+
+        let mut st = armed_consented();
+        assert_eq!(
+            disarm_counts(&st.tick(now), DisarmReason::HeartbeatLost),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn suspend_short_of_the_dead_man_window_leaves_liveness_fresh() {
+        let st = armed_consented();
+        let now = at3(
+            T0 + HEARTBEAT_TIMEOUT_MS - 1,
+            T0 + 1_000,
+            T0 + HEARTBEAT_TIMEOUT_MS - 1,
+        );
+        assert!(st.tx_permitted(now));
+    }
+
+    #[test]
+    fn heartbeat_slides_the_suspend_aware_window_too() {
+        let mut st = armed_consented();
+        // Heartbeat after a 20 s suspend (1 s awake), then another 20 s
+        // suspend: 40 s since the arm, but only 20 s since the heartbeat.
+        assert!(st
+            .heartbeat(JTI, 1, at3(T0 + 21_000, T0 + 1_000, T0 + 21_000))
+            .is_empty());
+        assert!(st.tx_permitted(at3(T0 + 41_000, T0 + 2_000, T0 + 41_000)));
+        assert!(!st.tx_permitted(at3(T0 + 51_000, T0 + 2_000, T0 + 51_000)));
+    }
+
+    #[test]
+    fn suspend_past_the_arm_lifetime_expires_the_arm() {
+        let mut st = armed_consented();
+        // The suspend-aware clock reaches the arm's lifetime while wall time
+        // (stepped back) is still short of armedUntil and the monotonic clock
+        // saw only 1 s. TTL expiry wins over heartbeat loss.
+        let now = at3(T0 + 1_000, T0 + 1_000, T0 + TTL);
+        assert_eq!(
+            st.tx_permit_reason(now),
+            TxPermit::Denied(DenyReason::Expired)
+        );
+        assert_eq!(
+            disarm_counts(&st.tick(now), DisarmReason::TtlExpired),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn suspend_aware_clock_running_backwards_fails_closed() {
+        let st = armed_consented();
+        assert!(!st.tx_permitted(at3(T0 + 1_000, T0 + 1_000, T0 - 1)));
+    }
+
+    #[test]
+    fn real_suspend_aware_clock_moves_forward_with_monotonic_time() {
+        let a = ArmTime::now();
+        std::thread::sleep(Duration::from_millis(20));
+        let b = ArmTime::now();
+        let susp_ms = b.suspend_aware_ms - a.suspend_aware_ms;
+        // The sleep sits between the two readings, so at least 20 ms passed
+        // (19 after millisecond truncation). No suspend happened, so it cannot
+        // run far ahead of the monotonic clock either.
+        assert!(
+            susp_ms >= 19,
+            "suspend-aware clock advanced only {susp_ms} ms"
+        );
+        let mono_ms = i64::try_from(b.monotonic.duration_since(a.monotonic).as_millis()).unwrap();
+        assert!(
+            susp_ms <= mono_ms + 1_000,
+            "suspend-aware {susp_ms} ms vs monotonic {mono_ms} ms"
+        );
     }
 
     #[test]
@@ -1505,8 +1690,9 @@ mod tests {
 
     /// A shadow model of every gate, computed independently of `ArmState`'s
     /// internals, to cross-check the safety invariant:
-    /// permitted ⇒ armed ∧ scope ∧ wall < armedUntil ∧ mono lifetime left ∧
-    /// heartbeat-fresh (mono) ∧ consent ∧ ¬killed.
+    /// permitted ⇒ armed ∧ scope ∧ wall < armedUntil ∧ lifetime left (mono and
+    /// suspend-aware) ∧ heartbeat-fresh (mono and suspend-aware) ∧ consent ∧
+    /// ¬killed.
     ///
     /// Expiry is terminal in the model: once any deadline has passed, the next
     /// heartbeat or tick drops the arm, and a later heartbeat cannot revive it.
@@ -1517,6 +1703,8 @@ mod tests {
         lifetime: i64,
         armed_until_unix: i64,
         last_hb_mono: i64,
+        armed_at_susp: i64,
+        last_hb_susp: i64,
         scope_tx: bool,
         consent: bool,
         kill: bool,
@@ -1530,22 +1718,28 @@ mod tests {
                 lifetime: 0,
                 armed_until_unix: 0,
                 last_hb_mono: 0,
+                armed_at_susp: 0,
+                last_hb_susp: 0,
                 scope_tx: false,
                 consent: false,
                 kill: false,
             }
         }
-        fn deadline_passed(&self, unix: i64, mono: i64) -> bool {
+        fn deadline_passed(&self, unix: i64, mono: i64, susp: i64) -> bool {
             unix >= self.armed_until_unix
                 || mono < self.armed_at_mono
                 || mono - self.armed_at_mono >= self.lifetime
                 || mono < self.last_hb_mono
                 || mono - self.last_hb_mono >= HEARTBEAT_TIMEOUT_MS
+                || susp < self.armed_at_susp
+                || susp - self.armed_at_susp >= self.lifetime
+                || susp < self.last_hb_susp
+                || susp - self.last_hb_susp >= HEARTBEAT_TIMEOUT_MS
         }
-        fn any_gate_closed(&self, unix: i64, mono: i64) -> bool {
+        fn any_gate_closed(&self, unix: i64, mono: i64, susp: i64) -> bool {
             !self.armed
                 || !self.scope_tx
-                || self.deadline_passed(unix, mono)
+                || self.deadline_passed(unix, mono, susp)
                 || !self.consent
                 || self.kill
         }
@@ -1562,6 +1756,9 @@ mod tests {
             // random skew (forward or backward steps) so the two clocks diverge.
             let mut mono: i64 = 1_000_000;
             let mut unix: i64 = 1_000_000;
+            // The suspend-aware clock runs with monotonic time plus any
+            // simulated host suspend (which the monotonic clock misses).
+            let mut susp: i64 = 1_000_000;
             // Per-arm jti + a monotonic heartbeat seq so every heartbeat this
             // trajectory issues names the live arm with a fresh seq: only the
             // deadline decides whether it is accepted.
@@ -1573,9 +1770,15 @@ mod tests {
                 // Advance time by a bounded random amount (can cross deadlines)
                 // with no tick in between.
                 let dt = rng.below(40_000) as i64;
+                let slept = if rng.below(4) == 0 {
+                    rng.below(40_000) as i64
+                } else {
+                    0
+                };
                 mono += dt;
-                unix += dt + rng.below(20_001) as i64 - 10_000;
-                let now = at2(unix, mono);
+                susp += dt + slept;
+                unix += dt + slept + rng.below(20_001) as i64 - 10_000;
+                let now = at3(unix, mono, susp);
 
                 match rng.below(6) {
                     0 => {
@@ -1604,6 +1807,8 @@ mod tests {
                             sh.lifetime = ttl;
                             sh.armed_until_unix = unix + ttl;
                             sh.last_hb_mono = mono;
+                            sh.armed_at_susp = susp;
+                            sh.last_hb_susp = susp;
                             sh.scope_tx = true;
                             // A fresh arm resets the heartbeat sequence.
                             cur_jti = jti;
@@ -1615,11 +1820,12 @@ mod tests {
                         hb_seq += 1;
                         st.heartbeat(&cur_jti, hb_seq, now);
                         if sh.armed {
-                            if sh.deadline_passed(unix, mono) {
+                            if sh.deadline_passed(unix, mono, susp) {
                                 // Terminal: a late heartbeat expires the arm.
                                 sh.armed = false;
                             } else {
                                 sh.last_hb_mono = mono;
+                                sh.last_hb_susp = susp;
                             }
                         }
                     }
@@ -1639,7 +1845,7 @@ mod tests {
                     }
                     _ => {
                         st.tick(now);
-                        if sh.armed && sh.deadline_passed(unix, mono) {
+                        if sh.armed && sh.deadline_passed(unix, mono, susp) {
                             sh.armed = false;
                         }
                     }
@@ -1657,13 +1863,13 @@ mod tests {
                     HEARTBEAT_TIMEOUT_MS,
                     200_000,
                 ] {
-                    let (qu, qm) = (unix + dt, mono + dt);
-                    let permitted = st.tx_permitted(at2(qu, qm));
+                    let (qu, qm, qs) = (unix + dt, mono + dt, susp + dt);
+                    let permitted = st.tx_permitted(at3(qu, qm, qs));
 
                     // THE SAFETY INVARIANT: if permitted, no gate may be closed.
                     if permitted {
                         assert!(
-                            !sh.any_gate_closed(qu, qm),
+                            !sh.any_gate_closed(qu, qm, qs),
                             "SAFETY VIOLATION: tx_permitted(true) with a closed gate. \
                              shadow: armed={} scope={} armed_at_mono={} lifetime={} \
                              armed_until_unix={} last_hb_mono={} consent={} kill={} \
@@ -1679,9 +1885,9 @@ mod tests {
                         );
                     }
                     // And the converse: with every gate open, the impl permits.
-                    assert_eq!(permitted, !sh.any_gate_closed(qu, qm));
+                    assert_eq!(permitted, !sh.any_gate_closed(qu, qm, qs));
                     // A Permitted verdict must agree the boolean is true.
-                    let reason = st.tx_permit_reason(at2(qu, qm));
+                    let reason = st.tx_permit_reason(at3(qu, qm, qs));
                     assert_eq!(permitted, matches!(reason, TxPermit::Permitted));
                 }
             }

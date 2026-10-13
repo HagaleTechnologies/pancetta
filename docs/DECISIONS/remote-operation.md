@@ -403,3 +403,9 @@ Normative station behaviour for heartbeat timing:
   time. At acceptance the lifetime is `min(verified ttl, armedUntil − now)`, so a delay between
   verification and acceptance cannot extend the grant. Production gates take their `ArmTime`
   sample after acquiring the arm lock. A monotonic sample earlier than a stored instant denies.
+- **Suspend counts as silence.** `Instant`'s monotonic clock stops while the host sleeps on Linux
+  and macOS, so silence and lifetime are also measured on a suspend-aware clock (Linux
+  `CLOCK_BOOTTIME`, Apple `CLOCK_MONOTONIC`; elsewhere it follows `Instant`). Either clock reaching
+  a limit expires the arm, so an operator silent through a suspend longer than 30 s must re-arm on
+  wake. A wall-clock forward step still does not expire liveness; only real elapsed time does. A
+  suspend-aware sample earlier than the stored one denies.

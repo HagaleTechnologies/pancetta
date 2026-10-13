@@ -47,9 +47,10 @@ mixing up which gate you are near.
 never revive the arm; only a fresh signed `txArm` can. The 5–15 s
 `heartbeatIntervalSec` is the client's send cadence, not the station's timeout.
 
-Timing-sensitive calls take an `ArmTime` (wall ms + monotonic `Instant`):
-silence and lifetime use the monotonic clock, the signed `armedUntil` uses wall
-time. The gate helpers take a closure (`ArmTime::now` in production) and call it
+Timing-sensitive calls take an `ArmTime` (wall ms + monotonic `Instant` +
+suspend-aware ms): silence and lifetime use both the monotonic and the
+suspend-aware clock (either reaching a limit expires the arm, so a host suspend
+longer than 30 s needs a fresh arm), the signed `armedUntil` uses wall time. The gate helpers take a closure (`ArmTime::now` in production) and call it
 only after locking the arm, so a lock wait cannot make the sample stale.
 
 Testing gotchas: build `ArmTime`s from one shared `Instant` origin plus explicit
