@@ -5386,19 +5386,23 @@ async fn supersede_and_rekey_or_bundle(
         // filter closes for a drained backlog. This function only ever
         // sees TWO identities (the whole in-flight side's, and the new
         // item's own), so a genuine conflict is a straight inequality
-        // check: `None` on either side means "no bound identity" (a
-        // pre-PAN-91 producer, degrades to the boolean-only gate) and is
-        // never itself a conflict. On a real conflict, refuse to bundle —
-        // fall through to the existing over-capacity path below, which
-        // abandons the in-flight side and replaces it with just the new
-        // request; the retry loop's own key-time gate re-verifies the new
-        // request's identity independently before it actually keys.
+        // check. PAN-98: `None` (the WSJT-X UDP bridge) and `Some` (the
+        // station agent) are also a conflict — they are different channels
+        // with independent consent, and the bundle's single folded identity
+        // would make its key-time gate check only ONE channel's consent.
+        // Two `None` sides share a channel and are never a conflict. On a
+        // real conflict, refuse to bundle — fall through to the existing
+        // over-capacity path below, which abandons the in-flight side and
+        // replaces it with just the new request; the retry loop's own
+        // key-time gate re-verifies the new request's channel and identity
+        // independently before it actually keys.
         let identity_conflict = in_flight_origin == crate::message_bus::TxOrigin::Remote
             && new_origin == crate::message_bus::TxOrigin::Remote
-            && matches!(
-                (&in_flight_remote_client_key_id, &new_remote_client_key_id),
-                (Some(a), Some(b)) if a != b
-            );
+            && match (&in_flight_remote_client_key_id, &new_remote_client_key_id) {
+                (Some(a), Some(b)) => a != b,
+                (None, Some(_)) | (Some(_), None) => true,
+                (None, None) => false,
+            };
         if identity_conflict {
             warn!(
                 target: "pancetta::tx.policy",
@@ -12937,6 +12941,99 @@ mod supersede_rekey_tests {
         // Working state also mutated to the new item (collision fallback).
         assert_eq!(message_text, "CQ K5ARH EM12");
         assert_eq!(frequency_offset, 1400.0);
+    }
+
+    /// PAN-98: a station-agent-bound in-flight stream (`Some` identity) and a
+    /// superseding WSJT-X UDP request (`None` identity) — or the reverse —
+    /// are different channels with independent consent. Folding them would
+    /// tag the bundle with ONE identity, so its key-time gate would check
+    /// only one channel's consent and the other channel's frame would key by
+    /// proxy. This must produce an identity-conflict `Replace`, never
+    /// `Bundle`, in both directions.
+    #[tokio::test]
+    async fn supersede_refuses_to_bundle_across_consent_channels() {
+        for (in_flight_id, new_id) in [(Some("client-a"), None), (None, Some("client-a"))] {
+            let bus = MessageBus::new(16).unwrap();
+            let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+
+            let now = chrono::Utc::now();
+            let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
+                pancetta_core::slot::current_slot_start_with_period(
+                    now,
+                    pancetta_core::slot::SLOT_NS,
+                ),
+                pancetta_core::slot::SLOT_NS,
+            );
+
+            let mut message_text = "OLD TEXT".to_string();
+            let mut frequency_offset = 1000.0;
+            let mut schedule = super::schedule_tx(
+                now,
+                cur_parity,
+                20_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+            );
+            let ptt_active = Arc::new(AtomicBool::new(true));
+            let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+
+            let in_flight = [crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH R-15".to_string(),
+                frequency_offset: 1000.0,
+                qso_id: Some("qso-1".to_string()),
+            }];
+
+            let new_request = MessageType::TransmitRequest {
+                message_text: "CQ K5ARH EM12".to_string(),
+                frequency_offset: 1400.0,
+                qso_id: Some("qso-2".to_string()),
+                tx_parity: Some(cur_parity),
+                origin: crate::message_bus::TxOrigin::Remote,
+                remote_client_key_id: new_id.map(str::to_string),
+            };
+
+            let outcome = super::supersede_and_rekey_or_bundle(
+                new_request,
+                &mut message_text,
+                &mut frequency_offset,
+                &mut schedule,
+                &bus,
+                &ptt_active,
+                &last_ptt_on_ms,
+                20_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+                pancetta_config::station::TxSelfParity::Auto,
+                now,
+                2,
+                crate::message_bus::TxOrigin::Remote,
+                in_flight_id.map(str::to_string),
+                &in_flight,
+            )
+            .await;
+
+            match outcome {
+                super::SupersedeOutcome::Replace {
+                    remote_client_key_id,
+                    identity_conflict,
+                    ..
+                } => {
+                    assert_eq!(
+                        remote_client_key_id.as_deref(),
+                        new_id,
+                        "Replace must carry the NEW request's own identity (channel)"
+                    );
+                    assert!(
+                        identity_conflict,
+                        "a cross-channel Replace must be flagged as a conflict"
+                    );
+                }
+                other => panic!(
+                    "cross-channel in-flight/new streams ({in_flight_id:?} / {new_id:?}) \
+                     must never fold into a Bundle, got {other:?}"
+                ),
+            }
+        }
     }
 
     /// PAN-91 review follow-up: an in-flight stream bound to one remote
