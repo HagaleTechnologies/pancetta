@@ -1191,7 +1191,11 @@ mod interruptible_sleep_tests {
 
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut st = pancetta_agent::arm::ArmState::new();
-        st.set_channel_consent(pancetta_agent::arm::ConsentChannel::StationAgent, true, now_ms);
+        st.set_channel_consent(
+            pancetta_agent::arm::ConsentChannel::StationAgent,
+            true,
+            now_ms,
+        );
         st.set_channel_consent(pancetta_agent::arm::ConsentChannel::WsjtxUdp, true, now_ms);
         st.arm(
             pancetta_agent::arm::VerifiedArmGrant {
@@ -1285,7 +1289,11 @@ mod interruptible_sleep_tests {
 
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut st = pancetta_agent::arm::ArmState::new();
-        st.set_channel_consent(pancetta_agent::arm::ConsentChannel::StationAgent, true, now_ms);
+        st.set_channel_consent(
+            pancetta_agent::arm::ConsentChannel::StationAgent,
+            true,
+            now_ms,
+        );
         st.set_channel_consent(pancetta_agent::arm::ConsentChannel::WsjtxUdp, true, now_ms);
         st.arm(
             pancetta_agent::arm::VerifiedArmGrant {
@@ -1432,7 +1440,11 @@ mod interruptible_sleep_tests {
 
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut st = pancetta_agent::arm::ArmState::new();
-        st.set_channel_consent(pancetta_agent::arm::ConsentChannel::StationAgent, true, now_ms);
+        st.set_channel_consent(
+            pancetta_agent::arm::ConsentChannel::StationAgent,
+            true,
+            now_ms,
+        );
         st.set_channel_consent(pancetta_agent::arm::ConsentChannel::WsjtxUdp, true, now_ms);
         st.arm(
             pancetta_agent::arm::VerifiedArmGrant {
@@ -12478,7 +12490,11 @@ mod disarm_interrupt_signal_tests {
         // pre-PTT gap.
         let mut st = pancetta_agent::arm::ArmState::new();
         let now_ms = chrono::Utc::now().timestamp_millis();
-        st.set_channel_consent(pancetta_agent::arm::ConsentChannel::StationAgent, true, now_ms);
+        st.set_channel_consent(
+            pancetta_agent::arm::ConsentChannel::StationAgent,
+            true,
+            now_ms,
+        );
         st.set_channel_consent(pancetta_agent::arm::ConsentChannel::WsjtxUdp, true, now_ms);
         st.arm(
             pancetta_agent::arm::VerifiedArmGrant {
@@ -15077,7 +15093,11 @@ mod coalesce_tests {
         // client-a is armed; client-b is not.
         let mut st = pancetta_agent::arm::ArmState::new();
         let now_ms = chrono::Utc::now().timestamp_millis();
-        st.set_channel_consent(pancetta_agent::arm::ConsentChannel::StationAgent, true, now_ms);
+        st.set_channel_consent(
+            pancetta_agent::arm::ConsentChannel::StationAgent,
+            true,
+            now_ms,
+        );
         st.set_channel_consent(pancetta_agent::arm::ConsentChannel::WsjtxUdp, true, now_ms);
         st.arm(
             pancetta_agent::arm::VerifiedArmGrant {

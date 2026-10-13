@@ -53,9 +53,12 @@
 //!   `controller` and disarms; a mere listener disconnecting disarms nothing.
 //! - **Verify + arm** on a `txArmGrant`: the two-stage crown-jewel verification
 //!   ([`CapabilityVerifier`]) mints a [`VerifiedArmGrant`] which is fed into the
-//!   coordinator's shared `remote_tx_arm` [`ArmState`]. Once armed (AND the
-//!   operator's local `remote_tx_enabled` consent is ON), a `TxOrigin::Remote`
-//!   transmit request will key PTT at the TX worker's arm gate.
+//!   coordinator's shared `remote_tx_arm` [`ArmState`]. The arm is refused
+//!   unless THIS channel's own local consent (`remote_tx_enabled`) is ON —
+//!   consent is tracked per channel, so the WSJT-X UDP bridge's
+//!   `allow_tx_initiation` never satisfies it. Once armed, a station-agent
+//!   `TxOrigin::Remote` transmit request will key PTT at the TX worker's arm
+//!   gate, which re-checks this channel's consent at key-time.
 //! - **Heartbeat / disarm / control-loss** all drive the same `ArmState`:
 //!   a heartbeat that names the current arm (`arm_jti`) with a monotonic `seq`
 //!   slides the dead-man window (a replayed/wrong-arm one is rejected, window
@@ -94,9 +97,10 @@
 //!
 //! Disabled OR unpaired OR missing relay/pairing URL → the component spawns a
 //! no-op drain task (so additive bus sends never flood) and does nothing else.
-//! Local consent is still seeded into the arm from config at startup (so the
-//! gate reflects `remote_tx_enabled` even when the transport is off), matching
-//! the coordinator's constructor seeding — this is idempotent.
+//! Per-channel local consent is still seeded into the arm from config at
+//! startup (so the gate reflects `remote_tx_enabled` even when the transport
+//! is off), matching the coordinator's constructor seeding — this is
+//! idempotent.
 
 pub mod net;
 
@@ -721,8 +725,9 @@ fn controller_gate(ctx: &mut ArmContext, peer: &str, now: i64) -> ControllerGate
 /// - `Arm { capability_token, grant }` → verify the capabilityToken as a
 ///   SEPARATE input (against the pinned IdP key) then verify the client-signed
 ///   grant (fail-closed, including the `txEnabledUntil` clock-2 gate + the
-///   best-effort deny-list) → `arm.arm()` on success, audited `TxDenied` on any
-///   verification error (NEVER arms on failure). The token is NOT extracted from
+///   best-effort deny-list), then require this channel's own consent
+///   (`remote_tx_enabled`) → `arm.arm()` on success, audited `TxDenied` on any
+///   verification error or missing consent (NEVER arms on failure). The token is NOT extracted from
 ///   the grant — `clientSig` signs only the grant, which references the token
 ///   via `capabilityJti`.
 /// - `Heartbeat` → `arm.heartbeat(arm_jti, seq)`: slides the dead-man window
@@ -734,8 +739,10 @@ fn controller_gate(ctx: &mut ArmContext, peer: &str, now: i64) -> ControllerGate
 ///   proceeds; a non-empty arm_jti that doesn't match the live arm still
 ///   disarms but logs a `warn!`.
 /// - `Qsy` / `SetSplit` → coordinator `RigControlMessage` (NON-TX rig control).
-/// - `TxRequest(_)` → audited `TxRequested` + routed into the REAL QSO engine
-///   via a `remote_origin = true` `QsoMessage` (P3.4c). Creating the QSO is
+/// - `TxRequest(_)` → refused (audited `TxDenied`) while this channel's own
+///   consent (`remote_tx_enabled`) is off; otherwise audited `TxRequested` +
+///   routed into the REAL QSO engine via a `remote_origin = true`
+///   `QsoMessage` (P3.4c). Creating the QSO is
 ///   allowed; TRANSMISSION is gated — every TransmitRequest the QSO emits is
 ///   `TxOrigin::Remote` and dropped by the armed-TX gate unless armed. This
 ///   arm never keys TX directly (no bypass).
@@ -2867,7 +2874,10 @@ mod tests {
         .await;
         assert_eq!(d.flow, Dispatch::Continue);
         assert!(
-            ctx.arm.lock().unwrap().tx_permitted(NOW, ConsentChannel::StationAgent),
+            ctx.arm
+                .lock()
+                .unwrap()
+                .tx_permitted(NOW, ConsentChannel::StationAgent),
             "a valid arm + consent must permit remote TX"
         );
     }
@@ -2912,7 +2922,10 @@ mod tests {
         .await;
         assert_eq!(d.flow, Dispatch::Continue);
         assert!(
-            ctx.arm.lock().unwrap().tx_permitted(NOW, ConsentChannel::StationAgent),
+            ctx.arm
+                .lock()
+                .unwrap()
+                .tx_permitted(NOW, ConsentChannel::StationAgent),
             "an owner edge present in both sets must be able to arm TX"
         );
     }
@@ -2947,7 +2960,10 @@ mod tests {
         .await;
         assert_eq!(d.flow, Dispatch::Continue);
         assert!(
-            !ctx.arm.lock().unwrap().tx_permitted(NOW, ConsentChannel::StationAgent),
+            !ctx.arm
+                .lock()
+                .unwrap()
+                .tx_permitted(NOW, ConsentChannel::StationAgent),
             "a delegated edge must never be able to arm TX, even with an \
              otherwise perfectly valid token/grant/signature/session"
         );
@@ -2987,7 +3003,10 @@ mod tests {
         .await;
         assert_eq!(d.flow, Dispatch::Continue);
         assert!(
-            !ctx.arm.lock().unwrap().tx_permitted(NOW, ConsentChannel::StationAgent),
+            !ctx.arm
+                .lock()
+                .unwrap()
+                .tx_permitted(NOW, ConsentChannel::StationAgent),
             "a grant signed for a different session must never arm this one"
         );
     }
@@ -3243,11 +3262,18 @@ mod tests {
             NOW,
         )
         .await;
-        assert!(ctx.arm.lock().unwrap().tx_permitted(NOW, ConsentChannel::StationAgent));
+        assert!(ctx
+            .arm
+            .lock()
+            .unwrap()
+            .tx_permitted(NOW, ConsentChannel::StationAgent));
         // No further heartbeats: at the dead-man deadline, tx_permitted is false.
         let dead = NOW + HEARTBEAT_TIMEOUT_MS;
         assert!(
-            !ctx.arm.lock().unwrap().tx_permitted(dead, ConsentChannel::StationAgent),
+            !ctx.arm
+                .lock()
+                .unwrap()
+                .tx_permitted(dead, ConsentChannel::StationAgent),
             "no heartbeat within the window must auto-deny (dead-man)"
         );
         // A heartbeat *before* the deadline slides the window.
@@ -3275,10 +3301,10 @@ mod tests {
         )
         .await;
         assert!(
-            ctx2.arm
-                .lock()
-                .unwrap()
-                .tx_permitted(NOW + 20_000 + HEARTBEAT_TIMEOUT_MS - 1, ConsentChannel::StationAgent),
+            ctx2.arm.lock().unwrap().tx_permitted(
+                NOW + 20_000 + HEARTBEAT_TIMEOUT_MS - 1,
+                ConsentChannel::StationAgent
+            ),
             "a heartbeat must slide the dead-man window"
         );
     }
@@ -3299,7 +3325,11 @@ mod tests {
             NOW,
         )
         .await;
-        assert!(ctx.arm.lock().unwrap().tx_permitted(NOW, ConsentChannel::StationAgent));
+        assert!(ctx
+            .arm
+            .lock()
+            .unwrap()
+            .tx_permitted(NOW, ConsentChannel::StationAgent));
 
         // Accept seq 5 at NOW+5000 (slides the window to there).
         let accepted_at = NOW + 5_000;
@@ -3344,9 +3374,16 @@ mod tests {
         .await;
 
         // Dead-man expires on schedule despite the later replays.
-        assert!(ctx.arm.lock().unwrap().tx_permitted(deadline - 1, ConsentChannel::StationAgent));
+        assert!(ctx
+            .arm
+            .lock()
+            .unwrap()
+            .tx_permitted(deadline - 1, ConsentChannel::StationAgent));
         assert!(
-            !ctx.arm.lock().unwrap().tx_permitted(deadline, ConsentChannel::StationAgent),
+            !ctx.arm
+                .lock()
+                .unwrap()
+                .tx_permitted(deadline, ConsentChannel::StationAgent),
             "a replayed-seq heartbeat must NOT hold the arm open past the dead-man deadline"
         );
     }
@@ -3408,7 +3445,10 @@ mod tests {
         )
         .await;
         assert!(
-            !ctx.arm.lock().unwrap().tx_permitted(NOW, ConsentChannel::StationAgent),
+            !ctx.arm
+                .lock()
+                .unwrap()
+                .tx_permitted(NOW, ConsentChannel::StationAgent),
             "consent OFF must deny TX even after a valid arm"
         );
     }
@@ -3587,7 +3627,11 @@ mod tests {
             !ctx.arm.lock().unwrap().is_armed(),
             "a grant from a non-allow-listed client must NOT arm"
         );
-        assert!(!ctx.arm.lock().unwrap().tx_permitted(NOW, ConsentChannel::StationAgent));
+        assert!(!ctx
+            .arm
+            .lock()
+            .unwrap()
+            .tx_permitted(NOW, ConsentChannel::StationAgent));
     }
 
     // ── Explicit Disarm clears a live arm ───────────────────────────────────
@@ -3605,7 +3649,11 @@ mod tests {
             NOW,
         )
         .await;
-        assert!(ctx.arm.lock().unwrap().tx_permitted(NOW, ConsentChannel::StationAgent));
+        assert!(ctx
+            .arm
+            .lock()
+            .unwrap()
+            .tx_permitted(NOW, ConsentChannel::StationAgent));
         dispatch_action(
             ControlAction::Disarm {
                 arm_jti: "arm-jti-1".into(),
@@ -3696,7 +3744,11 @@ mod tests {
             !ctx.arm.lock().unwrap().is_armed(),
             "a token without txEnabledUntil must NEVER arm (clock-2 gate)"
         );
-        assert!(!ctx.arm.lock().unwrap().tx_permitted(NOW, ConsentChannel::StationAgent));
+        assert!(!ctx
+            .arm
+            .lock()
+            .unwrap()
+            .tx_permitted(NOW, ConsentChannel::StationAgent));
     }
 
     // ── txDisarm{armJti} disarms a live arm (armJti is a sanity match) ──────
@@ -3714,7 +3766,11 @@ mod tests {
             NOW,
         )
         .await;
-        assert!(ctx.arm.lock().unwrap().tx_permitted(NOW, ConsentChannel::StationAgent));
+        assert!(ctx
+            .arm
+            .lock()
+            .unwrap()
+            .tx_permitted(NOW, ConsentChannel::StationAgent));
         // A txDisarm naming the live arm disarms it.
         dispatch_action(
             ControlAction::Disarm {
@@ -3748,7 +3804,11 @@ mod tests {
             NOW,
         )
         .await;
-        assert!(ctx.arm.lock().unwrap().tx_permitted(NOW, ConsentChannel::StationAgent));
+        assert!(ctx
+            .arm
+            .lock()
+            .unwrap()
+            .tx_permitted(NOW, ConsentChannel::StationAgent));
         // A txDisarm naming a DIFFERENT arm still disarms (armJti is a sanity
         // match, not a gate — disarm-any is fail-safe TX-OFF).
         dispatch_action(
@@ -3905,7 +3965,10 @@ mod tests {
         .await;
         assert_eq!(out.flow, Dispatch::Continue);
         assert!(
-            ctx.arm.lock().unwrap().tx_permitted(NOW, ConsentChannel::StationAgent),
+            ctx.arm
+                .lock()
+                .unwrap()
+                .tx_permitted(NOW, ConsentChannel::StationAgent),
             "implicit-grab arm must permit TX exactly like the pre-controller path"
         );
         assert_eq!(
@@ -4046,7 +4109,10 @@ mod tests {
             "a grant naming a DIFFERENT peer than the demuxed sender must never arm"
         );
         assert!(
-            !ctx.arm.lock().unwrap().tx_permitted(NOW, ConsentChannel::StationAgent),
+            !ctx.arm
+                .lock()
+                .unwrap()
+                .tx_permitted(NOW, ConsentChannel::StationAgent),
             "tx must stay not-permitted after a rejected cross-peer arm grant"
         );
 
@@ -4615,7 +4681,10 @@ mod tests {
         let d = dispatch_action(action, CLIENT_KEY_ID, &mut ctx, &bus, agent_session_id, NOW).await;
         assert_eq!(d.flow, Dispatch::Continue);
         assert!(
-            ctx.arm.lock().unwrap().tx_permitted(NOW, ConsentChannel::StationAgent),
+            ctx.arm
+                .lock()
+                .unwrap()
+                .tx_permitted(NOW, ConsentChannel::StationAgent),
             "end-to-end: a verified Arm over Noise must permit remote TX"
         );
 
@@ -4635,7 +4704,11 @@ mod tests {
         // jti replay guard is per-ctx (fresh seen set), so this arms the state
         // machine but consent-off denies at the gate.
         assert!(
-            !ctx_off.arm.lock().unwrap().tx_permitted(NOW, ConsentChannel::StationAgent),
+            !ctx_off
+                .arm
+                .lock()
+                .unwrap()
+                .tx_permitted(NOW, ConsentChannel::StationAgent),
             "consent OFF must deny even after a verified Arm over Noise"
         );
     }
@@ -5046,7 +5119,10 @@ mod tests {
         let agent_kid = identity.key_id();
         let mut ctx = fresh_ctx(&agent_kid, HashSet::from([CLIENT_KEY_ID.to_string()]));
         let real_now = now_ms();
-        ctx.arm.lock().unwrap().set_channel_consent(ConsentChannel::StationAgent, true, real_now);
+        ctx.arm
+            .lock()
+            .unwrap()
+            .set_channel_consent(ConsentChannel::StationAgent, true, real_now);
         ctx.arm.lock().unwrap().arm(
             pancetta_agent::arm::VerifiedArmGrant {
                 operator_callsign: OPERATOR.to_string(),
@@ -5117,7 +5193,9 @@ mod tests {
         let arm = ctx.arm.clone();
         let ws = TriggerAfterWs::new(hello_ws, 4, move || {
             assert!(
-                arm.lock().unwrap().tx_permitted(now_ms(), ConsentChannel::StationAgent),
+                arm.lock()
+                    .unwrap()
+                    .tx_permitted(now_ms(), ConsentChannel::StationAgent),
                 "old hello retained the live arm"
             );
             let wait_ms = expires.load(Ordering::Acquire) - now_ms();
@@ -6220,7 +6298,10 @@ mod tests {
         // grant must be armed against real "now" too or it reads as already
         // TTL-expired.
         let real_now = now_ms();
-        ctx.arm.lock().unwrap().set_channel_consent(ConsentChannel::StationAgent, true, real_now);
+        ctx.arm
+            .lock()
+            .unwrap()
+            .set_channel_consent(ConsentChannel::StationAgent, true, real_now);
         ctx.arm.lock().unwrap().arm(
             pancetta_agent::arm::VerifiedArmGrant {
                 operator_callsign: OPERATOR.to_string(),
@@ -6232,7 +6313,10 @@ mod tests {
             real_now,
         );
         assert!(
-            ctx.arm.lock().unwrap().tx_permitted(real_now, ConsentChannel::StationAgent),
+            ctx.arm
+                .lock()
+                .unwrap()
+                .tx_permitted(real_now, ConsentChannel::StationAgent),
             "setup sanity: must be armed+permitted before the peer establishes"
         );
 
@@ -6385,7 +6469,10 @@ mod tests {
         // shows `transmitArmed: true`, giving the later broadcast a real
         // true→false transition to prove for PEER_B.
         let real_now = now_ms();
-        ctx.arm.lock().unwrap().set_channel_consent(ConsentChannel::StationAgent, true, real_now);
+        ctx.arm
+            .lock()
+            .unwrap()
+            .set_channel_consent(ConsentChannel::StationAgent, true, real_now);
         ctx.arm.lock().unwrap().arm(
             pancetta_agent::arm::VerifiedArmGrant {
                 operator_callsign: OPERATOR.to_string(),
@@ -6853,7 +6940,13 @@ mod tests {
             NOW,
         )
         .await;
-        assert!(ctx.arm.lock().unwrap().tx_permitted(NOW, ConsentChannel::StationAgent), "setup: armed");
+        assert!(
+            ctx.arm
+                .lock()
+                .unwrap()
+                .tx_permitted(NOW, ConsentChannel::StationAgent),
+            "setup: armed"
+        );
         assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
         revoke_admission(&ctx, CLIENT_KEY_ID);
         (ctx, hamlib_rx)
@@ -6914,7 +7007,10 @@ mod tests {
         )
         .await;
         assert!(
-            !ctx.arm.lock().unwrap().tx_permitted(NOW + 1_000, ConsentChannel::StationAgent),
+            !ctx.arm
+                .lock()
+                .unwrap()
+                .tx_permitted(NOW + 1_000, ConsentChannel::StationAgent),
             "a revoked peer may still disarm"
         );
 
@@ -6934,7 +7030,11 @@ mod tests {
             ctx.controller.is_none(),
             "a revoked peer may still release control"
         );
-        assert!(!ctx.arm.lock().unwrap().tx_permitted(NOW + 1_000, ConsentChannel::StationAgent));
+        assert!(!ctx
+            .arm
+            .lock()
+            .unwrap()
+            .tx_permitted(NOW + 1_000, ConsentChannel::StationAgent));
     }
 
     #[tokio::test]
@@ -7048,7 +7148,13 @@ mod tests {
             NOW,
         )
         .await;
-        assert!(ctx.arm.lock().unwrap().tx_permitted(NOW, ConsentChannel::StationAgent), "setup: armed");
+        assert!(
+            ctx.arm
+                .lock()
+                .unwrap()
+                .tx_permitted(NOW, ConsentChannel::StationAgent),
+            "setup: armed"
+        );
         assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
 
         let out = dispatch_action(
@@ -7284,7 +7390,10 @@ mod tests {
             },
             NOW,
         );
-        assert!(st.tx_permitted(NOW, ConsentChannel::StationAgent), "setup: armed");
+        assert!(
+            st.tx_permitted(NOW, ConsentChannel::StationAgent),
+            "setup: armed"
+        );
         drop(st);
         ctx.controller = Some(kid.to_string());
     }
@@ -7417,7 +7526,13 @@ mod tests {
 
         let sends = reconcile_authorizations(&mut ctx, &mut sess, NOW);
         assert_eq!(ctx.controller, None, "a revoked controller is released");
-        assert!(!ctx.arm.lock().unwrap().tx_permitted(NOW, ConsentChannel::StationAgent), "and disarmed");
+        assert!(
+            !ctx.arm
+                .lock()
+                .unwrap()
+                .tx_permitted(NOW, ConsentChannel::StationAgent),
+            "and disarmed"
+        );
         let disarmed = disarmed_records(&ctx);
         assert_eq!(
             disarmed.len(),

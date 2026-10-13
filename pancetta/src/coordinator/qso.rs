@@ -7814,7 +7814,11 @@ mod auto_73_tests {
         // client-b holds the arm — a mismatch against the entry's client-a.
         let mut st = pancetta_agent::arm::ArmState::new();
         let now_ms = chrono::Utc::now().timestamp_millis();
-        st.set_channel_consent(pancetta_agent::arm::ConsentChannel::StationAgent, true, now_ms);
+        st.set_channel_consent(
+            pancetta_agent::arm::ConsentChannel::StationAgent,
+            true,
+            now_ms,
+        );
         st.set_channel_consent(pancetta_agent::arm::ConsentChannel::WsjtxUdp, true, now_ms);
         st.arm(
             pancetta_agent::arm::VerifiedArmGrant {

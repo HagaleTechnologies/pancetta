@@ -550,10 +550,7 @@ impl ArmState {
     /// independently re-checks the clock so it is correct even if `tick` has not
     /// run for this `now`.
     pub fn tx_permitted(&self, now_ms: i64, channel: ConsentChannel) -> bool {
-        matches!(
-            self.tx_permit_reason(now_ms, channel),
-            TxPermit::Permitted
-        )
+        matches!(self.tx_permit_reason(now_ms, channel), TxPermit::Permitted)
     }
 
     /// The same gate as [`tx_permitted`](Self::tx_permitted), but returning the
@@ -646,7 +643,10 @@ mod tests {
     fn armed_with_consent_and_fresh_heartbeat_is_permitted() {
         let st = armed_consented();
         assert!(st.tx_permitted(T0, ConsentChannel::StationAgent));
-        assert_eq!(st.tx_permit_reason(T0, ConsentChannel::StationAgent), TxPermit::Permitted);
+        assert_eq!(
+            st.tx_permit_reason(T0, ConsentChannel::StationAgent),
+            TxPermit::Permitted
+        );
         assert_eq!(st.operator_callsign(), Some("N0CALL"));
     }
 
@@ -838,7 +838,10 @@ mod tests {
         // After the last accepted heartbeat (at T0+15_000) TX stays permitted
         // across the whole interval up to its own deadline.
         let last = T0 + 15_000;
-        assert!(st.tx_permitted(last + HEARTBEAT_TIMEOUT_MS - 1, ConsentChannel::StationAgent));
+        assert!(st.tx_permitted(
+            last + HEARTBEAT_TIMEOUT_MS - 1,
+            ConsentChannel::StationAgent
+        ));
         assert!(!st.tx_permitted(last + HEARTBEAT_TIMEOUT_MS, ConsentChannel::StationAgent));
     }
 
@@ -923,7 +926,10 @@ mod tests {
         // A low seq (1) is accepted for the NEW arm despite the old arm's seq 9.
         let effects = st.heartbeat("arm-jti-2", 1, T0 + 3_000);
         assert!(effects.is_empty(), "new arm accepts a low seq");
-        assert!(st.tx_permitted(T0 + 3_000 + HEARTBEAT_TIMEOUT_MS - 1, ConsentChannel::StationAgent));
+        assert!(st.tx_permitted(
+            T0 + 3_000 + HEARTBEAT_TIMEOUT_MS - 1,
+            ConsentChannel::StationAgent
+        ));
         // And the OLD arm's jti is now rejected (it names a defunct arm).
         assert!(is_hb_rejected(&st.heartbeat(JTI, 10, T0 + 3_000)));
     }
@@ -967,7 +973,10 @@ mod tests {
         let mut st = armed_consented();
         assert!(st.tx_permitted(T0, ConsentChannel::StationAgent));
         st.set_local_kill(true, T0);
-        assert!(!st.tx_permitted(T0, ConsentChannel::StationAgent), "killed => denied immediately");
+        assert!(
+            !st.tx_permitted(T0, ConsentChannel::StationAgent),
+            "killed => denied immediately"
+        );
         assert_eq!(
             st.tx_permit_reason(T0, ConsentChannel::StationAgent),
             TxPermit::Denied(DenyReason::LocallyKilled)

@@ -62,6 +62,22 @@ Q-0031 (<https://github.com/HagaleTechnologies/dispensa/pull/16>, merged) — pe
 5-check remote-TX security spine and CLAUDE.md's cross-repo contract-first policy; the
 merged PR is the concurrence record for shipping Option A.
 
+**Correction (2026-10-13, PAN-98): per-channel consent.** Option A's safety argument
+("each channel still carries its own upstream consent") held only for the WSJT-X UDP
+channel. The shared `ArmState` remains (one arm, one TX-worker gate); the shared
+consent boolean is gone. `ArmState` now holds one consent bit per channel
+(`ConsentChannel::{StationAgent, WsjtxUdp}`), seeded independently at both seeding sites
+from `remote_tx_enabled` and `enabled && allow_tx_initiation`;
+`remote_tx_arm_consent` is deleted. The originating channel's own current consent is
+required at every enforcement point: **arm**: `verify_and_arm` and `ArmState::arm` refuse
+without station-agent consent, since arming is a station-agent-only act. **Intent**: a
+station-agent `txRequest` is refused, audited `TxDenied`; WSJT-X Reply keeps its gate 2.
+**Transmission**: `remote_tx_permitted_for` and `ArmSnapshot` pick the bit from
+`remote_client_key_id`: `Some` means station agent, `None` means the WSJT-X UDP bridge.
+Consequence: with `remote_tx_enabled = false` nothing can arm, so WSJT-X-UDP-originated
+frames are dropped `not-armed` even with `allow_tx_initiation = true`. A follow-up
+dispensa question should record this correction against Q-0031's concurrence record.
+
 **v1 non-goals.** No IPv6 (multicast destinations are IPv4-only; an IPv6 `destination`
 falls back to non-multicast socket-option handling and — deliberately fail-closed for the
 inbound gate — is still treated as a multicast-shaped peer for source filtering, never

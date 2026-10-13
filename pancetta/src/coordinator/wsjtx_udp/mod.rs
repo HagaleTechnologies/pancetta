@@ -2276,7 +2276,6 @@ mod reply_tests {
         assert!(reply_to_call(&InMsg::Replay, &ring).is_none());
         assert!(reply_to_call(&InMsg::Close, &ring).is_none());
     }
-
 }
 
 #[cfg(test)]
