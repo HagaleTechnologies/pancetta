@@ -365,6 +365,19 @@ is one RR73 from a logged contact; cancelling it costs the chaser the QSO.
 Letting the existing watchdog and grace drain each Hound needs no new
 teardown policy, and the protection ends on its own as entries leave the set.
 
+**Re-engage bound.** A Hound that converts the Fox CQ skips
+`maybe_answer_caller`'s cap, so each extra Fox CQ could add one protected
+stream. Turning Fox mode back on before earlier Hounds finish, or engaging it
+twice, used to start another CQ every time; enough cycles grew the tracked
+population past `MAX_RETAINED_TX_STREAMS` (8), and the coalescer's hard clamp
+then cut a protected Hound. The engage arm now counts the active
+(non-terminal) Fox-admitted QSOs first (`active_fox_admitted_split`). It
+starts no CQ while a Fox CQ is still calling, or while Fox-admitted Hounds
+already number `fox.max_streams` or more. `fox_mode` still turns on, and the
+status line says no new CQ was started. This holds active Fox-admitted QSOs
+to `fox.max_streams + 1` (at most 8), the same as a single engage. Completed
+Hounds in their 45 s grace are not counted, as in `maybe_answer_caller`.
+
 **PAN-78.** PAN-78's admission cap decides whether a new QSO may open; PAN-76
 decides which open QSOs keep their TX slots. While Hounds finish, a new
 ordinary QSO is refused at admission (with PAN-78) or held at TX by the
@@ -375,8 +388,9 @@ Tests: `coordinator::tx::coalesce_tests::pan76_*`,
 `coordinator::tx::supersede_rekey_tests::pan76_supersede_refresh_of_one_hound_bundles_with_the_other_two`,
 `coordinator::qso::fox_admitted_tracking_tests`, and the real-component
 `coordinator::qso::respond_to_caller_admission_tests::pan76_fox_disengage_keeps_admitted_hounds_on_air`
-(AC1), `pan76_unanswered_fox_cq_leaves_the_fox_set_on_disengage` and
-`pan76_never_fox_manual_pileup_is_still_capped` (AC2).
+(AC1), `pan76_unanswered_fox_cq_leaves_the_fox_set_on_disengage`,
+`pan76_never_fox_manual_pileup_is_still_capped` (AC2) and
+`pan76_fox_reengage_starts_no_cq_while_finishing_hounds_fill_the_cap`.
 
 ## UTC re-anchoring after sleep/wake and clock steps (PAN-114, 2026-10-10)
 

@@ -78,6 +78,9 @@ the existing exchange), no new codec.
   15 Hz, and every Fox auto-answer) are tracked in the coordinator's `fox_admitted_qsos` and finish
   on the air: the TX coalescer keeps them first and never truncates them, and a new ordinary QSO
   waits until they no longer fill the normal cap. See `docs/DECISIONS/tx-scheduling.md` (PAN-76).
+- Turning Fox back on starts no new CQ while a Fox CQ is still calling or while Hounds from an
+  earlier engage still fill `max_streams`; Fox mode turns on and the status line says no new CQ
+  was started (PAN-76).
 
 ## Scope / non-goals (v1)
 - **Manual-engaged Fox**, answers callers as they arrive up to `fox_max_streams` (no fancy
