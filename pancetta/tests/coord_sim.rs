@@ -472,12 +472,7 @@ impl CoordSim {
             },
             pancetta_agent::arm::ArmTime::now(),
         );
-<<<<<<< HEAD
-        st.heartbeat("sim-arm-jti", 1, now_ms);
-=======
-        st.set_local_consent(true, now_ms);
         st.heartbeat("sim-arm-jti", 1, pancetta_agent::arm::ArmTime::now());
->>>>>>> fa8e11c0ea0722355af15e18c8ec053ab2449174
     }
 
     /// Drain all currently-buffered `QsoEvent`s and apply the coordinator's
