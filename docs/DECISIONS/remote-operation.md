@@ -313,3 +313,65 @@ de-authorizing established peers when an authorization poll revokes them.
 
 Follow-up: `takeControl` and implicit control grabs do not yet require a currently-valid
 `status`+ capability. That is an inbound control-rule change left for a separate ticket.
+
+## Live authority checks + eviction on revocation (PAN-96, 2026-10-12)
+
+PAN-95 made a peer's hello capability expire at use time. PAN-96 makes the rest of a peer's
+authority live too: revoking a client's authorization (or letting its token expire) now stops it
+on its current connection, not only the next time it reconnects. Plan:
+`thoughts/shared/plans/2026-10-12-PAN-96-revoking-or-expiring-a-remote-clients-authority-should-stop.md`.
+
+Decisions:
+
+- **D1 — per-use checks.** `peer_grants` is now admitted ∧ unexpired ∧ not deny-listed ∧ scope.
+  `peer_admitted` reads the live `tx_allow_list` on every call and fails closed on a poisoned lock.
+  `qsy`/`setSplit` and the outbound predicate `peer_may_receive` all go through it, so a peer the
+  poll task drops is refused and sent nothing from the moment the new list is published, before any
+  eviction runs.
+- **D2 — a dropped peer may only reduce authority.** At the top of `dispatch_action`, a peer that
+  is no longer admitted gets every action refused except `Disarm` and `ReleaseControl`. This runs
+  before `controller_gate`, so a revoked peer cannot implicitly grab control either. `Heartbeat` is
+  refused too: refusing it can only shorten an arm.
+- **D3 — token identity.** `PeerAuth` keeps the hello token's `jti`. Client identity is the
+  `PeerCtx` key (the handshake-proven keyId, equal to the token's `clientKeyId`), so no copy is kept.
+- **D4 — authorization generation.** `poll_authorizations_loop` bumps a shared
+  `authz_generation` counter after publishing the lists, and only when either list's contents
+  changed. A failed poll, or one that changes nothing, bumps nothing. Static-config stations never
+  bump it, so their session path is unchanged.
+- **D5 — reconcile in the session task.** `session_housekeeping` (the end of every loop iteration
+  and the PAN-34 malformed-frame path) first runs `reconcile_authorizations`. When the session's
+  `authz_generation_seen` lags the counter, it replaces the demux admission set and, for every peer
+  the live list no longer holds, drops its Noise transport, removes its `PeerCtx`, and adds its
+  hello `jti` to `revoked_jtis`. If an evicted peer held control or the arm, it disarms with
+  `authorization-revoked` (a no-op when the poll task already did, so no duplicate audit record),
+  releases control and sends the remaining peers the updated `controlState`. The step has no
+  `.await`, so no frame from the evicted peer is processed in between. Latency is one `RECV_TICK`
+  (200 ms) after the poll publishes.
+- **D6 — `MultiPeerSession::replace_allowed`.** Replaces the admission set and returns the evicted
+  keyIds. This also resolves the 2026-07-22 auto-populate spec's deferred non-goal: a client
+  authorized mid-session can now connect without waiting for the relay session to cycle.
+- **D7 — re-authentication.** An evicted client must be re-admitted, run a fresh Noise handshake
+  (its old transport keys are gone), and present a token with a new `jti`. The old token is refused
+  at `hello` and, through the existing `CapError::Revoked`, at arm.
+- **D8 — silent eviction.** No new wire frame, config key, CLI output or `AuditKind`. relay.v1 has
+  no kick frame, and an evicted client's unanswered requests and stopped display drive its own
+  reconnect. New `agent.control` log lines: "control frame refused — peer is no longer authorized
+  on this station", "remote peer evicted — its authorization was revoked; it must be re-authorized
+  and reconnect" and "hello capabilityToken was revoked on this station — fetch a fresh token".
+  A controller eviction also logs "controller evicted with a live arm — disarming" on `agent.tx`.
+
+Known limits:
+
+- `revoked_jtis` is process-lifetime and best-effort. A StationAgent restart clears it. The token's
+  own `exp` still bounds it, and the client also needs re-admission plus a new handshake.
+- A revoke followed by a re-authorization inside one poll interval is never observed, so nothing is
+  evicted. That is inherent to polling.
+- A scope downgrade on an edge that stays admitted takes effect at token expiry (at most 900 s for
+  non-TX tokens). The token's IdP-signed scopes stay the authority, and arm is still gated live by
+  `tx_arm_allow_list`.
+
+Tests: `expired_hello_capability_cannot_qsy_or_split` (the ticket's
+`security_review_expired_hello_still_controls_rig` evidence),
+`real_poll_revocation_stops_qsy_split_and_reads` and
+`revoking_a_connected_client_evicts_its_live_session` (`station_agent/mod.rs`), and the three
+`replace_allowed_*` tests (`multi_session.rs`).

@@ -19,7 +19,12 @@
 //!   terminal code is the first line of defense). The peer must then also
 //!   prove, inside the Noise handshake, that it holds the keys for that keyId
 //!   (PAN-95: a msg1 client identity proof bound to its Noise static key);
-//!   the relay's `src` label alone never establishes a peer.
+//!   the relay's `src` label alone never establishes a peer. Admission stays
+//!   live after that (PAN-96): a peer an authorization refresh drops is
+//!   refused at dispatch and sent nothing from the moment the new list is
+//!   published, and is evicted from the demux (transport dropped, hello token
+//!   deny-listed) on the session's next tick; a newly listed peer may connect
+//!   without a reconnect.
 //! - **Controller model — one controller at a time, free grab:** at most one
 //!   established peer holds `controller` (arm/QSY/split/TX-initiation)
 //!   at a time; every other connected peer is a live read-only viewer.
@@ -1972,9 +1977,10 @@ async fn run_session_loop(mut cfg: RunConfig) {
         client_keys: cfg.client_keys,
         tx_allow_list: cfg.tx_allow_list,
         tx_arm_allow_list: cfg.tx_arm_allow_list,
-        // v1: no cqdx-fed deny-list yet (empty ⇒ inert; the station-local
-        // TX-allow-list is the authoritative revoke). Future seam: populate
-        // this from a cqdx revocation feed on (re)connect.
+        // Starts empty; `reconcile_authorizations` adds the hello-token jti of
+        // every peer an authorization refresh evicts (PAN-96). It lives across
+        // reconnects for the rest of this task's lifetime. Future seam: a cqdx
+        // revocation feed could populate it too.
         revoked_jtis: HashSet::new(),
         seen_jtis: HashSet::new(),
         audit: cfg.audit,
@@ -5498,6 +5504,7 @@ mod tests {
         let audit = AuditLog::new(audit_tmp());
         let revocation_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let authz_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let cqdx_cfg = pancetta_config::network::CqdxConfig {
             enabled: true,
             base_url: "http://127.0.0.1:1".to_string(), // nothing listening — every request fails
@@ -5518,7 +5525,7 @@ mod tests {
             revocation_pending,
             shutdown_clone,
             Duration::from_millis(50),
-            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            authz_generation.clone(),
         ));
         tokio::time::sleep(Duration::from_millis(150)).await;
         shutdown.store(true, Ordering::Release);
@@ -5532,6 +5539,11 @@ mod tests {
             *tx_arm_allow_list.read().unwrap(),
             HashSet::from(["seed".to_string()]),
             "a failing poll must never clear the pre-seeded TX-arm-eligible allow-list"
+        );
+        assert_eq!(
+            authz_generation.load(Ordering::Acquire),
+            0,
+            "a failing poll must never bump the authorization generation (PAN-96)"
         );
     }
 

@@ -147,7 +147,9 @@ New invariants (added to the tested set):
 
 - A peer is established only after proving, inside the Noise IK handshake, that it holds the keys
   for the keyId the relay labels it with (PAN-95).
-- A peer not in `tx_allow_list` never allocates handshake state and never reaches dispatch.
+- A peer not in `tx_allow_list` never allocates handshake state and never reaches dispatch, and an
+  already-established peer dropped from it is evicted on the next authorization refresh and refused
+  at dispatch immediately (PAN-96).
 - No frame of any kind is sent to an established peer until it holds a currently-valid
   `status`-or-higher capability from a verified `hello`.
 - Control-mutating actions execute only for the controller (or a peer becoming controller via
