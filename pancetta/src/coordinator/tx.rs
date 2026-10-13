@@ -4932,7 +4932,7 @@ pub(crate) async fn coalesce_backlog_into(
         .read()
         .map(|s| s.clone())
         .unwrap_or_default();
-    let outcome = coalesce_transmit_requests_with_fox_priority(
+    let mut outcome = coalesce_transmit_requests_with_fox_priority(
         admitted,
         max_concurrent_qsos,
         |id| tx_qso_is_live(id, active_tx_qsos),
@@ -4987,6 +4987,46 @@ pub(crate) async fn coalesce_backlog_into(
         }
     }
 
+    // A bundle has only one remote identity and therefore one consent channel.
+    // Keep the first retained remote channel and defer the other, preserving
+    // its identity for the next worker pass and the final key-time check.
+    // Do this after newest-per-QSO selection so an older frame cannot survive
+    // just because a newer request for that QSO came from the other channel.
+    let bundle_channel = outcome
+        .retained
+        .iter()
+        .find(|e| e.origin == crate::message_bus::TxOrigin::Remote)
+        .map(|e| consent_channel_for(e.remote_client_key_id.as_deref()));
+    let (retained, deferred): (Vec<_>, Vec<_>) = outcome.retained.into_iter().partition(|e| {
+        e.origin != crate::message_bus::TxOrigin::Remote
+            || Some(consent_channel_for(e.remote_client_key_id.as_deref())) == bundle_channel
+    });
+    outcome.retained = retained;
+    for entry in deferred {
+        let request = ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Ft8Transmitter,
+            MessageType::TransmitRequest {
+                message_text: entry.message_text.clone(),
+                frequency_offset: entry.frequency_offset,
+                qso_id: entry.qso_id.clone(),
+                tx_parity: entry.tx_parity,
+                origin: entry.origin,
+                remote_client_key_id: entry.remote_client_key_id,
+            },
+            Instant::now(),
+        );
+        if !matches!(message_bus.send_message_checked(request).await, Ok(true)) {
+            warn!(target: "pancetta::tx.policy", "failed to re-enqueue TX from a different consent channel");
+            if let Err(e) =
+                report_transmit_complete(message_bus, false, entry.message_text, 0, entry.qso_id)
+                    .await
+            {
+                warn!("Failed to report a dropped channel-deferred stream: {}", e);
+            }
+        }
+    }
+
     // Every drained request belonged to an ended QSO (rare: needs ≥2 queued
     // requests, all terminal). Hand back an empty MultiTransmitRequest; the
     // multi-TX arm's "empty after dropping stale items" branch consumes and
@@ -5036,18 +5076,9 @@ pub(crate) async fn coalesce_backlog_into(
     } else {
         crate::message_bus::TxOrigin::Local
     };
-    // PAN-91: mirror the origin fold for client identity. `find_map`, NOT
-    // `find().and_then()` (round 2, Codex P1): a `None`-bound legacy Remote
-    // entry (the WSJT-X UDP bridge's own path, which has no client identity
-    // concept) can legitimately sit alongside a bound entry in the same
-    // retained set — by this point every bound entry has already been
-    // filtered to agree with the currently-armed client (see the identity
-    // filter above), so ANY `Some` found here is safe to use for the whole
-    // bundle. `find().and_then()` instead stops at the FIRST Remote entry
-    // regardless of whether it's bound, so an unbound entry appearing
-    // before a bound one would erase the bound identity and fold the whole
-    // bundle down to the boolean-only `None` check — silently re-opening
-    // the PAN-91 gap for whichever entry actually needed the identity bind.
+    // All retained remote entries now share one consent channel, and the
+    // snapshot already checked every bound identity against the armed client.
+    // Folding that identity preserves the channel for the final key-time gate.
     let bundle_remote_client_key_id = outcome
         .retained
         .iter()
@@ -15167,6 +15198,101 @@ mod coalesce_tests {
                 ("qso-c".to_string(), "C".to_string())
             ]
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn backlog_preserves_consent_channels_until_key_time() {
+        use pancetta_agent::arm::{ArmState, ConsentChannel, VerifiedArmGrant};
+        use std::sync::{Arc, Mutex, RwLock};
+
+        // Exercise both FIFO orders: neither channel may borrow the other's
+        // consent when the TX worker rechecks after coalescing.
+        for udp_first in [true, false] {
+            let bus = MessageBus::new(16).unwrap();
+            let (_, deferred_rx) = bus
+                .create_channel(ComponentId::Ft8Transmitter)
+                .await
+                .unwrap();
+            let (backlog_tx, backlog_rx) = crossbeam_channel::unbounded();
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let mut state = ArmState::new();
+            state.set_channel_consent(ConsentChannel::StationAgent, true, now_ms);
+            state.set_channel_consent(ConsentChannel::WsjtxUdp, true, now_ms);
+            state.arm(
+                VerifiedArmGrant {
+                    operator_callsign: "K5ARH".into(),
+                    ttl_ms: 120_000,
+                    scope_tx: true,
+                    jti: "channel-backlog".into(),
+                    client_key_id: "client-a".into(),
+                },
+                now_ms,
+            );
+            let arm = Arc::new(Mutex::new(state));
+            let request = |udp| MessageType::TransmitRequest {
+                message_text: if udp { "UDP" } else { "AGENT" }.into(),
+                frequency_offset: if udp { 1000.0 } else { 1300.0 },
+                qso_id: Some(if udp { "udp-qso" } else { "agent-qso" }.into()),
+                tx_parity: None,
+                origin: crate::message_bus::TxOrigin::Remote,
+                remote_client_key_id: if udp { None } else { Some("client-a".into()) },
+            };
+            backlog_tx
+                .send(ComponentMessage::new(
+                    ComponentId::Ft8Transmitter,
+                    ComponentId::Ft8Transmitter,
+                    request(!udp_first),
+                    Instant::now(),
+                ))
+                .unwrap();
+            let result = coalesce_backlog_into(
+                request(udp_first),
+                &backlog_rx,
+                &bus,
+                &Arc::new(RwLock::new(liveset(&["udp-qso", "agent-qso"]))),
+                &Arc::new(RwLock::new(HashSet::new())),
+                2,
+                &arm,
+                &pancetta_agent::audit::AuditLog::new(audit_tmp()),
+                &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                None,
+            )
+            .await;
+            assert!(
+                matches!(result, MessageType::TransmitRequest { .. }),
+                "different consent channels must remain separate: {result:?}"
+            );
+            let deferred = deferred_rx
+                .try_recv()
+                .expect("other channel must be requeued");
+            assert!(deferred_rx.is_empty());
+
+            // Revoke only UDP after the snapshot. The actual final gate must
+            // refuse its frame while still permitting the station-agent frame.
+            arm.lock()
+                .unwrap()
+                .set_channel_consent(ConsentChannel::WsjtxUdp, false, now_ms);
+            let mut payloads = Vec::new();
+            for message in [result, deferred.message_type] {
+                let MessageType::TransmitRequest {
+                    message_text,
+                    remote_client_key_id,
+                    origin,
+                    ..
+                } = message
+                else {
+                    panic!("expected a separate request");
+                };
+                assert_eq!(origin, crate::message_bus::TxOrigin::Remote);
+                assert_eq!(
+                    super::remote_tx_permitted_for(&arm, now_ms, remote_client_key_id.as_deref()),
+                    message_text == "AGENT"
+                );
+                payloads.push(message_text);
+            }
+            payloads.sort();
+            assert_eq!(payloads, ["AGENT", "UDP"]);
+        }
     }
 
     /// PAN-91 review follow-up: a backlog containing entries bound to TWO
