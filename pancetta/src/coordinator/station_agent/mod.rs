@@ -110,7 +110,7 @@ use ed25519_dalek::VerifyingKey;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
-use pancetta_agent::arm::{ArmEffect, ArmState, DisarmReason};
+use pancetta_agent::arm::{ArmEffect, ArmState, ArmTime, DisarmReason};
 use pancetta_agent::audit::{AuditEvent, AuditKind, AuditLog};
 use pancetta_agent::capability::CapabilityVerifier;
 use pancetta_agent::control::{map_client_frame, ControlAction, TxKind};
@@ -254,7 +254,14 @@ struct ArmContext {
     /// `authz_generation`, [`reconcile_authorizations`] applies the refresh to
     /// the live session on the next tick.
     authz_generation_seen: u64,
+    /// The arm-timing clock (wall + monotonic). Production uses
+    /// [`ArmTime::now`]; session tests inject a manually advanced timeline.
+    clock: ArmClock,
 }
+
+/// Source of [`ArmTime`] samples for the session loop (see
+/// `ArmContext::clock`).
+type ArmClock = Arc<dyn Fn() -> ArmTime + Send + Sync>;
 
 /// A verified hello capability, kept whole enough to re-check at use time:
 /// every use re-checks admission ([`peer_admitted`]), expiry, the revocation
@@ -351,14 +358,14 @@ fn sweep_expired_peer_auth(ctx: &mut ArmContext, now: i64) -> Vec<String> {
 /// longer send anything to must not keep transmitting blind. Returns the
 /// updated `controlState` frames for the caller to deliver (empty when no
 /// controller expired).
-fn expire_peer_auth(ctx: &mut ArmContext, now: i64) -> Vec<PeerSend> {
+fn expire_peer_auth(ctx: &mut ArmContext, now: ArmTime) -> Vec<PeerSend> {
     let mut sends = Vec::new();
-    for peer in sweep_expired_peer_auth(ctx, now) {
+    for peer in sweep_expired_peer_auth(ctx, now.unix_ms) {
         info!(target: "agent.control", peer = %peer,
             "peer capability expired — station data paused until it sends a hello with a fresh capabilityToken");
         if ctx.controller.as_deref() == Some(peer.as_str()) {
             let effects = match ctx.arm.lock() {
-                Ok(mut st) => st.disarm(now),
+                Ok(mut st) => st.disarm(now.unix_ms),
                 Err(_) => Vec::new(),
             };
             if !effects.is_empty() {
@@ -393,7 +400,7 @@ fn expire_peer_auth(ctx: &mut ArmContext, now: i64) -> Vec<PeerSend> {
 fn reconcile_authorizations<W: pancetta_agent::relay::WsConn>(
     ctx: &mut ArmContext,
     sess: &mut MultiPeerSession<'_, W>,
-    now: i64,
+    now: ArmTime,
 ) -> Vec<PeerSend> {
     let current = ctx.authz_generation.load(Ordering::Acquire);
     if current == ctx.authz_generation_seen {
@@ -431,7 +438,7 @@ fn reconcile_authorizations<W: pancetta_agent::relay::WsConn>(
             .armed_client_key_id()
             .is_some_and(|k| evicted.iter().any(|p| p == k));
         if controller_evicted || armer_evicted {
-            let effects = st.disarm_with_reason(DisarmReason::AuthorizationRevoked, now);
+            let effects = st.disarm_with_reason(DisarmReason::AuthorizationRevoked, now.unix_ms);
             if !effects.is_empty() {
                 warn!(target: "agent.tx", "controller evicted with a live arm — disarming");
             }
@@ -484,9 +491,55 @@ fn apply_arm_effects(audit: &AuditLog, effects: &[ArmEffect]) {
     }
 }
 
-/// Unix milliseconds now (the one clock read for arm timing; `ArmState` is pure).
+/// Unix milliseconds now, for audit timestamps on arm-timing-free paths
+/// (explicit disarms). Deadline checks use an [`ArmTime`] sample instead.
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+/// Turn the effects of an arm transition into durable audits and, when the
+/// arm actually disarmed, the existing `controlState` fan-out so every
+/// established peer learns `transmitArmed: false` straight away. Shared by the
+/// per-iteration expiry sweep and the heartbeat path. Call with the arm lock
+/// released.
+fn arm_transition_sends(ctx: &ArmContext, effects: &[ArmEffect], now: ArmTime) -> Vec<PeerSend> {
+    apply_arm_effects(&ctx.audit, effects);
+    if effects
+        .iter()
+        .any(|e| matches!(e, ArmEffect::Disarmed { .. }))
+    {
+        control_state_sends(ctx, now, None)
+    } else {
+        Vec::new()
+    }
+}
+
+/// A fresh [`ArmTime`] for an arm mutation, taken with the arm lock already
+/// held so verification or a lock wait cannot make it stale. Never earlier
+/// than `floor` (the loop's pre-dispatch sample) on either clock.
+fn fresh_arm_time(ctx: &ArmContext, floor: ArmTime) -> ArmTime {
+    let fresh = (ctx.clock)();
+    ArmTime {
+        unix_ms: fresh.unix_ms.max(floor.unix_ms),
+        monotonic: fresh.monotonic.max(floor.monotonic),
+    }
+}
+
+/// Dead-man / TTL sweep for the session loop (PAN-97): expire a lapsed arm
+/// even when no heartbeat or TX request arrives. Dead-man expiry removes arm
+/// authority only — the controller slot, the peers and `seen_jtis` stay, so
+/// recovery is a fresh signed arm on the same session. A poisoned lock is left
+/// to the read-only gate, which already denies. The deadline check uses a
+/// fresh sample taken under the arm lock (floored at `now`).
+fn sweep_arm_expiry(ctx: &ArmContext, now: ArmTime) -> Vec<PeerSend> {
+    let effects = match ctx.arm.lock() {
+        Ok(mut st) => st.tick(fresh_arm_time(ctx, now)),
+        Err(_) => Vec::new(),
+    };
+    if !effects.is_empty() {
+        debug!(target: "agent.tx", "remote arm deadline passed — auto-disarmed");
+    }
+    arm_transition_sends(ctx, &effects, now)
 }
 
 /// Last-resort fail-safe for the live station-agent task. The guard is bound
@@ -638,8 +691,15 @@ impl DispatchOutcome {
 /// just peer `p` (the greeting case); `None` fans out one tailored frame per
 /// established peer (each with its own `controlHeldByMe`). Frames are built
 /// for every peer; [`deliver_sends`] withholds them from unauthorized ones.
-fn control_state_sends(ctx: &ArmContext, now: i64, only: Option<&str>) -> Vec<PeerSend> {
-    let armed = ctx.arm.lock().map(|s| s.tx_permitted(now)).unwrap_or(false);
+///
+/// `transmitArmed` is evaluated against a fresh sample taken under the arm
+/// lock (floored at `now`), so an arm accepted after `now` reads as live.
+fn control_state_sends(ctx: &ArmContext, now: ArmTime, only: Option<&str>) -> Vec<PeerSend> {
+    let armed = ctx
+        .arm
+        .lock()
+        .map(|s| s.tx_permitted(fresh_arm_time(ctx, now)))
+        .unwrap_or(false);
     ctx.peers
         .keys()
         .filter(|p| only.is_none_or(|o| o == p.as_str()))
@@ -673,7 +733,7 @@ enum ControllerGate {
 /// - `peer` already holds control → proceed with no extra frames;
 /// - a DIFFERENT peer holds control → refuse (audit `TxDenied` + `Error` frame
 ///   to `peer`), do NOT execute and do NOT grab.
-fn controller_gate(ctx: &mut ArmContext, peer: &str, now: i64) -> ControllerGate {
+fn controller_gate(ctx: &mut ArmContext, peer: &str, now: ArmTime) -> ControllerGate {
     match ctx.controller.as_deref() {
         None => {
             // Rule 3 — implicit grab keeps a single connected client (today's
@@ -688,7 +748,7 @@ fn controller_gate(ctx: &mut ArmContext, peer: &str, now: i64) -> ControllerGate
             // Rule 4 — exclusivity.
             warn!(target: "agent.control", peer = %peer, "control action refused — another client holds control");
             ctx.audit.append(&AuditEvent {
-                ts_unix_ms: now,
+                ts_unix_ms: now.unix_ms,
                 kind: AuditKind::TxDenied,
                 operator_callsign: None,
                 detail: "refused: not controller".to_string(),
@@ -708,7 +768,7 @@ fn controller_gate(ctx: &mut ArmContext, peer: &str, now: i64) -> ControllerGate
 
 /// Dispatch one decrypted control action against the arm + coordinator bus.
 ///
-/// Pure with respect to timing (takes `now_ms`); side effects are the arm
+/// Pure with respect to timing (takes an [`ArmTime`] sample); side effects are the arm
 /// mutation, audit writes, and best-effort bus sends. This is the security spine
 /// of the component and is unit-tested directly.
 ///
@@ -722,7 +782,10 @@ fn controller_gate(ctx: &mut ArmContext, peer: &str, now: i64) -> ControllerGate
 /// - `Heartbeat` → `arm.heartbeat(arm_jti, seq)`: slides the dead-man window
 ///   only for a heartbeat that names the current arm (`arm_jti`) with a
 ///   per-arm-monotonic `seq`; a replayed/wrong-arm heartbeat is rejected (audited
-///   `TxDenied`) and the window is NOT slid (contract `$defs.txHeartbeat`).
+///   `TxDenied`) and the window is NOT slid (contract `$defs.txHeartbeat`). A
+///   heartbeat at or after the deadline expires the arm instead (PAN-97) and
+///   the resulting `controlState` goes to every peer; only a fresh signed arm
+///   restores TX.
 /// - `Disarm { arm_jti }` → `arm.disarm()` + audit (fail-safe TX-OFF). The
 ///   `arm_jti` is a sanity match, NOT a security gate: disarm-any always
 ///   proceeds; a non-empty arm_jti that doesn't match the live arm still
@@ -741,7 +804,7 @@ async fn dispatch_action(
     ctx: &mut ArmContext,
     bus: &MessageBus,
     session_id: &str,
-    now: i64,
+    now: ArmTime,
 ) -> DispatchOutcome {
     // PAN-96: a peer no longer on the live admission list may only give up
     // authority (Disarm / ReleaseControl — fail-safe). Everything else, even a
@@ -779,7 +842,7 @@ async fn dispatch_action(
                     // Fail-closed: audit the denial, do NOT arm. Any implicit-grab
                     // controlState still stands (the grab itself succeeded).
                     ctx.audit.append(&AuditEvent {
-                        ts_unix_ms: now,
+                        ts_unix_ms: now.unix_ms,
                         kind: AuditKind::TxDenied,
                         operator_callsign: None,
                         detail: format!("arm rejected: {reason}"),
@@ -800,12 +863,15 @@ async fn dispatch_action(
             // per-arm `seq` monotonicity (contract $defs.txHeartbeat): a replayed
             // or wrong-arm heartbeat is rejected and does NOT slide the dead-man
             // window, so a captured heartbeat can never hold an arm open.
+            //
+            // PAN-97: a heartbeat arriving at or after the deadline expires the
+            // arm instead of refreshing it; that transition is broadcast like
+            // any other disarm, and only a fresh signed arm restores TX.
             let effects = match ctx.arm.lock() {
-                Ok(mut st) => st.heartbeat(&arm_jti, seq, now),
+                Ok(mut st) => st.heartbeat(&arm_jti, seq, fresh_arm_time(ctx, now)),
                 Err(_) => Vec::new(),
             };
-            apply_arm_effects(&ctx.audit, &effects);
-            DispatchOutcome::cont()
+            DispatchOutcome::cont_with(arm_transition_sends(ctx, &effects, now))
         }
         ControlAction::Disarm { arm_jti } => {
             // Disarm is fail-safe TX-OFF: it ALWAYS proceeds. The frozen
@@ -831,7 +897,7 @@ async fn dispatch_action(
             // controller check (fail-safe TX-OFF beats exclusivity). Does not
             // change who holds control.
             let effects = match ctx.arm.lock() {
-                Ok(mut st) => st.disarm(now),
+                Ok(mut st) => st.disarm(now.unix_ms),
                 Err(_) => Vec::new(),
             };
             apply_arm_effects(&ctx.audit, &effects);
@@ -847,7 +913,7 @@ async fn dispatch_action(
             // disarms and releases control (PAN-96, [`clear_peer_auth`]) — its
             // updated controlState frames for the remaining peers ride out
             // here too.
-            let (verified, mut sends) = dispatch_hello(capability_token, peer, ctx, now);
+            let (verified, mut sends) = dispatch_hello(capability_token, peer, ctx, now.unix_ms);
             if verified {
                 sends.extend(control_state_sends(ctx, now, Some(peer)));
             }
@@ -858,7 +924,7 @@ async fn dispatch_action(
                 ControllerGate::Proceed(sends) => sends,
                 ControllerGate::Refused(sends) => return DispatchOutcome::cont_with(sends),
             };
-            if !peer_grants(ctx, peer, "qsy", now) {
+            if !peer_grants(ctx, peer, "qsy", now.unix_ms) {
                 warn!(target: "agent.control", peer = %peer, "setFrequency refused — no currently-valid qsy-scoped hello capability for this peer");
                 return DispatchOutcome::cont_with(grab);
             }
@@ -877,7 +943,7 @@ async fn dispatch_action(
                 ControllerGate::Proceed(sends) => sends,
                 ControllerGate::Refused(sends) => return DispatchOutcome::cont_with(sends),
             };
-            if !peer_grants(ctx, peer, "qsy", now) {
+            if !peer_grants(ctx, peer, "qsy", now.unix_ms) {
                 warn!(target: "agent.control", peer = %peer, "setSplit refused — no currently-valid qsy-scoped hello capability for this peer");
                 return DispatchOutcome::cont_with(grab);
             }
@@ -918,7 +984,7 @@ async fn dispatch_action(
                 TxKind::StartCq { offset_hz } => format!("startCq offset={offset_hz}"),
             };
             ctx.audit.append(&AuditEvent {
-                ts_unix_ms: now,
+                ts_unix_ms: now.unix_ms,
                 kind: AuditKind::TxRequested,
                 operator_callsign: ctx
                     .arm
@@ -956,7 +1022,7 @@ async fn dispatch_action(
                 ctx.controller.is_some() && ctx.controller.as_deref() != Some(peer);
             if displacing_other {
                 let effects = match ctx.arm.lock() {
-                    Ok(mut st) => st.disarm(now),
+                    Ok(mut st) => st.disarm(now.unix_ms),
                     Err(_) => Vec::new(),
                 };
                 if !effects.is_empty() {
@@ -973,7 +1039,7 @@ async fn dispatch_action(
             // controller. From anyone else → debug no-op, no state change.
             if ctx.controller.as_deref() == Some(peer) {
                 let effects = match ctx.arm.lock() {
-                    Ok(mut st) => st.disarm(now),
+                    Ok(mut st) => st.disarm(now.unix_ms),
                     Err(_) => Vec::new(),
                 };
                 apply_arm_effects(&ctx.audit, &effects);
@@ -1019,7 +1085,10 @@ fn clear_peer_auth(ctx: &mut ArmContext, peer: &str, now: i64) -> Vec<PeerSend> 
     }
     apply_arm_effects(&ctx.audit, &effects);
     ctx.controller = None;
-    control_state_sends(ctx, now, None)
+    // The clear path only has wall time (`now`); sample the session clock for
+    // the `transmitArmed` broadcast — `control_state_sends` re-samples under
+    // the arm lock anyway, and the loop's injected test clock stays coherent.
+    control_state_sends(ctx, (ctx.clock)(), None)
 }
 
 /// Handle a `hello.capabilityToken` (Q-0019 #5): verify it against the pinned
@@ -1161,7 +1230,7 @@ fn verify_and_arm(
     peer: &str,
     ctx: &mut ArmContext,
     session_id: &str,
-    now: i64,
+    now: ArmTime,
 ) -> Result<(), String> {
     let obj = grant.as_object().ok_or("grant is not a JSON object")?;
 
@@ -1200,7 +1269,7 @@ fn verify_and_arm(
     // inside the grant). This also runs the short-TTL / enablement backstops.
     let cap = ctx
         .verifier
-        .verify_capability_token(capability_token, now)
+        .verify_capability_token(capability_token, now.unix_ms)
         .map_err(|e| format!("capability: {e}"))?;
 
     let verified = ctx
@@ -1212,7 +1281,7 @@ fn verify_and_arm(
             &allow_list,
             &ctx.revoked_jtis,
             session_id,
-            now,
+            now.unix_ms,
             &mut ctx.seen_jtis,
         )
         .map_err(|e| format!("arm grant: {e}"))?;
@@ -1257,7 +1326,7 @@ fn verify_and_arm(
                      (revoked by a concurrent authorization refresh)"
                 ));
             }
-            st.arm(verified, now)
+            st.arm(verified, fresh_arm_time(ctx, now))
         }
         Err(_) => return Err("arm mutex poisoned".to_string()),
     };
@@ -2021,6 +2090,7 @@ async fn run_session_loop(mut cfg: RunConfig) {
         authz_generation: cfg.authz_generation,
         // Set from the live generation at the start of every session.
         authz_generation_seen: 0,
+        clock: Arc::new(ArmTime::now),
     };
 
     while !cfg.shutdown.load(Ordering::Acquire) {
@@ -2094,12 +2164,19 @@ fn deliver_sends<W: pancetta_agent::relay::WsConn>(
     }
 }
 
+/// Most display events (or lag notices) [`drain_read_stream`] fans out per
+/// call. A display producer that never pauses must still hand control back to
+/// the session loop — and its arm-expiry sweep — on every iteration (PAN-97).
+const READ_STREAM_DRAIN_MAX: usize = 64;
+
 /// Fan pending display events out to every established peer that
 /// [`peer_may_receive`] admits, reading the clock for each recipient check
-/// (PAN-95: a peer without an unexpired `status`+ hello capability gets nothing).
-/// Each call consumes at most 64 events or lag notifications before returning
-/// to session housekeeping. Lossy by design: Lagged means the bounded broadcast
-/// ring dropped old events; log and continue within the same batch limit.
+/// (PAN-95: a peer without an unexpired `status`+ hello capability gets
+/// nothing). Each call consumes at most [`READ_STREAM_DRAIN_MAX`] events or
+/// lag notifications before returning to session housekeeping (PAN-97: so a
+/// busy read stream cannot hold the arm-expiry sweep off). Lossy by design:
+/// Lagged means the bounded broadcast ring dropped old events; log and
+/// continue within the same batch limit.
 fn drain_read_stream<W: pancetta_agent::relay::WsConn>(
     events: &mut Option<tokio::sync::broadcast::Receiver<pancetta_protocol::ServerEvent>>,
     sess: &mut MultiPeerSession<'_, W>,
@@ -2108,8 +2185,9 @@ fn drain_read_stream<W: pancetta_agent::relay::WsConn>(
 ) {
     let Some(rx) = events.as_mut() else { return };
     // Bound work even when producers keep the receiver nonempty, so the
-    // session loop returns to authorization and controller-expiry housekeeping.
-    for _ in 0..64 {
+    // session loop returns to authorization, controller-expiry and arm-expiry
+    // housekeeping.
+    for _ in 0..READ_STREAM_DRAIN_MAX {
         match rx.try_recv() {
             Ok(ev) => {
                 let frame = pancetta_protocol::ServerFrame::Event { event: ev };
@@ -2168,7 +2246,15 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
         return;
     }
     loop {
-        match sess.process_next(RECV_TICK) {
+        let polled = sess.process_next(RECV_TICK);
+        // PAN-97: expire a lapsed arm on EVERY iteration, before acting on
+        // what was received — time spent receiving counts, and no branch below
+        // (valid traffic, malformed frames, idle ticks) can skip it. The
+        // TX worker's key-time gate still checks the clock independently.
+        let now = (ctx.clock)();
+        let expiry_sends = sweep_arm_expiry(ctx, now);
+        deliver_sends(&mut sess, ctx, &expiry_sends, || (ctx.clock)().unix_ms);
+        match polled {
             Ok(Poll::Plaintext { peer, plaintext }) => {
                 let action = match map_client_frame(&plaintext) {
                     Ok(a) => a,
@@ -2190,18 +2276,17 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
                 // block a grant captured on one peer's session from being
                 // replayed into another peer's.
                 let sid = sess.session_id(&peer).unwrap_or_default().to_string();
-                let now = now_ms();
                 // A receive can cross expiry. Retire the previous authority
                 // before a fresh hello can replace it and hide the lapse.
                 let mut sends = expire_peer_auth(ctx, now);
                 let outcome = dispatch_action(action, &peer, ctx, bus, &sid, now).await;
                 sends.extend(outcome.sends);
-                deliver_sends(&mut sess, ctx, &sends, now_ms);
+                deliver_sends(&mut sess, ctx, &sends, || (ctx.clock)().unix_ms);
                 // Task 6: drain the read stream after every successful dispatch
                 // too, not just on Quiet/Idle — a chatty control session
                 // (frequent Arm/Heartbeat/Qsy traffic) must never starve the
                 // display feed of a chance to fan out.
-                drain_read_stream(events, &mut sess, ctx, now_ms);
+                drain_read_stream(events, &mut sess, ctx, || (ctx.clock)().unix_ms);
                 if outcome.flow == Dispatch::Teardown {
                     return;
                 }
@@ -2224,7 +2309,7 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
                 ctx.peers.remove(&peer);
                 if was_controller {
                     let effects = match ctx.arm.lock() {
-                        Ok(mut st) => st.disarm(now_ms()),
+                        Ok(mut st) => st.disarm(now.unix_ms),
                         Err(_) => Vec::new(),
                     };
                     if !effects.is_empty() {
@@ -2232,16 +2317,15 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
                     }
                     apply_arm_effects(&ctx.audit, &effects);
                     ctx.controller = None;
-                    let now = now_ms();
                     let sends = control_state_sends(ctx, now, None);
-                    deliver_sends(&mut sess, ctx, &sends, now_ms);
+                    deliver_sends(&mut sess, ctx, &sends, || (ctx.clock)().unix_ms);
                 }
             }
             Ok(Poll::Idle) | Ok(Poll::Quiet) => {
                 // Task 6: the common case — no control traffic this tick, so
                 // this is where the read stream gets most of its chances to
                 // fan out pending display events to established peers.
-                drain_read_stream(events, &mut sess, ctx, now_ms);
+                drain_read_stream(events, &mut sess, ctx, || (ctx.clock)().unix_ms);
             }
             Ok(Poll::Closed) => return,
             Err(e) => {
@@ -2266,13 +2350,12 @@ fn session_housekeeping<W: pancetta_agent::relay::WsConn>(
     ctx: &mut ArmContext,
     sess: &mut MultiPeerSession<'_, W>,
 ) {
-    let now = now_ms();
+    let now = (ctx.clock)();
     let sends = reconcile_authorizations(ctx, sess, now);
-    deliver_sends(sess, ctx, &sends, now_ms);
-    broadcast_pending_revocation(ctx, sess);
-    let now = now_ms();
+    deliver_sends(sess, ctx, &sends, || (ctx.clock)().unix_ms);
+    broadcast_pending_revocation(ctx, sess, now);
     let sends = expire_peer_auth(ctx, now);
-    deliver_sends(sess, ctx, &sends, now_ms);
+    deliver_sends(sess, ctx, &sends, || (ctx.clock)().unix_ms);
 }
 
 /// Broadcast the current (already-disarmed) control state to every
@@ -2285,11 +2368,11 @@ fn session_housekeeping<W: pancetta_agent::relay::WsConn>(
 fn broadcast_pending_revocation<W: pancetta_agent::relay::WsConn>(
     ctx: &ArmContext,
     sess: &mut MultiPeerSession<'_, W>,
+    now: ArmTime,
 ) {
     if ctx.revocation_pending.swap(false, Ordering::AcqRel) {
-        let now = now_ms();
         let sends = control_state_sends(ctx, now, None);
-        deliver_sends(sess, ctx, &sends, now_ms);
+        deliver_sends(sess, ctx, &sends, || (ctx.clock)().unix_ms);
     }
 }
 
@@ -2316,6 +2399,32 @@ mod tests {
     const IDP_KID: &str = "idp-kid-1";
     const OPERATOR: &str = "K5ARH";
     const NOW: i64 = 1_700_000_000_000;
+
+    /// One shared monotonic origin for every test timeline.
+    fn mono_base() -> std::time::Instant {
+        static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        *BASE.get_or_init(std::time::Instant::now)
+    }
+
+    /// Both arm clocks at `ms`: wall = `ms` unix ms, monotonic = origin + `ms`.
+    fn at(ms: i64) -> ArmTime {
+        ArmTime {
+            unix_ms: ms,
+            monotonic: mono_base() + Duration::from_millis(ms.unsigned_abs()),
+        }
+    }
+
+    /// A session clock pinned at `ms`.
+    fn fixed_clock(ms: i64) -> ArmClock {
+        Arc::new(move || at(ms))
+    }
+
+    /// A session clock that reads `ms` on every call, so a test can advance
+    /// the loop's timeline between scripted steps.
+    fn manual_clock(ms: &Arc<std::sync::atomic::AtomicI64>) -> ArmClock {
+        let ms = ms.clone();
+        Arc::new(move || at(ms.load(Ordering::SeqCst)))
+    }
     /// Matches `signed_grant`'s baked-in `sessionId` — the "live session"
     /// `dispatch_action` calls in this module check the grant against.
     const SESSION_ID: &str = "sess-1";
@@ -2488,6 +2597,7 @@ mod tests {
             revocation_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             authz_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             authz_generation_seen: 0,
+            clock: fixed_clock(NOW),
         }
     }
 
@@ -2510,11 +2620,13 @@ mod tests {
             pancetta_agent::arm::VerifiedArmGrant {
                 operator_callsign: OPERATOR.to_string(),
                 ttl_ms: 300_000,
+                armed_until_ms: NOW + 300_000,
+                heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "test-jti".to_string(),
                 client_key_id: CLIENT_KEY_ID.to_string(),
             },
-            NOW,
+            at(NOW),
         );
         st
     }
@@ -2813,12 +2925,12 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert_eq!(d.flow, Dispatch::Continue);
         assert!(
-            ctx.arm.lock().unwrap().tx_permitted(NOW),
+            ctx.arm.lock().unwrap().tx_permitted(at(NOW)),
             "a valid arm + consent must permit remote TX"
         );
     }
@@ -2858,12 +2970,12 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert_eq!(d.flow, Dispatch::Continue);
         assert!(
-            ctx.arm.lock().unwrap().tx_permitted(NOW),
+            ctx.arm.lock().unwrap().tx_permitted(at(NOW)),
             "an owner edge present in both sets must be able to arm TX"
         );
     }
@@ -2893,12 +3005,12 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert_eq!(d.flow, Dispatch::Continue);
         assert!(
-            !ctx.arm.lock().unwrap().tx_permitted(NOW),
+            !ctx.arm.lock().unwrap().tx_permitted(at(NOW)),
             "a delegated edge must never be able to arm TX, even with an \
              otherwise perfectly valid token/grant/signature/session"
         );
@@ -2933,12 +3045,12 @@ mod tests {
             &mut ctx,
             &bus,
             "a-completely-different-session",
-            NOW,
+            at(NOW),
         )
         .await;
         assert_eq!(d.flow, Dispatch::Continue);
         assert!(
-            !ctx.arm.lock().unwrap().tx_permitted(NOW),
+            !ctx.arm.lock().unwrap().tx_permitted(at(NOW)),
             "a grant signed for a different session must never arm this one"
         );
     }
@@ -2961,7 +3073,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert_eq!(d.flow, Dispatch::Continue);
@@ -2986,7 +3098,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert_eq!(d1.flow, Dispatch::Continue);
@@ -2999,7 +3111,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert_eq!(d2.flow, Dispatch::Continue);
@@ -3029,7 +3141,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         dispatch_action(
@@ -3041,7 +3153,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert!(
@@ -3079,7 +3191,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         let d = dispatch_action(
@@ -3091,7 +3203,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert_eq!(d.flow, Dispatch::Continue);
@@ -3117,7 +3229,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         let d = dispatch_action(
@@ -3129,7 +3241,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert_eq!(d.flow, Dispatch::Continue);
@@ -3169,7 +3281,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert_eq!(d.flow, Dispatch::Continue);
@@ -3191,14 +3303,14 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
-        assert!(ctx.arm.lock().unwrap().tx_permitted(NOW));
+        assert!(ctx.arm.lock().unwrap().tx_permitted(at(NOW)));
         // No further heartbeats: at the dead-man deadline, tx_permitted is false.
         let dead = NOW + HEARTBEAT_TIMEOUT_MS;
         assert!(
-            !ctx.arm.lock().unwrap().tx_permitted(dead),
+            !ctx.arm.lock().unwrap().tx_permitted(at(dead)),
             "no heartbeat within the window must auto-deny (dead-man)"
         );
         // A heartbeat *before* the deadline slides the window.
@@ -3210,7 +3322,7 @@ mod tests {
             &mut ctx2,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         dispatch_action(
@@ -3222,14 +3334,14 @@ mod tests {
             &mut ctx2,
             &bus,
             SESSION_ID,
-            NOW + 20_000,
+            at(NOW + 20_000),
         )
         .await;
         assert!(
             ctx2.arm
                 .lock()
                 .unwrap()
-                .tx_permitted(NOW + 20_000 + HEARTBEAT_TIMEOUT_MS - 1),
+                .tx_permitted(at(NOW + 20_000 + HEARTBEAT_TIMEOUT_MS - 1)),
             "a heartbeat must slide the dead-man window"
         );
     }
@@ -3247,10 +3359,10 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
-        assert!(ctx.arm.lock().unwrap().tx_permitted(NOW));
+        assert!(ctx.arm.lock().unwrap().tx_permitted(at(NOW)));
 
         // Accept seq 5 at NOW+5000 (slides the window to there).
         let accepted_at = NOW + 5_000;
@@ -3263,7 +3375,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            accepted_at,
+            at(accepted_at),
         )
         .await;
         let deadline = accepted_at + HEARTBEAT_TIMEOUT_MS;
@@ -3278,7 +3390,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            deadline - 1,
+            at(deadline - 1),
         )
         .await;
         dispatch_action(
@@ -3290,14 +3402,14 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            deadline - 1,
+            at(deadline - 1),
         )
         .await;
 
         // Dead-man expires on schedule despite the later replays.
-        assert!(ctx.arm.lock().unwrap().tx_permitted(deadline - 1));
+        assert!(ctx.arm.lock().unwrap().tx_permitted(at(deadline - 1)));
         assert!(
-            !ctx.arm.lock().unwrap().tx_permitted(deadline),
+            !ctx.arm.lock().unwrap().tx_permitted(at(deadline)),
             "a replayed-seq heartbeat must NOT hold the arm open past the dead-man deadline"
         );
     }
@@ -3314,7 +3426,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         // A heartbeat naming a different arm must not slide the window.
@@ -3327,7 +3439,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW + 10_000,
+            at(NOW + 10_000),
         )
         .await;
         // Original dead-man deadline (from the arm at NOW) still governs.
@@ -3335,12 +3447,12 @@ mod tests {
             .arm
             .lock()
             .unwrap()
-            .tx_permitted(NOW + HEARTBEAT_TIMEOUT_MS - 1));
+            .tx_permitted(at(NOW + HEARTBEAT_TIMEOUT_MS - 1)));
         assert!(!ctx
             .arm
             .lock()
             .unwrap()
-            .tx_permitted(NOW + HEARTBEAT_TIMEOUT_MS));
+            .tx_permitted(at(NOW + HEARTBEAT_TIMEOUT_MS)));
     }
 
     // ── Case 5: consent OFF → even a valid Arm never permits TX ─────────────
@@ -3355,11 +3467,11 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert!(
-            !ctx.arm.lock().unwrap().tx_permitted(NOW),
+            !ctx.arm.lock().unwrap().tx_permitted(at(NOW)),
             "consent OFF must deny TX even after a valid arm"
         );
     }
@@ -3377,14 +3489,14 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert!(
             !ctx.arm.lock().unwrap().is_armed(),
             "a grant from a non-allow-listed client must NOT arm"
         );
-        assert!(!ctx.arm.lock().unwrap().tx_permitted(NOW));
+        assert!(!ctx.arm.lock().unwrap().tx_permitted(at(NOW)));
     }
 
     // ── Explicit Disarm clears a live arm ───────────────────────────────────
@@ -3399,10 +3511,10 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
-        assert!(ctx.arm.lock().unwrap().tx_permitted(NOW));
+        assert!(ctx.arm.lock().unwrap().tx_permitted(at(NOW)));
         dispatch_action(
             ControlAction::Disarm {
                 arm_jti: "arm-jti-1".into(),
@@ -3411,7 +3523,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert!(
@@ -3436,7 +3548,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         // Disarm, then replay the SAME grant jti — must not re-arm.
@@ -3448,7 +3560,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         dispatch_action(
@@ -3460,7 +3572,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert!(
@@ -3486,14 +3598,14 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert!(
             !ctx.arm.lock().unwrap().is_armed(),
             "a token without txEnabledUntil must NEVER arm (clock-2 gate)"
         );
-        assert!(!ctx.arm.lock().unwrap().tx_permitted(NOW));
+        assert!(!ctx.arm.lock().unwrap().tx_permitted(at(NOW)));
     }
 
     // ── txDisarm{armJti} disarms a live arm (armJti is a sanity match) ──────
@@ -3508,10 +3620,10 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
-        assert!(ctx.arm.lock().unwrap().tx_permitted(NOW));
+        assert!(ctx.arm.lock().unwrap().tx_permitted(at(NOW)));
         // A txDisarm naming the live arm disarms it.
         dispatch_action(
             ControlAction::Disarm {
@@ -3521,7 +3633,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert!(
@@ -3542,10 +3654,10 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
-        assert!(ctx.arm.lock().unwrap().tx_permitted(NOW));
+        assert!(ctx.arm.lock().unwrap().tx_permitted(at(NOW)));
         // A txDisarm naming a DIFFERENT arm still disarms (armJti is a sanity
         // match, not a gate — disarm-any is fail-safe TX-OFF).
         dispatch_action(
@@ -3556,7 +3668,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert!(
@@ -3588,7 +3700,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert_eq!(d.flow, Dispatch::Continue);
@@ -3697,12 +3809,12 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert_eq!(out.flow, Dispatch::Continue);
         assert!(
-            ctx.arm.lock().unwrap().tx_permitted(NOW),
+            ctx.arm.lock().unwrap().tx_permitted(at(NOW)),
             "implicit-grab arm must permit TX exactly like the pre-controller path"
         );
         assert_eq!(
@@ -3737,7 +3849,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
@@ -3751,7 +3863,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert_eq!(out.flow, Dispatch::Continue);
@@ -3833,7 +3945,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
 
@@ -3843,7 +3955,7 @@ mod tests {
             "a grant naming a DIFFERENT peer than the demuxed sender must never arm"
         );
         assert!(
-            !ctx.arm.lock().unwrap().tx_permitted(NOW),
+            !ctx.arm.lock().unwrap().tx_permitted(at(NOW)),
             "tx must stay not-permitted after a rejected cross-peer arm grant"
         );
 
@@ -3882,7 +3994,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert!(ctx.arm.lock().unwrap().is_armed());
@@ -3894,7 +4006,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert_eq!(out.flow, Dispatch::Continue);
@@ -3946,7 +4058,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert!(ctx.arm.lock().unwrap().is_armed());
@@ -3960,7 +4072,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert_eq!(out.flow, Dispatch::Continue);
@@ -3983,7 +4095,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert!(ctx.arm.lock().unwrap().is_armed());
@@ -3995,7 +4107,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert_eq!(out.flow, Dispatch::Continue);
@@ -4015,7 +4127,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert!(
@@ -4045,7 +4157,7 @@ mod tests {
                 &mut ctx,
                 &bus,
                 SESSION_ID,
-                NOW,
+                at(NOW),
             )
             .await;
             assert!(ctx.arm.lock().unwrap().is_armed());
@@ -4081,7 +4193,7 @@ mod tests {
                 &mut ctx,
                 &bus,
                 SESSION_ID,
-                NOW,
+                at(NOW),
             )
             .await;
             assert!(ctx.arm.lock().unwrap().is_armed());
@@ -4280,6 +4392,11 @@ mod tests {
     /// `{type:"txArm", capabilityToken, grant}` — the token is a SIBLING of the
     /// client-signed grant (NOT inside it, per the frozen e2e-auth.v1 $defs).
     fn tx_arm_frame_for_agent(agent_key_id: &str, session_id: &str) -> Value {
+        tx_arm_frame(agent_key_id, session_id, "arm-jti-1", NOW + 300_000)
+    }
+
+    /// A signed `txArm` frame with an explicit grant `jti` and `armedUntil`.
+    fn tx_arm_frame(agent_key_id: &str, session_id: &str, jti: &str, armed_until: i64) -> Value {
         let mut grant = json!({
             "aud": agent_key_id,
             "clientKeyId": CLIENT_KEY_ID,
@@ -4287,9 +4404,9 @@ mod tests {
             "capabilityJti": "cap-jti-1",
             "operatorCallsign": OPERATOR,
             "armedAt": NOW,
-            "armedUntil": NOW + 300_000,
+            "armedUntil": armed_until,
             "heartbeatIntervalSec": 10,
-            "jti": "arm-jti-1"
+            "jti": jti
         })
         .as_object()
         .unwrap()
@@ -4409,10 +4526,18 @@ mod tests {
         let mut ctx = ctx_with_agent(&agent_kid, true, true);
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
-        let d = dispatch_action(action, CLIENT_KEY_ID, &mut ctx, &bus, agent_session_id, NOW).await;
+        let d = dispatch_action(
+            action,
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            agent_session_id,
+            at(NOW),
+        )
+        .await;
         assert_eq!(d.flow, Dispatch::Continue);
         assert!(
-            ctx.arm.lock().unwrap().tx_permitted(NOW),
+            ctx.arm.lock().unwrap().tx_permitted(at(NOW)),
             "end-to-end: a verified Arm over Noise must permit remote TX"
         );
 
@@ -4426,13 +4551,13 @@ mod tests {
             &mut ctx_off,
             &bus,
             agent_session_id,
-            NOW,
+            at(NOW),
         )
         .await;
         // jti replay guard is per-ctx (fresh seen set), so this arms the state
         // machine but consent-off denies at the gate.
         assert!(
-            !ctx_off.arm.lock().unwrap().tx_permitted(NOW),
+            !ctx_off.arm.lock().unwrap().tx_permitted(at(NOW)),
             "consent OFF must deny even after a verified Arm over Noise"
         );
     }
@@ -4511,6 +4636,7 @@ mod tests {
             revocation_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             authz_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             authz_generation_seen: 0,
+            clock: fixed_clock(NOW),
         };
         let bus = MessageBus::new(64).unwrap();
         run_one_session(ws, identity, &mut ctx, &bus, &mut None).await;
@@ -4602,6 +4728,7 @@ mod tests {
             revocation_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             authz_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             authz_generation_seen: 0,
+            clock: fixed_clock(NOW),
         }
     }
 
@@ -4645,11 +4772,12 @@ mod tests {
         TestInitiator::new(&device.agreement_private_bytes(), agent_pub)
     }
 
-    /// A capabilityToken for `client_kid` minted against the REAL wall clock —
-    /// needed for any hello dispatched inside `run_one_session`, which checks
-    /// tokens at `now_ms()`, not this module's fixed `NOW`.
-    fn real_clock_token(agent_kid: &str, client_kid: &str, scopes: &[&str]) -> String {
-        real_clock_token_with_jti(
+    /// A capabilityToken for `client_kid` minted on the injected `NOW`
+    /// timeline — needed for any hello dispatched inside `run_one_session`,
+    /// which reads its wall clock from `ctx.clock` (PAN-97): pinned to `NOW`
+    /// in these tests, `ArmTime::now` in production.
+    fn injected_clock_token(agent_kid: &str, client_kid: &str, scopes: &[&str]) -> String {
+        injected_clock_token_with_jti(
             agent_kid,
             client_kid,
             scopes,
@@ -4657,15 +4785,15 @@ mod tests {
         )
     }
 
-    /// [`real_clock_token`] minted under an explicit `jti` (PAN-96: a freshly
+    /// [`injected_clock_token`] minted under an explicit `jti` (PAN-96: a freshly
     /// minted token after a revocation carries a new one).
-    fn real_clock_token_with_jti(
+    fn injected_clock_token_with_jti(
         agent_kid: &str,
         client_kid: &str,
         scopes: &[&str],
         jti: &str,
     ) -> String {
-        let now_s = now_ms() / 1000;
+        let now_s = NOW / 1000;
         let header = json!({ "alg": "EdDSA", "kid": IDP_KID, "typ": "JWT" });
         let payload = json!({
             "iss": "cqdx", "sub": "acct-1", "operatorCallsign": OPERATOR,
@@ -4842,17 +4970,24 @@ mod tests {
         let identity = AgentIdentity::generate();
         let agent_kid = identity.key_id();
         let mut ctx = fresh_ctx(&agent_kid, HashSet::from([CLIENT_KEY_ID.to_string()]));
-        let real_now = now_ms();
-        ctx.arm.lock().unwrap().set_local_consent(true, real_now);
+        // The session reads arm time from `ctx.clock`, which `fresh_ctx` pins
+        // to this module's `NOW` (PAN-97), so the grant is armed on that same
+        // injected timeline and the expiry crossing below advances a manual
+        // clock instead of sleeping.
+        let t = Arc::new(std::sync::atomic::AtomicI64::new(NOW));
+        ctx.clock = manual_clock(&t);
+        ctx.arm.lock().unwrap().set_local_consent(true, NOW);
         ctx.arm.lock().unwrap().arm(
             pancetta_agent::arm::VerifiedArmGrant {
                 operator_callsign: OPERATOR.to_string(),
                 ttl_ms: 3_600_000,
+                armed_until_ms: NOW + 3_600_000,
+                heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "renewal-arm".to_string(),
                 client_key_id: CLIENT_KEY_ID.to_string(),
             },
-            real_now,
+            at(NOW),
         );
         ctx.controller = Some(CLIENT_KEY_ID.to_string());
         let device = client_device();
@@ -4884,20 +5019,24 @@ mod tests {
             let msg2 = envs_to(&hello_outbound.lock().unwrap(), CLIENT_KEY_ID).remove(0);
             initiator.read_msg2(&msg2);
             let mut transport = initiator.into_transport();
-            let exp_s = now_ms() / 1000 + 2;
-            expiry.store(exp_s * 1000, Ordering::Release);
+            let exp_ms = NOW + 2_000;
+            expiry.store(exp_ms, Ordering::Release);
             let short_token = mint_jws(
                 &json!({"alg": "EdDSA", "kid": IDP_KID, "typ": "JWT"}),
                 &json!({
                     "iss": "cqdx", "sub": "acct-1", "operatorCallsign": OPERATOR,
                     "aud": agent_kid, "clientKeyId": CLIENT_KEY_ID,
-                    "scopes": ["status"], "iat": exp_s - 10, "exp": exp_s,
+                    "scopes": ["status"], "iat": exp_ms / 1000 - 10, "exp": exp_ms / 1000,
                     "jti": "renewal-old",
                 }),
                 &idp_key(),
             );
-            let fresh_token =
-                real_clock_token_with_jti(&agent_kid, CLIENT_KEY_ID, &["status"], "renewal-new");
+            let fresh_token = injected_clock_token_with_jti(
+                &agent_kid,
+                CLIENT_KEY_ID,
+                &["status"],
+                "renewal-new",
+            );
             for token in [short_token, fresh_token] {
                 let ct = client_encrypt(&mut transport, &hello_frame_bytes(&token));
                 handle.push_inbound(
@@ -4912,15 +5051,17 @@ mod tests {
             }
         });
         let arm = ctx.arm.clone();
+        let clock = t.clone();
         let ws = TriggerAfterWs::new(hello_ws, 4, move || {
             assert!(
-                arm.lock().unwrap().tx_permitted(now_ms()),
+                arm.lock()
+                    .unwrap()
+                    .tx_permitted(at(clock.load(Ordering::Acquire))),
                 "old hello retained the live arm"
             );
-            let wait_ms = expires.load(Ordering::Acquire) - now_ms();
-            if wait_ms > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(wait_ms as u64));
-            }
+            // Advance the injected clock past the short token's expiry
+            // instead of sleeping.
+            clock.store(expires.load(Ordering::Acquire) + 1_000, Ordering::Release);
         });
         let bus = MessageBus::new(64).unwrap();
         run_one_session(ws, &identity, &mut ctx, &bus, &mut None).await;
@@ -4975,9 +5116,9 @@ mod tests {
                 }
                 drain_read_stream(&mut Some(rx), &mut sess, &ctx, clock);
             } else {
-                let mut sends = control_state_sends(&ctx, NOW, None);
+                let mut sends = control_state_sends(&ctx, at(NOW), None);
                 if !two_peers {
-                    sends.extend(control_state_sends(&ctx, NOW, None));
+                    sends.extend(control_state_sends(&ctx, at(NOW), None));
                 }
                 deliver_sends(&mut sess, &ctx, &sends, clock);
             }
@@ -5125,7 +5266,7 @@ mod tests {
 
         // One controlState frame per established peer, as every transition
         // builds them — plus an error frame addressed to B.
-        let mut sends = control_state_sends(&ctx, NOW, None);
+        let mut sends = control_state_sends(&ctx, at(NOW), None);
         assert_eq!(sends.len(), 2, "frames are still BUILT for every peer");
         sends.push(PeerSend {
             to: SendTarget::One(PEER_B.to_string()),
@@ -5170,7 +5311,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert_eq!(d.flow, Dispatch::Continue);
@@ -5205,7 +5346,7 @@ mod tests {
                 &mut ctx,
                 &bus,
                 SESSION_ID,
-                NOW,
+                at(NOW),
             )
             .await;
             assert!(d.sends.is_empty(), "token {token:?}: no frames");
@@ -5225,13 +5366,13 @@ mod tests {
         let hello = ControlAction::Hello {
             capability_token: Some(token_expiring_at(NOW / 1000 + 5)),
         };
-        dispatch_action(hello, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
+        dispatch_action(hello, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, at(NOW)).await;
         let qsy = || ControlAction::Qsy {
             vfo: 0,
             frequency_hz: 14_074_000.0,
         };
         // Sanity: within the token's lifetime the qsy is forwarded.
-        dispatch_action(qsy(), CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
+        dispatch_action(qsy(), CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, at(NOW)).await;
         assert!(hamlib_rx.try_recv().is_ok(), "qsy permitted before exp");
         // A minute later the capability has expired.
         dispatch_action(
@@ -5240,7 +5381,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW + 60_000,
+            at(NOW + 60_000),
         )
         .await;
         assert!(
@@ -5257,12 +5398,12 @@ mod tests {
         let hello = ControlAction::Hello {
             capability_token: Some(token_expiring_at(NOW / 1000 + 5)),
         };
-        dispatch_action(hello, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
+        dispatch_action(hello, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, at(NOW)).await;
         let split = || ControlAction::SetSplit {
             enabled: true,
             tx_frequency_hz: 14_075_000.0,
         };
-        dispatch_action(split(), CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
+        dispatch_action(split(), CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, at(NOW)).await;
         assert!(
             hamlib_rx.try_recv().is_ok(),
             "setSplit permitted before exp"
@@ -5273,7 +5414,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW + 60_000,
+            at(NOW + 60_000),
         )
         .await;
         assert!(
@@ -5326,7 +5467,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert!(ctx.arm.lock().unwrap().is_armed(), "setup: armed");
@@ -5341,12 +5482,12 @@ mod tests {
         );
 
         assert!(
-            expire_peer_auth(&mut ctx, NOW).is_empty(),
+            expire_peer_auth(&mut ctx, at(NOW)).is_empty(),
             "nothing expired yet"
         );
         assert!(ctx.arm.lock().unwrap().is_armed());
 
-        let sends = expire_peer_auth(&mut ctx, NOW + 1_000);
+        let sends = expire_peer_auth(&mut ctx, at(NOW + 1_000));
         assert!(
             !ctx.arm.lock().unwrap().is_armed(),
             "an expired controller capability must disarm"
@@ -5368,14 +5509,14 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         ctx.peers.insert(
             PEER_B.to_string(),
             PeerCtx::authorized_until(vec!["status".to_string()], NOW + 1_000),
         );
-        assert!(expire_peer_auth(&mut ctx, NOW + 1_000).is_empty());
+        assert!(expire_peer_auth(&mut ctx, at(NOW + 1_000)).is_empty());
         assert!(
             ctx.arm.lock().unwrap().is_armed(),
             "a listener expiring disarms nothing"
@@ -5449,7 +5590,7 @@ mod tests {
             let msg2_a = envs_to(&out, CLIENT_KEY_ID).remove(0);
             init_a.read_msg2(&msg2_a);
             let mut t = init_a.into_transport();
-            let token = real_clock_token(&trigger_agent_kid, CLIENT_KEY_ID, &["status"]);
+            let token = injected_clock_token(&trigger_agent_kid, CLIENT_KEY_ID, &["status"]);
             let ct = client_encrypt(&mut t, &hello_frame_bytes(&token));
             *slot.lock().unwrap() = Some(t);
             ws_handle.push_inbound(
@@ -5587,6 +5728,7 @@ mod tests {
             revocation_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             authz_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             authz_generation_seen: 0,
+            clock: fixed_clock(NOW),
         }
     }
 
@@ -5830,7 +5972,7 @@ mod tests {
     /// `is_tx_arm_eligible` is a live read, never a cached/stale snapshot: a
     /// write landing between two calls IS observed by the second call. This
     /// is the property `verify_and_arm`'s authoritative re-check (taken
-    /// while holding `ctx.arm`'s lock, immediately before `st.arm(...)`)
+    /// while holding `ctx.arm`'s lock, immediately before `st.arm(at(...))`)
     /// depends on. `verify_and_arm` itself has no `.await`/yield point
     /// between its top-of-function check and this re-check, so an external
     /// test cannot practically force a real race to land inside a single
@@ -5847,7 +5989,7 @@ mod tests {
         // top-of-function check and the final re-check under arm's lock.
         list.write().unwrap().remove(CLIENT_KEY_ID);
         // The re-check — literally the same function, called again, exactly
-        // as verify_and_arm does right before st.arm(...) — must now see the
+        // as verify_and_arm does right before st.arm(at(...)) — must now see the
         // revocation.
         assert!(!is_tx_arm_eligible(&list, CLIENT_KEY_ID));
     }
@@ -5906,11 +6048,13 @@ mod tests {
                 pancetta_agent::arm::VerifiedArmGrant {
                     operator_callsign: "K5ARH".to_string(),
                     ttl_ms: 3_600_000, // 1h — long enough that only the poll-driven disarm can end it
+                    armed_until_ms: NOW + 3_600_000,
+                    heartbeat_interval_sec: 10,
                     scope_tx: true,
                     jti: "revocation-test-jti".to_string(),
                     client_key_id: CLIENT_KEY_ID.to_string(),
                 },
-                NOW,
+                at(NOW),
             );
         }
         assert!(
@@ -6011,25 +6155,25 @@ mod tests {
         // Pre-arm as CLIENT_KEY_ID (consent + a live grant) BEFORE the
         // session starts — so the peer's hello greeting shows
         // `transmitArmed: true`, giving the later broadcast a real
-        // true→false transition to prove. `run_one_session`'s internal
-        // `control_state_sends` calls always use the REAL wall clock
-        // (`now_ms()`), not this module's fixed `NOW` test constant, so the
-        // grant must be armed against real "now" too or it reads as already
-        // TTL-expired.
-        let real_now = now_ms();
+        // true→false transition to prove. `run_one_session` reads arm time
+        // from `ctx.clock`, which `fresh_ctx` pins to this module's `NOW`, so
+        // the grant is armed on that same injected timeline.
+        let real_now = NOW;
         ctx.arm.lock().unwrap().set_local_consent(true, real_now);
         ctx.arm.lock().unwrap().arm(
             pancetta_agent::arm::VerifiedArmGrant {
                 operator_callsign: OPERATOR.to_string(),
                 ttl_ms: 3_600_000,
+                armed_until_ms: real_now + 3_600_000,
+                heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "broadcast-test-jti".to_string(),
                 client_key_id: CLIENT_KEY_ID.to_string(),
             },
-            real_now,
+            at(real_now),
         );
         assert!(
-            ctx.arm.lock().unwrap().tx_permitted(real_now),
+            ctx.arm.lock().unwrap().tx_permitted(at(real_now)),
             "setup sanity: must be armed+permitted before the peer establishes"
         );
 
@@ -6080,7 +6224,7 @@ mod tests {
             let msg2 = envs_to(&hello_outbound.lock().unwrap(), CLIENT_KEY_ID).remove(0);
             initiator.read_msg2(&msg2);
             let mut t = initiator.into_transport();
-            let token = real_clock_token(&hello_agent_kid, CLIENT_KEY_ID, &["status"]);
+            let token = injected_clock_token(&hello_agent_kid, CLIENT_KEY_ID, &["status"]);
             let ct = client_encrypt(&mut t, &hello_frame_bytes(&token));
             *slot.lock().unwrap() = Some(t);
             ws_handle.push_inbound(
@@ -6180,18 +6324,21 @@ mod tests {
 
         // Pre-arm as CLIENT_KEY_ID (PEER_A) so PEER_B's hello greeting
         // shows `transmitArmed: true`, giving the later broadcast a real
-        // true→false transition to prove for PEER_B.
-        let real_now = now_ms();
+        // true→false transition to prove for PEER_B. Armed on the injected
+        // `ctx.clock` timeline (`NOW`) the session loop reads.
+        let real_now = NOW;
         ctx.arm.lock().unwrap().set_local_consent(true, real_now);
         ctx.arm.lock().unwrap().arm(
             pancetta_agent::arm::VerifiedArmGrant {
                 operator_callsign: OPERATOR.to_string(),
                 ttl_ms: 3_600_000,
+                armed_until_ms: real_now + 3_600_000,
+                heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "malformed-frame-test-jti".to_string(),
                 client_key_id: CLIENT_KEY_ID.to_string(),
             },
-            real_now,
+            at(real_now),
         );
 
         let poll_arm = ctx.arm.clone();
@@ -6245,7 +6392,7 @@ mod tests {
             let msg2_b = envs_to(&hello_outbound.lock().unwrap(), PEER_B).remove(0);
             init_b.read_msg2(&msg2_b);
             let mut t = init_b.into_transport();
-            let token = real_clock_token(&hello_agent_kid, PEER_B, &["status"]);
+            let token = injected_clock_token(&hello_agent_kid, PEER_B, &["status"]);
             let ct = client_encrypt(&mut t, &hello_frame_bytes(&token));
             *slot_b.lock().unwrap() = Some(t);
             hello_ws_handle.push_inbound(
@@ -6467,7 +6614,7 @@ mod tests {
                 &mut ctx,
                 &bus,
                 SESSION_ID,
-                NOW,
+                at(NOW),
             )
             .await;
             tokio::task::yield_now().await;
@@ -6530,7 +6677,7 @@ mod tests {
         let hello = ControlAction::Hello {
             capability_token: Some(tok.clone()),
         };
-        dispatch_action(hello, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
+        dispatch_action(hello, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, at(NOW)).await;
         assert!(
             ctx.peers[CLIENT_KEY_ID].auth.is_some(),
             "setup: the hello verified at NOW"
@@ -6549,7 +6696,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            later,
+            at(later),
         )
         .await;
         dispatch_action(
@@ -6558,7 +6705,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            later,
+            at(later),
         )
         .await;
         assert!(
@@ -6575,15 +6722,31 @@ mod tests {
         let hello = ControlAction::Hello {
             capability_token: Some(valid_token()),
         };
-        dispatch_action(hello, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
-        dispatch_action(qsy_action(), CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
+        dispatch_action(hello, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, at(NOW)).await;
+        dispatch_action(
+            qsy_action(),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
         assert!(
             hamlib_rx.try_recv().is_ok(),
             "setup: qsy permitted while admitted"
         );
 
         revoke_admission(&ctx, CLIENT_KEY_ID);
-        dispatch_action(qsy_action(), CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
+        dispatch_action(
+            qsy_action(),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
         assert!(
             hamlib_rx.try_recv().is_err(),
             "a peer dropped from the admission list must not drive setFrequency"
@@ -6598,14 +6761,14 @@ mod tests {
         let hello = ControlAction::Hello {
             capability_token: Some(valid_token()),
         };
-        dispatch_action(hello, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
+        dispatch_action(hello, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, at(NOW)).await;
         dispatch_action(
             split_action(),
             CLIENT_KEY_ID,
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert!(
@@ -6620,7 +6783,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
         assert!(
@@ -6640,17 +6803,20 @@ mod tests {
         let hello = ControlAction::Hello {
             capability_token: Some(valid_token()),
         };
-        dispatch_action(hello, CLIENT_KEY_ID, &mut ctx, bus, SESSION_ID, NOW).await;
+        dispatch_action(hello, CLIENT_KEY_ID, &mut ctx, bus, SESSION_ID, at(NOW)).await;
         dispatch_action(
             arm_action("revoked-arm-jti"),
             CLIENT_KEY_ID,
             &mut ctx,
             bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
-        assert!(ctx.arm.lock().unwrap().tx_permitted(NOW), "setup: armed");
+        assert!(
+            ctx.arm.lock().unwrap().tx_permitted(at(NOW)),
+            "setup: armed"
+        );
         assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
         revoke_admission(&ctx, CLIENT_KEY_ID);
         (ctx, hamlib_rx)
@@ -6660,7 +6826,7 @@ mod tests {
     async fn revoked_peer_can_only_disarm_or_release() {
         let bus = MessageBus::new(64).unwrap();
         let (mut ctx, hamlib_rx) = armed_controller_then_revoked(&bus).await;
-        let at = NOW + 20_000;
+        let later = NOW + 20_000;
         let refused = [
             ControlAction::TakeControl,
             ControlAction::Hello {
@@ -6676,7 +6842,8 @@ mod tests {
         ];
         for action in refused {
             let label = format!("{action:?}");
-            let out = dispatch_action(action, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, at).await;
+            let out =
+                dispatch_action(action, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, at(later)).await;
             assert!(out.sends.is_empty(), "{label}: no frames");
             assert_eq!(
                 ctx.controller.as_deref(),
@@ -6694,7 +6861,7 @@ mod tests {
             !ctx.arm
                 .lock()
                 .unwrap()
-                .tx_permitted(at + HEARTBEAT_TIMEOUT_MS - 1),
+                .tx_permitted(at(later + HEARTBEAT_TIMEOUT_MS - 1)),
             "the refused heartbeat must not have slid the dead-man window"
         );
 
@@ -6707,11 +6874,11 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW + 1_000,
+            at(NOW + 1_000),
         )
         .await;
         assert!(
-            !ctx.arm.lock().unwrap().tx_permitted(NOW + 1_000),
+            !ctx.arm.lock().unwrap().tx_permitted(at(NOW + 1_000)),
             "a revoked peer may still disarm"
         );
 
@@ -6724,14 +6891,14 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW + 1_000,
+            at(NOW + 1_000),
         )
         .await;
         assert!(
             ctx.controller.is_none(),
             "a revoked peer may still release control"
         );
-        assert!(!ctx.arm.lock().unwrap().tx_permitted(NOW + 1_000));
+        assert!(!ctx.arm.lock().unwrap().tx_permitted(at(NOW + 1_000)));
     }
 
     #[tokio::test]
@@ -6742,10 +6909,18 @@ mod tests {
         let hello = ControlAction::Hello {
             capability_token: Some(valid_token()),
         };
-        dispatch_action(hello, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
+        dispatch_action(hello, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, at(NOW)).await;
         revoke_admission(&ctx, CLIENT_KEY_ID);
         assert!(ctx.controller.is_none());
-        dispatch_action(qsy_action(), CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
+        dispatch_action(
+            qsy_action(),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
         assert!(
             ctx.controller.is_none(),
             "a revoked peer's qsy must not implicitly grab control"
@@ -6784,7 +6959,7 @@ mod tests {
         let v = client_decrypt_json(&mut transports[1], &envs_b[0]);
         assert_eq!(v["event"]["event"], "txStatus");
 
-        let sends = control_state_sends(&ctx, NOW, None);
+        let sends = control_state_sends(&ctx, at(NOW), None);
         let before = outbound.lock().unwrap().len();
         deliver_sends(&mut sess, &ctx, &sends, || NOW);
         let out = outbound.lock().unwrap().clone();
@@ -6803,14 +6978,14 @@ mod tests {
     #[tokio::test]
     async fn hello_with_deny_listed_jti_grants_nothing() {
         let mut ctx = ctx_with(true, true);
-        let token = real_clock_token(AGENT_KEY_ID, CLIENT_KEY_ID, &["status", "qsy"]);
+        let token = injected_clock_token(AGENT_KEY_ID, CLIENT_KEY_ID, &["status", "qsy"]);
         assert!(
-            dispatch_hello(Some(token.clone()), CLIENT_KEY_ID, &mut ctx, now_ms()).0,
+            dispatch_hello(Some(token.clone()), CLIENT_KEY_ID, &mut ctx, NOW).0,
             "setup: the token is otherwise valid"
         );
         ctx.revoked_jtis.insert(format!("hello-{CLIENT_KEY_ID}"));
         assert!(
-            !dispatch_hello(Some(token), CLIENT_KEY_ID, &mut ctx, now_ms()).0,
+            !dispatch_hello(Some(token), CLIENT_KEY_ID, &mut ctx, NOW).0,
             "a deny-listed token must not re-authorize"
         );
         assert!(
@@ -6842,10 +7017,13 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
-        assert!(ctx.arm.lock().unwrap().tx_permitted(NOW), "setup: armed");
+        assert!(
+            ctx.arm.lock().unwrap().tx_permitted(at(NOW)),
+            "setup: armed"
+        );
         assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
 
         let out = dispatch_action(
@@ -6856,7 +7034,7 @@ mod tests {
             &mut ctx,
             &bus,
             SESSION_ID,
-            NOW,
+            at(NOW),
         )
         .await;
 
@@ -6887,8 +7065,8 @@ mod tests {
     #[tokio::test]
     async fn hello_stores_token_jti() {
         let mut ctx = ctx_with(true, true);
-        let token = real_clock_token(AGENT_KEY_ID, CLIENT_KEY_ID, &["status"]);
-        assert!(dispatch_hello(Some(token), CLIENT_KEY_ID, &mut ctx, now_ms()).0);
+        let token = injected_clock_token(AGENT_KEY_ID, CLIENT_KEY_ID, &["status"]);
+        assert!(dispatch_hello(Some(token), CLIENT_KEY_ID, &mut ctx, NOW).0);
         assert_eq!(
             ctx.peers[CLIENT_KEY_ID].auth.as_ref().unwrap().jti,
             format!("hello-{CLIENT_KEY_ID}")
@@ -6903,7 +7081,7 @@ mod tests {
         let hello = ControlAction::Hello {
             capability_token: Some(valid_token()),
         };
-        dispatch_action(hello, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
+        dispatch_action(hello, CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, at(NOW)).await;
         assert!(peer_admitted(&ctx, CLIENT_KEY_ID), "setup: admitted");
 
         let list = ctx.tx_allow_list.clone();
@@ -6918,7 +7096,15 @@ mod tests {
             !peer_admitted(&ctx, CLIENT_KEY_ID),
             "a poisoned admission list admits nobody"
         );
-        dispatch_action(qsy_action(), CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, NOW).await;
+        dispatch_action(
+            qsy_action(),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
         assert!(hamlib_rx.try_recv().is_err(), "and authorizes nothing");
     }
 
@@ -7012,7 +7198,7 @@ mod tests {
     }
 
     /// An established peer holding a `status`+`qsy` hello capability whose
-    /// `jti` is `hello-<kid>` (what `real_clock_token` mints).
+    /// `jti` is `hello-<kid>` (what `injected_clock_token` mints).
     fn hello_authorized(kid: &str, exp_ms: i64) -> PeerCtx {
         PeerCtx {
             auth: Some(PeerAuth {
@@ -7075,13 +7261,15 @@ mod tests {
             pancetta_agent::arm::VerifiedArmGrant {
                 operator_callsign: OPERATOR.to_string(),
                 ttl_ms: 300_000,
+                armed_until_ms: NOW + 300_000,
+                heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "reconcile-arm-jti".to_string(),
                 client_key_id: kid.to_string(),
             },
-            NOW,
+            at(NOW),
         );
-        assert!(st.tx_permitted(NOW), "setup: armed");
+        assert!(st.tx_permitted(at(NOW)), "setup: armed");
         drop(st);
         ctx.controller = Some(kid.to_string());
     }
@@ -7153,7 +7341,7 @@ mod tests {
         let (mut ctx, mut sess, _out, _t, _ws) = two_authorized_peers(&identity);
         revoke_admission(&ctx, CLIENT_KEY_ID);
 
-        assert!(reconcile_authorizations(&mut ctx, &mut sess, NOW).is_empty());
+        assert!(reconcile_authorizations(&mut ctx, &mut sess, at(NOW)).is_empty());
         assert_eq!(sess.established_peers().count(), 2, "nobody evicted");
         assert!(ctx.peers.contains_key(CLIENT_KEY_ID));
         assert!(ctx.peers.contains_key(PEER_B));
@@ -7171,7 +7359,7 @@ mod tests {
         revoke_admission(&ctx, CLIENT_KEY_ID);
         bump_generation(&ctx);
 
-        let sends = reconcile_authorizations(&mut ctx, &mut sess, NOW);
+        let sends = reconcile_authorizations(&mut ctx, &mut sess, at(NOW));
         assert!(
             sends.is_empty(),
             "no controller was evicted: nothing to tell"
@@ -7212,9 +7400,12 @@ mod tests {
         revoke_admission(&ctx, CLIENT_KEY_ID);
         bump_generation(&ctx);
 
-        let sends = reconcile_authorizations(&mut ctx, &mut sess, NOW);
+        let sends = reconcile_authorizations(&mut ctx, &mut sess, at(NOW));
         assert_eq!(ctx.controller, None, "a revoked controller is released");
-        assert!(!ctx.arm.lock().unwrap().tx_permitted(NOW), "and disarmed");
+        assert!(
+            !ctx.arm.lock().unwrap().tx_permitted(at(NOW)),
+            "and disarmed"
+        );
         let disarmed = disarmed_records(&ctx);
         assert_eq!(
             disarmed.len(),
@@ -7258,7 +7449,7 @@ mod tests {
         assert_eq!(disarmed_before, 1, "setup: the poll task's disarm");
         revoke_admission(&ctx, CLIENT_KEY_ID);
         bump_generation(&ctx);
-        reconcile_authorizations(&mut ctx, &mut sess, NOW);
+        reconcile_authorizations(&mut ctx, &mut sess, at(NOW));
         assert_eq!(ctx.controller, None);
         assert_eq!(
             disarmed_records(&ctx).len(),
@@ -7294,7 +7485,7 @@ mod tests {
             .unwrap()
             .insert(PEER_B.to_string());
         bump_generation(&ctx);
-        assert!(reconcile_authorizations(&mut ctx, &mut sess, NOW).is_empty());
+        assert!(reconcile_authorizations(&mut ctx, &mut sess, at(NOW)).is_empty());
 
         ws.push_inbound(msg1_from_c());
         assert!(
@@ -7315,13 +7506,13 @@ mod tests {
         let (mut sess, _out, mut transports, ws) = hand_session_ws(&identity, &[&client_device()]);
         ctx.peers
             .insert(CLIENT_KEY_ID.to_string(), PeerCtx::unauthorized());
-        let old_token = real_clock_token(&agent_kid, CLIENT_KEY_ID, &["status", "qsy"]);
-        assert!(dispatch_hello(Some(old_token.clone()), CLIENT_KEY_ID, &mut ctx, now_ms()).0);
+        let old_token = injected_clock_token(&agent_kid, CLIENT_KEY_ID, &["status", "qsy"]);
+        assert!(dispatch_hello(Some(old_token.clone()), CLIENT_KEY_ID, &mut ctx, NOW).0);
 
         // Revoked and evicted.
         revoke_admission(&ctx, CLIENT_KEY_ID);
         bump_generation(&ctx);
-        reconcile_authorizations(&mut ctx, &mut sess, now_ms());
+        reconcile_authorizations(&mut ctx, &mut sess, at(NOW));
         assert!(!ctx.peers.contains_key(CLIENT_KEY_ID));
 
         // Re-authorized.
@@ -7330,7 +7521,7 @@ mod tests {
             .unwrap()
             .insert(CLIENT_KEY_ID.to_string());
         bump_generation(&ctx);
-        assert!(reconcile_authorizations(&mut ctx, &mut sess, now_ms()).is_empty());
+        assert!(reconcile_authorizations(&mut ctx, &mut sess, at(NOW)).is_empty());
 
         // The old transport cannot resume: its frame is not a msg1.
         let ct = client_encrypt(&mut transports[0], &hello_frame_bytes(&old_token));
@@ -7358,15 +7549,15 @@ mod tests {
             }
             other => panic!("expected PeerEstablished, got {other:?}"),
         }
-        assert!(!peer_may_receive(&ctx, CLIENT_KEY_ID, now_ms()));
+        assert!(!peer_may_receive(&ctx, CLIENT_KEY_ID, NOW));
 
         // The old token stays refused; a freshly minted one is accepted.
-        assert!(!dispatch_hello(Some(old_token), CLIENT_KEY_ID, &mut ctx, now_ms()).0);
+        assert!(!dispatch_hello(Some(old_token), CLIENT_KEY_ID, &mut ctx, NOW).0);
         assert!(ctx.peers[CLIENT_KEY_ID].auth.is_none());
         let fresh =
-            real_clock_token_with_jti(&agent_kid, CLIENT_KEY_ID, &["status"], "hello-fresh");
-        assert!(dispatch_hello(Some(fresh), CLIENT_KEY_ID, &mut ctx, now_ms()).0);
-        assert!(peer_may_receive(&ctx, CLIENT_KEY_ID, now_ms()));
+            injected_clock_token_with_jti(&agent_kid, CLIENT_KEY_ID, &["status"], "hello-fresh");
+        assert!(dispatch_hello(Some(fresh), CLIENT_KEY_ID, &mut ctx, NOW).0);
+        assert!(peer_may_receive(&ctx, CLIENT_KEY_ID, NOW));
     }
 
     #[tokio::test]
@@ -7377,8 +7568,8 @@ mod tests {
         let (mut sess, outbound, _t) = hand_session(&identity, &[&client_device()]);
         ctx.peers
             .insert(CLIENT_KEY_ID.to_string(), PeerCtx::unauthorized());
-        let token = real_clock_token(&agent_kid, CLIENT_KEY_ID, &["status", "qsy"]);
-        assert!(dispatch_hello(Some(token), CLIENT_KEY_ID, &mut ctx, now_ms()).0);
+        let token = injected_clock_token(&agent_kid, CLIENT_KEY_ID, &["status", "qsy"]);
+        assert!(dispatch_hello(Some(token), CLIENT_KEY_ID, &mut ctx, NOW).0);
         let bus = MessageBus::new(64).unwrap();
         let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
 
@@ -7397,17 +7588,25 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
         assert!(!ctx.tx_allow_list.read().unwrap().contains(CLIENT_KEY_ID));
 
-        reconcile_authorizations(&mut ctx, &mut sess, now_ms());
+        reconcile_authorizations(&mut ctx, &mut sess, at(NOW));
 
-        let now = now_ms();
-        dispatch_action(qsy_action(), CLIENT_KEY_ID, &mut ctx, &bus, SESSION_ID, now).await;
+        let now = NOW;
+        dispatch_action(
+            qsy_action(),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(now),
+        )
+        .await;
         dispatch_action(
             split_action(),
             CLIENT_KEY_ID,
             &mut ctx,
             &bus,
             SESSION_ID,
-            now,
+            at(now),
         )
         .await;
         assert!(
@@ -7416,7 +7615,7 @@ mod tests {
         );
         let before = envs_to(&outbound.lock().unwrap(), CLIENT_KEY_ID).len();
         let mut events = feed_with(pancetta_protocol::ServerEvent::TxStatus { active: true });
-        drain_read_stream(&mut events, &mut sess, &ctx, now_ms);
+        drain_read_stream(&mut events, &mut sess, &ctx, || NOW);
         assert_eq!(
             envs_to(&outbound.lock().unwrap(), CLIENT_KEY_ID).len(),
             before,
@@ -7486,8 +7685,8 @@ mod tests {
             init_b.read_msg2(&envs_to(&out, PEER_B).remove(0));
             let mut ta = init_a.into_transport();
             let mut tb = init_b.into_transport();
-            let tok_a = real_clock_token(&kid1, CLIENT_KEY_ID, &["status", "qsy"]);
-            let tok_b = real_clock_token(&kid1, PEER_B, &["status"]);
+            let tok_a = injected_clock_token(&kid1, CLIENT_KEY_ID, &["status", "qsy"]);
+            let tok_b = injected_clock_token(&kid1, PEER_B, &["status"]);
             ws1.push_inbound(env_from(
                 &kid1,
                 CLIENT_KEY_ID,
@@ -7563,5 +7762,679 @@ mod tests {
         let event = client_decrypt_json(&mut tb, &envs_b[2]);
         assert_eq!(event["event"]["event"], "txStatus");
         assert_eq!(event["event"]["active"], true);
+    }
+
+    // ========================================================================
+    // PAN-97: a lapsed arm needs a fresh signed arm — real session loop
+    // ========================================================================
+
+    /// Builds one control-frame plaintext for a scripted [`Pan97Client`].
+    type Pan97Frame = Box<dyn FnOnce(&Pan97Client) -> Vec<u8> + Send>;
+
+    /// One scripted receive for [`Pan97Ws`].
+    enum Pan97Step {
+        /// Deliver a pre-built relay frame (clock unchanged).
+        Frame(String),
+        /// Set the injected clock to `ms`, then report a quiet receive tick.
+        QuietAt(i64),
+        /// Set the clock to `ms`, then deliver the plaintext built by the
+        /// closure, encrypted under client `idx`'s live Noise transport.
+        SendAt(i64, usize, Pan97Frame),
+        /// Run a check between ticks (clock unchanged), then report quiet.
+        Check(Box<dyn FnOnce() + Send>),
+    }
+
+    /// The client side of one Noise peer in a scripted `run_one_session`:
+    /// completes the handshake from the agent's msg2, encrypts control frames
+    /// and decrypts every event the agent sends back, in wire order.
+    struct Pan97Client {
+        kid: String,
+        agent_kid: String,
+        initiator: Option<TestInitiator>,
+        transport: Option<snow::TransportState>,
+        session_id: String,
+        envs_seen: usize,
+        events: Vec<Value>,
+    }
+
+    impl Pan97Client {
+        fn new(kid: &str, agent_kid: &str, agent_pub: &[u8]) -> Self {
+            Self {
+                kid: kid.to_string(),
+                agent_kid: agent_kid.to_string(),
+                initiator: Some(initiator_for(&device_for(kid), agent_pub)),
+                transport: None,
+                session_id: String::new(),
+                envs_seen: 0,
+                events: Vec::new(),
+            }
+        }
+
+        /// The relay env carrying this client's handshake msg1 (with the
+        /// PAN-95 client identity proof from its enrolled device).
+        fn msg1_env(&mut self) -> String {
+            let proof = proof_for(&device_for(&self.kid));
+            let msg1 = self.initiator.as_mut().unwrap().write_msg1(&proof);
+            RelayFrame::Env {
+                dst: self.agent_kid.clone(),
+                payload: b64url(&msg1),
+                src: Some(self.kid.clone()),
+            }
+            .to_json()
+            .unwrap()
+        }
+
+        /// Absorb new agent output: the first env is msg2 (completes the
+        /// handshake); every later one is an encrypted event.
+        fn sync(&mut self, outbound: &[String]) {
+            let envs: Vec<Vec<u8>> = outbound
+                .iter()
+                .filter_map(|s| match parse_frame(s).unwrap() {
+                    RelayFrame::Env { dst, payload, .. } if dst == self.kid => Some(
+                        base64::engine::general_purpose::URL_SAFE_NO_PAD
+                            .decode(&payload)
+                            .unwrap(),
+                    ),
+                    _ => None,
+                })
+                .collect();
+            for env in envs.iter().skip(self.envs_seen) {
+                if let Some(mut init) = self.initiator.take() {
+                    init.read_msg2(env);
+                    self.session_id = b64url(&init.handshake_hash());
+                    self.transport = Some(init.into_transport());
+                } else {
+                    let transport = self.transport.as_mut().unwrap();
+                    let mut buf = vec![0u8; env.len().max(1)];
+                    let n = transport.read_message(env, &mut buf).unwrap();
+                    buf.truncate(n);
+                    self.events.push(serde_json::from_slice(&buf).unwrap());
+                }
+            }
+            self.envs_seen = envs.len();
+        }
+
+        fn encrypt_env(&mut self, plaintext: &[u8]) -> String {
+            let transport = self
+                .transport
+                .as_mut()
+                .expect("handshake must complete before sending");
+            let mut ct = vec![0u8; plaintext.len() + 16];
+            let n = transport.write_message(plaintext, &mut ct).unwrap();
+            ct.truncate(n);
+            RelayFrame::Env {
+                dst: self.agent_kid.clone(),
+                payload: b64url(&ct),
+                src: Some(self.kid.clone()),
+            }
+            .to_json()
+            .unwrap()
+        }
+
+        /// `(controlHeldByMe, transmitArmed)` of every `controlState` received.
+        fn control_states(&self) -> Vec<(bool, bool)> {
+            self.events
+                .iter()
+                .filter(|e| e["event"]["event"] == "controlState")
+                .map(|e| {
+                    (
+                        e["event"]["controlHeldByMe"].as_bool().unwrap(),
+                        e["event"]["transmitArmed"].as_bool().unwrap(),
+                    )
+                })
+                .collect()
+        }
+    }
+
+    /// A relay transport whose every receive comes from a script, advancing
+    /// the session's injected clock as it goes. An exhausted script closes.
+    struct Pan97Ws {
+        outbound: Arc<Mutex<Vec<String>>>,
+        steps: std::collections::VecDeque<Pan97Step>,
+        clients: Arc<Mutex<Vec<Pan97Client>>>,
+        clock_ms: Arc<std::sync::atomic::AtomicI64>,
+    }
+
+    impl WsConn for Pan97Ws {
+        fn send_text(&mut self, s: String) -> Result<(), RelayError> {
+            self.outbound.lock().unwrap().push(s);
+            Ok(())
+        }
+        fn recv_text(&mut self) -> Result<Option<String>, RelayError> {
+            match self.recv_text_within(Duration::ZERO)? {
+                pancetta_agent::relay::RecvOutcome::Frame(t) => Ok(Some(t)),
+                _ => Ok(None),
+            }
+        }
+        fn recv_text_within(
+            &mut self,
+            _timeout: Duration,
+        ) -> Result<pancetta_agent::relay::RecvOutcome, RelayError> {
+            use pancetta_agent::relay::RecvOutcome;
+            let out = self.outbound.lock().unwrap().clone();
+            for c in self.clients.lock().unwrap().iter_mut() {
+                c.sync(&out);
+            }
+            Ok(match self.steps.pop_front() {
+                None => RecvOutcome::Closed,
+                Some(Pan97Step::Frame(t)) => RecvOutcome::Frame(t),
+                Some(Pan97Step::QuietAt(ms)) => {
+                    self.clock_ms.store(ms, Ordering::SeqCst);
+                    RecvOutcome::Quiet
+                }
+                Some(Pan97Step::SendAt(ms, idx, build)) => {
+                    self.clock_ms.store(ms, Ordering::SeqCst);
+                    let mut clients = self.clients.lock().unwrap();
+                    let plaintext = build(&clients[idx]);
+                    RecvOutcome::Frame(clients[idx].encrypt_env(&plaintext))
+                }
+                Some(Pan97Step::Check(f)) => {
+                    f();
+                    RecvOutcome::Quiet
+                }
+            })
+        }
+    }
+
+    /// A scripted PAN-97 session: CLIENT_KEY_ID (TX-arm eligible) plus any
+    /// `extra` listener peers, consent ON, clock at `NOW`.
+    struct Pan97Session {
+        identity: AgentIdentity,
+        ctx: ArmContext,
+        clients: Vec<Pan97Client>,
+        clock_ms: Arc<std::sync::atomic::AtomicI64>,
+    }
+
+    impl Pan97Session {
+        fn new(extra: &[&str]) -> Self {
+            let identity = AgentIdentity::generate();
+            let agent_kid = identity.key_id();
+            let agent_pub = identity.agreement_public_raw();
+            let mut ctx = ctx_with_agent(&agent_kid, true, true);
+            for peer in extra {
+                ctx.tx_allow_list.write().unwrap().insert(peer.to_string());
+            }
+            with_consent(&ctx, true);
+            let clock_ms = Arc::new(std::sync::atomic::AtomicI64::new(NOW));
+            ctx.clock = manual_clock(&clock_ms);
+            let clients = std::iter::once(CLIENT_KEY_ID)
+                .chain(extra.iter().copied())
+                .map(|kid| Pan97Client::new(kid, &agent_kid, &agent_pub))
+                .collect();
+            Self {
+                identity,
+                ctx,
+                clients,
+                clock_ms,
+            }
+        }
+
+        /// Run the real `run_one_session` over relay hello + every client's
+        /// msg1, then `script`. Returns the clients with all output decrypted.
+        async fn run(
+            mut self,
+            script: Vec<Pan97Step>,
+            events: &mut Option<tokio::sync::broadcast::Receiver<pancetta_protocol::ServerEvent>>,
+        ) -> (ArmContext, Vec<Pan97Client>) {
+            let hello = RelayFrame::Hello {
+                challenge: b64url(&[9u8; 32]),
+            }
+            .to_json()
+            .unwrap();
+            let mut steps: std::collections::VecDeque<Pan97Step> =
+                std::iter::once(Pan97Step::Frame(hello)).collect();
+            for (idx, c) in self.clients.iter_mut().enumerate() {
+                steps.push_back(Pan97Step::Frame(c.msg1_env()));
+                // PAN-95: an established peer is sent nothing until it holds
+                // a verified hello capability, so every scripted client
+                // hellos first (on the injected NOW timeline) — the arm and
+                // disarm broadcasts under test must actually reach them.
+                steps.push_back(Pan97Step::SendAt(NOW, idx, pan97_hello()));
+            }
+            steps.extend(script);
+            let outbound = Arc::new(Mutex::new(Vec::new()));
+            let clients = Arc::new(Mutex::new(std::mem::take(&mut self.clients)));
+            let ws = Pan97Ws {
+                outbound: outbound.clone(),
+                steps,
+                clients: clients.clone(),
+                clock_ms: self.clock_ms.clone(),
+            };
+            let bus = MessageBus::new(64).unwrap();
+            run_one_session(ws, &self.identity, &mut self.ctx, &bus, events).await;
+            let out = outbound.lock().unwrap().clone();
+            let mut clients = std::mem::take(&mut *clients.lock().unwrap());
+            for c in clients.iter_mut() {
+                c.sync(&out);
+            }
+            (self.ctx, clients)
+        }
+    }
+
+    /// A `hello` frame carrying a NOW-timeline capability token for the
+    /// sending client (PAN-95: a peer receives nothing until this verifies).
+    fn pan97_hello() -> Pan97Frame {
+        Box::new(|c: &Pan97Client| {
+            hello_frame_bytes(&injected_clock_token(&c.agent_kid, &c.kid, &["status"]))
+        })
+    }
+
+    fn pan97_arm(jti: &'static str, armed_until: i64) -> Pan97Frame {
+        Box::new(move |c: &Pan97Client| {
+            serde_json::to_vec(&tx_arm_frame(&c.agent_kid, &c.session_id, jti, armed_until))
+                .unwrap()
+        })
+    }
+
+    fn pan97_heartbeat(jti: &'static str, seq: u64) -> Pan97Frame {
+        Box::new(move |_: &Pan97Client| {
+            serde_json::to_vec(&json!({"type": "txHeartbeat", "armJti": jti, "seq": seq})).unwrap()
+        })
+    }
+
+    /// A valid control frame that touches neither the arm nor control. An
+    /// unknown frame tag maps to `Unsupported` (a logged no-op); a legacy
+    /// no-token `hello` is NOT benign anymore — since PAN-96 it clears the
+    /// sender's capability and disarms an authed controller.
+    fn pan97_benign() -> Pan97Frame {
+        Box::new(|_: &Pan97Client| {
+            serde_json::to_vec(&json!({
+                "frame": "statusPing",
+                "statusPing": { "protocolVersion": 1 }
+            }))
+            .unwrap()
+        })
+    }
+
+    fn pan97_check(f: impl FnOnce() + Send + 'static) -> Pan97Step {
+        Pan97Step::Check(Box::new(f))
+    }
+
+    /// How many audit records contain `needle`.
+    fn audit_count(ctx: &ArmContext, needle: &str) -> usize {
+        std::fs::read_to_string(ctx.audit.path())
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains(needle))
+            .count()
+    }
+
+    /// The ticket's scenario on the real loop: an established, armed
+    /// controller goes silent. With no heartbeat and no TX request, the
+    /// session loop's own sweep expires the arm at the deadline, audits it
+    /// once and tells every peer `transmitArmed: false`, keeping the peers
+    /// and the controller slot.
+    #[tokio::test]
+    async fn silent_controller_is_disarmed_by_the_session_loop_without_any_heartbeat() {
+        let sess = Pan97Session::new(&[PEER_B]);
+        let (arm_a, arm_b) = (sess.ctx.arm.clone(), sess.ctx.arm.clone());
+        let script = vec![
+            Pan97Step::SendAt(NOW, 0, pan97_arm("arm-jti-1", NOW + 300_000)),
+            pan97_check(move || assert!(arm_a.lock().unwrap().is_armed(), "armed")),
+            Pan97Step::QuietAt(NOW + HEARTBEAT_TIMEOUT_MS - 1),
+            Pan97Step::QuietAt(NOW + HEARTBEAT_TIMEOUT_MS),
+            pan97_check(move || {
+                assert!(
+                    !arm_b.lock().unwrap().is_armed(),
+                    "the sweep must expire the arm"
+                )
+            }),
+        ];
+        let (ctx, clients) = sess.run(script, &mut None).await;
+
+        assert!(!ctx.arm.lock().unwrap().is_armed());
+        assert_eq!(audit_count(&ctx, "auto-disarm: heartbeat-lost"), 1);
+        assert!(ctx.peers.contains_key(CLIENT_KEY_ID) && ctx.peers.contains_key(PEER_B));
+        assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
+        assert_eq!(clients[0].control_states().last(), Some(&(true, false)));
+        assert_eq!(clients[1].control_states().last(), Some(&(false, false)));
+        assert!(
+            clients[0].control_states().contains(&(true, true)),
+            "the controller saw the arm go live first"
+        );
+    }
+
+    /// Continuous valid (non-heartbeat) traffic from both peers cannot starve
+    /// the sweep: the frame that arrives at the deadline is handled only after
+    /// the arm has expired.
+    #[tokio::test]
+    async fn valid_traffic_cannot_skip_the_session_loop_expiry_sweep() {
+        let sess = Pan97Session::new(&[PEER_B]);
+        let arm = sess.ctx.arm.clone();
+        let script = vec![
+            Pan97Step::SendAt(NOW, 0, pan97_arm("arm-jti-1", NOW + 300_000)),
+            Pan97Step::SendAt(NOW + 10_000, 0, pan97_benign()),
+            Pan97Step::SendAt(NOW + 20_000, 1, pan97_benign()),
+            Pan97Step::SendAt(NOW + HEARTBEAT_TIMEOUT_MS, 1, pan97_benign()),
+            pan97_check(move || assert!(!arm.lock().unwrap().is_armed())),
+        ];
+        let (ctx, clients) = sess.run(script, &mut None).await;
+
+        assert_eq!(audit_count(&ctx, "auto-disarm: heartbeat-lost"), 1);
+        assert_eq!(clients[0].control_states().last(), Some(&(true, false)));
+        assert_eq!(clients[1].control_states().last(), Some(&(false, false)));
+    }
+
+    /// A malformed decrypted frame takes the loop's early `continue`; it
+    /// must not bypass the sweep either.
+    #[tokio::test]
+    async fn malformed_traffic_cannot_skip_the_session_loop_expiry_sweep() {
+        let sess = Pan97Session::new(&[PEER_B]);
+        let arm = sess.ctx.arm.clone();
+        let script = vec![
+            Pan97Step::SendAt(NOW, 0, pan97_arm("arm-jti-1", NOW + 300_000)),
+            Pan97Step::SendAt(
+                NOW + HEARTBEAT_TIMEOUT_MS,
+                1,
+                Box::new(|_: &Pan97Client| b"not valid json{{{".to_vec()),
+            ),
+            pan97_check(move || assert!(!arm.lock().unwrap().is_armed())),
+        ];
+        let (ctx, clients) = sess.run(script, &mut None).await;
+
+        assert_eq!(audit_count(&ctx, "auto-disarm: heartbeat-lost"), 1);
+        assert!(
+            ctx.peers.contains_key(PEER_B),
+            "malformed frame keeps the peer"
+        );
+        assert_eq!(clients[0].control_states().last(), Some(&(true, false)));
+        assert_eq!(clients[1].control_states().last(), Some(&(false, false)));
+    }
+
+    /// `(controlHeldByMe, transmitArmed)` per recipient of `sends`.
+    fn pan97_states(sends: &[PeerSend]) -> Vec<(String, bool, bool)> {
+        let mut states: Vec<_> = sends
+            .iter()
+            .filter_map(|s| {
+                let SendTarget::One(peer) = &s.to;
+                match &s.frame {
+                    pancetta_protocol::ServerFrame::Event {
+                        event:
+                            pancetta_protocol::ServerEvent::ControlState {
+                                control_held_by_me,
+                                transmit_armed,
+                            },
+                    } => Some((peer.clone(), *control_held_by_me, *transmit_armed)),
+                    _ => None,
+                }
+            })
+            .collect();
+        states.sort();
+        states
+    }
+
+    /// The clock advances between the loop's pre-dispatch sample and the arm
+    /// mutation (which re-samples under the lock): the successful-arm
+    /// `controlState` must agree with the live gate, not report the new arm
+    /// as already expired against the older sample.
+    #[tokio::test]
+    async fn arm_response_reflects_arm_accepted_after_dispatch_sample() {
+        let bus = MessageBus::new(64).unwrap();
+        let mut ctx = ctx_with(true, true);
+        ctx.controller = Some(CLIENT_KEY_ID.to_string());
+        with_consent(&ctx, true);
+        ctx.clock = fixed_clock(NOW + 1);
+        let d = dispatch_action(
+            arm_action("arm-jti-1"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(ctx.arm.lock().unwrap().tx_permitted((ctx.clock)()));
+        assert_eq!(
+            pan97_states(&d.sends),
+            vec![(CLIENT_KEY_ID.to_string(), true, true)]
+        );
+    }
+
+    /// The sweep re-samples under the arm lock: a deadline that passed after
+    /// the loop's sample still expires the arm on this iteration.
+    #[tokio::test]
+    async fn sweep_uses_clock_sampled_under_arm_lock() {
+        let bus = MessageBus::new(64).unwrap();
+        let mut ctx = ctx_with(true, true);
+        with_consent(&ctx, true);
+        dispatch_action(
+            arm_action("arm-jti-1"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        ctx.clock = fixed_clock(NOW + HEARTBEAT_TIMEOUT_MS);
+        assert_eq!(
+            pan97_states(&sweep_arm_expiry(&ctx, at(NOW))),
+            vec![(CLIENT_KEY_ID.to_string(), true, false)]
+        );
+        assert!(!ctx.arm.lock().unwrap().is_armed());
+    }
+
+    /// A late heartbeat reaching dispatch before any sweep expires the arm
+    /// itself and broadcasts the transition; once expired (by it or by the
+    /// sweep), further heartbeats change nothing and audit nothing.
+    #[tokio::test]
+    async fn late_heartbeat_dispatch_expires_and_broadcasts_exactly_once() {
+        let bus = MessageBus::new(64).unwrap();
+        let heartbeat = |seq| ControlAction::Heartbeat {
+            arm_jti: "arm-jti-1".to_string(),
+            seq,
+        };
+        // Sorted by keyId (pan97_states sorts): the real PEER_B keyId sorts
+        // before CLIENT_KEY_ID.
+        let expected = vec![
+            (PEER_B.to_string(), false, false),
+            (CLIENT_KEY_ID.to_string(), true, false),
+        ];
+
+        // Heartbeat first, no housekeeping. PEER_B sends it, so it must be
+        // admitted (PAN-96 refuses every action from a non-admitted peer,
+        // heartbeats included — refusing can only shorten an arm).
+        let mut ctx = ctx_with(true, true);
+        ctx.tx_allow_list
+            .write()
+            .unwrap()
+            .insert(PEER_B.to_string());
+        ctx.peers
+            .insert(PEER_B.to_string(), PeerCtx::unauthorized());
+        with_consent(&ctx, true);
+        dispatch_action(
+            arm_action("arm-jti-1"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(ctx.arm.lock().unwrap().tx_permitted(at(NOW)));
+        let late = at(NOW + HEARTBEAT_TIMEOUT_MS + 1);
+        let d = dispatch_action(heartbeat(1), PEER_B, &mut ctx, &bus, SESSION_ID, late).await;
+        assert_eq!(pan97_states(&d.sends), expected);
+        assert!(!ctx.arm.lock().unwrap().is_armed());
+        assert!(!ctx.arm.lock().unwrap().tx_permitted(late));
+        let d = dispatch_action(
+            heartbeat(2),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            late,
+        )
+        .await;
+        assert!(d.sends.is_empty(), "no duplicate transition");
+        assert_eq!(audit_count(&ctx, "auto-disarm: heartbeat-lost"), 1);
+        assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
+
+        // Housekeeping first, then the late heartbeat.
+        let mut ctx = ctx_with(true, true);
+        ctx.peers
+            .insert(PEER_B.to_string(), PeerCtx::unauthorized());
+        with_consent(&ctx, true);
+        dispatch_action(
+            arm_action("arm-jti-1"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        let deadline = at(NOW + HEARTBEAT_TIMEOUT_MS);
+        assert_eq!(pan97_states(&sweep_arm_expiry(&ctx, deadline)), expected);
+        assert!(
+            sweep_arm_expiry(&ctx, deadline).is_empty(),
+            "sweep is idempotent"
+        );
+        let d = dispatch_action(
+            heartbeat(1),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            deadline,
+        )
+        .await;
+        assert!(d.sends.is_empty());
+        assert!(!ctx.arm.lock().unwrap().tx_permitted(deadline));
+        assert_eq!(audit_count(&ctx, "auto-disarm: heartbeat-lost"), 1);
+    }
+
+    /// Recovery on the same session: the consumed grant replays as a
+    /// rejection, an old-arm heartbeat does nothing, and only a newly signed
+    /// grant with a fresh jti restores TX — whose own seq 1 heartbeat is
+    /// accepted while the old jti still cannot slide its window.
+    #[tokio::test]
+    async fn only_a_fresh_signed_arm_restores_tx_after_a_lapse() {
+        let sess = Pan97Session::new(&[]);
+        let (a1, a2, a3) = (
+            sess.ctx.arm.clone(),
+            sess.ctx.arm.clone(),
+            sess.ctx.arm.clone(),
+        );
+        let script = vec![
+            Pan97Step::SendAt(NOW, 0, pan97_arm("arm-jti-1", NOW + 300_000)),
+            Pan97Step::QuietAt(NOW + HEARTBEAT_TIMEOUT_MS),
+            // The consumed grant again: replay-rejected, still disarmed.
+            Pan97Step::SendAt(NOW + 31_000, 0, pan97_arm("arm-jti-1", NOW + 300_000)),
+            Pan97Step::SendAt(NOW + 32_000, 0, pan97_heartbeat("arm-jti-1", 7)),
+            pan97_check(move || assert!(!a1.lock().unwrap().is_armed(), "no resurrection")),
+            // A freshly signed grant.
+            Pan97Step::SendAt(NOW + 33_000, 0, pan97_arm("arm-jti-2", NOW + 300_000)),
+            pan97_check(move || {
+                let st = a2.lock().unwrap();
+                assert_eq!(st.current_arm_jti(), Some("arm-jti-2"));
+                assert!(st.tx_permitted(at(NOW + 33_000)));
+            }),
+            Pan97Step::SendAt(NOW + 40_000, 0, pan97_heartbeat("arm-jti-2", 1)),
+            Pan97Step::SendAt(NOW + 50_000, 0, pan97_heartbeat("arm-jti-1", 9)),
+            pan97_check(move || {
+                let st = a3.lock().unwrap();
+                assert!(st.tx_permitted(at(NOW + 40_000 + HEARTBEAT_TIMEOUT_MS - 1)));
+                assert!(
+                    !st.tx_permitted(at(NOW + 40_000 + HEARTBEAT_TIMEOUT_MS)),
+                    "the old jti must not slide the new arm's window"
+                );
+            }),
+        ];
+        let (ctx, clients) = sess.run(script, &mut None).await;
+
+        assert_eq!(audit_count(&ctx, "auto-disarm: heartbeat-lost"), 1);
+        assert_eq!(
+            audit_count(&ctx, "arm rejected: arm grant: replayed jti"),
+            1
+        );
+        assert_eq!(audit_count(&ctx, "heartbeat rejected: arm_jti mismatch"), 1);
+        assert!(ctx.seen_jtis.contains("arm-jti-1") && ctx.seen_jtis.contains("arm-jti-2"));
+        let states = clients[0].control_states();
+        assert_eq!(
+            states.last(),
+            Some(&(true, true)),
+            "fresh arm is live again"
+        );
+        assert!(states.contains(&(true, false)), "the lapse was announced");
+    }
+
+    /// Timely heartbeats do not outlive the signed `armedUntil`: the sweep
+    /// expires the arm for TTL exactly once, and a racing revocation of the
+    /// already-consumed arm adds no second disarm record.
+    #[tokio::test]
+    async fn session_loop_sweep_enforces_signed_expiry_despite_timely_heartbeats() {
+        let sess = Pan97Session::new(&[]);
+        let (a1, a2) = (sess.ctx.arm.clone(), sess.ctx.arm.clone());
+        let revocation_pending = sess.ctx.revocation_pending.clone();
+        let script = vec![
+            Pan97Step::SendAt(NOW, 0, pan97_arm("arm-jti-1", NOW + 60_000)),
+            Pan97Step::SendAt(NOW + 20_000, 0, pan97_heartbeat("arm-jti-1", 1)),
+            Pan97Step::SendAt(NOW + 40_000, 0, pan97_heartbeat("arm-jti-1", 2)),
+            Pan97Step::QuietAt(NOW + 59_999),
+            pan97_check(move || assert!(a1.lock().unwrap().is_armed())),
+            Pan97Step::QuietAt(NOW + 60_000),
+            pan97_check(move || {
+                let mut st = a2.lock().unwrap();
+                assert!(!st.is_armed());
+                assert!(st
+                    .disarm_with_reason(DisarmReason::AuthorizationRevoked, NOW + 60_000)
+                    .is_empty());
+                revocation_pending.store(true, Ordering::Release);
+            }),
+            Pan97Step::QuietAt(NOW + 61_000),
+        ];
+        let (ctx, clients) = sess.run(script, &mut None).await;
+
+        assert_eq!(audit_count(&ctx, "auto-disarm: ttl-expired"), 1);
+        assert_eq!(audit_count(&ctx, "heartbeat-lost"), 0);
+        assert_eq!(audit_count(&ctx, "authorization-revoked"), 0);
+        assert_eq!(clients[0].control_states().last(), Some(&(true, false)));
+    }
+
+    /// The display drain hands control back to the loop after at most
+    /// `READ_STREAM_DRAIN_MAX` items, so a flooded read stream cannot hold
+    /// off the sweep.
+    #[tokio::test]
+    async fn bounded_display_drain_returns_to_the_expiry_sweep() {
+        let sess = Pan97Session::new(&[]);
+        sess.ctx.arm.lock().unwrap().arm(
+            pancetta_agent::arm::VerifiedArmGrant {
+                operator_callsign: OPERATOR.to_string(),
+                ttl_ms: 300_000,
+                armed_until_ms: NOW + 300_000,
+                heartbeat_interval_sec: 10,
+                scope_tx: true,
+                jti: "arm-jti-1".to_string(),
+                client_key_id: CLIENT_KEY_ID.to_string(),
+            },
+            at(NOW),
+        );
+        let (tx, rx) = tokio::sync::broadcast::channel(512);
+        let queued = 3 * READ_STREAM_DRAIN_MAX + 10;
+        for _ in 0..queued {
+            tx.send(pancetta_protocol::ServerEvent::ControlState {
+                control_held_by_me: false,
+                transmit_armed: false,
+            })
+            .unwrap();
+        }
+        let arm = sess.ctx.arm.clone();
+        let script = vec![
+            Pan97Step::QuietAt(NOW + HEARTBEAT_TIMEOUT_MS),
+            pan97_check(move || assert!(!arm.lock().unwrap().is_armed())),
+        ];
+        let mut events = Some(rx);
+        let (ctx, _) = sess.run(script, &mut events).await;
+
+        assert_eq!(audit_count(&ctx, "auto-disarm: heartbeat-lost"), 1);
+        // The client's hello dispatch drains one batch (PAN-95: a peer
+        // receives nothing until it holds a verified hello), and each of the
+        // two quiet ticks drains exactly one more bounded batch.
+        assert_eq!(
+            events.as_ref().unwrap().len(),
+            queued - 3 * READ_STREAM_DRAIN_MAX,
+            "each loop iteration drains at most READ_STREAM_DRAIN_MAX items"
+        );
     }
 }
