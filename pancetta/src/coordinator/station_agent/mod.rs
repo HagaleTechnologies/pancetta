@@ -514,9 +514,10 @@ fn arm_transition_sends(ctx: &ArmContext, effects: &[ArmEffect], now: ArmTime) -
     }
 }
 
-/// A fresh [`ArmTime`] for an arm mutation, taken with the arm lock already
-/// held so verification or a lock wait cannot make it stale. Never earlier
-/// than `floor` (the loop's pre-dispatch sample) on either clock.
+/// A fresh [`ArmTime`], never earlier than `floor` (an earlier sample) on
+/// either clock. Arm mutations take it with the arm lock already held so
+/// verification or a lock wait cannot make it stale; the session loop takes
+/// it after a delivery that may have blocked.
 fn fresh_arm_time(ctx: &ArmContext, floor: ArmTime) -> ArmTime {
     let fresh = (ctx.clock)();
     ArmTime {
@@ -2254,6 +2255,10 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
         let now = (ctx.clock)();
         let expiry_sends = sweep_arm_expiry(ctx, now);
         deliver_sends(&mut sess, ctx, &expiry_sends, || (ctx.clock)().unix_ms);
+        // That delivery can block on a backed-up relay socket, and a hello or
+        // arm capability may expire meanwhile: authorize what was received at
+        // a fresh instant, never the pre-delivery one.
+        let now = fresh_arm_time(ctx, now);
         match polled {
             Ok(Poll::Plaintext { peer, plaintext }) => {
                 let action = match map_client_frame(&plaintext) {
@@ -2354,6 +2359,9 @@ fn session_housekeeping<W: pancetta_agent::relay::WsConn>(
     let sends = reconcile_authorizations(ctx, sess, now);
     deliver_sends(sess, ctx, &sends, || (ctx.clock)().unix_ms);
     broadcast_pending_revocation(ctx, sess, now);
+    // The deliveries above can block; check capability expiry at a fresh
+    // instant so an expired controller is released this tick.
+    let now = fresh_arm_time(ctx, now);
     let sends = expire_peer_auth(ctx, now);
     deliver_sends(sess, ctx, &sends, || (ctx.clock)().unix_ms);
 }
@@ -7782,6 +7790,9 @@ mod tests {
         SendAt(i64, usize, Pan97Frame),
         /// Run a check between ticks (clock unchanged), then report quiet.
         Check(Box<dyn FnOnce() + Send>),
+        /// Report quiet; the agent's next outbound send then "blocks" on
+        /// relay backpressure until the clock reads `ms`.
+        StallNextSendUntil(i64),
     }
 
     /// The client side of one Noise peer in a scripted `run_one_session`:
@@ -7893,10 +7904,14 @@ mod tests {
         steps: std::collections::VecDeque<Pan97Step>,
         clients: Arc<Mutex<Vec<Pan97Client>>>,
         clock_ms: Arc<std::sync::atomic::AtomicI64>,
+        stall_next_send: Option<i64>,
     }
 
     impl WsConn for Pan97Ws {
         fn send_text(&mut self, s: String) -> Result<(), RelayError> {
+            if let Some(ms) = self.stall_next_send.take() {
+                self.clock_ms.store(ms, Ordering::SeqCst);
+            }
             self.outbound.lock().unwrap().push(s);
             Ok(())
         }
@@ -7930,6 +7945,10 @@ mod tests {
                 }
                 Some(Pan97Step::Check(f)) => {
                     f();
+                    RecvOutcome::Quiet
+                }
+                Some(Pan97Step::StallNextSendUntil(ms)) => {
+                    self.stall_next_send = Some(ms);
                     RecvOutcome::Quiet
                 }
             })
@@ -7999,6 +8018,7 @@ mod tests {
                 steps,
                 clients: clients.clone(),
                 clock_ms: self.clock_ms.clone(),
+                stall_next_send: None,
             };
             let bus = MessageBus::new(64).unwrap();
             run_one_session(ws, &self.identity, &mut self.ctx, &bus, events).await;
@@ -8436,5 +8456,61 @@ mod tests {
             queued - 3 * READ_STREAM_DRAIN_MAX,
             "each loop iteration drains at most READ_STREAM_DRAIN_MAX items"
         );
+    }
+
+    /// The sweep's expiry broadcast can stall on relay backpressure. The frame
+    /// received with it is authorized at a fresh instant afterwards, so a
+    /// capability that lapsed during the stall cannot establish a new arm.
+    #[tokio::test]
+    async fn frame_after_a_stalled_expiry_broadcast_is_authorized_at_a_fresh_instant() {
+        // The hello and arm capability tokens both expire at NOW + 600 s.
+        let cap_exp = NOW + 600_000;
+        let sess = Pan97Session::new(&[]);
+        let script = vec![
+            Pan97Step::SendAt(NOW + 560_000, 0, pan97_arm("arm-jti-1", NOW + 900_000)),
+            Pan97Step::StallNextSendUntil(cap_exp),
+            // arm-jti-1's heartbeat deadline: the sweep expires it, and its
+            // controlState send stalls until the capability has expired.
+            Pan97Step::SendAt(NOW + 590_000, 0, pan97_arm("arm-jti-2", NOW + 900_000)),
+        ];
+        let (ctx, _) = sess.run(script, &mut None).await;
+
+        assert_eq!(audit_count(&ctx, "auto-disarm: heartbeat-lost"), 1);
+        assert_eq!(
+            audit_count(&ctx, "armed ttl_ms="),
+            1,
+            "arm-jti-2 must not arm on a capability that expired during the stall"
+        );
+        assert_eq!(audit_count(&ctx, "arm rejected: capability"), 1);
+    }
+
+    /// Housekeeping likewise checks capability expiry after its own sends: a
+    /// controller whose capability lapsed while a broadcast stalled is
+    /// disarmed on that same tick.
+    #[tokio::test]
+    async fn housekeeping_checks_capability_expiry_after_a_stalled_broadcast() {
+        let cap_exp = NOW + 600_000;
+        let sess = Pan97Session::new(&[]);
+        let arm = sess.ctx.arm.clone();
+        let revocation_pending = sess.ctx.revocation_pending.clone();
+        let script = vec![
+            Pan97Step::SendAt(NOW + 580_000, 0, pan97_arm("arm-jti-1", NOW + 900_000)),
+            Pan97Step::QuietAt(NOW + 590_000),
+            Pan97Step::StallNextSendUntil(cap_exp),
+            // Any housekeeping broadcast will do; this one stalls until the
+            // controller's capability has expired.
+            pan97_check(move || revocation_pending.store(true, Ordering::Release)),
+            // Runs before the next tick's sweep and housekeeping.
+            pan97_check(move || {
+                assert!(
+                    !arm.lock().unwrap().is_armed(),
+                    "the expired controller's arm must drop on the stalled tick"
+                )
+            }),
+        ];
+        let (ctx, _) = sess.run(script, &mut None).await;
+
+        assert_eq!(audit_count(&ctx, "armed ttl_ms="), 1);
+        assert!(ctx.controller.is_none());
     }
 }
