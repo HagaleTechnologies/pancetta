@@ -5385,6 +5385,24 @@ impl super::ApplicationCoordinator {
                                                             );
                                                         } else {
                                                             cancelled += 1;
+                                                            // PAN-76: drop it from the Fox
+                                                            // set now, not when the event
+                                                            // forwarder sees the cancel
+                                                            // (it repeats this
+                                                            // idempotently). Until then an
+                                                            // immediate re-engage would
+                                                            // read the cancelled CQ as a
+                                                            // Hound in its completed grace
+                                                            // and could start no CQ.
+                                                            if let Ok(mut set) =
+                                                                fox_admitted_qsos.write()
+                                                            {
+                                                                set.remove(
+                                                                    &super::active_tx_qso_key(
+                                                                        &id.to_string(),
+                                                                    ),
+                                                                );
+                                                            }
                                                         }
                                                     } else {
                                                         let key = super::active_tx_qso_key(
@@ -11345,6 +11363,74 @@ mod respond_to_caller_admission_tests {
             .read()
             .unwrap()
             .contains(&pan76_key(&new_cq)));
+
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// PR #421 review (Codex P2): Fox off then straight back on. The Fox CQ
+    /// the disengage cancelled has left `get_active_qsos()` but, until the
+    /// event forwarder handles its failure, would still sit in both shared
+    /// sets and read as a Hound in its completed grace. With
+    /// `fox_max_streams = 1` that filled the cap and the re-engage started no
+    /// CQ. The disengage drops a cancelled CQ from the Fox set itself.
+    #[tokio::test]
+    async fn pan76_fox_off_and_straight_on_starts_a_fresh_cq() {
+        let (coordinator, manager, tui_rx) = pan76_station().await;
+        coordinator
+            .fox_max_streams
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        pan76_set_fox_mode(&coordinator, &tui_rx, true).await;
+        let old_cq = match pan76_calling_cqs(&manager).await.as_slice() {
+            [id] => *id,
+            other => panic!("Fox mode must start exactly one CQ, got {other:?}"),
+        };
+        let old_key = pan76_key(&old_cq);
+        assert!(
+            pan76_poll(|| coordinator
+                .active_tx_qsos
+                .read()
+                .unwrap()
+                .contains(&old_key))
+            .await,
+            "the Fox CQ must be TX-live before the toggle"
+        );
+
+        // Both toggles back to back: no wait for the off acknowledgement, so
+        // the re-engage can run before the forwarder sees the cancel.
+        for on in [false, true] {
+            coordinator
+                .message_bus
+                .send_message(ComponentMessage::new(
+                    ComponentId::Tui,
+                    ComponentId::Qso,
+                    MessageType::QsoMessage(QsoMessage::SetFoxMode { on }),
+                    Instant::now(),
+                ))
+                .await
+                .unwrap();
+        }
+        assert!(
+            pan76_wait_for(&tui_rx, |m| matches!(
+                m,
+                MessageType::FoxModeStatus { on: true }
+            ))
+            .await,
+            "the re-engage must be acknowledged"
+        );
+        match pan76_calling_cqs(&manager).await.as_slice() {
+            [id] => assert_ne!(*id, old_cq, "the old CQ was cancelled"),
+            other => panic!("the re-engage must start one fresh CQ, got {other:?}"),
+        }
+        assert!(
+            !coordinator
+                .fox_admitted_qsos
+                .read()
+                .unwrap()
+                .contains(&old_key),
+            "the cancelled CQ must leave the Fox set"
+        );
 
         coordinator
             .shutdown_signal

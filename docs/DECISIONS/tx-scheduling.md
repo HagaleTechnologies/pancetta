@@ -334,7 +334,9 @@ the autonomous operator writes it.
 **Lifecycle.** Entries leave at exactly `active_tx_qsos`'s removal points: a
 `StateChanged` into `Failed`, `QsoFailed`, and the end of the 45 s
 completed grace (`COMPLETED_QSO_REWORK_GRACE`). The grace matters because a
-completed Hound's final RR73/73 airs inside it.
+completed Hound's final RR73/73 airs inside it. A Fox CQ the disengage
+cancels also leaves the set right there, before the forwarder sees the
+cancel; otherwise an immediate re-engage reads it as a Hound in its grace.
 
 **Coalescer rule.** `coalesce_backlog_into` passes the unraised ceiling plus
 the set to `coalesce_transmit_requests_with_fox_priority`. Fox-admitted
@@ -405,7 +407,8 @@ Tests: `coordinator::tx::coalesce_tests::pan76_*`,
 `pan76_fox_reengage_counts_hounds_in_their_completed_grace`,
 `coordinator::qso::fox_admitted_split_tests`,
 `fox_admitted_tracking_tests::pan76_hounds_in_their_completed_grace_fill_the_fox_cap`
-and `supersede_rekey_tests::pan76_supersede_refresh_of_a_hound_in_a_mixed_bundle_keeps_every_stream`.
+`supersede_rekey_tests::pan76_supersede_refresh_of_a_hound_in_a_mixed_bundle_keeps_every_stream`
+and `pan76_fox_off_and_straight_on_starts_a_fresh_cq`.
 
 ## UTC re-anchoring after sleep/wake and clock steps (PAN-114, 2026-10-10)
 
