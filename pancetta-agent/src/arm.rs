@@ -20,9 +20,16 @@
 //! - **Local-kill primacy.** The station's local kill switch (maps to
 //!   `TxPolicy::Disabled` / Shift+Q at the coordinator) overrides everything.
 //!   While engaged, TX is denied even with a fresh, valid, consented arm.
-//! - **Local consent gate** (operator decision): a station-side
-//!   `remote_tx_enabled` switch, **default OFF**, is ANDed with everything. The
-//!   operator at the rig must have explicitly opted in to remote TX.
+//! - **Local consent gate, per channel** (operator decision): each remote-TX
+//!   channel ([`ConsentChannel`]) carries its own station-side consent bit,
+//!   **default OFF** — the station-agent channel's is
+//!   `[network.station_agent].remote_tx_enabled`, the WSJT-X UDP bridge's is
+//!   `[network.wsjtx_udp] enabled && allow_tx_initiation`. The two bits are
+//!   independent: one channel's consent never satisfies the other's. Arming is
+//!   a station-agent-channel act, so [`ArmState::arm`] refuses unless the
+//!   station-agent bit is on, and every TX-permit query names the channel the
+//!   request originated on and ANDs in THAT channel's bit. The operator at the
+//!   rig must have explicitly opted in to remote TX on each channel.
 //! - **Grant scope.** A grant that does not carry TX scope
 //!   ([`VerifiedArmGrant::scope_tx`] `== false`) can never permit TX and is
 //!   rejected at arm time.
@@ -204,7 +211,9 @@ pub enum DenyReason {
     Expired,
     /// No heartbeat within [`HEARTBEAT_TIMEOUT_MS`] — dead-man triggered.
     HeartbeatLost,
-    /// The station-local consent gate (`remote_tx_enabled`) is OFF.
+    /// The station-local consent gate of the channel being queried is OFF
+    /// (see [`ConsentChannel`]): `remote_tx_enabled` for the station-agent
+    /// channel, `allow_tx_initiation` for the WSJT-X UDP bridge.
     NoLocalConsent,
     /// The station-local kill switch is engaged (local-kill primacy).
     LocallyKilled,
@@ -222,6 +231,30 @@ impl DenyReason {
             DenyReason::NoLocalConsent => "no-local-consent",
             DenyReason::LocallyKilled => "locally-killed",
             DenyReason::NoTxScope => "no-tx-scope",
+        }
+    }
+}
+
+/// Which remote-TX channel a consent bit — or a TX-permit query — belongs to.
+///
+/// Consent is tracked per channel: each channel's operator setting gates only
+/// that channel's own arm / intent / transmission, never another channel's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsentChannel {
+    /// The relay station-agent channel; consent =
+    /// `[network.station_agent].remote_tx_enabled`.
+    StationAgent,
+    /// The WSJT-X UDP bridge; consent =
+    /// `[network.wsjtx_udp] enabled && allow_tx_initiation`.
+    WsjtxUdp,
+}
+
+impl ConsentChannel {
+    /// A short stable string for audit `detail`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ConsentChannel::StationAgent => "station_agent",
+            ConsentChannel::WsjtxUdp => "wsjtx_udp",
         }
     }
 }
@@ -356,14 +389,21 @@ fn suspend_aware_elapsed_reaches(now: i64, since: i64, limit_ms: i64) -> bool {
 /// The armed-TX safety state machine.
 ///
 /// Construct with [`ArmState::new`] (not armed, no consent, not killed). Feed it
-/// events (`arm` / `heartbeat` / `disarm` / `set_local_consent` /
-/// `set_local_kill` / `tick`) and query [`tx_permitted`](Self::tx_permitted).
+/// events (`arm` / `heartbeat` / `disarm` / `set_channel_consent` /
+/// `set_local_kill` / `tick`) and query [`tx_permitted`](Self::tx_permitted)
+/// for the channel a request originated on.
 #[derive(Clone, Debug)]
 pub struct ArmState {
     /// `Some` iff currently armed.
     session: Option<ArmedSession>,
-    /// Station-local consent gate (`remote_tx_enabled`); **default OFF**.
-    local_consent: bool,
+    /// Station-agent channel consent (`[network.station_agent]
+    /// remote_tx_enabled`); **default OFF**. Required to arm and for any
+    /// station-agent-originated TX.
+    station_agent_consent: bool,
+    /// WSJT-X UDP bridge consent (`[network.wsjtx_udp] enabled &&
+    /// allow_tx_initiation`); **default OFF**. Required for any
+    /// WSJT-X-UDP-originated TX. Never satisfies the station-agent channel.
+    wsjtx_consent: bool,
     /// Station-local kill switch; **default not engaged**. Overrides everything.
     local_kill: bool,
 }
@@ -375,11 +415,12 @@ impl Default for ArmState {
 }
 
 impl ArmState {
-    /// A fresh state: not armed, local consent OFF, not killed.
+    /// A fresh state: not armed, every channel's local consent OFF, not killed.
     pub fn new() -> Self {
         Self {
             session: None,
-            local_consent: false,
+            station_agent_consent: false,
+            wsjtx_consent: false,
             local_kill: false,
         }
     }
@@ -391,9 +432,12 @@ impl ArmState {
         self.session.is_some()
     }
 
-    /// The station-local consent gate value.
-    pub fn local_consent(&self) -> bool {
-        self.local_consent
+    /// The station-local consent gate value for one channel.
+    pub fn channel_consent(&self, channel: ConsentChannel) -> bool {
+        match channel {
+            ConsentChannel::StationAgent => self.station_agent_consent,
+            ConsentChannel::WsjtxUdp => self.wsjtx_consent,
+        }
     }
 
     /// Whether the station-local kill switch is engaged.
@@ -438,6 +482,13 @@ impl ArmState {
     /// If the grant lacks TX scope, or its signed deadline has already passed
     /// at `now`, the state is **not** changed and a `TxDenied` audit effect is
     /// returned — an arm that could never permit TX is refused outright.
+    ///
+    /// Arming is exclusively a station-agent-channel act, so it also requires
+    /// the station-agent channel's own consent
+    /// ([`ConsentChannel::StationAgent`]): while that bit is off the state is
+    /// **not** armed and a `TxDenied` audit effect (`NoLocalConsent`) is
+    /// returned. Another channel's consent never satisfies this check. Either
+    /// refusal leaves any existing arm untouched.
     pub fn arm(&mut self, grant: VerifiedArmGrant, now: ArmTime) -> Vec<ArmEffect> {
         if !grant.scope_tx {
             return vec![ArmEffect::Audit(AuditEvent {
@@ -445,6 +496,18 @@ impl ArmState {
                 kind: AuditKind::TxDenied,
                 operator_callsign: Some(grant.operator_callsign),
                 detail: format!("arm rejected: {}", DenyReason::NoTxScope.as_str()),
+            })];
+        }
+        if !self.station_agent_consent {
+            return vec![ArmEffect::Audit(AuditEvent {
+                ts_unix_ms: now.unix_ms,
+                kind: AuditKind::TxDenied,
+                operator_callsign: Some(grant.operator_callsign),
+                detail: format!(
+                    "arm rejected: {} ({})",
+                    DenyReason::NoLocalConsent.as_str(),
+                    ConsentChannel::StationAgent.as_str()
+                ),
             })];
         }
 
@@ -587,18 +650,28 @@ impl ArmState {
         }
     }
 
-    /// Set the station-local consent gate (`remote_tx_enabled`). Emits a
-    /// `LocalConsentChanged` audit effect only on an actual change.
-    pub fn set_local_consent(&mut self, enabled: bool, now_ms: i64) -> Vec<ArmEffect> {
-        if self.local_consent == enabled {
+    /// Set one channel's station-local consent gate (see [`ConsentChannel`]).
+    /// Only that channel's bit changes. Emits a `LocalConsentChanged` audit
+    /// effect, naming the channel, only on an actual change.
+    pub fn set_channel_consent(
+        &mut self,
+        channel: ConsentChannel,
+        enabled: bool,
+        now_ms: i64,
+    ) -> Vec<ArmEffect> {
+        let bit = match channel {
+            ConsentChannel::StationAgent => &mut self.station_agent_consent,
+            ConsentChannel::WsjtxUdp => &mut self.wsjtx_consent,
+        };
+        if *bit == enabled {
             return Vec::new();
         }
-        self.local_consent = enabled;
+        *bit = enabled;
         vec![ArmEffect::Audit(AuditEvent {
             ts_unix_ms: now_ms,
             kind: AuditKind::LocalConsentChanged,
             operator_callsign: self.operator_callsign().map(str::to_string),
-            detail: format!("local remote_tx_enabled={enabled}"),
+            detail: format!("local consent {}={enabled}", channel.as_str()),
         })]
     }
 
@@ -649,22 +722,27 @@ impl ArmState {
     /// **The safety gate.** Returns `true` **iff ALL** of:
     /// currently armed AND wall `now < armedUntil` AND monotonic time since the
     /// arm `< lifetime` AND monotonic silence since the last heartbeat
-    /// `< HEARTBEAT_TIMEOUT_MS` AND `local_consent == true` AND
+    /// `< HEARTBEAT_TIMEOUT_MS` AND `channel`'s own local consent is on AND
     /// `local_kill == false` AND the grant carries TX scope.
+    ///
+    /// `channel` is the channel the TX request originated on; only THAT
+    /// channel's consent bit is consulted, so one channel's consent can never
+    /// permit another channel's TX.
     ///
     /// Pure read — never mutates, never resurrects an expired arm, and
     /// independently re-checks the clock so it is correct even if `tick` has not
     /// run for this `now`.
-    pub fn tx_permitted(&self, now: ArmTime) -> bool {
-        matches!(self.tx_permit_reason(now), TxPermit::Permitted)
+    pub fn tx_permitted(&self, now: ArmTime, channel: ConsentChannel) -> bool {
+        matches!(self.tx_permit_reason(now, channel), TxPermit::Permitted)
     }
 
     /// The same gate as [`tx_permitted`](Self::tx_permitted), but returning the
     /// first-closed gate for audit `detail` / diagnostics. Evaluation order:
     /// NotArmed → NoTxScope → Expired → HeartbeatLost → NoLocalConsent →
     /// LocallyKilled. The *result* is an AND; the order only picks which reason
-    /// is reported when several gates are closed.
-    pub fn tx_permit_reason(&self, now: ArmTime) -> TxPermit {
+    /// is reported when several gates are closed. `NoLocalConsent` reads only
+    /// `channel`'s own consent bit.
+    pub fn tx_permit_reason(&self, now: ArmTime, channel: ConsentChannel) -> TxPermit {
         let s = match self.session.as_ref() {
             Some(s) => s,
             None => return TxPermit::Denied(DenyReason::NotArmed),
@@ -680,7 +758,7 @@ impl ArmState {
             Some(_) => return TxPermit::Denied(DenyReason::HeartbeatLost),
             None => {}
         }
-        if !self.local_consent {
+        if !self.channel_consent(channel) {
             return TxPermit::Denied(DenyReason::NoLocalConsent);
         }
         if self.local_kill {
@@ -746,11 +824,12 @@ mod tests {
             .any(|e| matches!(e, ArmEffect::HeartbeatRejected { .. }))
     }
 
-    /// A helper: armed at T0 with TX scope + consent ON, no kill.
+    /// A helper: station-agent consent ON, then armed at T0 with TX scope, no
+    /// kill.
     fn armed_consented() -> ArmState {
         let mut st = ArmState::new();
+        st.set_channel_consent(ConsentChannel::StationAgent, true, T0);
         st.arm(grant(true), at(T0));
-        st.set_local_consent(true, T0);
         st
     }
 
@@ -759,21 +838,26 @@ mod tests {
     #[test]
     fn fresh_state_is_not_permitted_not_armed() {
         let st = ArmState::new();
-        assert!(!st.tx_permitted(at(T0)));
+        assert!(!st.tx_permitted(at(T0), ConsentChannel::StationAgent));
+        assert!(!st.tx_permitted(at(T0), ConsentChannel::WsjtxUdp));
         assert_eq!(
-            st.tx_permit_reason(at(T0)),
+            st.tx_permit_reason(at(T0), ConsentChannel::StationAgent),
             TxPermit::Denied(DenyReason::NotArmed)
         );
         assert!(!st.is_armed());
-        assert!(!st.local_consent());
+        assert!(!st.channel_consent(ConsentChannel::StationAgent));
+        assert!(!st.channel_consent(ConsentChannel::WsjtxUdp));
         assert!(!st.local_kill());
     }
 
     #[test]
     fn armed_with_consent_and_fresh_heartbeat_is_permitted() {
         let st = armed_consented();
-        assert!(st.tx_permitted(at(T0)));
-        assert_eq!(st.tx_permit_reason(at(T0)), TxPermit::Permitted);
+        assert!(st.tx_permitted(at(T0), ConsentChannel::StationAgent));
+        assert_eq!(
+            st.tx_permit_reason(at(T0), ConsentChannel::StationAgent),
+            TxPermit::Permitted
+        );
         assert_eq!(st.operator_callsign(), Some("N0CALL"));
     }
 
@@ -788,6 +872,7 @@ mod tests {
     fn armed_client_key_id_tracks_the_live_arm() {
         let mut st = ArmState::new();
         assert_eq!(st.armed_client_key_id(), None, "not armed yet");
+        st.set_channel_consent(ConsentChannel::StationAgent, true, T0);
         st.arm(grant(true), at(T0));
         assert_eq!(st.armed_client_key_id(), Some(CLIENT_KEY_ID));
         st.disarm(T0 + 1_000);
@@ -795,15 +880,139 @@ mod tests {
     }
 
     #[test]
-    fn arm_without_consent_is_never_permitted() {
+    fn arm_without_consent_is_refused_and_never_permitted() {
         let mut st = ArmState::new();
-        st.arm(grant(true), at(T0));
-        // consent still default OFF
-        assert!(!st.tx_permitted(at(T0)));
+        // consent still default OFF on every channel
+        let effects = st.arm(grant(true), at(T0));
+        assert!(!st.is_armed(), "no station-agent consent => no arm");
+        assert!(!st.tx_permitted(at(T0), ConsentChannel::StationAgent));
+        assert!(!st.tx_permitted(at(T0), ConsentChannel::WsjtxUdp));
         assert_eq!(
-            st.tx_permit_reason(at(T0)),
+            st.tx_permit_reason(at(T0), ConsentChannel::StationAgent),
+            TxPermit::Denied(DenyReason::NotArmed)
+        );
+        assert!(matches!(
+            &effects[..],
+            [ArmEffect::Audit(e)] if e.kind == AuditKind::TxDenied
+                && e.detail.contains(DenyReason::NoLocalConsent.as_str())
+        ));
+    }
+
+    /// PAN-98: arming is a station-agent-channel act; the WSJT-X UDP
+    /// channel's consent alone must never satisfy it.
+    #[test]
+    fn arm_refused_when_station_agent_channel_consent_off_even_if_wsjtx_on() {
+        let mut st = ArmState::new();
+        st.set_channel_consent(ConsentChannel::WsjtxUdp, true, T0); // wsjtx consent alone
+        let effects = st.arm(grant(true), at(T0));
+        assert!(
+            !st.is_armed(),
+            "the arm is a station-agent-channel act; the wsjtx channel's \
+             consent must never satisfy it"
+        );
+        assert!(!st.tx_permitted(at(T0), ConsentChannel::StationAgent));
+        assert!(!st.tx_permitted(at(T0), ConsentChannel::WsjtxUdp));
+        // Audited as TxDenied with no-local-consent, mirroring the NoTxScope
+        // refusal shape.
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            &effects[0],
+            ArmEffect::Audit(e) if e.kind == AuditKind::TxDenied
+                && e.detail.contains(DenyReason::NoLocalConsent.as_str())
+                && e.detail.contains(ConsentChannel::StationAgent.as_str())
+        ));
+    }
+
+    /// A refused arm leaves an existing arm untouched (same as a no-scope
+    /// refusal).
+    #[test]
+    fn arm_refused_for_consent_leaves_existing_arm_untouched() {
+        let mut st = armed_consented();
+        st.set_channel_consent(ConsentChannel::StationAgent, false, T0 + 1);
+        let g2 = VerifiedArmGrant {
+            operator_callsign: "W1AW".to_string(),
+            ttl_ms: TTL,
+            armed_until_ms: T0 + TTL,
+            heartbeat_interval_sec: 10,
+            scope_tx: true,
+            jti: "arm-jti-2".to_string(),
+            client_key_id: "otherClientKeyId".to_string(),
+        };
+        st.arm(g2, at(T0 + 2));
+        assert_eq!(st.current_arm_jti(), Some(JTI));
+        assert_eq!(st.armed_client_key_id(), Some(CLIENT_KEY_ID));
+    }
+
+    /// PAN-98: TX-time re-checks the ORIGINATING channel's own consent. Revoking
+    /// station-agent consent after a valid arm denies the station-agent
+    /// channel while the wsjtx channel (its own consent on) stays permitted.
+    #[test]
+    fn station_agent_channel_tx_denied_when_own_consent_off_even_though_wsjtx_on() {
+        let mut st = ArmState::new();
+        st.set_channel_consent(ConsentChannel::StationAgent, true, T0);
+        st.set_channel_consent(ConsentChannel::WsjtxUdp, true, T0);
+        st.arm(grant(true), at(T0));
+        st.set_channel_consent(ConsentChannel::StationAgent, false, T0 + 1);
+        assert_eq!(
+            st.tx_permit_reason(at(T0 + 1), ConsentChannel::StationAgent),
             TxPermit::Denied(DenyReason::NoLocalConsent)
         );
+        assert_eq!(
+            st.tx_permit_reason(at(T0 + 1), ConsentChannel::WsjtxUdp),
+            TxPermit::Permitted
+        );
+    }
+
+    #[test]
+    fn wsjtx_channel_tx_denied_when_wsjtx_consent_off() {
+        let mut st = ArmState::new();
+        st.set_channel_consent(ConsentChannel::StationAgent, true, T0);
+        st.arm(grant(true), at(T0));
+        assert_eq!(
+            st.tx_permit_reason(at(T0), ConsentChannel::WsjtxUdp),
+            TxPermit::Denied(DenyReason::NoLocalConsent)
+        );
+        assert_eq!(
+            st.tx_permit_reason(at(T0), ConsentChannel::StationAgent),
+            TxPermit::Permitted
+        );
+    }
+
+    #[test]
+    fn set_channel_consent_audits_on_change_only_and_names_the_channel() {
+        let mut st = ArmState::new();
+        // OFF -> OFF on either channel: no effect.
+        assert!(st
+            .set_channel_consent(ConsentChannel::StationAgent, false, T0)
+            .is_empty());
+        assert!(st
+            .set_channel_consent(ConsentChannel::WsjtxUdp, false, T0)
+            .is_empty());
+        // OFF -> ON: one LocalConsentChanged effect naming the channel.
+        for (ch, name) in [
+            (ConsentChannel::WsjtxUdp, "wsjtx_udp"),
+            (ConsentChannel::StationAgent, "station_agent"),
+        ] {
+            let effects = st.set_channel_consent(ch, true, T0);
+            assert_eq!(effects.len(), 1);
+            match &effects[0] {
+                ArmEffect::Audit(ev) => {
+                    assert_eq!(ev.kind, AuditKind::LocalConsentChanged);
+                    assert_eq!(ev.detail, format!("local consent {name}=true"));
+                }
+                other => panic!("expected audit effect, got {other:?}"),
+            }
+            // ON -> ON: no effect.
+            assert!(st.set_channel_consent(ch, true, T0).is_empty());
+        }
+        // The bits are independent: clearing one leaves the other on.
+        assert_eq!(
+            st.set_channel_consent(ConsentChannel::WsjtxUdp, false, T0)
+                .len(),
+            1
+        );
+        assert!(!st.channel_consent(ConsentChannel::WsjtxUdp));
+        assert!(st.channel_consent(ConsentChannel::StationAgent));
     }
 
     // --- heartbeat / dead-man boundary ------------------------------------
@@ -815,15 +1024,15 @@ mod tests {
         let just_before = T0 + HEARTBEAT_TIMEOUT_MS - 1;
         let at_deadline = T0 + HEARTBEAT_TIMEOUT_MS;
         assert!(
-            st.tx_permitted(at(just_before)),
+            st.tx_permitted(at(just_before), ConsentChannel::StationAgent),
             "permitted 1ms before deadline"
         );
         assert!(
-            !st.tx_permitted(at(at_deadline)),
+            !st.tx_permitted(at(at_deadline), ConsentChannel::StationAgent),
             "denied exactly at deadline (>=)"
         );
         assert_eq!(
-            st.tx_permit_reason(at(at_deadline)),
+            st.tx_permit_reason(at(at_deadline), ConsentChannel::StationAgent),
             TxPermit::Denied(DenyReason::HeartbeatLost)
         );
     }
@@ -837,13 +1046,22 @@ mod tests {
             let effects = st.heartbeat(JTI, seq, at(hb));
             assert!(effects.is_empty(), "accepted heartbeat emits no effects");
             // Window now measured from `hb`: still permitted just before deadline.
-            assert!(st.tx_permitted(at(hb + HEARTBEAT_TIMEOUT_MS - 1)));
+            assert!(st.tx_permitted(
+                at(hb + HEARTBEAT_TIMEOUT_MS - 1),
+                ConsentChannel::StationAgent
+            ));
         }
         // After the last accepted heartbeat (at T0+15_000) TX stays permitted
         // across the whole interval up to its own deadline.
         let last = T0 + 15_000;
-        assert!(st.tx_permitted(at(last + HEARTBEAT_TIMEOUT_MS - 1)));
-        assert!(!st.tx_permitted(at(last + HEARTBEAT_TIMEOUT_MS)));
+        assert!(st.tx_permitted(
+            at(last + HEARTBEAT_TIMEOUT_MS - 1),
+            ConsentChannel::StationAgent
+        ));
+        assert!(!st.tx_permitted(
+            at(last + HEARTBEAT_TIMEOUT_MS),
+            ConsentChannel::StationAgent
+        ));
     }
 
     /// THE finding: a **replayed** heartbeat must NOT hold the arm open past its
@@ -868,15 +1086,15 @@ mod tests {
         // Because neither replay slid the window, TX is denied at the ORIGINAL
         // deadline — the dead-man still expires on schedule.
         assert!(
-            st.tx_permitted(at(deadline - 1)),
+            st.tx_permitted(at(deadline - 1), ConsentChannel::StationAgent),
             "permitted 1ms before deadline"
         );
         assert!(
-            !st.tx_permitted(at(deadline)),
+            !st.tx_permitted(at(deadline), ConsentChannel::StationAgent),
             "dead-man expires on schedule; a replay cannot hold the arm open"
         );
         assert_eq!(
-            st.tx_permit_reason(at(deadline)),
+            st.tx_permit_reason(at(deadline), ConsentChannel::StationAgent),
             TxPermit::Denied(DenyReason::HeartbeatLost)
         );
     }
@@ -888,21 +1106,24 @@ mod tests {
         let effects = st.heartbeat("some-other-arm", 1, at(hb));
         assert!(is_hb_rejected(&effects), "wrong arm_jti must be rejected");
         // The window was never seeded past T0: original dead-man deadline holds.
-        assert!(st.tx_permitted(at(T0 + HEARTBEAT_TIMEOUT_MS - 1)));
-        assert!(!st.tx_permitted(at(T0 + HEARTBEAT_TIMEOUT_MS)));
+        assert!(st.tx_permitted(
+            at(T0 + HEARTBEAT_TIMEOUT_MS - 1),
+            ConsentChannel::StationAgent
+        ));
+        assert!(!st.tx_permitted(at(T0 + HEARTBEAT_TIMEOUT_MS), ConsentChannel::StationAgent));
     }
 
     #[test]
     fn heartbeat_while_not_armed_is_a_noop() {
         let mut st = ArmState::new();
-        st.set_local_consent(true, T0);
+        st.set_channel_consent(ConsentChannel::StationAgent, true, T0);
         // Must not arm, must not panic, returns empty effects.
         let effects = st.heartbeat(JTI, 1, at(T0));
         assert!(effects.is_empty());
         assert!(!st.is_armed());
-        assert!(!st.tx_permitted(at(T0)));
+        assert!(!st.tx_permitted(at(T0), ConsentChannel::StationAgent));
         assert_eq!(
-            st.tx_permit_reason(at(T0)),
+            st.tx_permit_reason(at(T0), ConsentChannel::StationAgent),
             TxPermit::Denied(DenyReason::NotArmed)
         );
     }
@@ -912,7 +1133,7 @@ mod tests {
     #[test]
     fn fresh_arm_resets_the_heartbeat_seq() {
         let mut st = ArmState::new();
-        st.set_local_consent(true, T0);
+        st.set_channel_consent(ConsentChannel::StationAgent, true, T0);
         st.arm(grant(true), at(T0)); // jti = JTI
         assert!(st.heartbeat(JTI, 9, at(T0 + 1_000)).is_empty());
         // Re-arm with a DIFFERENT jti (fresh grant): seq resets.
@@ -929,7 +1150,10 @@ mod tests {
         // A low seq (1) is accepted for the NEW arm despite the old arm's seq 9.
         let effects = st.heartbeat("arm-jti-2", 1, at(T0 + 3_000));
         assert!(effects.is_empty(), "new arm accepts a low seq");
-        assert!(st.tx_permitted(at(T0 + 3_000 + HEARTBEAT_TIMEOUT_MS - 1)));
+        assert!(st.tx_permitted(
+            at(T0 + 3_000 + HEARTBEAT_TIMEOUT_MS - 1),
+            ConsentChannel::StationAgent
+        ));
         // And the OLD arm's jti is now rejected (it names a defunct arm).
         assert!(is_hb_rejected(&st.heartbeat(JTI, 10, at(T0 + 3_000))));
     }
@@ -965,7 +1189,7 @@ mod tests {
     fn late_heartbeat_at_or_after_deadline_expires_instead_of_restoring_tx() {
         for late in [T0 + HEARTBEAT_TIMEOUT_MS, T0 + HEARTBEAT_TIMEOUT_MS + 1] {
             let mut st = armed_consented();
-            assert!(!st.tx_permitted(at(late)));
+            assert!(!st.tx_permitted(at(late), ConsentChannel::StationAgent));
             // Correct jti, fresh seq, no tick beforehand.
             let effects = st.heartbeat(JTI, 1, at(late));
             assert_eq!(
@@ -977,9 +1201,9 @@ mod tests {
             assert!(matches!(&effects[0], ArmEffect::Audit(ev)
                 if ev.detail == "auto-disarm: heartbeat-lost" && ev.ts_unix_ms == late));
             assert!(!st.is_armed(), "late heartbeat must remove the arm");
-            assert!(!st.tx_permitted(at(late)));
+            assert!(!st.tx_permitted(at(late), ConsentChannel::StationAgent));
             assert_eq!(
-                st.tx_permit_reason(at(late)),
+                st.tx_permit_reason(at(late), ConsentChannel::StationAgent),
                 TxPermit::Denied(DenyReason::NotArmed)
             );
         }
@@ -993,7 +1217,10 @@ mod tests {
             st.heartbeat(JTI, 1, at(hb1)).is_empty(),
             "1ms early is accepted"
         );
-        assert!(st.tx_permitted(at(hb1 + HEARTBEAT_TIMEOUT_MS - 1)));
+        assert!(st.tx_permitted(
+            at(hb1 + HEARTBEAT_TIMEOUT_MS - 1),
+            ConsentChannel::StationAgent
+        ));
         let effects = st.heartbeat(JTI, 2, at(hb1 + HEARTBEAT_TIMEOUT_MS));
         assert_eq!(disarm_counts(&effects, DisarmReason::HeartbeatLost), (1, 1));
         assert!(!st.is_armed());
@@ -1010,7 +1237,7 @@ mod tests {
         let late = T0 + 40_000 + HEARTBEAT_TIMEOUT_MS + 5;
         let effects = st.heartbeat(JTI, 5, at(late));
         assert_eq!(disarm_counts(&effects, DisarmReason::HeartbeatLost), (1, 1));
-        assert!(!st.tx_permitted(at(late)));
+        assert!(!st.tx_permitted(at(late), ConsentChannel::StationAgent));
     }
 
     #[test]
@@ -1046,7 +1273,7 @@ mod tests {
             assert!(st.heartbeat(JTI, seq, t).is_empty(), "no duplicate disarm");
             assert!(st.tick(t).is_empty(), "no duplicate disarm");
             assert!(!st.is_armed(), "no recreated session");
-            assert!(!st.tx_permitted(t));
+            assert!(!st.tx_permitted(t, ConsentChannel::StationAgent));
         }
     }
 
@@ -1054,7 +1281,7 @@ mod tests {
     fn ttl_expiry_before_a_heartbeat_removes_the_session_with_ttl_reason() {
         // TTL alone.
         let mut st = ArmState::new();
-        st.set_local_consent(true, T0);
+        st.set_channel_consent(ConsentChannel::StationAgent, true, T0);
         st.arm(grant_full(10_000, T0 + 10_000, 10, JTI), at(T0));
         assert!(st.heartbeat(JTI, 1, at(T0 + 5_000)).is_empty());
         let effects = st.heartbeat(JTI, 2, at(T0 + 10_000));
@@ -1063,7 +1290,7 @@ mod tests {
 
         // TTL and dead-man both passed: TTL is the reason, via heartbeat too.
         let mut st = ArmState::new();
-        st.set_local_consent(true, T0);
+        st.set_channel_consent(ConsentChannel::StationAgent, true, T0);
         st.arm(grant_full(5_000, T0 + 5_000, 10, JTI), at(T0));
         let effects = st.heartbeat(JTI, 1, at(T0 + 40_000));
         assert_eq!(disarm_counts(&effects, DisarmReason::TtlExpired), (1, 1));
@@ -1076,15 +1303,24 @@ mod tests {
         let mut st = armed_consented();
         let late = T0 + HEARTBEAT_TIMEOUT_MS + 1;
         st.heartbeat(JTI, 1, at(late));
-        assert!(!st.tx_permitted(at(late)));
+        assert!(!st.tx_permitted(at(late), ConsentChannel::StationAgent));
 
         st.arm(grant_full(TTL, late + TTL, 10, "arm-jti-2"), at(late));
-        assert!(st.tx_permitted(at(late)), "a fresh signed arm restores TX");
+        assert!(
+            st.tx_permitted(at(late), ConsentChannel::StationAgent),
+            "a fresh signed arm restores TX"
+        );
         assert!(st.heartbeat("arm-jti-2", 1, at(late + 10_000)).is_empty());
         // The old arm's jti is rejected and does not slide the new window.
         assert!(is_hb_rejected(&st.heartbeat(JTI, 9, at(late + 20_000))));
-        assert!(st.tx_permitted(at(late + 10_000 + HEARTBEAT_TIMEOUT_MS - 1)));
-        assert!(!st.tx_permitted(at(late + 10_000 + HEARTBEAT_TIMEOUT_MS)));
+        assert!(st.tx_permitted(
+            at(late + 10_000 + HEARTBEAT_TIMEOUT_MS - 1),
+            ConsentChannel::StationAgent
+        ));
+        assert!(!st.tx_permitted(
+            at(late + 10_000 + HEARTBEAT_TIMEOUT_MS),
+            ConsentChannel::StationAgent
+        ));
     }
 
     // --- PAN-97: wall vs monotonic time -----------------------------------
@@ -1095,7 +1331,7 @@ mod tests {
         // Wall steps back 20 s while monotonic time passes the dead-man limit.
         let now = at2(T0 - 20_000, T0 + HEARTBEAT_TIMEOUT_MS);
         assert_eq!(
-            st.tx_permit_reason(now),
+            st.tx_permit_reason(now, ConsentChannel::StationAgent),
             TxPermit::Denied(DenyReason::HeartbeatLost)
         );
         let effects = st.heartbeat(JTI, 1, now);
@@ -1108,7 +1344,7 @@ mod tests {
         let st = armed_consented();
         // Wall jumps 100 s forward (still before armedUntil = T0 + TTL); the
         // monotonic heartbeat age is only 1 s.
-        assert!(st.tx_permitted(at2(T0 + 100_000, T0 + 1_000)));
+        assert!(st.tx_permitted(at2(T0 + 100_000, T0 + 1_000), ConsentChannel::StationAgent));
     }
 
     #[test]
@@ -1123,7 +1359,7 @@ mod tests {
             T0 + HEARTBEAT_TIMEOUT_MS,
         );
         assert_eq!(
-            st.tx_permit_reason(now),
+            st.tx_permit_reason(now, ConsentChannel::StationAgent),
             TxPermit::Denied(DenyReason::HeartbeatLost)
         );
         // A heartbeat on wake is too late: it expires the arm, then a fresh
@@ -1132,7 +1368,7 @@ mod tests {
         assert_eq!(disarm_counts(&effects, DisarmReason::HeartbeatLost), (1, 1));
         assert!(!st.is_armed());
         assert!(st.heartbeat(JTI, 2, now).is_empty());
-        assert!(!st.tx_permitted(now));
+        assert!(!st.tx_permitted(now, ConsentChannel::StationAgent));
 
         let mut st = armed_consented();
         assert_eq!(
@@ -1149,7 +1385,7 @@ mod tests {
             T0 + 1_000,
             T0 + HEARTBEAT_TIMEOUT_MS - 1,
         );
-        assert!(st.tx_permitted(now));
+        assert!(st.tx_permitted(now, ConsentChannel::StationAgent));
     }
 
     #[test]
@@ -1160,8 +1396,14 @@ mod tests {
         assert!(st
             .heartbeat(JTI, 1, at3(T0 + 21_000, T0 + 1_000, T0 + 21_000))
             .is_empty());
-        assert!(st.tx_permitted(at3(T0 + 41_000, T0 + 2_000, T0 + 41_000)));
-        assert!(!st.tx_permitted(at3(T0 + 51_000, T0 + 2_000, T0 + 51_000)));
+        assert!(st.tx_permitted(
+            at3(T0 + 41_000, T0 + 2_000, T0 + 41_000),
+            ConsentChannel::StationAgent
+        ));
+        assert!(!st.tx_permitted(
+            at3(T0 + 51_000, T0 + 2_000, T0 + 51_000),
+            ConsentChannel::StationAgent
+        ));
     }
 
     #[test]
@@ -1172,7 +1414,7 @@ mod tests {
         // saw only 1 s. TTL expiry wins over heartbeat loss.
         let now = at3(T0 + 1_000, T0 + 1_000, T0 + TTL);
         assert_eq!(
-            st.tx_permit_reason(now),
+            st.tx_permit_reason(now, ConsentChannel::StationAgent),
             TxPermit::Denied(DenyReason::Expired)
         );
         assert_eq!(
@@ -1184,7 +1426,10 @@ mod tests {
     #[test]
     fn suspend_aware_clock_running_backwards_fails_closed() {
         let st = armed_consented();
-        assert!(!st.tx_permitted(at3(T0 + 1_000, T0 + 1_000, T0 - 1)));
+        assert!(!st.tx_permitted(
+            at3(T0 + 1_000, T0 + 1_000, T0 - 1),
+            ConsentChannel::StationAgent
+        ));
     }
 
     #[test]
@@ -1213,7 +1458,7 @@ mod tests {
         // Wall reaches armedUntil (T0 + TTL) while monotonic age is 1 s.
         let now = at2(T0 + TTL, T0 + 1_000);
         assert_eq!(
-            st.tx_permit_reason(now),
+            st.tx_permit_reason(now, ConsentChannel::StationAgent),
             TxPermit::Denied(DenyReason::Expired)
         );
         let effects = st.heartbeat(JTI, 1, now);
@@ -1238,7 +1483,7 @@ mod tests {
         }
         let now = at2(T0 + TTL - 60_000, T0 + TTL);
         assert_eq!(
-            st.tx_permit_reason(now),
+            st.tx_permit_reason(now, ConsentChannel::StationAgent),
             TxPermit::Denied(DenyReason::Expired)
         );
         assert_eq!(
@@ -1251,34 +1496,34 @@ mod tests {
     fn delayed_acceptance_cannot_extend_the_signed_grant() {
         // Verified at T0 for 60 s (armedUntil = T0 + 60 s), accepted 10 s later.
         let mut st = ArmState::new();
-        st.set_local_consent(true, T0);
+        st.set_channel_consent(ConsentChannel::StationAgent, true, T0);
         let effects = st.arm(grant_full(60_000, T0 + 60_000, 10, JTI), at(T0 + 10_000));
         assert!(matches!(&effects[0], ArmEffect::Audit(ev)
             if ev.detail.starts_with("armed ttl_ms=50000 ")));
         st.heartbeat(JTI, 1, at(T0 + 30_000));
         st.heartbeat(JTI, 2, at(T0 + 50_000));
         // Wall rolled back so only the monotonic lifetime (50 s) can expire it.
-        assert!(st.tx_permitted(at2(T0, T0 + 59_999)));
-        assert!(!st.tx_permitted(at2(T0, T0 + 60_000)));
+        assert!(st.tx_permitted(at2(T0, T0 + 59_999), ConsentChannel::StationAgent));
+        assert!(!st.tx_permitted(at2(T0, T0 + 60_000), ConsentChannel::StationAgent));
 
         // A backward wall step between verification and acceptance must not
         // enlarge the verified cap: remaining = 90 s, cap stays 60 s.
         let mut st = ArmState::new();
-        st.set_local_consent(true, T0);
+        st.set_channel_consent(ConsentChannel::StationAgent, true, T0);
         st.arm(
             grant_full(60_000, T0 + 60_000, 10, JTI),
             at2(T0 - 30_000, T0),
         );
         st.heartbeat(JTI, 1, at2(T0 - 5_000, T0 + 25_000));
         st.heartbeat(JTI, 2, at2(T0 + 20_000, T0 + 50_000));
-        assert!(st.tx_permitted(at2(T0 + 29_999, T0 + 59_999)));
-        assert!(!st.tx_permitted(at2(T0 + 29_999, T0 + 60_000)));
+        assert!(st.tx_permitted(at2(T0 + 29_999, T0 + 59_999), ConsentChannel::StationAgent));
+        assert!(!st.tx_permitted(at2(T0 + 29_999, T0 + 60_000), ConsentChannel::StationAgent));
     }
 
     #[test]
     fn already_expired_grant_cannot_arm() {
         let mut st = ArmState::new();
-        st.set_local_consent(true, T0);
+        st.set_channel_consent(ConsentChannel::StationAgent, true, T0);
         for accept in [T0 + 60_000, T0 + 60_001] {
             let effects = st.arm(grant_full(60_000, T0 + 60_000, 10, JTI), at(accept));
             assert!(!st.is_armed());
@@ -1290,18 +1535,18 @@ mod tests {
     #[test]
     fn monotonic_sample_before_a_stored_instant_denies_and_cannot_refresh() {
         let mut st = ArmState::new();
-        st.set_local_consent(true, T0);
+        st.set_channel_consent(ConsentChannel::StationAgent, true, T0);
         st.arm(grant(true), at2(T0, 10_000));
         // Earlier than the arm instant: the lifetime cannot be measured.
         assert_eq!(
-            st.tx_permit_reason(at2(T0, 5_000)),
+            st.tx_permit_reason(at2(T0, 5_000), ConsentChannel::StationAgent),
             TxPermit::Denied(DenyReason::Expired)
         );
         assert!(st.heartbeat(JTI, 1, at2(T0, 20_000)).is_empty());
         // After the arm but earlier than the last heartbeat.
         let back = at2(T0, 15_000);
         assert_eq!(
-            st.tx_permit_reason(back),
+            st.tx_permit_reason(back, ConsentChannel::StationAgent),
             TxPermit::Denied(DenyReason::HeartbeatLost)
         );
         let effects = st.heartbeat(JTI, 2, back);
@@ -1312,6 +1557,7 @@ mod tests {
     #[test]
     fn audit_timestamps_use_wall_time_not_monotonic_offsets() {
         let mut st = ArmState::new();
+        st.set_channel_consent(ConsentChannel::StationAgent, true, T0);
         let effects = st.arm(grant(true), at2(T0, 7));
         assert!(matches!(&effects[0], ArmEffect::Audit(ev) if ev.ts_unix_ms == T0));
         let effects = st.tick(at2(T0 + 1, 7 + HEARTBEAT_TIMEOUT_MS));
@@ -1322,7 +1568,7 @@ mod tests {
     fn every_accepted_cadence_keeps_the_fixed_30s_silence_limit() {
         for cadence in [5i64, 10, 15] {
             let mut st = ArmState::new();
-            st.set_local_consent(true, T0);
+            st.set_channel_consent(ConsentChannel::StationAgent, true, T0);
             let effects = st.arm(grant_full(TTL, T0 + TTL, cadence, JTI), at(T0));
             let want = format!(
                 "armed ttl_ms={TTL} heartbeat_interval_sec={cadence} heartbeat_timeout_ms=30000"
@@ -1334,11 +1580,17 @@ mod tests {
             for seq in 1..=(60_000 / step) as u64 {
                 last = T0 + seq as i64 * step;
                 assert!(st.heartbeat(JTI, seq, at(last)).is_empty());
-                assert!(st.tx_permitted(at(last)));
+                assert!(st.tx_permitted(at(last), ConsentChannel::StationAgent));
             }
             // Silence expires at the same boundary for every cadence.
-            assert!(st.tx_permitted(at(last + HEARTBEAT_TIMEOUT_MS - 1)));
-            assert!(!st.tx_permitted(at(last + HEARTBEAT_TIMEOUT_MS)));
+            assert!(st.tx_permitted(
+                at(last + HEARTBEAT_TIMEOUT_MS - 1),
+                ConsentChannel::StationAgent
+            ));
+            assert!(!st.tx_permitted(
+                at(last + HEARTBEAT_TIMEOUT_MS),
+                ConsentChannel::StationAgent
+            ));
             assert_eq!(
                 disarm_counts(
                     &st.tick(at(last + HEARTBEAT_TIMEOUT_MS)),
@@ -1355,6 +1607,7 @@ mod tests {
     fn ttl_boundary_is_exact() {
         // Use a short TTL well within the heartbeat window so TTL is the gate.
         let mut st = ArmState::new();
+        st.set_channel_consent(ConsentChannel::StationAgent, true, T0);
         let short_ttl = 10_000;
         st.arm(
             VerifiedArmGrant {
@@ -1368,17 +1621,16 @@ mod tests {
             },
             at(T0),
         );
-        st.set_local_consent(true, T0);
         assert!(
-            st.tx_permitted(at(T0 + short_ttl - 1)),
+            st.tx_permitted(at(T0 + short_ttl - 1), ConsentChannel::StationAgent),
             "permitted 1ms before ttl"
         );
         assert!(
-            !st.tx_permitted(at(T0 + short_ttl)),
+            !st.tx_permitted(at(T0 + short_ttl), ConsentChannel::StationAgent),
             "denied exactly at ttl (>=)"
         );
         assert_eq!(
-            st.tx_permit_reason(at(T0 + short_ttl)),
+            st.tx_permit_reason(at(T0 + short_ttl), ConsentChannel::StationAgent),
             TxPermit::Denied(DenyReason::Expired)
         );
     }
@@ -1388,31 +1640,34 @@ mod tests {
     #[test]
     fn local_kill_denies_immediately_and_survives_heartbeats() {
         let mut st = armed_consented();
-        assert!(st.tx_permitted(at(T0)));
+        assert!(st.tx_permitted(at(T0), ConsentChannel::StationAgent));
         st.set_local_kill(true, T0);
-        assert!(!st.tx_permitted(at(T0)), "killed => denied immediately");
+        assert!(
+            !st.tx_permitted(at(T0), ConsentChannel::StationAgent),
+            "killed => denied immediately"
+        );
         assert_eq!(
-            st.tx_permit_reason(at(T0)),
+            st.tx_permit_reason(at(T0), ConsentChannel::StationAgent),
             TxPermit::Denied(DenyReason::LocallyKilled)
         );
         // Fresh heartbeats cannot un-kill.
         st.heartbeat(JTI, 1, at(T0 + 1_000));
         st.heartbeat(JTI, 2, at(T0 + 2_000));
-        assert!(!st.tx_permitted(at(T0 + 2_000)));
+        assert!(!st.tx_permitted(at(T0 + 2_000), ConsentChannel::StationAgent));
         // Only clearing the kill restores permission (still armed + consented).
         st.set_local_kill(false, T0 + 3_000);
-        assert!(st.tx_permitted(at(T0 + 3_000)));
+        assert!(st.tx_permitted(at(T0 + 3_000), ConsentChannel::StationAgent));
     }
 
     #[test]
     fn kill_engaged_before_arm_blocks_a_later_valid_arm() {
         let mut st = ArmState::new();
         st.set_local_kill(true, T0);
+        st.set_channel_consent(ConsentChannel::StationAgent, true, T0);
         st.arm(grant(true), at(T0));
-        st.set_local_consent(true, T0);
-        assert!(!st.tx_permitted(at(T0)));
+        assert!(!st.tx_permitted(at(T0), ConsentChannel::StationAgent));
         assert_eq!(
-            st.tx_permit_reason(at(T0)),
+            st.tx_permit_reason(at(T0), ConsentChannel::StationAgent),
             TxPermit::Denied(DenyReason::LocallyKilled)
         );
     }
@@ -1422,11 +1677,11 @@ mod tests {
     #[test]
     fn revoking_consent_denies_immediately() {
         let mut st = armed_consented();
-        assert!(st.tx_permitted(at(T0)));
-        st.set_local_consent(false, T0);
-        assert!(!st.tx_permitted(at(T0)));
+        assert!(st.tx_permitted(at(T0), ConsentChannel::StationAgent));
+        st.set_channel_consent(ConsentChannel::StationAgent, false, T0);
+        assert!(!st.tx_permitted(at(T0), ConsentChannel::StationAgent));
         assert_eq!(
-            st.tx_permit_reason(at(T0)),
+            st.tx_permit_reason(at(T0), ConsentChannel::StationAgent),
             TxPermit::Denied(DenyReason::NoLocalConsent)
         );
     }
@@ -1436,12 +1691,12 @@ mod tests {
     #[test]
     fn grant_without_tx_scope_is_rejected_and_never_permits() {
         let mut st = ArmState::new();
+        st.set_channel_consent(ConsentChannel::StationAgent, true, T0);
         let effects = st.arm(grant(false), at(T0));
-        st.set_local_consent(true, T0);
         assert!(!st.is_armed(), "no-scope grant does not arm");
-        assert!(!st.tx_permitted(at(T0)));
+        assert!(!st.tx_permitted(at(T0), ConsentChannel::StationAgent));
         assert_eq!(
-            st.tx_permit_reason(at(T0)),
+            st.tx_permit_reason(at(T0), ConsentChannel::StationAgent),
             TxPermit::Denied(DenyReason::NotArmed)
         );
         // The rejection was audited as a TxDenied(NoTxScope).
@@ -1460,6 +1715,7 @@ mod tests {
     #[test]
     fn expired_arm_never_resurrects_via_heartbeat() {
         let mut st = ArmState::new();
+        st.set_channel_consent(ConsentChannel::StationAgent, true, T0);
         let short_ttl = 10_000;
         st.arm(
             VerifiedArmGrant {
@@ -1473,11 +1729,10 @@ mod tests {
             },
             at(T0),
         );
-        st.set_local_consent(true, T0);
         let after_expiry = T0 + short_ttl + 5;
-        assert!(!st.tx_permitted(at(after_expiry)));
+        assert!(!st.tx_permitted(at(after_expiry), ConsentChannel::StationAgent));
         assert_eq!(
-            st.tx_permit_reason(at(after_expiry)),
+            st.tx_permit_reason(at(after_expiry), ConsentChannel::StationAgent),
             TxPermit::Denied(DenyReason::Expired)
         );
         // A heartbeat after expiry must NOT re-permit — it expires the arm
@@ -1487,7 +1742,7 @@ mod tests {
             reason: DisarmReason::TtlExpired
         }));
         assert!(!st.is_armed());
-        assert!(!st.tx_permitted(at(after_expiry)));
+        assert!(!st.tx_permitted(at(after_expiry), ConsentChannel::StationAgent));
         // Only a fresh arm restores permission.
         st.arm(
             VerifiedArmGrant {
@@ -1501,7 +1756,7 @@ mod tests {
             },
             at(after_expiry),
         );
-        assert!(st.tx_permitted(at(after_expiry)));
+        assert!(st.tx_permitted(at(after_expiry), ConsentChannel::StationAgent));
     }
 
     #[test]
@@ -1516,9 +1771,9 @@ mod tests {
             .any(|e| matches!(e, ArmEffect::Disarmed { reason } if *reason == DisarmReason::HeartbeatLost)));
         // A heartbeat now targets no session; still not permitted.
         assert!(st.heartbeat(JTI, 1, at(dead)).is_empty());
-        assert!(!st.tx_permitted(at(dead)));
+        assert!(!st.tx_permitted(at(dead), ConsentChannel::StationAgent));
         assert_eq!(
-            st.tx_permit_reason(at(dead)),
+            st.tx_permit_reason(at(dead), ConsentChannel::StationAgent),
             TxPermit::Denied(DenyReason::NotArmed)
         );
     }
@@ -1535,6 +1790,7 @@ mod tests {
     #[test]
     fn tick_past_ttl_emits_disarmed_and_audit_with_ttl_reason() {
         let mut st = ArmState::new();
+        st.set_channel_consent(ConsentChannel::StationAgent, true, T0);
         st.arm(
             VerifiedArmGrant {
                 operator_callsign: "N0CALL".into(),
@@ -1547,7 +1803,6 @@ mod tests {
             },
             at(T0),
         );
-        st.set_local_consent(true, T0);
         let effects = st.tick(at(T0 + 10_000));
         assert!(!st.is_armed());
         assert_eq!(effects.len(), 2);
@@ -1591,6 +1846,7 @@ mod tests {
     fn ttl_takes_precedence_over_heartbeat_when_both_fire() {
         // TTL shorter than heartbeat window; tick well past both.
         let mut st = ArmState::new();
+        st.set_channel_consent(ConsentChannel::StationAgent, true, T0);
         st.arm(
             VerifiedArmGrant {
                 operator_callsign: "N0CALL".into(),
@@ -1603,7 +1859,6 @@ mod tests {
             },
             at(T0),
         );
-        st.set_local_consent(true, T0);
         let effects = st.tick(at(T0 + 40_000)); // past ttl AND past heartbeat window
         assert_eq!(
             effects[1],
@@ -1625,7 +1880,7 @@ mod tests {
             }
         );
         assert!(!st.is_armed());
-        assert!(!st.tx_permitted(at(T0 + 1_000)));
+        assert!(!st.tx_permitted(at(T0 + 1_000), ConsentChannel::StationAgent));
         // Disarm again = no effects.
         assert!(st.disarm(T0 + 2_000).is_empty());
     }
@@ -1659,11 +1914,19 @@ mod tests {
     fn consent_and_kill_only_audit_on_change() {
         let mut st = ArmState::new();
         // OFF -> OFF: no effect.
-        assert!(st.set_local_consent(false, T0).is_empty());
+        assert!(st
+            .set_channel_consent(ConsentChannel::StationAgent, false, T0)
+            .is_empty());
         // OFF -> ON: one effect.
-        assert_eq!(st.set_local_consent(true, T0).len(), 1);
+        assert_eq!(
+            st.set_channel_consent(ConsentChannel::StationAgent, true, T0)
+                .len(),
+            1
+        );
         // ON -> ON: no effect.
-        assert!(st.set_local_consent(true, T0).is_empty());
+        assert!(st
+            .set_channel_consent(ConsentChannel::StationAgent, true, T0)
+            .is_empty());
         // kill: same pattern.
         assert!(st.set_local_kill(false, T0).is_empty());
         assert_eq!(st.set_local_kill(true, T0).len(), 1);
@@ -1689,10 +1952,10 @@ mod tests {
     }
 
     /// A shadow model of every gate, computed independently of `ArmState`'s
-    /// internals, to cross-check the safety invariant:
-    /// permitted ⇒ armed ∧ scope ∧ wall < armedUntil ∧ lifetime left (mono and
-    /// suspend-aware) ∧ heartbeat-fresh (mono and suspend-aware) ∧ consent ∧
-    /// ¬killed.
+    /// internals, to cross-check the safety invariant for each channel `ch`:
+    /// permitted(ch) ⇒ armed ∧ scope ∧ wall < armedUntil ∧ lifetime left (mono
+    /// and suspend-aware) ∧ heartbeat-fresh (mono and suspend-aware) ∧
+    /// consent(ch) ∧ ¬killed.
     ///
     /// Expiry is terminal in the model: once any deadline has passed, the next
     /// heartbeat or tick drops the arm, and a later heartbeat cannot revive it.
@@ -1706,7 +1969,8 @@ mod tests {
         armed_at_susp: i64,
         last_hb_susp: i64,
         scope_tx: bool,
-        consent: bool,
+        consent_sa: bool,
+        consent_wsjtx: bool,
         kill: bool,
     }
 
@@ -1721,8 +1985,15 @@ mod tests {
                 armed_at_susp: 0,
                 last_hb_susp: 0,
                 scope_tx: false,
-                consent: false,
+                consent_sa: false,
+                consent_wsjtx: false,
                 kill: false,
+            }
+        }
+        fn consent(&self, ch: ConsentChannel) -> bool {
+            match ch {
+                ConsentChannel::StationAgent => self.consent_sa,
+                ConsentChannel::WsjtxUdp => self.consent_wsjtx,
             }
         }
         fn deadline_passed(&self, unix: i64, mono: i64, susp: i64) -> bool {
@@ -1736,11 +2007,11 @@ mod tests {
                 || susp < self.last_hb_susp
                 || susp - self.last_hb_susp >= HEARTBEAT_TIMEOUT_MS
         }
-        fn any_gate_closed(&self, unix: i64, mono: i64, susp: i64) -> bool {
+        fn any_gate_closed(&self, unix: i64, mono: i64, susp: i64, ch: ConsentChannel) -> bool {
             !self.armed
                 || !self.scope_tx
                 || self.deadline_passed(unix, mono, susp)
-                || !self.consent
+                || !self.consent(ch)
                 || self.kill
         }
     }
@@ -1800,8 +2071,9 @@ mod tests {
                             },
                             now,
                         );
-                        // Shadow: arm only takes effect if scope_tx.
-                        if scope {
+                        // Shadow: arm only takes effect if scope_tx AND the
+                        // station-agent channel's own consent is on.
+                        if scope && sh.consent_sa {
                             sh.armed = true;
                             sh.armed_at_mono = mono;
                             sh.lifetime = ttl;
@@ -1814,7 +2086,7 @@ mod tests {
                             cur_jti = jti;
                             hb_seq = 0;
                         }
-                        // (no-scope arm leaves prior session untouched, matching impl)
+                        // (a refused arm leaves prior session untouched, matching impl)
                     }
                     1 => {
                         hb_seq += 1;
@@ -1835,8 +2107,13 @@ mod tests {
                     }
                     3 => {
                         let en = rng.below(2) == 1;
-                        st.set_local_consent(en, unix);
-                        sh.consent = en;
+                        if rng.below(2) == 1 {
+                            st.set_channel_consent(ConsentChannel::StationAgent, en, unix);
+                            sh.consent_sa = en;
+                        } else {
+                            st.set_channel_consent(ConsentChannel::WsjtxUdp, en, unix);
+                            sh.consent_wsjtx = en;
+                        }
                     }
                     4 => {
                         let en = rng.below(2) == 1;
@@ -1864,31 +2141,33 @@ mod tests {
                     200_000,
                 ] {
                     let (qu, qm, qs) = (unix + dt, mono + dt, susp + dt);
-                    let permitted = st.tx_permitted(at3(qu, qm, qs));
+                    for ch in [ConsentChannel::StationAgent, ConsentChannel::WsjtxUdp] {
+                        let permitted = st.tx_permitted(at3(qu, qm, qs), ch);
 
-                    // THE SAFETY INVARIANT: if permitted, no gate may be closed.
-                    if permitted {
-                        assert!(
-                            !sh.any_gate_closed(qu, qm, qs),
-                            "SAFETY VIOLATION: tx_permitted(true) with a closed gate. \
-                             shadow: armed={} scope={} armed_at_mono={} lifetime={} \
-                             armed_until_unix={} last_hb_mono={} consent={} kill={} \
-                             q=({qu},{qm})",
+                        // THE SAFETY INVARIANT: if permitted, no gate may be
+                        // closed for the queried channel; and with every gate
+                        // open for it, the impl permits.
+                        assert_eq!(
+                            permitted,
+                            !sh.any_gate_closed(qu, qm, qs, ch),
+                            "SAFETY VIOLATION: permitted={permitted} against the shadow \
+                             model. shadow: armed={} scope={} armed_at_mono={} lifetime={} \
+                             armed_until_unix={} last_hb_mono={} consent_sa={} \
+                             consent_wsjtx={} kill={} q=({qu},{qm},{qs}) ch={ch:?}",
                             sh.armed,
                             sh.scope_tx,
                             sh.armed_at_mono,
                             sh.lifetime,
                             sh.armed_until_unix,
                             sh.last_hb_mono,
-                            sh.consent,
+                            sh.consent_sa,
+                            sh.consent_wsjtx,
                             sh.kill,
                         );
+                        // A Permitted verdict must agree the boolean is true.
+                        let reason = st.tx_permit_reason(at3(qu, qm, qs), ch);
+                        assert_eq!(permitted, matches!(reason, TxPermit::Permitted));
                     }
-                    // And the converse: with every gate open, the impl permits.
-                    assert_eq!(permitted, !sh.any_gate_closed(qu, qm, qs));
-                    // A Permitted verdict must agree the boolean is true.
-                    let reason = st.tx_permit_reason(at3(qu, qm, qs));
-                    assert_eq!(permitted, matches!(reason, TxPermit::Permitted));
                 }
             }
         }

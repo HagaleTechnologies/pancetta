@@ -1453,13 +1453,16 @@ pub struct ApplicationCoordinator {
     /// the QSO component as it forwards each `MessageToSend`; read by the TX
     /// worker at key-time to pivot to the freshest message for the QSO.
     pub(crate) latest_tx_intent: Arc<std::sync::RwLock<HashMap<String, LatestTxIntent>>>,
-    /// Station-agent remote-TX arm gate. The FINAL TX authority for
+    /// Shared remote-TX arm gate. The FINAL TX authority for
     /// remote-originated (`TxOrigin::Remote`) transmit requests: the TX worker
-    /// checks `tx_permitted(now_ms)` before keying PTT for any remote request
-    /// and drops it (fail-closed) if not permitted. Seeded at startup with the
-    /// LOCAL operator consent from `[network.station_agent].remote_tx_enabled`
-    /// (default OFF), so with nothing arming it and no remote requests being
-    /// constructed (P0–P2), this gate is inert. Local TX never consults it.
+    /// checks `tx_permitted(now_ms, channel)` — for the channel the request
+    /// originated on — before keying PTT for any remote request and drops it
+    /// (fail-closed) if not permitted. Seeded at startup with PER-CHANNEL
+    /// local operator consent (PAN-98): the station-agent channel's from
+    /// `[network.station_agent].remote_tx_enabled`, the WSJT-X UDP channel's
+    /// from `[network.wsjtx_udp] enabled && allow_tx_initiation` (both default
+    /// OFF); one channel's consent never satisfies the other's. Local TX never
+    /// consults it.
     pub(crate) remote_tx_arm: Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
     /// The station-agent audit log, shared so more than just
     /// `run_session_loop`'s own `ArmContext` can append to it — notably the
@@ -1790,31 +1793,23 @@ impl ApplicationCoordinator {
         // the Arc<RwLock> — mirrors `display_feed_enabled_init` above.
         let wsjtx_enabled_init = config.network.wsjtx_udp.enabled;
         // Snapshot the LOCAL remote-TX consent before config is moved into the
-        // Arc<RwLock>. Seeds the shared remote-TX arm's local-consent gate.
-        // Option A of the WSJT-X-UDP design spec: the arm is the operator's
-        // channel-independent "I consent to remote TX" bit, so EITHER channel's
-        // consent seeds it — the station agent's `remote_tx_enabled` OR the
-        // WSJT-X-UDP `allow_tx_initiation` (both default OFF, so remote TX can
-        // never be permitted this phase unless the operator opts in).
+        // Arc<RwLock>. The shared remote-TX arm tracks consent PER CHANNEL
+        // (PAN-98), each seeded only from that channel's own settings (both
+        // default OFF, so remote TX can never be permitted unless the operator
+        // opts in on that channel):
+        // - station-agent channel: `[network.station_agent].remote_tx_enabled`;
+        // - WSJT-X UDP channel: `[network.wsjtx_udp] enabled &&
+        //   allow_tx_initiation`.
+        // Neither channel's consent ever satisfies the other's gate.
         //
-        // The wsjtx contribution is additionally gated on `enabled`: when the
-        // component is disabled there is no Reply-handling code path at all,
-        // so seeding the arm from a disabled component's flag is pure risk
-        // (an armed-but-unreachable seed) with no functional benefit. This
-        // also closes an audit-visibility gap — with `enabled = false`, the
-        // startup DiagnosticEvent in `start_wsjtx_udp_component` never fires
-        // (it's behind that component's own enabled check), so an operator
-        // with `enabled = false, allow_tx_initiation = true` would otherwise
-        // get only a `warn!` log line for a misconfiguration that still arms
-        // remote TX. `enabled && allow_tx_initiation` equals
-        // `allow_tx_initiation` whenever `enabled` is already true, so this
-        // is a no-op for the `enabled = true` case.
+        // The wsjtx bit is additionally gated on `enabled`: when the component
+        // is disabled there is no Reply-handling code path at all, so consent
+        // from a disabled component's flag is pure risk with no functional
+        // benefit. `enabled && allow_tx_initiation` equals
+        // `allow_tx_initiation` whenever `enabled` is already true.
+        let station_agent_tx_consent_init = config.network.station_agent.remote_tx_enabled;
         let wsjtx_allow_tx_initiation_init =
             wsjtx_enabled_init && config.network.wsjtx_udp.allow_tx_initiation;
-        let remote_tx_consent_init = crate::coordinator::wsjtx_udp::remote_tx_arm_consent(
-            config.network.station_agent.remote_tx_enabled,
-            wsjtx_allow_tx_initiation_init,
-        );
         // Snapshot the audit log path before config is moved into the
         // Arc<RwLock> — mirrors the other "snapshot before move" fields
         // above. Constructed unconditionally (cheap, no I/O until the first
@@ -1830,13 +1825,6 @@ impl ApplicationCoordinator {
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(pancetta_agent::audit::default_audit_path),
         );
-        if wsjtx_allow_tx_initiation_init {
-            warn!(
-                target: "remote.wsjtx",
-                "remote-TX arm seeded by [network.wsjtx_udp].allow_tx_initiation \
-                 — UDP Reply may initiate QSOs"
-            );
-        }
         // Snapshot fox.max_streams before config is moved into the Arc<RwLock>.
         // The QSO component reads this to cap concurrent caller-answer QSOs
         // while Fox mode is engaged.
@@ -2125,14 +2113,24 @@ impl ApplicationCoordinator {
             active_tx_qsos: Arc::new(std::sync::RwLock::new(HashSet::new())),
             fox_admitted_qsos: Arc::new(std::sync::RwLock::new(HashSet::new())),
             latest_tx_intent: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            // Station-agent remote-TX arm. Fresh (unarmed, not killed), then
-            // seed the LOCAL operator consent from config. With consent OFF (the
-            // default) `tx_permitted()` is always false; nothing arms and no
-            // remote request is constructed in P0–P2, so the gate is inert.
+            // Shared remote-TX arm. Fresh (unarmed, not killed), then seed
+            // each channel's LOCAL operator consent from its own config. With
+            // a channel's consent OFF (the default) `tx_permitted(_, channel)`
+            // is always false for that channel, and with the station-agent
+            // channel's consent OFF nothing can arm at all.
             remote_tx_arm: {
                 let mut st = pancetta_agent::arm::ArmState::new();
                 let now_ms = chrono::Utc::now().timestamp_millis();
-                let _ = st.set_local_consent(remote_tx_consent_init, now_ms);
+                let _ = st.set_channel_consent(
+                    pancetta_agent::arm::ConsentChannel::StationAgent,
+                    station_agent_tx_consent_init,
+                    now_ms,
+                );
+                let _ = st.set_channel_consent(
+                    pancetta_agent::arm::ConsentChannel::WsjtxUdp,
+                    wsjtx_allow_tx_initiation_init,
+                    now_ms,
+                );
                 Arc::new(std::sync::Mutex::new(st))
             },
             audit_log: audit_log_init,
@@ -2589,9 +2587,10 @@ impl ApplicationCoordinator {
         self.resolved_hardware_tier.clone()
     }
 
-    /// Station-agent remote-TX arm gate (shared handle). Cloned into the TX
-    /// worker, which checks `tx_permitted(now_ms)` before keying PTT for any
-    /// `TxOrigin::Remote` request and drops it (fail-closed) if not permitted.
+    /// Shared remote-TX arm gate (shared handle). Cloned into the TX worker,
+    /// which checks `tx_permitted(now_ms, channel)` for the request's
+    /// originating channel before keying PTT for any `TxOrigin::Remote`
+    /// request and drops it (fail-closed) if not permitted.
     /// In P0–P2 nothing arms it and no remote request is constructed, so it is
     /// inert; local TX never consults it.
     pub(crate) fn remote_tx_arm(&self) -> Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>> {

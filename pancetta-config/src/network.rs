@@ -258,8 +258,11 @@ pub struct WsjtxUdpConfig {
     pub instance_id: String,
     /// Master switch for processing ANY inbound request (Reply/HaltTx/...).
     pub accept_udp_requests: bool,
-    /// Reply(4) may initiate a QSO. Also seeds the remote-TX arm gate —
-    /// see the design spec's security model. Fail-closed everywhere.
+    /// Reply(4) may initiate a QSO. Also seeds THIS channel's own remote-TX
+    /// consent bit in the shared arm (with `enabled`), which TX for a
+    /// Reply-initiated QSO requires on top of a live arm. It never satisfies
+    /// the station-agent channel's consent and never arms anything — see the
+    /// design spec's security model. Fail-closed everywhere.
     pub allow_tx_initiation: bool,
     /// For multicast destinations: hosts allowed to send requests. Empty ⇒
     /// all requests refused (and logged). Unicast infers the peer host.
@@ -342,10 +345,15 @@ impl Default for RemoteGatewayConfig {
 /// Default OFF on every field. This section governs the offline safety core
 /// of the station agent (P0–P2): [`enabled`](Self::enabled) will (in a later
 /// phase) gate the remote-control transport, and
-/// [`remote_tx_enabled`](Self::remote_tx_enabled) is the LOCAL operator
-/// consent gate seeded into the coordinator's `ArmState` at startup — while
-/// it is `false`, `ArmState::tx_permitted()` can never return `true`, so no
-/// remote-originated TX can ever key PTT regardless of any (future) arm grant.
+/// [`remote_tx_enabled`](Self::remote_tx_enabled) is the station-agent
+/// channel's LOCAL operator consent gate, seeded into the coordinator's
+/// `ArmState` at startup as that channel's own consent bit. Consent is tracked
+/// per channel: while it is `false`, a station-agent `txArm` is refused, a
+/// station-agent `txRequest` is refused, and no station-agent-originated TX
+/// can key PTT. `[network.wsjtx_udp].allow_tx_initiation` never satisfies it.
+/// Because only the station-agent channel can arm, with it `false` nothing
+/// can arm, so WSJT-X-UDP-originated TX cannot key PTT either (that channel
+/// is additionally gated by its own settings).
 ///
 /// In this phase the remote transport is not built, so [`enabled`](Self::enabled)
 /// has no runtime effect (it is only validated as well-formed).
@@ -357,9 +365,12 @@ pub struct StationAgentConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// LOCAL operator consent gate for remote-originated TX. When `false`
-    /// (default), the coordinator's remote-TX arm can never permit TX — this
-    /// is the operator's local, physical-presence consent to remote keying.
+    /// LOCAL operator consent gate for TX over the station-agent channel.
+    /// When `false` (default), the station-agent channel can neither arm nor
+    /// request TX, and none of its frames can key PTT — this is the operator's
+    /// local, physical-presence consent to remote keying over this channel.
+    /// Independent of `[network.wsjtx_udp].allow_tx_initiation`: neither
+    /// channel's consent satisfies the other's.
     #[serde(default)]
     pub remote_tx_enabled: bool,
 
