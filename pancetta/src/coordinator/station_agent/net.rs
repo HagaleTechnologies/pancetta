@@ -33,11 +33,7 @@
 
 use std::time::Duration;
 
-<<<<<<< HEAD
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
-=======
-use futures_util::{SinkExt, StreamExt};
->>>>>>> 9245cf073d2bab96df9092c2da96901a2ca66dda
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -47,7 +43,6 @@ use tracing::debug;
 use pancetta_agent::pairing::{PairingError, PairingHttp};
 use pancetta_agent::relay::{RecvOutcome, RelayError, WsConn, MAX_FRAME_BYTES};
 
-<<<<<<< HEAD
 /// Dial + TLS + WebSocket upgrade.
 pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// WebSocket upgrade complete → the relay's opening `hello` (the
@@ -85,7 +80,7 @@ impl Default for RelayTimeouts {
         }
     }
 }
-=======
+
 /// Transport limits for the relay socket. relay.v1 sends one frame per text
 /// message and [`parse_frame`](pancetta_agent::relay::parse_frame) refuses
 /// anything over [`MAX_FRAME_BYTES`]; matching it here makes tungstenite
@@ -100,7 +95,6 @@ fn relay_ws_config() -> WebSocketConfig {
 const MAX_PAIRING_RESPONSE_BYTES: usize = 64 * 1024;
 /// Total time allowed for one pairing POST, connect through body.
 const PAIRING_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
->>>>>>> 9245cf073d2bab96df9092c2da96901a2ca66dda
 
 /// A real relay WebSocket connection adapting an async [`tokio_tungstenite`]
 /// stream to the synchronous [`WsConn`] seam.
@@ -128,73 +122,21 @@ impl RealWsConn {
     /// Dial `url` and return a synchronous [`WsConn`] over the established
     /// WebSocket. Must be called from within a Tokio runtime (uses the current
     /// [`Handle`]). Spawns a pump task that owns the socket for its lifetime.
-<<<<<<< HEAD
     /// The dial, TLS and upgrade together are bounded by
-    /// [`RelayTimeouts::connect`].
+    /// [`RelayTimeouts::connect`]; `relay_ws_config` bounds each inbound frame.
     pub async fn connect(url: &str, timeouts: RelayTimeouts) -> Result<Self, RelayError> {
-        let (stream, _resp) =
-            match tokio::time::timeout(timeouts.connect, tokio_tungstenite::connect_async(url))
-                .await
-            {
-                Ok(Ok(connected)) => connected,
-                Ok(Err(e)) => return Err(RelayError::Transport(format!("connect {url}: {e}"))),
-                Err(_elapsed) => {
-                    return Err(RelayError::Transport(format!("connect {url}: timed out")))
-=======
-    pub async fn connect(url: &str) -> Result<Self, RelayError> {
-        let (stream, _resp) =
-            tokio_tungstenite::connect_async_with_config(url, Some(relay_ws_config()), false)
-                .await
-                .map_err(|e| RelayError::Transport(format!("connect {url}: {e}")))?;
-        let (mut sink, mut source) = stream.split();
-
-        // The channels bound queue depth and `relay_ws_config` bounds each
-        // frame, so a stuck or oversending peer can't grow memory without
-        // limit.
-        let (out_tx, mut out_rx) = mpsc::channel::<String>(64);
-        let (in_tx, in_rx) = mpsc::channel::<Option<String>>(64);
-
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    // Outbound: forward text frames to the socket.
-                    maybe = out_rx.recv() => match maybe {
-                        Some(text) => {
-                            if sink.send(Message::Text(text.into())).await.is_err() {
-                                let _ = in_tx.send(None).await;
-                                break;
-                            }
-                        }
-                        None => {
-                            // Adapter dropped: close the socket and stop.
-                            let _ = sink.send(Message::Close(None)).await;
-                            break;
-                        }
-                    },
-                    // Inbound: forward text frames (and closes) to the adapter.
-                    inbound = source.next() => match inbound {
-                        Some(Ok(Message::Text(t))) => {
-                            if in_tx.send(Some(t.to_string())).await.is_err() {
-                                break;
-                            }
-                        }
-                        Some(Ok(Message::Binary(_))) | Some(Ok(Message::Ping(_)))
-                        | Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {
-                            // Non-text frames are not part of relay.v1; ignore.
-                        }
-                        Some(Ok(Message::Close(_))) | None => {
-                            let _ = in_tx.send(None).await;
-                            break;
-                        }
-                        Some(Err(e)) => {
-                            tracing::debug!(target: "agent", "relay socket error: {e}");
-                            let _ = in_tx.send(None).await;
-                            break;
-                        }
-                    }
->>>>>>> 9245cf073d2bab96df9092c2da96901a2ca66dda
-                }
-            };
+        let (stream, _resp) = match tokio::time::timeout(
+            timeouts.connect,
+            tokio_tungstenite::connect_async_with_config(url, Some(relay_ws_config()), false),
+        )
+        .await
+        {
+            Ok(Ok(connected)) => connected,
+            Ok(Err(e)) => return Err(RelayError::Transport(format!("connect {url}: {e}"))),
+            Err(_elapsed) => {
+                return Err(RelayError::Transport(format!("connect {url}: timed out")))
+            }
+        };
         let (sink, source) = stream.split();
         Ok(Self::spawn(sink, source, timeouts))
     }
@@ -204,8 +146,11 @@ impl RealWsConn {
     where
         Si: Sink<Message> + Unpin + Send + 'static,
         St: Stream<Item = Result<Message, E>> + Unpin + Send + 'static,
-        E: Send + 'static,
+        E: std::fmt::Display + Send + 'static,
     {
+        // The channels bound queue depth and `relay_ws_config` bounds each
+        // frame, so a stuck or oversending peer can't grow memory without
+        // limit.
         let (out_tx, out_rx) = mpsc::channel::<String>(RELAY_QUEUE_DEPTH);
         let (in_tx, in_rx) = mpsc::channel::<String>(RELAY_QUEUE_DEPTH);
         let pump = tokio::spawn(pump(sink, source, out_rx, in_tx, timeouts.write));
@@ -232,6 +177,7 @@ async fn pump<Si, St, E>(
 ) where
     Si: Sink<Message> + Unpin,
     St: Stream<Item = Result<Message, E>> + Unpin,
+    E: std::fmt::Display,
 {
     let writer = async move {
         while let Some(text) = out_rx.recv().await {
@@ -259,7 +205,11 @@ async fn pump<Si, St, E>(
                 Ok(
                     Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_),
                 ) => {}
-                Ok(Message::Close(_)) | Err(_) => return,
+                Ok(Message::Close(_)) => return,
+                Err(e) => {
+                    debug!(target: "agent", "relay socket error: {e}");
+                    return;
+                }
             }
         }
     };
@@ -490,7 +440,6 @@ mod tests {
         assert_eq!(received, Some("hello".to_string()));
     }
 
-<<<<<<< HEAD
     // ── PAN-102: bounded, decoupled relay IO ─────────────────────────────
 
     use std::pin::Pin;
@@ -828,7 +777,7 @@ mod tests {
             );
         }
     }
-=======
+
     /// Serve one raw HTTP/1.1 connection on a std thread: read the request
     /// headers and any `Content-Length` body, then answer `200` with
     /// `prefix` followed by `pad` spaces, chunked in 64 KiB pieces. Write
@@ -900,7 +849,7 @@ mod tests {
         });
 
         let client = tokio::spawn(async move {
-            let mut conn = RealWsConn::connect(&format!("ws://{addr}"))
+            let mut conn = RealWsConn::connect(&format!("ws://{addr}"), RelayTimeouts::default())
                 .await
                 .expect("connect");
             let first = conn.recv_text().expect("first recv_text");
@@ -949,7 +898,7 @@ mod tests {
         });
 
         let client = tokio::spawn(async move {
-            let mut conn = RealWsConn::connect(&format!("ws://{addr}"))
+            let mut conn = RealWsConn::connect(&format!("ws://{addr}"), RelayTimeouts::default())
                 .await
                 .expect("connect");
             conn.recv_text().expect("recv_text")
@@ -1014,5 +963,4 @@ mod tests {
             "expected Transport error, got {result:?}"
         );
     }
->>>>>>> 9245cf073d2bab96df9092c2da96901a2ca66dda
 }
