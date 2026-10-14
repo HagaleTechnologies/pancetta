@@ -131,7 +131,9 @@ record_action() { printf '%s\n' "$1" >> "$WORK/actions"; }
 #      verified, stand down without spending it; the next pass requests again.
 # A response run whose request lookup happens after our request selects our request as the
 # baseline and finds no tied Codex signal, so it leaves the gate alone.
-SETTLE_TRIES=${SETTLE_TRIES:-20}
+# 8 x 15s = 2 min per settle; at most four settles keeps a pass inside the job's 15-minute
+# timeout (a response run takes well under a minute).
+SETTLE_TRIES=${SETTLE_TRIES:-8}
 SETTLE_INTERVAL=${SETTLE_INTERVAL:-15}
 # Return 0 once no Wait-for-Codex issue_comment run is pending, 1 if one still is after the
 # bounded wait, 2 if unreadable. Not PR-scoped (the run list can't filter by PR): conservative.
