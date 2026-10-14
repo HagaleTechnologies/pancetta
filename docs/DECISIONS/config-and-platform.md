@@ -502,3 +502,36 @@ binary-only `doctor.rs` into `pancetta_lib` so the coordinator can use it; docto
   This local override leaves the synced general convergence policy unchanged. The external
   claude.ai routine must receive the documented prompt pointer, daily schedule and Linear
   connector edits before the full lifecycle is operational.
+
+## Network input budgets (PAN-101), 2026-10-14
+
+HTTP response bodies in `pancetta-cqdx`, `pancetta-dx` and the `pancetta pair` client, DX cluster
+lines, and relay WebSocket frames are read through a reader that stops at a fixed byte budget, so
+none of them is buffered whole before its size is known. This record does not cover the
+remote-gateway WebSocket acceptor; its limits are tracked in PAN-99. The budgets are `const`s
+beside each client, not config:
+
+- **HTTP bodies.** `pancetta-cqdx` (`client.rs::read_body_capped`) and `pancetta-dx`
+  (`body::{bytes_within, text_within, text_prefix}`) read with `Response::chunk()` and stop once the
+  budget is passed. A body that is read whole fails when it is over budget, or before reading when
+  its declared `Content-Length` is (`CqdxError::ResponseTooLarge`, `DxError::ResponseTooLarge`,
+  `PairingError::MalformedResponse` for `pancetta pair`). Two success bodies are read only up to
+  their budget and never fail on size: a cqdx `log_qso` 2xx body over 64 KiB is not checked for a
+  duplicate marker and counts as logged, and ClubLog's body is read only up to 4 KiB whatever the
+  status, with the outcome set by the HTTP status. The cqdx, QRZ Logbook and eQSL error bodies are
+  read only up to 4 KiB, so an error message carries at most that much of the body. Budgets: cqdx
+  JSON 10 MiB, cqdx `log_qso` 2xx 64 KiB, QRZ XML 64 KiB, QRZ Logbook/eQSL 64 KiB, ClubLog 4 KiB,
+  LoTW pages 1 MiB and report 64 MiB, PSKReporter query 16 MiB, `pancetta pair` 64 KiB with a 30 s
+  timeout. `pancetta-dx` decodes text the way `Response::text` does (Content-Type charset, BOM
+  sniffing).
+- **DX cluster.** Telnet lines longer than 4096 bytes (line ending included) are discarded without
+  being buffered (`cluster.rs::read_capped_line`). The spot queue holds 1024 and drops new spots when
+  full (`DxClusterClient::dropped_spot_count`); the command queue holds 64. The WebSocket branch
+  refuses messages over 4096 bytes.
+- **Relay WebSocket.** `RealWsConn` sets tungstenite's `max_message_size` and `max_frame_size` to
+  relay.v1's `MAX_FRAME_BYTES` (65536), so a larger frame is refused from its header and the session
+  closes, the same outcome `parse_frame` already produced.
+
+Rule: do not call `.text()`, `.bytes()` or `.json()` on a `reqwest::Response` in these crates, and
+do not dial or accept a WebSocket without a `WebSocketConfig` sized to its protocol. The
+remote-gateway acceptor does not follow this rule yet (PAN-99).

@@ -49,6 +49,7 @@
 
 #![allow(missing_docs)] // TODO: documentation pass pending — see CONTRIBUTING.md
 
+mod body;
 pub mod cluster;
 pub mod lotw;
 mod network_error;
@@ -80,6 +81,13 @@ pub type Result<T> = std::result::Result<T, DxError>;
 pub enum DxError {
     #[error("Network error: {0}")]
     Network(#[from] NetworkError),
+
+    /// A response body passed its byte budget; reading stopped there.
+    #[error("Response too large: more than {limit} bytes")]
+    ResponseTooLarge {
+        /// The budget, in bytes.
+        limit: usize,
+    },
 
     #[error("External service error: {0}")]
     ExternalService(String),

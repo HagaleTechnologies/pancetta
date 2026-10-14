@@ -15,7 +15,11 @@ pub(crate) const TRUNCATED_BODY: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/x
 
 /// Send `raw` verbatim to each of the next `n` connections.
 pub(crate) fn serve_raw(n: usize, raw: impl Into<String>) -> SocketAddr {
-    let raw = raw.into();
+    serve_raw_bytes(n, raw.into().into_bytes())
+}
+
+/// Send `raw` bytes verbatim to each of the next `n` connections.
+pub(crate) fn serve_raw_bytes(n: usize, raw: Vec<u8>) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
@@ -25,10 +29,113 @@ pub(crate) fn serve_raw(n: usize, raw: impl Into<String>) -> SocketAddr {
             };
             let mut buf = [0u8; 4096];
             let _ = stream.read(&mut buf);
-            let _ = stream.write_all(raw.as_bytes());
+            let _ = stream.write_all(&raw);
         }
     });
     addr
+}
+
+/// What a [`serve_chunked`] server managed to send.
+pub(crate) struct Served {
+    /// Body bytes the socket accepted.
+    pub written: usize,
+    /// The whole body and the closing chunk were sent.
+    pub completed: bool,
+}
+
+/// Answer one request with `head` (status line and headers, no framing
+/// header, no blank line), then a chunked body: `prefix` followed by `pad`
+/// bytes of `b' '` in 64 KiB chunks.
+///
+/// The request headers and any `Content-Length` request body are read first,
+/// so a POST client never sees its upload cut off. A write that stalls for
+/// 10 s ends the response with `completed: false` instead of hanging.
+pub(crate) fn serve_chunked(
+    head: &'static str,
+    prefix: &'static [u8],
+    pad: usize,
+) -> (SocketAddr, std::thread::JoinHandle<Served>) {
+    const CHUNK: usize = 64 * 1024;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let mut served = Served {
+            written: 0,
+            completed: false,
+        };
+        let Ok((mut stream, _)) = listener.accept() else {
+            return served;
+        };
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(10)));
+        if read_request(&mut stream).is_err() {
+            return served;
+        }
+        let head = format!("{head}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+        if stream.write_all(head.as_bytes()).is_err() {
+            return served;
+        }
+        let total = prefix.len() + pad;
+        let mut chunk = Vec::with_capacity(CHUNK + 16);
+        while served.written < total {
+            let len = CHUNK.min(total - served.written);
+            chunk.clear();
+            chunk.extend_from_slice(format!("{len:x}\r\n").as_bytes());
+            let start = served.written.min(prefix.len());
+            let end = (served.written + len).min(prefix.len());
+            chunk.extend_from_slice(&prefix[start..end]);
+            chunk.resize(chunk.len() + len - (end - start), b' ');
+            chunk.extend_from_slice(b"\r\n");
+            if stream.write_all(&chunk).is_err() {
+                return served;
+            }
+            served.written += len;
+        }
+        served.completed = stream.write_all(b"0\r\n\r\n").is_ok();
+        served
+    });
+    (addr, handle)
+}
+
+/// Read one request's headers and its `Content-Length` body, if any.
+fn read_request(stream: &mut std::net::TcpStream) -> std::io::Result<()> {
+    let mut req = Vec::new();
+    let mut buf = [0u8; 4096];
+    let header_end = loop {
+        if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        req.extend_from_slice(&buf[..n]);
+    };
+    let content_length = String::from_utf8_lossy(&req[..header_end])
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    let mut remaining = content_length.saturating_sub(req.len() - header_end);
+    while remaining > 0 {
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        remaining = remaining.saturating_sub(n);
+    }
+    Ok(())
+}
+
+/// Wait for a [`serve_chunked`] server without blocking the runtime thread:
+/// the client's connection task must keep running to close the socket.
+pub(crate) async fn served(h: std::thread::JoinHandle<Served>) -> Served {
+    tokio::task::spawn_blocking(move || h.join().unwrap())
+        .await
+        .unwrap()
 }
 
 /// Answer every request with a 302 back to its own target, so the client

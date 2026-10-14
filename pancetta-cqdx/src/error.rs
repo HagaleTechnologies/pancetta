@@ -19,6 +19,8 @@ pub enum CqdxError {
     #[error("Not configured: no PAT token provided")]
     NotConfigured,
 
+    /// The declared Content-Length, or for an undeclared length the bytes
+    /// received when reading stopped.
     #[error("Response too large: {0} bytes")]
     ResponseTooLarge(u64),
 

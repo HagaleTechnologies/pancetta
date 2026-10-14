@@ -3283,6 +3283,7 @@ dependencies = [
  "approx",
  "chrono",
  "csv",
+ "encoding_rs",
  "futures-util",
  "pancetta-core",
  "quick-xml",
