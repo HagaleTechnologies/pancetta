@@ -7,6 +7,8 @@ DRY_RUN=${DRY_RUN:-false}
 REPORT_MENTION=${REPORT_MENTION:-thagale}
 RUN_URL=${RUN_URL:-}
 RESOLVE_TOKEN=${RESOLVE_TOKEN:-}
+CHECKS_TOKEN=${CHECKS_TOKEN:-}
+GATE_CHECK='Codex review clean (gate before expensive downstream jobs)'
 for arg in "$@"; do
   case "$arg" in --dry-run) DRY_RUN=true ;; *) echo "Unknown argument: $arg" >&2; exit 2 ;; esac
 done
@@ -114,6 +116,28 @@ gather_snapshot() {
     --arg head "$head" "$dir/snapshot" > "$dest" || return 1
 }
 record_action() { printf '%s\n' "$1" >> "$WORK/actions"; }
+# Q-0068: a fresh-verdict request on a gate that already failed must reopen it first, or
+# the response job and the timeout scanner (in_progress checks only) may never touch it
+# again. PATCH the managed check-run (numeric external_id, written by hagale-agent) back to
+# in_progress; if that is refused (another app created it), create a fresh in_progress one,
+# which becomes the latest and is the one the response job concludes.
+reopen_gate() {
+  local head=$1 lookup id conclusion
+  lookup=$(gh api "repos/$REPO/commits/$head/check-runs?per_page=100" --paginate |
+    jq -cs --arg name "$GATE_CHECK" '[.[].check_runs[] | select(.name == $name) |
+      select((.external_id // "") | test("^[0-9]+$"))] | sort_by(.started_at,.id) | last // {}') || return 1
+  conclusion=$(jq -r '.conclusion // empty' <<< "$lookup")
+  [[ $conclusion == failure ]] || return 0
+  id=$(jq -r '.id // empty' <<< "$lookup")
+  if [[ -n $id ]] && GH_TOKEN="$CHECKS_TOKEN" gh api -X PATCH "repos/$REPO/check-runs/$id" \
+      -f status=in_progress -f external_id="${GITHUB_RUN_ID:-0}" >/dev/null 2>&1; then
+    record_action "reopened Codex gate check $id"
+    return 0
+  fi
+  GH_TOKEN="$CHECKS_TOKEN" gh api -X POST "repos/$REPO/check-runs" -f name="$GATE_CHECK" \
+    -f head_sha="$head" -f status=in_progress -f external_id="${GITHUB_RUN_ID:-0}" >/dev/null || return 1
+  record_action "created a fresh in_progress Codex gate check"
+}
 # Return 0 when no queue producer is running and the pause label is absent, 1 when either
 # is present, 2 when unreadable.
 arm_window_clear() {
@@ -230,13 +254,15 @@ apply() {
   # workflow definition from before the codex-review environment, and the
   # pull_request_review response path is gone). Mirrors wait-for-codex.yml's request job:
   # "@codex review" then the head_sha marker, both as the CODEX_REVIEW_PAT identity its
-  # response job trusts. The audit marker that spends the per-head budget is posted only
-  # after the request lands, so a failed request is retried on the next pass; a failed
-  # audit post at worst allows one extra request.
+  # response job trusts. A failed gate is reopened first (reopen_gate). The audit marker
+  # that spends the per-head budget is posted only after the request lands, so a failed
+  # request is retried on the next pass; a failed audit post at worst allows one extra.
   if jq -e '.request_codex_verdict' "$decision" >/dev/null; then
     [[ -n $RESOLVE_TOKEN ]] || { echo '::error::Missing CODEX_REVIEW_PAT' >&2; return 1; }
+    [[ -n $CHECKS_TOKEN ]] || { echo '::error::Missing hagale-agent check-run token' >&2; return 1; }
     refresh "$pr" "$head" || return $?
     if jq -e '.request_codex_verdict' "$WORK/live-decision" >/dev/null; then
+      reopen_gate "$head" || return 1
       GH_TOKEN="$RESOLVE_TOKEN" gh api -X POST "repos/$REPO/issues/$pr/comments" -f body="@codex review" >/dev/null || return 1
       GH_TOKEN="$RESOLVE_TOKEN" gh api -X POST "repos/$REPO/issues/$pr/comments" -f body="<!-- codex-review-request head_sha=$head -->" >/dev/null || return 1
       gh api -X POST "repos/$REPO/issues/$pr/comments" -f body="Requested a fresh Codex verdict for ${head:0:12}: every Codex thread now carries a disposition.

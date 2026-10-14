@@ -5,13 +5,14 @@ dir="$PWD/scripts/ci/research-scan-shepherd"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 export PATH="$dir/stub:$PATH" STUB_DIR="$dir/stub" REPO=example/pancetta
-export GH_TOKEN=test-workflow-token RESOLVE_TOKEN=test-user-token ONLY_PR=420
+export GH_TOKEN=test-workflow-token RESOLVE_TOKEN=test-user-token CHECKS_TOKEN=test-app-token ONLY_PR=420 GITHUB_RUN_ID=555
 export REPORT_MENTION=thagale RUN_URL=https://example.invalid/run/1
 # P replays B's data with only the re-arm marker comment failing; Q replays B with the
 # queue handler re-pausing the PR as green checks queue it. R is armed and queued past the
-# round cap.
-for scenario in A B C D E F G H I J K L M N O P Q R; do
-  export STUB_CASE=$scenario STUB_FAIL_REARM_COMMENT='' STUB_PAUSE_ON_ARM=''
+# round cap. S replays C with the gate check-run PATCH refused (created by another app).
+for scenario in A B C D E F G H I J K L M N O P Q R S; do
+  export STUB_CASE=$scenario STUB_FAIL_REARM_COMMENT='' STUB_PAUSE_ON_ARM='' STUB_FAIL_CHECK_PATCH=''
+  [[ $scenario == S ]] && export STUB_CASE=C STUB_FAIL_CHECK_PATCH=1
   [[ $scenario == P ]] && export STUB_CASE=B STUB_FAIL_REARM_COMMENT=1
   [[ $scenario == Q ]] && export STUB_CASE=B STUB_PAUSE_ON_ARM=1
   export STUB_LOG="$tmp/$scenario.log" STUB_STATE="$tmp/$scenario"
@@ -51,7 +52,10 @@ when 'C', 'M', 'N'
   request = find.call('body=@codex review')
   marker = find.call('body=<!-- codex-review-request head_sha=1a2b3c4000000000000000000000000000000000 -->')
   ci = find.call('run rerun 801 --failed')
-  raise 'refresh order' unless resolves.max < request && request < marker && marker < audit && audit < ci
+  # The stub's gate is completed/failure (check-run 3), so it is reopened first.
+  reopen = find.call('-X PATCH repos/example/pancetta/check-runs/3 -f status=in_progress -f external_id=555')
+  raise 'refresh order' unless resolves.max < reopen && reopen < request && request < marker && marker < audit && audit < ci
+  raise 'reopen identity' unless calls[reopen]['token'] == 'test-app-token'
   raise 'request identity' unless calls[request]['token'] == 'test-user-token' && calls[marker]['token'] == 'test-user-token'
   raise 'audit identity' unless calls[audit]['token'] == 'test-workflow-token'
   raise 'reran a Codex run' if calls.any? { |c| c['args'][0,2] == ['run','rerun'] && !c['args'].include?('--failed') }
@@ -100,6 +104,12 @@ when 'R'
   raise 'round-cap order' unless disarm < dequeue && dequeue < report
   raise 'armed past the round cap' if calls.any? { |c| c['args'].include?('--auto') }
   raise 'missing round-cap blocker' unless File.read(output).include?('round-cap-exceeded')
+when 'S'
+  patch = find.call('-X PATCH repos/example/pancetta/check-runs/3')
+  create = find.call('-X POST repos/example/pancetta/check-runs -f name=Codex review clean (gate before expensive downstream jobs) -f head_sha=1a2b3c4000000000000000000000000000000000 -f status=in_progress')
+  request = find.call('body=@codex review')
+  raise 'fallback order' unless patch < create && create < request
+  raise 'fallback identity' unless calls[create]['token'] == 'test-app-token'
 when 'E'
   raise 'busy mutation' unless mutations.empty?
   raise 'missing skip notice' unless File.read(output).include?('skip')
