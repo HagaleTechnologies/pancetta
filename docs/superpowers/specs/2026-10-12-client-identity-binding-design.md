@@ -153,7 +153,9 @@ Expiry:
   peers get the updated `controlState`. The station never keeps transmitting for a controller it
   can no longer send anything to.
 - A new `hello` with a fresh token restores delivery. An invalid `hello` clears the peer's
-  capability.
+  capability. A token with no `status`-or-higher scope (empty or unrecognized scopes) counts as
+  invalid. If the cleared peer is the controller, the station disarms and releases control as on
+  expiry (`hello_without_status_scope_fails_and_releases_the_armed_controller`).
 
 No frame of any kind goes to a peer without a currently-valid `status`-or-higher capability:
 no events, no `controlState`, and no `error` frames, including the "another client holds

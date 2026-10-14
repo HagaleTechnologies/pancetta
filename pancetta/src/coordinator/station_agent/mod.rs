@@ -1168,6 +1168,17 @@ fn dispatch_hello(
                 "hello capabilityToken was revoked on this station — fetch a fresh token");
             (false, clear_peer_auth(ctx, peer, now))
         }
+        Ok(cap) if cap.client_key_id == peer && !scope_at_least(&cap.scopes, "status") => {
+            // A token with no `status`-or-higher scope (empty, or only
+            // unrecognized strings) authorizes nothing the station can serve,
+            // not even outbound frames. Storing it would leave a future-dated
+            // capability that `peer_may_receive` refuses but the expiry sweep
+            // never flags, so an armed controller would stay armed while sent
+            // nothing. Treat it as a refused hello: clear, disarm, release.
+            warn!(target: "agent.control", peer = %peer, scopes = ?cap.scopes,
+                "hello capabilityToken carries no status-or-higher scope — no scope granted");
+            (false, clear_peer_auth(ctx, peer, now))
+        }
         Ok(cap) if cap.client_key_id == peer => {
             debug!(
                 target: "agent.control",
@@ -7367,6 +7378,77 @@ mod tests {
             )),
             "the updated controlState is returned for the remaining peers"
         );
+    }
+
+    /// PR #425 review: a peer-matched, otherwise-valid hello token whose scopes
+    /// hold nothing at `status` or above (empty, or only unrecognized strings)
+    /// must be a FAILED hello. Storing it would leave a future-dated
+    /// `Some(auth)` that `peer_may_receive` refuses but the expiry sweep never
+    /// flags, so an armed controller could keep heartbeating and transmitting
+    /// while the station sends it nothing. It must clear the capability,
+    /// disarm, and release control.
+    #[tokio::test]
+    async fn hello_without_status_scope_fails_and_releases_the_armed_controller() {
+        for scopes in [&[][..], &["bogus"][..]] {
+            let mut ctx = ctx_with(true, true);
+            with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
+            let bus = MessageBus::new(64).unwrap();
+            ctx.peers.insert(
+                CLIENT_KEY_ID.to_string(),
+                PeerCtx::authorized_until(vec!["tx".to_string()], NOW + 600_000),
+            );
+            dispatch_action(
+                arm_action("arm-jti-1"),
+                CLIENT_KEY_ID,
+                &mut ctx,
+                &bus,
+                SESSION_ID,
+                at(NOW),
+            )
+            .await;
+            assert!(ctx.arm.lock().unwrap().is_armed(), "setup: armed");
+            assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
+
+            let token = injected_clock_token(AGENT_KEY_ID, CLIENT_KEY_ID, scopes);
+            let out = dispatch_action(
+                ControlAction::Hello {
+                    capability_token: Some(token),
+                },
+                CLIENT_KEY_ID,
+                &mut ctx,
+                &bus,
+                SESSION_ID,
+                at(NOW),
+            )
+            .await;
+
+            assert!(
+                ctx.peers[CLIENT_KEY_ID].auth.is_none(),
+                "scopes {scopes:?}: a hello without status scope must not be stored"
+            );
+            assert!(
+                !ctx.arm.lock().unwrap().is_armed(),
+                "scopes {scopes:?}: it must disarm the controller"
+            );
+            assert_eq!(
+                ctx.controller, None,
+                "scopes {scopes:?}: and release control"
+            );
+            assert!(
+                out.sends.iter().any(|s| matches!(
+                    &s.frame,
+                    pancetta_protocol::ServerFrame::Event {
+                        event: pancetta_protocol::ServerEvent::ControlState { .. }
+                    }
+                )),
+                "scopes {scopes:?}: the updated controlState is returned for the remaining peers"
+            );
+        }
+
+        // A direct dispatch_hello reports the refusal too.
+        let mut ctx = ctx_with(true, true);
+        let token = injected_clock_token(AGENT_KEY_ID, CLIENT_KEY_ID, &[]);
+        assert!(!dispatch_hello(Some(token), CLIENT_KEY_ID, &mut ctx, NOW).0);
     }
 
     #[tokio::test]
