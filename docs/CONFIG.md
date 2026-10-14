@@ -558,8 +558,10 @@ Pancetta watches its config file for changes while it runs: the file
 given with `--config`, otherwise `~/.pancetta/pancetta.toml`. If that
 file does not exist (for example, your config lives only in one of the
 other search locations above), nothing is watched and every change
-needs a restart. A save is picked up within a few seconds. The reload
-reads the watched file alone, so keep a single config file.
+needs a restart. A save is picked up within a few seconds. Each save is
+compared with the file's previous content, so a value that came from
+another config file or a `PANCETTA_*` environment variable stays as it
+is unless you edit that key in the watched file.
 
 **Applied live — remote-access revocations (security):**
 
@@ -592,16 +594,16 @@ reads the watched file alone, so keep a single config file.
   `pairing_api_url`, `pairing_origin`, `key_dir` and `audit_log_path`.
 - Every other key: `[audio]` device names, `[rig.interface]`,
   `[station]`, `[autonomous]`, `[ui]`, upload/logging settings, …
-  Nothing outside the live list above is applied to a running process;
-  restart pancetta to enforce them. The saved value is kept in memory,
-  except that `[station].callsign`, `[station].grid_square` and
-  `[autonomous].slot_parity` are held back while a QSO is active so an
-  in-progress exchange is never contradicted.
+  Nothing outside the live list above is applied to a running process,
+  not even to its in-memory copy of the config; restart pancetta to
+  enforce them. (`[station].callsign`, `[station].grid_square` and
+  `[autonomous].slot_parity` in particular can never change under an
+  in-progress QSO.)
 
 When a reload succeeds you see a `Config reloaded` line in the TUI
-diagnostics, plus one line per security action and a line saying a
-restart is needed when other keys changed. A save that changes nothing
-shows nothing. When a reload fails (typo, schema violation), the
+diagnostics, plus one line per security action and, when other keys
+changed, `Saved changes take effect after a restart: …` naming them. A
+save that changes nothing shows nothing. When a reload fails (typo, schema violation), the
 previous config stays active and
 `Config reload failed: … — previous configuration still active` shows
 in the TUI diagnostics.

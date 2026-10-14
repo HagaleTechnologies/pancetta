@@ -85,9 +85,10 @@ pub fn panic_count() -> u64 {
 /// consult before touching anything. The wired handler
 /// (`coordinator::config_reload::ReloadApplyPlan::decide`, PAN-103) consults
 /// it for every saved edit, so it also pins down which fields are unsafe to
-/// apply to the shared config snapshot while a QSO is active. `SafeLive`
-/// means safe to put in the snapshot, not that a running component applies
-/// it: only the remote-access revocations are applied to running state.
+/// apply while a QSO is active. The handler writes only the live
+/// remote-access fields to running state, so `SafeLive` does not mean a
+/// running component applies the change: everything else is
+/// restart-required.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigReloadApplicability {
     /// Nothing changed that matters; ignore.
@@ -349,11 +350,11 @@ impl super::ApplicationCoordinator {
 
         // Configuration hot-reload (PAN-103). The watcher forwards saved edits
         // to `run_main_loop`, whose `handle_config_reload`
-        // (`coordinator/config_reload.rs`) gates every change through
-        // `classify_config_reload(...)`: C19 -- a `DeferQsoLatched` change
-        // (callsign / grid / slot parity while a QSO is active) is held back
-        // from the shared snapshot until `active_tx_qsos` is empty, and no
-        // reload path rebuilds the task-local `QsoManager` /
+        // (`coordinator/config_reload.rs`) classifies every change through
+        // `classify_config_reload(...)`. C19: only the live remote-access
+        // fields are ever written to running state, so a QSO-latched change
+        // (callsign / grid / slot parity) is refused as restart-required --
+        // no reload path rebuilds the task-local `QsoManager` /
         // `AutonomousOperator` or touches a latched partner/`tx_parity`.
         // Remote-access revocations apply live; everything else is
         // restart-required (docs/CONFIG.md "Hot reload"). A watcher that
@@ -450,7 +451,6 @@ impl super::ApplicationCoordinator {
                 }
                 _ = health_check_interval.tick() => {
                     self.check_task_handles().await;
-                    self.flush_pending_config_if_quiescent().await;
                 }
                 Some(req) = hamlib_reconnect_rx.recv() => {
                     self.handle_hamlib_reconnect_request(req).await;

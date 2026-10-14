@@ -799,10 +799,10 @@ pub struct ApplicationCoordinator {
     /// PAN-103: reload outcomes forwarded from the watcher; taken by
     /// `run_main_loop` (mirrors `hamlib_reconnect_rx`).
     config_reload_rx: Option<tokio::sync::mpsc::Receiver<config_reload::ConfigReloadOutcome>>,
-    /// PAN-103 / C19: a reloaded config whose QSO-latched fields were held
-    /// back from the shared snapshot while a QSO was active; applied by
-    /// `flush_pending_config_if_quiescent` once `active_tx_qsos` is empty.
-    pending_config: Option<Config>,
+    /// PAN-103: the watched config file's content as last loaded. Saved edits
+    /// are measured against it, not against `config` (which may also hold
+    /// values from other config files or `PANCETTA_*` environment variables).
+    config_file_baseline: Option<Config>,
 
     /// PAN-43/45 follow-up (Codex round 2 on PR #342): self-CQ attempt IDs
     /// whose dispatch failed but whose `AutonomousCqDispatchFailed`
@@ -2111,7 +2111,7 @@ impl ApplicationCoordinator {
             station_agent_live: None,
             config_reload_watcher: None,
             config_reload_rx: None,
-            pending_config: None,
+            config_file_baseline: None,
             pending_autonomous_cq_dispatch_failures: Arc::new(std::sync::Mutex::new(Vec::new())),
             pending_qso_offset_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
             pending_cq_offset_nudge: Arc::new(std::sync::atomic::AtomicBool::new(false)),

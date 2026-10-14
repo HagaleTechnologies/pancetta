@@ -46,7 +46,9 @@ PAN-103. `docs/CONFIG.md` promised that most keys hot-reload within a second, bu
 binary constructed the watcher, so every edit — including revoking a remote client — needed a
 restart. The coordinator now starts `pancetta_config::ConfigHotReload` on its `config_path` when
 that file exists, re-reads the file once a burst of watcher events settles, and hands the result to
-`run_main_loop` → `handle_config_reload` (`pancetta/src/coordinator/config_reload.rs`).
+`run_main_loop` → `handle_config_reload` (`pancetta/src/coordinator/config_reload.rs`). Each edit is
+measured against the file's previous content, not the running config, because the running config
+can also hold values from other config files and `PANCETTA_*` environment variables.
 
 - **Live, never deferred (revocation direction):** the station-agent and WSJT-X UDP consent bits
   (audited `LocalConsentChanged`), `tx_allow_list` removals (sets pruned under the arm lock, armed
@@ -59,10 +61,13 @@ that file exists, re-reads the file once a burst of watcher events settles, and 
   is unchanged.
 - **Consent off gates, it does not disarm.** Re-enabling consent re-allows an arm that is still
   inside its TTL and heartbeat window. Removing the client from `tx_allow_list` is the kill path.
-- **Restart-required, said in a diagnostic:** allow-list additions, `enabled = true`, the agent's
-  transport/identity fields, and every other key. The shared snapshot does take the new values
-  (through `classify_config_reload`; C19 latched fields are held back while a QSO is active and
-  flushed on the health tick), but no running component re-reads them until a restart.
+- **Restart-required, said in a diagnostic naming the keys:** allow-list additions,
+  `enabled = true`, the agent's transport/identity fields, and every other key. Only the applied
+  remote-access fields are written into the shared `config` snapshot. Writing the whole reloaded
+  config there was rejected: running code reads that snapshot (the shutdown PTT-off safety net reads
+  `rig.interface.enabled`), so a restart-required key would be half-applied. Every edit still goes
+  through `classify_config_reload`; C19-latched fields are never written, so they cannot clobber a
+  QSO.
 - **cqdx-integrated stations:** the authorization poll stays authoritative; a TOML removal is
   evicted at once but a later poll re-admits an edge cqdx still returns.
 - The PAN-59 decision above (live rig switch via a TUI command rather than the watcher) stands; the

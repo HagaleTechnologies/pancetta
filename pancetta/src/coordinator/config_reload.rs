@@ -12,11 +12,19 @@
 //!   The TX worker's key-time and per-chunk playback re-checks then refuse
 //!   queued remote frames and stop a transmission in progress.
 //! - **Grant-direction security edits and every other key are
-//!   restart-required.** The handler says so in a diagnostic line.
-//! - The shared config snapshot is replaced through the C19 classifier
-//!   ([`classify_config_reload`]): a QSO-latched field (callsign, grid, slot
-//!   parity) is held back while a QSO is active and applied once the band is
-//!   quiet.
+//!   restart-required.** The handler says so in a diagnostic line naming the
+//!   keys. Only the live remote-access fields are written into the shared
+//!   config snapshot: other code reads that snapshot while running (e.g. the
+//!   shutdown PTT-off safety net reads `rig.interface.enabled`), so writing a
+//!   restart-required key into it would half-apply that key.
+//! - Changes are measured between the previous and the new content of the
+//!   watched file, not against the running config, so a value that came from
+//!   another config file or a `PANCETTA_*` environment variable at startup is
+//!   never overridden unless that very key is edited in the watched file.
+//! - C19: every reload is classified by [`classify_config_reload`]. A
+//!   QSO-latched field (callsign, grid, slot parity) is never written to the
+//!   running state at all — it is restart-required — so no reload can clobber
+//!   an in-progress QSO.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -57,10 +65,23 @@ pub(crate) const MSG_STATION_AGENT_DISABLED: &str =
     "station_agent disabled — remote sessions closed and remote TX disarmed";
 pub(crate) const MSG_STATION_AGENT_ENABLED: &str =
     "station_agent enabled — restart required before it takes effect";
-pub(crate) const MSG_DEFERRED: &str =
-    "Config change deferred while a QSO is active — applied when the band goes quiet";
-pub(crate) const MSG_OTHER_KEYS_RESTART: &str =
-    "Config changes outside the remote-access settings take effect after a restart";
+/// Prefix of the line listing saved keys that need a restart.
+pub(crate) const MSG_RESTART_REQUIRED_PREFIX: &str = "Saved changes take effect after a restart:";
+/// At most this many key names are listed in that line.
+const RESTART_KEYS_LISTED: usize = 6;
+
+/// The station-agent fields [`SecurityConfigDiff`] covers. Changes to them are
+/// reported by the security lines, never by the generic restart line.
+const STATION_AGENT_SECURITY_KEYS: [&str; 8] = [
+    "network.station_agent.remote_tx_enabled",
+    "network.station_agent.tx_allow_list",
+    "network.station_agent.enabled",
+    "network.station_agent.relay_url",
+    "network.station_agent.pairing_api_url",
+    "network.station_agent.pairing_origin",
+    "network.station_agent.key_dir",
+    "network.station_agent.audit_log_path",
+];
 
 /// The remote-access settings that changed between two configs, by
 /// direction. Revocations are applied live; grants and transport/identity
@@ -146,80 +167,139 @@ fn wsjtx_consent(config: &Config) -> bool {
 /// What happens to the shared config snapshot (`ApplicationCoordinator::config`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotAction {
-    /// Replace the snapshot with the reloaded config.
-    Replace,
-    /// C19: a QSO-latched field changed while a QSO is active. Store the
-    /// reloaded config with the latched fields kept at their running values
-    /// and apply the rest once no QSO is active.
-    Defer,
-    /// Nothing changed; leave the snapshot alone.
+    /// Write the applied remote-access fields into the snapshot (see
+    /// [`patch_live_security_fields`]); nothing else in it changes.
+    PatchSecurity,
+    /// No remote-access field changed; leave the snapshot alone.
     Keep,
 }
 
-/// One decision for one reload: the security actions to apply now (never
-/// deferred) and what to do with the shared snapshot.
+/// One decision for one saved edit: the security actions to apply now (never
+/// deferred) and the keys that need a restart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReloadApplyPlan {
-    /// Remote-access changes. Applied immediately, even when the snapshot
-    /// is deferred: a revocation never waits for a QSO to end.
-    pub security: SecurityConfigDiff,
-    /// What happens to the shared snapshot, from [`classify_config_reload`].
+    /// Remote-access changes. Applied immediately, even while a QSO is
+    /// active: a revocation never waits.
+    pub apply_security: SecurityConfigDiff,
+    /// What happens to the shared snapshot.
     pub snapshot: SnapshotAction,
-    /// The C19 classification the snapshot action came from.
+    /// C19 classification of the edit. A QSO-latched change is never
+    /// applied to running state (it appears in `restart_required_keys`), so
+    /// `DeferQsoLatched` can never clobber an in-progress QSO.
     pub applicability: ConfigReloadApplicability,
-    /// Keys outside the live remote-access settings changed. They are
-    /// restart-required.
-    pub other_keys_changed: bool,
+    /// Dotted names of the changed keys outside the remote-access settings,
+    /// sorted. All restart-required.
+    pub restart_required_keys: Vec<String>,
 }
 
 impl ReloadApplyPlan {
-    /// Decide how to apply `new` over the running `old`, given whether a QSO
-    /// is active.
+    /// Decide how to apply a saved edit, from the watched file's previous
+    /// content `old` and its new content `new`, given whether a QSO is
+    /// active.
     pub fn decide(old: &Config, new: &Config, qso_active: bool) -> Self {
         let applicability = classify_config_reload(old, new, qso_active);
-        let snapshot = match applicability {
-            ConfigReloadApplicability::NoChange => SnapshotAction::Keep,
-            ConfigReloadApplicability::DeferQsoLatched => SnapshotAction::Defer,
-            ConfigReloadApplicability::SafeLive | ConfigReloadApplicability::SafeQuiescent => {
-                SnapshotAction::Replace
-            }
+        let apply_security = SecurityConfigDiff::diff(old, new);
+        let snapshot = if apply_security.is_empty() {
+            SnapshotAction::Keep
+        } else {
+            SnapshotAction::PatchSecurity
         };
-        let other_keys_changed = snapshot != SnapshotAction::Keep && {
-            let mut normalized = new.clone();
-            let n = &mut normalized.network.station_agent;
-            let o = &old.network.station_agent;
-            n.remote_tx_enabled = o.remote_tx_enabled;
-            n.tx_allow_list = o.tx_allow_list.clone();
-            n.enabled = o.enabled;
-            n.relay_url = o.relay_url.clone();
-            n.pairing_api_url = o.pairing_api_url.clone();
-            n.pairing_origin = o.pairing_origin.clone();
-            n.key_dir = o.key_dir.clone();
-            n.audit_log_path = o.audit_log_path.clone();
-            normalized.network.wsjtx_udp.allow_tx_initiation =
-                old.network.wsjtx_udp.allow_tx_initiation;
-            !matches!(
-                (toml::to_string(old), toml::to_string(&normalized)),
-                (Ok(a), Ok(b)) if a == b
-            )
+        let restart_required_keys = if applicability == ConfigReloadApplicability::NoChange {
+            Vec::new()
+        } else {
+            changed_keys(old, new)
+                .into_iter()
+                .filter(|k| !is_security_key(k))
+                .collect()
         };
         Self {
-            security: SecurityConfigDiff::diff(old, new),
+            apply_security,
             snapshot,
             applicability,
-            other_keys_changed,
+            restart_required_keys,
         }
     }
 }
 
-/// `new` with the C19 QSO-latched fields kept at `running`'s values — what
-/// the shared snapshot holds while a latched change is deferred.
-pub(crate) fn with_latched_fields_from(new: &Config, running: &Config) -> Config {
-    let mut merged = new.clone();
-    merged.station.callsign = running.station.callsign.clone();
-    merged.station.grid_square = running.station.grid_square.clone();
-    merged.autonomous.slot_parity = running.autonomous.slot_parity.clone();
-    merged
+/// Whether a dotted key is covered by [`SecurityConfigDiff`] (and so has its
+/// own diagnostic line rather than the generic restart line).
+fn is_security_key(key: &str) -> bool {
+    STATION_AGENT_SECURITY_KEYS
+        .iter()
+        .any(|k| key == *k || key.starts_with(&format!("{k}.")))
+        || key == "network.wsjtx_udp.allow_tx_initiation"
+}
+
+/// The dotted names of every leaf value that differs between `a` and `b`
+/// (arrays compare whole), sorted. Empty when either side fails to serialize.
+pub(crate) fn changed_keys(a: &Config, b: &Config) -> Vec<String> {
+    let (Ok(a), Ok(b)) = (toml::Value::try_from(a), toml::Value::try_from(b)) else {
+        return Vec::new();
+    };
+    let mut fa = std::collections::BTreeMap::new();
+    let mut fb = std::collections::BTreeMap::new();
+    flatten_toml("", &a, &mut fa);
+    flatten_toml("", &b, &mut fb);
+    let mut keys: Vec<String> = fa
+        .keys()
+        .chain(fb.keys())
+        .filter(|k| fa.get(*k) != fb.get(*k))
+        .cloned()
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn flatten_toml(
+    prefix: &str,
+    value: &toml::Value,
+    out: &mut std::collections::BTreeMap<String, toml::Value>,
+) {
+    match value {
+        toml::Value::Table(table) => {
+            for (k, v) in table {
+                let key = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{prefix}.{k}")
+                };
+                flatten_toml(&key, v, out);
+            }
+        }
+        leaf => {
+            out.insert(prefix.to_string(), leaf.clone());
+        }
+    }
+}
+
+/// Write what [`ApplicationCoordinator::apply_security_config`] applies into
+/// the running config snapshot, and nothing more: consent values, the
+/// allow-list minus removed entries (additions are restart-required), and
+/// `station_agent.enabled = false`. A component the supervisor restarts then
+/// comes back with the same remote-access state the running station has.
+pub(crate) fn patch_live_security_fields(
+    running: &mut Config,
+    diff: &SecurityConfigDiff,
+    new: &Config,
+) {
+    if let Some(on) = diff.station_agent_consent {
+        running.network.station_agent.remote_tx_enabled = on;
+    }
+    if diff.wsjtx_consent.is_some() {
+        running.network.wsjtx_udp.allow_tx_initiation = new.network.wsjtx_udp.allow_tx_initiation;
+        running.network.wsjtx_udp.enabled = new.network.wsjtx_udp.enabled;
+    }
+    if !diff.allow_list_removed.is_empty() {
+        running
+            .network
+            .station_agent
+            .tx_allow_list
+            .retain(|k| !diff.allow_list_removed.contains(k));
+    }
+    if diff.station_agent_disabled {
+        running.network.station_agent.enabled = false;
+    }
 }
 
 /// Load and validate `path` the way the watcher does.
@@ -302,8 +382,22 @@ impl super::ApplicationCoordinator {
             );
             return Ok(());
         }
-        let initial = self.config.read().await.clone();
-        let (mut watcher, events) = match ConfigHotReload::new(initial, &self.config_path) {
+        // The file's own content is the baseline edits are measured from:
+        // the running config may also hold values from other config files or
+        // `PANCETTA_*` environment variables (see the module doc).
+        let path = self.config_path.clone();
+        let baseline = match tokio::task::spawn_blocking(move || load_config_for_reload(&path))
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()))
+        {
+            Ok(config) => config,
+            Err(e) => {
+                info!("Config hot reload not started: {e}");
+                return Ok(());
+            }
+        };
+        let (mut watcher, events) = match ConfigHotReload::new(baseline.clone(), &self.config_path)
+        {
             Ok(pair) => pair,
             Err(e) => {
                 info!("Config hot reload not started: {e}");
@@ -323,6 +417,7 @@ impl super::ApplicationCoordinator {
         ));
         self.config_reload_watcher = Some(watcher);
         self.config_reload_rx = Some(rx);
+        self.config_file_baseline = Some(baseline);
         info!(
             "Watching {} for config changes (remote-access revocations apply live)",
             self.config_path.display()
@@ -339,9 +434,9 @@ impl super::ApplicationCoordinator {
             .unwrap_or(true)
     }
 
-    /// Apply one reload outcome: security changes first-class and never
-    /// deferred, the snapshot through C19, then one diagnostic line per
-    /// action.
+    /// Apply one reload outcome: the remote-access changes now (never
+    /// deferred), every other changed key reported as restart-required, then
+    /// one diagnostic line per action.
     pub(crate) async fn handle_config_reload(&mut self, outcome: ConfigReloadOutcome) {
         let new = match outcome {
             Ok(config) => config,
@@ -355,49 +450,63 @@ impl super::ApplicationCoordinator {
                 return;
             }
         };
-        let old = self.config.read().await.clone();
+        // Measure the edit against the file's previous content; without a
+        // baseline (watcher not started) fall back to the running config.
+        let old = match self.config_file_baseline.take() {
+            Some(baseline) => baseline,
+            None => self.config.read().await.clone(),
+        };
         let plan = ReloadApplyPlan::decide(&old, &new, self.config_reload_qso_active());
-        if plan.snapshot == SnapshotAction::Keep && plan.security.is_empty() {
+        if plan.applicability == ConfigReloadApplicability::NoChange
+            && plan.apply_security.is_empty()
+        {
+            self.config_file_baseline = Some(new);
             debug!("Config file event with no content change — nothing to apply");
             return;
         }
 
-        // The snapshot is written before the security actions: disabling the
+        // A key already holding the saved value in the running config was
+        // applied by the action that saved it (e.g. the TUI device picker
+        // persists after applying live); it needs no restart.
+        let restart_keys: Vec<String> = {
+            let running = self.config.read().await;
+            let not_yet_running = changed_keys(&running, &new);
+            plan.restart_required_keys
+                .iter()
+                .filter(|k| not_yet_running.contains(k))
+                .cloned()
+                .collect()
+        };
+
+        // The snapshot is patched before the security actions: disabling the
         // station agent restarts it, and the restart re-reads this snapshot.
-        match plan.snapshot {
-            SnapshotAction::Replace => {
-                *self.config.write().await = new;
-                self.pending_config = None;
-            }
-            SnapshotAction::Defer => {
-                *self.config.write().await = with_latched_fields_from(&new, &old);
-                self.pending_config = Some(new);
-            }
-            SnapshotAction::Keep => {}
+        if plan.snapshot == SnapshotAction::PatchSecurity {
+            patch_live_security_fields(&mut *self.config.write().await, &plan.apply_security, &new);
         }
         info!(?plan.applicability, "Config reloaded");
 
         let mut lines = vec![(DiagnosticLevel::Info, MSG_RELOADED.to_string())];
-        lines.extend(self.apply_security_config(&plan.security).await);
-        if plan.snapshot == SnapshotAction::Defer {
-            lines.push((DiagnosticLevel::Info, MSG_DEFERRED.to_string()));
+        lines.extend(self.apply_security_config(&plan.apply_security).await);
+        if !restart_keys.is_empty() {
+            let mut listed = restart_keys
+                .iter()
+                .take(RESTART_KEYS_LISTED)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            if restart_keys.len() > RESTART_KEYS_LISTED {
+                listed.push_str(&format!(
+                    " (+{} more)",
+                    restart_keys.len() - RESTART_KEYS_LISTED
+                ));
+            }
+            lines.push((
+                DiagnosticLevel::Warn,
+                format!("{MSG_RESTART_REQUIRED_PREFIX} {listed}"),
+            ));
         }
-        if plan.other_keys_changed {
-            lines.push((DiagnosticLevel::Warn, MSG_OTHER_KEYS_RESTART.to_string()));
-        }
+        self.config_file_baseline = Some(new);
         self.emit_config_reload_lines(lines).await;
-    }
-
-    /// Apply a held-back (C19) reload once no QSO is active. Called from the
-    /// main loop's periodic health tick.
-    pub(crate) async fn flush_pending_config_if_quiescent(&mut self) {
-        if self.pending_config.is_none() || self.config_reload_qso_active() {
-            return;
-        }
-        if let Some(pending) = self.pending_config.take() {
-            info!("Applying deferred config change (no QSO active)");
-            self.handle_config_reload(Ok(pending)).await;
-        }
     }
 
     /// Make the running station enforce `diff`'s revocations, and report the
@@ -695,73 +804,102 @@ mod tests {
     // --- ReloadApplyPlan -----------------------------------------------------
 
     #[test]
-    fn decide_defers_latched_snapshot_but_never_the_revocation() {
+    fn decide_never_defers_the_revocation_and_reports_latched_fields_restart_required() {
         let old = base();
         let mut new = old.clone();
         new.station.callsign = "K9NEW".to_string();
         new.network.station_agent.remote_tx_enabled = false;
         let plan = ReloadApplyPlan::decide(&old, &new, true);
-        assert_eq!(plan.snapshot, SnapshotAction::Defer);
         assert_eq!(
             plan.applicability,
             ConfigReloadApplicability::DeferQsoLatched
         );
-        assert_eq!(plan.security.station_agent_consent, Some(false));
+        assert_eq!(plan.snapshot, SnapshotAction::PatchSecurity);
+        assert_eq!(plan.apply_security.station_agent_consent, Some(false));
+        assert_eq!(plan.restart_required_keys, vec!["station.callsign"]);
     }
 
     #[test]
-    fn decide_replaces_on_safe_live_and_safe_quiescent() {
+    fn decide_reports_non_security_keys_and_keeps_the_snapshot() {
         let old = base();
         let mut ui = old.clone();
         ui.ui.theme = format!("{}-x", old.ui.theme);
+        ui.rig.interface.enabled = !old.rig.interface.enabled;
         let plan = ReloadApplyPlan::decide(&old, &ui, true);
-        assert_eq!(plan.snapshot, SnapshotAction::Replace);
-        assert!(plan.other_keys_changed);
-        assert!(plan.security.is_empty());
+        assert_eq!(plan.applicability, ConfigReloadApplicability::SafeLive);
+        assert_eq!(plan.snapshot, SnapshotAction::Keep);
+        assert_eq!(
+            plan.restart_required_keys,
+            vec!["rig.interface.enabled", "ui.theme"]
+        );
+        assert!(plan.apply_security.is_empty());
 
         let mut call = old.clone();
         call.station.callsign = "K9NEW".to_string();
         let plan = ReloadApplyPlan::decide(&old, &call, false);
         assert_eq!(plan.applicability, ConfigReloadApplicability::SafeQuiescent);
-        assert_eq!(plan.snapshot, SnapshotAction::Replace);
+        assert_eq!(plan.snapshot, SnapshotAction::Keep);
+        assert_eq!(plan.restart_required_keys, vec!["station.callsign"]);
     }
 
     #[test]
-    fn decide_security_only_edit_reports_no_other_keys() {
+    fn decide_security_only_edit_lists_no_restart_keys() {
         let old = base();
         let mut new = old.clone();
         new.network.station_agent.remote_tx_enabled = false;
         new.network.station_agent.tx_allow_list = vec!["B".to_string()];
+        new.network.station_agent.relay_url = Some("wss://relay.example".to_string());
+        new.network.wsjtx_udp.allow_tx_initiation = !old.network.wsjtx_udp.allow_tx_initiation;
         let plan = ReloadApplyPlan::decide(&old, &new, false);
-        assert_eq!(plan.snapshot, SnapshotAction::Replace);
-        assert!(!plan.other_keys_changed);
+        assert_eq!(plan.snapshot, SnapshotAction::PatchSecurity);
+        assert!(
+            plan.restart_required_keys.is_empty(),
+            "{:?}",
+            plan.restart_required_keys
+        );
     }
 
     #[test]
     fn decide_identical_config_is_a_no_op() {
         let old = base();
         let plan = ReloadApplyPlan::decide(&old, &old.clone(), true);
+        assert_eq!(plan.applicability, ConfigReloadApplicability::NoChange);
         assert_eq!(plan.snapshot, SnapshotAction::Keep);
-        assert!(plan.security.is_empty());
-        assert!(!plan.other_keys_changed);
+        assert!(plan.apply_security.is_empty());
+        assert!(plan.restart_required_keys.is_empty());
     }
 
     #[test]
-    fn with_latched_fields_keeps_only_the_running_latched_values() {
-        let running = base();
+    fn patch_writes_only_the_applied_security_fields() {
+        let mut running = base();
+        running.network.station_agent.enabled = true;
         let mut new = running.clone();
         new.station.callsign = "K9NEW".to_string();
-        new.station.grid_square = "EM10".to_string();
-        new.autonomous.slot_parity = SlotParitySetting::Odd;
+        new.rig.interface.enabled = !running.rig.interface.enabled;
         new.network.station_agent.remote_tx_enabled = false;
-        let merged = with_latched_fields_from(&new, &running);
-        assert_eq!(merged.station.callsign, running.station.callsign);
-        assert_eq!(merged.station.grid_square, running.station.grid_square);
+        new.network.station_agent.tx_allow_list = vec!["B".to_string(), "C".to_string()];
+        new.network.station_agent.enabled = false;
+        let diff = SecurityConfigDiff::diff(&running, &new);
+        let before_rig = running.rig.interface.enabled;
+        let before_call = running.station.callsign.clone();
+        patch_live_security_fields(&mut running, &diff, &new);
+        assert!(!running.network.station_agent.remote_tx_enabled);
         assert_eq!(
-            merged.autonomous.slot_parity,
-            running.autonomous.slot_parity
+            running.network.station_agent.tx_allow_list,
+            vec!["B".to_string()],
+            "removal applied, addition not"
         );
-        assert!(!merged.network.station_agent.remote_tx_enabled);
+        assert!(!running.network.station_agent.enabled);
+        assert_eq!(running.rig.interface.enabled, before_rig);
+        assert_eq!(running.station.callsign, before_call);
+
+        // Enabling is restart-required: never written.
+        let mut off = base();
+        let mut on = off.clone();
+        on.network.station_agent.enabled = true;
+        let diff = SecurityConfigDiff::diff(&off, &on);
+        patch_live_security_fields(&mut off, &diff, &on);
+        assert!(!off.network.station_agent.enabled);
     }
 
     // --- classify_config_reload (C19; first direct tests) -------------------
@@ -899,21 +1037,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reload_with_a_live_safe_change_replaces_the_snapshot_and_reports_it() {
+    async fn reload_with_a_non_security_change_keeps_running_config_and_says_restart() {
         let mut coordinator = test_coordinator(base()).await;
         let rx = tui_rx(&coordinator).await;
+        let before = toml::to_string(&*coordinator.config.read().await).unwrap();
+        let ptt_off_before = coordinator.wants_direct_rigctld_ptt_off().await;
         let mut new = coordinator.config.read().await.clone();
         new.ui.theme = format!("{}-x", new.ui.theme);
-        coordinator.handle_config_reload(Ok(new.clone())).await;
+        new.rig.interface.enabled = !new.rig.interface.enabled;
+        coordinator.handle_config_reload(Ok(new)).await;
 
-        assert_eq!(coordinator.config.read().await.ui.theme, new.ui.theme);
+        assert_eq!(
+            toml::to_string(&*coordinator.config.read().await).unwrap(),
+            before,
+            "a restart-required key is never half-applied"
+        );
+        assert_eq!(
+            coordinator.wants_direct_rigctld_ptt_off().await,
+            ptt_off_before
+        );
         let lines = diagnostics(&rx);
         assert_eq!(
             lines.iter().filter(|(_, t)| t == MSG_RELOADED).count(),
             1,
             "{lines:?}"
         );
-        assert!(texts(&lines).contains(&MSG_OTHER_KEYS_RESTART));
+        assert!(texts(&lines).contains(
+            &"Saved changes take effect after a restart: rig.interface.enabled, ui.theme"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_key_the_tui_already_applied_is_not_reported_as_restart_required() {
+        let mut coordinator = test_coordinator(base()).await;
+        let rx = tui_rx(&coordinator).await;
+        let mut new = coordinator.config.read().await.clone();
+        new.audio.output_device = "Picked In TUI".to_string();
+        // What `TuiCommand::SelectDevice` does: apply live, then persist.
+        coordinator.config.write().await.audio.output_device = "Picked In TUI".to_string();
+        coordinator.handle_config_reload(Ok(new)).await;
+        let lines = diagnostics(&rx);
+        assert!(
+            !lines
+                .iter()
+                .any(|(_, t)| t.starts_with(MSG_RESTART_REQUIRED_PREFIX)),
+            "{lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edits_are_measured_against_the_file_not_values_from_other_sources() {
+        // Running config: consent OFF (e.g. from another config file); the
+        // watched file has said `true` all along.
+        let mut running = base();
+        running.network.station_agent.remote_tx_enabled = false;
+        let mut coordinator = test_coordinator(running).await;
+        let mut file = coordinator.config.read().await.clone();
+        file.network.station_agent.remote_tx_enabled = true;
+        coordinator.config_file_baseline = Some(file.clone());
+
+        // An unrelated save must not turn consent on.
+        let mut saved = file.clone();
+        saved.ui.theme = format!("{}-x", saved.ui.theme);
+        coordinator.handle_config_reload(Ok(saved.clone())).await;
+        assert!(!coordinator
+            .remote_tx_arm
+            .lock()
+            .unwrap()
+            .channel_consent(ConsentChannel::StationAgent));
+        assert!(
+            !coordinator
+                .config
+                .read()
+                .await
+                .network
+                .station_agent
+                .remote_tx_enabled
+        );
+        assert_eq!(
+            coordinator.config_file_baseline.as_ref().unwrap().ui.theme,
+            saved.ui.theme,
+            "the baseline follows the file"
+        );
     }
 
     #[tokio::test]
@@ -944,7 +1149,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn latched_change_is_deferred_while_a_qso_is_active_then_flushed() {
+    async fn latched_change_is_never_applied_but_a_revocation_in_the_same_save_is() {
         let mut coordinator = test_coordinator(base()).await;
         let running_call = coordinator.config.read().await.station.callsign.clone();
         coordinator
@@ -956,15 +1161,15 @@ mod tests {
         let mut new = coordinator.config.read().await.clone();
         new.station.callsign = "K9NEW".to_string();
         new.network.station_agent.remote_tx_enabled = false;
-        coordinator.handle_config_reload(Ok(new)).await;
+        coordinator.handle_config_reload(Ok(new.clone())).await;
 
         {
             let cfg = coordinator.config.read().await;
-            assert_eq!(cfg.station.callsign, running_call, "latched field held");
-            assert!(
-                !cfg.network.station_agent.remote_tx_enabled,
-                "the rest of the edit is in the snapshot"
+            assert_eq!(
+                cfg.station.callsign, running_call,
+                "C19: latched field untouched"
             );
+            assert!(!cfg.network.station_agent.remote_tx_enabled);
         }
         assert!(
             !coordinator
@@ -975,20 +1180,18 @@ mod tests {
             "the revocation was not deferred"
         );
         let lines = diagnostics(&rx);
-        assert!(texts(&lines).contains(&MSG_DEFERRED), "{lines:?}");
-        assert!(coordinator.pending_config.is_some());
+        assert!(
+            texts(&lines).contains(&"Saved changes take effect after a restart: station.callsign"),
+            "{lines:?}"
+        );
 
-        // Still active: the flush does nothing.
-        coordinator.flush_pending_config_if_quiescent().await;
+        // Nor once the QSO ends: the callsign needs a restart.
+        coordinator.active_tx_qsos.write().unwrap().clear();
+        coordinator.handle_config_reload(Ok(new)).await;
         assert_eq!(
             coordinator.config.read().await.station.callsign,
             running_call
         );
-
-        coordinator.active_tx_qsos.write().unwrap().clear();
-        coordinator.flush_pending_config_if_quiescent().await;
-        assert_eq!(coordinator.config.read().await.station.callsign, "K9NEW");
-        assert!(coordinator.pending_config.is_none());
     }
 
     #[tokio::test]
@@ -1015,7 +1218,12 @@ mod tests {
             texts(&lines).contains(&MSG_STATION_AGENT_CONSENT_OFF),
             "{lines:?}"
         );
-        assert!(!texts(&lines).contains(&MSG_OTHER_KEYS_RESTART));
+        assert!(
+            !lines
+                .iter()
+                .any(|(_, t)| t.starts_with(MSG_RESTART_REQUIRED_PREFIX)),
+            "{lines:?}"
+        );
         let audit = std::fs::read_to_string(coordinator.audit_log().path()).unwrap();
         assert!(
             audit.contains("local consent station_agent=false"),
@@ -1050,6 +1258,18 @@ mod tests {
             .unwrap()
             .channel_consent(ConsentChannel::WsjtxUdp));
         assert!(texts(&diagnostics(&rx)).contains(&MSG_WSJTX_CONSENT_OFF));
+
+        let mut on = coordinator.config.read().await.clone();
+        on.network.wsjtx_udp.allow_tx_initiation = true;
+        coordinator.handle_config_reload(Ok(on)).await;
+        assert!(coordinator
+            .remote_tx_arm
+            .lock()
+            .unwrap()
+            .channel_consent(ConsentChannel::WsjtxUdp));
+        assert!(texts(&diagnostics(&rx)).contains(&MSG_WSJTX_CONSENT_ON));
+        let audit = std::fs::read_to_string(coordinator.audit_log().path()).unwrap();
+        assert!(audit.contains("local consent wsjtx_udp=false"), "{audit}");
     }
 
     #[tokio::test]
@@ -1124,6 +1344,18 @@ mod tests {
     #[tokio::test]
     async fn allow_list_addition_and_transport_change_are_restart_required() {
         let mut coordinator = test_coordinator(base()).await;
+        let live = crate::coordinator::station_agent::StationAgentLiveHandles {
+            tx_allow_list: Arc::new(std::sync::RwLock::new(
+                ["A".to_string(), "B".to_string()].into_iter().collect(),
+            )),
+            tx_arm_allow_list: Arc::new(std::sync::RwLock::new(
+                ["A".to_string(), "B".to_string()].into_iter().collect(),
+            )),
+            client_keys: Default::default(),
+            revocation_pending: Default::default(),
+            authz_generation: Default::default(),
+        };
+        coordinator.station_agent_live = Some(live.clone());
         let rx = tui_rx(&coordinator).await;
         let mut new = coordinator.config.read().await.clone();
         new.network
@@ -1137,6 +1369,16 @@ mod tests {
         assert!(t.contains(&MSG_ALLOW_LIST_ADDED), "{lines:?}");
         assert!(
             t.contains(&"station_agent transport settings changed (relay_url) — restart required")
+        );
+        assert!(
+            !live.tx_allow_list.read().unwrap().contains("C"),
+            "an addition is not applied live"
+        );
+        assert_eq!(live.tx_allow_list.read().unwrap().len(), 2);
+        assert_eq!(
+            live.authz_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
         );
     }
 
@@ -1200,6 +1442,8 @@ mod tests {
             "only the inert drain task remains"
         );
         assert!(texts(&diagnostics(&rx)).contains(&MSG_STATION_AGENT_DISABLED));
+        let audit = std::fs::read_to_string(coordinator.audit_log().path()).unwrap();
+        assert!(audit.contains("disarmed:"), "disarm audited: {audit}");
 
         coordinator.check_task_handles().await;
         let status = coordinator.component_status.read().await;
