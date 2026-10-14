@@ -632,16 +632,7 @@ compared with the file's previous content, so a value that came from
 another config file or a `PANCETTA_*` environment variable stays as it
 is unless you edit that key in the watched file.
 
-<<<<<<< HEAD
 **Applied live — remote-access revocations (security):**
-=======
-- `[audio]` device names — require a TUI restart (cpal streams are bound
-  at startup).
-- `[rig.interface]` — same; rigctld is spawned once.
-- `[network.remote_gateway]` changes take effect on restart.
-- `[station].callsign` — never hot-reloaded (active QSOs would mid-flight
-  contradict their own metadata).
->>>>>>> 469e869cb5ea07accbf682702f72303cc0920848
 
 - `[network.station_agent].remote_tx_enabled` — the station-agent
   channel's local consent. Setting it to `false` immediately refuses all
@@ -670,6 +661,10 @@ is unless you edit that key in the watched file.
 - Adding a `tx_allow_list` entry, `station_agent.enabled = true` on a
   disabled station, and the station agent's `relay_url`,
   `pairing_api_url`, `pairing_origin`, `key_dir` and `audit_log_path`.
+- `[network.remote_gateway]` changes take effect on restart, including
+  `auth_token` and `allowed_origins`: until pancetta restarts, the
+  running gateway still accepts the old token and origins and keeps
+  clients that are already connected.
 - Every other key: `[audio]` device names, `[rig.interface]`,
   `[station]`, `[autonomous]`, `[ui]`, upload/logging settings, …
   Nothing outside the live list above is applied to a running process,
