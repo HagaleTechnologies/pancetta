@@ -4538,9 +4538,14 @@ pub fn parse_mhz_to_hz(s: &str) -> Option<u64> {
 ///    `Band::from_frequency_for_region`. An invalid region number (not 1/2/3)
 ///    falls back to the original global-table behavior
 ///    (`Band::from_frequency`), matching this function's pre-region-awareness
-///    behavior exactly.
+/// behavior exactly.
 ///
-/// This stays a soft, once-per-session warning — never a hard TX block.
+/// Contract for both callers: the TUI's manual frequency-entry modal
+/// treats `true` as grounds for its once-per-session dismissable
+/// warning; since PAN-118 the coordinator's TX gate
+/// (`tx::tx_band_plan_mute_reason`) also treats `true` as grounds for
+/// refusing TX before PTT is asserted, so this boolean is now
+/// load-bearing for hard TX safety, not display only.
 pub fn tx_rf_out_of_band_plan(tx_rf_hz: u64, band_plan: &pancetta_config::BandPlanConfig) -> bool {
     if !band_plan.edge_warnings {
         return false;

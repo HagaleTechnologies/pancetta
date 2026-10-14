@@ -44,8 +44,8 @@ pub(crate) mod wsjtx_udp;
 
 pub use tx::{
     coalesce_transmit_requests, coalesce_transmit_requests_with_fox_priority, remote_tx_permitted,
-    remote_tx_permitted_for, resolve_required_parity, schedule_tx, CoalesceEntry, CoalesceOutcome,
-    TxSchedule,
+    remote_tx_permitted_for, resolve_required_parity, schedule_tx, tx_band_plan_mute_reason,
+    tx_rf_for_gate, CoalesceEntry, CoalesceOutcome, TxSchedule,
 };
 
 pub use qso::compute_manual_tx_offset;

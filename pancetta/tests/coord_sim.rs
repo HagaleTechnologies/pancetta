@@ -71,8 +71,8 @@ use pancetta_config::OperatingMode;
 use pancetta_hamlib::{MockRig, PttState, RigControl, Vfo};
 use pancetta_lib::coordinator::{
     active_tx_qso_key, coalesce_transmit_requests, compute_manual_tx_offset,
-    remote_tx_permitted_for, try_switch_operating_mode, tx_qso_is_live, CoalesceEntry,
-    ModeSwitchError,
+    remote_tx_permitted_for, try_switch_operating_mode, tx_band_plan_mute_reason, tx_qso_is_live,
+    tx_rf_for_gate, CoalesceEntry, ModeSwitchError,
 };
 use pancetta_lib::message_bus::{
     ComponentId, ComponentMessage, MessageBus, MessageType, RigControlMessage,
@@ -127,12 +127,16 @@ pub enum DropReason {
     /// The request's QSO was not in `active_tx_qsos` (superseded / cancelled /
     /// completed-past-grace), so the Step 4b gate dropped it.
     StaleQso,
-    /// The request was superseded by a newer one for the same QSO during
+    /// The request was superseded a newer one for the same QSO during
     /// backlog coalescing (older keep-call frame).
     CoalescedAway,
     /// A `TxOrigin::Remote` request that the station-agent arm gate did not
     /// permit (unarmed / no local consent / expired / etc.) — fail-closed drop.
     RemoteNotArmed,
+    /// PAN-118: the item's absolute TX RF (effective split-aware dial + audio
+    /// offset) fell outside the configured amateur band plan — refused before
+    /// PTT by the band-plan gate.
+    OutOfBandPlan,
 }
 
 /// Accumulated, readable record of everything a scenario drove. Mirrors the
@@ -362,6 +366,12 @@ pub struct CoordSim {
     /// `drive_slot` consults it (via the real `remote_tx_permitted`) for any
     /// `TxOrigin::Remote` pending item before keying PTT. Fresh = unarmed = deny.
     pub remote_tx_arm: Arc<Mutex<pancetta_agent::arm::ArmState>>,
+    /// PAN-118: the configured amateur band plan, exactly as the TX worker
+    /// snapshots at startup. `drive_slot` consults it (via the REAL
+    /// `tx_rf_for_gate` / `tx_band_plan_mute_reason` gate) before keying PTT:
+    /// an item whose absolute TX RF (effective split-aware dial + audio
+    /// offset) falls outside the plan is dropped, never keyed.
+    pub band_plan: pancetta_config::BandPlanConfig,
 }
 
 impl CoordSim {
@@ -421,6 +431,9 @@ impl CoordSim {
             completed: Vec::new(),
             // Fresh (unarmed) arm — remote TX is denied until a scenario arms it.
             remote_tx_arm: Arc::new(Mutex::new(pancetta_agent::arm::ArmState::new())),
+            // PAN-118: default band plan (region 2, edge warnings on) — what
+            // `Config::default()` gives the real worker.
+            band_plan: pancetta_config::BandPlanConfig::default(),
         }
     }
 
@@ -718,6 +731,25 @@ impl CoordSim {
                     text: entry.message_text.clone(),
                     qso_id: entry.qso_id.clone(),
                     reason: DropReason::StaleQso,
+                });
+                continue;
+            }
+            // PAN-118: the REAL band-plan gate, exactly as the worker applies
+            // it before PTT — effective split-aware dial (skipped while the
+            // dial is the unknown-0 sentinel) + this item's audio offset.
+            if tx_rf_for_gate(
+                &self.dial_frequency_hz,
+                &self.split_tx_frequency_hz,
+                entry.frequency_offset,
+            )
+            .and_then(|rf| tx_band_plan_mute_reason(rf, &self.band_plan))
+            .is_some()
+            {
+                self.timeline.dropped.push(DroppedTx {
+                    slot,
+                    text: entry.message_text.clone(),
+                    qso_id: entry.qso_id.clone(),
+                    reason: DropReason::OutOfBandPlan,
                 });
                 continue;
             }
@@ -1681,6 +1713,47 @@ async fn split_active_qso_logs_tx_dial() {
          split TX dial was not used.\n{}",
         sim.timeline
     );
+}
+
+// ===========================================================================
+// PAN-118 — band-plan TX gate (out-of-privilege refusal before PTT)
+// ===========================================================================
+
+/// An autonomous QSO whose absolute TX RF (dial + audio offset) falls
+/// outside the configured amateur band plan must never key PTT: with the
+/// dial parked at 15.000 MHz (between 20m and 17m — inside no amateur
+/// allocation) the coordinator's band-plan gate refuses the frame before
+/// PTT, exactly like every other hard-mute refusal, and the rig stays
+/// silent.
+#[tokio::test]
+async fn out_of_band_dial_never_keys() {
+    let mut sim = CoordSim::new("K5ARH").await;
+    sim.set_rx_dial(15_000_000);
+    let qso_id = sim
+        .autonomous_pounce("VB7F", 1500.0, Some(SlotParity::Odd))
+        .await;
+
+    let pending = sim.pump_qso_events();
+    sim.drive_slot(pending).await;
+
+    sim.timeline.assert_not_keyed_for_qso(&qso_id);
+    sim.timeline.assert_silent();
+}
+
+/// Control: the same autonomous QSO on a normal in-band 20m dial keys
+/// exactly as before PAN-118 (the gate must not over-block legitimate TX).
+#[tokio::test]
+async fn in_band_dial_control_keys() {
+    let mut sim = CoordSim::new("K5ARH").await;
+    sim.set_rx_dial(14_074_000);
+    let qso_id = sim
+        .autonomous_pounce("VB7F", 1500.0, Some(SlotParity::Odd))
+        .await;
+
+    let pending = sim.pump_qso_events();
+    sim.drive_slot(pending).await;
+
+    sim.timeline.assert_keyed_for_qso(&qso_id);
 }
 
 // ===========================================================================

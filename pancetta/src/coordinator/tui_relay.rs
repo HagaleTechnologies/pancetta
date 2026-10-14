@@ -825,6 +825,14 @@ impl super::ApplicationCoordinator {
         // Split TX dial atomic (0 = simplex). Written by SetSplit relay, read
         // by QSO RF-stamp and cleared here on any band change.
         let cmd_split_tx_hz = self.split_tx_frequency_hz();
+        // PAN-118: band-plan snapshot for the manual-PTT band gate
+        // (`ptt_band_plan_refusal`). Config loads once at startup (the
+        // hot-reload apply task is a documented no-op), so a relay-startup
+        // snapshot is always the live value.
+        let cmd_band_plan = {
+            let cfg = self.config.read().await;
+            cfg.rig.frequency.band_plan.clone()
+        };
         // C9 dedup anchor: record that *pancetta* (via the operator's TUI
         // SetFrequency) commanded this dial change, so the hamlib poll loop
         // doesn't double-fire the teardown when it reads the new freq back.
@@ -2370,6 +2378,29 @@ impl super::ApplicationCoordinator {
                                     );
                                     continue;
                                 }
+                                // PAN-118: frequency-aware sibling of the gate
+                                // above — a manual PTT key-up is a raw carrier on
+                                // the effective TX dial, so refuse it while that
+                                // dial sits outside the configured amateur band
+                                // plan. Same status channel as every other PTT
+                                // refusal; PTT-off remains always allowed below.
+                                if let Some(status) = ptt_band_plan_refusal(
+                                    &cmd_operating_freq_hz,
+                                    &cmd_split_tx_hz,
+                                    &cmd_band_plan,
+                                ) {
+                                    warn!(
+                                        target: "tx.policy",
+                                        "Refusing PTT key-up: {status}"
+                                    );
+                                    let _ = cmd_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                            component: "TX".to_string(),
+                                            status,
+                                        },
+                                    );
+                                    continue;
+                                }
                             }
                             cmd_ptt_state.store(new_state, Ordering::Release);
                             info!("TUI TogglePtt: {} -> {}", current, new_state);
@@ -3561,6 +3592,35 @@ fn ptt_on_refusal(
         audio_output_alive,
     )
     .map(|reason| format!("Can't key PTT — {reason}"))
+}
+
+/// PAN-118: the frequency-aware sibling of `ptt_on_refusal` — a manual PTT
+/// key-up (Shift+T) is a transmission too: a raw carrier at the effective
+/// TX dial (split when active, else RX dial), with no audio offset. Refuse
+/// it while that dial sits outside the configured amateur band plan
+/// (`edge_warnings` is the master switch, so `false` remains the
+/// operator's escape hatch). `None` means the key-up may proceed;
+/// `Some(status)` is the operator-facing status text. The dial-vs-split
+/// resolution and the out-of-band boolean come from the TX worker's shared
+/// pure helpers (`tx::tx_rf_for_gate` / `tx::tx_band_plan_mute_reason`),
+/// so the split-vs-RX-dial rule and the band tables have exactly one
+/// implementation each. Skips the check while the dial reads the
+/// unknown-0 sentinel (mock/rig-disabled dev modes), mirroring the worker.
+fn ptt_band_plan_refusal(
+    operating_freq_hz: &Arc<std::sync::atomic::AtomicU64>,
+    split_tx_hz: &Arc<std::sync::atomic::AtomicU64>,
+    band_plan: &pancetta_config::BandPlanConfig,
+) -> Option<String> {
+    // A raw carrier keys AT the dial — offset 0.0.
+    super::tx::tx_rf_for_gate(operating_freq_hz, split_tx_hz, 0.0).and_then(|rf| {
+        if super::tx::tx_band_plan_mute_reason(rf, band_plan).is_some() {
+            Some(format!(
+                "Can't key PTT — TX dial {rf} Hz is outside the configured amateur band plan"
+            ))
+        } else {
+            None
+        }
+    })
 }
 
 /// Upsert a bookmark into a list by name (PAN-61: save-as, overwrite if the
@@ -4877,6 +4937,46 @@ mod tui_relay_tests {
                 &Arc::new(AtomicBool::new(false)),
             ),
             Some("Can't key PTT — audio output device is dead".to_string())
+        );
+    }
+
+    /// PAN-118, manual-PTT path: a key-up is refused with the exact
+    /// operator-facing status while the effective TX dial sits outside the
+    /// configured amateur band plan (15.000 MHz is inside no allocation).
+    #[test]
+    fn ptt_band_plan_refusal_names_the_out_of_band_dial() {
+        assert_eq!(
+            ptt_band_plan_refusal(
+                &Arc::new(std::sync::atomic::AtomicU64::new(15_000_000)),
+                &Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                &pancetta_config::BandPlanConfig::default(),
+            ),
+            Some(
+                "Can't key PTT — TX dial 15000000 Hz is outside the configured amateur band plan"
+                    .to_string()
+            )
+        );
+    }
+
+    /// PAN-118, manual-PTT path: an in-band dial keys, and the unknown-0
+    /// sentinel dial (mock/rig-disabled dev modes) skips the check.
+    #[test]
+    fn ptt_band_plan_refusal_passes_in_band_and_unknown_dial() {
+        assert_eq!(
+            ptt_band_plan_refusal(
+                &Arc::new(std::sync::atomic::AtomicU64::new(14_074_000)),
+                &Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                &pancetta_config::BandPlanConfig::default(),
+            ),
+            None
+        );
+        assert_eq!(
+            ptt_band_plan_refusal(
+                &Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                &Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                &pancetta_config::BandPlanConfig::default(),
+            ),
+            None
         );
     }
 
