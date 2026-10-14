@@ -1848,6 +1848,7 @@ impl super::ApplicationCoordinator {
                 revocation_pending,
                 authz_generation,
                 shutdown,
+                timeouts: net::RelayTimeouts::default(),
             })
             .await;
             Ok::<(), anyhow::Error>(())
@@ -2112,6 +2113,8 @@ struct RunConfig {
     /// Threaded into `ArmContext::authz_generation` — see there.
     authz_generation: Arc<std::sync::atomic::AtomicU64>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// Deadlines for every relay IO wait (PAN-102). `Default` in production.
+    timeouts: net::RelayTimeouts,
 }
 
 /// The connect → authenticate → process → (disarm on loss) → reconnect loop.
@@ -2154,10 +2157,18 @@ async fn run_session_loop(mut cfg: RunConfig) {
     };
 
     while !cfg.shutdown.load(Ordering::Acquire) {
-        match net::RealWsConn::connect(&cfg.relay_url).await {
+        match net::RealWsConn::connect(&cfg.relay_url, cfg.timeouts).await {
             Ok(ws) => {
                 backoff = RECONNECT_BACKOFF_MIN;
-                run_one_session(ws, &cfg.identity, &mut ctx, &cfg.bus, &mut cfg.events).await;
+                run_one_session(
+                    ws,
+                    &cfg.identity,
+                    &mut ctx,
+                    &cfg.bus,
+                    &mut cfg.events,
+                    cfg.timeouts.hello,
+                )
+                .await;
                 // Session ended (teardown / drained): fail TX-off.
                 disarm_on_loss(&mut ctx);
             }
@@ -2196,9 +2207,11 @@ fn disarm_on_loss(ctx: &mut ArmContext) {
 /// loop calls after every dispatch (and on peer-down / revocation). A frame
 /// addressed to a peer [`peer_may_receive`] refuses is withheld. The clock is
 /// read for each frame, since earlier sends can block across token expiry.
-/// (PAN-95). A failed serialize or send is `debug!`-logged and skipped
-/// (best-effort — a control frame that can't reach one peer never tears down
-/// the session).
+/// (PAN-95). A failed serialize or per-peer send is `debug!`-logged and
+/// skipped (best-effort — a control frame that can't reach one peer never
+/// tears down the session). A relay transport failure is different: the
+/// socket is shared, so [`run_one_session`] ends the session at its next
+/// check (PAN-102).
 fn deliver_sends<W: pancetta_agent::relay::WsConn>(
     sess: &mut MultiPeerSession<'_, W>,
     ctx: &ArmContext,
@@ -2229,6 +2242,13 @@ fn deliver_sends<W: pancetta_agent::relay::WsConn>(
 /// the session loop — and its arm-expiry sweep — on every iteration (PAN-97).
 const READ_STREAM_DRAIN_MAX: usize = 64;
 
+/// The display feed queues frames only while the relay's outbound queue has
+/// this many free slots. One fan-out needs at most `MAX_PEERS`, and the rest
+/// stays free for control frames, so the lossy feed never makes the session
+/// loop wait on a congested relay (PAN-102).
+const DISPLAY_FEED_MIN_SEND_CAPACITY: usize = 2 * pancetta_agent::multi_session::MAX_PEERS;
+const _: () = assert!(DISPLAY_FEED_MIN_SEND_CAPACITY < net::RELAY_QUEUE_DEPTH);
+
 /// Fan pending display events out to every established peer that
 /// [`peer_may_receive`] admits, reading the clock for each recipient check
 /// (PAN-95: a peer without an unexpired `status`+ hello capability gets
@@ -2236,7 +2256,11 @@ const READ_STREAM_DRAIN_MAX: usize = 64;
 /// lag notifications before returning to session housekeeping (PAN-97: so a
 /// busy read stream cannot hold the arm-expiry sweep off). Lossy by design:
 /// Lagged means the bounded broadcast ring dropped old events; log and
-/// continue within the same batch limit.
+/// continue within the same batch limit. The drain also stops while the
+/// relay's outbound queue has fewer than [`DISPLAY_FEED_MIN_SEND_CAPACITY`]
+/// free slots (PAN-102): pending events stay in the broadcast ring, which
+/// drops the oldest if the congestion persists, and the loop never waits on
+/// display traffic.
 fn drain_read_stream<W: pancetta_agent::relay::WsConn>(
     events: &mut Option<tokio::sync::broadcast::Receiver<pancetta_protocol::ServerEvent>>,
     sess: &mut MultiPeerSession<'_, W>,
@@ -2248,6 +2272,15 @@ fn drain_read_stream<W: pancetta_agent::relay::WsConn>(
     // session loop returns to authorization, controller-expiry and arm-expiry
     // housekeeping.
     for _ in 0..READ_STREAM_DRAIN_MAX {
+        // Checked before taking an event, so no event is taken and then
+        // dropped, and no frame is encrypted and then left unsent.
+        if sess
+            .send_capacity()
+            .is_some_and(|free| free < DISPLAY_FEED_MIN_SEND_CAPACITY)
+        {
+            // Leave the rest in the broadcast ring; it drops the oldest if this persists.
+            break;
+        }
         match rx.try_recv() {
             Ok(ev) => {
                 let frame = pancetta_protocol::ServerFrame::Event { event: ev };
@@ -2270,7 +2303,11 @@ fn drain_read_stream<W: pancetta_agent::relay::WsConn>(
 /// Returns when the session tears down (drain, teardown action, or error).
 ///
 /// This runs on a blocking-capable task because the [`pancetta_agent::relay::WsConn`]
-/// seam is synchronous (`RealWsConn` bridges via `block_on`).
+/// seam is synchronous (`RealWsConn` bridges via `block_on`). Every relay wait
+/// is deadline-bounded (PAN-102): the opening `hello` must arrive within
+/// `hello_timeout`, and `RealWsConn` bounds each send and receive with its
+/// [`net::RelayTimeouts`], so a relay that stops responding ends the session
+/// instead of holding it.
 ///
 /// Task 4: drives a [`MultiPeerSession`] rather than the single-peer
 /// `AgentSession` — up to `multi_session::MAX_PEERS` allow-listed clients may
@@ -2293,6 +2330,7 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
     ctx: &mut ArmContext,
     bus: &MessageBus,
     events: &mut Option<tokio::sync::broadcast::Receiver<pancetta_protocol::ServerEvent>>,
+    hello_timeout: Duration,
 ) {
     ctx.peers.clear();
     // D8 (PAN-96): record the generation BEFORE snapshotting the list. A poll
@@ -2301,7 +2339,7 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
     ctx.authz_generation_seen = ctx.authz_generation.load(Ordering::Acquire);
     let allow_snapshot = ctx.tx_allow_list.read().unwrap().clone();
     let mut sess = MultiPeerSession::new(ws, identity, allow_snapshot);
-    if let Err(e) = sess.authenticate() {
+    if let Err(e) = sess.authenticate(hello_timeout) {
         debug!(target: "agent", "relay authenticate failed: {e}");
         return;
     }
@@ -2314,6 +2352,13 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
         let now = (ctx.clock)();
         let expiry_sends = sweep_arm_expiry(ctx, now);
         deliver_sends(&mut sess, ctx, &expiry_sends, || (ctx.clock)().unix_ms);
+        // PAN-102: the relay socket is shared by every peer. Once a send on it has
+        // failed, end the session before acting on anything received; the caller
+        // disarms and reconnects.
+        if sess.transport_failed() {
+            debug!(target: "agent", "relay transport failed; ending session");
+            return;
+        }
         // That delivery can block on a backed-up relay socket, and a hello or
         // arm capability may expire meanwhile: authorize what was received at
         // a fresh instant, never the pre-delivery one.
@@ -4449,7 +4494,15 @@ mod tests {
             assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
 
             let ws = scripted_ws_for_peer_down(&identity, CLIENT_KEY_ID);
-            run_one_session(ws, &identity, &mut ctx, &bus, &mut None).await;
+            run_one_session(
+                ws,
+                &identity,
+                &mut ctx,
+                &bus,
+                &mut None,
+                net::RELAY_HELLO_TIMEOUT,
+            )
+            .await;
 
             assert!(
                 !ctx.arm.lock().unwrap().is_armed(),
@@ -4485,7 +4538,15 @@ mod tests {
             assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
 
             let ws = scripted_ws_for_peer_down(&identity, PEER_B);
-            run_one_session(ws, &identity, &mut ctx, &bus, &mut None).await;
+            run_one_session(
+                ws,
+                &identity,
+                &mut ctx,
+                &bus,
+                &mut None,
+                net::RELAY_HELLO_TIMEOUT,
+            )
+            .await;
 
             assert!(
                 ctx.arm.lock().unwrap().is_armed(),
@@ -4931,7 +4992,15 @@ mod tests {
             clock: fixed_clock(NOW),
         };
         let bus = MessageBus::new(64).unwrap();
-        run_one_session(ws, identity, &mut ctx, &bus, &mut None).await;
+        run_one_session(
+            ws,
+            identity,
+            &mut ctx,
+            &bus,
+            &mut None,
+            net::RELAY_HELLO_TIMEOUT,
+        )
+        .await;
         let out = outbound.lock().unwrap().clone();
         (ctx, out)
     }
@@ -5360,7 +5429,15 @@ mod tests {
             clock.store(expires.load(Ordering::Acquire) + 1_000, Ordering::Release);
         });
         let bus = MessageBus::new(64).unwrap();
-        run_one_session(ws, &identity, &mut ctx, &bus, &mut None).await;
+        run_one_session(
+            ws,
+            &identity,
+            &mut ctx,
+            &bus,
+            &mut None,
+            net::RELAY_HELLO_TIMEOUT,
+        )
+        .await;
         assert_eq!(
             ctx.peers[CLIENT_KEY_ID].auth.as_ref().unwrap().jti,
             "renewal-new"
@@ -5904,7 +5981,15 @@ mod tests {
                 .unwrap();
         });
 
-        run_one_session(ws, &identity, &mut ctx, &bus, &mut events).await;
+        run_one_session(
+            ws,
+            &identity,
+            &mut ctx,
+            &bus,
+            &mut events,
+            net::RELAY_HELLO_TIMEOUT,
+        )
+        .await;
         drop(evt_tx);
 
         assert!(ctx.peers.contains_key(CLIENT_KEY_ID));
@@ -5974,7 +6059,15 @@ mod tests {
 
         let mut events: Option<tokio::sync::broadcast::Receiver<pancetta_protocol::ServerEvent>> =
             None;
-        run_one_session(ws, &identity, &mut ctx, &bus, &mut events).await;
+        run_one_session(
+            ws,
+            &identity,
+            &mut ctx,
+            &bus,
+            &mut events,
+            net::RELAY_HELLO_TIMEOUT,
+        )
+        .await;
 
         assert!(
             ctx.peers.contains_key(CLIENT_KEY_ID),
@@ -6554,7 +6647,15 @@ mod tests {
             poll_revocation_pending.store(true, Ordering::Release);
         });
 
-        run_one_session(ws, &identity, &mut ctx, &bus, &mut None).await;
+        run_one_session(
+            ws,
+            &identity,
+            &mut ctx,
+            &bus,
+            &mut None,
+            net::RELAY_HELLO_TIMEOUT,
+        )
+        .await;
 
         assert!(
             ctx.peers.contains_key(CLIENT_KEY_ID),
@@ -6764,7 +6865,15 @@ mod tests {
             ws_handle.push_inbound(malformed_env);
         });
 
-        run_one_session(ws, &identity, &mut ctx, &bus, &mut None).await;
+        run_one_session(
+            ws,
+            &identity,
+            &mut ctx,
+            &bus,
+            &mut None,
+            net::RELAY_HELLO_TIMEOUT,
+        )
+        .await;
 
         assert!(
             ctx.peers.contains_key(CLIENT_KEY_ID),
@@ -8124,7 +8233,15 @@ mod tests {
             *snapshot.lock().unwrap() = Some(envs_to(&out2.lock().unwrap(), CLIENT_KEY_ID).len());
         });
 
-        run_one_session(ws, &identity, &mut ctx, &bus, &mut events).await;
+        run_one_session(
+            ws,
+            &identity,
+            &mut ctx,
+            &bus,
+            &mut events,
+            net::RELAY_HELLO_TIMEOUT,
+        )
+        .await;
         drop(evt_tx);
 
         let at_revocation = envs_to_a_at_revocation
@@ -8408,7 +8525,15 @@ mod tests {
                 stall_next_send: None,
             };
             let bus = MessageBus::new(64).unwrap();
-            run_one_session(ws, &self.identity, &mut self.ctx, &bus, events).await;
+            run_one_session(
+                ws,
+                &self.identity,
+                &mut self.ctx,
+                &bus,
+                events,
+                net::RELAY_HELLO_TIMEOUT,
+            )
+            .await;
             let out = outbound.lock().unwrap().clone();
             let mut clients = std::mem::take(&mut *clients.lock().unwrap());
             for c in clients.iter_mut() {
@@ -8921,5 +9046,492 @@ mod tests {
 
         assert_eq!(audit_count(&ctx, "armed ttl_ms="), 1);
         assert!(ctx.controller.is_none());
+    }
+
+    // ── PAN-102: bounded relay session IO ────────────────────────────────
+
+    /// Wraps a WS and reports a settable outbound-queue capacity.
+    struct CongestedWs<W: WsConn> {
+        inner: W,
+        capacity: Arc<Mutex<Option<usize>>>,
+    }
+
+    impl<W: WsConn> WsConn for CongestedWs<W> {
+        fn send_text(&mut self, s: String) -> Result<(), RelayError> {
+            self.inner.send_text(s)
+        }
+        fn recv_text(&mut self) -> Result<Option<String>, RelayError> {
+            self.inner.recv_text()
+        }
+        fn recv_text_within(&mut self, timeout: Duration) -> Result<RecvOutcome, RelayError> {
+            self.inner.recv_text_within(timeout)
+        }
+        fn send_capacity(&self) -> Option<usize> {
+            *self.capacity.lock().unwrap()
+        }
+    }
+
+    /// Wraps a WS and fails its `fail_at`-th send (1-based) with a relay
+    /// transport error, as a stalled relay's send timeout would.
+    struct FailSendsWs<W: WsConn> {
+        inner: W,
+        fail_at: usize,
+        sends: usize,
+    }
+
+    impl<W: WsConn> WsConn for FailSendsWs<W> {
+        fn send_text(&mut self, s: String) -> Result<(), RelayError> {
+            self.sends += 1;
+            if self.sends == self.fail_at {
+                return Err(RelayError::Transport("relay send timed out".to_string()));
+            }
+            self.inner.send_text(s)
+        }
+        fn recv_text(&mut self) -> Result<Option<String>, RelayError> {
+            self.inner.recv_text()
+        }
+    }
+
+    /// A relay that never sends anything: the first bounded receive is quiet,
+    /// every later one reports a close (so a regression cannot spin forever).
+    /// Records every receive deadline and counts sends.
+    struct QuietWs {
+        timeouts: Arc<Mutex<Vec<Duration>>>,
+        sends: Arc<Mutex<usize>>,
+    }
+
+    impl WsConn for QuietWs {
+        fn send_text(&mut self, _s: String) -> Result<(), RelayError> {
+            *self.sends.lock().unwrap() += 1;
+            Ok(())
+        }
+        fn recv_text(&mut self) -> Result<Option<String>, RelayError> {
+            Ok(None)
+        }
+        fn recv_text_within(&mut self, timeout: Duration) -> Result<RecvOutcome, RelayError> {
+            let mut seen = self.timeouts.lock().unwrap();
+            seen.push(timeout);
+            Ok(if seen.len() == 1 {
+                RecvOutcome::Quiet
+            } else {
+                RecvOutcome::Closed
+            })
+        }
+    }
+
+    use pancetta_agent::relay::RecvOutcome;
+
+    /// What the test relay saw on one connection.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RelayConnEvent {
+        Accepted(usize),
+        Closed(usize),
+    }
+
+    type RelayEvents = tokio::sync::mpsc::UnboundedReceiver<(RelayConnEvent, std::time::Instant)>;
+
+    async fn next_relay_event(
+        rx: &mut RelayEvents,
+        within: Duration,
+    ) -> (RelayConnEvent, std::time::Instant) {
+        tokio::time::timeout(within, rx.recv())
+            .await
+            .expect("relay event did not arrive in time")
+            .expect("relay task ended")
+    }
+
+    /// Gherkin scenario 1 end to end over a real socket: a relay that completes
+    /// the WebSocket upgrade but never sends `hello` is torn down within the
+    /// authentication deadline, the arm is disarmed, the loop reconnects, and
+    /// the task stays cancellable while it waits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn relay_that_withholds_hello_is_torn_down_and_disarmed() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_url = format!("ws://{}", listener.local_addr().unwrap());
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Relay: accept every connection, complete the upgrade, never send.
+        tokio::spawn(async move {
+            let mut n = 0;
+            while let Ok((tcp, _)) = listener.accept().await {
+                n += 1;
+                let ev_tx = ev_tx.clone();
+                tokio::spawn(async move {
+                    let Ok(ws) = tokio_tungstenite::accept_async(tcp).await else {
+                        return;
+                    };
+                    let _ = ev_tx.send((RelayConnEvent::Accepted(n), std::time::Instant::now()));
+                    let (_sink, mut source) = ws.split();
+                    while let Some(Ok(msg)) = source.next().await {
+                        if matches!(msg, Message::Close(_)) {
+                            break;
+                        }
+                    }
+                    let _ = ev_tx.send((RelayConnEvent::Closed(n), std::time::Instant::now()));
+                });
+            }
+        });
+
+        let ArmContext {
+            arm,
+            verifier,
+            client_keys,
+            tx_allow_list,
+            tx_arm_allow_list,
+            audit,
+            revocation_pending,
+            authz_generation,
+            ..
+        } = ctx_with(true, true);
+        *arm.lock().unwrap() = armed_state();
+        let hello = Duration::from_millis(300);
+        let cfg = RunConfig {
+            relay_url,
+            identity: AgentIdentity::generate(),
+            verifier,
+            client_keys,
+            tx_allow_list,
+            tx_arm_allow_list,
+            audit,
+            bus: MessageBus::new(64).unwrap(),
+            events: None,
+            arm: arm.clone(),
+            revocation_pending,
+            authz_generation,
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            timeouts: net::RelayTimeouts {
+                connect: Duration::from_secs(2),
+                hello,
+                send: Duration::from_secs(1),
+                write: Duration::from_secs(1),
+            },
+        };
+        let handle = tokio::spawn(run_session_loop(cfg));
+
+        // 1. The first connection is closed by the agent within the deadline.
+        let (ev, accepted_at) = next_relay_event(&mut ev_rx, Duration::from_secs(5)).await;
+        assert_eq!(ev, RelayConnEvent::Accepted(1));
+        assert!(
+            arm.lock().unwrap().is_armed(),
+            "still armed while the agent waits for hello"
+        );
+        let (ev, closed_at) = next_relay_event(&mut ev_rx, Duration::from_secs(3)).await;
+        assert_eq!(
+            ev,
+            RelayConnEvent::Closed(1),
+            "the agent tore the connection down"
+        );
+        assert!(
+            closed_at - accepted_at < Duration::from_secs(2),
+            "torn down after {:?}",
+            closed_at - accepted_at
+        );
+
+        // 2. The session loss disarmed remote TX.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while arm.lock().unwrap().is_armed() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the arm must be disarmed after the teardown"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // 3. The loop moved on and reconnected.
+        let (ev, _) =
+            next_relay_event(&mut ev_rx, RECONNECT_BACKOFF_MIN + Duration::from_secs(2)).await;
+        assert_eq!(ev, RelayConnEvent::Accepted(2));
+
+        // 4. While it waits for #2's hello, the task is still cancellable
+        //    within the hello bound.
+        handle.abort();
+        let joined = tokio::time::timeout(hello + Duration::from_secs(1), handle).await;
+        assert!(
+            joined.is_ok(),
+            "the session task must honour abort() promptly"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_one_session_returns_when_hello_never_arrives() {
+        let identity = AgentIdentity::generate();
+        let mut ctx = ctx_with(true, true);
+        let bus = MessageBus::new(64).unwrap();
+        let timeouts = Arc::new(Mutex::new(Vec::new()));
+        let sends = Arc::new(Mutex::new(0));
+        let ws = QuietWs {
+            timeouts: timeouts.clone(),
+            sends: sends.clone(),
+        };
+        run_one_session(
+            ws,
+            &identity,
+            &mut ctx,
+            &bus,
+            &mut None,
+            Duration::from_millis(1234),
+        )
+        .await;
+        assert_eq!(
+            *timeouts.lock().unwrap(),
+            vec![Duration::from_millis(1234)],
+            "hello is awaited once, under the caller's deadline, and the session ends"
+        );
+        assert_eq!(*sends.lock().unwrap(), 0, "nothing is sent without a hello");
+    }
+
+    #[tokio::test]
+    async fn run_one_session_stops_before_dispatch_after_a_transport_failure() {
+        let identity = AgentIdentity::generate();
+        let agent_kid = identity.key_id();
+        let mut ctx = ctx_with(true, true);
+        let bus = MessageBus::new(64).unwrap();
+        let device = client_device();
+        let mut init = initiator_for(&device, &identity.agreement_public_raw());
+        let msg1 = init.write_msg1(&proof_for(&device));
+        let hello = RelayFrame::Hello {
+            challenge: b64url(&[5u8; 32]),
+        }
+        .to_json()
+        .unwrap();
+        let env = |payload: &[u8]| {
+            RelayFrame::Env {
+                dst: agent_kid.clone(),
+                payload: b64url(payload),
+                src: Some(CLIENT_KEY_ID.to_string()),
+            }
+            .to_json()
+            .unwrap()
+        };
+        let idle_tick = RelayFrame::Presence {
+            peer: "irrelevant-peer".to_string(),
+            state: "up".to_string(),
+        }
+        .to_json()
+        .unwrap();
+        let mock = MockWs::new(
+            vec![hello, env(&msg1), idle_tick, env(b"second")],
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let inbound = mock.inbound.clone();
+        // Send #1 is `auth`; send #2 is the msg2 reply to the device.
+        let ws = FailSendsWs {
+            inner: mock,
+            fail_at: 2,
+            sends: 0,
+        };
+        run_one_session(
+            ws,
+            &identity,
+            &mut ctx,
+            &bus,
+            &mut None,
+            net::RELAY_HELLO_TIMEOUT,
+        )
+        .await;
+        assert_eq!(
+            inbound.lock().unwrap().len(),
+            2,
+            "nothing received after the transport failure is read"
+        );
+        assert!(
+            !ctx.peers.contains_key(CLIENT_KEY_ID),
+            "the device whose reply could not be sent is not established"
+        );
+    }
+
+    #[tokio::test]
+    async fn display_feed_waits_for_send_capacity_before_taking_events() {
+        let identity = AgentIdentity::generate();
+        let ctx = fresh_ctx(&identity.key_id(), HashSet::new());
+        let hello = RelayFrame::Hello {
+            challenge: b64url(&[3u8; 32]),
+        }
+        .to_json()
+        .unwrap();
+        let outbound = Arc::new(Mutex::new(Vec::new()));
+        let capacity = Arc::new(Mutex::new(Some(DISPLAY_FEED_MIN_SEND_CAPACITY - 1)));
+        let ws = CongestedWs {
+            inner: MockWs::new(vec![hello], outbound.clone()),
+            capacity: capacity.clone(),
+        };
+        let mut sess = MultiPeerSession::new(ws, &identity, HashSet::new());
+        sess.authenticate(net::RELAY_HELLO_TIMEOUT).unwrap();
+        let sent_after_auth = outbound.lock().unwrap().len();
+
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let mut events = Some(rx);
+        let publish = |n: usize| {
+            for _ in 0..n {
+                tx.send(pancetta_protocol::ServerEvent::TxStatus { active: true })
+                    .unwrap();
+            }
+        };
+        let pending =
+            |events: &Option<tokio::sync::broadcast::Receiver<_>>| events.as_ref().unwrap().len();
+
+        publish(3);
+        drain_read_stream(&mut events, &mut sess, &ctx, || NOW);
+        assert_eq!(pending(&events), 3, "congested: no event is taken");
+        assert_eq!(outbound.lock().unwrap().len(), sent_after_auth);
+
+        *capacity.lock().unwrap() = Some(DISPLAY_FEED_MIN_SEND_CAPACITY);
+        drain_read_stream(&mut events, &mut sess, &ctx, || NOW);
+        assert_eq!(pending(&events), 0, "enough room: the feed drains");
+
+        publish(3);
+        *capacity.lock().unwrap() = None;
+        drain_read_stream(&mut events, &mut sess, &ctx, || NOW);
+        assert_eq!(pending(&events), 0, "unknown capacity: the feed drains");
+    }
+
+    /// Runs one session in which device A (CLIENT_KEY_ID) holds control of a
+    /// live arm, sends its hello, a display event is published, and A then
+    /// sends `txDisarm` — all while the relay reports `capacity` free
+    /// outbound slots. Returns whether the arm is still live afterwards and
+    /// every frame A received after msg2, decrypted in order.
+    async fn run_disarm_under_capacity(capacity: Option<usize>) -> (bool, Vec<Value>) {
+        let identity = AgentIdentity::generate();
+        let agent_kid = identity.key_id();
+        let agent_pub = identity.agreement_public_raw();
+        let mut allow = HashSet::new();
+        allow.insert(CLIENT_KEY_ID.to_string());
+        let mut ctx = fresh_ctx(&agent_kid, allow);
+        let bus = MessageBus::new(64).unwrap();
+
+        let jti = "congested-test-jti";
+        ctx.arm
+            .lock()
+            .unwrap()
+            .set_channel_consent(ConsentChannel::StationAgent, true, NOW);
+        ctx.arm.lock().unwrap().arm(
+            pancetta_agent::arm::VerifiedArmGrant {
+                operator_callsign: OPERATOR.to_string(),
+                ttl_ms: 3_600_000,
+                armed_until_ms: NOW + 3_600_000,
+                heartbeat_interval_sec: 10,
+                scope_tx: true,
+                jti: jti.to_string(),
+                client_key_id: CLIENT_KEY_ID.to_string(),
+            },
+            at(NOW),
+        );
+        ctx.controller = Some(CLIENT_KEY_ID.to_string());
+        assert!(ctx.arm.lock().unwrap().is_armed());
+
+        let dev_a = client_device();
+        let mut init_a = initiator_for(&dev_a, &agent_pub);
+        let msg1_a = init_a.write_msg1(&proof_for(&dev_a));
+        let hello = RelayFrame::Hello {
+            challenge: b64url(&[22u8; 32]),
+        }
+        .to_json()
+        .unwrap();
+        let env_msg1 = RelayFrame::Env {
+            dst: agent_kid.clone(),
+            payload: b64url(&msg1_a),
+            src: Some(CLIENT_KEY_ID.to_string()),
+        }
+        .to_json()
+        .unwrap();
+
+        let outbound = Arc::new(Mutex::new(Vec::new()));
+        let mock = MockWs::new(vec![hello, env_msg1], outbound.clone());
+        let ws_handle = mock.clone();
+        let trigger_outbound = outbound.clone();
+        let trigger_agent_kid = agent_kid.clone();
+        let (evt_tx, evt_rx) = tokio::sync::broadcast::channel(16);
+        let mut events = Some(evt_rx);
+        let trigger_evt_tx = evt_tx.clone();
+        let transport_slot: Arc<Mutex<Option<snow::TransportState>>> = Arc::new(Mutex::new(None));
+        let slot = transport_slot.clone();
+        // recv #1 hello, #2 env A. Just before #3: complete A's handshake,
+        // queue its hello, publish a display event, then queue its txDisarm.
+        let trigger = TriggerAfterWs::new(mock, 3, move || {
+            let out = trigger_outbound.lock().unwrap().clone();
+            let msg2_a = envs_to(&out, CLIENT_KEY_ID).remove(0);
+            init_a.read_msg2(&msg2_a);
+            let mut t = init_a.into_transport();
+            let env = |ct: &[u8]| {
+                RelayFrame::Env {
+                    dst: trigger_agent_kid.clone(),
+                    payload: b64url(ct),
+                    src: Some(CLIENT_KEY_ID.to_string()),
+                }
+                .to_json()
+                .unwrap()
+            };
+            let token = injected_clock_token(&trigger_agent_kid, CLIENT_KEY_ID, &["status"]);
+            ws_handle.push_inbound(env(&client_encrypt(&mut t, &hello_frame_bytes(&token))));
+            trigger_evt_tx
+                .send(pancetta_protocol::ServerEvent::TxStatus { active: true })
+                .unwrap();
+            let disarm = serde_json::to_vec(&json!({"type": "txDisarm", "armJti": jti})).unwrap();
+            ws_handle.push_inbound(env(&client_encrypt(&mut t, &disarm)));
+            *slot.lock().unwrap() = Some(t);
+        });
+        let ws = CongestedWs {
+            inner: trigger,
+            capacity: Arc::new(Mutex::new(capacity)),
+        };
+
+        run_one_session(
+            ws,
+            &identity,
+            &mut ctx,
+            &bus,
+            &mut events,
+            net::RELAY_HELLO_TIMEOUT,
+        )
+        .await;
+        drop(evt_tx);
+
+        let still_armed = ctx.arm.lock().unwrap().is_armed();
+        let out = outbound.lock().unwrap().clone();
+        let mut t = transport_slot.lock().unwrap().take().unwrap();
+        let received = envs_to(&out, CLIENT_KEY_ID)
+            .iter()
+            .skip(1) // msg2
+            .map(|ct| client_decrypt_json(&mut t, ct))
+            .collect();
+        (still_armed, received)
+    }
+
+    fn event_names(frames: &[Value]) -> Vec<String> {
+        frames
+            .iter()
+            .map(|f| f["event"]["event"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// Gherkin scenario 2 at the loop level: with the relay's outbound queue
+    /// congested, an inbound `txDisarm` is still dispatched on the iteration
+    /// that receives it, and only the lossy display feed yields.
+    #[tokio::test]
+    async fn disarm_is_processed_while_relay_outbound_is_congested() {
+        let (still_armed, frames) =
+            run_disarm_under_capacity(Some(DISPLAY_FEED_MIN_SEND_CAPACITY - 1)).await;
+        assert!(!still_armed, "the inbound txDisarm must be dispatched");
+        let names = event_names(&frames);
+        assert!(
+            !names.iter().any(|n| n == "txStatus"),
+            "the display feed yields under congestion: {names:?}"
+        );
+        assert!(
+            names.iter().filter(|n| *n == "controlState").count() >= 2,
+            "control frames (hello greeting, post-disarm state) still flow: {names:?}"
+        );
+
+        // Control: the same run uncongested DOES deliver the display event,
+        // so the gate (not the setup) withheld it above.
+        let (still_armed, frames) = run_disarm_under_capacity(None).await;
+        assert!(!still_armed);
+        let names = event_names(&frames);
+        assert!(
+            names.iter().any(|n| n == "txStatus"),
+            "uncongested, the display event reaches the peer: {names:?}"
+        );
     }
 }

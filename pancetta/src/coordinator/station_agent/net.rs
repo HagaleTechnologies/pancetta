@@ -3,8 +3,8 @@
 //!
 //! `pancetta_agent`'s core (crypto, verification, the relay/session state
 //! machines) is deliberately **network-free** and exercised entirely with
-//! scripted mocks. This module is the thin, un-unit-tested edge that binds those
-//! traits to real IO — [`tokio_tungstenite`] for the relay WebSocket
+//! scripted mocks. This module is the thin edge that binds those traits to
+//! real IO — [`tokio_tungstenite`] for the relay WebSocket
 //! ([`RealWsConn`]) and [`reqwest`] for the pairing HTTP POSTs
 //! ([`ReqwestPairingHttp`]). Both live here (not in `pancetta-agent`) so the
 //! agent crate never gains a networking dependency.
@@ -24,89 +24,174 @@
 //! doesn't apply to [`ReqwestPairingHttp`]: its one caller
 //! (`pancetta pair`) already runs it via `tokio::task::spawn_blocking`, a
 //! genuine OS thread with no outer `block_on` to nest inside.
+//!
+//! Code inside `block_in_place` cannot be cancelled: neither an `abort()` nor
+//! a shutdown reaches the session task until the closure returns. So every
+//! `block_in_place` wait in [`RealWsConn`] is wrapped in a [`RelayTimeouts`]
+//! deadline (PAN-102). That bound is what keeps the session task cancellable,
+//! and what turns a relay that stops responding into a session teardown.
 
-use futures_util::{SinkExt, StreamExt};
+use std::time::Duration;
+
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
+use tracing::debug;
 
 use pancetta_agent::pairing::{PairingError, PairingHttp};
 use pancetta_agent::relay::{RecvOutcome, RelayError, WsConn, MAX_FRAME_BYTES};
+
+/// Dial + TLS + WebSocket upgrade.
+pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// WebSocket upgrade complete → the relay's opening `hello` (the
+/// authentication deadline). Also bounds [`RealWsConn`]'s `recv_text`.
+pub const RELAY_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest `send_text` waits for a free outbound slot.
+pub const RELAY_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longest one frame's socket write + flush may stay pending.
+pub const RELAY_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Depth of the adapter ↔ pump queues. Bounded so a stuck peer can't grow memory.
+pub(crate) const RELAY_QUEUE_DEPTH: usize = 64;
+
+/// Deadlines for every relay IO wait. Production uses `Default`; tests
+/// inject short values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayTimeouts {
+    /// Bounds [`RealWsConn::connect`] (dial + TLS + WebSocket upgrade).
+    pub connect: Duration,
+    /// Bounds the wait for the relay's opening `hello`, and every
+    /// [`WsConn::recv_text`] on a [`RealWsConn`].
+    pub hello: Duration,
+    /// Bounds `send_text`'s wait for a free outbound slot.
+    pub send: Duration,
+    /// Bounds one frame's socket write + flush in the pump.
+    pub write: Duration,
+}
+
+impl Default for RelayTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: RELAY_CONNECT_TIMEOUT,
+            hello: RELAY_HELLO_TIMEOUT,
+            send: RELAY_SEND_TIMEOUT,
+            write: RELAY_WRITE_TIMEOUT,
+        }
+    }
+}
 
 /// A real relay WebSocket connection adapting an async [`tokio_tungstenite`]
 /// stream to the synchronous [`WsConn`] seam.
 ///
 /// The async read/write halves are driven on a dedicated pump task; this handle
 /// talks to that task over bounded channels and `block_on`s the channel ops via
-/// the captured [`Handle`]. Constructed by [`connect`](RealWsConn::connect).
+/// the captured [`Handle`], each under a [`RelayTimeouts`] deadline. The pump's
+/// reader and writer progress independently, so inbound frames keep arriving
+/// while a write is stuck; a write that stays pending longer than
+/// [`RelayTimeouts::write`] ends the connection. Constructed by
+/// [`connect`](RealWsConn::connect).
 pub struct RealWsConn {
     handle: Handle,
     /// Outbound text frames → pump → socket.
     tx: mpsc::Sender<String>,
-    /// Inbound text frames ← pump ← socket. `None` sentinel = closed.
-    rx: mpsc::Receiver<Option<String>>,
+    /// Inbound text frames ← pump ← socket. A closed channel means the
+    /// connection is over.
+    rx: mpsc::Receiver<String>,
+    /// The pump task; aborted when a send times out so the socket drops at once.
+    pump: tokio::task::AbortHandle,
+    timeouts: RelayTimeouts,
 }
 
 impl RealWsConn {
     /// Dial `url` and return a synchronous [`WsConn`] over the established
     /// WebSocket. Must be called from within a Tokio runtime (uses the current
     /// [`Handle`]). Spawns a pump task that owns the socket for its lifetime.
-    pub async fn connect(url: &str) -> Result<Self, RelayError> {
-        let (stream, _resp) = tokio_tungstenite::connect_async(url)
-            .await
-            .map_err(|e| RelayError::Transport(format!("connect {url}: {e}")))?;
-        let (mut sink, mut source) = stream.split();
-
-        // Bounded so a stuck peer can't grow memory without limit.
-        let (out_tx, mut out_rx) = mpsc::channel::<String>(64);
-        let (in_tx, in_rx) = mpsc::channel::<Option<String>>(64);
-
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    // Outbound: forward text frames to the socket.
-                    maybe = out_rx.recv() => match maybe {
-                        Some(text) => {
-                            if sink.send(Message::Text(text.into())).await.is_err() {
-                                let _ = in_tx.send(None).await;
-                                break;
-                            }
-                        }
-                        None => {
-                            // Adapter dropped: close the socket and stop.
-                            let _ = sink.send(Message::Close(None)).await;
-                            break;
-                        }
-                    },
-                    // Inbound: forward text frames (and closes) to the adapter.
-                    inbound = source.next() => match inbound {
-                        Some(Ok(Message::Text(t))) => {
-                            if in_tx.send(Some(t.to_string())).await.is_err() {
-                                break;
-                            }
-                        }
-                        Some(Ok(Message::Binary(_))) | Some(Ok(Message::Ping(_)))
-                        | Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {
-                            // Non-text frames are not part of relay.v1; ignore.
-                        }
-                        Some(Ok(Message::Close(_))) | None => {
-                            let _ = in_tx.send(None).await;
-                            break;
-                        }
-                        Some(Err(_)) => {
-                            let _ = in_tx.send(None).await;
-                            break;
-                        }
-                    }
+    /// The dial, TLS and upgrade together are bounded by
+    /// [`RelayTimeouts::connect`].
+    pub async fn connect(url: &str, timeouts: RelayTimeouts) -> Result<Self, RelayError> {
+        let (stream, _resp) =
+            match tokio::time::timeout(timeouts.connect, tokio_tungstenite::connect_async(url))
+                .await
+            {
+                Ok(Ok(connected)) => connected,
+                Ok(Err(e)) => return Err(RelayError::Transport(format!("connect {url}: {e}"))),
+                Err(_elapsed) => {
+                    return Err(RelayError::Transport(format!("connect {url}: timed out")))
                 }
-            }
-        });
+            };
+        let (sink, source) = stream.split();
+        Ok(Self::spawn(sink, source, timeouts))
+    }
 
-        Ok(Self {
+    /// Spawn the pump over `sink`/`source` and return the adapter handle.
+    fn spawn<Si, St, E>(sink: Si, source: St, timeouts: RelayTimeouts) -> Self
+    where
+        Si: Sink<Message> + Unpin + Send + 'static,
+        St: Stream<Item = Result<Message, E>> + Unpin + Send + 'static,
+        E: Send + 'static,
+    {
+        let (out_tx, out_rx) = mpsc::channel::<String>(RELAY_QUEUE_DEPTH);
+        let (in_tx, in_rx) = mpsc::channel::<String>(RELAY_QUEUE_DEPTH);
+        let pump = tokio::spawn(pump(sink, source, out_rx, in_tx, timeouts.write));
+        Self {
             handle: Handle::current(),
             tx: out_tx,
             rx: in_rx,
-        })
+            pump: pump.abort_handle(),
+            timeouts,
+        }
+    }
+}
+
+/// Move frames between the socket halves and the adapter's queues. The writer
+/// and reader run as two concurrent futures, so neither waits on the other.
+/// Returning drops both halves, the socket and both channel ends, which the
+/// adapter sees as a closed connection.
+async fn pump<Si, St, E>(
+    mut sink: Si,
+    mut source: St,
+    mut out_rx: mpsc::Receiver<String>,
+    in_tx: mpsc::Sender<String>,
+    write_timeout: Duration,
+) where
+    Si: Sink<Message> + Unpin,
+    St: Stream<Item = Result<Message, E>> + Unpin,
+{
+    let writer = async move {
+        while let Some(text) = out_rx.recv().await {
+            match tokio::time::timeout(write_timeout, sink.send(Message::Text(text.into()))).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return,
+                Err(_elapsed) => {
+                    debug!(target: "agent", "relay write timed out; closing the connection");
+                    return;
+                }
+            }
+        }
+        // Adapter dropped: close the socket, bounded like any other write.
+        let _ = tokio::time::timeout(write_timeout, sink.send(Message::Close(None))).await;
+    };
+    let reader = async move {
+        while let Some(inbound) = source.next().await {
+            match inbound {
+                Ok(Message::Text(t)) => {
+                    if in_tx.send(t.to_string()).await.is_err() {
+                        return;
+                    }
+                }
+                // Non-text frames are not part of relay.v1; ignore.
+                Ok(
+                    Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_),
+                ) => {}
+                Ok(Message::Close(_)) | Err(_) => return,
+            }
+        }
+    };
+    // Neither half waits on the other. Whichever ends first ends the
+    // connection: returning drops both halves, the socket and both channel ends.
+    tokio::select! {
+        () = writer => {}
+        () = reader => {}
     }
 }
 
@@ -121,6 +206,7 @@ impl WsConn for RealWsConn {
         }
         let tx = self.tx.clone();
         let handle = &self.handle;
+        let send_timeout = self.timeouts.send;
         // See the module doc: the session loop that drives this seam runs as
         // a normal async task (`tokio::spawn`), not a bare OS thread, so a
         // bare `handle.block_on` here would nest inside the task's own poll
@@ -128,39 +214,53 @@ impl WsConn for RealWsConn {
         // `block_in_place` is Tokio's documented escape hatch for exactly
         // this: it hands this worker's other tasks off to the rest of the
         // multi-thread pool for the closure's duration, making a nested
-        // `block_on` legal again.
-        tokio::task::block_in_place(|| handle.block_on(async move { tx.send(s).await }))
-            .map_err(|_| RelayError::Transport("relay send channel closed".to_string()))
-    }
-
-    fn recv_text(&mut self) -> Result<Option<String>, RelayError> {
-        // `None` from the pump (channel closed OR explicit close sentinel) maps
-        // to a closed connection — the session driver treats `Ok(None)` as
-        // drained and the component reconnects.
-        let handle = &self.handle;
-        let rx = &mut self.rx;
-        match tokio::task::block_in_place(|| handle.block_on(rx.recv())) {
-            Some(Some(text)) => Ok(Some(text)),
-            Some(None) | None => Ok(None),
+        // `block_on` legal again. The wait is bounded, so the call always
+        // returns to the async caller within `send`.
+        let sent = tokio::task::block_in_place(|| {
+            handle.block_on(tokio::time::timeout(send_timeout, tx.send(s)))
+        });
+        match sent {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(RelayError::Transport(
+                "relay send channel closed".to_string(),
+            )),
+            Err(_elapsed) => {
+                // The relay is not draining its queue. Drop the socket now
+                // rather than wait for the pump's own write deadline.
+                self.pump.abort();
+                Err(RelayError::Transport("relay send timed out".to_string()))
+            }
         }
     }
 
-    fn recv_text_within(
-        &mut self,
-        timeout: std::time::Duration,
-    ) -> Result<RecvOutcome, RelayError> {
+    /// Bounded by [`RelayTimeouts::hello`]: the relay protocol's only blocking
+    /// receive is the opening `hello`, and a relay that withholds it must not
+    /// hold the session.
+    fn recv_text(&mut self) -> Result<Option<String>, RelayError> {
+        match self.recv_text_within(self.timeouts.hello)? {
+            RecvOutcome::Frame(text) => Ok(Some(text)),
+            RecvOutcome::Closed => Ok(None),
+            RecvOutcome::Quiet => Err(RelayError::Transport("relay receive timed out".to_string())),
+        }
+    }
+
+    fn recv_text_within(&mut self, timeout: Duration) -> Result<RecvOutcome, RelayError> {
         let handle = &self.handle;
         let rx = &mut self.rx;
         let out = tokio::task::block_in_place(|| {
             handle.block_on(async move {
                 match tokio::time::timeout(timeout, rx.recv()).await {
                     Err(_elapsed) => RecvOutcome::Quiet,
-                    Ok(Some(Some(text))) => RecvOutcome::Frame(text),
-                    Ok(Some(None)) | Ok(None) => RecvOutcome::Closed,
+                    Ok(Some(text)) => RecvOutcome::Frame(text),
+                    Ok(None) => RecvOutcome::Closed,
                 }
             })
         });
         Ok(out)
+    }
+
+    fn send_capacity(&self) -> Option<usize> {
+        Some(self.tx.capacity())
     }
 }
 
@@ -272,7 +372,7 @@ mod tests {
         // send_text/recv_text from *inside* a spawned task, not the test's
         // own root task.
         let client = tokio::spawn(async move {
-            let mut conn = RealWsConn::connect(&format!("ws://{addr}"))
+            let mut conn = RealWsConn::connect(&format!("ws://{addr}"), RelayTimeouts::default())
                 .await
                 .expect("connect");
             conn.send_text("hello".to_string()).expect("send_text");
@@ -281,5 +381,343 @@ mod tests {
 
         let received = client.await.expect("client task panicked");
         assert_eq!(received, Some("hello".to_string()));
+    }
+
+    // ── PAN-102: bounded, decoupled relay IO ─────────────────────────────
+
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use std::time::Instant;
+    use tokio::net::TcpListener;
+
+    /// A frame comfortably under `MAX_FRAME_BYTES`, large enough to fill
+    /// socket buffers quickly.
+    const BIG_FRAME: usize = 60_000;
+
+    /// Short deadlines for tests; each test overrides what it exercises.
+    fn test_timeouts() -> RelayTimeouts {
+        RelayTimeouts {
+            connect: Duration::from_secs(5),
+            hello: Duration::from_secs(5),
+            send: Duration::from_secs(5),
+            write: Duration::from_secs(5),
+        }
+    }
+
+    /// A socket sink that never accepts a frame (`poll_ready` stays pending),
+    /// like a relay that stopped reading once the kernel buffers filled.
+    struct StalledSink;
+
+    impl Sink<Message> for StalledSink {
+        type Error = std::io::Error;
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+        fn start_send(self: Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    type InboundItem = Result<Message, std::io::Error>;
+
+    /// An inbound source that never yields.
+    fn silent_source() -> futures_util::stream::Pending<InboundItem> {
+        futures_util::stream::pending()
+    }
+
+    /// Bind a local listener and return it with its `ws://` URL.
+    async fn local_relay() -> (TcpListener, String) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        (listener, url)
+    }
+
+    /// The headline property: with the relay no longer reading (so the
+    /// pump's socket write is stuck), an inbound frame still reaches the
+    /// adapter promptly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_frames_still_arrive_while_a_relay_write_is_stalled() {
+        let (listener, url) = local_relay().await;
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        // Relay: never reads; sends `disarm` when signalled, then holds the socket.
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let (mut sink, _source) = ws.split();
+            let _ = go_rx.await;
+            sink.send(Message::Text("disarm".into())).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let client = tokio::spawn(async move {
+            let timeouts = RelayTimeouts {
+                write: Duration::from_secs(30),
+                send: Duration::from_secs(30),
+                ..test_timeouts()
+            };
+            let mut conn = RealWsConn::connect(&url, timeouts).await.expect("connect");
+            let frame = "x".repeat(BIG_FRAME);
+            let mut pushed = 0;
+            // Push until the queue stops draining: the writer may only be
+            // behind at first, so re-check after a pause.
+            loop {
+                while conn.send_capacity() >= Some(8) && pushed < 3000 {
+                    conn.send_text(frame.clone()).expect("queue has room");
+                    pushed += 1;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if conn.send_capacity() < Some(16) || pushed >= 3000 {
+                    break;
+                }
+            }
+            assert!(
+                conn.send_capacity() < Some(16),
+                "the writer is stuck (pushed {pushed} frames, capacity {:?})",
+                conn.send_capacity()
+            );
+            go_tx.send(()).unwrap();
+            let t0 = Instant::now();
+            let got = conn.recv_text_within(Duration::from_secs(3)).unwrap();
+            assert!(
+                matches!(&got, RecvOutcome::Frame(f) if f == "disarm"),
+                "inbound frame must arrive while the write is stalled, got {got:?}"
+            );
+            assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
+        });
+        tokio::time::timeout(Duration::from_secs(30), client)
+            .await
+            .expect("test hung")
+            .expect("client task panicked");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn relay_write_that_cannot_flush_closes_the_connection() {
+        let (listener, url) = local_relay().await;
+        // Relay: never reads; holds the socket.
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let _ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let client = tokio::spawn(async move {
+            let timeouts = RelayTimeouts {
+                write: Duration::from_millis(300),
+                send: Duration::from_millis(300),
+                ..test_timeouts()
+            };
+            let mut conn = RealWsConn::connect(&url, timeouts).await.expect("connect");
+            let frame = "x".repeat(BIG_FRAME);
+            let t0 = Instant::now();
+            let mut failed = None;
+            for _ in 0..5000 {
+                if let Err(e) = conn.send_text(frame.clone()) {
+                    failed = Some(e);
+                    break;
+                }
+            }
+            assert!(
+                matches!(failed, Some(RelayError::Transport(_))),
+                "sends must start failing once the relay stops reading: {failed:?}"
+            );
+            assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+            let got = conn.recv_text_within(Duration::from_secs(1)).unwrap();
+            assert!(matches!(got, RecvOutcome::Closed), "got {got:?}");
+        });
+        tokio::time::timeout(Duration::from_secs(30), client)
+            .await
+            .expect("test hung")
+            .expect("client task panicked");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_text_times_out_and_aborts_the_connection_when_the_queue_stays_full() {
+        let client = tokio::spawn(async move {
+            let timeouts = RelayTimeouts {
+                send: Duration::from_millis(200),
+                write: Duration::from_secs(60),
+                ..test_timeouts()
+            };
+            let mut conn = RealWsConn::spawn(StalledSink, silent_source(), timeouts);
+            // Fill the queue; the first send that finds no room is under test.
+            while conn.send_capacity() > Some(0) {
+                conn.send_text("x".to_string()).expect("queue has room");
+            }
+            let t0 = Instant::now();
+            match conn.send_text("x".to_string()) {
+                Err(RelayError::Transport(msg)) => assert!(msg.contains("timed out"), "{msg}"),
+                other => panic!("expected a send timeout, got {other:?}"),
+            }
+            let waited = t0.elapsed();
+            assert!(waited >= Duration::from_millis(200), "{waited:?}");
+            assert!(waited < Duration::from_secs(2), "{waited:?}");
+
+            let t1 = Instant::now();
+            assert!(conn.send_text("x".to_string()).is_err());
+            assert!(
+                t1.elapsed() < Duration::from_millis(100),
+                "{:?}",
+                t1.elapsed()
+            );
+
+            let t2 = Instant::now();
+            let got = conn.recv_text_within(Duration::from_secs(1)).unwrap();
+            assert!(
+                matches!(got, RecvOutcome::Closed),
+                "pump aborted, got {got:?}"
+            );
+            assert!(
+                t2.elapsed() < Duration::from_millis(100),
+                "{:?}",
+                t2.elapsed()
+            );
+        });
+        tokio::time::timeout(Duration::from_secs(10), client)
+            .await
+            .expect("test hung")
+            .expect("client task panicked");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pump_write_timeout_ends_the_connection() {
+        let client = tokio::spawn(async move {
+            let timeouts = RelayTimeouts {
+                write: Duration::from_millis(200),
+                send: Duration::from_secs(5),
+                ..test_timeouts()
+            };
+            let mut conn = RealWsConn::spawn(StalledSink, silent_source(), timeouts);
+            conn.send_text("x".to_string()).expect("queued");
+            let t0 = Instant::now();
+            let got = conn.recv_text_within(Duration::from_secs(2)).unwrap();
+            assert!(matches!(got, RecvOutcome::Closed), "got {got:?}");
+            assert!(
+                t0.elapsed() < Duration::from_millis(1500),
+                "{:?}",
+                t0.elapsed()
+            );
+            assert!(conn.send_text("x".to_string()).is_err());
+        });
+        tokio::time::timeout(Duration::from_secs(10), client)
+            .await
+            .expect("test hung")
+            .expect("client task panicked");
+    }
+
+    /// Deterministic twin of the real-socket test above.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pump_delivers_inbound_while_its_writer_is_stuck() {
+        let (in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel::<InboundItem>();
+        let source = futures_util::stream::poll_fn(move |cx| in_rx.poll_recv(cx));
+        let client = tokio::spawn(async move {
+            let timeouts = RelayTimeouts {
+                write: Duration::from_secs(60),
+                ..test_timeouts()
+            };
+            let mut conn = RealWsConn::spawn(StalledSink, source, timeouts);
+            conn.send_text("x".to_string()).expect("queued");
+            // Once the writer has taken the frame off the queue it is stuck
+            // in `poll_ready`; only then does the inbound frame arrive.
+            while conn.send_capacity() < Some(RELAY_QUEUE_DEPTH) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            in_tx.send(Ok(Message::Text("disarm".into()))).unwrap();
+            let got = conn.recv_text_within(Duration::from_secs(1)).unwrap();
+            assert!(
+                matches!(&got, RecvOutcome::Frame(f) if f == "disarm"),
+                "got {got:?}"
+            );
+        });
+        tokio::time::timeout(Duration::from_secs(10), client)
+            .await
+            .expect("test hung")
+            .expect("client task panicked");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connect_times_out_when_the_websocket_upgrade_never_completes() {
+        let (listener, url) = local_relay().await;
+        // Accepts TCP and never answers the HTTP upgrade.
+        tokio::spawn(async move {
+            let (_tcp, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let timeouts = RelayTimeouts {
+            connect: Duration::from_millis(300),
+            ..test_timeouts()
+        };
+        let t0 = Instant::now();
+        let res =
+            tokio::time::timeout(Duration::from_secs(10), RealWsConn::connect(&url, timeouts))
+                .await
+                .expect("connect must not hang");
+        match res {
+            Err(RelayError::Transport(msg)) => assert!(msg.contains("timed out"), "{msg}"),
+            Err(other) => panic!("expected a connect timeout, got {other:?}"),
+            Ok(_) => panic!("expected a connect timeout, got a connection"),
+        }
+        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recv_text_is_bounded_by_the_hello_timeout() {
+        let (listener, url) = local_relay().await;
+        // Upgrades, then sends nothing.
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let _ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let client = tokio::spawn(async move {
+            let timeouts = RelayTimeouts {
+                hello: Duration::from_millis(300),
+                ..test_timeouts()
+            };
+            let mut conn = RealWsConn::connect(&url, timeouts).await.expect("connect");
+            let t0 = Instant::now();
+            match conn.recv_text() {
+                Err(RelayError::Transport(msg)) => assert_eq!(msg, "relay receive timed out"),
+                other => panic!("expected a receive timeout, got {other:?}"),
+            }
+            assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+        });
+        tokio::time::timeout(Duration::from_secs(10), client)
+            .await
+            .expect("test hung")
+            .expect("client task panicked");
+    }
+
+    #[test]
+    fn relay_timeouts_drop_a_stalled_relay_before_the_dead_man_window() {
+        use pancetta_agent::arm::HEARTBEAT_TIMEOUT_MS;
+        let t = RelayTimeouts::default();
+        for (name, d) in [
+            ("connect", t.connect),
+            ("hello", t.hello),
+            ("send", t.send),
+            ("write", t.write),
+        ] {
+            let ms = i64::try_from(d.as_millis()).unwrap();
+            assert!(ms > 0, "{name} must be a real deadline");
+            assert!(
+                ms < HEARTBEAT_TIMEOUT_MS,
+                "{name} ({ms} ms) must expire before the dead-man window"
+            );
+        }
     }
 }
