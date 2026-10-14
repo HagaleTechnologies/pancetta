@@ -3219,14 +3219,11 @@ mod tests {
         );
     }
 
-    /// Round-4 regression: `[network.remote_gateway].enabled = true` under
-    /// `--replay` must never bind a listener or feed one, even though
-    /// neither `start_display_feed` nor `start_remote_gateway_component`
-    /// consult `replay_mode` through the same `config.network.remote_gateway
-    /// .enabled` flag every other outbound integration in this list checks.
-    /// `bind_addr` is pinned to an ephemeral loopback port so a live run
-    /// would succeed here too — the assertion is entirely on replay-mode
-    /// behavior, not on some other reason the bind failed.
+    /// Build a coordinator with the given gateway bind/token, start the
+    /// display feed, and assert how many `RemoteGateway` tasks
+    /// `start_remote_gateway_component` added: 0 when the fail-closed
+    /// backstop refuses the config (no token, or a non-loopback bind
+    /// without opt-in), 1 when it binds.
     async fn assert_remote_gateway_task_count(
         bind: &str,
         token: Option<&str>,
@@ -3278,6 +3275,14 @@ mod tests {
         .await;
     }
 
+    /// Round-4 regression: `[network.remote_gateway].enabled = true` under
+    /// `--replay` must never bind a listener or feed one, even though
+    /// neither `start_display_feed` nor `start_remote_gateway_component`
+    /// consult `replay_mode` through the same `config.network.remote_gateway
+    /// .enabled` flag every other outbound integration in this list checks.
+    /// No `auth_token` is set: the component's `replay_mode()` early return
+    /// precedes its config re-validation, so the assertion below is entirely
+    /// on replay-mode behavior.
     #[tokio::test]
     async fn replay_mode_suppresses_remote_gateway_even_when_configured_enabled() {
         let mut config = Config::default();

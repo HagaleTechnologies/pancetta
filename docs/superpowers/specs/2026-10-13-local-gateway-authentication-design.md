@@ -63,7 +63,7 @@ Reject a browser Origin with HTTP 403 and body `origin not allowed`. Authenticat
 
 A loopback listener logs INFO `remote_gateway listening on ws://<local>/ws (read-only, loopback only, clients must authenticate)`. A network listener logs WARN `remote_gateway listening on ws://<local>/ws (read-only, NETWORK-EXPOSED by allow_network_exposure, unencrypted, clients must authenticate)`. Use the actual local address, including an assigned port.
 
-Origin refusal logs WARN `remote_gateway refused a browser connection from origin <origin> (not in allowed_origins)`. Admission refusal logs WARN `remote_gateway closed a connection that did not authenticate (<reason>)`. Reasons are `no hello in time`, `first frame was not a hello`, `hello carried no gatewayToken`, `gatewayToken did not match`, and `client closed before hello`.
+Origin refusal logs WARN `remote_gateway refused a browser connection from origin <origin> (not in allowed_origins)`. Admission refusal logs WARN `remote_gateway closed a connection that did not authenticate (<reason>)`. Reasons are `no hello in time`, `first frame was not a hello`, `hello carried no gatewayToken`, `gatewayToken did not match`, `client closed before hello`, and `connection error before hello` (a socket that errored, e.g. an oversized first frame). The last two reasons describe a peer or socket that can no longer accept a close frame, so no 1008 is written for them.
 
 ## Alternatives considered
 

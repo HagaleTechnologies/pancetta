@@ -23,6 +23,10 @@ pub(crate) enum AuthFailure {
     MissingToken,
     WrongToken,
     ClosedBeforeHello,
+    /// The socket errored before a hello arrived (e.g. an oversized frame
+    /// tripping `MAX_INBOUND_BYTES`, or a protocol violation) — distinct from
+    /// a clean peer close so the log names the real cause.
+    ConnectionErrorBeforeHello,
 }
 
 impl AuthFailure {
@@ -33,6 +37,7 @@ impl AuthFailure {
             Self::MissingToken => "hello carried no gatewayToken",
             Self::WrongToken => "gatewayToken did not match",
             Self::ClosedBeforeHello => "client closed before hello",
+            Self::ConnectionErrorBeforeHello => "connection error before hello",
         }
     }
 }

@@ -80,6 +80,9 @@ pub(crate) struct GatewayState {
     pub snapshot: Arc<RwLock<StateSnapshot>>,
     /// Server version string embedded in the `Welcome` frame.
     pub server_version: String,
+    /// Admission policy applied to every connection: the browser-Origin
+    /// allow-list (before upgrade) and the `hello` gateway token (before
+    /// any station data is sent).
     pub auth: auth::GatewayAuth,
 }
 
@@ -119,9 +122,10 @@ async fn await_authenticated_hello(
             Ok(Some(Ok(Message::Text(text)))) => return auth.check_hello(&text),
             Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
             Ok(Some(Ok(Message::Binary(_)))) => return Err(auth::AuthFailure::NotHello),
-            Ok(Some(Ok(Message::Close(_))) | Some(Err(_)) | None) => {
+            Ok(Some(Ok(Message::Close(_))) | None) => {
                 return Err(auth::AuthFailure::ClosedBeforeHello)
             }
+            Ok(Some(Err(_))) => return Err(auth::AuthFailure::ConnectionErrorBeforeHello),
         }
     }
 }
@@ -132,7 +136,14 @@ async fn handle_socket(mut socket: WebSocket, state: GatewayState) {
             "remote_gateway closed a connection that did not authenticate ({})",
             why.as_str()
         );
-        if !matches!(why, auth::AuthFailure::ClosedBeforeHello) {
+        // No Close frame for a peer that is already gone or whose socket has
+        // errored (e.g. an oversized first frame) — the write would be
+        // pointless or fail, and 1008 "authentication required" would
+        // mislabel a size/protocol failure.
+        if !matches!(
+            why,
+            auth::AuthFailure::ClosedBeforeHello | auth::AuthFailure::ConnectionErrorBeforeHello
+        ) {
             let _ = socket
                 .send(Message::Close(Some(CloseFrame {
                     code: close_code::POLICY,
