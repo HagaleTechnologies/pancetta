@@ -24,7 +24,7 @@ def disposition($s):
 | ($s | ineligible_reasons) as $reasons
 | {number: $s.pr.number, eligible: ($reasons | length == 0), ineligible_reasons: $reasons,
    codex_rounds: ($s.codex_review_commits | unique | length), resolve: [],
-   rerun_codex_verdict: false, rerun_ci_failed_jobs: false, clear_pause: false,
+   request_codex_verdict: false, rerun_ci_failed_jobs: false, clear_pause: false,
    arm: false, disarm: false, blockers: [], report: false}
 | if .eligible | not then . else
     [$s.threads[] | select(.isResolved | not) | disposition($s)] as $dispositions
@@ -33,25 +33,31 @@ def disposition($s):
     | . as $d
     | ([$s.required_checks[] | select(.name == "Codex review clean (gate before expensive downstream jobs)")][0] // {}) as $codex
     | ([$s.required_checks[] | select(.name == "CI")][0] // {}) as $ci
-    | .rerun_codex_verdict = ($codex.conclusion == "failure" and
-        (($s.codex_run.attempt // 1) < 2) and
-        $codex.title == "Codex raised new concerns" and
+    # Q-0068: a Codex findings review no longer fires the response job, so the gate stays
+    # pending (null) on the head Codex reviewed; an older response may have failed it instead.
+    # Either way, once every Codex thread carries a disposition, ask for a fresh verdict, at
+    # most refresh_budget times per head.
+    | .request_codex_verdict = (
+        (($codex.conclusion == "failure" and $codex.title == "Codex raised new concerns") or
+          ($codex.conclusion == null and ($s.codex_review_commits | index($s.pr.headRefOid)) != null)) and
+        (($s.refresh_count_for_head // 0) < $s.config.refresh_budget) and
         all($s.threads[] | select((.isResolved | not) and (.opener | codex_login));
           .id as $id | any($d.resolve[]; .thread_id == $id)))
     | .rerun_ci_failed_jobs = ($ci.conclusion == "failure" and
         (($s.ci_run.attempt // 1) < 2) and
         ($s.ci_failed_jobs | length > 0) and
         ($s.ci_failed_jobs - ["Codex-clean label gate (waits for wait-for-codex.yml's verdict)", "CI"] | length == 0) and
-        (($s.pr.labels | index("codex-clean:" + $s.pr.headRefOid[0:12])) != null or .rerun_codex_verdict))
+        (($s.pr.labels | index("codex-clean:" + $s.pr.headRefOid[0:12])) != null or .request_codex_verdict))
     | . as $d
     | .blockers += [$s.required_checks[]
         | select(.conclusion != null)
         | select(.conclusion as $c | ["success", "skipped", "neutral"] | index($c) == null)
-        | select((.name == $codex.name and $d.rerun_codex_verdict or .name == "CI" and $d.rerun_ci_failed_jobs) | not)
+        | select((.name == $codex.name and $d.request_codex_verdict or .name == "CI" and $d.rerun_ci_failed_jobs) | not)
         | {kind: "check-failing", name}]
     # Missing, queued and in-progress required checks have a null conclusion; list them so a
     # PR that waits on one past the stuck threshold is still reported.
-    | .blockers += [$s.required_checks[] | select(.conclusion == null) | {kind: "check-pending", name}]
+    | .blockers += [$s.required_checks[] | select(.conclusion == null) |
+        select((.name == $codex.name and $d.request_codex_verdict) | not) | {kind: "check-pending", name}]
     # Every shepherd arm records an attempt marker first, so the budget applies whether or not
     # the pause label is still present (a failed arm after clearing the pause leaves none).
     | ($s.rearm_count_for_head >= $s.config.rearm_budget) as $spent

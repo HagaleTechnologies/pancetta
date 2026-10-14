@@ -3,7 +3,8 @@ name: Research Scan Shepherd
 # PAN-172: the weekly pancetta-research-scan routine opens a notes-only PR and stops.
 # This workflow owns the mechanical half of landing it: resolve Codex threads whose
 # latest reply is a verified disposition (docs/routines/pancetta-research-scan.md),
-# refresh the Codex verdict and CI after deferrals, re-arm auto-merge after a merge-queue
+# request a fresh Codex verdict (Q-0068: a new `@codex review` comment, once per head,
+# never a rerun) and rerun failed CI after deferrals, re-arm auto-merge after a merge-queue
 # ejection, and report a PR stuck for more than a day. The judgment half (fix or defer,
 # the PAN ticket, the reply) stays in the routine. Scope: open PRs titled
 # "Weekly research scan YYYY-MM-DD", same-repo, author on auto-merge-trigger.yml's

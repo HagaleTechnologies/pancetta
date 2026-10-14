@@ -8,7 +8,8 @@
     "title_regex": "^Weekly research scan [0-9]{4}-[0-9]{2}-[0-9]{2}$",
     "rearm_budget": 2,
     "stuck_after_hours": 24,
-    "round_cap": 3
+    "round_cap": 3,
+    "refresh_budget": 1
   },
   "pr": {
     "number": 420,

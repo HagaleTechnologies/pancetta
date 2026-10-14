@@ -46,9 +46,16 @@ when 'B'
 when 'C', 'M', 'N'
   resolves = calls.each_index.select { |i| calls[i]['args'].join(' ').include?('resolveReviewThread(') }
   raise 'resolve count/token' unless resolves.length == 2 && resolves.all? { |i| calls[i]['token'] == 'test-user-token' }
-  codex = find.call('run rerun 802'); ci = find.call('run rerun 801 --failed')
-  raise 'refresh order' unless resolves.max < codex && codex < ci
-  raise 'reran human review' if calls.any? { |c| c['args'][0,3] == ['run','rerun','803'] }
+  # Q-0068: a fresh request (audit marker, "@codex review", head marker), never a rerun.
+  audit = find.call('<!-- research-scan-shepherd:refresh sha=1a2b3c400000 -->')
+  request = find.call('body=@codex review')
+  marker = find.call('body=<!-- codex-review-request head_sha=1a2b3c4000000000000000000000000000000000 -->')
+  ci = find.call('run rerun 801 --failed')
+  raise 'refresh order' unless resolves.max < audit && audit < request && request < marker && marker < ci
+  raise 'request identity' unless calls[request]['token'] == 'test-user-token' && calls[marker]['token'] == 'test-user-token'
+  raise 'audit identity' unless calls[audit]['token'] == 'test-workflow-token'
+  raise 'reran a Codex run' if calls.any? { |c| c['args'][0,2] == ['run','rerun'] && !c['args'].include?('--failed') }
+  raise 'looked up a pull_request_review run' if calls.any? { |c| c['args'].join(' ').include?('event=pull_request_review') }
 when 'D'
   find.call('label create research-scan-stuck')
   find.call('issue create')
