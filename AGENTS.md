@@ -64,6 +64,7 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 - Remote gateway bus sends are additive-only; `pancetta-tui` behavior stays byte-identical.
 - The armed-TX gate fails CLOSED (poisoned lock ⇒ no remote TX) and ANDs under `TxPolicy`; no remote QSO frame is ever emitted as `TxOrigin::Local`.
 - Remote peers are identified only by the keyId proven in their Noise msg1 (relay `src` is routing metadata), and nothing is sent to a peer until it holds a currently-valid `status`+ capability from a verified `hello`.
+- A remote peer's authority (admission, token expiry, revoked jti, scope) is re-checked on every action and every outbound frame; an authorization refresh that drops a peer evicts its live session, deny-lists its hello token, and disarms it if it held control (PAN-96).
 - Drop-stale-TX: the worker re-checks QSO liveness at the last instant before PTT.
 - The TX hard mute (`tx_hard_mute_reason`) also refuses while the rig CAT link is `PollingFailed` or the audio output has stopped calling back (PAN-115). Both clear on their own when the link/device recovers, and the Hamlib poll loop must keep redialling rigctld while disconnected.
 - `mode=FT8` paths must remain byte-identical when FT4/FT2 features are untouched.

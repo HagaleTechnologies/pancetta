@@ -195,6 +195,9 @@ fn happy_path_mints_verified_arm_grant() {
     .expect("valid capability + grant must verify");
     assert_eq!(out.operator_callsign, OPERATOR);
     assert_eq!(out.ttl_ms, 300_000);
+    // PAN-97: the signed absolute deadline and cadence survive verification.
+    assert_eq!(out.armed_until_ms, NOW_MS + 300_000);
+    assert_eq!(out.heartbeat_interval_sec, 10);
     assert!(out.scope_tx);
 }
 
@@ -622,6 +625,12 @@ fn grant_heartbeat_bounds_are_exact() {
 
     assert!(check(5).is_ok(), "hb=5 (min) accepted");
     assert!(check(15).is_ok(), "hb=15 (max) accepted");
+    // PAN-97: each accepted cadence is retained verbatim on the grant.
+    for hb in [5, 10, 15] {
+        let out = check(hb).expect("in-range cadence verifies");
+        assert_eq!(out.heartbeat_interval_sec, hb);
+        assert_eq!(out.armed_until_ms, NOW_MS + 300_000);
+    }
     assert_eq!(check(4), Err(CapError::BadHeartbeat), "hb=4 rejected");
     assert_eq!(check(16), Err(CapError::BadHeartbeat), "hb=16 rejected");
 }

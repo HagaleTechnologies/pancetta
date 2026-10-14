@@ -135,18 +135,18 @@ impl super::ApplicationCoordinator {
             cfg.destination, cfg.instance_id
         );
 
-        // Design spec Option A audit: when `allow_tx_initiation` is on, the
-        // shared remote-TX arm was seeded by THIS channel (see the constructor
-        // + station-agent seeding sites). Surface it as a startup diagnostic so
-        // the operator sees, in the TUI, that a GridTracker/UDP Reply can now
-        // initiate an (arm-gated) on-air QSO — matching the warn! logged at
-        // seed time.
+        // When `allow_tx_initiation` is on, THIS channel's own remote-TX
+        // consent bit in the shared arm is on (see the constructor +
+        // station-agent seeding sites; consent is per channel, PAN-98).
+        // Surface it as a startup diagnostic so the operator sees, in the TUI,
+        // that a GridTracker/UDP Reply can now initiate an (arm-gated) on-air
+        // QSO.
         if cfg.allow_tx_initiation {
             emit_diagnostic(
                 &self.message_bus,
                 DiagnosticLevel::Warn,
-                "remote-TX arm seeded by [network.wsjtx_udp].allow_tx_initiation \
-                 — UDP Reply may initiate QSOs"
+                "WSJT-X UDP remote-TX consent on ([network.wsjtx_udp].allow_tx_initiation) \
+                 — UDP Reply may initiate arm-gated QSOs"
                     .to_string(),
             )
             .await;
@@ -1073,23 +1073,6 @@ fn normalize_qrz(message: &str) -> String {
     } else {
         format!("CQ {rest}")
     }
-}
-
-/// Option A of the design spec's arm-gate decision: the shared
-/// `remote_tx_arm` local-consent bit is seeded true when EITHER channel's
-/// operator consent is on — the station agent's `remote_tx_enabled` OR the
-/// WSJT-X-UDP `allow_tx_initiation`. The arm is the operator's
-/// channel-independent "I consent to remote TX" last line; each channel still
-/// carries its own upstream consent (this returns only the *arm* seed, not a
-/// bypass) and source filtering. Pure, so the seeding rule is unit-tested
-/// directly. Used at BOTH `set_local_consent` sites (coordinator constructor
-/// and `start_station_agent_component`) so the later seed never clobbers the
-/// wsjtx contribution.
-pub(crate) fn remote_tx_arm_consent(
-    station_agent_enabled: bool,
-    wsjtx_allow_tx_initiation: bool,
-) -> bool {
-    station_agent_enabled || wsjtx_allow_tx_initiation
 }
 
 /// Julian Day Number for a UTC instant's calendar date (protocol notes §3
@@ -2292,17 +2275,6 @@ mod reply_tests {
         let ring = VecDeque::new();
         assert!(reply_to_call(&InMsg::Replay, &ring).is_none());
         assert!(reply_to_call(&InMsg::Close, &ring).is_none());
-    }
-
-    #[test]
-    fn remote_tx_arm_consent_is_the_or_of_both_channels() {
-        // Option A: the wsjtx flag alone seeds (arms) the shared consent.
-        assert!(remote_tx_arm_consent(false, true));
-        // Station-agent flag alone still seeds it (unchanged behavior).
-        assert!(remote_tx_arm_consent(true, false));
-        assert!(remote_tx_arm_consent(true, true));
-        // Both off ⇒ not seeded (fail-closed default).
-        assert!(!remote_tx_arm_consent(false, false));
     }
 }
 

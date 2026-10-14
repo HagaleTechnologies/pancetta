@@ -88,6 +88,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Turning Fox mode off (Shift+X) no longer cuts the Hound contacts already in
+  progress down to one transmitted stream; they keep transmitting until they
+  finish, while new QSOs wait for the normal `max_concurrent_qsos` limit
+  (PAN-76).
+
+- Narrow terminals keep the station state that matters (PAN-88). At 80×24
+  and 100×30 the title bar now always shows the UTC clock, callsign and TX
+  policy, and drops lower-priority chips in a documented order instead of
+  pushing the clock off the right edge. DX Hunter and Callers hide
+  lower-priority columns instead of cutting headings to single letters
+  (`G S R R L P`). The footer key hints fit at 80 columns, and `?` help
+  scrolls (↑/↓, PgUp/PgDn, Home/End) and always names `Shift+Q`. Nothing
+  changes at sizes where everything already fit.
+
 - A QSO whose frame the TX worker drops before it reaches the air (concurrent-QSO cap, F8 abort, supersede, arm or mute refusal) no longer spends a call from its keep-calling budget, advances the stall detector toward a TX-offset switch, or shows the unsent frame as sent (PAN-75).
 
 - Ctrl/Alt chords no longer trigger transmit keys at the main view (PAN-112).
@@ -169,6 +183,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - Station agent: a remote client must now prove its device identity inside the encrypted handshake, and it receives station data only after a valid `hello`; clients must be updated to connect (PAN-95).
+- Station agent: remote clients' authority is now re-checked on every use, and an authorization refresh applies to already-connected clients immediately (PAN-96).
+- Remote-TX consent is now tracked per channel: `[network.station_agent].remote_tx_enabled` alone governs arming, TX requests and transmission over the station agent, and `[network.wsjtx_udp].allow_tx_initiation` governs only WSJT-X UDP Reply-initiated TX. With `remote_tx_enabled = false` nothing can arm, so Reply-initiated QSOs no longer transmit; set `remote_tx_enabled = true` to allow remote TX (PAN-98).
 
 ## [0.9.6] - 2026-09-02
 

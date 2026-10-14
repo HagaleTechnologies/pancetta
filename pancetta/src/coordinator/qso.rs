@@ -801,7 +801,7 @@ async fn maybe_auto_resend_73(
     if entry_remote_origin
         && !crate::coordinator::tx::remote_tx_permitted_for(
             remote_tx_arm,
-            chrono::Utc::now().timestamp_millis(),
+            pancetta_agent::arm::ArmTime::now,
             entry_remote_client_key_id.as_deref(),
         )
     {
@@ -1139,6 +1139,84 @@ fn caller_creation_slot_key(timestamp: std::time::SystemTime) -> u64 {
         / 15
 }
 
+/// PAN-76: remember that Fox mode opened `qso_id`, so the TX worker keeps its
+/// stream after Fox mode is turned off. Called right after the open returns,
+/// before any `.await`.
+fn record_fox_admitted(
+    fox_admitted_qsos: &std::sync::RwLock<std::collections::HashSet<String>>,
+    qso_id: &pancetta_qso::QsoId,
+) {
+    if let Ok(mut set) = fox_admitted_qsos.write() {
+        set.insert(super::active_tx_qso_key(&qso_id.to_string()));
+    }
+}
+
+/// PAN-76: completed Fox-admitted Hounds still inside their 45 s completed
+/// grace. They have left the active set, but keep their Fox-admitted TX
+/// stream until the grace elapses so their final RR73/73 can air. Read from
+/// the QSO manager's own record (completed QSOs stay in its map with their
+/// `completed_at`; cancelled and failed ones leave it), so a Hound opened
+/// already complete counts the moment `respond_to_caller` returns, with no
+/// wait for the event forwarder, and stale Fox-set keys (never pruned) are
+/// inert. A poisoned Fox set reads as 0, i.e. no tighter than without it.
+async fn fox_grace_hound_count(
+    qso_manager: &pancetta_qso::QsoManager,
+    fox_admitted_qsos: &std::sync::RwLock<std::collections::HashSet<String>>,
+) -> usize {
+    let keys: Vec<String> = match fox_admitted_qsos.read() {
+        Ok(set) => set.iter().cloned().collect(),
+        Err(_) => return 0,
+    };
+    let now = chrono::Utc::now();
+    let mut count = 0usize;
+    for key in keys {
+        let Ok(id) = uuid::Uuid::parse_str(&key) else {
+            continue;
+        };
+        if let Ok(progress) = qso_manager.get_qso(id).await {
+            if let pancetta_qso::QsoState::Completed { completed_at, .. } = progress.state {
+                if now - completed_at <= pancetta_qso::qso_manager::COMPLETED_QSO_REWORK_GRACE {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
+}
+
+/// PAN-76: whether a Fox-admitted CQ is still calling, and how many
+/// Fox-admitted Hounds still hold a TX stream: the active (non-terminal)
+/// ones plus those in their completed grace ([`fox_grace_hound_count`]).
+/// A poisoned Fox set reads as empty, like the TX worker's reads of it.
+async fn fox_admitted_split(
+    qso_manager: &pancetta_qso::QsoManager,
+    fox_admitted_qsos: &std::sync::RwLock<std::collections::HashSet<String>>,
+) -> (bool, usize) {
+    let active = qso_manager.get_active_qsos().await;
+    let (cq_calling, active_hounds) = {
+        let Ok(fox) = fox_admitted_qsos.read() else {
+            return (false, 0);
+        };
+        let mut cq_calling = false;
+        let mut hounds = 0usize;
+        for (id, progress) in &active {
+            if !fox.contains(&super::active_tx_qso_key(&id.to_string())) {
+                continue;
+            }
+            if matches!(progress.state, pancetta_qso::QsoState::CallingCq { .. }) {
+                cq_calling = true;
+            } else {
+                hounds += 1;
+            }
+        }
+        (cq_calling, hounds)
+    };
+    (
+        cq_calling,
+        active_hounds + fox_grace_hound_count(qso_manager, fox_admitted_qsos).await,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn maybe_answer_caller(
     msg_type: &pancetta_qso::states::MessageType,
@@ -1152,6 +1230,7 @@ async fn maybe_answer_caller(
     message_bus: &MessageBus,
     fox_mode: &std::sync::atomic::AtomicBool,
     fox_max_streams: &std::sync::atomic::AtomicUsize,
+    fox_admitted_qsos: &std::sync::RwLock<std::collections::HashSet<String>>,
 ) {
     // 1. TX policy: DISABLED blocks; RESPOND-ONLY / FULL allow responses.
     let policy =
@@ -1225,8 +1304,13 @@ async fn maybe_answer_caller(
     } else {
         max_concurrent
     };
+    // PAN-76: Fox-admitted Hounds in their 45 s completed grace still hold a
+    // TX stream for their final RR73/73, so they count against the Fox cap
+    // too; otherwise a full fresh set of Hounds on top of them could reach
+    // the coalescer's hard clamp and cut those closing frames.
     let active_count = if is_fox {
         qso_manager.active_caller_qso_count().await
+            + fox_grace_hound_count(qso_manager, fox_admitted_qsos).await
     } else {
         qso_manager.active_qso_count().await
     };
@@ -1284,7 +1368,13 @@ async fn maybe_answer_caller(
         )
         .await
     {
-        Ok(_) => {
+        Ok(qso_id) => {
+            // PAN-76: `is_fox` is the snapshot the capacity check used, so a
+            // QSO admitted under Fox's raised cap is recorded even if Fox
+            // mode was turned off during the awaits since.
+            if is_fox {
+                record_fox_admitted(fox_admitted_qsos, &qso_id);
+            }
             emit_status(
                 message_bus,
                 format!("Answering {} (caller)", answer.their_call),
@@ -2495,6 +2585,10 @@ impl super::ApplicationCoordinator {
         // gate. The QSO component keeps it in sync from the QsoEvent stream
         // below.
         let active_tx_qsos = self.active_tx_qsos.clone();
+        // PAN-76: QSOs Fox mode opened. Written by the Fox engage arm and
+        // `maybe_answer_caller`; drained by the event forwarder below at the
+        // same points as `active_tx_qsos`.
+        let fox_admitted_qsos = self.fox_admitted_qsos.clone();
         // FQ-F3: active QSO id -> TX offset (Hz), mirroring `active_tx_qsos`'s
         // exact insert/remove points (including the 45s completed-grace
         // window) so the autonomous frequency allocator's own-frequency
@@ -2618,7 +2712,7 @@ impl super::ApplicationCoordinator {
                 move |remote_client_key_id: Option<&str>| {
                     crate::coordinator::tx::remote_tx_permitted_for(
                         &arm_for_stall_evidence,
-                        chrono::Utc::now().timestamp_millis(),
+                        pancetta_agent::arm::ArmTime::now,
                         remote_client_key_id,
                     )
                 },
@@ -3049,6 +3143,7 @@ impl super::ApplicationCoordinator {
                 let qso_freq_state = active_qso_freq_hz;
                 let qso_freq_slot_ns = qso_freq_slot_ns.clone();
                 let active_tx_qsos = active_tx_qsos.clone();
+                let fox_admitted_for_events = fox_admitted_qsos.clone();
                 let active_tx_offsets = active_tx_offsets.clone();
                 let latest_tx_intent = latest_tx_intent.clone();
                 let snapshot_qso_manager = qso_manager.clone();
@@ -3105,6 +3200,10 @@ impl super::ApplicationCoordinator {
                                     } = &new_state
                                     {
                                         if let Ok(mut set) = active_tx_qsos.write() {
+                                            set.remove(&key);
+                                        }
+                                        // PAN-76: same removal point as `active_tx_qsos`.
+                                        if let Ok(mut set) = fox_admitted_for_events.write() {
                                             set.remove(&key);
                                         }
                                         if let Ok(mut m) = latest_tx_intent.write() {
@@ -3423,6 +3522,7 @@ impl super::ApplicationCoordinator {
                                         offsets.insert(key.clone(), metadata.frequency);
                                     }
                                     let set = active_tx_qsos.clone();
+                                    let fox_set = fox_admitted_for_events.clone();
                                     let intent_map = latest_tx_intent.clone();
                                     let offsets_map = active_tx_offsets.clone();
                                     let qid = qso_id;
@@ -3438,6 +3538,12 @@ impl super::ApplicationCoordinator {
                                     tokio::spawn(async move {
                                         tokio::time::sleep(completed_tx_grace).await;
                                         if let Ok(mut s) = set.write() {
+                                            s.remove(&key);
+                                        }
+                                        // PAN-76: a completed Hound keeps its
+                                        // Fox-admitted slot through the grace,
+                                        // so its final RR73/73 still airs.
+                                        if let Ok(mut s) = fox_set.write() {
                                             s.remove(&key);
                                         }
                                         if let Ok(mut m) = intent_map.write() {
@@ -3627,6 +3733,10 @@ impl super::ApplicationCoordinator {
                                 {
                                     let key = super::active_tx_qso_key(&qso_id.to_string());
                                     if let Ok(mut set) = active_tx_qsos.write() {
+                                        set.remove(&key);
+                                    }
+                                    // PAN-76: same removal point as `active_tx_qsos`.
+                                    if let Ok(mut set) = fox_admitted_for_events.write() {
                                         set.remove(&key);
                                     }
                                     if let Ok(mut m) = latest_tx_intent.write() {
@@ -4016,6 +4126,7 @@ impl super::ApplicationCoordinator {
                                                 &message_bus,
                                                 &fox_mode,
                                                 &fox_max_streams,
+                                                &fox_admitted_qsos,
                                             )
                                             .await;
                                         }
@@ -5089,13 +5200,18 @@ impl super::ApplicationCoordinator {
                                         // Fox-mode engage/disengage. On engage:
                                         //   1. TX-policy gate (Fox originates CQ = initiation).
                                         //   2. Set fox_mode flag.
-                                        //   3. Start a repeating CQ (same path as StartCq / `c`).
+                                        //   3. Start a repeating CQ (same path as StartCq / `c`),
+                                        //      unless a Fox CQ is still calling or Hounds an
+                                        //      earlier engage admitted fill fox_max_streams
+                                        //      (PAN-76).
                                         //   4. Raise the caller-answer cap to fox_max_streams
                                         //      (read dynamically in maybe_answer_caller).
                                         // On disengage:
                                         //   1. Clear fox_mode.
                                         //   2. Cancel any active un-answered CallingCq QSO (StopCq path).
-                                        //   3. Normal cap automatically restored (fox_mode == false).
+                                        //   3. Normal cap restored for *new* admissions; QSOs Fox
+                                        //      mode already opened keep their TX slots until they
+                                        //      finish (PAN-76, `fox_admitted_qsos`).
                                         crate::message_bus::QsoMessage::SetFoxMode { on } => {
                                             if on {
                                                 // Gate: Fox originates CQ — initiation only under Full.
@@ -5147,46 +5263,89 @@ impl super::ApplicationCoordinator {
                                                 // Fox CQ audio offset; tx_parity = None (Fox
                                                 // picks its own slot via the self-parity fallback).
                                                 const FOX_CQ_OFFSET_HZ: f64 = 1500.0;
-                                                match qso_manager
-                                                    .start_cq_manual(FOX_CQ_OFFSET_HZ, None, false, None)
-                                                    .await
-                                                {
-                                                    Ok(qso_id) => {
-                                                        let n = fox_max_streams.load(
-                                                            std::sync::atomic::Ordering::Relaxed,
-                                                        );
-                                                        info!(
-                                                            "Fox mode ON — CQ started: {} \
-                                                             ({:.0} Hz, up to {} streams)",
-                                                            qso_id, FOX_CQ_OFFSET_HZ, n
-                                                        );
-                                                        emit_status(
-                                                            &message_bus,
-                                                            format!(
-                                                                "Fox mode ON — CQ + up to {} \
-                                                                 streams",
-                                                                n
-                                                            ),
+                                                // PAN-76: a Hound that converts the Fox CQ
+                                                // skips maybe_answer_caller's cap. Start no
+                                                // CQ while a Fox CQ is still calling, or while
+                                                // Hounds an earlier engage admitted still fill
+                                                // fox_max_streams, counting completed Hounds
+                                                // whose final RR73/73 is still inside its 45 s
+                                                // grace. That holds TX-live Fox-admitted QSOs
+                                                // to fox_max_streams + 1, as for a single
+                                                // engage. fox_mode stays on.
+                                                let n = fox_max_streams.load(
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                                let (fox_cq_calling, finishing) =
+                                                    fox_admitted_split(
+                                                        &qso_manager,
+                                                        &fox_admitted_qsos,
+                                                    )
+                                                    .await;
+                                                if fox_cq_calling || finishing >= n {
+                                                    info!(
+                                                        "Fox mode ON — no new CQ (Fox CQ \
+                                                         calling: {}, {} Fox-admitted QSO(s) \
+                                                         still finishing, up to {} streams)",
+                                                        fox_cq_calling, finishing, n
+                                                    );
+                                                    let status = if fox_cq_calling {
+                                                        "Fox mode ON — Fox CQ already calling, \
+                                                         no new CQ"
+                                                            .to_string()
+                                                    } else {
+                                                        format!(
+                                                            "Fox mode ON — no new CQ: {} Hound \
+                                                             QSO(s) still finishing",
+                                                            finishing
                                                         )
-                                                        .await;
-                                                    }
-                                                    Err(e) => {
-                                                        // CQ start failed — still leave fox_mode
-                                                        // set so the cap raise takes effect and the
-                                                        // operator can manually call CQ.
-                                                        warn!(
-                                                            "Fox mode ON but CQ start failed: {}",
-                                                            e
-                                                        );
-                                                        emit_status(
-                                                            &message_bus,
-                                                            format!(
-                                                                "Fox mode ON (CQ start failed: \
-                                                                 {})",
+                                                    };
+                                                    emit_status(&message_bus, status).await;
+                                                } else {
+                                                    match qso_manager
+                                                        .start_cq_manual(FOX_CQ_OFFSET_HZ, None, false, None)
+                                                        .await
+                                                    {
+                                                        Ok(qso_id) => {
+                                                            // PAN-76: a Hound answering within 15 Hz
+                                                            // of the CQ converts this QSO into its
+                                                            // exchange, so it counts as Fox-admitted.
+                                                            record_fox_admitted(
+                                                                &fox_admitted_qsos,
+                                                                &qso_id,
+                                                            );
+                                                            info!(
+                                                                "Fox mode ON — CQ started: {} \
+                                                                 ({:.0} Hz, up to {} streams)",
+                                                                qso_id, FOX_CQ_OFFSET_HZ, n
+                                                            );
+                                                            emit_status(
+                                                                &message_bus,
+                                                                format!(
+                                                                    "Fox mode ON — CQ + up to {} \
+                                                                     streams",
+                                                                    n
+                                                                ),
+                                                            )
+                                                            .await;
+                                                        }
+                                                        Err(e) => {
+                                                            // CQ start failed — still leave fox_mode
+                                                            // set so the cap raise takes effect and the
+                                                            // operator can manually call CQ.
+                                                            warn!(
+                                                                "Fox mode ON but CQ start failed: {}",
                                                                 e
-                                                            ),
-                                                        )
-                                                        .await;
+                                                            );
+                                                            emit_status(
+                                                                &message_bus,
+                                                                format!(
+                                                                    "Fox mode ON (CQ start failed: \
+                                                                     {})",
+                                                                    e
+                                                                ),
+                                                            )
+                                                            .await;
+                                                        }
                                                     }
                                                 }
                                                 // Echo actual state (engaged = true) to TUI.
@@ -5199,8 +5358,9 @@ impl super::ApplicationCoordinator {
                                                     ))
                                                     .await;
                                             } else {
-                                                // Disengage: clear flag first so cap drops
-                                                // immediately; then cancel CQ.
+                                                // Disengage: clear flag first so the admission
+                                                // cap and the base TX ceiling drop immediately;
+                                                // then cancel CQ.
                                                 fox_mode.store(
                                                     false,
                                                     std::sync::atomic::Ordering::Relaxed,
@@ -5208,6 +5368,9 @@ impl super::ApplicationCoordinator {
 
                                                 let active = qso_manager.get_active_qsos().await;
                                                 let mut cancelled = 0usize;
+                                                // PAN-76: Fox-admitted exchanges left to
+                                                // finish on the air (log only).
+                                                let mut finishing = 0usize;
                                                 for (id, progress) in active {
                                                     if matches!(
                                                         progress.state,
@@ -5223,12 +5386,41 @@ impl super::ApplicationCoordinator {
                                                             );
                                                         } else {
                                                             cancelled += 1;
+                                                            // PAN-76: drop it from the Fox
+                                                            // set now, not when the event
+                                                            // forwarder sees the cancel
+                                                            // (it repeats this
+                                                            // idempotently). Until then an
+                                                            // immediate re-engage would
+                                                            // read the cancelled CQ as a
+                                                            // Hound in its completed grace
+                                                            // and could start no CQ.
+                                                            if let Ok(mut set) =
+                                                                fox_admitted_qsos.write()
+                                                            {
+                                                                set.remove(
+                                                                    &super::active_tx_qso_key(
+                                                                        &id.to_string(),
+                                                                    ),
+                                                                );
+                                                            }
+                                                        }
+                                                    } else {
+                                                        let key = super::active_tx_qso_key(
+                                                            &id.to_string(),
+                                                        );
+                                                        if fox_admitted_qsos
+                                                            .read()
+                                                            .is_ok_and(|s| s.contains(&key))
+                                                        {
+                                                            finishing += 1;
                                                         }
                                                     }
                                                 }
                                                 info!(
-                                                    "Fox mode OFF — cancelled {} CQ QSO(s)",
-                                                    cancelled
+                                                    "Fox mode OFF — cancelled {} CQ QSO(s); {} \
+                                                     Fox-admitted QSO(s) left to finish",
+                                                    cancelled, finishing
                                                 );
                                                 emit_status(
                                                     &message_bus,
@@ -7622,17 +7814,24 @@ mod auto_73_tests {
         // client-b holds the arm — a mismatch against the entry's client-a.
         let mut st = pancetta_agent::arm::ArmState::new();
         let now_ms = chrono::Utc::now().timestamp_millis();
+        st.set_channel_consent(
+            pancetta_agent::arm::ConsentChannel::StationAgent,
+            true,
+            now_ms,
+        );
+        st.set_channel_consent(pancetta_agent::arm::ConsentChannel::WsjtxUdp, true, now_ms);
         st.arm(
             pancetta_agent::arm::VerifiedArmGrant {
                 operator_callsign: "W1AW".to_string(),
                 ttl_ms: 120_000,
+                armed_until_ms: now_ms + 120_000,
+                heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "auto73-rollback-test-jti".to_string(),
                 client_key_id: "client-b".to_string(),
             },
-            now_ms,
+            pancetta_agent::arm::ArmTime::now(),
         );
-        st.set_local_consent(true, now_ms);
         let arm = Arc::new(std::sync::Mutex::new(st));
 
         maybe_auto_resend_73(
@@ -10536,6 +10735,967 @@ mod respond_to_caller_admission_tests {
             rx.borrow().is_some(),
             "a late subscriber (the Autonomous task) must be seeded with the \
              stored QsoManager, or drain_pending_qso_offset_requests never runs"
+        );
+    }
+
+    // ── PAN-76: Fox-admitted QSOs through the real Qso component ────────────
+
+    /// Poll `cond` every 10 ms for up to 2 s.
+    async fn pan76_poll(mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if cond() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Drain `rx` until a message matching `pred` arrives (bounded, 2 s).
+    async fn pan76_wait_for(
+        rx: &crossbeam_channel::Receiver<ComponentMessage>,
+        pred: impl Fn(&MessageType) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            while let Ok(msg) = rx.try_recv() {
+                if pred(&msg.message_type) {
+                    return true;
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The real Qso component for K5ARH with `max_concurrent_qsos = 1`, its
+    /// event forwarder proven subscribed (readiness probe, then the probe QSO
+    /// failed and gone from `active_tx_qsos`), and a Tui channel to observe.
+    async fn pan76_station() -> (
+        ApplicationCoordinator,
+        pancetta_qso::QsoManager,
+        crossbeam_channel::Receiver<ComponentMessage>,
+    ) {
+        let mut coordinator = test_coordinator().await;
+        {
+            let mut config = coordinator.config.write().await;
+            config.station.callsign = "K5ARH".to_string();
+            config.autonomous.max_concurrent_qsos = 1;
+        }
+        let (_tui_tx, tui_rx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Tui)
+            .await
+            .unwrap();
+        coordinator.start_qso_component().await.unwrap();
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+
+        let mut probe = None;
+        for i in 0..20 {
+            let probe_id = manager
+                .respond_to_cq_manual(format!("K9RD{i}"), 2400.0, None)
+                .await
+                .expect("seeding a readiness-probe QSO");
+            let key = crate::coordinator::active_tx_qso_key(&probe_id.to_string());
+            if pan76_poll(|| coordinator.active_tx_qsos.read().unwrap().contains(&key)).await {
+                probe = Some((probe_id, key));
+                break;
+            }
+            manager.cancel_qso(probe_id).await.unwrap();
+        }
+        let (probe_id, probe_key) =
+            probe.expect("readiness probe: real forwarder never populated active_tx_qsos");
+        manager
+            .fail_qso(probe_id, pancetta_qso::QsoFailureReason::UserCancelled)
+            .await
+            .unwrap();
+        assert!(
+            pan76_poll(|| !coordinator
+                .active_tx_qsos
+                .read()
+                .unwrap()
+                .contains(&probe_key))
+            .await,
+            "the failed probe QSO must leave active_tx_qsos"
+        );
+        while tui_rx.try_recv().is_ok() {}
+        (coordinator, manager, tui_rx)
+    }
+
+    async fn pan76_set_fox_mode(
+        coordinator: &ApplicationCoordinator,
+        tui_rx: &crossbeam_channel::Receiver<ComponentMessage>,
+        on: bool,
+    ) {
+        coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Tui,
+                ComponentId::Qso,
+                MessageType::QsoMessage(QsoMessage::SetFoxMode { on }),
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            pan76_wait_for(
+                tui_rx,
+                |m| matches!(m, MessageType::FoxModeStatus { on: o } if *o == on)
+            )
+            .await,
+            "SetFoxMode {{ on: {on} }} must be acknowledged with FoxModeStatus"
+        );
+    }
+
+    fn pan76_key(id: &pancetta_qso::QsoId) -> String {
+        crate::coordinator::active_tx_qso_key(&id.to_string())
+    }
+
+    fn pan76_request(qso_id: &pancetta_qso::QsoId, text: &str, freq: f64) -> MessageType {
+        MessageType::TransmitRequest {
+            message_text: text.to_string(),
+            frequency_offset: freq,
+            qso_id: Some(qso_id.to_string()),
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
+        }
+    }
+
+    /// The next backlog through the real `coalesce_backlog_into`: `head`
+    /// first, then `queued` in order, under `max_concurrent_qsos`.
+    async fn pan76_coalesce(
+        coordinator: &ApplicationCoordinator,
+        head: MessageType,
+        queued: Vec<MessageType>,
+        max_concurrent_qsos: u32,
+    ) -> MessageType {
+        let (backlog_tx, backlog_rx) = crossbeam_channel::unbounded();
+        for request in queued {
+            backlog_tx
+                .send(ComponentMessage::new(
+                    ComponentId::Ft8Transmitter,
+                    ComponentId::Ft8Transmitter,
+                    request,
+                    Instant::now(),
+                ))
+                .unwrap();
+        }
+        let arm = Arc::new(std::sync::Mutex::new(pancetta_agent::arm::ArmState::new()));
+        let audit_log = pancetta_agent::audit::AuditLog::new(std::env::temp_dir().join(format!(
+            "pancetta-pan76-audit-{}-{}.log",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        )));
+        let display_feed_enabled = Arc::new(AtomicBool::new(false));
+        crate::coordinator::tx::coalesce_backlog_into(
+            head,
+            &backlog_rx,
+            &coordinator.message_bus,
+            &coordinator.active_tx_qsos,
+            &coordinator.fox_admitted_qsos,
+            max_concurrent_qsos,
+            &arm,
+            &audit_log,
+            &display_feed_enabled,
+            None,
+        )
+        .await
+    }
+
+    /// AC1: engage Fox mode, admit three Hounds (one by converting the Fox
+    /// CQ, two through the real `maybe_answer_caller`), turn Fox mode off
+    /// mid-exchange, and the next backlog keeps all three on the air under
+    /// the restored cap of 1.
+    #[tokio::test]
+    async fn pan76_fox_disengage_keeps_admitted_hounds_on_air() {
+        use crate::coordinator::tx::{
+            effective_max_concurrent_qsos, live_fox_admitted_count, supersede_max_concurrent_qsos,
+        };
+
+        let (coordinator, manager, tui_rx) = pan76_station().await;
+
+        // 1. Engage: the Fox CQ is recorded.
+        pan76_set_fox_mode(&coordinator, &tui_rx, true).await;
+        let cq_id = manager
+            .get_active_qsos()
+            .await
+            .into_iter()
+            .find(|(_, p)| matches!(p.state, pancetta_qso::QsoState::CallingCq { .. }))
+            .map(|(id, _)| id)
+            .expect("Fox mode must start a CQ");
+        assert_eq!(
+            coordinator.fox_admitted_qsos.read().unwrap().clone(),
+            std::collections::HashSet::from([pan76_key(&cq_id)]),
+            "the Fox CQ must be the only Fox-admitted QSO after engage"
+        );
+
+        // 2. Hound 1 answers within 15 Hz of the CQ and converts it.
+        manager
+            .process_message(
+                pancetta_qso::states::MessageType::CqResponse {
+                    calling_station: "K5ARH".to_string(),
+                    responding_station: "W1AAA".to_string(),
+                    grid: Some("FN31".to_string()),
+                },
+                "K5ARH W1AAA FN31".to_string(),
+                1505.0,
+                Some(-10.0),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                manager.get_qso(cq_id).await.unwrap().state,
+                pancetta_qso::QsoState::WaitingForReport { .. }
+            ),
+            "Hound 1 must convert the Fox CQ into its exchange"
+        );
+
+        // 3. Hounds 2 and 3 through the real auto-answer path.
+        let side = manager.current_tx_side().await;
+        let mut hound_ids = vec![cq_id];
+        for (call, freq) in [("W2BBB", 1200.0), ("W3CCC", 1800.0)] {
+            super::maybe_answer_caller(
+                &pancetta_qso::states::MessageType::CqResponse {
+                    calling_station: "K5ARH".to_string(),
+                    responding_station: call.to_string(),
+                    grid: Some("FN31".to_string()),
+                },
+                "K5ARH",
+                freq,
+                side.map(|s| s.opposite()),
+                -12.0,
+                &manager,
+                &coordinator.tx_policy,
+                1,
+                &coordinator.message_bus,
+                &coordinator.fox_mode,
+                &coordinator.fox_max_streams,
+                &coordinator.fox_admitted_qsos,
+            )
+            .await;
+            let id = manager
+                .get_active_qsos()
+                .await
+                .into_iter()
+                .find(|(_, p)| p.metadata.their_callsign.as_deref() == Some(call))
+                .map(|(id, _)| id)
+                .unwrap_or_else(|| panic!("{call} must be auto-answered in Fox mode"));
+            hound_ids.push(id);
+        }
+
+        // 4. All three are TX-live and Fox-admitted.
+        let keys: Vec<String> = hound_ids.iter().map(pan76_key).collect();
+        assert!(
+            pan76_poll(|| {
+                let active = coordinator.active_tx_qsos.read().unwrap();
+                let fox = coordinator.fox_admitted_qsos.read().unwrap();
+                keys.iter().all(|k| active.contains(k) && fox.contains(k))
+            })
+            .await,
+            "all three Hounds must be in both active_tx_qsos and fox_admitted_qsos"
+        );
+
+        // 5. Disengage mid-exchange: the Hounds keep running.
+        pan76_set_fox_mode(&coordinator, &tui_rx, false).await;
+        assert!(!coordinator
+            .fox_mode
+            .load(std::sync::atomic::Ordering::Relaxed));
+        let active_ids: Vec<_> = manager
+            .get_active_qsos()
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        for id in &hound_ids {
+            assert!(active_ids.contains(id), "Hound {id} must still be active");
+        }
+
+        // 6. The next backlog under the restored cap keeps all three.
+        let cap =
+            effective_max_concurrent_qsos(1, &coordinator.fox_mode, &coordinator.fox_max_streams);
+        assert_eq!(cap, 1, "Fox mode is off, so the base cap is back to 1");
+        let result = pan76_coalesce(
+            &coordinator,
+            pan76_request(&hound_ids[0], "W1AAA K5ARH -10", 1505.0),
+            vec![
+                pan76_request(&hound_ids[1], "W2BBB K5ARH -12", 1200.0),
+                pan76_request(&hound_ids[2], "W3CCC K5ARH -08", 1800.0),
+            ],
+            cap,
+        )
+        .await;
+        match result {
+            MessageType::MultiTransmitRequest { items, .. } => {
+                let mut got: Vec<String> =
+                    items.iter().filter_map(|it| it.qso_id.clone()).collect();
+                let mut want: Vec<String> = hound_ids.iter().map(|id| id.to_string()).collect();
+                got.sort();
+                want.sort();
+                assert_eq!(got, want, "all three Hounds must stay in the bundle");
+            }
+            other => panic!("expected a three-Hound MultiTransmitRequest, got {other:?}"),
+        }
+
+        // 7. A mid-TX refresh keeps the three-stream bundle too: the three
+        //    live Hounds on top of the restored cap of 1.
+        assert_eq!(
+            supersede_max_concurrent_qsos(
+                cap,
+                live_fox_admitted_count(
+                    &coordinator.fox_admitted_qsos,
+                    &coordinator.active_tx_qsos
+                )
+            ),
+            4
+        );
+
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Turning Fox mode off cancels an unanswered Fox CQ, and the forwarder's
+    /// `Failed` removal takes it out of the Fox set with `active_tx_qsos`.
+    #[tokio::test]
+    async fn pan76_unanswered_fox_cq_leaves_the_fox_set_on_disengage() {
+        let (coordinator, manager, tui_rx) = pan76_station().await;
+
+        pan76_set_fox_mode(&coordinator, &tui_rx, true).await;
+        let cq_key = manager
+            .get_active_qsos()
+            .await
+            .into_iter()
+            .find(|(_, p)| matches!(p.state, pancetta_qso::QsoState::CallingCq { .. }))
+            .map(|(id, _)| pan76_key(&id))
+            .expect("Fox mode must start a CQ");
+        assert!(coordinator
+            .fox_admitted_qsos
+            .read()
+            .unwrap()
+            .contains(&cq_key));
+
+        pan76_set_fox_mode(&coordinator, &tui_rx, false).await;
+        assert!(
+            pan76_poll(|| {
+                !coordinator
+                    .fox_admitted_qsos
+                    .read()
+                    .unwrap()
+                    .contains(&cq_key)
+                    && !coordinator.active_tx_qsos.read().unwrap().contains(&cq_key)
+            })
+            .await,
+            "the cancelled Fox CQ must leave both fox_admitted_qsos and active_tx_qsos"
+        );
+
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// AC2: with Fox mode never engaged, three ordinary QSOs opened over
+    /// `max_concurrent_qsos = 1` stay capped: the Fox set is empty and the
+    /// next backlog keeps one stream and reports the other two as not sent.
+    #[tokio::test]
+    async fn pan76_never_fox_manual_pileup_is_still_capped() {
+        use crate::coordinator::tx::{
+            effective_max_concurrent_qsos, live_fox_admitted_count, supersede_max_concurrent_qsos,
+        };
+
+        let (coordinator, manager, tui_rx) = pan76_station().await;
+        let (_autonomous_tx, autonomous_rx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Autonomous)
+            .await
+            .unwrap();
+
+        let mut ids = Vec::new();
+        for (call, freq) in [("K1AAA", 1000.0), ("K2BBB", 1300.0), ("K3CCC", 1600.0)] {
+            ids.push(
+                manager
+                    .respond_to_cq_manual(call.to_string(), freq, Some(SlotParity::Even))
+                    .await
+                    .unwrap(),
+            );
+        }
+        coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Tui,
+                ComponentId::Qso,
+                MessageType::QsoMessage(QsoMessage::StartQso {
+                    callsign: "K4DDD".to_string(),
+                    frequency: 1900,
+                    dx_parity: Some(SlotParity::Even),
+                    remote_origin: false,
+                    remote_client_key_id: None,
+                }),
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            pan76_wait_for(
+                &tui_rx,
+                |m| matches!(m, MessageType::StatusUpdate(t) if t.contains("K4DDD"))
+            )
+            .await,
+            "the Qso component must handle the StartQso"
+        );
+        let keys: Vec<String> = ids.iter().map(pan76_key).collect();
+        assert!(
+            pan76_poll(|| {
+                let active = coordinator.active_tx_qsos.read().unwrap();
+                keys.iter().all(|k| active.contains(k))
+            })
+            .await,
+            "the three manual QSOs must be TX-live"
+        );
+        assert!(
+            coordinator.fox_admitted_qsos.read().unwrap().is_empty(),
+            "no ordinary open path may record a Fox-admitted QSO"
+        );
+
+        let cap =
+            effective_max_concurrent_qsos(1, &coordinator.fox_mode, &coordinator.fox_max_streams);
+        assert_eq!(cap, 1);
+        let result = pan76_coalesce(
+            &coordinator,
+            pan76_request(&ids[0], "K1AAA K5ARH EM10", 1000.0),
+            vec![
+                pan76_request(&ids[1], "K2BBB K5ARH EM10", 1300.0),
+                pan76_request(&ids[2], "K3CCC K5ARH EM10", 1600.0),
+            ],
+            cap,
+        )
+        .await;
+        let ids_s: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        assert!(
+            matches!(
+                &result,
+                MessageType::TransmitRequest { qso_id: Some(id), .. } if *id == ids_s[0]
+            ),
+            "only K1AAA may transmit under the cap of 1, got {result:?}"
+        );
+        // `report_transmit_complete` sends each truncated frame's failed
+        // completion here and its `TxFrameNotSent` to the (running) Qso loop.
+        let mut not_sent = Vec::new();
+        while let Ok(msg) = autonomous_rx.try_recv() {
+            if let MessageType::TransmitComplete {
+                success: false,
+                qso_id: Some(id),
+                ..
+            } = msg.message_type
+            {
+                not_sent.push(id);
+            }
+        }
+        not_sent.sort();
+        let mut truncated = vec![ids_s[1].clone(), ids_s[2].clone()];
+        truncated.sort();
+        assert_eq!(
+            not_sent, truncated,
+            "K2BBB and K3CCC must each be reported as not sent"
+        );
+
+        assert_eq!(
+            supersede_max_concurrent_qsos(
+                cap,
+                live_fox_admitted_count(
+                    &coordinator.fox_admitted_qsos,
+                    &coordinator.active_tx_qsos
+                )
+            ),
+            1
+        );
+
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Send `SetFoxMode { on: true }` and return the status lines emitted
+    /// before its `FoxModeStatus` acknowledgement.
+    async fn pan76_engage_fox_statuses(
+        coordinator: &ApplicationCoordinator,
+        tui_rx: &crossbeam_channel::Receiver<ComponentMessage>,
+    ) -> Vec<String> {
+        coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Tui,
+                ComponentId::Qso,
+                MessageType::QsoMessage(QsoMessage::SetFoxMode { on: true }),
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+        let mut statuses = Vec::new();
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            while let Ok(msg) = tui_rx.try_recv() {
+                match msg.message_type {
+                    MessageType::StatusUpdate(text) => statuses.push(text),
+                    MessageType::FoxModeStatus { on: true } => return statuses,
+                    _ => {}
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "SetFoxMode {{ on: true }} must be acknowledged with FoxModeStatus"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn pan76_calling_cqs(manager: &pancetta_qso::QsoManager) -> Vec<pancetta_qso::QsoId> {
+        manager
+            .get_active_qsos()
+            .await
+            .into_iter()
+            .filter(|(_, p)| matches!(p.state, pancetta_qso::QsoState::CallingCq { .. }))
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// Re-engaging Fox mode starts no second CQ while the Fox CQ is still
+    /// calling, and none while Hounds from an earlier engage still fill
+    /// `fox_max_streams`; a Hound converting that CQ would bypass
+    /// `maybe_answer_caller`'s cap. Once the finishing Hounds drop below the
+    /// cap, a re-engage starts the CQ again.
+    #[tokio::test]
+    async fn pan76_fox_reengage_starts_no_cq_while_finishing_hounds_fill_the_cap() {
+        let (coordinator, manager, tui_rx) = pan76_station().await;
+        coordinator
+            .fox_max_streams
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+
+        // 1. Engage, then engage again while the Fox CQ is still calling.
+        pan76_set_fox_mode(&coordinator, &tui_rx, true).await;
+        let cq_id = match pan76_calling_cqs(&manager).await.as_slice() {
+            [id] => *id,
+            other => panic!("Fox mode must start exactly one CQ, got {other:?}"),
+        };
+        let statuses = pan76_engage_fox_statuses(&coordinator, &tui_rx).await;
+        assert_eq!(
+            pan76_calling_cqs(&manager).await,
+            vec![cq_id],
+            "a repeated engage must not start a second Fox CQ"
+        );
+        assert!(
+            statuses.iter().any(|s| s.contains("no new CQ")),
+            "the operator must be told no CQ was started, got {statuses:?}"
+        );
+
+        // 2. Hound 1 converts the Fox CQ; Hound 2 through the real
+        //    auto-answer path. Two Fox-admitted Hounds = fox_max_streams.
+        manager
+            .process_message(
+                pancetta_qso::states::MessageType::CqResponse {
+                    calling_station: "K5ARH".to_string(),
+                    responding_station: "W1AAA".to_string(),
+                    grid: Some("FN31".to_string()),
+                },
+                "K5ARH W1AAA FN31".to_string(),
+                1505.0,
+                Some(-10.0),
+            )
+            .await
+            .unwrap();
+        let side = manager.current_tx_side().await;
+        super::maybe_answer_caller(
+            &pancetta_qso::states::MessageType::CqResponse {
+                calling_station: "K5ARH".to_string(),
+                responding_station: "W2BBB".to_string(),
+                grid: Some("FN31".to_string()),
+            },
+            "K5ARH",
+            1200.0,
+            side.map(|s| s.opposite()),
+            -12.0,
+            &manager,
+            &coordinator.tx_policy,
+            1,
+            &coordinator.message_bus,
+            &coordinator.fox_mode,
+            &coordinator.fox_max_streams,
+            &coordinator.fox_admitted_qsos,
+        )
+        .await;
+        let w2_id = manager
+            .get_active_qsos()
+            .await
+            .into_iter()
+            .find(|(_, p)| p.metadata.their_callsign.as_deref() == Some("W2BBB"))
+            .map(|(id, _)| id)
+            .expect("W2BBB must be auto-answered in Fox mode");
+        assert!(pan76_calling_cqs(&manager).await.is_empty());
+
+        // 3. Off and on again while both Hounds are finishing: no new CQ.
+        pan76_set_fox_mode(&coordinator, &tui_rx, false).await;
+        let statuses = pan76_engage_fox_statuses(&coordinator, &tui_rx).await;
+        assert!(coordinator
+            .fox_mode
+            .load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            pan76_calling_cqs(&manager).await.is_empty(),
+            "re-engage must not start a CQ while finishing Hounds fill fox_max_streams"
+        );
+        assert!(
+            statuses.iter().any(|s| s.contains("no new CQ")),
+            "the operator must be told no CQ was started, got {statuses:?}"
+        );
+
+        // 4. One Hound finishes: below the cap, a re-engage starts the CQ.
+        manager
+            .fail_qso(w2_id, pancetta_qso::QsoFailureReason::UserCancelled)
+            .await
+            .unwrap();
+        pan76_set_fox_mode(&coordinator, &tui_rx, false).await;
+        pan76_set_fox_mode(&coordinator, &tui_rx, true).await;
+        let new_cq = match pan76_calling_cqs(&manager).await.as_slice() {
+            [id] => *id,
+            other => panic!("re-engage below the cap must start one CQ, got {other:?}"),
+        };
+        assert!(coordinator
+            .fox_admitted_qsos
+            .read()
+            .unwrap()
+            .contains(&pan76_key(&new_cq)));
+
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// PR #421 review (Codex P2): Fox off then straight back on. The Fox CQ
+    /// the disengage cancelled has left `get_active_qsos()` but, until the
+    /// event forwarder handles its failure, would still sit in both shared
+    /// sets and read as a Hound in its completed grace. With
+    /// `fox_max_streams = 1` that filled the cap and the re-engage started no
+    /// CQ. The disengage drops a cancelled CQ from the Fox set itself.
+    #[tokio::test]
+    async fn pan76_fox_off_and_straight_on_starts_a_fresh_cq() {
+        let (coordinator, manager, tui_rx) = pan76_station().await;
+        coordinator
+            .fox_max_streams
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        pan76_set_fox_mode(&coordinator, &tui_rx, true).await;
+        let old_cq = match pan76_calling_cqs(&manager).await.as_slice() {
+            [id] => *id,
+            other => panic!("Fox mode must start exactly one CQ, got {other:?}"),
+        };
+        let old_key = pan76_key(&old_cq);
+        assert!(
+            pan76_poll(|| coordinator
+                .active_tx_qsos
+                .read()
+                .unwrap()
+                .contains(&old_key))
+            .await,
+            "the Fox CQ must be TX-live before the toggle"
+        );
+
+        // Both toggles back to back: no wait for the off acknowledgement, so
+        // the re-engage can run before the forwarder sees the cancel.
+        for on in [false, true] {
+            coordinator
+                .message_bus
+                .send_message(ComponentMessage::new(
+                    ComponentId::Tui,
+                    ComponentId::Qso,
+                    MessageType::QsoMessage(QsoMessage::SetFoxMode { on }),
+                    Instant::now(),
+                ))
+                .await
+                .unwrap();
+        }
+        assert!(
+            pan76_wait_for(&tui_rx, |m| matches!(
+                m,
+                MessageType::FoxModeStatus { on: true }
+            ))
+            .await,
+            "the re-engage must be acknowledged"
+        );
+        match pan76_calling_cqs(&manager).await.as_slice() {
+            [id] => assert_ne!(*id, old_cq, "the old CQ was cancelled"),
+            other => panic!("the re-engage must start one fresh CQ, got {other:?}"),
+        }
+        assert!(
+            !coordinator
+                .fox_admitted_qsos
+                .read()
+                .unwrap()
+                .contains(&old_key),
+            "the cancelled CQ must leave the Fox set"
+        );
+
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// PR #421 review (Codex P2): a completed Hound keeps its Fox-admitted
+    /// TX slot for the 45 s completed grace so its final RR73/73 can air, but
+    /// it has already left `get_active_qsos()`. Re-engaging Fox mode while
+    /// such Hounds fill `fox_max_streams` must start no CQ, or the old closing
+    /// frames plus a fresh set of Hounds can exceed `MAX_RETAINED_TX_STREAMS`
+    /// and the hard clamp cuts exactly those closing frames.
+    #[tokio::test]
+    async fn pan76_fox_reengage_counts_hounds_in_their_completed_grace() {
+        let (coordinator, manager, tui_rx) = pan76_station().await;
+        coordinator
+            .fox_max_streams
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+
+        pan76_set_fox_mode(&coordinator, &tui_rx, true).await;
+        assert_eq!(pan76_calling_cqs(&manager).await.len(), 1);
+        let mut known = coordinator.fox_admitted_qsos.read().unwrap().clone();
+
+        // Two Hounds send RR73 straight to us: the real auto-answer path
+        // opens each at its close, so it completes at once and enters grace.
+        let mut hound_keys = Vec::new();
+        for (call, freq) in [("W1AAA", 1200.0), ("W2BBB", 1800.0)] {
+            let side = manager.current_tx_side().await;
+            super::maybe_answer_caller(
+                &pancetta_qso::states::MessageType::FinalConfirmation {
+                    to_station: "K5ARH".to_string(),
+                    from_station: call.to_string(),
+                },
+                "K5ARH",
+                freq,
+                side.map(|s| s.opposite()),
+                -12.0,
+                &manager,
+                &coordinator.tx_policy,
+                1,
+                &coordinator.message_bus,
+                &coordinator.fox_mode,
+                &coordinator.fox_max_streams,
+                &coordinator.fox_admitted_qsos,
+            )
+            .await;
+            let now = coordinator.fox_admitted_qsos.read().unwrap().clone();
+            let new: Vec<String> = now.difference(&known).cloned().collect();
+            assert_eq!(new.len(), 1, "{call} must be recorded as Fox-admitted");
+            hound_keys.push(new[0].clone());
+            known = now;
+        }
+        for key in &hound_keys {
+            assert!(
+                pan76_poll(|| coordinator.active_tx_qsos.read().unwrap().contains(key)).await,
+                "a completed Hound stays TX-live through its grace"
+            );
+        }
+        assert_eq!(
+            manager.active_caller_qso_count().await,
+            0,
+            "both Hounds are completed, not active"
+        );
+
+        // Off (cancels the unanswered Fox CQ) and on again inside the grace.
+        pan76_set_fox_mode(&coordinator, &tui_rx, false).await;
+        assert!(pan76_calling_cqs(&manager).await.is_empty());
+        let statuses = pan76_engage_fox_statuses(&coordinator, &tui_rx).await;
+        assert!(
+            pan76_calling_cqs(&manager).await.is_empty(),
+            "re-engage must not start a CQ while grace-period Hounds fill fox_max_streams"
+        );
+        assert!(
+            statuses.iter().any(|s| s.contains("no new CQ")),
+            "the operator must be told no CQ was started, got {statuses:?}"
+        );
+
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod fox_admitted_tracking_tests {
+    //! PAN-76: `maybe_answer_caller` records the QSOs it opens under Fox
+    //! mode's raised cap in `fox_admitted_qsos`, and nothing else.
+    use super::maybe_answer_caller;
+    use crate::message_bus::MessageBus;
+    use pancetta_core::slot::SlotParity;
+    use pancetta_core::TxPolicy;
+    use pancetta_qso::states::MessageType as Mt;
+    use pancetta_qso::{QsoManager, QsoManagerConfig};
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
+    use std::sync::RwLock;
+
+    const OUR: &str = "K5ARH";
+
+    async fn manager() -> QsoManager {
+        let m = QsoManager::new(QsoManagerConfig {
+            our_callsign: OUR.to_string(),
+            our_grid: Some("EM10".to_string()),
+            ..Default::default()
+        });
+        m.start().await.expect("manager start");
+        m
+    }
+
+    fn caller(call: &str) -> Mt {
+        Mt::CqResponse {
+            calling_station: OUR.to_string(),
+            responding_station: call.to_string(),
+            grid: Some("FN31".to_string()),
+        }
+    }
+
+    struct Station {
+        manager: QsoManager,
+        bus: MessageBus,
+        tx_policy: AtomicU8,
+        fox_mode: AtomicBool,
+        fox_max_streams: AtomicUsize,
+        fox_admitted_qsos: RwLock<HashSet<String>>,
+    }
+
+    impl Station {
+        async fn new(fox_mode: bool, fox_max_streams: usize) -> Self {
+            Self {
+                manager: manager().await,
+                bus: MessageBus::new(1000).expect("bus"),
+                tx_policy: AtomicU8::new(TxPolicy::Full.as_u8()),
+                fox_mode: AtomicBool::new(fox_mode),
+                fox_max_streams: AtomicUsize::new(fox_max_streams),
+                fox_admitted_qsos: RwLock::new(HashSet::new()),
+            }
+        }
+
+        async fn answer(&self, call: &str, freq: f64, max_concurrent: usize) {
+            self.answer_msg(&caller(call), freq, max_concurrent).await;
+        }
+
+        async fn answer_msg(&self, msg: &Mt, freq: f64, max_concurrent: usize) {
+            maybe_answer_caller(
+                msg,
+                OUR,
+                freq,
+                Some(SlotParity::Even),
+                -10.0,
+                &self.manager,
+                &self.tx_policy,
+                max_concurrent,
+                &self.bus,
+                &self.fox_mode,
+                &self.fox_max_streams,
+                &self.fox_admitted_qsos,
+            )
+            .await;
+        }
+
+        async fn key_of(&self, call: &str) -> String {
+            let (id, _) = self
+                .manager
+                .get_active_qsos()
+                .await
+                .into_iter()
+                .find(|(_, p)| p.metadata.their_callsign.as_deref() == Some(call))
+                .unwrap_or_else(|| panic!("{call} must have an active QSO"));
+            crate::coordinator::active_tx_qso_key(&id.to_string())
+        }
+
+        fn fox_set(&self) -> HashSet<String> {
+            self.fox_admitted_qsos.read().unwrap().clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn pan76_auto_answer_in_fox_mode_records_the_hound() {
+        let st = Station::new(true, 5).await;
+        st.answer("W1AAA", 1200.0, 1).await;
+        let key = st.key_of("W1AAA").await;
+        assert_eq!(st.fox_set(), HashSet::from([key]));
+    }
+
+    #[tokio::test]
+    async fn pan76_auto_answer_outside_fox_mode_records_nothing() {
+        let st = Station::new(false, 5).await;
+        st.answer("W1AAA", 1200.0, 1).await;
+        assert_eq!(st.manager.active_qso_count().await, 1);
+        assert!(st.fox_set().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pan76_refused_auto_answer_records_nothing() {
+        let st = Station::new(true, 1).await;
+        st.answer("W1AAA", 1200.0, 1).await;
+        st.answer("W2BBB", 1600.0, 1).await;
+        assert_eq!(
+            st.manager.active_caller_qso_count().await,
+            1,
+            "W2BBB must be refused at the Fox capacity of 1"
+        );
+        let key = st.key_of("W1AAA").await;
+        assert_eq!(st.fox_set(), HashSet::from([key]));
+    }
+
+    /// PR #421 review (Codex P2, rounds 2 and 4): Hounds that open already
+    /// complete (their RR73 straight to us) hold a Fox-admitted TX stream for
+    /// their closing 73 through the 45 s grace, so they fill Fox capacity, and
+    /// they count the moment they open. This station has no event forwarder
+    /// at all, which is the same decode batch draining before it runs.
+    #[tokio::test]
+    async fn pan76_hounds_in_their_completed_grace_fill_the_fox_cap() {
+        let st = Station::new(true, 2).await;
+        for (call, freq) in [("W1AAA", 1200.0), ("W2BBB", 1600.0)] {
+            st.answer_msg(
+                &Mt::FinalConfirmation {
+                    to_station: OUR.to_string(),
+                    from_station: call.to_string(),
+                },
+                freq,
+                1,
+            )
+            .await;
+        }
+        assert_eq!(
+            st.fox_set().len(),
+            2,
+            "both completed Hounds are Fox-admitted"
+        );
+        assert_eq!(st.manager.active_caller_qso_count().await, 0);
+
+        st.answer("W3CCC", 2000.0, 1).await;
+        assert_eq!(
+            st.manager.active_caller_qso_count().await,
+            0,
+            "W3CCC must be refused: two grace-period Hounds fill the Fox cap of 2"
+        );
+        assert_eq!(st.fox_set().len(), 2);
+    }
+
+    /// Fox-set keys are never pruned, so a stale one (a QSO that failed or
+    /// was cancelled, gone from the manager, or not a QSO id at all) must
+    /// not hold Fox capacity.
+    #[tokio::test]
+    async fn pan76_stale_fox_keys_do_not_fill_the_fox_cap() {
+        let st = Station::new(true, 1).await;
+        {
+            let mut set = st.fox_admitted_qsos.write().unwrap();
+            set.insert(crate::coordinator::active_tx_qso_key(
+                &uuid::Uuid::new_v4().to_string(),
+            ));
+            set.insert("NOT-A-QSO-ID".to_string());
+        }
+        st.answer("W1AAA", 1200.0, 1).await;
+        assert_eq!(
+            st.manager.active_caller_qso_count().await,
+            1,
+            "W1AAA must be admitted: no stale key counts against the cap of 1"
         );
     }
 }

@@ -62,6 +62,22 @@ Q-0031 (<https://github.com/HagaleTechnologies/dispensa/pull/16>, merged) — pe
 5-check remote-TX security spine and CLAUDE.md's cross-repo contract-first policy; the
 merged PR is the concurrence record for shipping Option A.
 
+**Correction (2026-10-13, PAN-98): per-channel consent.** Option A's safety argument
+("each channel still carries its own upstream consent") held only for the WSJT-X UDP
+channel. The shared `ArmState` remains (one arm, one TX-worker gate); the shared
+consent boolean is gone. `ArmState` now holds one consent bit per channel
+(`ConsentChannel::{StationAgent, WsjtxUdp}`), seeded independently at both seeding sites
+from `remote_tx_enabled` and `enabled && allow_tx_initiation`;
+`remote_tx_arm_consent` is deleted. The originating channel's own current consent is
+required at every enforcement point: **arm**: `verify_and_arm` and `ArmState::arm` refuse
+without station-agent consent, since arming is a station-agent-only act. **Intent**: a
+station-agent `txRequest` is refused, audited `TxDenied`; WSJT-X Reply keeps its gate 2.
+**Transmission**: `remote_tx_permitted_for` and `ArmSnapshot` pick the bit from
+`remote_client_key_id`: `Some` means station agent, `None` means the WSJT-X UDP bridge.
+Consequence: with `remote_tx_enabled = false` nothing can arm, so WSJT-X-UDP-originated
+frames are dropped `not-armed` even with `allow_tx_initiation = true`. A follow-up
+dispensa question should record this correction against Q-0031's concurrence record.
+
 **v1 non-goals.** No IPv6 (multicast destinations are IPv4-only; an IPv6 `destination`
 falls back to non-multicast socket-option handling and — deliberately fail-closed for the
 inbound gate — is still treated as a multicast-shaped peer for source filtering, never
@@ -166,7 +182,8 @@ panino's operator hit this live: `armedUntil`'s v1 conservative 10-minute ceilin
 arbitrary `N` instantiation in dispensa ADR-0002 §Decision #5, never derived from a Part-97 number or
 specific threat model) forced a full re-arm ceremony every 10 minutes during any real operating
 session. Confirmed via `docs/fcc-part97-compliance.md`: §97.109(c) control-operator presence is what
-the 5-15s dead-man heartbeat already enforces on a fast, continuous cadence; `armedUntil` is a
+the dead-man heartbeat already enforces continuously (the client sends every 5-15 s; the station
+disarms after 30 s of silence); `armedUntil` is a
 coarser, independent worst-case-exposure backstop, not doing compliance work the heartbeat isn't
 already doing. cqdx concurred (2026-07-28) on 60 minutes as a fixed contract constant (not
 station-configurable — matches the existing `MIN_HEARTBEAT_SEC`/`MAX_HEARTBEAT_SEC` pattern).
@@ -268,10 +285,7 @@ Decisions:
   expired auth once per loop and logs each peer once. If the expired peer is the controller,
   `expire_peer_auth` also disarms and releases control (fail TX-off, as on controller loss), so an
   armed controller is never left transmitting while the station sends it nothing
-  (`controller_capability_expiry_disarms_and_releases_control`). A failed `hello` that clears the
-  controller's capability does the same (`clear_peer_auth`), so re-sending a just-expired token
-  before the sweep cannot dodge it
-  (`failed_hello_clearing_controller_capability_disarms_and_releases_control`).
+  (`controller_capability_expiry_disarms_and_releases_control`).
 - **D7 — no unfiltered fan-out.** `MultiPeerSession::broadcast` is replaced by `broadcast_to`,
   where the caller names who may receive.
 - **D8 — refusal reasons.** `Poll::PeerRefused` carries a `RefuseReason` (`NotAllowListed`,
@@ -316,3 +330,98 @@ de-authorizing established peers when an authorization poll revokes them.
 
 Follow-up: `takeControl` and implicit control grabs do not yet require a currently-valid
 `status`+ capability. That is an inbound control-rule change left for a separate ticket.
+
+## Live authority checks + eviction on revocation (PAN-96, 2026-10-12)
+
+PAN-95 made a peer's hello capability expire at use time. PAN-96 makes the rest of a peer's
+authority live too: revoking a client's authorization (or letting its token expire) now stops it
+on its current connection, not only the next time it reconnects. Plan:
+`thoughts/shared/plans/2026-10-12-PAN-96-revoking-or-expiring-a-remote-clients-authority-should-stop.md`.
+
+Decisions:
+
+- **D1 — per-use checks.** `peer_grants` is now admitted ∧ unexpired ∧ not deny-listed ∧ scope.
+  `peer_admitted` reads the live `tx_allow_list` on every call and fails closed on a poisoned lock.
+  `qsy`/`setSplit` and the outbound predicate `peer_may_receive` all go through it, so a peer the
+  poll task drops is refused and sent nothing from the moment the new list is published, before any
+  eviction runs.
+- **D2 — a dropped peer may only reduce authority.** At the top of `dispatch_action`, a peer that
+  is no longer admitted gets every action refused except `Disarm` and `ReleaseControl`. This runs
+  before `controller_gate`, so a revoked peer cannot implicitly grab control either. `Heartbeat` is
+  refused too: refusing it can only shorten an arm.
+- **D3 — token identity.** `PeerAuth` keeps the hello token's `jti`. Client identity is the
+  `PeerCtx` key (the handshake-proven keyId, equal to the token's `clientKeyId`), so no copy is kept.
+- **D4 — authorization generation.** `poll_authorizations_loop` bumps a shared
+  `authz_generation` counter after publishing the lists, and only when either list's contents
+  changed. A failed poll, or one that changes nothing, bumps nothing. Static-config stations never
+  bump it, so their session path is unchanged.
+- **D5 — reconcile in the session task.** `session_housekeeping` (the end of every loop iteration
+  and the PAN-34 malformed-frame path) first runs `reconcile_authorizations`. When the session's
+  `authz_generation_seen` lags the counter, it replaces the demux admission set and, for every peer
+  the live list no longer holds, drops its Noise transport, removes its `PeerCtx`, and adds its
+  hello `jti` to `revoked_jtis`. If an evicted peer held control or the arm, it disarms with
+  `authorization-revoked` (a no-op when the poll task already did, so no duplicate audit record),
+  releases control and sends the remaining peers the updated `controlState`. The step has no
+  `.await`, so no frame from the evicted peer is processed in between. Latency is one `RECV_TICK`
+  (200 ms) after the poll publishes.
+- **D6 — `MultiPeerSession::replace_allowed`.** Replaces the admission set and returns the evicted
+  keyIds. This also resolves the 2026-07-22 auto-populate spec's deferred non-goal: a client
+  authorized mid-session can now connect without waiting for the relay session to cycle.
+- **D7 — re-authentication.** An evicted client must be re-admitted, run a fresh Noise handshake
+  (its old transport keys are gone), and present a token with a new `jti`. The old token is refused
+  at `hello` and, through the existing `CapError::Revoked`, at arm.
+- **D8 — silent eviction.** No new wire frame, config key, CLI output or `AuditKind`. relay.v1 has
+  no kick frame, and an evicted client's unanswered requests and stopped display drive its own
+  reconnect. New `agent.control` log lines: "control frame refused — peer is no longer authorized
+  on this station", "remote peer evicted — its authorization was revoked; it must be re-authorized
+  and reconnect" and "hello capabilityToken was revoked on this station — fetch a fresh token".
+  A controller eviction also logs "controller evicted with a live arm — disarming" on `agent.tx`.
+
+Known limits:
+
+- `revoked_jtis` is process-lifetime and best-effort. A StationAgent restart clears it. The token's
+  own `exp` still bounds it, and the client also needs re-admission plus a new handshake.
+- A revoke followed by a re-authorization inside one poll interval is never observed, so nothing is
+  evicted. That is inherent to polling.
+- A scope downgrade on an edge that stays admitted takes effect at token expiry (at most 900 s for
+  non-TX tokens). The token's IdP-signed scopes stay the authority, and arm is still gated live by
+  `tx_arm_allow_list`.
+
+Tests: `expired_hello_capability_cannot_qsy_or_split` (the ticket's
+`security_review_expired_hello_still_controls_rig` evidence),
+`real_poll_revocation_stops_qsy_split_and_reads` and
+`revoking_a_connected_client_evicts_its_live_session` (`station_agent/mod.rs`), and the three
+`replace_allowed_*` tests (`multi_session.rs`).
+
+## Dead-man loss needs a fresh signed arm (PAN-97), 2026-10-13
+
+Normative station behaviour for heartbeat timing:
+
+- **Cadence vs. silence limit.** `heartbeatIntervalSec` (validated to [5,15] s) is how often the
+  client *sends*. The station's silence limit is the fixed `HEARTBEAT_TIMEOUT_MS` = 30 s for every
+  accepted cadence; it is not derived from the cadence. The verified cadence and the signed
+  `armedUntil` are carried on `VerifiedArmGrant` and recorded in the arm audit
+  (`armed ttl_ms=… heartbeat_interval_sec=… heartbeat_timeout_ms=30000`). Changing the limit, or
+  tying it to the cadence, is a dispensa contract question, not a local tweak.
+- **Expiry is terminal.** Once 30 s pass without an accepted heartbeat, or the arm's lifetime ends,
+  the arm is gone. `ArmState::heartbeat` runs the same expiry transition as `tick` *before* any
+  `armJti`/`seq` check, so a heartbeat at or after the deadline (`>=`) cannot refresh anything, even
+  on the same still-connected session. The only way back is a newly signed, previously unseen
+  `txArm` grant (`seen_jtis` still refuses the consumed one). Dead-man expiry removes arm authority
+  only; the Noise peer, the controller slot and `seen_jtis` stay.
+- **Independent sweep.** `run_one_session` calls `ArmState::tick` on every receive-loop iteration,
+  before acting on the received frame (valid, malformed or idle), and broadcasts the existing
+  `controlState` (`transmitArmed:false`) on a real transition. The display drain is capped at 64
+  items per iteration so a busy read stream cannot hold the sweep off. The TX worker's key-time
+  check stays independent of both.
+- **Two clocks.** Local liveness (silence, the arm's maximum lifetime) is measured on the monotonic
+  clock, so a wall-clock step cannot stretch it. The signed `armedUntil` is checked against wall
+  time. At acceptance the lifetime is `min(verified ttl, armedUntil − now)`, so a delay between
+  verification and acceptance cannot extend the grant. Production gates take their `ArmTime`
+  sample after acquiring the arm lock. A monotonic sample earlier than a stored instant denies.
+- **Suspend counts as silence.** `Instant`'s monotonic clock stops while the host sleeps on Linux
+  and macOS, so silence and lifetime are also measured on a suspend-aware clock (Linux
+  `CLOCK_BOOTTIME`, Apple `CLOCK_MONOTONIC`; elsewhere it follows `Instant`). Either clock reaching
+  a limit expires the arm, so an operator silent through a suspend longer than 30 s must re-arm on
+  wake. A wall-clock forward step still does not expire liveness; only real elapsed time does. A
+  suspend-aware sample earlier than the stored one denies.
