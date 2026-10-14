@@ -251,8 +251,9 @@ struct ArmContext {
     /// The authorization generation (PAN-96): bumped by
     /// `poll_authorizations_loop`, after it publishes them, whenever a poll
     /// changes `tx_allow_list` or `tx_arm_allow_list`. Shared with the poll
-    /// task (a SEPARATE tokio task, like `revocation_pending`); never bumped in
-    /// static-config mode.
+    /// task (a SEPARATE tokio task, like `revocation_pending`). In
+    /// static-config mode its only bumper is a saved config edit that removes
+    /// `tx_allow_list` entries (PAN-103, [`revoke_static_allow_list_entries`]).
     authz_generation: Arc<std::sync::atomic::AtomicU64>,
     /// The generation THIS session last reconciled to. When it lags
     /// `authz_generation`, [`reconcile_authorizations`] applies the refresh to
@@ -1536,6 +1537,93 @@ pub(crate) fn station_agent_active(
     has_relay_config(cfg) && (!cfg.tx_allow_list.is_empty() || cqdx_will_populate)
 }
 
+/// PAN-103: shared handles onto a RUNNING station-agent session's live
+/// authorization state, so a saved config edit can revoke access without a
+/// restart. `start_station_agent_component` stashes one on the coordinator
+/// only when it spawns the real session (never on the inert/drain or
+/// `--replay` paths); teardown and the next start clear it. The arm and audit
+/// log are the coordinator's own shared instances and are not repeated here.
+#[derive(Clone)]
+pub(crate) struct StationAgentLiveHandles {
+    pub(crate) tx_allow_list: Arc<std::sync::RwLock<HashSet<String>>>,
+    pub(crate) tx_arm_allow_list: Arc<std::sync::RwLock<HashSet<String>>>,
+    pub(crate) client_keys: Arc<std::sync::RwLock<std::collections::HashMap<String, VerifyingKey>>>,
+    pub(crate) revocation_pending: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) authz_generation: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// PAN-103: remove `removed` keyIds from a running session's authorization
+/// sets, using the same publish protocol as `poll_authorizations_loop`:
+/// under the arm lock, disarm (`authorization-revoked`) if the armed client
+/// was removed and flag `revocation_pending`, then prune the TX-arm set; then
+/// prune the admission set and device keys; then bump `authz_generation`
+/// AFTER publishing so the session loop's [`reconcile_authorizations`] evicts
+/// the removed peers (Noise transport dropped, hello-token `jti`
+/// deny-listed, controller released) on its next tick.
+///
+/// Poisoned locks are entered rather than skipped: a revocation must never be
+/// lost to a poisoned lock. Returns whether anything changed (and so whether
+/// the generation was bumped).
+pub(crate) fn revoke_static_allow_list_entries(
+    live: &StationAgentLiveHandles,
+    arm: &Mutex<ArmState>,
+    audit: &AuditLog,
+    removed: &[String],
+    now_unix_ms: i64,
+) -> bool {
+    if removed.is_empty() {
+        return false;
+    }
+    let arm_changed = {
+        let mut st = match arm.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let armed_removed = st
+            .armed_client_key_id()
+            .is_some_and(|cur| removed.iter().any(|r| r == cur));
+        if armed_removed {
+            let effects = st.disarm_with_reason(DisarmReason::AuthorizationRevoked, now_unix_ms);
+            apply_arm_effects(audit, &effects);
+            live.revocation_pending.store(true, Ordering::Release);
+            warn!(
+                target: "agent.tx",
+                "remote TX disarmed: the armed client was removed from tx_allow_list"
+            );
+        }
+        // Published while still holding the arm lock (the same atomicity
+        // `verify_and_arm`'s re-check relies on for the poller's publish).
+        let mut g = match live.tx_arm_allow_list.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let before = g.len();
+        g.retain(|k| !removed.contains(k));
+        before != g.len()
+    };
+    let allow_changed = {
+        let mut g = match live.tx_allow_list.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let before = g.len();
+        g.retain(|k| !removed.contains(k));
+        before != g.len()
+    };
+    {
+        let mut g = match live.client_keys.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        g.retain(|k, _| !removed.contains(k));
+    }
+    let changed = arm_changed || allow_changed;
+    if changed {
+        live.authz_generation.fetch_add(1, Ordering::AcqRel);
+    }
+    changed
+}
+
 /// The initial seed for `tx_arm_allow_list` — FAIL-CLOSED, not fail-open
 /// (CQD-11 / dispensa Q-0052 follow-up: PR #259 shipped the split with a
 /// fail-open seed; this closes that gap).
@@ -1617,6 +1705,8 @@ impl super::ApplicationCoordinator {
     /// touches nothing off-box, and keeps the arm's values identical to a live
     /// run's — with no session to admit a controller, it can never lead to TX.
     pub(crate) async fn start_station_agent_component(&mut self) -> Result<()> {
+        // PAN-103: set again below only when the real session is spawned.
+        self.station_agent_live = None;
         let config = self.config.read().await;
         let cfg = config.network.station_agent.clone();
         let cqdx_cfg = config.network.cqdx.clone();
@@ -1832,6 +1922,16 @@ impl super::ApplicationCoordinator {
             });
             self.station_agent_poll = Some(poll_handle.abort_handle());
         }
+
+        // PAN-103: live handles for config-edit revocation (see
+        // `coordinator::config_reload`).
+        self.station_agent_live = Some(StationAgentLiveHandles {
+            tx_allow_list: tx_allow_list.clone(),
+            tx_arm_allow_list: tx_arm_allow_list.clone(),
+            client_keys: client_keys.clone(),
+            revocation_pending: revocation_pending.clone(),
+            authz_generation: authz_generation.clone(),
+        });
 
         let handle = tokio::spawn(async move {
             run_session_loop(RunConfig {
@@ -7851,6 +7951,126 @@ mod tests {
             disarmed_before,
             "no duplicate Disarmed record"
         );
+    }
+
+    /// PAN-103: the live handles a config edit revokes through, built over
+    /// `ctx`'s own shared state (what `start_station_agent_component` stashes).
+    fn live_handles_for(ctx: &ArmContext) -> StationAgentLiveHandles {
+        StationAgentLiveHandles {
+            tx_allow_list: ctx.tx_allow_list.clone(),
+            tx_arm_allow_list: ctx.tx_arm_allow_list.clone(),
+            client_keys: ctx.client_keys.clone(),
+            revocation_pending: ctx.revocation_pending.clone(),
+            authz_generation: ctx.authz_generation.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn config_edit_removing_the_armed_controller_disarms_and_reconcile_evicts() {
+        let identity = AgentIdentity::generate();
+        let (mut ctx, mut sess, _outbound, _transports, _ws) = two_authorized_peers(&identity);
+        arm_controller(&mut ctx, CLIENT_KEY_ID);
+        ctx.client_keys.write().unwrap().insert(
+            CLIENT_KEY_ID.to_string(),
+            SigningKey::from_bytes(&[0x22; 32]).verifying_key(),
+        );
+        let live = live_handles_for(&ctx);
+        let generation_before = live.authz_generation.load(Ordering::Acquire);
+        let disarmed_before = disarmed_records(&ctx).len();
+
+        let changed = revoke_static_allow_list_entries(
+            &live,
+            &ctx.arm,
+            &ctx.audit,
+            &[CLIENT_KEY_ID.to_string()],
+            NOW,
+        );
+
+        assert!(changed);
+        assert_eq!(
+            live.authz_generation.load(Ordering::Acquire),
+            generation_before + 1,
+            "generation bumped exactly once, after publishing"
+        );
+        assert!(!live.tx_allow_list.read().unwrap().contains(CLIENT_KEY_ID));
+        assert!(live.tx_allow_list.read().unwrap().contains(PEER_B));
+        assert!(!live
+            .tx_arm_allow_list
+            .read()
+            .unwrap()
+            .contains(CLIENT_KEY_ID));
+        assert!(!live.client_keys.read().unwrap().contains_key(CLIENT_KEY_ID));
+        assert!(
+            live.revocation_pending.load(Ordering::Acquire),
+            "the session loop is told to broadcast the disarm"
+        );
+        // Pending-work invalidation: the gate every key-time TX site and the
+        // playback chunk re-check consult now refuses this client.
+        assert!(!crate::coordinator::tx::remote_tx_permitted_for(
+            &ctx.arm,
+            || at(NOW),
+            Some(CLIENT_KEY_ID)
+        ));
+        let disarmed = disarmed_records(&ctx);
+        assert_eq!(disarmed.len(), disarmed_before + 1);
+        assert!(disarmed
+            .last()
+            .unwrap()
+            .detail
+            .contains("authorization-revoked"));
+
+        // The real session reconcile then evicts the removed peer.
+        reconcile_authorizations(&mut ctx, &mut sess, at(NOW));
+        assert!(!ctx.peers.contains_key(CLIENT_KEY_ID), "PeerCtx removed");
+        assert!(
+            ctx.revoked_jtis.contains(&format!("hello-{CLIENT_KEY_ID}")),
+            "its hello-token jti is deny-listed"
+        );
+        assert_eq!(ctx.controller, None, "control released");
+        assert!(ctx.peers.contains_key(PEER_B), "the other peer stays");
+        assert_eq!(
+            disarmed_records(&ctx).len(),
+            disarmed_before + 1,
+            "no duplicate Disarmed record"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_edit_removing_a_non_armed_peer_keeps_the_arm_and_evicts_only_it() {
+        let identity = AgentIdentity::generate();
+        let (mut ctx, mut sess, _outbound, _transports, _ws) = two_authorized_peers(&identity);
+        arm_controller(&mut ctx, CLIENT_KEY_ID);
+        let live = live_handles_for(&ctx);
+
+        assert!(revoke_static_allow_list_entries(
+            &live,
+            &ctx.arm,
+            &ctx.audit,
+            &[PEER_B.to_string()],
+            NOW,
+        ));
+        assert!(!live.revocation_pending.load(Ordering::Acquire));
+        assert!(crate::coordinator::tx::remote_tx_permitted_for(
+            &ctx.arm,
+            || at(NOW),
+            Some(CLIENT_KEY_ID)
+        ));
+        reconcile_authorizations(&mut ctx, &mut sess, at(NOW));
+        assert!(!ctx.peers.contains_key(PEER_B));
+        assert!(ctx.revoked_jtis.contains(&format!("hello-{PEER_B}")));
+        assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
+
+        // Removing a keyId that is not listed changes nothing and does not
+        // bump the generation.
+        let generation = live.authz_generation.load(Ordering::Acquire);
+        assert!(!revoke_static_allow_list_entries(
+            &live,
+            &ctx.arm,
+            &ctx.audit,
+            &["not-listed".to_string()],
+            NOW,
+        ));
+        assert_eq!(live.authz_generation.load(Ordering::Acquire), generation);
     }
 
     #[tokio::test]
