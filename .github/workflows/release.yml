@@ -18,6 +18,9 @@ name: Release
 #     MiniPC builds with MinGW already, so gnu is also the proven toolchain.
 #   - crates.io publishing is OUT of scope ([workspace.package] publish=false).
 #     This workflow ships binaries only.
+#   - Every action is pinned to a full commit SHA (version in the trailing
+#     comment). The workflow token is read-only; only the release job gets
+#     contents: write, and checkouts do not persist credentials.
 
 on:
   push:
@@ -27,7 +30,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -57,8 +60,9 @@ jobs:
             os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           # REQUIRED: without the ft8_lib submodule the binary ships the
           # degraded ft8lib_stub decoder. Two more gates below back this up.
           submodules: recursive
@@ -99,11 +103,11 @@ jobs:
         #   choco install mingw -y
         run: gcc --version
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: release-${{ matrix.target }}
 
@@ -180,7 +184,7 @@ jobs:
             shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
           fi
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-${{ matrix.target }}
           path: |
@@ -194,10 +198,14 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # gh release create
     steps:
-      - uses: actions/checkout@v7   # CHANGELOG.md only; no submodule needed
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false   # CHANGELOG.md only; no submodule needed
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           merge-multiple: true
