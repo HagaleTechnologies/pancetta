@@ -47,7 +47,10 @@ def disposition($s):
         (($s.ci_run.attempt // 1) < 2) and
         ($s.ci_failed_jobs | length > 0) and
         ($s.ci_failed_jobs - ["Codex-clean label gate (waits for wait-for-codex.yml's verdict)", "CI"] | length == 0) and
-        (($s.pr.labels | index("codex-clean:" + $s.pr.headRefOid[0:12])) != null or .request_codex_verdict))
+        # A refresh already spent on this head (the same pass re-reads live state after
+        # requesting it) still justifies rerunning the label gate, which waits for the verdict.
+        (($s.pr.labels | index("codex-clean:" + $s.pr.headRefOid[0:12])) != null or .request_codex_verdict or
+          (($s.refresh_count_for_head // 0) > 0)))
     | . as $d
     | .blockers += [$s.required_checks[]
         | select(.conclusion != null)

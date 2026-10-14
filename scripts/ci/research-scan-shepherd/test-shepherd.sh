@@ -6,13 +6,20 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 export PATH="$dir/stub:$PATH" STUB_DIR="$dir/stub" REPO=example/pancetta
 export GH_TOKEN=test-workflow-token RESOLVE_TOKEN=test-user-token CHECKS_TOKEN=test-app-token ONLY_PR=420 GITHUB_RUN_ID=555
+export SETTLE_TRIES=3 SETTLE_INTERVAL=0
 export REPORT_MENTION=thagale RUN_URL=https://example.invalid/run/1
 # P replays B's data with only the re-arm marker comment failing; Q replays B with the
 # queue handler re-pausing the PR as green checks queue it. R is armed and queued past the
 # round cap. S replays C with the gate check-run PATCH refused (created by another app).
-for scenario in A B C D E F G H I J K L M N O P Q R S; do
+# T-V replay C racing the response job: T, a response fails the gate just after the request;
+# U, the same race but Codex has already replied to the request; V, response runs never settle.
+for scenario in A B C D E F G H I J K L M N O P Q R S T U V; do
   export STUB_CASE=$scenario STUB_FAIL_REARM_COMMENT='' STUB_PAUSE_ON_ARM='' STUB_FAIL_CHECK_PATCH=''
+  export STUB_RACE_AFTER_REQUEST='' STUB_CODEX_ANSWERED='' STUB_ALWAYS_INFLIGHT=''
   [[ $scenario == S ]] && export STUB_CASE=C STUB_FAIL_CHECK_PATCH=1
+  [[ $scenario == T ]] && export STUB_CASE=C STUB_RACE_AFTER_REQUEST=1
+  [[ $scenario == U ]] && export STUB_CASE=C STUB_RACE_AFTER_REQUEST=1 STUB_CODEX_ANSWERED=1
+  [[ $scenario == V ]] && export STUB_CASE=C STUB_ALWAYS_INFLIGHT=1
   [[ $scenario == P ]] && export STUB_CASE=B STUB_FAIL_REARM_COMMENT=1
   [[ $scenario == Q ]] && export STUB_CASE=B STUB_PAUSE_ON_ARM=1
   export STUB_LOG="$tmp/$scenario.log" STUB_STATE="$tmp/$scenario"
@@ -54,7 +61,10 @@ when 'C', 'M', 'N'
   ci = find.call('run rerun 801 --failed')
   # The stub's gate is completed/failure (check-run 3), so it is reopened first.
   reopen = find.call('-X PATCH repos/example/pancetta/check-runs/3 -f status=in_progress -f external_id=555')
-  raise 'refresh order' unless resolves.max < reopen && reopen < request && request < marker && marker < audit && audit < ci
+  settle = ->(after) { calls.each_index.find { |i| i > after && calls[i]['args'].join(' ').include?('--workflow wait-for-codex.yml --event issue_comment') } || raise('missing settle') }
+  pre = calls.each_index.find { |i| calls[i]['args'].join(' ').include?('--workflow wait-for-codex.yml --event issue_comment') }
+  raise 'refresh order' unless resolves.max < pre && pre < reopen && reopen < request && request < marker &&
+    marker < settle.call(marker) && settle.call(marker) < audit && audit < ci
   raise 'reopen identity' unless calls[reopen]['token'] == 'test-app-token'
   raise 'request identity' unless calls[request]['token'] == 'test-user-token' && calls[marker]['token'] == 'test-user-token'
   raise 'audit identity' unless calls[audit]['token'] == 'test-workflow-token'
@@ -110,6 +120,20 @@ when 'S'
   request = find.call('body=@codex review')
   raise 'fallback order' unless patch < create && create < request
   raise 'fallback identity' unless calls[create]['token'] == 'test-app-token'
+when 'T'
+  reopens = calls.each_index.select { |i| calls[i]['args'].join(' ').include?('-X PATCH repos/example/pancetta/check-runs/3') }
+  request = find.call('body=@codex review')
+  audit = find.call('<!-- research-scan-shepherd:refresh sha=1a2b3c400000 -->')
+  raise 'race not repaired' unless reopens.length == 2 && reopens[0] < request && request < reopens[1] && reopens[1] < audit
+  raise 'missing race notice' unless File.read(output).include?('Codex gate failed after the request')
+when 'U'
+  reopens = calls.each_index.select { |i| calls[i]['args'].join(' ').include?('-X PATCH repos/example/pancetta/check-runs/3') }
+  raise 'clobbered an answered verdict' unless reopens.length == 1 && reopens[0] < find.call('body=@codex review')
+  find.call('<!-- research-scan-shepherd:refresh sha=1a2b3c400000 -->')
+when 'V'
+  find.call('body=@codex review')
+  raise 'spent the budget on an unverified gate' if calls.any? { |c| c['args'].join(' ').include?('research-scan-shepherd:refresh') }
+  raise 'missing settle notice' unless File.read(output).include?('response run is still pending')
 when 'E'
   raise 'busy mutation' unless mutations.empty?
   raise 'missing skip notice' unless File.read(output).include?('skip')

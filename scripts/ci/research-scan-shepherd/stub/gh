@@ -10,7 +10,11 @@ case "$1 $2" in
     if [[ $args == *'auto-merge-trigger.yml'* || $args == *'queue-retry-handler.yml'* ]]; then
       if [[ $STUB_CASE == E && $args == *'queue-retry-handler.yml'* && $args == *'in_progress'* ]]; then echo '[{"databaseId":99}]'; else echo '[]'; fi
     elif [[ $args == *'wait-for-codex.yml'* ]]; then
-      get '.codex_workflow_runs.workflow_runs | sort_by(.created_at) | reverse | .[:1] | map({databaseId:.id,conclusion,status,headSha:.head_sha,attempt:.run_attempt,createdAt:.created_at})'
+      # Response runs in flight: one after a raced request (STUB_RACE_AFTER_REQUEST), or forever after the
+      # request (STUB_ALWAYS_INFLIGHT).
+      if [[ -n ${STUB_ALWAYS_INFLIGHT:-} && -f $STUB_STATE/requested ]]; then echo '[{"databaseId":7}]'
+      elif [[ -f $STUB_STATE/inflight ]]; then rm -f "$STUB_STATE/inflight"; echo '[{"databaseId":7}]'
+      else echo '[]'; fi
     else get '.ci_runs'; fi ;;
   'run view') get '.jobs' ;;
   'run rerun') echo '{}' ;;
@@ -63,6 +67,17 @@ case "$1 $2" in
       echo 'stub: rearm marker post failed' >&2; exit 1
     elif [[ -n ${STUB_FAIL_CHECK_PATCH:-} && $args == *' -X PATCH '* && $args == *'/check-runs/'* ]]; then
       echo 'stub: check run can only be modified by the GitHub App that created it' >&2; exit 1
+    elif [[ $args == *' -X PATCH '* && $args == *'/check-runs/'* ]] || [[ $args == *' -X POST '* && $args == *'/check-runs '* ]]; then
+      echo open > "$STUB_STATE/gate"; echo '{}'
+    elif [[ $args == *' -X POST '* && $args == *'body=@codex review'* ]]; then
+      touch "$STUB_STATE/requested"
+      # STUB_RACE_AFTER_REQUEST: a response run that started before the request fails the gate right after it.
+      if [[ -n ${STUB_RACE_AFTER_REQUEST:-} && ! -f $STUB_STATE/raced ]]; then
+        echo failed > "$STUB_STATE/gate"; touch "$STUB_STATE/raced" "$STUB_STATE/inflight"
+      fi
+      echo '2026-10-14T12:00:00Z'
+    elif [[ $args == *' -X POST '* && $args == *'research-scan-shepherd:refresh'* ]]; then
+      touch "$STUB_STATE/refreshed"; echo '{}'
     elif [[ $args == *' -X POST '* || $args == *' -X PATCH '* ]]; then echo '{}'
     else
       case "$2" in
@@ -70,11 +85,21 @@ case "$1 $2" in
         *'/labels/research-scan-stuck') [[ $STUB_CASE == J ]] || exit 1; echo '{"name":"research-scan-stuck"}' ;;
         *'/actions/workflows/wait-for-codex.yml/runs?'*) get '.codex_workflow_runs' ;;
         *'/rules/branches/main'*) [[ $STUB_CASE != H && $STUB_CASE != O ]] || exit 1; get '.rules' ;;
-        *'/check-runs'*) get '.checks' ;;
+        *'/check-runs'*)
+          gate=$(cat "$STUB_STATE/gate" 2>/dev/null || true)
+          get '.checks' | jq --arg gate "$gate" '(.check_runs[] | select(.name == "Codex review clean (gate before expensive downstream jobs)")) |=
+            (if $gate == "open" then .status = "in_progress" | .conclusion = null
+             elif $gate == "failed" then .status = "completed" | .conclusion = "failure" else . end)' ;;
         *'/statuses'*) get '.statuses' ;;
         *'/files'*) get '.files' ;;
         *'/timeline'*) get '.timeline' ;;
-        *'/comments'*) get '.comments' ;;
+        *'/comments'*)
+          # Reflect posted refresh markers, and a Codex reply after the request (STUB_CODEX_ANSWERED).
+          get '.comments' | jq --argjson refreshed "$([[ -f $STUB_STATE/refreshed ]] && echo true || echo false)" \
+            --argjson answered "$([[ -n ${STUB_CODEX_ANSWERED:-} && -f $STUB_STATE/requested ]] && echo true || echo false)" '
+            (. // []) + (if $refreshed then [{user:{login:"github-actions[bot]"},created_at:"2026-10-14T12:00:01Z",
+              body:"<!-- research-scan-shepherd:refresh sha=1a2b3c400000 -->"}] else [] end)
+              + (if $answered then [{user:{login:"chatgpt-codex-connector[bot]"},created_at:"2026-10-14T12:05:00Z",body:"Codex Review: Did not find any major issues."}] else [] end)' ;;
         *'/labels'*) if [[ -f $STUB_STATE/repaused ]]; then echo '[{"name":"queue-needs-human-review"}]'
           elif [[ -f $STUB_STATE/cleared ]]; then echo '[]'; else get '.pr.data.repository.pullRequest.labels.nodes'; fi ;;
         *'/commits/'*) get '.commit_files' ;;
