@@ -7,6 +7,8 @@ DRY_RUN=${DRY_RUN:-false}
 REPORT_MENTION=${REPORT_MENTION:-thagale}
 RUN_URL=${RUN_URL:-}
 RESOLVE_TOKEN=${RESOLVE_TOKEN:-}
+CHECKS_TOKEN=${CHECKS_TOKEN:-}
+GATE_CHECK='Codex review clean (gate before expensive downstream jobs)'
 for arg in "$@"; do
   case "$arg" in --dry-run) DRY_RUN=true ;; *) echo "Unknown argument: $arg" >&2; exit 2 ;; esac
 done
@@ -19,7 +21,7 @@ validate_inputs() {
 validate_inputs || { echo 'Invalid shepherd input' >&2; exit 2; }
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
-CONFIG='{"actors":["thagale","catalyst-cloud-connector[bot]"],"title_regex":"^Weekly research scan [0-9]{4}-[0-9]{2}-[0-9]{2}$","rearm_budget":2,"stuck_after_hours":24,"round_cap":3}'
+CONFIG='{"actors":["thagale","catalyst-cloud-connector[bot]"],"title_regex":"^Weekly research scan [0-9]{4}-[0-9]{2}-[0-9]{2}$","rearm_budget":2,"refresh_budget":1,"stuck_after_hours":24,"round_cap":3}'
 # Return 0 for quiet, 1 for busy, 2 for an unreadable producer. Never treat an API
 # failure as an empty queue. Check again before mutations, not just at startup.
 quiescent() {
@@ -71,14 +73,6 @@ gather_snapshot() {
   gh api "repos/$REPO/issues/$pr/comments?per_page=100" --paginate | jq -s 'add' > "$dir/comments" || return 1
   gh run list --repo "$REPO" --workflow ci.yml --commit "$head" --event pull_request \
     --json databaseId,conclusion,status,headSha,attempt,createdAt --limit 1 > "$dir/ci" || return 1
-  # Human reviews also create runs, but their Codex response job is skipped. Pick
-  # only a Codex-triggered response; rerunning a later human review cannot refresh it.
-  gh api "repos/$REPO/actions/workflows/wait-for-codex.yml/runs?event=pull_request_review&head_sha=$head&per_page=100" --paginate |
-    jq -s --arg head "$head" '[.[].workflow_runs[] |
-      select(.head_sha == $head and .event == "pull_request_review") |
-      select(.actor.login == "chatgpt-codex-connector" or .actor.login == "chatgpt-codex-connector[bot]")] |
-      sort_by(.created_at,.id) | reverse | .[:1] |
-      map({databaseId:.id,conclusion,status,headSha:.head_sha,attempt:.run_attempt,createdAt:.created_at})' > "$dir/codex" || return 1
   ci_id=$(jq -r '.[0].databaseId // empty' "$dir/ci") || return 1
   printf '{"jobs":[]}' > "$dir/jobs"
   if [[ -n $ci_id ]]; then gh run view "$ci_id" --repo "$REPO" --json jobs > "$dir/jobs" || return 1; fi
@@ -96,15 +90,17 @@ gather_snapshot() {
   jq --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson config "$CONFIG" \
     --slurpfile files "$dir/files" --slurpfile rules "$dir/rules" --slurpfile checks "$dir/checks" \
     --slurpfile statuses "$dir/statuses" --slurpfile timeline "$dir/timeline" --slurpfile comments "$dir/comments" \
-    --slurpfile ci "$dir/ci" --slurpfile codex "$dir/codex" --slurpfile jobs "$dir/jobs" --slurpfile commit_files "$dir/commit-files" '
+    --slurpfile ci "$dir/ci" --slurpfile jobs "$dir/jobs" --slurpfile commit_files "$dir/commit-files" '
     . + {now:$now,config:$config,commit_files:$commit_files[0],
       merge_queue_rule_present:any($rules[0][]; .type == "merge_queue"),
       ci_failed_jobs:[$jobs[0].jobs[] | select(.conclusion != null and .conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral") | .name],
-      ci_run:($ci[0][0] // null), codex_run:($codex[0][0] // null),
+      ci_run:($ci[0][0] // null),
       pause:{present:(.pr.labels | index("queue-needs-human-review") != null),
         attached_by:([$timeline[0][] | select(.event == "labeled" and .label.name == "queue-needs-human-review")][-1].actor.login // null)},
       rearm_count_for_head:([ $comments[0][] | select(.user.login == "github-actions[bot]") |
-        select(.body | contains("<!-- research-scan-shepherd:rearm sha=" + $head[0:12] + " -->"))] | length)}
+        select(.body | contains("<!-- research-scan-shepherd:rearm sha=" + $head[0:12] + " -->"))] | length),
+      refresh_count_for_head:([ $comments[0][] | select(.user.login == "github-actions[bot]") |
+        select(.body | contains("<!-- research-scan-shepherd:refresh sha=" + $head[0:12] + " -->"))] | length)}
     | .pr.files = $files[0]
     | .required_checks = [$rules[0][] | select(.type == "required_status_checks") |
         .parameters.required_status_checks[] | . as $rule |
@@ -120,6 +116,86 @@ gather_snapshot() {
     --arg head "$head" "$dir/snapshot" > "$dest" || return 1
 }
 record_action() { printf '%s\n' "$1" >> "$WORK/actions"; }
+# Q-0068 refresh-path concurrency. Three actors touch the managed gate check-run for a head:
+# this shepherd (reopen, request, spend the budget), wait-for-codex.yml's response job
+# (serialized per PR; concludes the latest check-run success/failure), and credenza's timeout
+# scanner (recovers in_progress checks only). The one unrecoverable state is a gate that is
+# completed/failure with this head's budget spent and no Codex reply pending, so:
+#   1. settle (no response run queued or running) before the lookup/reopen, so a verdict
+#      being written right now is never clobbered;
+#   2. reopen a failed gate, then post the request;
+#   3. settle again and re-read: a response that raced the request may have failed the gate.
+#      Unless Codex has replied since the request (its own response run concludes the gate),
+#      reopen and re-check, a bounded number of times;
+#   4. spend the budget only once the gate is verified open (or answered). If that cannot be
+#      verified, stand down without spending it; the next pass requests again.
+# A response run whose request lookup happens after our request selects our request as the
+# baseline and finds no tied Codex signal, so it leaves the gate alone.
+# Waiting is bounded twice: per settle (8 x 15s), and across the whole run (SETTLE_BUDGET
+# seconds of total waiting, shared by every candidate PR), so many PRs needing a refresh can't
+# push the job past its 15-minute timeout. Past the run-wide deadline a settle that finds a
+# response run pending stands down at once; that is safe (no budget spent, next pass retries).
+SETTLE_TRIES=${SETTLE_TRIES:-8}
+SETTLE_INTERVAL=${SETTLE_INTERVAL:-15}
+SETTLE_BUDGET=${SETTLE_BUDGET:-360}
+SETTLE_DEADLINE=$((SECONDS + SETTLE_BUDGET))
+# Return 0 once no Wait-for-Codex issue_comment run is pending, 1 if one still is after the
+# bounded wait, 2 if unreadable. Not PR-scoped (the run list can't filter by PR): conservative.
+settle_responses() {
+  local i status runs busy
+  for ((i = 0; i < SETTLE_TRIES; i++)); do
+    busy=0
+    for status in requested waiting pending queued in_progress; do
+      runs=$(gh run list --repo "$REPO" --workflow wait-for-codex.yml --event issue_comment --status "$status" --json databaseId --limit 1) || return 2
+      jq -e 'type == "array"' <<< "$runs" >/dev/null || return 2
+      [[ $(jq 'length' <<< "$runs") == 0 ]] || { busy=1; break; }
+    done
+    [[ $busy == 1 ]] || return 0
+    (( SECONDS + SETTLE_INTERVAL <= SETTLE_DEADLINE )) || break
+    sleep "$SETTLE_INTERVAL"
+  done
+  echo "::notice::A Wait for Codex response run is still pending; not touching the gate this pass." >&2
+  return 1
+}
+# The managed check-run: numeric external_id (GitHub's native skipped job has a UUID), latest.
+gate_lookup() {
+  gh api "repos/$REPO/commits/$1/check-runs?per_page=100" --paginate |
+    jq -cs --arg name "$GATE_CHECK" '[.[].check_runs[] | select(.name == $name) |
+      select((.external_id // "") | test("^[0-9]+$"))] | sort_by(.started_at,.id) | last // {}'
+}
+# Reopen a completed/failure gate. Check-runs can only be modified by the app that created
+# them: PATCH with hagale-agent; if refused, create a fresh in_progress one, which becomes the
+# latest and is the one the response job concludes. No-op unless the gate is failed.
+reopen_gate() {
+  local head=$1 lookup id
+  lookup=$(gate_lookup "$head") || return 1
+  [[ $(jq -r '.conclusion // empty' <<< "$lookup") == failure ]] || return 0
+  id=$(jq -r '.id // empty' <<< "$lookup")
+  if [[ -n $id ]] && GH_TOKEN="$CHECKS_TOKEN" gh api -X PATCH "repos/$REPO/check-runs/$id" \
+      -f status=in_progress -f external_id="${GITHUB_RUN_ID:-0}" >/dev/null 2>&1; then
+    record_action "reopened Codex gate check $id"
+    return 0
+  fi
+  GH_TOKEN="$CHECKS_TOKEN" gh api -X POST "repos/$REPO/check-runs" -f name="$GATE_CHECK" \
+    -f head_sha="$head" -f status=in_progress -f external_id="${GITHUB_RUN_ID:-0}" >/dev/null || return 1
+  record_action "created a fresh in_progress Codex gate check"
+}
+# Steps 3-4 above. Return 0 when the budget may be spent, 3 to stand down, 1 on API failure.
+ensure_gate_open() {
+  local pr=$1 head=$2 asked=$3 attempt code answered
+  for attempt in 1 2 3; do
+    code=0; settle_responses || code=$?
+    [[ $code == 0 ]] || { [[ $code == 2 ]] && return 1; return 3; }
+    answered=$(gh api "repos/$REPO/issues/$pr/comments?per_page=100" --paginate | jq -s --arg t "$asked" '[add // [] | .[] |
+      select(.user.login == "chatgpt-codex-connector" or .user.login == "chatgpt-codex-connector[bot]") |
+      select(.created_at >= $t)] | length') || return 1
+    [[ $answered == 0 ]] || return 0
+    [[ $(gate_lookup "$head" | jq -r '.conclusion // empty') == failure ]] || return 0
+    echo "::notice::Codex gate failed after the request (attempt $attempt); reopening." >&2
+    reopen_gate "$head" || return 1
+  done
+  return 3
+}
 # Return 0 when no queue producer is running and the pause label is absent, 1 when either
 # is present, 2 when unreadable.
 arm_window_clear() {
@@ -203,7 +279,7 @@ $body
   fi
 }
 apply() {
-  local snapshot=$1 decision=$2 pr head entry id original live code ci_id codex_id attempt
+  local snapshot=$1 decision=$2 pr head entry id original live code ci_id attempt asked
   pr=$(jq -r '.pr.number' "$snapshot"); head=$(jq -r '.pr.headRefOid' "$snapshot")
   cat "$decision"
   if [[ $DRY_RUN == true ]]; then record_action "dry-run (no writes)"; return 0; fi
@@ -232,13 +308,30 @@ apply() {
     GH_TOKEN="$RESOLVE_TOKEN" gh api graphql -f query="mutation(\$id: ID!) { resolveReviewThread(input: {threadId: \$id}) { thread { isResolved } } }" -f id="$id" >/dev/null || return 1
     record_action "resolved $id"
   done < <(jq -c '.resolve[]' "$decision")
-  if jq -e '.rerun_codex_verdict' "$decision" >/dev/null; then
+  # Q-0068: request a fresh verdict with a new event, never a rerun (a rerun replays the
+  # workflow definition from before the codex-review environment, and the
+  # pull_request_review response path is gone). Mirrors wait-for-codex.yml's request job:
+  # "@codex review" then the head_sha marker, both as the CODEX_REVIEW_PAT identity its
+  # response job trusts. Ordering and the race with the response job: see the
+  # "refresh-path concurrency" comment above settle_responses. A failed audit post at
+  # worst allows one extra request.
+  if jq -e '.request_codex_verdict' "$decision" >/dev/null; then
+    [[ -n $RESOLVE_TOKEN ]] || { echo '::error::Missing CODEX_REVIEW_PAT' >&2; return 1; }
+    [[ -n $CHECKS_TOKEN ]] || { echo '::error::Missing hagale-agent check-run token' >&2; return 1; }
     refresh "$pr" "$head" || return $?
-    if jq -e '.rerun_codex_verdict' "$WORK/live-decision" >/dev/null; then
-      codex_id=$(jq -r '.codex_run | select(.status == "completed") | .databaseId // empty' "$WORK/live")
-      [[ -n $codex_id ]] || { echo '::error::No completed Codex response run for this head' >&2; return 1; }
-      gh run rerun "$codex_id" --repo "$REPO" >/dev/null || return 1
-      record_action "reran Codex verdict"
+    if jq -e '.request_codex_verdict' "$WORK/live-decision" >/dev/null; then
+      code=0; settle_responses || code=$?
+      [[ $code == 0 ]] || { [[ $code == 2 ]] && return 1; return 3; }
+      reopen_gate "$head" || return 1
+      asked=$(GH_TOKEN="$RESOLVE_TOKEN" gh api -X POST "repos/$REPO/issues/$pr/comments" -f body="@codex review" --jq '.created_at // empty') || return 1
+      [[ -n $asked ]] || asked=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+      GH_TOKEN="$RESOLVE_TOKEN" gh api -X POST "repos/$REPO/issues/$pr/comments" -f body="<!-- codex-review-request head_sha=$head -->" >/dev/null || return 1
+      record_action "requested a fresh Codex verdict"
+      code=0; ensure_gate_open "$pr" "$head" "$asked" || code=$?
+      [[ $code == 0 ]] || return "$code"
+      gh api -X POST "repos/$REPO/issues/$pr/comments" -f body="Requested a fresh Codex verdict for ${head:0:12}: every Codex thread now carries a disposition.
+<!-- research-scan-shepherd:refresh sha=${head:0:12} -->" >/dev/null || return 1
+      record_action "spent the Codex refresh budget for ${head:0:12}"
     fi
   fi
   if jq -e '.rerun_ci_failed_jobs' "$decision" >/dev/null; then

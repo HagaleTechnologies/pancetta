@@ -111,6 +111,6 @@ findings from later rounds to the same ticket.
 ### Landing
 
 You never merge. Auto-merge is armed when the PR opens. `research-scan-shepherd.yml`
-(twice daily) resolves threads that carry a disposition, refreshes the Codex verdict
-after deferrals, re-arms auto-merge after a merge-queue removal, and reports a PR stuck
-for more than a day.
+(twice daily) resolves threads that carry a disposition, requests a fresh Codex verdict
+after deferrals (an `@codex review` comment, once per head), re-arms auto-merge after a
+merge-queue removal, and reports a PR stuck for more than a day.

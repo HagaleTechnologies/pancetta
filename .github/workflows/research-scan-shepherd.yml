@@ -3,7 +3,8 @@ name: Research Scan Shepherd
 # PAN-172: the weekly pancetta-research-scan routine opens a notes-only PR and stops.
 # This workflow owns the mechanical half of landing it: resolve Codex threads whose
 # latest reply is a verified disposition (docs/routines/pancetta-research-scan.md),
-# refresh the Codex verdict and CI after deferrals, re-arm auto-merge after a merge-queue
+# request a fresh Codex verdict (Q-0068: a new `@codex review` comment, once per head,
+# never a rerun) and rerun failed CI after deferrals, re-arm auto-merge after a merge-queue
 # ejection, and report a PR stuck for more than a day. The judgment half (fix or defer,
 # the PAN ticket, the reply) stays in the routine. Scope: open PRs titled
 # "Weekly research scan YYYY-MM-DD", same-repo, author on auto-merge-trigger.yml's
@@ -40,6 +41,10 @@ concurrency:
 jobs:
   shepherd:
     name: Shepherd weekly research-scan PRs
+    # Q-0068: CODEX_REVIEW_PAT and the app key live in the main-only codex-review environment.
+    environment:
+      name: codex-review
+      deployment: false
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -47,9 +52,21 @@ jobs:
         with:
           ref: main
           persist-credentials: false
+      # Check-runs can only be modified by the app that created them, so reopening the
+      # managed Codex gate before a fresh-verdict request needs hagale-agent, the same app
+      # wait-for-codex.yml writes that check with.
+      - name: Mint a hagale-agent installation token for check-run writes
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: 4696353
+          private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: pancetta
       - name: Shepherd
         env:
           GH_TOKEN: ${{ github.token }}
+          CHECKS_TOKEN: ${{ steps.app-token.outputs.token }}
           # Real-user PAT: resolveReviewThread on a Codex-started thread fails under
           # GITHUB_TOKEN (wait-for-codex.yml), and an arm attributed to GITHUB_TOKEN would
           # suppress push-triggered workflows on the queue-merged commit (auto-merge-trigger.yml).
