@@ -9,7 +9,7 @@
 
 ## Read-only remote gateway (Panino client, v1)
 
-`pancetta/src/coordinator/remote_gateway/{mod.rs,translate.rs}`, `pancetta-protocol` crate, `pancetta-config/src/network.rs`: a **default-OFF, localhost-bound** axum WebSocket component that serves the read-only remote view (decodes + QSO progress + scalar status) to WebSocket clients (panino) using the `pancetta_protocol` wire types. **NO control / NO remote-TX** in v1 — inbound `clientCommand` frames are accepted but ignored (logged); the control/relay/auth path is gated behind dispensa ADR-0002 (Accepted) and is not built here. Started in `start_remote_gateway_component` (mirrors `start_pskreporter_component`: disabled → drain channel, enabled → bus-pump + axum-serve tasks). The pure `translate.rs` maps bus payloads → protocol types (`ActiveQsoSnapshotItem`→`QsoProgress`, `DecodedMessage`→`DecodedView` enriched with worked/needed/atno from `CachedStationLookup`, etc.). Live feed via **additive dual-destination** bus sends gated on a cached `gateway_enabled: Arc<AtomicBool>` (zero overhead when off): decode fan-out (`ft8.rs`), `ActiveQsosSnapshot` ×3 (`qso.rs`), Frequency+SignalStrength (`hamlib.rs`), Split-clear (`autonomous.rs`), Mode (`tui_relay.rs`, see below) — the existing `→Tui` sends are **untouched** (additive-only invariant; `pancetta-tui` diff empty). On connect: `Welcome{StateSnapshot}` (full state, sent every reconnect) then `event` deltas; `protocolVersion = 1`. v1 emits `decoded`/`activeQsos`/`frequency`/`signalStrength`/`split`/`mode`/`spectrum` (NOT `dxHunter` rows — client builds DX Hunter from the decode stream; NOT live `txStatus`/`txPolicy`). **`mode` field** (2026-07-06, dispensa Q-0027 — fulfills the Q-0009 promise made when FT4 landed): `StateSnapshot.mode: String` (station-wide operating mode, "FT8"/"FT4"/"FT2"; `#[serde(default)]` ⇒ "FT8" for back-compat) seeded from the live `active_protocol_mode` atomic at gateway startup, plus a new `ServerEvent::Mode` pushed on every successful Shift+M switch (`tui_relay.rs`'s `CycleOperatingMode` handler, gated through `relay_to_gateway` same as Frequency/Split) so already-connected clients see a live mode change without reconnecting. Additive/optional on the wire — no schema-breaking change. **`spectrum` event** (2026-07-22, dispensa Q-0024, rig-api v1.2): `ServerEvent::Spectrum{spectrum: {binStartHz, binWidthHz, magsDb, seq, timestamp}}`, event-only (not carried in `StateSnapshot` — consumers key off `seq` and tolerate gaps). Source is `pancetta-ft8::decoder::generate_waterfall_data` — raw, pre-normalization dB (distinct from the TUI's own 0-1 color-mapped waterfall, which is untouched). `ft8.rs` forwards one `MessageType::SpectrumRow` (native ~2.93 Hz/bin resolution, audio-baseband `audio_bin_start_hz`) per waterfall row (~4 per FT8 decode window) to the gateway, gated by `display_feed_enabled` exactly like the `DecodedMessage` relay. The pure `translate::spectrum_row_to_event` pair-averages bins down to ~5.86 Hz/bin (matching panino's fixture default) and converts `audio_bin_start_hz` → RF-absolute by adding the live dial frequency (mirrors `decoded_to_view`'s enrichment); `handle_bus_msg` assigns `seq` from a per-display-feed-session `AtomicU64`. Config: `[network.remote_gateway]` (`enabled`=false, `bind_addr`=`127.0.0.1:4080`). Plain `ws://` localhost only (wss/TLS deferred to Sub-plan C). Cross-repo: dispensa ADR-0003 (rig-API) + ADR-0009 (this v1 implemented profile) + `contracts/rig/rig-api.v1.schema.json`. Spec: `docs/superpowers/specs/2026-06-26-remote-operation-design.md`; plan: `docs/superpowers/plans/2026-06-27-remote-gateway.md`.
+`pancetta/src/coordinator/remote_gateway/{mod.rs,translate.rs}`, `pancetta-protocol` crate, `pancetta-config/src/network.rs`: a **default-OFF, localhost-bound** axum WebSocket component that serves the read-only remote view (decodes + QSO progress + scalar status) to WebSocket clients (panino) using the `pancetta_protocol` wire types. **NO control / NO remote-TX** in v1 — inbound `clientCommand` frames are accepted but ignored (logged); the control/relay/auth path is gated behind dispensa ADR-0002 (Accepted) and is not built here. Started in `start_remote_gateway_component` (mirrors `start_pskreporter_component`: disabled → drain channel, enabled → bus-pump + axum-serve tasks). The pure `translate.rs` maps bus payloads → protocol types (`ActiveQsoSnapshotItem`→`QsoProgress`, `DecodedMessage`→`DecodedView` enriched with worked/needed/atno from `CachedStationLookup`, etc.). Live feed via **additive dual-destination** bus sends gated on a cached `gateway_enabled: Arc<AtomicBool>` (zero overhead when off): decode fan-out (`ft8.rs`), `ActiveQsosSnapshot` ×3 (`qso.rs`), Frequency+SignalStrength (`hamlib.rs`), Split-clear (`autonomous.rs`), Mode (`tui_relay.rs`, see below) — the existing `→Tui` sends are **untouched** (additive-only invariant; `pancetta-tui` diff empty). After an authenticated `hello`: `Welcome{StateSnapshot}` (full state, sent every reconnect) then `event` deltas; `protocolVersion = 1`. v1 emits `decoded`/`activeQsos`/`frequency`/`signalStrength`/`split`/`mode`/`spectrum` (NOT `dxHunter` rows — client builds DX Hunter from the decode stream; NOT live `txStatus`/`txPolicy`). **`mode` field** (2026-07-06, dispensa Q-0027 — fulfills the Q-0009 promise made when FT4 landed): `StateSnapshot.mode: String` (station-wide operating mode, "FT8"/"FT4"/"FT2"; `#[serde(default)]` ⇒ "FT8" for back-compat) seeded from the live `active_protocol_mode` atomic at gateway startup, plus a new `ServerEvent::Mode` pushed on every successful Shift+M switch (`tui_relay.rs`'s `CycleOperatingMode` handler, gated through `relay_to_gateway` same as Frequency/Split) so already-connected clients see a live mode change without reconnecting. Additive/optional on the wire — no schema-breaking change. **`spectrum` event** (2026-07-22, dispensa Q-0024, rig-api v1.2): `ServerEvent::Spectrum{spectrum: {binStartHz, binWidthHz, magsDb, seq, timestamp}}`, event-only (not carried in `StateSnapshot` — consumers key off `seq` and tolerate gaps). Source is `pancetta-ft8::decoder::generate_waterfall_data` — raw, pre-normalization dB (distinct from the TUI's own 0-1 color-mapped waterfall, which is untouched). `ft8.rs` forwards one `MessageType::SpectrumRow` (native ~2.93 Hz/bin resolution, audio-baseband `audio_bin_start_hz`) per waterfall row (~4 per FT8 decode window) to the gateway, gated by `display_feed_enabled` exactly like the `DecodedMessage` relay. The pure `translate::spectrum_row_to_event` pair-averages bins down to ~5.86 Hz/bin (matching panino's fixture default) and converts `audio_bin_start_hz` → RF-absolute by adding the live dial frequency (mirrors `decoded_to_view`'s enrichment); `handle_bus_msg` assigns `seq` from a per-display-feed-session `AtomicU64`. Config: `[network.remote_gateway]` (`enabled`=false, `bind_addr`=`127.0.0.1:4080`, required `auth_token` when enabled, `allowed_origins`=[], `allow_network_exposure`=false). Clients must authenticate with `hello.gatewayToken` before receiving station data. Plain `ws://` is loopback-only unless explicitly exposed; wss/TLS remains deferred. See [gateway configuration](../CONFIG.md#networkremote_gateway--local-read-only-view-panino). Cross-repo: dispensa ADR-0003 (rig-API) + ADR-0009 (this v1 implemented profile) + `contracts/rig/rig-api.v1.schema.json`. Spec: `docs/superpowers/specs/2026-06-26-remote-operation-design.md`; plan: `docs/superpowers/plans/2026-06-27-remote-gateway.md`.
 
 ## Station agent — remote rig control (P0–P2 safety core + P3 relay/pairing wire landed offline; the FINAL TX authority)
 
@@ -425,3 +425,52 @@ Normative station behaviour for heartbeat timing:
   a limit expires the arm, so an operator silent through a suspend longer than 30 s must re-arm on
   wake. A wall-clock forward step still does not expire liveness; only real elapsed time does. A
   suspend-aware sample earlier than the stored one denies.
+
+## Local gateway authentication (PAN-99), 2026-10-13
+
+The [design spec](../superpowers/specs/2026-10-13-local-gateway-authentication-design.md)
+defines admission for the read-only local gateway. It leaves the relay-connected
+station agent, display-feed translation and TUI behavior unchanged.
+
+| Decision | Required behavior |
+|----------|-------------------|
+| D1 | The first text frame must be a `hello` with `gatewayToken` within 5 seconds. Subscribe and send station data only after authentication. |
+| D2 | An enabled gateway requires a configured secret of at least 32 characters, without whitespace or control characters. |
+| D3 | Compare token bytes with `subtle::ConstantTimeEq`. |
+| D4 | A present Origin must match the explicit allow-list, ignoring ASCII case. Reject `null`. Native clients without Origin still authenticate. |
+| D5 | Parse an IP-literal socket address. A non-loopback IP requires `allow_network_exposure = true`. |
+| D6 | Validate enabled sections at config load and again at component start; invalid runtime config leaves the listener unstarted. |
+| D7 | Authentication failure closes with 1008 and `authentication required`; log only a fixed local reason. |
+| D8 | Cap inbound frames and messages at 64 KiB. |
+| D9 | TLS remains deferred. Network-exposed `ws://` requires the explicit acknowledgement and logs a warning. |
+| D10 | Keep protocol version 1 and omit `gatewayToken` when absent. File the dispensa proposal before merge. |
+| D11 | Commit messages describe the required behavior in generic terms. |
+| D12 | Bind the parsed address and log the real `listener.local_addr()`. |
+
+Implementation is in `pancetta/src/coordinator/remote_gateway/{auth.rs,mod.rs}`,
+with component tests in `pancetta/src/coordinator/mod.rs`, the optional wire field
+in `pancetta-protocol/src/session.rs`, config validation and redaction in
+`pancetta-config/src/network.rs`, the merge guardrail in `pancetta-config/src/lib.rs`,
+and regenerated `pancetta-config/defaults.toml`. `pancetta/Cargo.toml` and
+`Cargo.lock` make the existing `subtle` dependency direct. The config reference,
+changelog and AGENTS.md record the operator requirements and invariant.
+
+| Scenario | Regression tests |
+|----------|------------------|
+| No credential, no station data | `client_without_credential_gets_no_welcome`, `hello_without_token_is_closed_without_welcome`, `hello_with_wrong_token_is_closed_without_welcome`, `non_hello_first_frame_is_closed_without_welcome`, `oversized_first_message_is_rejected_without_welcome`; `auth::tests::*` |
+| Browser admission | `untrusted_browser_origin_is_refused_before_upgrade`, `null_origin_is_refused_before_upgrade`, `allowed_browser_origin_with_token_gets_welcome` |
+| Authenticated view | `authenticated_client_gets_welcome_then_events`, `welcome_snapshot_reflects_initial_state` |
+| Bind opt-in and validation | `remote_gateway_non_loopback_bind_requires_explicit_opt_in`, `remote_gateway_loopback_bind_needs_no_opt_in`, `remote_gateway_bind_addr_must_be_ip_and_port`, `remote_gateway_allowed_origins_must_be_bare_origins`, `network_validation_covers_remote_gateway`, `remote_gateway_disabled_is_not_validated` |
+| Component backstop | `remote_gateway_does_not_bind_non_loopback_without_opt_in`, `remote_gateway_binds_on_loopback_with_auth_token`, `remote_gateway_does_not_bind_without_auth_token` |
+| Secret handling | `remote_gateway_enabled_requires_auth_token`, `credential_debug_is_redacted`, `hello_debug_redacts_gateway_token` |
+| Config merge | `merge_with_carries_over_every_opt_in_integration`, `merge_with_carries_every_field` |
+| Wire compatibility | `hello_without_gateway_token_serializes_unchanged`, `hello_missing_gateway_token_key_deserializes_none`, `hello_gateway_token_round_trips_camel_case`, `frames_roundtrip`, `frame_shapes_match_schema` |
+
+On upgrade, enabled gateways need `auth_token` or startup fails with the named
+fix. Panino's `?gateway=` transport must send `hello.gatewayToken` first; browser
+dev-server Origins must also be configured. Production relay transport is
+unaffected. Token and bind changes require restart. There is no data migration.
+
+Merge prerequisite: file the dispensa question in the design spec's
+`Proposed dispensa question` section before merging. Panino's `?gateway=` mode
+cannot connect until it sends `hello.gatewayToken`.

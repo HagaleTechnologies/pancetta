@@ -3219,14 +3219,70 @@ mod tests {
         );
     }
 
+    /// Build a coordinator with the given gateway bind/token, start the
+    /// display feed, and assert how many `RemoteGateway` tasks
+    /// `start_remote_gateway_component` added: 0 when the fail-closed
+    /// backstop refuses the config (no token, or a non-loopback bind
+    /// without opt-in), 1 when it binds.
+    async fn assert_remote_gateway_task_count(
+        bind: &str,
+        token: Option<&str>,
+        expected_added: usize,
+    ) {
+        let mut config = Config::default();
+        config.network.remote_gateway.enabled = true;
+        config.network.remote_gateway.bind_addr = bind.into();
+        config.network.remote_gateway.auth_token = token.map(str::to_owned);
+        let mut coordinator = build_coordinator_with_config_and_replay(config, None).await;
+        coordinator.start_display_feed().await.unwrap();
+        let before = coordinator
+            .named_task_handles
+            .iter()
+            .filter(|(id, _)| *id == ComponentId::RemoteGateway)
+            .count();
+        coordinator.start_remote_gateway_component().await.unwrap();
+        let after = coordinator
+            .named_task_handles
+            .iter()
+            .filter(|(id, _)| *id == ComponentId::RemoteGateway)
+            .count();
+        coordinator.shutdown_signal.store(true, Ordering::Release);
+        assert_eq!(after, before + expected_added);
+    }
+
+    #[tokio::test]
+    async fn remote_gateway_does_not_bind_without_auth_token() {
+        assert_remote_gateway_task_count("127.0.0.1:0", None, 0).await;
+    }
+
+    #[tokio::test]
+    async fn remote_gateway_does_not_bind_non_loopback_without_opt_in() {
+        assert_remote_gateway_task_count(
+            "0.0.0.0:0",
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef"),
+            0,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn remote_gateway_binds_on_loopback_with_auth_token() {
+        assert_remote_gateway_task_count(
+            "127.0.0.1:0",
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef"),
+            1,
+        )
+        .await;
+    }
+
     /// Round-4 regression: `[network.remote_gateway].enabled = true` under
     /// `--replay` must never bind a listener or feed one, even though
     /// neither `start_display_feed` nor `start_remote_gateway_component`
     /// consult `replay_mode` through the same `config.network.remote_gateway
     /// .enabled` flag every other outbound integration in this list checks.
-    /// `bind_addr` is pinned to an ephemeral loopback port so a live run
-    /// would succeed here too — the assertion is entirely on replay-mode
-    /// behavior, not on some other reason the bind failed.
+    /// No `auth_token` is set: the component's `replay_mode()` early return
+    /// precedes its config re-validation, so the assertion below is entirely
+    /// on replay-mode behavior.
     #[tokio::test]
     async fn replay_mode_suppresses_remote_gateway_even_when_configured_enabled() {
         let mut config = Config::default();
