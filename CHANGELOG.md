@@ -186,7 +186,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Station agent: remote clients' authority is now re-checked on every use, and an authorization refresh applies to already-connected clients immediately (PAN-96).
 - Remote-TX consent is now tracked per channel: `[network.station_agent].remote_tx_enabled` alone governs arming, TX requests and transmission over the station agent, and `[network.wsjtx_udp].allow_tx_initiation` governs only WSJT-X UDP Reply-initiated TX. With `remote_tx_enabled = false` nothing can arm, so Reply-initiated QSOs no longer transmit; set `remote_tx_enabled = true` to allow remote TX (PAN-98).
 - Network errors from the QRZ XML lookup and LoTW clients no longer carry account credentials or session keys into log lines or error messages (PAN-100).
+<<<<<<< HEAD
 - Station agent: a relay connection that stops responding or stops accepting data is now closed within seconds, remote TX is disarmed, and the agent reconnects (PAN-102).
+=======
+- Responses from cqdx.io, QRZ, the online logbooks, the DX cluster and the station-agent relay are now read within fixed size limits (PAN-101).
+>>>>>>> 9245cf073d2bab96df9092c2da96901a2ca66dda
 
 ## [0.9.6] - 2026-09-02
 
