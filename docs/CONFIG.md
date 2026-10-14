@@ -1,8 +1,10 @@
 # Pancetta Configuration Reference
 
 Pancetta's configuration lives in a single TOML file at
-`~/.pancetta/pancetta.toml`. The file is loaded at startup and watched for
-changes; most keys hot-reload without a restart.
+`~/.pancetta/pancetta.toml`. The file is loaded at startup. It is also
+watched for changes, but only the remote-access revocations listed under
+[Hot reload](#hot-reload) apply to a running station; every other key
+needs a restart.
 
 This document covers the keys you'll actually touch, with explanations.
 The complete schema — every section, every key, every default — is
@@ -503,6 +505,17 @@ allowed_request_hosts = []          # required for multicast inbound; unicast in
 `instance_id` must be non-empty, whenever `enabled = true` — otherwise
 config validation rejects the file.
 
+### `[network.station_agent]` — remote operation
+
+The station agent's keys (`enabled`, `remote_tx_enabled`, `relay_url`,
+`pairing_api_url`, `key_dir`, `tx_allow_list`, …) and their defaults are
+in [`defaults.toml`](../pancetta-config/defaults.toml); the design is in
+[`docs/DECISIONS/remote-operation.md`](DECISIONS/remote-operation.md).
+Revocations — `remote_tx_enabled = false`, removing a `tx_allow_list`
+entry, `enabled = false` — apply to a running station when you save;
+every other change to this table needs a restart. See
+[Hot reload](#hot-reload).
+
 ---
 
 ## `[ui]` — TUI behaviour
@@ -541,19 +554,60 @@ priority over both config and environment.
 
 ## Hot reload
 
-Pancetta watches `~/.pancetta/pancetta.toml` for changes. Most keys take
-effect within a second of save. Exceptions:
+Pancetta watches its config file for changes while it runs: the file
+given with `--config`, otherwise `~/.pancetta/pancetta.toml`. If that
+file does not exist (for example, your config lives only in one of the
+other search locations above), nothing is watched and every change
+needs a restart. A save is picked up within a few seconds. The reload
+reads the watched file alone, so keep a single config file.
 
-- `[audio]` device names — require a TUI restart (cpal streams are bound
-  at startup).
-- `[rig.interface]` — same; rigctld is spawned once.
-- `[station].callsign` — never hot-reloaded (active QSOs would mid-flight
-  contradict their own metadata).
+**Applied live — remote-access revocations (security):**
 
-When a hot-reload succeeds you'll see a TUI status line like
-`Config reloaded: 12 keys updated`. When it fails (typo, schema
-violation), the previous config stays active and the parse error shows
-in the TUI error log.
+- `[network.station_agent].remote_tx_enabled` — the station-agent
+  channel's local consent. Setting it to `false` immediately refuses all
+  remote transmission: queued remote frames are dropped and audited
+  `not-armed`, and a transmission in progress stops within ~50 ms (PTT
+  off). The arm record itself is kept; re-enabling consent re-allows an
+  existing arm within its TTL and heartbeat. To kill a client's arm,
+  remove it from `tx_allow_list` (below) or disarm from the TUI.
+- `[network.wsjtx_udp].enabled` / `allow_tx_initiation` — the WSJT-X UDP
+  channel's own consent bit (`enabled && allow_tx_initiation`), same
+  mechanics. It never arms anything and never satisfies the
+  station-agent channel's consent. Only the consent bit is live: the UDP
+  socket itself opens and closes on a restart.
+- Removing an entry from `[network.station_agent].tx_allow_list` — the
+  client's session is evicted (Noise transport dropped, hello-token JTI
+  deny-listed), and it is disarmed and loses control if it held either.
+  On cqdx-integrated stations (`[network.cqdx]` enabled with a token)
+  the authorization poll stays authoritative: a removed entry is evicted
+  immediately but is re-admitted by the next successful poll if cqdx
+  still returns its edge — revoke it there too.
+- `[network.station_agent].enabled` set to `false` — the relay session
+  and authorization poll stop and remote TX is disarmed, live.
+
+**Explicitly restart-required (a diagnostic says so on save):**
+
+- Adding a `tx_allow_list` entry, `station_agent.enabled = true` on a
+  disabled station, and the station agent's `relay_url`,
+  `pairing_api_url`, `pairing_origin`, `key_dir` and `audit_log_path`.
+- Every other key: `[audio]` device names, `[rig.interface]`,
+  `[station]`, `[autonomous]`, `[ui]`, upload/logging settings, …
+  Nothing outside the live list above is applied to a running process;
+  restart pancetta to enforce them. The saved value is kept in memory,
+  except that `[station].callsign`, `[station].grid_square` and
+  `[autonomous].slot_parity` are held back while a QSO is active so an
+  in-progress exchange is never contradicted.
+
+When a reload succeeds you see a `Config reloaded` line in the TUI
+diagnostics, plus one line per security action and a line saying a
+restart is needed when other keys changed. A save that changes nothing
+shows nothing. When a reload fails (typo, schema violation), the
+previous config stays active and
+`Config reload failed: … — previous configuration still active` shows
+in the TUI diagnostics.
+
+To revoke a suspect remote client step by step, see
+[RUNBOOK.md → Revoking a suspect remote client](RUNBOOK.md#revoking-a-suspect-remote-client).
 
 ---
 

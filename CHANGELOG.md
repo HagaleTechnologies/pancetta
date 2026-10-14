@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Config hot-reload is now real for remote-access settings (PAN-103): saving
+  `pancetta.toml` while pancetta runs applies remote-access revocations to the
+  running station — `[network.station_agent].remote_tx_enabled = false`,
+  removing a `tx_allow_list` entry, `[network.station_agent].enabled = false`,
+  and the WSJT-X UDP channel's consent. Every save shows a `Config reloaded`
+  line (or the load error) in the TUI diagnostics, and grant-direction or
+  other edits say a restart is required. `docs/CONFIG.md` now lists exactly
+  which settings apply live and which need a restart, and `docs/RUNBOOK.md`
+  has a procedure for revoking a remote client.
+
 - In-session clock-skew monitor (PAN-114): a live session (TUI or
   `--headless`; never `--replay`/`--wav`) sends one SNTP query to
   pool.ntp.org 30 s after start and then every 30 minutes, plus one re-check
