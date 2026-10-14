@@ -6,7 +6,7 @@ name: Main Alert
 # deliberately not listed.
 #
 # INLINED COPY of HagaleTechnologies/credenza .github/workflows/main-alert.yml
-# @ 97738944f65d4c01318a9a29212020df3137ceb1 -- this repo is public and cannot call a reusable workflow in a
+# @ ca2c4743a5c061f60ec8c6082296c750faa716db -- this repo is public and cannot call a reusable workflow in a
 # private repo. Logic and its tests live there (scripts/main-alert/); change it
 # there first, then re-copy. Inputs are fixed here: assignee thagale, label
 # main-red, events push/schedule/workflow_run, tags '^v[0-9]', recovery_jobs {}. Runs on
@@ -81,11 +81,14 @@ jobs:
           effective_success() {
             local path="repos/$REPO/actions/runs/$1/jobs?per_page=100"
             [ -z "${2:-}" ] || path="repos/$REPO/actions/runs/$1/attempts/$2/jobs?per_page=100"
-            gh api "$path" | jq -e --arg wf "$WORKFLOW_NAME" --argjson req "$RECOVERY_JOBS" '
+            local jobs
+            # An unreadable job list must abort, not read as "did nothing".
+            jobs=$(gh api "$path") || exit 1
+            jq -e --arg wf "$WORKFLOW_NAME" --argjson req "$RECOVERY_JOBS" '
               [.jobs[] | select(.conclusion != "skipped")] as $ran
               | ($ran | length) > 0
                 and (($req[$wf] // null) as $re
-                     | $re == null or any($ran[]; .conclusion == "success" and (.name | test($re))))' >/dev/null
+                     | $re == null or any($ran[]; .conclusion == "success" and (.name | test($re))))' <<<"$jobs" >/dev/null
           }
 
           if [ "$CONCLUSION" = success ] && ! effective_success "$RUN_ID" "$RUN_ATTEMPT"; then
@@ -97,10 +100,15 @@ jobs:
           # newer run of the same workflow has already reported. "Newer" spans
           # every watched ref (overlapping release tags share one issue) and
           # includes a later attempt of this same run. A newer success that
-          # did nothing does not count.
-          newer=$(gh api "repos/$REPO/actions/workflows/$WORKFLOW_ID/runs?status=completed&per_page=50" \
-            | jq -r --argjson ev "$EVENTS" --arg def "$DEFAULT_BRANCH" --arg tags "$TAGS" \
-                --argjson n "$RUN_NUMBER" --argjson id "$RUN_ID" --argjson att "$RUN_ATTEMPT" '.workflow_runs[]
+          # did nothing does not count. One query per counted event, so PR,
+          # dispatch and merge-queue runs (the bulk of a shared CI workflow's
+          # history) can't page a newer main run out of view.
+          newer=$(for ev in $(jq -r '.[]' <<<"$EVENTS"); do
+              # A missing event's history would make a stale run look current.
+              gh api "repos/$REPO/actions/workflows/$WORKFLOW_ID/runs?status=completed&event=$ev&per_page=100" || exit 1
+            done \
+            | jq -rs --argjson ev "$EVENTS" --arg def "$DEFAULT_BRANCH" --arg tags "$TAGS" \
+                --argjson n "$RUN_NUMBER" --argjson id "$RUN_ID" --argjson att "$RUN_ATTEMPT" '[.[].workflow_runs[]] | .[]
                 | select(.event as $e | $ev | index($e))
                 | select(.head_branch == $def or ($tags != "" and .event == "push" and (.head_branch | test($tags))))
                 | select(.conclusion as $c | ["success","failure","timed_out","startup_failure"] | index($c))
@@ -139,8 +147,11 @@ jobs:
 
           if [ -n "$issue" ]; then
             # The opening report lives in the issue body, later ones in comments.
-            seen=$(gh api "repos/$REPO/issues/$issue" --jq '.body // ""'
-              gh api "repos/$REPO/issues/$issue/comments?per_page=100" --jq '.[].body')
+            # Fetched separately so either failing aborts the step (a missed
+            # marker would re-post).
+            body=$(gh api "repos/$REPO/issues/$issue" --jq '.body // ""')
+            comments=$(gh api --paginate "repos/$REPO/issues/$issue/comments?per_page=100" --jq '.[].body')
+            seen="$body"$'\n'"$comments"
             if grep -qF "$marker" <<<"$seen"; then
               echo "Issue #$issue already has this run -- duplicate delivery."
               exit 0
