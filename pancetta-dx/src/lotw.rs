@@ -7,13 +7,20 @@
 // ergonomic `?`; boxing it crate-wide to satisfy this lint is out of scope here.
 #![allow(clippy::result_large_err)]
 
-use crate::{ConfirmationStatus, DxError, DxQso, Result};
+use crate::{body, ConfirmationStatus, DxError, DxQso, Result};
 use chrono::{NaiveDate, Utc};
 use reqwest::{multipart::Form, Client};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokio::fs;
 use tracing::info;
+
+/// Most bytes read from a LoTW login or upload page (HTML).
+const LOTW_PAGE_MAX_BYTES: usize = 1024 * 1024;
+
+/// Most bytes read from a `lotwreport.adi` download, the one legitimately large
+/// body (~0.5 KB per QSL record).
+const LOTW_REPORT_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// LoTW configuration
 #[derive(Clone)]
@@ -244,7 +251,7 @@ impl LotwClient {
         let response = self.client.post(&login_url).form(&params).send().await?;
 
         if response.status().is_success() {
-            let text = response.text().await?;
+            let text = body::text_within(response, LOTW_PAGE_MAX_BYTES).await?;
 
             if text.contains("Invalid username") || text.contains("Invalid password") {
                 return Err(DxError::ExternalService(
@@ -276,7 +283,7 @@ impl LotwClient {
 
         let response = self.client.post(&upload_url).multipart(form).send().await?;
 
-        let text = response.text().await?;
+        let text = body::text_within(response, LOTW_PAGE_MAX_BYTES).await?;
 
         // Parse the response (LoTW returns HTML, so we need to parse it)
         self.parse_upload_response(&text)
@@ -361,7 +368,7 @@ impl LotwClient {
             )));
         }
 
-        Ok(response.text().await?)
+        body::text_within(response, LOTW_REPORT_MAX_BYTES).await
     }
 
     /// Get QSL confirmations for specific callsign
@@ -1035,6 +1042,23 @@ mod tests {
             .unwrap_err();
         assert_error_omits(&err, &[LOTW_SECRET]);
         assert!(err.to_string().contains("503"), "status text lost: {err}");
+    }
+
+    #[tokio::test]
+    async fn qsl_report_over_budget_is_refused() {
+        // A 64 MiB budget leaves no room under socket buffering for a cheap
+        // "stopped early" check, so only the error is asserted.
+        let (addr, h) =
+            crate::test_support::serve_chunked("HTTP/1.1 200 OK", b"", LOTW_REPORT_MAX_BYTES + 1);
+        let err = lotw_client_at(addr)
+            .fetch_qsl_report(&report_params())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DxError::ResponseTooLarge { limit } if limit == LOTW_REPORT_MAX_BYTES),
+            "got {err:?}"
+        );
+        crate::test_support::served(h).await;
     }
 
     #[test]

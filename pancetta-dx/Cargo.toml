@@ -23,6 +23,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 reqwest = { workspace = true }
+encoding_rs = { workspace = true }
 quick-xml = { workspace = true }
 csv = { workspace = true }
 url = { workspace = true }
