@@ -8174,7 +8174,8 @@ async fn maybe_enrich_from_qrz(
             cache.lock().await.insert(key, Some(lookup));
         }
         Err(e) => {
-            // Never log credentials; QrzXmlClient errors never carry them.
+            // Safe to log: pancetta-dx network errors never carry the request URL,
+            // which holds the QRZ password or session key (see pancetta_dx::NetworkError).
             debug!(target: "dx.qrz", "QRZ lookup failed for {} (skipping): {}", callsign, e);
             cache.lock().await.insert(key, None);
         }
@@ -9109,6 +9110,99 @@ mod qrz_enrichment_tests {
         maybe_enrich_from_qrz(&mut p, &client, &empty).await;
         assert!(empty.lock().await.is_empty());
         assert!(p.grids.theirs.is_none());
+    }
+
+    /// Collects formatted log output so a test can assert on it.
+    #[derive(Clone)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Serve each canned raw HTTP response to one connection, in order, and
+    /// return the mock's QRZ base URL.
+    fn serve(responses: Vec<String>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for r in responses {
+                let Ok((mut s, _)) = listener.accept() else {
+                    return;
+                };
+                let mut b = [0u8; 4096];
+                let _ = s.read(&mut b);
+                let _ = s.write_all(r.as_bytes());
+            }
+        });
+        format!("http://{addr}/xml/current/")
+    }
+
+    /// Run `maybe_enrich_from_qrz` for a grid-less QSO with JA1ABC while every
+    /// target is captured at TRACE, and return what was logged.
+    async fn enrich_capturing_logs(client: &pancetta_dx::QrzXmlClient) -> String {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = Capture(buf.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let mut m = metadata(None, None);
+        let cache = tokio::sync::Mutex::new(std::collections::HashMap::new());
+        super::maybe_enrich_from_qrz(&mut m, client, &cache).await;
+        // Copy out in its own statement so the lock guard drops before `buf`.
+        let bytes = buf.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    const QRZ_PASSWORD: &str = "pw-7Hq2-secret";
+    const QRZ_SESSION_KEY: &str = "sk-4c1e9b7f-secret";
+
+    /// Authentication fails at the transport level: the logged failure must
+    /// not contain the password.
+    #[tokio::test]
+    async fn qrz_auth_failure_log_omits_password() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let client = pancetta_dx::QrzXmlClient::new("user", QRZ_PASSWORD, "pancetta-test")
+            .with_base_url(format!("http://{closed}/xml/current/"));
+        let logs = enrich_capturing_logs(&client).await;
+        assert!(logs.contains("QRZ lookup failed for JA1ABC"), "{logs}");
+        assert!(!logs.contains(QRZ_PASSWORD), "{logs}");
+    }
+
+    /// Authentication succeeds, then the session-keyed lookup gets a 503: the
+    /// logged failure must contain neither the session key nor the password.
+    #[tokio::test]
+    async fn qrz_lookup_failure_log_omits_session_key() {
+        let auth =
+            format!("<QRZDatabase><Session><Key>{QRZ_SESSION_KEY}</Key></Session></QRZDatabase>");
+        let base = serve(vec![
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{auth}",
+                auth.len()
+            ),
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+        ]);
+        let client = pancetta_dx::QrzXmlClient::new("user", QRZ_PASSWORD, "pancetta-test")
+            .with_base_url(base);
+        let logs = enrich_capturing_logs(&client).await;
+        assert!(logs.contains("QRZ lookup failed for JA1ABC"), "{logs}");
+        assert!(!logs.contains(QRZ_SESSION_KEY), "{logs}");
+        assert!(!logs.contains(QRZ_PASSWORD), "{logs}");
     }
 }
 

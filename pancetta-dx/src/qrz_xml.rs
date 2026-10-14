@@ -124,7 +124,8 @@ impl QrzXmlClient {
     /// once if QRZ reports the session has expired (`Session Timeout`). Any
     /// QRZ-reported error (bad credentials, callsign not found, …) maps to a
     /// [`DxError`]; **no credential or session-key value is ever included** in
-    /// an error or log line.
+    /// an error or log line; network failures carry no URL (see
+    /// [`NetworkError`](crate::NetworkError)).
     pub async fn lookup(&self, callsign: &str) -> Result<QrzLookup> {
         // Ensure we hold a session key (auth on first use).
         let key = self.session_key().await?;
@@ -175,13 +176,10 @@ impl QrzXmlClient {
             .client
             .get(&url)
             .send()
-            .await
-            .map_err(DxError::Network)?
-            .error_for_status()
-            .map_err(DxError::Network)?
+            .await?
+            .error_for_status()?
             .text()
-            .await
-            .map_err(DxError::Network)?;
+            .await?;
 
         match parse_session(&body)? {
             SessionResult::Key(key) => {
@@ -210,13 +208,10 @@ impl QrzXmlClient {
             .client
             .get(&url)
             .send()
-            .await
-            .map_err(DxError::Network)?
-            .error_for_status()
-            .map_err(DxError::Network)?
+            .await?
+            .error_for_status()?
             .text()
-            .await
-            .map_err(DxError::Network)?;
+            .await?;
 
         // A session error in the response (timeout/invalid) is surfaced as an
         // ExternalService error so `lookup` can decide whether to re-auth.
@@ -620,5 +615,103 @@ mod tests {
         assert!(msg.contains("authentication failed"), "msg: {msg}");
         // The error must NOT leak the password.
         assert!(!msg.contains("wrong"), "error leaked credential: {msg}");
+    }
+
+    // ----- Network failures: no credential or session key in any rendering. --
+
+    use crate::test_support::{
+        assert_network_error_omits, closed_port, serve_raw, serve_redirect_loop, STATUS_503,
+        TRUNCATED_BODY,
+    };
+
+    const SECRET_PASSWORD: &str = "pw-7Hq2-secret";
+    const SECRET_KEY: &str = "sk-4c1e9b7f-secret";
+
+    fn client_at(addr: std::net::SocketAddr) -> QrzXmlClient {
+        QrzXmlClient::new("user", SECRET_PASSWORD, "pancetta-test")
+            .with_base_url(format!("http://{addr}/xml/current/"))
+    }
+
+    /// A client that already holds a session key, so `lookup` goes straight to
+    /// the session-keyed request.
+    async fn session_client_at(addr: std::net::SocketAddr) -> QrzXmlClient {
+        let client = client_at(addr);
+        *client.session_key.lock().await = Some(SECRET_KEY.to_string());
+        client
+    }
+
+    #[tokio::test]
+    async fn auth_status_error_omits_password() {
+        let err = client_at(serve_raw(1, STATUS_503))
+            .lookup("AA7BQ")
+            .await
+            .unwrap_err();
+        assert_network_error_omits(&err, &[SECRET_PASSWORD]);
+        assert!(err.to_string().contains("503"), "status text lost: {err}");
+    }
+
+    #[tokio::test]
+    async fn auth_connect_error_omits_password() {
+        let err = client_at(closed_port()).lookup("AA7BQ").await.unwrap_err();
+        assert_network_error_omits(&err, &[SECRET_PASSWORD]);
+    }
+
+    #[tokio::test]
+    async fn auth_redirect_error_omits_password() {
+        let err = client_at(serve_redirect_loop())
+            .lookup("AA7BQ")
+            .await
+            .unwrap_err();
+        assert_network_error_omits(&err, &[SECRET_PASSWORD]);
+    }
+
+    #[tokio::test]
+    async fn auth_body_error_omits_password() {
+        let err = client_at(serve_raw(1, TRUNCATED_BODY))
+            .lookup("AA7BQ")
+            .await
+            .unwrap_err();
+        assert_network_error_omits(&err, &[SECRET_PASSWORD]);
+    }
+
+    #[tokio::test]
+    async fn lookup_status_error_omits_session_key() {
+        let err = session_client_at(serve_raw(1, STATUS_503))
+            .await
+            .lookup("AA7BQ")
+            .await
+            .unwrap_err();
+        assert_network_error_omits(&err, &[SECRET_KEY, SECRET_PASSWORD]);
+        assert!(err.to_string().contains("503"), "status text lost: {err}");
+    }
+
+    #[tokio::test]
+    async fn lookup_connect_error_omits_session_key() {
+        let err = session_client_at(closed_port())
+            .await
+            .lookup("AA7BQ")
+            .await
+            .unwrap_err();
+        assert_network_error_omits(&err, &[SECRET_KEY, SECRET_PASSWORD]);
+    }
+
+    #[tokio::test]
+    async fn lookup_redirect_error_omits_session_key() {
+        let err = session_client_at(serve_redirect_loop())
+            .await
+            .lookup("AA7BQ")
+            .await
+            .unwrap_err();
+        assert_network_error_omits(&err, &[SECRET_KEY, SECRET_PASSWORD]);
+    }
+
+    #[tokio::test]
+    async fn lookup_body_error_omits_session_key() {
+        let err = session_client_at(serve_raw(1, TRUNCATED_BODY))
+            .await
+            .lookup("AA7BQ")
+            .await
+            .unwrap_err();
+        assert_network_error_omits(&err, &[SECRET_KEY, SECRET_PASSWORD]);
     }
 }

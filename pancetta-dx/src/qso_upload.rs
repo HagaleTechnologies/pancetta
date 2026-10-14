@@ -146,8 +146,7 @@ impl ClubLogClient {
             .post(&self.endpoint)
             .form(&params)
             .send()
-            .await
-            .map_err(DxError::Network)?;
+            .await?;
 
         let status = response.status();
         // Body may carry an operator-facing message; safe to surface (it does
@@ -230,11 +229,10 @@ impl QrzLogbookClient {
             .post(&self.endpoint)
             .form(&params)
             .send()
-            .await
-            .map_err(DxError::Network)?;
+            .await?;
 
         let status = response.status();
-        let body = response.text().await.map_err(DxError::Network)?;
+        let body = response.text().await?;
 
         if !status.is_success() {
             return Err(DxError::ExternalService(format!(
@@ -429,8 +427,7 @@ impl EqslClient {
             .header(reqwest::header::CONTENT_TYPE, "text/plain")
             .body(payload)
             .send()
-            .await
-            .map_err(DxError::Network)?;
+            .await?;
 
         let status = response.status();
         let body = response.text().await.unwrap_or_default();

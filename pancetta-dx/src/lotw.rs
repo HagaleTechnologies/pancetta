@@ -225,16 +225,10 @@ impl LotwClient {
             ("actn", "login"),
         ];
 
-        let response = self
-            .client
-            .post(&login_url)
-            .form(&params)
-            .send()
-            .await
-            .map_err(DxError::Network)?;
+        let response = self.client.post(&login_url).form(&params).send().await?;
 
         if response.status().is_success() {
-            let text = response.text().await.map_err(DxError::Network)?;
+            let text = response.text().await?;
 
             if text.contains("Invalid username") || text.contains("Invalid password") {
                 return Err(DxError::ExternalService(
@@ -264,15 +258,9 @@ impl LotwClient {
             .text("uploadfile", adif_data.to_string())
             .text("actn", "upload");
 
-        let response = self
-            .client
-            .post(&upload_url)
-            .multipart(form)
-            .send()
-            .await
-            .map_err(DxError::Network)?;
+        let response = self.client.post(&upload_url).multipart(form).send().await?;
 
-        let text = response.text().await.map_err(DxError::Network)?;
+        let text = response.text().await?;
 
         // Parse the response (LoTW returns HTML, so we need to parse it)
         self.parse_upload_response(&text)
@@ -348,8 +336,7 @@ impl LotwClient {
             .get(&download_url)
             .query(&query_params)
             .send()
-            .await
-            .map_err(DxError::Network)?;
+            .await?;
 
         if !response.status().is_success() {
             return Err(DxError::ExternalService(format!(
@@ -358,7 +345,7 @@ impl LotwClient {
             )));
         }
 
-        response.text().await.map_err(DxError::Network)
+        Ok(response.text().await?)
     }
 
     /// Get QSL confirmations for specific callsign
@@ -970,6 +957,68 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(client.fetch_qsl_report(&params).await.unwrap(), body);
+    }
+
+    use crate::test_support::{
+        assert_error_omits, assert_network_error_omits, closed_port, serve_raw,
+        serve_redirect_loop, STATUS_503, TRUNCATED_BODY,
+    };
+
+    const LOTW_SECRET: &str = "lotw-pw-3e8d-secret";
+
+    fn lotw_client_at(addr: std::net::SocketAddr) -> LotwClient {
+        LotwClient::with_config(LotwConfig {
+            username: "W1ABC".into(),
+            password: LOTW_SECRET.into(),
+            base_url: format!("http://{addr}"),
+            ..Default::default()
+        })
+    }
+
+    fn report_params() -> LotwDownloadParams {
+        LotwDownloadParams {
+            own_callsign: "W1ABC".into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn qsl_report_connect_error_omits_password() {
+        let err = lotw_client_at(closed_port())
+            .fetch_qsl_report(&report_params())
+            .await
+            .unwrap_err();
+        assert_network_error_omits(&err, &[LOTW_SECRET]);
+    }
+
+    #[tokio::test]
+    async fn qsl_report_redirect_error_omits_password() {
+        let err = lotw_client_at(serve_redirect_loop())
+            .fetch_qsl_report(&report_params())
+            .await
+            .unwrap_err();
+        assert_network_error_omits(&err, &[LOTW_SECRET]);
+    }
+
+    #[tokio::test]
+    async fn qsl_report_body_error_omits_password() {
+        let err = lotw_client_at(serve_raw(1, TRUNCATED_BODY))
+            .fetch_qsl_report(&report_params())
+            .await
+            .unwrap_err();
+        assert_network_error_omits(&err, &[LOTW_SECRET]);
+    }
+
+    /// A non-success status becomes an `ExternalService` error built from the
+    /// status alone; kept as a guard that it stays that way.
+    #[tokio::test]
+    async fn qsl_report_status_error_omits_password() {
+        let err = lotw_client_at(serve_raw(1, STATUS_503))
+            .fetch_qsl_report(&report_params())
+            .await
+            .unwrap_err();
+        assert_error_omits(&err, &[LOTW_SECRET]);
+        assert!(err.to_string().contains("503"), "status text lost: {err}");
     }
 
     #[test]
