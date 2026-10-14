@@ -16,7 +16,7 @@ use tokio::fs;
 use tracing::info;
 
 /// LoTW configuration
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LotwConfig {
     /// LoTW username
     pub username: String,
@@ -32,6 +32,22 @@ pub struct LotwConfig {
     pub certificate_path: Option<String>,
     /// Private key file path for signing
     pub private_key_path: Option<String>,
+}
+
+// Hand-written so `{:?}` never prints the password (same rule as the
+// credential configs in pancetta-config).
+impl std::fmt::Debug for LotwConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LotwConfig")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("base_url", &self.base_url)
+            .field("timeout_seconds", &self.timeout_seconds)
+            .field("station_callsign", &self.station_callsign)
+            .field("certificate_path", &self.certificate_path)
+            .field("private_key_path", &self.private_key_path)
+            .finish()
+    }
 }
 
 impl Default for LotwConfig {
@@ -225,16 +241,10 @@ impl LotwClient {
             ("actn", "login"),
         ];
 
-        let response = self
-            .client
-            .post(&login_url)
-            .form(&params)
-            .send()
-            .await
-            .map_err(DxError::Network)?;
+        let response = self.client.post(&login_url).form(&params).send().await?;
 
         if response.status().is_success() {
-            let text = response.text().await.map_err(DxError::Network)?;
+            let text = response.text().await?;
 
             if text.contains("Invalid username") || text.contains("Invalid password") {
                 return Err(DxError::ExternalService(
@@ -264,15 +274,9 @@ impl LotwClient {
             .text("uploadfile", adif_data.to_string())
             .text("actn", "upload");
 
-        let response = self
-            .client
-            .post(&upload_url)
-            .multipart(form)
-            .send()
-            .await
-            .map_err(DxError::Network)?;
+        let response = self.client.post(&upload_url).multipart(form).send().await?;
 
-        let text = response.text().await.map_err(DxError::Network)?;
+        let text = response.text().await?;
 
         // Parse the response (LoTW returns HTML, so we need to parse it)
         self.parse_upload_response(&text)
@@ -297,6 +301,21 @@ impl LotwClient {
 
         info!("Downloading QSLs from LoTW for {}", params.own_callsign);
 
+        let adif_data = self.fetch_qsl_report(&params).await?;
+
+        if adif_data.contains("No records found") {
+            tracing::warn!("No QSL records found in LoTW");
+            return Ok(Vec::new());
+        }
+
+        // Parse ADIF data
+        self.parse_adif_qsls(&adif_data)
+    }
+
+    /// Fetch the raw `lotwreport.adi` body for `params`. Split from
+    /// [`download_qsls`](Self::download_qsls) so the request can be tested
+    /// against a plain-HTTP mock (`login` refuses non-HTTPS endpoints).
+    async fn fetch_qsl_report(&self, params: &LotwDownloadParams) -> Result<String> {
         let download_url = format!("{}/lotw/lotwreport.adi", self.config.base_url);
 
         let start_date_str = params.start_date.format("%Y-%m-%d").to_string();
@@ -333,8 +352,7 @@ impl LotwClient {
             .get(&download_url)
             .query(&query_params)
             .send()
-            .await
-            .map_err(DxError::Network)?;
+            .await?;
 
         if !response.status().is_success() {
             return Err(DxError::ExternalService(format!(
@@ -343,15 +361,7 @@ impl LotwClient {
             )));
         }
 
-        let adif_data = response.text().await.map_err(DxError::Network)?;
-
-        if adif_data.contains("No records found") {
-            tracing::warn!("No QSL records found in LoTW");
-            return Ok(Vec::new());
-        }
-
-        // Parse ADIF data
-        self.parse_adif_qsls(&adif_data)
+        Ok(response.text().await?)
     }
 
     /// Get QSL confirmations for specific callsign
@@ -940,6 +950,104 @@ mod tests {
         assert_eq!(resp.processed, Some(5));
         assert_eq!(resp.accepted, Some(3));
         assert_eq!(resp.rejected, Some(2));
+    }
+
+    #[tokio::test]
+    async fn fetch_qsl_report_returns_the_report_body() {
+        let body = "<CALL:5>K1ABC<EOR>";
+        let addr = crate::test_support::serve_raw(
+            1,
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        let client = LotwClient::with_config(LotwConfig {
+            username: "W1ABC".into(),
+            password: "lotw-pw".into(),
+            base_url: format!("http://{addr}"),
+            ..Default::default()
+        });
+        let params = LotwDownloadParams {
+            own_callsign: "W1ABC".into(),
+            ..Default::default()
+        };
+        assert_eq!(client.fetch_qsl_report(&params).await.unwrap(), body);
+    }
+
+    use crate::test_support::{
+        assert_error_omits, assert_network_error_omits, closed_port, serve_raw,
+        serve_redirect_loop, STATUS_503, TRUNCATED_BODY,
+    };
+
+    const LOTW_SECRET: &str = "lotw-pw-3e8d-secret";
+
+    fn lotw_client_at(addr: std::net::SocketAddr) -> LotwClient {
+        LotwClient::with_config(LotwConfig {
+            username: "W1ABC".into(),
+            password: LOTW_SECRET.into(),
+            base_url: format!("http://{addr}"),
+            ..Default::default()
+        })
+    }
+
+    fn report_params() -> LotwDownloadParams {
+        LotwDownloadParams {
+            own_callsign: "W1ABC".into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn qsl_report_connect_error_omits_password() {
+        let err = lotw_client_at(closed_port())
+            .fetch_qsl_report(&report_params())
+            .await
+            .unwrap_err();
+        assert_network_error_omits(&err, &[LOTW_SECRET]);
+    }
+
+    #[tokio::test]
+    async fn qsl_report_redirect_error_omits_password() {
+        let err = lotw_client_at(serve_redirect_loop())
+            .fetch_qsl_report(&report_params())
+            .await
+            .unwrap_err();
+        assert_network_error_omits(&err, &[LOTW_SECRET]);
+    }
+
+    #[tokio::test]
+    async fn qsl_report_body_error_omits_password() {
+        let err = lotw_client_at(serve_raw(1, TRUNCATED_BODY))
+            .fetch_qsl_report(&report_params())
+            .await
+            .unwrap_err();
+        assert_network_error_omits(&err, &[LOTW_SECRET]);
+    }
+
+    /// A non-success status becomes an `ExternalService` error built from the
+    /// status alone; kept as a guard that it stays that way.
+    #[tokio::test]
+    async fn qsl_report_status_error_omits_password() {
+        let err = lotw_client_at(serve_raw(1, STATUS_503))
+            .fetch_qsl_report(&report_params())
+            .await
+            .unwrap_err();
+        assert_error_omits(&err, &[LOTW_SECRET]);
+        assert!(err.to_string().contains("503"), "status text lost: {err}");
+    }
+
+    #[test]
+    fn config_debug_redacts_password() {
+        let config = LotwConfig {
+            username: "W1ABC".into(),
+            password: LOTW_SECRET.into(),
+            ..Default::default()
+        };
+        let s = format!("{config:?}");
+        assert!(!s.contains(LOTW_SECRET), "LotwConfig password leaked: {s}");
+        assert!(s.contains("<redacted>"), "{s}");
+        assert!(s.contains("W1ABC"), "{s}");
     }
 
     #[test]

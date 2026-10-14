@@ -207,12 +207,7 @@ impl PskReporterClient {
         let url = self.build_query_url(&params)?;
         debug!("Querying PSKReporter: {}", url);
 
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .map_err(DxError::Network)?;
+        let response = self.client.get(url).send().await?;
 
         if !response.status().is_success() {
             return Err(DxError::ExternalService(format!(
