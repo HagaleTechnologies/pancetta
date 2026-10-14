@@ -6,7 +6,7 @@ name: Main Alert
 # deliberately not listed.
 #
 # INLINED COPY of HagaleTechnologies/credenza .github/workflows/main-alert.yml
-# @ a9d61f074aa7a495a7ffc1318e333af4e094fc47 -- this repo is public and cannot call a reusable workflow in a
+# @ 6951108686e1c54943f1c28ed7090adc662ac5f7 -- this repo is public and cannot call a reusable workflow in a
 # private repo. Logic and its tests live there (scripts/main-alert/); change it
 # there first, then re-copy. Inputs are fixed here: assignee thagale, label
 # main-red, events push/schedule/workflow_run, tags '^v[0-9]', recovery_jobs {}. Runs on
@@ -144,9 +144,11 @@ jobs:
             exit 0
           fi
 
-          failed=$(gh api "repos/$REPO/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100" \
-            | jq -r '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out")
-                | "- [\(.name)](\(.html_url))"' || true)
+          # Abort on an unreadable job list rather than posting the generic
+          # line below in place of the real job links; a rerun reports properly.
+          run_jobs=$(gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100")
+          failed=$(jq -rs '[.[].jobs[]] | .[] | select(.conclusion == "failure" or .conclusion == "timed_out")
+              | "- [\(.name)](\(.html_url))"' <<<"$run_jobs")
           [ -n "$failed" ] || failed="- (no failed job reported; conclusion: $CONCLUSION)"
           report="$marker
           [$WORKFLOW_NAME #$RUN_NUMBER]($RUN_URL) ($RUN_EVENT, attempt $RUN_ATTEMPT) **$CONCLUSION** on $commit.
