@@ -452,12 +452,22 @@ Normative station behaviour for the station agent's relay connection:
   poll returns the error. `run_session_loop` then disarms (`disarm_on_loss`) and reconnects with
   the existing 2 s → 60 s backoff. An oversized frame is not a transport failure and stays a
   per-peer skip.
-- **The display feed yields to control traffic.** `drain_read_stream` takes display events only
-  while the outbound queue has at least `DISPLAY_FEED_MIN_SEND_CAPACITY` = 16 free slots (two
-  fan-outs at `MAX_PEERS`). Under congestion the events stay in the broadcast ring, which drops
-  the oldest, and the session loop never waits on display traffic. This restores the spec rule
-  that control frames are never queued behind the lossy read stream
-  (`docs/superpowers/specs/2026-07-20-concurrent-multi-client-station-agent-design.md`).
+- **Display sends never wait, but display frames share the outbound FIFO.** `drain_read_stream`
+  takes display events only while the outbound queue has at least `DISPLAY_FEED_MIN_SEND_CAPACITY`
+  = 16 free slots (two fan-outs at `MAX_PEERS`), so a display fan-out never waits and always leaves
+  at least `MAX_PEERS` free slots, enough for one control fan-out. Under congestion the events stay
+  in the broadcast ring, which drops the oldest. A larger control batch (an `Arm` that implicitly
+  grabs control sends two `controlState` fan-outs) waits for display frames to drain: each send
+  past the free slots can wait up to the send deadline, and a timeout ends the session. Control
+  frames are not prioritised: the queue is one FIFO, so a control frame can sit behind up to
+  `RELAY_QUEUE_DEPTH - DISPLAY_FEED_MIN_SEND_CAPACITY + MAX_PEERS` = 56 queued display frames plus
+  the one being written. The write deadline bounds each of those writes, not their sum: a relay
+  that takes just under 10 s per frame delays that control frame by up to about 57 × 10 s. Frames
+  are encrypted before they are queued and each peer's Noise transport uses implicit nonces, so a
+  peer's queued frames cannot be reordered or dropped. The spec's rule that control frames are
+  never queued behind the lossy read stream
+  (`docs/superpowers/specs/2026-07-20-concurrent-multi-client-station-agent-design.md`) holds for
+  the broadcast ring, which control frames never enter, not for the relay socket's queue.
 - **Constants, not config.** The deadlines are not configuration keys. There is no idle-read
   timeout for a relay that authenticates and then goes quiet, and no deadline on `ready` after
   `auth`; adding relay keepalive or changing `ready` timing changes relay.v1 behaviour and is a

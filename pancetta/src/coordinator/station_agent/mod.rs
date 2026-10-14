@@ -2243,9 +2243,13 @@ fn deliver_sends<W: pancetta_agent::relay::WsConn>(
 const READ_STREAM_DRAIN_MAX: usize = 64;
 
 /// The display feed queues frames only while the relay's outbound queue has
-/// this many free slots. One fan-out needs at most `MAX_PEERS`, and the rest
-/// stays free for control frames, so the lossy feed never makes the session
-/// loop wait on a congested relay (PAN-102).
+/// this many free slots. One fan-out needs at most `MAX_PEERS`, so a display
+/// fan-out never waits and leaves at least `MAX_PEERS` free slots, enough for
+/// one control fan-out (PAN-102). Control frames are not prioritised: the
+/// queue is one FIFO, so a control frame can sit behind up to
+/// `RELAY_QUEUE_DEPTH - DISPLAY_FEED_MIN_SEND_CAPACITY + MAX_PEERS` (56) queued
+/// display frames. In a control batch larger than `MAX_PEERS`, each send after
+/// the first `MAX_PEERS` can wait up to the relay send deadline.
 const DISPLAY_FEED_MIN_SEND_CAPACITY: usize = 2 * pancetta_agent::multi_session::MAX_PEERS;
 const _: () = assert!(DISPLAY_FEED_MIN_SEND_CAPACITY < net::RELAY_QUEUE_DEPTH);
 
@@ -2259,8 +2263,8 @@ const _: () = assert!(DISPLAY_FEED_MIN_SEND_CAPACITY < net::RELAY_QUEUE_DEPTH);
 /// continue within the same batch limit. The drain also stops while the
 /// relay's outbound queue has fewer than [`DISPLAY_FEED_MIN_SEND_CAPACITY`]
 /// free slots (PAN-102): pending events stay in the broadcast ring, which
-/// drops the oldest if the congestion persists, and the loop never waits on
-/// display traffic.
+/// drops the oldest if the congestion persists, and the drain never waits to
+/// send.
 fn drain_read_stream<W: pancetta_agent::relay::WsConn>(
     events: &mut Option<tokio::sync::broadcast::Receiver<pancetta_protocol::ServerEvent>>,
     sess: &mut MultiPeerSession<'_, W>,
