@@ -60,6 +60,8 @@ on:
   # executes the PR's own code -- only `gh api` calls against metadata (PR number, head
   # SHA) from the event payload.
   pull_request_target:
+    # Q-0068: non-main bases get no gate (main-only codex-review environment); main's ruleset is what requires it.
+    branches: [main]
     types: [opened, ready_for_review, synchronize, reopened]
   # issue_comment: Codex's clean verdict (and its error replies) arrive here and fire
   # codex-review-response. pull_request_review was dropped (Q-0068, see header).
