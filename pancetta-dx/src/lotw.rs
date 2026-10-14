@@ -16,7 +16,7 @@ use tokio::fs;
 use tracing::info;
 
 /// LoTW configuration
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LotwConfig {
     /// LoTW username
     pub username: String,
@@ -32,6 +32,22 @@ pub struct LotwConfig {
     pub certificate_path: Option<String>,
     /// Private key file path for signing
     pub private_key_path: Option<String>,
+}
+
+// Hand-written so `{:?}` never prints the password (same rule as the
+// credential configs in pancetta-config).
+impl std::fmt::Debug for LotwConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LotwConfig")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("base_url", &self.base_url)
+            .field("timeout_seconds", &self.timeout_seconds)
+            .field("station_callsign", &self.station_callsign)
+            .field("certificate_path", &self.certificate_path)
+            .field("private_key_path", &self.private_key_path)
+            .finish()
+    }
 }
 
 impl Default for LotwConfig {
@@ -1019,6 +1035,19 @@ mod tests {
             .unwrap_err();
         assert_error_omits(&err, &[LOTW_SECRET]);
         assert!(err.to_string().contains("503"), "status text lost: {err}");
+    }
+
+    #[test]
+    fn config_debug_redacts_password() {
+        let config = LotwConfig {
+            username: "W1ABC".into(),
+            password: LOTW_SECRET.into(),
+            ..Default::default()
+        };
+        let s = format!("{config:?}");
+        assert!(!s.contains(LOTW_SECRET), "LotwConfig password leaked: {s}");
+        assert!(s.contains("<redacted>"), "{s}");
+        assert!(s.contains("W1ABC"), "{s}");
     }
 
     #[test]
