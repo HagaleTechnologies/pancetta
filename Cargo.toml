@@ -92,6 +92,7 @@ metrics = "0.24"
 
 # HTTP client and networking
 reqwest = { version = "0.13", features = ["json", "stream", "multipart", "cookies", "query", "form"] }
+encoding_rs = "0.8"
 
 # Geographic calculations
 geo = "0.28"

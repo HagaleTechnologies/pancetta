@@ -48,13 +48,16 @@
 // ergonomic `?`; boxing it crate-wide to satisfy this lint is out of scope here.
 #![allow(clippy::result_large_err)]
 
-use crate::{DxError, Result};
+use crate::{body, DxError, Result};
 use reqwest::Client;
 use std::time::Duration;
 use tracing::{debug, warn};
 
 /// Default request timeout for log uploads (seconds).
 const UPLOAD_TIMEOUT_SECS: u64 = 30;
+
+/// Most bytes read from a 2xx upload response: `k=v` strings and short pages.
+const UPLOAD_MAX_BODY_BYTES: usize = 64 * 1024;
 
 fn build_client() -> Client {
     Client::builder()
@@ -150,8 +153,11 @@ impl ClubLogClient {
 
         let status = response.status();
         // Body may carry an operator-facing message; safe to surface (it does
-        // not echo our POSTed credentials).
-        let body = response.text().await.unwrap_or_default();
+        // not echo our POSTed credentials). It only feeds the error message,
+        // so only its first bytes are read.
+        let body = body::text_prefix(response, body::MAX_ERROR_BODY_BYTES)
+            .await
+            .unwrap_or_default();
 
         if status.is_success() {
             debug!(target: "qso.upload", "ClubLog accepted QSO (HTTP {})", status);
@@ -232,9 +238,8 @@ impl QrzLogbookClient {
             .await?;
 
         let status = response.status();
-        let body = response.text().await?;
-
         if !status.is_success() {
+            let body = body::text_prefix(response, body::MAX_ERROR_BODY_BYTES).await?;
             return Err(DxError::ExternalService(format!(
                 "QRZ Logbook upload failed: HTTP {} — {}",
                 status,
@@ -242,6 +247,7 @@ impl QrzLogbookClient {
             )));
         }
 
+        let body = body::text_within(response, UPLOAD_MAX_BODY_BYTES).await?;
         parse_qrz_response(&body)
     }
 }
@@ -430,9 +436,10 @@ impl EqslClient {
             .await?;
 
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-
         if !status.is_success() {
+            let body = body::text_prefix(response, body::MAX_ERROR_BODY_BYTES)
+                .await
+                .unwrap_or_default();
             return Err(DxError::ExternalService(format!(
                 "eQSL upload failed: HTTP {} — {}",
                 status,
@@ -440,6 +447,7 @@ impl EqslClient {
             )));
         }
 
+        let body = body::text_within(response, UPLOAD_MAX_BODY_BYTES).await?;
         parse_eqsl_response(&body)
     }
 }
@@ -936,5 +944,108 @@ mod tests {
         // The station location is passed as a single argv element (no shell
         // splitting), so embedded spaces are preserved.
         assert!(args.contains(&"My Multi Word Location".to_string()));
+    }
+
+    // ----- Byte budget: bodies are read only up to their budget. -------------
+
+    use crate::body::MAX_ERROR_BODY_BYTES;
+    use crate::test_support::{serve_chunked, served};
+
+    const MIB: usize = 1024 * 1024;
+    const STATUS_500: &str = "HTTP/1.1 500 Internal Server Error";
+    const STATUS_200: &str = "HTTP/1.1 200 OK";
+
+    fn clublog_at(addr: std::net::SocketAddr) -> ClubLogClient {
+        ClubLogClient::new("op@example.com", "secret", "K5ARH", "appkey")
+            .with_endpoint(format!("http://{addr}/realtime.php"))
+    }
+
+    fn qrz_logbook_at(addr: std::net::SocketAddr) -> QrzLogbookClient {
+        QrzLogbookClient::new("qrzkey").with_endpoint(format!("http://{addr}/api"))
+    }
+
+    fn eqsl_at(addr: std::net::SocketAddr) -> EqslClient {
+        EqslClient::new("K5ARH", "secret", None).with_endpoint(format!("http://{addr}/import"))
+    }
+
+    const RECORD: &str = "<CALL:5>K1ABC<BAND:3>20m<MODE:3>FT8<EOR>";
+
+    #[tokio::test]
+    async fn clublog_error_body_is_bounded() {
+        let (addr, h) = serve_chunked(STATUS_500, b"", 64 * MIB);
+        let err = clublog_at(addr).upload_adif(RECORD).await.unwrap_err();
+        let DxError::ExternalService(msg) = err else {
+            panic!("expected ExternalService, got {err:?}");
+        };
+        assert!(msg.starts_with("ClubLog upload failed: HTTP 500"), "{msg}");
+        assert!(msg.len() < MAX_ERROR_BODY_BYTES + 64, "len {}", msg.len());
+        let s = served(h).await;
+        assert!(!s.completed && s.written < 32 * MIB, "wrote {}", s.written);
+    }
+
+    #[tokio::test]
+    async fn qrz_logbook_success_body_over_budget_is_refused() {
+        let (addr, h) = serve_chunked(STATUS_200, b"RESULT=OK&LOGID=1", 64 * MIB);
+        let err = qrz_logbook_at(addr).upload_adif(RECORD).await.unwrap_err();
+        assert!(
+            matches!(err, DxError::ResponseTooLarge { limit } if limit == UPLOAD_MAX_BODY_BYTES),
+            "got {err:?}"
+        );
+        let s = served(h).await;
+        assert!(!s.completed && s.written < 32 * MIB, "wrote {}", s.written);
+    }
+
+    #[tokio::test]
+    async fn qrz_logbook_error_body_is_bounded() {
+        let (addr, h) = serve_chunked(STATUS_500, b"", 64 * MIB);
+        let err = qrz_logbook_at(addr).upload_adif(RECORD).await.unwrap_err();
+        let DxError::ExternalService(msg) = err else {
+            panic!("expected ExternalService, got {err:?}");
+        };
+        assert!(
+            msg.starts_with("QRZ Logbook upload failed: HTTP 500"),
+            "{msg}"
+        );
+        assert!(msg.len() < MAX_ERROR_BODY_BYTES + 64, "len {}", msg.len());
+        let s = served(h).await;
+        assert!(!s.completed && s.written < 32 * MIB, "wrote {}", s.written);
+    }
+
+    #[tokio::test]
+    async fn qrz_logbook_chunked_ok_still_parses() {
+        let (addr, h) = serve_chunked(STATUS_200, b"RESULT=OK&LOGID=123", 0);
+        let outcome = qrz_logbook_at(addr).upload_adif(RECORD).await.unwrap();
+        assert_eq!(
+            outcome,
+            QrzInsertOutcome::Inserted {
+                logid: Some("123".to_string())
+            }
+        );
+        assert!(served(h).await.completed);
+    }
+
+    #[tokio::test]
+    async fn eqsl_success_body_over_budget_is_refused() {
+        let (addr, h) = serve_chunked(STATUS_200, b"Result: 1 out of 1 records added", 64 * MIB);
+        let err = eqsl_at(addr).upload_adif(RECORD).await.unwrap_err();
+        assert!(
+            matches!(err, DxError::ResponseTooLarge { limit } if limit == UPLOAD_MAX_BODY_BYTES),
+            "got {err:?}"
+        );
+        let s = served(h).await;
+        assert!(!s.completed && s.written < 32 * MIB, "wrote {}", s.written);
+    }
+
+    #[tokio::test]
+    async fn eqsl_error_body_is_bounded() {
+        let (addr, h) = serve_chunked(STATUS_500, b"", 64 * MIB);
+        let err = eqsl_at(addr).upload_adif(RECORD).await.unwrap_err();
+        let DxError::ExternalService(msg) = err else {
+            panic!("expected ExternalService, got {err:?}");
+        };
+        assert!(msg.starts_with("eQSL upload failed: HTTP 500"), "{msg}");
+        assert!(msg.len() < MAX_ERROR_BODY_BYTES + 64, "len {}", msg.len());
+        let s = served(h).await;
+        assert!(!s.completed && s.written < 32 * MIB, "wrote {}", s.written);
     }
 }

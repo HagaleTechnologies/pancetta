@@ -123,6 +123,11 @@ impl super::ApplicationCoordinator {
                                 }
                             }
                         }
+
+                        let dropped = client.dropped_spot_count();
+                        if dropped > 0 {
+                            info!("DX cluster dropped {dropped} spot(s) while its queue was full");
+                        }
                     }
                     Err(e) => {
                         warn!("Failed to connect to DX cluster: {}. Feature disabled.", e);
