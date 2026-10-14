@@ -525,7 +525,7 @@ allow_network_exposure = false
 | `enabled` | `false` | Enable the read-only WebSocket listener. Disabled sections are not validated. |
 | `bind_addr` | `"127.0.0.1:4080"` | An IP literal and port, such as `127.0.0.1:4080` or `[::1]:4080`; hostnames are refused. |
 | `auth_token` | absent | Required when enabled; at least 32 characters, with no whitespace or control characters. |
-| `allowed_origins` | `[]` | Bare `http://` or `https://` browser origins, with a host and optional port; no path, query, fragment, credentials, whitespace or trailing slash. |
+| `allowed_origins` | `[]` | Bare `http://` or `https://` browser origins, with a host and optional port; no path, query, fragment, credentials, whitespace or trailing slash. Each entry must be written exactly as a browser sends it in `Origin` (ASCII case aside): no default port (`http://localhost`, not `http://localhost:80`) and no host the URL parser would rewrite. A non-canonical entry is refused, and the error names the origin a browser would send. |
 | `allow_network_exposure` | `false` | Explicitly acknowledge serving station and contact data unencrypted over the network when binding a non-loopback address. A token is still required. |
 
 Connect to `ws://<bind_addr>/ws` and send `hello.gatewayToken` as the first text

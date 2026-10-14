@@ -342,11 +342,6 @@ fn default_gateway_bind() -> String {
     "127.0.0.1:4080".to_string()
 }
 
-/// A port an `Origin` authority can carry: digits only, 0–65535.
-fn valid_port(port: &str) -> bool {
-    !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok()
-}
-
 impl Default for RemoteGatewayConfig {
     fn default() -> Self {
         Self {
@@ -371,42 +366,40 @@ impl RemoteGatewayConfig {
         )))
     }
 
-    fn origin_is_bare(origin: &str) -> bool {
-        let Some(authority) = origin
-            .strip_prefix("http://")
-            .or_else(|| origin.strip_prefix("https://"))
-        else {
-            return false;
-        };
-        origin == origin.trim()
-            && !authority.is_empty()
-            && !authority
-                .chars()
-                .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '?' | '#' | '@'))
-            && Self::authority_has_valid_host_and_port(authority)
-    }
-
-    /// The authority after `scheme://`: either a bracketed IPv6 literal
-    /// (optionally followed by `:port`) or a name/IPv4 literal that is
-    /// non-empty and colon-free, optionally followed by `:port`. A port is
-    /// digits only, 0–65535; anything else is rejected.
-    fn authority_has_valid_host_and_port(authority: &str) -> bool {
-        if let Some(rest) = authority.strip_prefix('[') {
-            // Bracketed IPv6 literal, e.g. `[::1]` or `[::1]:8081`.
-            let Some((addr, tail)) = rest.split_once(']') else {
-                return false;
-            };
-            if addr.parse::<std::net::Ipv6Addr>().is_err() {
-                return false;
-            }
-            return match tail.strip_prefix(':') {
-                None => tail.is_empty(),
-                Some(port) => valid_port(port),
-            };
+    /// Checks one `allowed_origins` entry against what a browser actually
+    /// sends. Returns `Ok(())` for an entry that is already a canonical
+    /// `http://` or `https://` origin (ASCII case aside, since matching is
+    /// case-insensitive), and otherwise `Err(hint)`, where `hint` is the
+    /// canonical origin a browser would send instead, if there is one.
+    ///
+    /// The entry is parsed with the WHATWG URL parser and compared with its
+    /// serialized origin, so an entry no browser `Origin` header can ever
+    /// equal is refused instead of passing validation and then 403ing every
+    /// connection: a default port (`http://localhost:80`), a host the parser
+    /// rewrites (`http://foo\bar`, `http://127.1`, `http://[0::1]`) or a
+    /// host it rejects (`http://exa[mple.com`).
+    fn check_origin(origin: &str) -> Result<(), Option<String>> {
+        let lower = origin.to_ascii_lowercase();
+        if origin != origin.trim()
+            || !(lower.starts_with("http://") || lower.starts_with("https://"))
+        {
+            return Err(None);
         }
-        match authority.split_once(':') {
-            None => true,
-            Some((host, port)) => !host.is_empty() && !host.contains(':') && valid_port(port),
+        let url = url::Url::parse(origin).map_err(|_| None)?;
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || url.path() != "/"
+            || url.port() == Some(0)
+        {
+            return Err(None);
+        }
+        let canonical = url.origin().ascii_serialization();
+        if canonical == lower {
+            Ok(())
+        } else {
+            Err(Some(canonical))
         }
     }
 }
@@ -427,8 +420,11 @@ impl ConfigSection for RemoteGatewayConfig {
             return Err(ConfigError::Validation(format!("network.remote_gateway.bind_addr {addr} is not a loopback address, so station and contact data would be served unencrypted to the network; bind to 127.0.0.1 or [::1], or set network.remote_gateway.allow_network_exposure = true to accept that")));
         }
         for origin in &self.allowed_origins {
-            if !Self::origin_is_bare(origin) {
-                return Err(ConfigError::Validation(format!("network.remote_gateway.allowed_origins entry {origin:?} must be a bare browser origin: http:// or https:// followed by a host and optional port, with no path, query or trailing slash")));
+            if let Err(hint) = Self::check_origin(origin) {
+                let hint = hint
+                    .map(|canonical| format!(" (a browser sends this origin as {canonical:?})"))
+                    .unwrap_or_default();
+                return Err(ConfigError::Validation(format!("network.remote_gateway.allowed_origins entry {origin:?} must be a bare browser origin: http:// or https:// followed by a host and optional port, with no path, query or trailing slash{hint}")));
             }
         }
         Ok(())
@@ -2081,12 +2077,38 @@ mod tests {
             "https://cqdx.io",
             "http://[::1]",
             "http://[::1]:8081",
+            "HTTP://LocalHost:8081",
         ] {
             cfg.allowed_origins = vec![origin.into()];
             assert!(
                 cfg.validate_section().is_ok(),
                 "allowed_origins entry {origin:?} should be accepted"
             );
+        }
+    }
+
+    #[test]
+    fn remote_gateway_allowed_origins_reject_entries_no_browser_sends() {
+        let mut cfg = gw(true, "127.0.0.1:4080", Some(GOOD_TOKEN));
+        for (origin, canonical) in [
+            // Default ports are omitted from a browser's Origin.
+            ("http://localhost:80", Some("http://localhost")),
+            ("https://cqdx.io:443", Some("https://cqdx.io")),
+            // Hosts the URL parser rewrites.
+            ("http://foo\\bar", None),
+            ("http://127.1", Some("http://127.0.0.1")),
+            ("http://[0:0::1]", Some("http://[::1]")),
+            // Hosts the URL parser refuses, and port 0.
+            ("http://exa[mple.com", None),
+            ("http://localhost:0", None),
+        ] {
+            cfg.allowed_origins = vec![origin.into()];
+            let err = cfg.validate_section().unwrap_err().to_string();
+            assert!(err.contains("allowed_origins entry"), "{origin:?}: {err}");
+            match canonical {
+                Some(c) => assert!(err.contains(&format!("{c:?}")), "{origin:?}: {err}"),
+                None => assert!(!err.contains("a browser sends"), "{origin:?}: {err}"),
+            }
         }
     }
 
