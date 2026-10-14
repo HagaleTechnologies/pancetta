@@ -342,6 +342,11 @@ fn default_gateway_bind() -> String {
     "127.0.0.1:4080".to_string()
 }
 
+/// A port an `Origin` authority can carry: digits only, 0–65535.
+fn valid_port(port: &str) -> bool {
+    !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok()
+}
+
 impl Default for RemoteGatewayConfig {
     fn default() -> Self {
         Self {
@@ -367,17 +372,42 @@ impl RemoteGatewayConfig {
     }
 
     fn origin_is_bare(origin: &str) -> bool {
-        let Some(host) = origin
+        let Some(authority) = origin
             .strip_prefix("http://")
             .or_else(|| origin.strip_prefix("https://"))
         else {
             return false;
         };
         origin == origin.trim()
-            && !host.is_empty()
-            && !host
+            && !authority.is_empty()
+            && !authority
                 .chars()
                 .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '?' | '#' | '@'))
+            && Self::authority_has_valid_host_and_port(authority)
+    }
+
+    /// The authority after `scheme://`: either a bracketed IPv6 literal
+    /// (optionally followed by `:port`) or a name/IPv4 literal that is
+    /// non-empty and colon-free, optionally followed by `:port`. A port is
+    /// digits only, 0–65535; anything else is rejected.
+    fn authority_has_valid_host_and_port(authority: &str) -> bool {
+        if let Some(rest) = authority.strip_prefix('[') {
+            // Bracketed IPv6 literal, e.g. `[::1]` or `[::1]:8081`.
+            let Some((addr, tail)) = rest.split_once(']') else {
+                return false;
+            };
+            if addr.parse::<std::net::Ipv6Addr>().is_err() {
+                return false;
+            }
+            return match tail.strip_prefix(':') {
+                None => tail.is_empty(),
+                Some(port) => valid_port(port),
+            };
+        }
+        match authority.split_once(':') {
+            None => true,
+            Some((host, port)) => !host.is_empty() && !host.contains(':') && valid_port(port),
+        }
     }
 }
 
@@ -2019,6 +2049,44 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("allowed_origins entry"));
+        }
+    }
+
+    #[test]
+    fn remote_gateway_allowed_origins_reject_malformed_authorities() {
+        let mut cfg = gw(true, "127.0.0.1:4080", Some(GOOD_TOKEN));
+        for origin in [
+            // No host.
+            "http://:8081",
+            // Port not numeric / empty / out of range.
+            "http://localhost:notaport",
+            "http://localhost:99999",
+            "http://localhost:",
+            "http://localhost:+80",
+            // Unbracketed IPv6, unclosed bracket, non-address bracket content.
+            "http://::1:8080",
+            "http://[::1",
+            "http://[not-an-ipv6]:8081",
+            "http://[::1]:8081:extra",
+        ] {
+            cfg.allowed_origins = vec![origin.into()];
+            assert!(
+                cfg.validate_section().is_err(),
+                "allowed_origins entry {origin:?} should be rejected"
+            );
+        }
+        for origin in [
+            "http://localhost:8081",
+            "http://localhost:65535",
+            "https://cqdx.io",
+            "http://[::1]",
+            "http://[::1]:8081",
+        ] {
+            cfg.allowed_origins = vec![origin.into()];
+            assert!(
+                cfg.validate_section().is_ok(),
+                "allowed_origins entry {origin:?} should be accepted"
+            );
         }
     }
 
