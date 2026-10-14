@@ -15,12 +15,30 @@ use pancetta_core::TxPolicy;
 use serde::{Deserialize, Serialize};
 
 /// Client's opening frame.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Hello {
     pub protocol_version: u32,
     pub client_name: String,
     pub client_version: String,
+    /// Local-gateway credential; must match `[network.remote_gateway].auth_token`.
+    /// Never sent over the relay. Omitted on the wire when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_token: Option<String>,
+}
+
+impl std::fmt::Debug for Hello {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hello")
+            .field("protocol_version", &self.protocol_version)
+            .field("client_name", &self.client_name)
+            .field("client_version", &self.client_version)
+            .field(
+                "gateway_token",
+                &self.gateway_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// Server's reply: negotiated version + full current state.
@@ -114,6 +132,51 @@ mod tests {
     use crate::PROTOCOL_VERSION;
     use pancetta_core::TxPolicy;
 
+    fn test_hello(token: Option<&str>) -> Hello {
+        Hello {
+            protocol_version: 1,
+            client_name: "Panino".into(),
+            client_version: "0.1.0".into(),
+            gateway_token: token.map(str::to_owned),
+        }
+    }
+
+    const LEGACY_HELLO: &str = r#"{"frame":"hello","hello":{"protocolVersion":1,"clientName":"Panino","clientVersion":"0.1.0"}}"#;
+
+    #[test]
+    fn hello_without_gateway_token_serializes_unchanged() {
+        assert_eq!(
+            serde_json::to_string(&ClientFrame::hello(test_hello(None))).unwrap(),
+            LEGACY_HELLO
+        );
+    }
+
+    #[test]
+    fn hello_gateway_token_round_trips_camel_case() {
+        let frame = ClientFrame::hello(test_hello(Some("tok-test")));
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(json.contains(r#""gatewayToken":"tok-test""#));
+        assert_eq!(serde_json::from_str::<ClientFrame>(&json).unwrap(), frame);
+    }
+
+    #[test]
+    fn hello_missing_gateway_token_key_deserializes_none() {
+        let ClientFrame::Hello { hello } = serde_json::from_str(LEGACY_HELLO).unwrap() else {
+            panic!("not hello")
+        };
+        assert_eq!(hello.gateway_token, None);
+    }
+
+    #[test]
+    fn hello_debug_redacts_gateway_token() {
+        let debug = format!(
+            "{:?}",
+            ClientFrame::hello(test_hello(Some("s3cret-gw-token")))
+        );
+        assert!(!debug.contains("s3cret-gw-token"));
+        assert!(debug.contains("<redacted>"));
+    }
+
     fn empty_snapshot() -> StateSnapshot {
         StateSnapshot {
             frequency_hz: 14_074_000,
@@ -143,6 +206,7 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             client_name: "Panino".into(),
             client_version: "0.1.0".into(),
+            gateway_token: None,
         });
         let hj = serde_json::to_string(&hello).unwrap();
         assert_eq!(serde_json::from_str::<ClientFrame>(&hj).unwrap(), hello);
@@ -163,6 +227,7 @@ mod tests {
             protocol_version: 1,
             client_name: "Panino".into(),
             client_version: "0.1.0".into(),
+            gateway_token: None,
         });
         let j = serde_json::to_string(&hf).unwrap();
         assert!(

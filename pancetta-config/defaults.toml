@@ -343,6 +343,8 @@ max_attempts = 3
 max_delay_ms = 10000
 
 [network.remote_gateway]
+allow_network_exposure = false
+allowed_origins = []
 bind_addr = "127.0.0.1:4080"
 enabled = false
 
