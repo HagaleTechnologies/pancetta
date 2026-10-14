@@ -230,16 +230,17 @@ apply() {
   # workflow definition from before the codex-review environment, and the
   # pull_request_review response path is gone). Mirrors wait-for-codex.yml's request job:
   # "@codex review" then the head_sha marker, both as the CODEX_REVIEW_PAT identity its
-  # response job trusts. The audit marker is persisted first so the per-head budget counts
-  # every request even if a later post fails.
+  # response job trusts. The audit marker that spends the per-head budget is posted only
+  # after the request lands, so a failed request is retried on the next pass; a failed
+  # audit post at worst allows one extra request.
   if jq -e '.request_codex_verdict' "$decision" >/dev/null; then
     [[ -n $RESOLVE_TOKEN ]] || { echo '::error::Missing CODEX_REVIEW_PAT' >&2; return 1; }
     refresh "$pr" "$head" || return $?
     if jq -e '.request_codex_verdict' "$WORK/live-decision" >/dev/null; then
-      gh api -X POST "repos/$REPO/issues/$pr/comments" -f body="Requesting a fresh Codex verdict for ${head:0:12}: every Codex thread now carries a disposition.
-<!-- research-scan-shepherd:refresh sha=${head:0:12} -->" >/dev/null || return 1
       GH_TOKEN="$RESOLVE_TOKEN" gh api -X POST "repos/$REPO/issues/$pr/comments" -f body="@codex review" >/dev/null || return 1
       GH_TOKEN="$RESOLVE_TOKEN" gh api -X POST "repos/$REPO/issues/$pr/comments" -f body="<!-- codex-review-request head_sha=$head -->" >/dev/null || return 1
+      gh api -X POST "repos/$REPO/issues/$pr/comments" -f body="Requested a fresh Codex verdict for ${head:0:12}: every Codex thread now carries a disposition.
+<!-- research-scan-shepherd:refresh sha=${head:0:12} -->" >/dev/null || return 1
       record_action "requested a fresh Codex verdict"
     fi
   fi

@@ -46,12 +46,12 @@ when 'B'
 when 'C', 'M', 'N'
   resolves = calls.each_index.select { |i| calls[i]['args'].join(' ').include?('resolveReviewThread(') }
   raise 'resolve count/token' unless resolves.length == 2 && resolves.all? { |i| calls[i]['token'] == 'test-user-token' }
-  # Q-0068: a fresh request (audit marker, "@codex review", head marker), never a rerun.
+  # Q-0068: a fresh request ("@codex review", head marker, then the budget-spending audit marker), never a rerun.
   audit = find.call('<!-- research-scan-shepherd:refresh sha=1a2b3c400000 -->')
   request = find.call('body=@codex review')
   marker = find.call('body=<!-- codex-review-request head_sha=1a2b3c4000000000000000000000000000000000 -->')
   ci = find.call('run rerun 801 --failed')
-  raise 'refresh order' unless resolves.max < audit && audit < request && request < marker && marker < ci
+  raise 'refresh order' unless resolves.max < request && request < marker && marker < audit && audit < ci
   raise 'request identity' unless calls[request]['token'] == 'test-user-token' && calls[marker]['token'] == 'test-user-token'
   raise 'audit identity' unless calls[audit]['token'] == 'test-workflow-token'
   raise 'reran a Codex run' if calls.any? { |c| c['args'][0,2] == ['run','rerun'] && !c['args'].include?('--failed') }
