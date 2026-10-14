@@ -12,14 +12,17 @@ export REPORT_MENTION=thagale RUN_URL=https://example.invalid/run/1
 # queue handler re-pausing the PR as green checks queue it. R is armed and queued past the
 # round cap. S replays C with the gate check-run PATCH refused (created by another app).
 # T-V replay C racing the response job: T, a response fails the gate just after the request;
-# U, the same race but Codex has already replied to the request; V, response runs never settle.
-for scenario in A B C D E F G H I J K L M N O P Q R S T U V; do
+# U, the same race but Codex has already replied to the request; V, response runs never settle;
+# W, V with the run-wide settle budget already spent.
+for scenario in A B C D E F G H I J K L M N O P Q R S T U V W; do
   export STUB_CASE=$scenario STUB_FAIL_REARM_COMMENT='' STUB_PAUSE_ON_ARM='' STUB_FAIL_CHECK_PATCH=''
   export STUB_RACE_AFTER_REQUEST='' STUB_CODEX_ANSWERED='' STUB_ALWAYS_INFLIGHT=''
   [[ $scenario == S ]] && export STUB_CASE=C STUB_FAIL_CHECK_PATCH=1
   [[ $scenario == T ]] && export STUB_CASE=C STUB_RACE_AFTER_REQUEST=1
   [[ $scenario == U ]] && export STUB_CASE=C STUB_RACE_AFTER_REQUEST=1 STUB_CODEX_ANSWERED=1
   [[ $scenario == V ]] && export STUB_CASE=C STUB_ALWAYS_INFLIGHT=1
+  export SETTLE_TRIES=3 SETTLE_BUDGET=360
+  [[ $scenario == W ]] && export STUB_CASE=C STUB_ALWAYS_INFLIGHT=1 SETTLE_TRIES=100 SETTLE_BUDGET=0
   [[ $scenario == P ]] && export STUB_CASE=B STUB_FAIL_REARM_COMMENT=1
   [[ $scenario == Q ]] && export STUB_CASE=B STUB_PAUSE_ON_ARM=1
   export STUB_LOG="$tmp/$scenario.log" STUB_STATE="$tmp/$scenario"
@@ -134,6 +137,11 @@ when 'V'
   find.call('body=@codex review')
   raise 'spent the budget on an unverified gate' if calls.any? { |c| c['args'].join(' ').include?('research-scan-shepherd:refresh') }
   raise 'missing settle notice' unless File.read(output).include?('response run is still pending')
+when 'W'
+  request = find.call('body=@codex review')
+  polls = calls.each_index.count { |i| i > request && calls[i]['args'].join(' ').include?('--workflow wait-for-codex.yml --event issue_comment') }
+  raise "waited past the run-wide settle budget (#{polls} polls)" unless polls == 1
+  raise 'spent the budget on an unverified gate' if calls.any? { |c| c['args'].join(' ').include?('research-scan-shepherd:refresh') }
 when 'E'
   raise 'busy mutation' unless mutations.empty?
   raise 'missing skip notice' unless File.read(output).include?('skip')

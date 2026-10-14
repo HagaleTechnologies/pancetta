@@ -131,10 +131,14 @@ record_action() { printf '%s\n' "$1" >> "$WORK/actions"; }
 #      verified, stand down without spending it; the next pass requests again.
 # A response run whose request lookup happens after our request selects our request as the
 # baseline and finds no tied Codex signal, so it leaves the gate alone.
-# 8 x 15s = 2 min per settle; at most four settles keeps a pass inside the job's 15-minute
-# timeout (a response run takes well under a minute).
+# Waiting is bounded twice: per settle (8 x 15s), and across the whole run (SETTLE_BUDGET
+# seconds of total waiting, shared by every candidate PR), so many PRs needing a refresh can't
+# push the job past its 15-minute timeout. Past the run-wide deadline a settle that finds a
+# response run pending stands down at once; that is safe (no budget spent, next pass retries).
 SETTLE_TRIES=${SETTLE_TRIES:-8}
 SETTLE_INTERVAL=${SETTLE_INTERVAL:-15}
+SETTLE_BUDGET=${SETTLE_BUDGET:-360}
+SETTLE_DEADLINE=$((SECONDS + SETTLE_BUDGET))
 # Return 0 once no Wait-for-Codex issue_comment run is pending, 1 if one still is after the
 # bounded wait, 2 if unreadable. Not PR-scoped (the run list can't filter by PR): conservative.
 settle_responses() {
@@ -147,6 +151,7 @@ settle_responses() {
       [[ $(jq 'length' <<< "$runs") == 0 ]] || { busy=1; break; }
     done
     [[ $busy == 1 ]] || return 0
+    (( SECONDS + SETTLE_INTERVAL <= SETTLE_DEADLINE )) || break
     sleep "$SETTLE_INTERVAL"
   done
   echo "::notice::A Wait for Codex response run is still pending; not touching the gate this pass." >&2
