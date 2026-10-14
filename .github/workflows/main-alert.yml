@@ -6,7 +6,7 @@ name: Main Alert
 # deliberately not listed.
 #
 # INLINED COPY of HagaleTechnologies/credenza .github/workflows/main-alert.yml
-# @ ca2c4743a5c061f60ec8c6082296c750faa716db -- this repo is public and cannot call a reusable workflow in a
+# @ 9c2f231a6447b2033aca9fa88e768bda1c4cd5f2 -- this repo is public and cannot call a reusable workflow in a
 # private repo. Logic and its tests live there (scripts/main-alert/); change it
 # there first, then re-copy. Inputs are fixed here: assignee thagale, label
 # main-red, events push/schedule/workflow_run, tags '^v[0-9]', recovery_jobs {}. Runs on
@@ -73,7 +73,10 @@ jobs:
           fi
           title="main is red: $WORKFLOW_NAME"
           marker="<!-- main-alert run=$RUN_ID attempt=$RUN_ATTEMPT -->"
-          subject=$(printf '%s\n' "$HEAD_MSG" | head -n1 | cut -c1-120)
+          # Parameter expansion, not `| head -n1`: with a body past the pipe
+          # buffer, head's early exit SIGPIPEs printf and pipefail aborts.
+          subject=${HEAD_MSG%%$'\n'*}
+          subject=${subject:0:120}
           commit="\`${HEAD_SHA:0:7}\` $subject"
 
           # Whether a run's success actually did something: some job ran, and
