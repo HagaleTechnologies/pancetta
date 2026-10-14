@@ -255,6 +255,10 @@ jobs:
   handle-merge-group-failure:
     needs: [parse-pr-number, check-pr-state]
     if: needs.check-pr-state.outputs.stale == 'false'
+    # Q-0068: CODEX_REVIEW_PAT lives in the main-only codex-review environment.
+    environment:
+      name: codex-review
+      deployment: false
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # Shared with auto-merge-trigger.yml's own mutating job -- closes a TOCTOU race where

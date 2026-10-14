@@ -40,6 +40,10 @@ concurrency:
 jobs:
   shepherd:
     name: Shepherd weekly research-scan PRs
+    # Q-0068: CODEX_REVIEW_PAT lives in the main-only codex-review environment.
+    environment:
+      name: codex-review
+      deployment: false
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
