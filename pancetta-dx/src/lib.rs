@@ -54,6 +54,8 @@ pub mod lotw;
 pub mod pskreporter;
 pub mod qrz_xml;
 pub mod qso_upload;
+#[cfg(test)]
+mod test_support;
 
 pub use qrz_xml::{QrzLookup, QrzXmlClient};
 pub use qso_upload::{

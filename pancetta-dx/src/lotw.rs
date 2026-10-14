@@ -297,6 +297,21 @@ impl LotwClient {
 
         info!("Downloading QSLs from LoTW for {}", params.own_callsign);
 
+        let adif_data = self.fetch_qsl_report(&params).await?;
+
+        if adif_data.contains("No records found") {
+            tracing::warn!("No QSL records found in LoTW");
+            return Ok(Vec::new());
+        }
+
+        // Parse ADIF data
+        self.parse_adif_qsls(&adif_data)
+    }
+
+    /// Fetch the raw `lotwreport.adi` body for `params`. Split from
+    /// [`download_qsls`](Self::download_qsls) so the request can be tested
+    /// against a plain-HTTP mock (`login` refuses non-HTTPS endpoints).
+    async fn fetch_qsl_report(&self, params: &LotwDownloadParams) -> Result<String> {
         let download_url = format!("{}/lotw/lotwreport.adi", self.config.base_url);
 
         let start_date_str = params.start_date.format("%Y-%m-%d").to_string();
@@ -343,15 +358,7 @@ impl LotwClient {
             )));
         }
 
-        let adif_data = response.text().await.map_err(DxError::Network)?;
-
-        if adif_data.contains("No records found") {
-            tracing::warn!("No QSL records found in LoTW");
-            return Ok(Vec::new());
-        }
-
-        // Parse ADIF data
-        self.parse_adif_qsls(&adif_data)
+        response.text().await.map_err(DxError::Network)
     }
 
     /// Get QSL confirmations for specific callsign
@@ -940,6 +947,29 @@ mod tests {
         assert_eq!(resp.processed, Some(5));
         assert_eq!(resp.accepted, Some(3));
         assert_eq!(resp.rejected, Some(2));
+    }
+
+    #[tokio::test]
+    async fn fetch_qsl_report_returns_the_report_body() {
+        let body = "<CALL:5>K1ABC<EOR>";
+        let addr = crate::test_support::serve_raw(
+            1,
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        let client = LotwClient::with_config(LotwConfig {
+            username: "W1ABC".into(),
+            password: "lotw-pw".into(),
+            base_url: format!("http://{addr}"),
+            ..Default::default()
+        });
+        let params = LotwDownloadParams {
+            own_callsign: "W1ABC".into(),
+            ..Default::default()
+        };
+        assert_eq!(client.fetch_qsl_report(&params).await.unwrap(), body);
     }
 
     #[test]

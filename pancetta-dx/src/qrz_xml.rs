@@ -108,9 +108,12 @@ impl QrzXmlClient {
         }
     }
 
-    /// Override the base URL (used only by tests / mock servers).
-    #[cfg(test)]
-    fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+    /// Point the client at another endpoint. Test and mock-server seam only:
+    /// production builds the client with [`new`](Self::new), which always uses
+    /// QRZ's HTTPS endpoint. `pub` so the coordinator's tests can drive a
+    /// failing server; hidden from rustdoc like `pancetta_qso::sim`.
+    #[doc(hidden)]
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
     }
