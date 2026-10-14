@@ -625,6 +625,8 @@ priority over both config and environment.
 
 Pancetta watches its config file for changes while it runs: the file
 given with `--config`, otherwise `~/.pancetta/pancetta.toml`. If that
+path is a symlink, both edits to the file it points at and repointing
+the symlink itself are picked up. If that
 file does not exist (for example, your config lives only in one of the
 other search locations above), nothing is watched and every change
 needs a restart. A save is picked up within a few seconds. Each save is
@@ -676,7 +678,9 @@ is unless you edit that key in the watched file.
 When a reload succeeds you see a `Config reloaded` line in the TUI
 diagnostics, plus one line per security action and, when other keys
 changed, `Saved changes take effect after a restart: …` naming them. A
-save that changes nothing shows nothing. When a reload fails (typo, schema violation), the
+misspelled or unrecognized key shows a `Config warning: …` line on the
+save that introduces it; that key has no effect. Otherwise a save that
+changes nothing shows nothing. When a reload fails (typo, schema violation), the
 previous config stays active and
 `Config reload failed: … — previous configuration still active` shows
 in the TUI diagnostics.

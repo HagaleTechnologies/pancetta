@@ -40,8 +40,9 @@ use crate::message_bus::ComponentId;
 use pancetta_agent::arm::ConsentChannel;
 
 /// What the watcher forwards to the main loop: the reloaded, validated
-/// config, or the load/validation error text.
-pub(crate) type ConfigReloadOutcome = Result<Config, String>;
+/// config with its non-fatal load warnings (e.g. an unrecognized section),
+/// or the load/validation error text.
+pub(crate) type ConfigReloadOutcome = Result<(Config, Vec<String>), String>;
 
 /// How long to wait after the first watcher event before re-reading the file.
 /// Editors often truncate and then write, which produces several events; the
@@ -310,7 +311,7 @@ fn load_config_for_reload(path: &Path) -> ConfigReloadOutcome {
         warn!("Config reload warning: {w}");
     }
     config.validate().map_err(|e| e.to_string())?;
-    Ok(config)
+    Ok((config, warnings))
 }
 
 /// Turn watcher events into reload outcomes for the main loop. Each burst of
@@ -361,11 +362,20 @@ pub(crate) async fn recv_config_reload(
 }
 
 impl super::ApplicationCoordinator {
-    /// Start watching `config_path` for saved edits. Only runs when that path
-    /// is an existing file (a defaults-only run has nothing to watch). A
-    /// watcher that fails to start is logged and skipped: the station then
-    /// runs exactly as it did before PAN-103, with every edit needing a
-    /// restart.
+    /// The config file path as the operator gave it (`--config`, or the
+    /// default location), symlinks NOT resolved. Reloads read and watch this
+    /// path, so repointing a symlinked config at a new file is picked up.
+    pub fn set_config_watch_path(&mut self, path: PathBuf) {
+        self.config_watch_path = path;
+    }
+
+    /// Start watching `config_watch_path` for saved edits. Only runs when
+    /// that path is an existing file (a defaults-only run has nothing to
+    /// watch). The path's own directory is watched (a symlink repoint shows
+    /// up there), and so is the directory of its current symlink target (an
+    /// edit to the target shows up there). A watcher that fails to start is
+    /// logged and skipped: the station then runs exactly as it did before
+    /// PAN-103, with every edit needing a restart.
     pub(crate) async fn start_config_reload_watcher(&mut self) -> anyhow::Result<()> {
         self.start_config_reload_watcher_with_settle(RELOAD_SETTLE)
             .await
@@ -375,29 +385,34 @@ impl super::ApplicationCoordinator {
         &mut self,
         settle: Duration,
     ) -> anyhow::Result<()> {
-        if !self.config_path.is_file() {
+        // Absolute but not symlink-resolved: the watcher also watches the
+        // path's parent, which a bare relative file name does not have.
+        let watch_path = std::path::absolute(&self.config_watch_path)
+            .unwrap_or_else(|_| self.config_watch_path.clone());
+        if !watch_path.is_file() {
             info!(
                 "Config hot reload not started: {} is not a file",
-                self.config_path.display()
+                watch_path.display()
             );
             return Ok(());
         }
         // The file's own content is the baseline edits are measured from:
         // the running config may also hold values from other config files or
         // `PANCETTA_*` environment variables (see the module doc).
-        let path = self.config_path.clone();
+        let path = watch_path.clone();
         let baseline = match tokio::task::spawn_blocking(move || load_config_for_reload(&path))
             .await
             .unwrap_or_else(|e| Err(e.to_string()))
         {
-            Ok(config) => config,
+            Ok(pair) => pair,
             Err(e) => {
                 info!("Config hot reload not started: {e}");
                 return Ok(());
             }
         };
-        let (mut watcher, events) = match ConfigHotReload::new(baseline.clone(), &self.config_path)
-        {
+        // Startup already showed this file's warnings (`config_warnings`).
+        let (baseline, baseline_warnings) = baseline;
+        let (mut watcher, events) = match ConfigHotReload::new(baseline.clone(), &watch_path) {
             Ok(pair) => pair,
             Err(e) => {
                 info!("Config hot reload not started: {e}");
@@ -412,17 +427,76 @@ impl super::ApplicationCoordinator {
         tokio::spawn(forward_config_reload_events(
             events,
             tx,
-            self.config_path.clone(),
+            watch_path.clone(),
             settle,
         ));
         self.config_reload_watcher = Some(watcher);
         self.config_reload_rx = Some(rx);
         self.config_file_baseline = Some(baseline);
+        self.config_file_warnings = baseline_warnings;
+        // `start_watching` already watches the path's own directory; record
+        // its resolved form too so a target in that same directory is not
+        // watched twice.
+        self.config_link_dirs.clear();
+        self.config_target_dir = None;
+        if let Some(dir) = watch_path.parent() {
+            self.config_link_dirs.push(dir.to_path_buf());
+            if let Ok(resolved) = std::fs::canonicalize(dir) {
+                self.config_link_dirs.push(resolved);
+            }
+        }
+        self.config_watch_path = watch_path;
+        self.watch_config_target_dir().await;
         info!(
             "Watching {} for config changes (remote-access revocations apply live)",
-            self.config_path.display()
+            self.config_watch_path.display()
         );
         Ok(())
+    }
+
+    /// Watch the directory of the config path's current symlink target in
+    /// place of the previous target's directory. Run at start and after every
+    /// reload, so edits to a target that a symlink repoint moved to another
+    /// directory are still seen. Returns `true` when it started watching a
+    /// directory it did not watch before. The config path's own directory
+    /// (`config_link_dirs`) is always watched and never handled here.
+    async fn watch_config_target_dir(&mut self) -> bool {
+        if self.config_reload_watcher.is_none() {
+            return false;
+        }
+        let path = self.config_watch_path.clone();
+        let Ok(Ok(target)) = tokio::task::spawn_blocking(move || std::fs::canonicalize(path)).await
+        else {
+            return false;
+        };
+        let dir = target
+            .parent()
+            .map(Path::to_path_buf)
+            .filter(|d| !self.config_link_dirs.contains(d));
+        if dir == self.config_target_dir {
+            return false;
+        }
+        let Some(watcher) = self.config_reload_watcher.as_mut() else {
+            return false;
+        };
+        if let Some(dir) = &dir {
+            if let Err(e) = watcher.watch_also(dir) {
+                warn!("Config hot reload: {e:#}");
+                return false;
+            }
+            info!(
+                "Also watching {} (target of {})",
+                dir.display(),
+                self.config_watch_path.display()
+            );
+        }
+        if let Some(old) = self.config_target_dir.take() {
+            if let Err(e) = watcher.unwatch_also(&old) {
+                debug!("Config hot reload: {e:#}");
+            }
+        }
+        self.config_target_dir = dir;
+        self.config_target_dir.is_some()
     }
 
     /// C19: a poisoned `active_tx_qsos` lock counts as "a QSO is active", so
@@ -434,12 +508,27 @@ impl super::ApplicationCoordinator {
             .unwrap_or(true)
     }
 
+    /// Apply one reload outcome (see [`Self::apply_config_reload`]), then
+    /// follow a symlink repoint: when the config's target moved to a
+    /// directory not watched yet, watch it and re-read the file once, so an
+    /// edit made there before the watch existed is not missed.
+    pub(crate) async fn handle_config_reload(&mut self, outcome: ConfigReloadOutcome) {
+        self.apply_config_reload(outcome).await;
+        if self.watch_config_target_dir().await {
+            let path = self.config_watch_path.clone();
+            let outcome = tokio::task::spawn_blocking(move || load_config_for_reload(&path))
+                .await
+                .unwrap_or_else(|e| Err(format!("config reload task failed: {e}")));
+            self.apply_config_reload(outcome).await;
+        }
+    }
+
     /// Apply one reload outcome: the remote-access changes now (never
     /// deferred), every other changed key reported as restart-required, then
     /// one diagnostic line per action.
-    pub(crate) async fn handle_config_reload(&mut self, outcome: ConfigReloadOutcome) {
-        let new = match outcome {
-            Ok(config) => config,
+    async fn apply_config_reload(&mut self, outcome: ConfigReloadOutcome) {
+        let (new, warnings) = match outcome {
+            Ok(pair) => pair,
             Err(err) => {
                 warn!("Config reload failed: {err}");
                 self.emit_config_reload_lines(vec![(
@@ -456,12 +545,23 @@ impl super::ApplicationCoordinator {
             Some(baseline) => baseline,
             None => self.config.read().await.clone(),
         };
+        // Like the startup `config_warnings`: a misspelled or unrecognized
+        // key is otherwise silently ignored. Only warnings the previous load
+        // did not have are shown, since a write to any other file in a
+        // watched directory also causes a reload.
+        let warning_lines: Vec<(DiagnosticLevel, String)> = warnings
+            .iter()
+            .filter(|w| !self.config_file_warnings.contains(w))
+            .map(|w| (DiagnosticLevel::Warn, format!("Config warning: {w}")))
+            .collect();
+        self.config_file_warnings = warnings;
         let plan = ReloadApplyPlan::decide(&old, &new, self.config_reload_qso_active());
         if plan.applicability == ConfigReloadApplicability::NoChange
             && plan.apply_security.is_empty()
         {
             self.config_file_baseline = Some(new);
             debug!("Config file event with no content change — nothing to apply");
+            self.emit_config_reload_lines(warning_lines).await;
             return;
         }
 
@@ -486,6 +586,7 @@ impl super::ApplicationCoordinator {
         info!(?plan.applicability, "Config reloaded");
 
         let mut lines = vec![(DiagnosticLevel::Info, MSG_RELOADED.to_string())];
+        lines.extend(warning_lines);
         lines.extend(self.apply_security_config(&plan.apply_security).await);
         if !restart_keys.is_empty() {
             let mut listed = restart_keys
@@ -1045,7 +1146,9 @@ mod tests {
         let mut new = coordinator.config.read().await.clone();
         new.ui.theme = format!("{}-x", new.ui.theme);
         new.rig.interface.enabled = !new.rig.interface.enabled;
-        coordinator.handle_config_reload(Ok(new)).await;
+        coordinator
+            .handle_config_reload(Ok((new, Vec::new())))
+            .await;
 
         assert_eq!(
             toml::to_string(&*coordinator.config.read().await).unwrap(),
@@ -1075,7 +1178,9 @@ mod tests {
         new.audio.output_device = "Picked In TUI".to_string();
         // What `TuiCommand::SelectDevice` does: apply live, then persist.
         coordinator.config.write().await.audio.output_device = "Picked In TUI".to_string();
-        coordinator.handle_config_reload(Ok(new)).await;
+        coordinator
+            .handle_config_reload(Ok((new, Vec::new())))
+            .await;
         let lines = diagnostics(&rx);
         assert!(
             !lines
@@ -1099,7 +1204,9 @@ mod tests {
         // An unrelated save must not turn consent on.
         let mut saved = file.clone();
         saved.ui.theme = format!("{}-x", saved.ui.theme);
-        coordinator.handle_config_reload(Ok(saved.clone())).await;
+        coordinator
+            .handle_config_reload(Ok((saved.clone(), Vec::new())))
+            .await;
         assert!(!coordinator
             .remote_tx_arm
             .lock()
@@ -1126,7 +1233,9 @@ mod tests {
         let mut coordinator = test_coordinator(base()).await;
         let rx = tui_rx(&coordinator).await;
         let same = coordinator.config.read().await.clone();
-        coordinator.handle_config_reload(Ok(same)).await;
+        coordinator
+            .handle_config_reload(Ok((same, Vec::new())))
+            .await;
         assert!(diagnostics(&rx).is_empty());
     }
 
@@ -1161,7 +1270,9 @@ mod tests {
         let mut new = coordinator.config.read().await.clone();
         new.station.callsign = "K9NEW".to_string();
         new.network.station_agent.remote_tx_enabled = false;
-        coordinator.handle_config_reload(Ok(new.clone())).await;
+        coordinator
+            .handle_config_reload(Ok((new.clone(), Vec::new())))
+            .await;
 
         {
             let cfg = coordinator.config.read().await;
@@ -1187,7 +1298,9 @@ mod tests {
 
         // Nor once the QSO ends: the callsign needs a restart.
         coordinator.active_tx_qsos.write().unwrap().clear();
-        coordinator.handle_config_reload(Ok(new)).await;
+        coordinator
+            .handle_config_reload(Ok((new, Vec::new())))
+            .await;
         assert_eq!(
             coordinator.config.read().await.station.callsign,
             running_call
@@ -1208,7 +1321,9 @@ mod tests {
 
         let mut off = coordinator.config.read().await.clone();
         off.network.station_agent.remote_tx_enabled = false;
-        coordinator.handle_config_reload(Ok(off.clone())).await;
+        coordinator
+            .handle_config_reload(Ok((off.clone(), Vec::new())))
+            .await;
         assert!(
             !permitted(&coordinator, "A"),
             "queued/in-flight remote TX refused"
@@ -1232,7 +1347,7 @@ mod tests {
 
         let mut on = off;
         on.network.station_agent.remote_tx_enabled = true;
-        coordinator.handle_config_reload(Ok(on)).await;
+        coordinator.handle_config_reload(Ok((on, Vec::new()))).await;
         assert!(permitted(&coordinator, "A"), "arm kept; consent restored");
         assert!(texts(&diagnostics(&rx)).contains(&MSG_STATION_AGENT_CONSENT_ON));
     }
@@ -1251,7 +1366,9 @@ mod tests {
         let rx = tui_rx(&coordinator).await;
         let mut new = coordinator.config.read().await.clone();
         new.network.wsjtx_udp.allow_tx_initiation = false;
-        coordinator.handle_config_reload(Ok(new)).await;
+        coordinator
+            .handle_config_reload(Ok((new, Vec::new())))
+            .await;
         assert!(!coordinator
             .remote_tx_arm
             .lock()
@@ -1261,7 +1378,7 @@ mod tests {
 
         let mut on = coordinator.config.read().await.clone();
         on.network.wsjtx_udp.allow_tx_initiation = true;
-        coordinator.handle_config_reload(Ok(on)).await;
+        coordinator.handle_config_reload(Ok((on, Vec::new()))).await;
         assert!(coordinator
             .remote_tx_arm
             .lock()
@@ -1279,7 +1396,9 @@ mod tests {
         let rx = tui_rx(&coordinator).await;
         let mut new = coordinator.config.read().await.clone();
         new.network.station_agent.tx_allow_list = vec!["B".to_string()];
-        coordinator.handle_config_reload(Ok(new)).await;
+        coordinator
+            .handle_config_reload(Ok((new, Vec::new())))
+            .await;
         assert_eq!(
             coordinator
                 .config
@@ -1324,7 +1443,9 @@ mod tests {
 
         let mut new = coordinator.config.read().await.clone();
         new.network.station_agent.tx_allow_list = vec!["B".to_string()];
-        coordinator.handle_config_reload(Ok(new)).await;
+        coordinator
+            .handle_config_reload(Ok((new, Vec::new())))
+            .await;
 
         assert!(!live.tx_allow_list.read().unwrap().contains("A"));
         assert!(!live.tx_arm_allow_list.read().unwrap().contains("A"));
@@ -1363,7 +1484,9 @@ mod tests {
             .tx_allow_list
             .push("C".to_string());
         new.network.station_agent.relay_url = Some("wss://relay.example".to_string());
-        coordinator.handle_config_reload(Ok(new)).await;
+        coordinator
+            .handle_config_reload(Ok((new, Vec::new())))
+            .await;
         let lines = diagnostics(&rx);
         let t = texts(&lines);
         assert!(t.contains(&MSG_ALLOW_LIST_ADDED), "{lines:?}");
@@ -1416,7 +1539,9 @@ mod tests {
 
         let mut new = coordinator.config.read().await.clone();
         new.network.station_agent.enabled = false;
-        coordinator.handle_config_reload(Ok(new)).await;
+        coordinator
+            .handle_config_reload(Ok((new, Vec::new())))
+            .await;
 
         assert!(
             !coordinator
@@ -1462,7 +1587,9 @@ mod tests {
         let rx = tui_rx(&coordinator).await;
         let mut new = coordinator.config.read().await.clone();
         new.network.station_agent.enabled = true;
-        coordinator.handle_config_reload(Ok(new)).await;
+        coordinator
+            .handle_config_reload(Ok((new, Vec::new())))
+            .await;
         assert!(coordinator
             .named_task_handles
             .iter()
@@ -1490,6 +1617,7 @@ mod tests {
 
         let mut coordinator = test_coordinator(config.clone()).await;
         coordinator.config_path = path.clone();
+        coordinator.set_config_watch_path(path.clone());
         coordinator
             .start_config_reload_watcher_with_settle(Duration::from_millis(100))
             .await
@@ -1509,8 +1637,164 @@ mod tests {
             .await
             .expect("a reload outcome within 15 s")
             .expect("channel open");
-        let reloaded = outcome.expect("the saved file loads and validates");
+        let (reloaded, _) = outcome.expect("the saved file loads and validates");
         assert!(!reloaded.network.station_agent.remote_tx_enabled);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Wait for the next reload outcome whose `remote_tx_enabled` is `want`.
+    async fn next_outcome_with_consent(
+        rx: &mut mpsc::Receiver<ConfigReloadOutcome>,
+        want: bool,
+    ) -> ConfigReloadOutcome {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let outcome = rx.recv().await.expect("channel open");
+                if matches!(&outcome, Ok((c, _)) if c.network.station_agent.remote_tx_enabled == want)
+                {
+                    return outcome;
+                }
+            }
+        })
+        .await
+        .expect("a matching reload outcome within 15 s")
+    }
+
+    /// `--config` names a symlink that a dotfile manager repoints at a new
+    /// file in another directory; the new file is then edited, once before
+    /// the coordinator handled the repoint and once after.
+    /// `config_path` is the resolved target, as `main.rs` passes it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watcher_follows_a_symlinked_config_repointed_at_a_new_file() {
+        let root = temp_path("symlink");
+        let (link_dir, old_dir, new_dir) = (root.join("link"), root.join("v1"), root.join("v2"));
+        for d in [&link_dir, &old_dir, &new_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let mut config = base();
+        config.station.callsign = "K1TEST".to_string();
+        config.station.grid_square = "FN42".to_string();
+        let old_target = old_dir.join("pancetta.toml");
+        std::fs::write(&old_target, toml::to_string(&config).unwrap()).unwrap();
+        let link = link_dir.join("pancetta.toml");
+        std::os::unix::fs::symlink(&old_target, &link).unwrap();
+
+        let mut coordinator = test_coordinator(config.clone()).await;
+        coordinator.config_path = std::fs::canonicalize(&link).unwrap();
+        coordinator.set_config_watch_path(link.clone());
+        coordinator
+            .start_config_reload_watcher_with_settle(Duration::from_millis(100))
+            .await
+            .unwrap();
+        let mut rx = coordinator
+            .config_reload_rx
+            .take()
+            .expect("watcher started");
+        assert_eq!(
+            coordinator.config_target_dir,
+            Some(std::fs::canonicalize(&old_dir).unwrap())
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Repoint: the old target never changes.
+        let mut revoked = config.clone();
+        revoked.network.station_agent.remote_tx_enabled = false;
+        let new_target = new_dir.join("pancetta.toml");
+        std::fs::write(&new_target, toml::to_string(&revoked).unwrap()).unwrap();
+        let tmp_link = link_dir.join(".pancetta.toml.tmp");
+        std::os::unix::fs::symlink(&new_target, &tmp_link).unwrap();
+        std::fs::rename(&tmp_link, &link).unwrap();
+        let outcome = next_outcome_with_consent(&mut rx, false).await;
+        // Saved before the new directory is watched: no event fires for it.
+        let mut pruned = revoked.clone();
+        pruned.network.station_agent.tx_allow_list = vec!["B".to_string()];
+        std::fs::write(&new_target, toml::to_string(&pruned).unwrap()).unwrap();
+        coordinator.handle_config_reload(outcome).await;
+        assert!(!coordinator
+            .remote_tx_arm
+            .lock()
+            .unwrap()
+            .channel_consent(ConsentChannel::StationAgent));
+        assert_eq!(
+            coordinator.config_target_dir,
+            Some(std::fs::canonicalize(&new_dir).unwrap())
+        );
+        assert_eq!(
+            coordinator
+                .config
+                .read()
+                .await
+                .network
+                .station_agent
+                .tx_allow_list,
+            vec!["B".to_string()],
+            "the file is re-read once its new directory is watched"
+        );
+
+        // An in-place edit of the new target is seen too. Wait out the
+        // library's 500 ms reload debounce first (this test's settle is
+        // shorter than the production 750 ms that covers it).
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        std::fs::write(&new_target, toml::to_string(&config).unwrap()).unwrap();
+        assert!(next_outcome_with_consent(&mut rx, true).await.is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reload_load_returns_the_loader_warnings() {
+        let dir = temp_path("warn");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pancetta.toml");
+        std::fs::write(
+            &path,
+            "[station]\ncallsign = \"K1TEST\"\ngrid_square = \"FN42\"\n\n[autonomous_operator]\nenabled = true\n",
+        )
+        .unwrap();
+        let (_, warnings) = load_config_for_reload(&path).expect("loads");
+        assert!(
+            warnings.iter().any(|w| w.contains("autonomous_operator")),
+            "{warnings:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_new_reload_warning_reaches_the_operator_once() {
+        let mut coordinator = test_coordinator(base()).await;
+        let rx = tui_rx(&coordinator).await;
+        let first = "unknown config section [autonomous_operator]".to_string();
+        let second = "unknown key [ui].themee".to_string();
+
+        // A save adding an ignored key leaves the parsed config unchanged.
+        let same = coordinator.config.read().await.clone();
+        coordinator
+            .handle_config_reload(Ok((same.clone(), vec![first.clone()])))
+            .await;
+        let lines = diagnostics(&rx);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].0, DiagnosticLevel::Warn);
+        assert!(lines[0].1.contains(&first), "{lines:?}");
+
+        // A reload caused by another file in the watched directory.
+        coordinator
+            .handle_config_reload(Ok((same.clone(), vec![first.clone()])))
+            .await;
+        assert!(diagnostics(&rx).is_empty());
+
+        let mut changed = same;
+        changed.ui.theme = format!("{}-x", changed.ui.theme);
+        coordinator
+            .handle_config_reload(Ok((changed, vec![first.clone(), second.clone()])))
+            .await;
+        let lines = diagnostics(&rx);
+        assert!(texts(&lines).contains(&MSG_RELOADED), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|(l, t)| *l == DiagnosticLevel::Warn && t.contains(&second)),
+            "{lines:?}"
+        );
+        assert!(!lines.iter().any(|(_, t)| t.contains(&first)), "{lines:?}");
     }
 }

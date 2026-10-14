@@ -420,9 +420,12 @@ async fn run_application(cli: Cli) -> Result<()> {
     // PAN-62: resolve BEFORE `cli` is partially moved into the fields below.
     let config_write_path = config_write_path(&cli);
     let config_write_is_toml = config_write_is_toml(&cli);
+    // PAN-103: config reloads watch and read the path as given, so a
+    // symlinked config repointed at a new file is picked up.
+    let config_watch_path = config_raw_path(&cli);
 
     // Create application coordinator
-    let coordinator = ApplicationCoordinator::new(
+    let mut coordinator = ApplicationCoordinator::new(
         config,
         cli.audio_device,
         cli.no_audio,
@@ -439,6 +442,7 @@ async fn run_application(cli: Cli) -> Result<()> {
         config_write_is_toml,
     )
     .await?;
+    coordinator.set_config_watch_path(config_watch_path);
 
     info!("Application coordinator initialized");
 

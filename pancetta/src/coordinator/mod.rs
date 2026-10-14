@@ -796,6 +796,21 @@ pub struct ApplicationCoordinator {
     pub(crate) station_agent_live: Option<station_agent::StationAgentLiveHandles>,
     /// PAN-103: the config-file watcher. Watching stops when it is dropped.
     config_reload_watcher: Option<pancetta_config::hot_reload::ConfigHotReload>,
+    /// PAN-103: the config file path as the operator gave it, symlinks NOT
+    /// resolved (`config_path` is the resolved write target). Reloads read
+    /// and watch this path so repointing a symlinked config is picked up.
+    /// Defaults to `config_path`; `main.rs` sets it via
+    /// [`ApplicationCoordinator::set_config_watch_path`].
+    pub(crate) config_watch_path: PathBuf,
+    /// PAN-103: `config_watch_path`'s own directory, as given and resolved.
+    /// The watcher always watches it.
+    config_link_dirs: Vec<PathBuf>,
+    /// PAN-103: the directory of `config_watch_path`'s current symlink
+    /// target, when that is not one of `config_link_dirs`. Also watched.
+    config_target_dir: Option<PathBuf>,
+    /// PAN-103: the watched file's non-fatal load warnings as last loaded.
+    /// A reload shows only warnings not already in this list.
+    config_file_warnings: Vec<String>,
     /// PAN-103: reload outcomes forwarded from the watcher; taken by
     /// `run_main_loop` (mirrors `hamlib_reconnect_rx`).
     config_reload_rx: Option<tokio::sync::mpsc::Receiver<config_reload::ConfigReloadOutcome>>,
@@ -1983,6 +1998,7 @@ impl ApplicationCoordinator {
         // reports "already in progress" instead of queuing or blocking.
         let (hamlib_reconnect_tx, hamlib_reconnect_rx) =
             tokio::sync::mpsc::channel::<crate::coordinator::hamlib::HamlibReconnectRequest>(1);
+        let config_watch_path = config_path.clone();
 
         let coordinator = Self {
             id,
@@ -2110,6 +2126,10 @@ impl ApplicationCoordinator {
             station_agent_poll: None,
             station_agent_live: None,
             config_reload_watcher: None,
+            config_watch_path,
+            config_link_dirs: Vec::new(),
+            config_target_dir: None,
+            config_file_warnings: Vec::new(),
             config_reload_rx: None,
             config_file_baseline: None,
             pending_autonomous_cq_dispatch_failures: Arc::new(std::sync::Mutex::new(Vec::new())),

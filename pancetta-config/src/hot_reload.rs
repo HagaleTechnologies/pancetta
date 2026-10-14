@@ -211,6 +211,32 @@ impl ConfigHotReload {
         Ok(())
     }
 
+    /// Also watch `path` (non-recursively) with the started watcher. A change
+    /// there triggers the same reload of the configured path. Used for the
+    /// directory holding a symlinked config file's current target.
+    pub fn watch_also(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        let watcher = self
+            .watcher
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("configuration watcher not started"))?;
+        watcher
+            .watch(path.as_ref(), RecursiveMode::NonRecursive)
+            .with_context(|| format!("Failed to watch {}", path.as_ref().display()))?;
+        Ok(())
+    }
+
+    /// Stop watching a path added with [`watch_also`](Self::watch_also).
+    pub fn unwatch_also(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        let watcher = self
+            .watcher
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("configuration watcher not started"))?;
+        watcher
+            .unwatch(path.as_ref())
+            .with_context(|| format!("Failed to unwatch {}", path.as_ref().display()))?;
+        Ok(())
+    }
+
     /// Stop watching for configuration changes
     pub fn stop_watching(&mut self) {
         if let Some(watcher) = self.watcher.take() {
