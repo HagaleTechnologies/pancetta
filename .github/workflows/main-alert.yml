@@ -6,7 +6,7 @@ name: Main Alert
 # deliberately not listed.
 #
 # INLINED COPY of HagaleTechnologies/credenza .github/workflows/main-alert.yml
-# @ 9c2f231a6447b2033aca9fa88e768bda1c4cd5f2 -- this repo is public and cannot call a reusable workflow in a
+# @ a9d61f074aa7a495a7ffc1318e333af4e094fc47 -- this repo is public and cannot call a reusable workflow in a
 # private repo. Logic and its tests live there (scripts/main-alert/); change it
 # there first, then re-copy. Inputs are fixed here: assignee thagale, label
 # main-red, events push/schedule/workflow_run, tags '^v[0-9]', recovery_jobs {}. Runs on
@@ -37,9 +37,14 @@ jobs:
     permissions:
       issues: write
       actions: read
+    # queue: max (GitHub, 2026-05-07): by default a group keeps ONE pending job
+    # and a newer arrival cancels it, so an older run's delivery could replace a
+    # newer one's, see the newer run as already reported, and exit -- losing it.
+    # Queued deliveries now each run, in arrival order.
     concurrency:
       group: main-alert-${{ github.event.workflow_run.workflow_id }}
       cancel-in-progress: false
+      queue: max
     steps:
       - name: Open, comment on, or close the main-red issue
         shell: bash
