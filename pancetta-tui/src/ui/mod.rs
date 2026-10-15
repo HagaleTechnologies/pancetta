@@ -1765,7 +1765,8 @@ pub fn render_recent_qsos_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
 /// healthy right now?" snapshot (docs/observability-diagnostics-plan.md
 /// Layer 3), aggregating signals already computed elsewhere rather than
 /// introducing new detection logic. Unlike `render_diagnostics_overlay`
-/// (a scrollback), this is a point-in-time view — no scroll state.
+/// (a scrollback), this is a point-in-time view; it scrolls only when the
+/// readiness section makes it outgrow the panel (`App::health_scroll`).
 pub fn render_health_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
     if area.width < 20 || area.height < 6 {
         return;

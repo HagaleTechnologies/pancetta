@@ -1376,6 +1376,11 @@ pub struct ApplicationCoordinator {
     /// unkey). Read by the TUI relay's readiness snapshot
     /// (`readiness::ReadinessSources`). Display-only: it never gates TX.
     pub(crate) ptt_off_unconfirmed: Arc<AtomicBool>,
+    /// PAN-89: count of rig-confirmed PTT-offs (`hamlib::confirm_ptt_off`).
+    /// Teardown snapshots it before its PTT-off attempts so a confirmation
+    /// from the still-running watchdog is not overwritten by the failure
+    /// latch (`hamlib::latch_ptt_off_unconfirmed_unless_confirmed_since`).
+    pub(crate) ptt_off_confirmations: Arc<std::sync::atomic::AtomicU64>,
 
     /// PAN-89: the supervisor's degraded-components summary
     /// (`health::degraded_summary`), `None` when nothing has failed. Written
@@ -2131,6 +2136,7 @@ impl ApplicationCoordinator {
             audio_output_alive: Arc::new(AtomicBool::new(true)),
             audio_input_fallback: Arc::new(AtomicBool::new(false)),
             ptt_off_unconfirmed: Arc::new(AtomicBool::new(false)),
+            ptt_off_confirmations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             degraded_summary: Arc::new(std::sync::Mutex::new(None)),
             audio_reopen_tx: None,
             hamlib_reconnect_tx,
