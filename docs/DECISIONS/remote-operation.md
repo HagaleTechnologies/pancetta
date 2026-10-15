@@ -450,6 +450,10 @@ Normative station behaviour for the station agent's relay connection:
   Inbound frames still buffered when the outbound side fails are discarded, not delivered, so a
   queued heartbeat or TX request cannot act after the connection has failed; a read-side close or
   socket error is reported after the frames that preceded it, which are still delivered.
+- **The session loop yields every tick.** `run_one_session` awaits `yield_now` once per
+  `RECV_TICK` (200 ms) and ends the session when the component shutdown flag is set, so an
+  `abort()` or a requested shutdown takes effect on a quiet authenticated relay without waiting for
+  a socket event; the caller then disarms.
   Any relay transport error on a send latches in `MultiPeerSession`: the relay socket is shared by
   every peer, so no later send touches it, nothing received afterwards is acted on, and the next
   poll returns the error. `run_session_loop` then disarms (`disarm_on_loss`) and reconnects with

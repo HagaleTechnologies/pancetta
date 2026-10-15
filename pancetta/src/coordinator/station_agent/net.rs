@@ -649,6 +649,13 @@ mod tests {
                 ..test_timeouts()
             };
             let mut conn = RealWsConn::spawn(StalledSink, silent_source(), timeouts);
+            // The writer takes one frame off the queue and then sticks in
+            // `poll_ready`. Wait for that first, or it can free a slot after
+            // the queue is filled and the send under test succeeds.
+            conn.send_text("x".to_string()).expect("queued");
+            while conn.send_capacity() < Some(RELAY_QUEUE_DEPTH) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
             // Fill the queue; the first send that finds no room is under test.
             while conn.send_capacity() > Some(0) {
                 conn.send_text("x".to_string()).expect("queue has room");

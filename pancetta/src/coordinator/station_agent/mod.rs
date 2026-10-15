@@ -261,6 +261,10 @@ struct ArmContext {
     /// The arm-timing clock (wall + monotonic). Production uses
     /// [`ArmTime::now`]; session tests inject a manually advanced timeline.
     clock: ArmClock,
+    /// The component's shutdown flag. `run_one_session` checks it every tick
+    /// so a requested shutdown ends the session (and disarms) without
+    /// waiting for a socket event (PAN-102).
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Source of [`ArmTime`] samples for the session loop (see
@@ -577,9 +581,9 @@ fn sweep_arm_expiry(ctx: &ArmContext, now: ArmTime) -> Vec<PeerSend> {
 /// be raced by anything outside this task.
 ///
 /// PAN-36 round 2: `normal_exit` alone under-covers a second ordinary exit
-/// path -- `run_one_session` never checks `cfg.shutdown` itself, so a
-/// session with an established peer can still be mid-flight when shutdown is
-/// requested. `shutdown.rs` gives every named task a 1s grace period, then
+/// path -- a session can still be mid-flight when shutdown is requested
+/// (`run_one_session` checks the flag once per tick since PAN-102, but a tick
+/// blocked in a dispatch or send can outlast the grace period). `shutdown.rs` gives every named task a 1s grace period, then
 /// force-`abort()`s it. That abort drops this guard immediately, well before
 /// `mark_normal_exit`, via ordinary (non-unwinding) `Drop` cleanup -- so a
 /// genuine panic always leaves this thread `std::thread::panicking()`, while
@@ -2154,6 +2158,7 @@ async fn run_session_loop(mut cfg: RunConfig) {
         // Set from the live generation at the start of every session.
         authz_generation_seen: 0,
         clock: Arc::new(ArmTime::now),
+        shutdown: cfg.shutdown.clone(),
     };
 
     while !cfg.shutdown.load(Ordering::Acquire) {
@@ -2348,6 +2353,19 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
         return;
     }
     loop {
+        // PAN-102: `process_next` blocks synchronously (`block_in_place`) for
+        // up to `RECV_TICK`, and a quiet relay makes every branch below
+        // synchronous too, so without this the loop would never reach an
+        // `.await`: an `abort()` (shutdown.rs's force-stop, supervisor
+        // teardown) is only observed at a yield point, and would wait for
+        // the next socket event while a remote-TX arm stays live. Yield once
+        // per tick, and end the session at once when shutdown is requested;
+        // the caller disarms.
+        tokio::task::yield_now().await;
+        if ctx.shutdown.load(Ordering::Acquire) {
+            debug!(target: "agent", "shutdown requested; ending relay session");
+            return;
+        }
         let polled = sess.process_next(RECV_TICK);
         // PAN-97: expire a lapsed arm on EVERY iteration, before acting on
         // what was received — time spent receiving counts, and no branch below
@@ -2716,6 +2734,7 @@ mod tests {
             authz_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             authz_generation_seen: 0,
             clock: fixed_clock(NOW),
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -2946,7 +2965,7 @@ mod tests {
 
     /// PAN-36 round 2 (Codex finding on this PR): reproduces the actual
     /// shutdown.rs mechanism end-to-end rather than just the `Drop` logic in
-    /// isolation. `run_one_session` never checks `cfg.shutdown` itself, so a
+    /// isolation. `run_one_session` checks `shutdown` only once per tick, so a
     /// session with an established peer can still be mid-flight when
     /// shutdown is requested; `shutdown.rs` gives the task a 1s grace
     /// period, then force-`abort()`s it -- dropping this guard before
@@ -4994,6 +5013,7 @@ mod tests {
             authz_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             authz_generation_seen: 0,
             clock: fixed_clock(NOW),
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let bus = MessageBus::new(64).unwrap();
         run_one_session(
@@ -5094,6 +5114,7 @@ mod tests {
             authz_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             authz_generation_seen: 0,
             clock: fixed_clock(NOW),
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -6122,6 +6143,7 @@ mod tests {
             authz_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             authz_generation_seen: 0,
             clock: fixed_clock(NOW),
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -9256,6 +9278,142 @@ mod tests {
             joined.is_ok(),
             "the session task must honour abort() promptly"
         );
+    }
+
+    /// An authenticated relay that then goes quiet: delivers its scripted
+    /// frames, then answers every bounded receive with `Quiet` after a short
+    /// real wait (as `RealWsConn` would), up to `max_quiet` times, after which
+    /// it reports a close so a regression fails instead of spinning forever.
+    struct QuietAfterAuthWs {
+        inner: MockWs,
+        quiet_ticks: Arc<std::sync::atomic::AtomicUsize>,
+        max_quiet: usize,
+    }
+
+    impl WsConn for QuietAfterAuthWs {
+        fn send_text(&mut self, s: String) -> Result<(), RelayError> {
+            self.inner.send_text(s)
+        }
+        fn recv_text(&mut self) -> Result<Option<String>, RelayError> {
+            self.inner.recv_text()
+        }
+        fn recv_text_within(&mut self, timeout: Duration) -> Result<RecvOutcome, RelayError> {
+            if let Some(t) = self.inner.recv_text()? {
+                return Ok(RecvOutcome::Frame(t));
+            }
+            let n = self
+                .quiet_ticks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n >= self.max_quiet {
+                return Ok(RecvOutcome::Closed);
+            }
+            std::thread::sleep(timeout.min(Duration::from_millis(10)));
+            Ok(RecvOutcome::Quiet)
+        }
+    }
+
+    fn quiet_after_auth_ws(
+        identity: &AgentIdentity,
+        max_quiet: usize,
+    ) -> (QuietAfterAuthWs, Arc<std::sync::atomic::AtomicUsize>) {
+        let hello = RelayFrame::Hello {
+            challenge: b64url(&[7u8; 32]),
+        }
+        .to_json()
+        .unwrap();
+        let ready = RelayFrame::Ready {
+            key_id: identity.key_id(),
+            peer_present: false,
+        }
+        .to_json()
+        .unwrap();
+        let quiet_ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            QuietAfterAuthWs {
+                inner: MockWs::new(vec![hello, ready], Arc::new(Mutex::new(Vec::new()))),
+                quiet_ticks: quiet_ticks.clone(),
+                max_quiet,
+            },
+            quiet_ticks,
+        )
+    }
+
+    /// Review (PR #433): an authenticated session on a quiet relay must still
+    /// honour `abort()` promptly; the loop has no other `.await` on that path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quiet_authenticated_session_honours_abort() {
+        let identity = AgentIdentity::generate();
+        // ~10 ms per quiet tick: 1000 ticks is ~10 s before the mock closes.
+        let (ws, quiet_ticks) = quiet_after_auth_ws(&identity, 1000);
+        let mut ctx = ctx_with(true, true);
+        let handle = tokio::spawn(async move {
+            let bus = MessageBus::new(64).unwrap();
+            let mut events = None;
+            run_one_session(
+                ws,
+                &identity,
+                &mut ctx,
+                &bus,
+                &mut events,
+                Duration::from_secs(1),
+            )
+            .await;
+        });
+        // Wait until the session is past authentication and idling.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while quiet_ticks.load(std::sync::atomic::Ordering::SeqCst) < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "session never went idle"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        handle.abort();
+        let joined = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        assert!(
+            joined.is_ok(),
+            "abort() must end a quiet authenticated session promptly"
+        );
+        assert!(
+            quiet_ticks.load(std::sync::atomic::Ordering::SeqCst) < 1000,
+            "the session ended by abort, not by the mock closing"
+        );
+    }
+
+    /// A requested shutdown ends a quiet authenticated session within a tick.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quiet_authenticated_session_ends_on_shutdown() {
+        let identity = AgentIdentity::generate();
+        let (ws, quiet_ticks) = quiet_after_auth_ws(&identity, 1000);
+        let mut ctx = ctx_with(true, true);
+        let shutdown = ctx.shutdown.clone();
+        let handle = tokio::spawn(async move {
+            let bus = MessageBus::new(64).unwrap();
+            let mut events = None;
+            run_one_session(
+                ws,
+                &identity,
+                &mut ctx,
+                &bus,
+                &mut events,
+                Duration::from_secs(1),
+            )
+            .await;
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while quiet_ticks.load(std::sync::atomic::Ordering::SeqCst) < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "session never went idle"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("shutdown must end the session promptly")
+            .expect("session task panicked");
+        assert!(quiet_ticks.load(std::sync::atomic::Ordering::SeqCst) < 1000);
     }
 
     #[tokio::test]
