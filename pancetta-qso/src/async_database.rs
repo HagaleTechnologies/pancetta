@@ -1082,9 +1082,30 @@ impl QsoDatabase {
         Ok((inserted, skipped))
     }
 
-    /// Close the pool, so a short-lived process (e.g. `pancetta import`)
-    /// checkpoints the WAL cleanly before it exits.
+    /// Checkpoint the WAL into the database file, then close the pool, so a
+    /// short-lived process (e.g. `pancetta import`) leaves a quiescent
+    /// `qso.db` when this returns: every committed frame is in the main file,
+    /// and no pooled connection still owes it a write (PAN-127). The pool's
+    /// own close is not enough on its own — a connection can outlive the
+    /// `Pool::close` future's completion, and its later checkpoint would
+    /// change `qso.db`'s bytes and mtime after the caller had already read
+    /// them.
     pub async fn close(&self) {
+        // TRUNCATE writes every committed frame into the main database file
+        // and resets the WAL to zero bytes, so whatever the pooled
+        // connections do afterwards cannot touch the file again.
+        if let Ok(row) = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(&self.pool)
+            .await
+        {
+            // (busy, log_frames, checkpointed_frames); busy means a reader
+            // blocked the truncation — the frames that did get checkpointed
+            // are still durable in the main file.
+            let (busy, log, checkpointed): (i64, i64, i64) = (row.get(0), row.get(1), row.get(2));
+            if busy != 0 {
+                warn!("WAL checkpoint on close was busy: {checkpointed}/{log} frames checkpointed");
+            }
+        }
         self.pool.close().await
     }
 
@@ -1672,6 +1693,41 @@ mod tests {
             "missing K9DEF in {:?}",
             calls
         );
+    }
+
+    /// PAN-127: `close()` must leave a file-backed index quiescent — every
+    /// committed frame checkpointed into `qso.db`, the WAL sidecar empty or
+    /// gone — before it returns. Before the fix the pool's close left a
+    /// connection alive with the whole log still in the WAL, so a caller
+    /// that snapshotted `qso.db`'s bytes or mtime right after `close()`
+    /// raced the connection's late checkpoint (`tests/import_cli.rs` failed
+    /// 24/40 parallel runs).
+    #[tokio::test]
+    async fn close_leaves_a_file_index_quiescent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let adif_path = tmp.path().join("qsos.adi");
+        let db_path = tmp.path().join("qso.db");
+        tokio::fs::write(&adif_path, INSERT_FIXTURE).await.unwrap();
+
+        QsoDatabase::replay_from_adif(&db_path, &adif_path)
+            .await
+            .unwrap()
+            .close()
+            .await;
+
+        let wal_len = std::fs::metadata(tmp.path().join("qso.db-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert_eq!(
+            wal_len, 0,
+            "close() must checkpoint the WAL into qso.db before returning"
+        );
+
+        // The checkpointed file must be complete on its own: reopening it
+        // (no WAL to recover from) sees every record.
+        let reopened = QsoDatabase::open(&db_path).await.unwrap();
+        assert_eq!(reopened.count_qsos().await.unwrap(), 3);
+        reopened.close().await;
     }
 
     /// PAN-127: three records exercising band, grid and state seeding.
