@@ -66,7 +66,9 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 - Remote peers are identified only by the keyId proven in their Noise msg1 (relay `src` is routing metadata), and nothing is sent to a peer until it holds a currently-valid `status`+ capability from a verified `hello`.
 - A remote peer's authority (admission, token expiry, revoked jti, scope) is re-checked on every action and every outbound frame; an authorization refresh that drops a peer evicts its live session, deny-lists its hello token, and disarms it if it held control (PAN-96).
 - The local gateway sends nothing before a `hello` whose `gatewayToken` matches `[network.remote_gateway].auth_token`; it refuses browser Origins not in `allowed_origins` and binds a non-loopback address only with `allow_network_exposure = true` (PAN-99).
-- Drop-stale-TX: the worker re-checks QSO liveness at the last instant before PTT.
+- Drop-stale-TX: the worker re-checks QSO liveness and slot-timing headroom (`tx_late_max_ms`
+  elapsed in the target slot) at the last instant before PTT; an over-cap frame is dropped,
+  never keyed (PAN-117).
 - The TX hard mute (`tx_hard_mute_reason`) also refuses while the rig CAT link is `PollingFailed` or the audio output has stopped calling back (PAN-115). Both clear on their own when the link/device recovers, and the Hamlib poll loop must keep redialling rigctld while disconnected.
 - `mode=FT8` paths must remain byte-identical when FT4/FT2 features are untouched.
 - `merge_with` must carry every config field (see the §5 config-merge guardrail).

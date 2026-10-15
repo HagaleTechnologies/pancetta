@@ -134,17 +134,25 @@ operator-supervised.
    - PTT releases ~12.7s + 50ms after audio start. The slot-aware
      scheduler ensures we never key during the DX's slot.
 
-7. **Late-press test.** Wait for another CQ. Press Space about 5
-   seconds into the slot (so ~5s after the heard CQ ended). Confirm:
+7. **Late-press test.** Wait for another CQ. Press Space about 1 second
+   into the slot (so ~1s after the heard CQ ended). Confirm:
    - TX still happens *that same slot* (the opposite-parity one),
      using audio-cursor skip-ahead — not deferred 30s.
    - Rig audio is shorter than 12.64s (only the back portion of the
      waveform is emitted).
 
-   This is the WSJT-X-style late-start path. If TX lands 30s later
-   instead of in the current slot, something's off — check
-   `[station].tx_late_max_ms` (default 8000) and `[station].ptt_lead_ms`
-   (default 80).
+   This is the WSJT-X-style late-start path. The same-slot window is
+   deliberately smaller than `[station].tx_late_max_ms` (default 3000):
+   the scheduler holds back the 800ms coalesce window plus a safety
+   margin, so at the default a press within roughly the first 1.7s of
+   the slot still makes the current slot. Pressing later than that —
+   try ~5s in on a second CQ — *should* defer TX by 30s to the next
+   slot of the same parity; that is the correct result, not a fault (a
+   frame that slipped past the cap between queue time and key time
+   would be dropped at the final pre-PTT gate, never keyed
+   undecodably). If a press well inside the window still defers,
+   check `[station].tx_late_max_ms` (default 3000) and
+   `[station].ptt_lead_ms` (default 80).
 
 ### Switch to antenna
 

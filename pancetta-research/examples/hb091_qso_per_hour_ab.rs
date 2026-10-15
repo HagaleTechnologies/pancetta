@@ -12,7 +12,7 @@
 //! 2000ms slot budget (DSP fires at t=13.0; next-slot TX boundary at
 //! t=15.0). When the decoder busts, TX is late on the next slot;
 //! pancetta's TX scheduler skip-ahead-cursors the leading samples (up
-//! to `tx_late_max_ms=8s` per coordinator/tx.rs), truncating the
+//! to `tx_late_max_ms=3s` per coordinator/tx.rs), truncating the
 //! transmitted audio's leading symbols. Partner's decoder loses
 //! leading sync information → reduced decode success at their end →
 //! some legs require retry → fewer QSOs/hour.

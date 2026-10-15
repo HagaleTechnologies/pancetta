@@ -595,7 +595,7 @@ itu_zone = 8
 power_watts = 100
 ptt_lead_ms = 80
 qth = "Unknown"
-tx_late_max_ms = 8000
+tx_late_max_ms = 3000
 tx_self_parity = "auto"
 
 [[station.antennas]]

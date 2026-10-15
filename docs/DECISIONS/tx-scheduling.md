@@ -5,7 +5,7 @@
 
 ## DX-slot-aware TX scheduling
 
-`pancetta/src/coordinator/tx.rs`: WSJT-X-style. Every `DecodedMessage` carries `slot_parity`; the QSO state machine latches `tx_parity = opposite_of(dx_parity)` at QSO start; the TX scheduler picks the next slot of that parity, padding silent samples if early or skip-ahead-cursoring into the modulated waveform if late (up to `tx_late_max_ms`, default 8s). Past that, defers 30s. Never collides with the DX's parity. See `docs/superpowers/specs/2026-04-27-dx-slot-aware-tx-design.md` — its "the first received decode will refine the parity for any subsequent QSO responses" promise is now implemented (2026-07-18 review, Batch 2): a QSO opened with no observed `dx_parity` (a cluster/DX-Hunter spot pick) latches a provisional parity and refines it to the true opposite-of-DX value on the first genuine decode from the latched partner.
+`pancetta/src/coordinator/tx.rs`: WSJT-X-style. Every `DecodedMessage` carries `slot_parity`; the QSO state machine latches `tx_parity = opposite_of(dx_parity)` at QSO start; the TX scheduler picks the next slot of that parity, padding silent samples if early or skip-ahead-cursoring into the modulated waveform if late (up to `tx_late_max_ms`, default 3s, minus the unconditional coalesce window + safety margin reserved at the queue-time acceptance check). Past that, defers 30s. Never collides with the DX's parity. See `docs/superpowers/specs/2026-04-27-dx-slot-aware-tx-design.md` — its "the first received decode will refine the parity for any subsequent QSO responses" promise is now implemented (2026-07-18 review, Batch 2): a QSO opened with no observed `dx_parity` (a cluster/DX-Hunter spot pick) latches a provisional parity and refines it to the true opposite-of-DX value on the first genuine decode from the latched partner.
 
 ## Half-duplex parity scheduler + always-answer-callers (#39)
 
@@ -484,3 +484,69 @@ queued-call TTL change (it is `std::time::Instant`-based and immune to NTP steps
 median-DT clock estimate (it mixes our clock error with audio latency and other stations' errors);
 no TX inhibit on large skew (a product decision for its own ticket). The in-session skew monitor is
 recorded in `config-and-platform.md`, its title-bar chip in `tui.md`.
+
+## Refusing to key TX frames too late in the slot to decode (PAN-117, 2026-10-15)
+
+Six-lane review L5 H-7: the `tx_late_max_ms` default was 8000 ms, past the mathematical floor of
+decodability. The key-time cursor (`pad_and_cursor_for_target`, refreshed from a fresh
+`Utc::now()` in both worker arms) had no policy bound of its own — only the ~12.64 s
+waveform-length defense followed — and the one genuine late re-check (PAN-114's `ptt_wait_step`,
+D5 above) only fires when the pre-PTT wait *started* before the PTT instant. So a frame that
+queued inside the cap but slipped past it through the coalesce wait, encode/modulate and gate
+awaits was keyed anyway.
+
+- **Default lowered to 3000 ms** (`default_tx_late_max_ms()`, `impl Default`, `defaults.toml`),
+  with the corrected math everywhere the old "8 s leaves two of three Costas arrays" rationale was
+  repeated. At 8000 ms elapsed the cursor sits at 7500 ms = symbol 46.9: Costas #1, all of data
+  block 1 and Costas #2 are gone; 25 of 58 data symbols remain = 75 coded bits, fewer than the 91
+  information bits LDPC(174,91) needs — recovery is impossible no matter the SNR (only the third
+  Costas array survives, not "two of three"). The hard floor for any decodability is 31 of 58 data
+  symbols (93 ≥ 91 bits), i.e. elapsed ≤ ~5940 ms. At 3000 ms both surviving Costas arrays and
+  49/58 data symbols (147 bits) air with ~10.1 s of audio — the six-lane review's suggested bound
+  with margin on both the practical (two sync arrays) and mathematical cliffs. FT4/FT2 effective
+  caps keep deriving proportionally (`tx_late_max_ms_effective`, unchanged): 1500 ms and ~640 ms.
+  Operators who set the value explicitly keep it; it is now honored at key time too.
+- **Key-time check, both arms** (`key_time_too_late(now, target_slot, late_max_ms)`): elapsed
+  `now - target_slot > tx_late_max_ms_effective` denies. The boundary is inclusive on the key
+  side, mirroring `schedule_tx`'s queue-time `mstr <= tx_late_max_ms`; a deferred target (slot in
+  the future) is naturally not late. Single-TX: a third `FinalGateDenial` variant,
+  `TooLateToDecode { elapsed_ms, late_max_ms }`, returned by `key_time_gate_denial`. Multi-TX: a
+  bundle-level check in the Step 4d region — the whole bundle shares one slot — taking the same
+  whole-bundle unwind. In both arms the check runs LAST, after the liveness/DX-parity gate, the
+  hard mute and the remote-arm recheck, immediately before the `SetPtt{true}` send, so its
+  `Utc::now()` is the true last clock read (PR #450 Codex review: sampling it before the other
+  synchronous gates' lock reads let the read go stale before the key).
+- **Drop, not defer.** The `use_current` slot decision stays frozen at `request_received_at`
+  (Symptom-B protection); an over-cap frame at key time is dropped through the existing
+  final-gate unwind (`tx.policy` Info diagnostic, strip clear, `report_unaired_frame` per frame
+  so PAN-75 keep-call accounting reverses exactly as for a stale-QSO drop) and the QSO engine's
+  existing retry timers own the re-send. No new bus message types; TUI paths stay byte-identical.
+- **D5 above still holds at the *wait* layer**: a request that was already a late start when the
+  pre-PTT wait began keeps today's path through `ptt_wait_step` (`waited_from_before_target`
+  gating and its test are unchanged). PAN-117 closes the gap one stage later, at the final gate,
+  which bounds elapsed slot time unconditionally.
+- **Coalesce coherence** (`adaptive_coalesce_cap_ms`): extension headroom now subtracts the
+  mandatory base collection window (`coalesce_collect_window_ms`) in addition to the elapsed
+  time and safety margin. Without this, the scheduler could deliberately stretch a slot-start
+  request to base + (cap − margin) ms under pileup load and have the new key-time gate drop it —
+  a self-inflicted TX outage. Under the 3000 ms default a slot-start FT8 request's maximum
+  extension drops 2500 → 1700 ms; the reclaimed time is decode margin on the air. The headroom
+  is measured against the slot the head resolves to even when that slot is DEFERRED (PR #450
+  Codex review): a head arriving at :14.5 for the :15 slot gets 3000 + 500 − 800 − 500 = 2200 ms
+  of extension, not the full 3000 ms ceiling that would carry it to :18.3 and into the
+  key-time drop. A deferred slot a whole cycle away still gets the ceiling.
+- **Queue-time acceptance reserves the overhead too** (PR #450 review round): the first cut
+  enforced the cap only at key time, so an FT8 request arriving 2.2–3.0 s into its slot (FT4
+  1.1–1.5 s) passed the queue-time `mstr <= cap` check, sat through the unconditional 800 ms
+  base coalesce wait, and was then ALWAYS dropped at the gate — scheduled, dropped, never
+  deferred. Requests that took the base wait (every single `TransmitRequest`, and bundles
+  coalesced from one) now decide `use_current` against
+  `current_slot_acceptance_cap_ms` = effective cap − base window − safety margin (1700 ms at
+  the FT8 3000 ms default), so such a request defers 30 s instead; `adaptive_coalesce_cap_ms`'s
+  probe uses the same value so its deferred branch matches the decision the worker actually
+  makes. A `MultiTransmitRequest` dequeued directly (autonomous bundle, mid-TX supersede
+  re-enqueue) never takes the base wait, so the multi-TX arm reserves only the safety margin
+  for it (`multi_tx_acceptance_cap_ms`: 2500 ms FT8, 1000 ms FT4 at the default) instead of
+  deferring a bundle that can still key before the raw cap (review round 2). The key-time gate
+  keeps the raw effective cap as its unconditional backstop, and single-TX mid-TX re-keys
+  (which re-read the clock at the decision, with no coalesce wait in between) keep the raw cap.
