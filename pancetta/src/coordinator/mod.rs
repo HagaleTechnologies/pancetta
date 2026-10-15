@@ -31,6 +31,7 @@ mod pipeline;
 mod psk_reporter;
 mod qso;
 mod qso_filter;
+mod readiness;
 mod remote_gateway;
 mod replay;
 mod restart_budget;
@@ -741,6 +742,13 @@ pub struct ApplicationCoordinator {
     rigctld_process: Option<std::process::Child>,
     #[cfg(feature = "pancetta-hamlib")]
     pub(crate) rig_handle: Option<Arc<dyn pancetta_hamlib::RigControl + Send + Sync>>,
+    /// PAN-89: `true` when `rig_handle` is a real CAT link (rig control
+    /// enabled, not `PANCETTA_MOCK_RIG`), set alongside it in
+    /// `start_hamlib_component`. A MockRig accepting PTT-off says nothing
+    /// about the radio, so teardown only clears `ptt_off_unconfirmed` when
+    /// this is set.
+    #[cfg(feature = "pancetta-hamlib")]
+    pub(crate) rig_handle_is_real: bool,
     #[cfg(feature = "pancetta-hamlib")]
     pub(crate) hamlib_children: Option<hamlib::HamlibChildren>,
     #[cfg(feature = "pancetta-hamlib")]
@@ -1397,6 +1405,30 @@ pub struct ApplicationCoordinator {
     /// capture fell back to another device — RX-side mirror of
     /// `audio_output_default`. Drives a persistent TUI badge via the relay.
     audio_input_fallback: Arc<AtomicBool>,
+
+    /// PAN-89: latched `true` when a Hamlib teardown could not force PTT off
+    /// and retained the PTT watchdog as an orphan (the "watchdog retained"
+    /// diagnostic in `hamlib::teardown_hamlib`). Cleared only by a
+    /// rig-confirmed PTT-off, via `hamlib::confirm_ptt_off`: teardown's
+    /// successful PTT-off, the startup `set_ptt(Off)`, the PTT watchdog's
+    /// forced off and the command loop's `SetPtt { state: false }`. Orphan
+    /// release does NOT clear it (a replacement watchdog is not a confirmed
+    /// unkey). Read by the TUI relay's readiness snapshot
+    /// (`readiness::ReadinessSources`). Display-only: it never gates TX.
+    pub(crate) ptt_off_unconfirmed: Arc<AtomicBool>,
+    /// PAN-89: count of rig-confirmed PTT-offs (`hamlib::confirm_ptt_off`).
+    /// Teardown snapshots it before its PTT-off attempts so a confirmation
+    /// from the still-running watchdog is not overwritten by the failure
+    /// latch (`hamlib::latch_ptt_off_unconfirmed_unless_confirmed_since`).
+    pub(crate) ptt_off_confirmations: Arc<std::sync::atomic::AtomicU64>,
+
+    /// PAN-89: the supervisor's degraded-components summary
+    /// (`health::degraded_summary`), `None` when nothing has failed. Written
+    /// by the health monitor (`health::start_health_monitor`) on every tick;
+    /// read by the TUI relay's readiness snapshot
+    /// (`readiness::ReadinessSources`). A std mutex, not the tokio
+    /// `component_status` lock, so the relay's OS thread can read it.
+    pub(crate) degraded_summary: Arc<std::sync::Mutex<Option<String>>>,
 
     /// Command channel into the dedicated audio thread for **live device
     /// switching**. The TUI `SelectDevice` handler sends an
@@ -2125,6 +2157,8 @@ impl ApplicationCoordinator {
             #[cfg(feature = "pancetta-hamlib")]
             rig_handle: None,
             #[cfg(feature = "pancetta-hamlib")]
+            rig_handle_is_real: false,
+            #[cfg(feature = "pancetta-hamlib")]
             hamlib_children: None,
             #[cfg(feature = "pancetta-hamlib")]
             hamlib_orphans: Vec::new(),
@@ -2152,6 +2186,9 @@ impl ApplicationCoordinator {
             audio_output_default: Arc::new(AtomicBool::new(false)),
             audio_output_alive: Arc::new(AtomicBool::new(true)),
             audio_input_fallback: Arc::new(AtomicBool::new(false)),
+            ptt_off_unconfirmed: Arc::new(AtomicBool::new(false)),
+            ptt_off_confirmations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            degraded_summary: Arc::new(std::sync::Mutex::new(None)),
             audio_reopen_tx: None,
             hamlib_reconnect_tx,
             hamlib_reconnect_rx: Some(hamlib_reconnect_rx),

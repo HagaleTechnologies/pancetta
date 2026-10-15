@@ -4,13 +4,41 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use super::{
     component_criticality, component_restart_policy, degradation_message, ComponentCriticality,
     ComponentState, ComponentStatus, RestartPolicy,
 };
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
+
+/// PAN-89: the supervisor's degraded-components summary: one
+/// `"<component>: <error>"` part per `ComponentState::Failed` component,
+/// sorted by component name (so the text is stable across `HashMap`
+/// iteration orders) and joined with `"; "`. `None` when nothing has failed.
+pub(crate) fn degraded_summary(
+    map: &std::collections::HashMap<ComponentId, ComponentStatus>,
+) -> Option<String> {
+    let mut parts: Vec<(String, &str)> = map
+        .iter()
+        .filter_map(|(id, status)| match &status.state {
+            ComponentState::Failed(err) => Some((id.to_string(), err.as_str())),
+            // Running is fine; NotStarted is disabled -- don't report.
+            ComponentState::Running | ComponentState::NotStarted => None,
+        })
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    parts.sort();
+    Some(
+        parts
+            .iter()
+            .map(|(id, err)| format!("{id}: {err}"))
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
+}
 
 // PAN-59 (I3 fix): `pub(super)` (not private) so `hamlib.rs`'s
 // `handle_hamlib_reconnect_request` -- a sibling submodule of `coordinator`,
@@ -373,53 +401,39 @@ impl super::ApplicationCoordinator {
     ///
     /// Runs every `health_check_interval` (5s) and:
     /// 1. Reads the component_status map (populated by `check_task_handles()`)
-    /// 2. Sends a health status summary to the TUI via the message bus
+    /// 2. Stores its [`degraded_summary`] in the coordinator's shared
+    ///    `degraded_summary` (PAN-89), which the TUI relay's readiness
+    ///    snapshot reads. It used to send a `StatusUpdate("Degraded -- …")`
+    ///    every tick instead, which overwrote the status line and never
+    ///    cleared on recovery. A `warn!` is logged when the summary changes
+    ///    and an `info!` when it clears, for headless/log readers.
     ///
     /// Note: heartbeat checking via `message_bus.get_component_health()` was
     /// removed because no component ever sends heartbeat messages. Failure
     /// detection is handled by `check_task_handles()` in the main loop.
     pub(crate) async fn start_health_monitor(&self) -> JoinHandle<Result<()>> {
-        let message_bus = self.message_bus.clone();
         let shutdown = self.shutdown_signal.clone();
         let component_status = self.component_status.clone();
+        let shared_summary = self.degraded_summary.clone();
         let mut health_interval = interval(Duration::from_secs(5));
 
         tokio::spawn(async move {
             while !shutdown.load(Ordering::Acquire) {
                 health_interval.tick().await;
 
-                // Build a status summary from the component_status map
-                // (populated by check_task_handles in the main loop)
-                let status_map = component_status.read().await;
-                let mut summary_parts: Vec<String> = Vec::new();
-                let mut any_failed = false;
-
-                for (id, status) in status_map.iter() {
-                    match &status.state {
-                        ComponentState::Running => {
-                            // Component is fine
-                        }
-                        ComponentState::Failed(err) => {
-                            any_failed = true;
-                            summary_parts.push(format!("{}: {}", id, err));
-                        }
-                        ComponentState::NotStarted => {
-                            // Not started / disabled -- don't report
-                        }
-                    }
-                }
-
-                // Send health summary to TUI
-                if any_failed {
-                    let summary = format!("Degraded -- {}", summary_parts.join("; "));
-                    let msg = ComponentMessage::new(
-                        ComponentId::Coordinator,
-                        ComponentId::Tui,
-                        MessageType::StatusUpdate(summary),
-                        Instant::now(),
-                    );
-                    if let Err(e) = message_bus.send_message(msg).await {
-                        debug!("Failed to send health summary to TUI: {}", e);
+                // Build the summary from the component_status map
+                // (populated by check_task_handles in the main loop).
+                let summary = degraded_summary(&*component_status.read().await);
+                let previous = {
+                    let mut slot = shared_summary
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    std::mem::replace(&mut *slot, summary.clone())
+                };
+                if summary != previous {
+                    match &summary {
+                        Some(s) => warn!("Degraded -- {s}"),
+                        None => info!("Degraded state cleared"),
                     }
                 }
             }
@@ -1757,6 +1771,70 @@ mod supervisor_tests {
         assert_eq!(
             status.get(&ComponentId::Qso).map(|s| &s.state),
             Some(&super::ComponentState::Running)
+        );
+    }
+}
+
+#[cfg(test)]
+mod degraded_summary_tests {
+    use super::super::{ComponentState, ComponentStatus};
+    use super::degraded_summary;
+    use crate::message_bus::ComponentId;
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    fn status(state: ComponentState) -> ComponentStatus {
+        ComponentStatus {
+            state,
+            last_seen: Instant::now(),
+            error_count: 0,
+        }
+    }
+
+    #[test]
+    fn degraded_summary_is_none_when_nothing_failed() {
+        assert_eq!(degraded_summary(&HashMap::new()), None);
+        let mut map = HashMap::new();
+        map.insert(ComponentId::Audio, status(ComponentState::Running));
+        map.insert(ComponentId::DxCluster, status(ComponentState::NotStarted));
+        assert_eq!(degraded_summary(&map), None);
+    }
+
+    #[test]
+    fn degraded_summary_lists_failed_components_sorted_by_name() {
+        let failed = [
+            (ComponentId::PskReporter, "connection refused"),
+            (ComponentId::DxCluster, "telnet closed"),
+            (ComponentId::Hamlib, "rigctld gone"),
+        ];
+        let mut expected_parts: Vec<String> = failed
+            .iter()
+            .map(|(id, err)| format!("{id}: {err}"))
+            .collect();
+        expected_parts.sort();
+        let expected = expected_parts.join("; ");
+
+        // Same text whatever order the map was built (and iterates) in.
+        for rotation in 0..failed.len() {
+            let mut map = HashMap::new();
+            map.insert(ComponentId::Audio, status(ComponentState::Running));
+            for i in 0..failed.len() {
+                let (id, err) = failed[(i + rotation) % failed.len()];
+                map.insert(id, status(ComponentState::Failed(err.to_string())));
+            }
+            let summary = degraded_summary(&map).expect("failed components are reported");
+            assert_eq!(summary, expected);
+            assert!(!summary.starts_with("Degraded"), "{summary}");
+        }
+
+        let mut one = HashMap::new();
+        one.insert(
+            ComponentId::Hamlib,
+            status(ComponentState::Failed("rigctld gone".into())),
+        );
+        assert_eq!(
+            degraded_summary(&one),
+            Some(format!("{}: rigctld gone", ComponentId::Hamlib))
         );
     }
 }

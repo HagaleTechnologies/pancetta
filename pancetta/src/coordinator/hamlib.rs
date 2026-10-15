@@ -845,6 +845,10 @@ impl super::ApplicationCoordinator {
         }
 
         let mut ptt_off = false;
+        // PAN-89: the still-running watchdog can confirm a PTT-off while the
+        // attempts below fail; snapshot the confirmation count so the
+        // failure latch below does not overwrite that confirmation.
+        let confirms_before = self.ptt_off_confirmations.load(Ordering::SeqCst);
         if let Some(rig) = self.rig_handle.as_ref() {
             for attempt in 1..=3 {
                 match rig
@@ -857,6 +861,12 @@ impl super::ApplicationCoordinator {
                     Ok(()) => {
                         ptt_off = true;
                         self.ptt_active.store(false, Ordering::Release);
+                        // PAN-89: the rig accepted PTT off.
+                        confirm_ptt_off(
+                            &self.ptt_off_unconfirmed,
+                            &self.ptt_off_confirmations,
+                            self.rig_handle_is_real,
+                        );
                         break;
                     }
                     Err(error) => {
@@ -927,6 +937,15 @@ impl super::ApplicationCoordinator {
                 children.watchdog.abort();
             } else {
                 self.hamlib_orphans.push(children.watchdog);
+                // PAN-89: latch until the rig confirms a later PTT-off
+                // (`confirm_ptt_off`); the readiness strip shows it. A
+                // confirmation that landed during the attempts (the
+                // watchdog's forced off) wins over this failure.
+                latch_ptt_off_unconfirmed_unless_confirmed_since(
+                    &self.ptt_off_unconfirmed,
+                    &self.ptt_off_confirmations,
+                    confirms_before,
+                );
                 super::tx::emit_diagnostic(
                     &self.message_bus,
                     "supervisor",
@@ -1067,6 +1086,12 @@ impl super::ApplicationCoordinator {
                 {
                     Ok(()) => {
                         self.ptt_active.store(false, Ordering::Release);
+                        // PAN-89: the rig accepted PTT off.
+                        confirm_ptt_off(
+                            &self.ptt_off_unconfirmed,
+                            &self.ptt_off_confirmations,
+                            self.rig_handle_is_real,
+                        );
                     }
                     Err(e) => {
                         error!(
@@ -1444,12 +1469,18 @@ impl super::ApplicationCoordinator {
             ))
         };
         self.rig_handle = Some(rig.clone());
+        self.rig_handle_is_real = rig_enabled;
 
         let operating_frequency_hz = self.operating_frequency_hz.clone();
         let ptt_active = self.ptt_active.clone();
         let last_ptt_on_ms = self.last_ptt_on_ms.clone();
         let tx_restart_inhibit = self.tx_restart_inhibit.clone();
         let rig_conn_state = self.rig_conn_state.clone();
+        // PAN-89: cleared (via `confirm_ptt_off`) wherever this generation's
+        // rig accepts a PTT-off -- startup, the PTT watchdog's forced off and
+        // the command loop's `SetPtt { state: false }`.
+        let ptt_off_unconfirmed = self.ptt_off_unconfirmed.clone();
+        let ptt_off_confirmations = self.ptt_off_confirmations.clone();
         // C9 dedup anchor (most recent pancetta-initiated SetFrequency) — the
         // poll loop reads it to tell an operator dial move (tear down) from a
         // pancetta-commanded change (already torn down by the TUI / autonomous
@@ -1976,6 +2007,8 @@ impl super::ApplicationCoordinator {
                 let ptt_watchdog_tracker = ptt_on_since.clone();
                 let shutdown_for_watchdog = shutdown.clone();
                 let ptt_active_watchdog = ptt_active.clone();
+                let ptt_off_unconfirmed_watchdog = ptt_off_unconfirmed.clone();
+                let ptt_off_confirmations_watchdog = ptt_off_confirmations.clone();
                 // PAN-19 round-16 review (Codex P1): same reasoning as the
                 // poll task's own guard above -- see that comment.
                 let hamlib_command_loop_ready_for_watchdog = hamlib_command_loop_ready.clone();
@@ -2024,6 +2057,11 @@ impl super::ApplicationCoordinator {
                                     Ok(_) => {
                                         warn!("PTT SAFETY WATCHDOG: PTT forced off successfully");
                                         ptt_active_watchdog.store(false, Ordering::Release);
+                                        confirm_ptt_off(
+                                            &ptt_off_unconfirmed_watchdog,
+                                            &ptt_off_confirmations_watchdog,
+                                            rig_enabled,
+                                        );
                                         // Only clear timer on success -- retry on next tick if it fails
                                         let mut guard = ptt_watchdog_tracker.write().await;
                                         *guard = None;
@@ -2067,7 +2105,14 @@ impl super::ApplicationCoordinator {
                             )
                             .await
                         {
-                            Ok(()) => startup_ptt_off_succeeded = true,
+                            Ok(()) => {
+                                startup_ptt_off_succeeded = true;
+                                confirm_ptt_off(
+                                    &ptt_off_unconfirmed,
+                                    &ptt_off_confirmations,
+                                    rig_enabled,
+                                );
+                            }
                             Err(e) => warn!("Startup PTT-off failed: {e}"),
                         }
                         // Only flag a *real* CAT link as Connected — a mock rig
@@ -2101,9 +2146,9 @@ impl super::ApplicationCoordinator {
                             report_rig_error(
                                 &message_bus_for_connect,
                                 format!(
-                                    "Rig connect failed ({e}) — RIG badge is ✗. Check the radio \
-                                     is powered on and the USB cable; verify with \
-                                     `pancetta test-rig`, then restart pancetta."
+                                    "Rig connect failed ({e}). Check the radio is powered on \
+                                     and the USB cable; verify with `pancetta test-rig`, then \
+                                     restart pancetta."
                                 ),
                             )
                             .await;
@@ -2387,11 +2432,20 @@ impl super::ApplicationCoordinator {
                                             .set_ptt(pancetta_hamlib::Vfo::Current, ptt)
                                             .await
                                         {
-                                            Ok(()) => info!(
-                                                target: "pancetta::tx.ptt",
-                                                "rig set_ptt {} OK",
-                                                if *state { "ON" } else { "OFF" }
-                                            ),
+                                            Ok(()) => {
+                                                info!(
+                                                    target: "pancetta::tx.ptt",
+                                                    "rig set_ptt {} OK",
+                                                    if *state { "ON" } else { "OFF" }
+                                                );
+                                                if !*state {
+                                                    confirm_ptt_off(
+                                                        &ptt_off_unconfirmed,
+                                                        &ptt_off_confirmations,
+                                                        rig_enabled,
+                                                    );
+                                                }
+                                            }
                                             Err(e) => error!("Failed to set PTT: {}", e),
                                         }
                                     }
@@ -3355,6 +3409,47 @@ fn orphan_safe_to_abort(
 /// [`orphan_safe_to_abort`] does on every other uncertain outcome.
 fn orphan_release_is_safe(confirmed_safe: bool, replacement_watchdog_alive: bool) -> bool {
     confirmed_safe && replacement_watchdog_alive
+}
+
+/// PAN-89: the rig accepted a PTT-off, so clear the coordinator's
+/// `ptt_off_unconfirmed` latch (set by `teardown_hamlib` when it had to
+/// retain the PTT watchdog). Returns whether the latch was set. Call it only
+/// on a rig-confirmed unkey -- never on orphan release, which only proves a
+/// replacement watchdog exists. `real_rig` is whether the PTT-off went to a
+/// real CAT link: a MockRig (rig control off / `PANCETTA_MOCK_RIG`)
+/// accepting it says nothing about the radio, so the latch stays set.
+/// Every rig-confirmed call also bumps `confirms`, which lets
+/// [`latch_ptt_off_unconfirmed_unless_confirmed_since`] see a confirmation
+/// that raced a failing teardown.
+pub(crate) fn confirm_ptt_off(
+    flag: &std::sync::atomic::AtomicBool,
+    confirms: &std::sync::atomic::AtomicU64,
+    real_rig: bool,
+) -> bool {
+    if !real_rig {
+        return false;
+    }
+    confirms.fetch_add(1, Ordering::SeqCst);
+    flag.swap(false, Ordering::SeqCst)
+}
+
+/// PAN-89: set the `ptt_off_unconfirmed` latch after a teardown failed to
+/// force PTT off, unless a rig-confirmed PTT-off ([`confirm_ptt_off`]) has
+/// happened since `confirms_before` was read. The watchdog keeps running
+/// during teardown's attempts and may confirm an unkey before this store;
+/// without the check the store would re-latch over that confirmation and,
+/// since the watchdog then clears its retry timer, nothing would clear it.
+/// Latch first, then re-check, so a confirmation on either side of the
+/// store leaves the latch clear.
+pub(crate) fn latch_ptt_off_unconfirmed_unless_confirmed_since(
+    flag: &std::sync::atomic::AtomicBool,
+    confirms: &std::sync::atomic::AtomicU64,
+    confirms_before: u64,
+) {
+    flag.store(true, Ordering::SeqCst);
+    if confirms.load(Ordering::SeqCst) != confirms_before {
+        flag.store(false, Ordering::SeqCst);
+    }
 }
 
 // `ComponentMessage` (432 bytes) travels by value through `Result::Err` here
@@ -4794,6 +4889,203 @@ mod teardown_stall_tests {
             elapsed >= Duration::from_millis(900),
             "teardown_hamlib should sleep between PTT-off retry attempts -- took {elapsed:?}"
         );
+    }
+}
+
+#[cfg(all(test, feature = "pancetta-hamlib"))]
+mod ptt_off_unconfirmed_tests {
+    //! PAN-89: `ptt_off_unconfirmed` latches exactly where teardown retains
+    //! the PTT watchdog ("watchdog retained") and clears only on a
+    //! rig-confirmed PTT-off.
+    use super::*;
+    use pancetta_config::Config;
+    use pancetta_hamlib::{MockRig, RigControl};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    /// Same direct-construction shape as `restart_orphan_tests::test_coordinator`.
+    async fn test_coordinator() -> super::super::ApplicationCoordinator {
+        let config = Config::default();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        super::super::ApplicationCoordinator::new(
+            config,
+            None,
+            true,  // no_audio
+            true,  // headless
+            false, // metrics
+            9090,
+            None, // no WAV
+            None, // no replay
+            None, // no test-tx
+            1500.0,
+            shutdown,
+            Vec::new(),                                             // no config warnings
+            std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
+            true,                                                   // test-only: assume TOML
+        )
+        .await
+        .expect("coordinator creation should succeed")
+    }
+
+    /// A child task that stays alive for the whole test.
+    fn long_running_child() -> tokio::task::AbortHandle {
+        tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        })
+        .abort_handle()
+    }
+
+    #[tokio::test]
+    async fn teardown_that_cannot_force_ptt_off_latches_ptt_off_unconfirmed() {
+        let mut coordinator = test_coordinator().await;
+        // An unconnected MockRig's `set_ptt` always fails, so all 3 PTT-off
+        // attempts fail and teardown keeps the watchdog.
+        coordinator.rig_handle = Some(Arc::new(MockRig::default()));
+        coordinator.hamlib_children = Some(HamlibChildren {
+            poll: long_running_child(),
+            watchdog: long_running_child(),
+        });
+        assert!(!coordinator.ptt_off_unconfirmed.load(Ordering::Acquire));
+
+        coordinator.teardown_hamlib().await;
+
+        assert!(
+            coordinator.ptt_off_unconfirmed.load(Ordering::Acquire),
+            "a teardown that could not force PTT off must latch ptt_off_unconfirmed"
+        );
+        assert_eq!(coordinator.hamlib_orphans.len(), 1);
+        for orphan in coordinator.hamlib_orphans.drain(..) {
+            orphan.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn teardown_that_forces_ptt_off_clears_ptt_off_unconfirmed() {
+        let mut coordinator = test_coordinator().await;
+        let rig = Arc::new(MockRig::default());
+        rig.connect().await.expect("mock rig connects");
+        coordinator.rig_handle = Some(rig);
+        // Stands in for a real CAT link: the MockRig answers like one.
+        coordinator.rig_handle_is_real = true;
+        coordinator
+            .ptt_off_unconfirmed
+            .store(true, Ordering::Release);
+
+        coordinator.teardown_hamlib().await;
+
+        assert!(
+            !coordinator.ptt_off_unconfirmed.load(Ordering::Acquire),
+            "a rig-confirmed teardown PTT-off must clear ptt_off_unconfirmed"
+        );
+        assert!(coordinator.hamlib_orphans.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mock_rig_teardown_ptt_off_does_not_clear_ptt_off_unconfirmed() {
+        let mut coordinator = test_coordinator().await;
+        let rig = Arc::new(MockRig::default());
+        rig.connect().await.expect("mock rig connects");
+        coordinator.rig_handle = Some(rig);
+        coordinator.rig_handle_is_real = false;
+        coordinator
+            .ptt_off_unconfirmed
+            .store(true, Ordering::Release);
+
+        coordinator.teardown_hamlib().await;
+
+        assert!(
+            coordinator.ptt_off_unconfirmed.load(Ordering::Acquire),
+            "a MockRig accepting PTT-off is not the radio confirming it"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_rig_start_keeps_ptt_off_unconfirmed() {
+        let mut coordinator = test_coordinator().await;
+        coordinator
+            .ptt_off_unconfirmed
+            .store(true, Ordering::Release);
+
+        // Config::default() has rig control disabled: the mock-rig path,
+        // whose startup `set_ptt(Off)` succeeds against the MockRig. That
+        // says nothing about the radio, so the latch must stay set.
+        coordinator
+            .start_hamlib_component()
+            .await
+            .expect("mock-rig hamlib start should succeed");
+        assert!(!coordinator.rig_handle_is_real);
+
+        for _ in 0..100 {
+            if coordinator
+                .hamlib_command_loop_ready
+                .load(Ordering::Acquire)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(coordinator
+            .hamlib_command_loop_ready
+            .load(Ordering::Acquire));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            coordinator.ptt_off_unconfirmed.load(Ordering::Acquire),
+            "a mock-rig start must not claim the radio confirmed PTT off"
+        );
+
+        coordinator.shutdown_signal.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn confirm_ptt_off_reports_whether_it_was_latched() {
+        let flag = AtomicBool::new(true);
+        let confirms = AtomicU64::new(0);
+        assert!(
+            !confirm_ptt_off(&flag, &confirms, false),
+            "a mock rig's PTT-off confirms nothing"
+        );
+        assert!(flag.load(Ordering::Acquire), "and leaves the latch set");
+        assert_eq!(confirms.load(Ordering::Acquire), 0, "nor counts");
+        assert!(
+            confirm_ptt_off(&flag, &confirms, true),
+            "a latched flag reports true"
+        );
+        assert!(!flag.load(Ordering::Acquire), "and is cleared");
+        assert!(
+            !confirm_ptt_off(&flag, &confirms, true),
+            "an unlatched flag reports false"
+        );
+        assert!(!flag.load(Ordering::Acquire));
+        assert_eq!(confirms.load(Ordering::Acquire), 2);
+    }
+
+    /// Review (PR #420): the watchdog confirming PTT off while teardown's
+    /// attempts fail must not be overwritten by teardown's failure latch.
+    #[test]
+    fn a_confirmation_during_failed_teardown_attempts_keeps_the_latch_clear() {
+        let flag = AtomicBool::new(false);
+        let confirms = AtomicU64::new(0);
+        let before = confirms.load(Ordering::SeqCst);
+        // The watchdog forces PTT off while teardown's attempts are failing.
+        assert!(!confirm_ptt_off(&flag, &confirms, true));
+        latch_ptt_off_unconfirmed_unless_confirmed_since(&flag, &confirms, before);
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "the watchdog's confirmed unkey must win over the failure latch"
+        );
+    }
+
+    #[test]
+    fn a_failed_teardown_with_no_confirmation_latches() {
+        let flag = AtomicBool::new(false);
+        let confirms = AtomicU64::new(0);
+        let before = confirms.load(Ordering::SeqCst);
+        // A mock rig's success is not a confirmation either.
+        assert!(!confirm_ptt_off(&flag, &confirms, false));
+        latch_ptt_off_unconfirmed_unless_confirmed_since(&flag, &confirms, before);
+        assert!(flag.load(Ordering::Acquire));
+        // A later rig-confirmed PTT-off clears it.
+        assert!(confirm_ptt_off(&flag, &confirms, true));
+        assert!(!flag.load(Ordering::Acquire));
     }
 }
 
