@@ -109,6 +109,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   readiness list outgrows the panel (80×24), Shift+S scrolls (↑/↓, PgUp/PgDn,
   Home/End).
 
+- Turning Fox mode off (Shift+X) no longer cuts the Hound contacts already in
+  progress down to one transmitted stream; they keep transmitting until they
+  finish, while new QSOs wait for the normal `max_concurrent_qsos` limit
+  (PAN-76).
+
 - Narrow terminals keep the station state that matters (PAN-88). At 80×24
   and 100×30 the title bar now always shows the UTC clock, callsign and TX
   policy, and drops lower-priority chips in a documented order instead of
@@ -202,6 +207,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `pancetta-config/examples/config.toml`: unreferenced, did not parse, and
   duplicated the generated, drift-tested `pancetta-config/defaults.toml`.
+
+### Security
+
+- Local gateway: clients must now authenticate with the configured `[network.remote_gateway].auth_token` (sent as `hello.gatewayToken`) before receiving any station data; browser origins must be listed in `allowed_origins`, and a non-loopback `bind_addr` requires `allow_network_exposure = true`. Enabling the gateway now requires `auth_token` (PAN-99).
+- Station agent: a remote client must now prove its device identity inside the encrypted handshake, and it receives station data only after a valid `hello`; clients must be updated to connect (PAN-95).
+- Station agent: remote clients' authority is now re-checked on every use, and an authorization refresh applies to already-connected clients immediately (PAN-96).
+- Remote-TX consent is now tracked per channel: `[network.station_agent].remote_tx_enabled` alone governs arming, TX requests and transmission over the station agent, and `[network.wsjtx_udp].allow_tx_initiation` governs only WSJT-X UDP Reply-initiated TX. With `remote_tx_enabled = false` nothing can arm, so Reply-initiated QSOs no longer transmit; set `remote_tx_enabled = true` to allow remote TX (PAN-98).
+- Network errors from the QRZ XML lookup and LoTW clients no longer carry account credentials or session keys into log lines or error messages (PAN-100).
+- Responses from cqdx.io, QRZ, the online logbooks, the DX cluster and the station-agent relay are now read within fixed size limits (PAN-101).
+- Release workflow: every GitHub Action is pinned to a full commit SHA, and only the job that creates the draft release can write to the repository (PAN-106).
 
 ## [0.9.6] - 2026-09-02
 

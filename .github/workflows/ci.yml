@@ -125,6 +125,7 @@ jobs:
               - '**/*.rs'
               - '**/Cargo.toml'
               - '**/Cargo.lock'
+              - 'rust-toolchain.toml'
               - '.github/workflows/ci.yml'
 
       # PAN-172: a merge group whose cumulative diff (base_sha..head_sha covers every PR

@@ -49,12 +49,17 @@
 
 #![allow(missing_docs)] // TODO: documentation pass pending — see CONTRIBUTING.md
 
+mod body;
 pub mod cluster;
 pub mod lotw;
+mod network_error;
 pub mod pskreporter;
 pub mod qrz_xml;
 pub mod qso_upload;
+#[cfg(test)]
+mod test_support;
 
+pub use network_error::NetworkError;
 pub use qrz_xml::{QrzLookup, QrzXmlClient};
 pub use qso_upload::{
     ClubLogClient, EqslClient, LotwClient as LotwUploadClient, QrzInsertOutcome, QrzLogbookClient,
@@ -75,7 +80,14 @@ pub type Result<T> = std::result::Result<T, DxError>;
 #[derive(Error, Debug)]
 pub enum DxError {
     #[error("Network error: {0}")]
-    Network(#[from] reqwest::Error),
+    Network(#[from] NetworkError),
+
+    /// A response body passed its byte budget; reading stopped there.
+    #[error("Response too large: more than {limit} bytes")]
+    ResponseTooLarge {
+        /// The budget, in bytes.
+        limit: usize,
+    },
 
     #[error("External service error: {0}")]
     ExternalService(String),
@@ -106,6 +118,14 @@ pub enum DxError {
 
     #[error("Format error: {0}")]
     Format(#[from] std::fmt::Error),
+}
+
+/// Every `reqwest` failure enters `DxError` here, so none keeps its request
+/// URL (see [`NetworkError`]).
+impl From<reqwest::Error> for DxError {
+    fn from(e: reqwest::Error) -> Self {
+        DxError::Network(e.into())
+    }
 }
 
 /// QSO confirmation status
@@ -215,5 +235,20 @@ mod tests {
         assert_eq!(Mode::FT8.to_string(), "FT8");
         assert_eq!(Mode::CW.to_string(), "CW");
         // Custom mode variant removed from unified types
+    }
+
+    #[tokio::test]
+    async fn network_error_drops_the_request_url() {
+        let url = format!(
+            "http://{}/path?token=tok-secret-123",
+            crate::test_support::closed_port()
+        );
+        let raw = reqwest::Client::new().get(&url).send().await.unwrap_err();
+        // reqwest itself renders the URL, so this test sees a regression.
+        assert!(raw.to_string().contains("tok-secret-123"));
+
+        let err = DxError::from(raw);
+        crate::test_support::assert_network_error_omits(&err, &["tok-secret-123"]);
+        assert_eq!(err.to_string(), "Network error: error sending request");
     }
 }

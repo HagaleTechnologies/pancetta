@@ -24,7 +24,7 @@ use base64::Engine as _;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde_json::Value;
 
-use pancetta_agent::keys::AgentIdentity;
+use pancetta_agent::keys::{key_id_from_identity_public, AgentIdentity};
 
 const VECTOR_JSON: &str = include_str!("fixtures/pairing-sig.vectors.v1.json");
 
@@ -158,6 +158,13 @@ fn pairing_sig_vector_byte_for_byte() {
     assert_eq!(
         key_id, "_RENMB0vB33hQUuPmfRBsUA_qyB7IFL70sBl5O6OfcI",
         "keyId must match the known-answer anchor"
+    );
+    // The free derivation the station uses to name a peer from the identity
+    // key it proved in the Noise handshake (PAN-95) reproduces the same keyId.
+    assert_eq!(
+        key_id_from_identity_public(&id_pub),
+        want_key_id,
+        "key_id_from_identity_public must reproduce the fixture keyId"
     );
 
     // idSig signed payload = dsep("cqdx-pair-idsig-v1", raw agreement pubkey).

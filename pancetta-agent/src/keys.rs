@@ -115,6 +115,16 @@ fn b64url_unpadded(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// pairing.v1 keyId for ANY Ed25519 identity public key: unpadded base64url
+/// SHA-256 of its SPKI DER (`302a300506032b6570032100` ‖ raw key).
+/// Self-certifying — a keyId can only be produced by its own key.
+pub fn key_id_from_identity_public(identity_public_raw: &[u8; 32]) -> String {
+    let mut spki = Vec::with_capacity(ED25519_SPKI_PREFIX.len() + 32);
+    spki.extend_from_slice(&ED25519_SPKI_PREFIX);
+    spki.extend_from_slice(identity_public_raw);
+    b64url_unpadded(&Sha256::digest(&spki))
+}
+
 /// An agent's cryptographic identity: an Ed25519 signing key (identity) and an
 /// X25519 static secret (Noise IK agreement key).
 ///
@@ -135,6 +145,16 @@ impl AgentIdentity {
         }
     }
 
+    /// Build an identity from raw secret bytes (Ed25519 seed + X25519 secret).
+    /// Used by `load_or_generate` and by deterministic fixtures; a device
+    /// identity (agent or client) has the same Ed25519 + X25519 shape.
+    pub fn from_secret_bytes(identity_seed: [u8; 32], agreement_secret: [u8; 32]) -> Self {
+        Self {
+            identity: SigningKey::from_bytes(&identity_seed),
+            agreement: XStaticSecret::from(agreement_secret),
+        }
+    }
+
     /// Load an existing identity from `dir`, or generate + persist a new one if
     /// the key files do not exist.
     ///
@@ -147,12 +167,7 @@ impl AgentIdentity {
         if identity_path.exists() && agreement_path.exists() {
             let id_bytes = read_key_file(&identity_path)?;
             let agr_bytes = read_key_file(&agreement_path)?;
-            let identity = SigningKey::from_bytes(&id_bytes);
-            let agreement = XStaticSecret::from(agr_bytes);
-            return Ok(Self {
-                identity,
-                agreement,
-            });
+            return Ok(Self::from_secret_bytes(id_bytes, agr_bytes));
         }
 
         // Generate fresh and persist.
@@ -207,11 +222,7 @@ impl AgentIdentity {
     /// The agent's keyId: unpadded base64url SHA-256 of the Ed25519 identity
     /// SPKI DER (`302a300506032b6570032100` ‖ 32-byte raw key).
     pub fn key_id(&self) -> String {
-        let mut spki = Vec::with_capacity(ED25519_SPKI_PREFIX.len() + 32);
-        spki.extend_from_slice(&ED25519_SPKI_PREFIX);
-        spki.extend_from_slice(&self.identity_public_raw());
-        let digest = Sha256::digest(&spki);
-        b64url_unpadded(&digest)
+        key_id_from_identity_public(&self.identity_public_raw())
     }
 
     /// Sign `msg` with the identity key under a domain-separation `tag`:
@@ -441,6 +452,29 @@ mod tests {
         let digest = Sha256::digest(&spki);
         let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
         assert_eq!(id.key_id(), expected);
+    }
+
+    #[test]
+    fn key_id_from_identity_public_matches_agent_key_id() {
+        let id = AgentIdentity::generate();
+        assert_eq!(
+            key_id_from_identity_public(&id.identity_public_raw()),
+            id.key_id()
+        );
+    }
+
+    #[test]
+    fn from_secret_bytes_is_deterministic() {
+        let id = AgentIdentity::from_secret_bytes([0x22; 32], [0x23; 32]);
+        assert_eq!(id.key_id(), "dE82zKZ-sZEssoLgjoa9L-DQkASijPbnxr1Wzda_Zao");
+        assert_eq!(
+            b64url_unpadded(&id.agreement_public_raw()),
+            "mkUDqYqxD-jTVMnELL0MnXlE9S59FNjqWXdefcnjv0s"
+        );
+        // Same inputs → same identity.
+        let again = AgentIdentity::from_secret_bytes([0x22; 32], [0x23; 32]);
+        assert_eq!(again.key_id(), id.key_id());
+        assert_eq!(again.agreement_public_raw(), id.agreement_public_raw());
     }
 
     #[test]

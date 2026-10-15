@@ -10,6 +10,11 @@
 //! The initiator ([`InitiatorHandshake`]) exists only for loopback tests and
 //! is gated behind `#[cfg(test)]`.
 //!
+//! The responder learns the initiator's static key from msg1
+//! ([`ResponderHandshake::remote_static`]). Noise authenticates that key, but it
+//! does not say WHO owns it: callers MUST bind it to a client identity before
+//! trusting the peer (PAN-95: [`crate::peer_identity`]).
+//!
 //! Misuse-resistance:
 //! - Each phase is a distinct type. [`ResponderHandshake::into_transport`]
 //!   consumes `self` by value, so a completed handshake cannot be reused and
@@ -119,6 +124,16 @@ impl ResponderHandshake {
     /// but before transport mode is entered. Useful as a channel-binding token.
     pub fn handshake_hash(&self) -> Vec<u8> {
         self.inner.get_handshake_hash().to_vec()
+    }
+
+    /// The initiator's static X25519 public key, as AUTHENTICATED by the IK
+    /// handshake (msg1's payload is encrypted under a key mixing `ss`, so a
+    /// successful `read_msg1` proves the sender holds this key's private half).
+    /// `None` until `read_msg1` has succeeded.
+    pub fn remote_static(&self) -> Option<[u8; 32]> {
+        self.inner
+            .get_remote_static()
+            .and_then(|k| <[u8; 32]>::try_from(k).ok())
     }
 }
 
@@ -294,6 +309,25 @@ mod tests {
         assert!(
             matches!(replay, Err(NoiseError::Cipher(_))),
             "replayed ciphertext must fail (nonce consumed), got {replay:?}"
+        );
+    }
+
+    #[test]
+    fn responder_exposes_initiator_static_after_msg1() {
+        let resp_kp = gen_keypair();
+        let init_kp = gen_keypair();
+
+        let mut initiator =
+            InitiatorHandshake::new(&init_kp.private, &resp_kp.public).expect("init");
+        let mut responder = ResponderHandshake::new(&resp_kp.private).expect("resp");
+        assert_eq!(responder.remote_static(), None, "unknown before msg1");
+
+        let msg1 = initiator.write_msg1(b"").expect("msg1");
+        responder.read_msg1(&msg1).expect("read msg1");
+        assert_eq!(
+            responder.remote_static().map(|k| k.to_vec()),
+            Some(init_kp.public.clone()),
+            "responder learns the initiator's static public key from msg1"
         );
     }
 

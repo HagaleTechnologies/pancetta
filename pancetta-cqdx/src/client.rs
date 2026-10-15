@@ -41,6 +41,63 @@ pub struct CqdxClient {
 /// Maximum response body size accepted from the API (10 MB).
 const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 
+/// Most bytes of a non-2xx body read into an error message. The message keeps
+/// at most [`MAX_ERROR_BODY_CHARS`] chars, so the rest is never needed.
+const MAX_ERROR_BODY_BYTES: usize = 4 * 1024;
+
+/// Most bytes of a 2xx `log_qso` body read to look for a duplicate marker.
+const MAX_LOG_QSO_BODY_BYTES: usize = 64 * 1024;
+
+/// A response body read up to a byte budget by [`read_body_capped`].
+struct CappedBody {
+    /// The body, or its first `limit` bytes when `truncated`.
+    bytes: Vec<u8>,
+    /// The body was longer than the budget; reading stopped there.
+    truncated: bool,
+    /// Bytes received when reading stopped (at most one chunk past the budget).
+    received: usize,
+}
+
+/// Read `resp`'s body until it ends or passes `limit` bytes, whichever comes
+/// first. Holds at most `limit` bytes plus the chunk that crossed it.
+async fn read_body_capped(
+    mut resp: reqwest::Response,
+    limit: usize,
+) -> reqwest::Result<CappedBody> {
+    let hint = resp
+        .content_length()
+        .map_or(0, |n| n.min(limit as u64) as usize);
+    let mut bytes = Vec::with_capacity(hint);
+    let mut received = 0;
+    while let Some(chunk) = resp.chunk().await? {
+        received += chunk.len();
+        let room = limit - bytes.len();
+        if chunk.len() > room {
+            bytes.extend_from_slice(&chunk[..room]);
+            return Ok(CappedBody {
+                bytes,
+                truncated: true,
+                received,
+            });
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(CappedBody {
+        bytes,
+        truncated: false,
+        received,
+    })
+}
+
+/// A non-2xx body as text for an error message, read within
+/// [`MAX_ERROR_BODY_BYTES`]. `"unknown"` if the read fails, as before.
+async fn error_body_text(resp: reqwest::Response) -> String {
+    match read_body_capped(resp, MAX_ERROR_BODY_BYTES).await {
+        Ok(body) => String::from_utf8_lossy(&body.bytes).into_owned(),
+        Err(_) => "unknown".to_string(),
+    }
+}
+
 impl CqdxClient {
     /// Create a new client for the given base URL and PAT token.
     ///
@@ -283,7 +340,7 @@ impl CqdxClient {
             return Ok(QsoUploadOutcome::Duplicate);
         }
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_else(|_| "unknown".to_string());
+            let body = error_body_text(resp).await;
             return Err(CqdxError::Server {
                 status: status.as_u16(),
                 message: sanitize_error_body(&body),
@@ -293,12 +350,19 @@ impl CqdxClient {
         // 2xx: a duplicate may still be reported in-band with a 200 body
         // (`{"status":"duplicate"}` / `{"duplicate":true}` — the exact shape is
         // not pinned by the API doc, so we sniff leniently). Read the body
-        // best-effort; a missing / non-JSON body just means "logged".
-        let body = resp.text().await.unwrap_or_default();
-        if !body.is_empty() {
-            if let Ok(parsed) = serde_json::from_str::<QsoUploadBody>(&body) {
-                if parsed.is_duplicate() {
-                    return Ok(QsoUploadOutcome::Duplicate);
+        // best-effort; a missing / non-JSON body just means "logged". A body
+        // over MAX_LOG_QSO_BODY_BYTES is not sniffed and also counts as logged.
+        if let Ok(CappedBody {
+            bytes,
+            truncated: false,
+            ..
+        }) = read_body_capped(resp, MAX_LOG_QSO_BODY_BYTES).await
+        {
+            if !bytes.is_empty() {
+                if let Ok(parsed) = serde_json::from_slice::<QsoUploadBody>(&bytes) {
+                    if parsed.is_duplicate() {
+                        return Ok(QsoUploadOutcome::Duplicate);
+                    }
                 }
             }
         }
@@ -313,7 +377,7 @@ impl CqdxClient {
         if status.as_u16() == 401 {
             return Err(CqdxError::Unauthorized);
         }
-        let body = resp.text().await.unwrap_or_else(|_| "unknown".to_string());
+        let body = error_body_text(resp).await;
         Err(CqdxError::Server {
             status: status.as_u16(),
             message: sanitize_error_body(&body),
@@ -321,6 +385,10 @@ impl CqdxClient {
     }
 
     /// Deserialize a JSON response body with a size limit to prevent OOM.
+    ///
+    /// A declared Content-Length over the limit is refused before reading.
+    /// Otherwise the body is read in chunks and abandoned as soon as it passes
+    /// the limit, so an undeclared length is never buffered past it.
     async fn checked_json<T: serde::de::DeserializeOwned>(
         &self,
         resp: reqwest::Response,
@@ -331,12 +399,12 @@ impl CqdxClient {
                 return Err(CqdxError::ResponseTooLarge(len));
             }
         }
-        // Read bytes with actual size check
-        let bytes = resp.bytes().await?;
-        if bytes.len() > MAX_RESPONSE_BYTES {
-            return Err(CqdxError::ResponseTooLarge(bytes.len() as u64));
+        // Read chunks, stopping once the running total passes the limit
+        let body = read_body_capped(resp, MAX_RESPONSE_BYTES).await?;
+        if body.truncated {
+            return Err(CqdxError::ResponseTooLarge(body.received as u64));
         }
-        Ok(serde_json::from_slice(&bytes)?)
+        Ok(serde_json::from_slice(&body.bytes)?)
     }
 }
 
@@ -400,6 +468,9 @@ fn sanitize_error_body(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::time::{Duration, Instant};
     use wiremock::matchers::{body_partial_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1003,6 +1074,320 @@ mod tests {
         let client = test_client(&server.uri());
         let result = client.fetch_entities().await;
         assert!(matches!(result, Err(CqdxError::Server { status: 500, .. })));
+    }
+
+    // ----- Byte-budget tests against a raw HTTP server. ---------------------
+    // wiremock always sends Content-Length, so a std-thread server streams
+    // chunked bodies and reports how much of the body the socket accepted.
+
+    const MIB: usize = 1024 * 1024;
+
+    /// Size of each body write from the raw server.
+    const SERVE_CHUNK_BYTES: usize = 64 * 1024;
+
+    /// Bound on every blocking accept/read/write in the raw server, so a test
+    /// that goes wrong fails instead of hanging.
+    const SERVE_IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// How a streamed body is framed.
+    enum Framing {
+        Chunked,
+        ContentLength,
+    }
+
+    /// What a `serve_body` server managed to send.
+    struct Served {
+        /// Body bytes the socket accepted.
+        written: usize,
+        /// The whole body (and the chunked terminator) was written.
+        completed: bool,
+    }
+
+    /// Read one request's headers and any Content-Length body, so the client
+    /// never sees the connection reset while it is still sending.
+    fn read_request(sock: &mut TcpStream) -> std::io::Result<()> {
+        let mut buf = Vec::new();
+        let mut scratch = [0u8; 4096];
+        let head_end = loop {
+            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+            let n = sock.read(&mut scratch)?;
+            if n == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            buf.extend_from_slice(&scratch[..n]);
+        };
+        let head = String::from_utf8_lossy(&buf[..head_end]);
+        let body_len = head
+            .lines()
+            .filter_map(|l| l.split_once(':'))
+            .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut have = buf.len() - head_end;
+        while have < body_len {
+            let n = sock.read(&mut scratch)?;
+            if n == 0 {
+                break;
+            }
+            have += n;
+        }
+        Ok(())
+    }
+
+    /// Answer one request (headers + any Content-Length body read first) with
+    /// `status`, then `prefix` followed by `pad` spaces in 64 KiB chunks.
+    fn serve_body(
+        status: &'static str,
+        framing: Framing,
+        prefix: &'static [u8],
+        pad: usize,
+    ) -> (String, std::thread::JoinHandle<Served>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let not_sent = Served {
+                written: 0,
+                completed: false,
+            };
+            // Accept with a deadline rather than blocking forever.
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + SERVE_IO_TIMEOUT;
+            let mut sock = loop {
+                match listener.accept() {
+                    Ok((sock, _)) => break sock,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return not_sent,
+                }
+            };
+            sock.set_nonblocking(false).unwrap();
+            sock.set_read_timeout(Some(SERVE_IO_TIMEOUT)).unwrap();
+            sock.set_write_timeout(Some(SERVE_IO_TIMEOUT)).unwrap();
+            if read_request(&mut sock).is_err() {
+                return not_sent;
+            }
+
+            let framing_header = match framing {
+                Framing::Chunked => "Transfer-Encoding: chunked".to_string(),
+                Framing::ContentLength => format!("Content-Length: {}", prefix.len() + pad),
+            };
+            let head = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                 {framing_header}\r\nConnection: close\r\n\r\n"
+            );
+            if sock.write_all(head.as_bytes()).is_err() {
+                return not_sent;
+            }
+
+            let mut written = 0;
+            let mut pad_left = pad;
+            let mut prefix_left = prefix;
+            loop {
+                let mut data = prefix_left.to_vec();
+                prefix_left = &[];
+                let spaces = SERVE_CHUNK_BYTES.saturating_sub(data.len()).min(pad_left);
+                data.resize(data.len() + spaces, b' ');
+                pad_left -= spaces;
+                if data.is_empty() {
+                    break;
+                }
+                let frame = match framing {
+                    Framing::Chunked => {
+                        let mut frame = format!("{:x}\r\n", data.len()).into_bytes();
+                        frame.extend_from_slice(&data);
+                        frame.extend_from_slice(b"\r\n");
+                        frame
+                    }
+                    Framing::ContentLength => data.clone(),
+                };
+                if sock.write_all(&frame).is_err() {
+                    return Served {
+                        written,
+                        completed: false,
+                    };
+                }
+                written += data.len();
+            }
+            if matches!(framing, Framing::Chunked) && sock.write_all(b"0\r\n\r\n").is_err() {
+                return Served {
+                    written,
+                    completed: false,
+                };
+            }
+            Served {
+                written,
+                completed: true,
+            }
+        });
+        (url, handle)
+    }
+
+    /// Wait for the server thread off the runtime thread: the client's
+    /// connection task must keep running to close the socket.
+    async fn served(h: std::thread::JoinHandle<Served>) -> Served {
+        tokio::task::spawn_blocking(move || h.join().unwrap())
+            .await
+            .unwrap()
+    }
+
+    const EMPTY_ENTITIES: &[u8] = br#"{"entities":[]}"#;
+
+    #[tokio::test]
+    async fn chunked_body_over_limit_stops_reading_early() {
+        let (url, h) = serve_body("200 OK", Framing::Chunked, EMPTY_ENTITIES, 64 * MIB);
+        let result = test_client(&url).fetch_entities().await;
+        let s = served(h).await;
+        match result {
+            Err(CqdxError::ResponseTooLarge(n)) => assert!(
+                n as usize > MAX_RESPONSE_BYTES,
+                "reported {n} bytes, budget is {MAX_RESPONSE_BYTES}"
+            ),
+            other => panic!("expected ResponseTooLarge, got {other:?}"),
+        }
+        assert!(
+            !s.completed && s.written < 32 * MIB,
+            "client kept reading: {} bytes written, completed={}",
+            s.written,
+            s.completed
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_body_at_limit_is_accepted() {
+        let pad = MAX_RESPONSE_BYTES - EMPTY_ENTITIES.len();
+        let (url, h) = serve_body("200 OK", Framing::Chunked, EMPTY_ENTITIES, pad);
+        let result = test_client(&url).fetch_entities().await;
+        let s = served(h).await;
+        assert!(result.unwrap().is_empty());
+        assert!(s.completed);
+        assert_eq!(s.written, MAX_RESPONSE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn chunked_body_one_byte_over_limit_is_rejected() {
+        let pad = MAX_RESPONSE_BYTES + 1 - EMPTY_ENTITIES.len();
+        let (url, h) = serve_body("200 OK", Framing::Chunked, EMPTY_ENTITIES, pad);
+        let result = test_client(&url).fetch_entities().await;
+        served(h).await;
+        assert!(
+            matches!(result, Err(CqdxError::ResponseTooLarge(n)) if n as usize > MAX_RESPONSE_BYTES),
+            "expected ResponseTooLarge, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn declared_length_over_limit_is_rejected_before_reading() {
+        let pad = 64 * MIB - EMPTY_ENTITIES.len();
+        let (url, h) = serve_body("200 OK", Framing::ContentLength, EMPTY_ENTITIES, pad);
+        let result = test_client(&url).fetch_entities().await;
+        let s = served(h).await;
+        assert!(
+            matches!(result, Err(CqdxError::ResponseTooLarge(67_108_864))),
+            "expected ResponseTooLarge(67108864), got {result:?}"
+        );
+        assert!(!s.completed, "{} bytes written", s.written);
+    }
+
+    #[tokio::test]
+    async fn error_body_is_read_only_up_to_its_budget() {
+        let (url, h) = serve_body(
+            "500 Internal Server Error",
+            Framing::Chunked,
+            br#"{"error":"unavailable"}"#,
+            64 * MIB,
+        );
+        let result = test_client(&url).fetch_entities().await;
+        let s = served(h).await;
+        match result {
+            Err(CqdxError::Server {
+                status: 500,
+                message,
+            }) => assert!(
+                message.chars().count() <= MAX_ERROR_BODY_CHARS + 1,
+                "message is {} chars",
+                message.chars().count()
+            ),
+            other => panic!("expected Server 500, got {other:?}"),
+        }
+        assert!(
+            !s.completed && s.written < 32 * MIB,
+            "client kept reading: {} bytes written, completed={}",
+            s.written,
+            s.completed
+        );
+    }
+
+    #[tokio::test]
+    async fn error_body_redaction_survives_the_budget() {
+        let (url, h) = serve_body(
+            "500 Internal Server Error",
+            Framing::Chunked,
+            br#"{"error":"bad pat_abcdef0123456789"}"#,
+            1024,
+        );
+        let result = test_client(&url).fetch_entities().await;
+        served(h).await;
+        match result {
+            Err(CqdxError::Server {
+                status: 500,
+                message,
+            }) => {
+                assert!(message.contains("pat_***REDACTED***"), "{message}");
+                assert!(!message.contains("pat_abcdef0123456789"), "{message}");
+            }
+            other => panic!("expected Server 500, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn log_qso_error_body_is_read_only_up_to_its_budget() {
+        let (url, h) = serve_body(
+            "500 Internal Server Error",
+            Framing::Chunked,
+            br#"{"error":"unavailable"}"#,
+            64 * MIB,
+        );
+        let result = test_client(&url).log_qso(sample_qso()).await;
+        let s = served(h).await;
+        assert!(
+            matches!(result, Err(CqdxError::Server { status: 500, .. })),
+            "expected Server 500, got {result:?}"
+        );
+        assert!(
+            !s.completed && s.written < 32 * MIB,
+            "client kept reading: {} bytes written, completed={}",
+            s.written,
+            s.completed
+        );
+    }
+
+    #[tokio::test]
+    async fn log_qso_success_body_over_budget_counts_as_logged() {
+        let (url, h) = serve_body("201 Created", Framing::Chunked, br#"{"ok":true}"#, 64 * MIB);
+        let result = test_client(&url).log_qso(sample_qso()).await;
+        let s = served(h).await;
+        assert_eq!(result.unwrap(), QsoUploadOutcome::Logged);
+        assert!(
+            !s.completed && s.written < 32 * MIB,
+            "client kept reading: {} bytes written, completed={}",
+            s.written,
+            s.completed
+        );
+    }
+
+    #[tokio::test]
+    async fn log_qso_chunked_duplicate_is_still_detected() {
+        let (url, h) = serve_body("200 OK", Framing::Chunked, br#"{"status":"duplicate"}"#, 0);
+        let result = test_client(&url).log_qso(sample_qso()).await;
+        let s = served(h).await;
+        assert_eq!(result.unwrap(), QsoUploadOutcome::Duplicate);
+        assert!(s.completed);
     }
 
     #[tokio::test]
