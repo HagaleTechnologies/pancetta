@@ -102,13 +102,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-<<<<<<< HEAD
-- A crash in the transmit worker no longer keeps the station off the air for
-  the rest of the session: the supervisor restarts it after a short backoff,
-  within the same 5-restarts-per-10-minutes budget as the other restartable
-  components. Past that budget TX stays disabled until pancetta is
-  restarted, as before (PAN-119).
-=======
 - `max_concurrent_qsos` now also limits QSOs you open by hand (PAN-78). With
   the default of 1, calling a second station while a QSO is waiting for a
   reply used to open it anyway and transmit it alongside the first. Now the
@@ -127,7 +120,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decode; they stay on the readiness strip until acknowledged. When the
   readiness list outgrows the panel (80×24), Shift+S scrolls (↑/↓, PgUp/PgDn,
   Home/End).
->>>>>>> eaa0ff4f3badcb1a6a922e62f626dfcb1d62a088
+
+- A crash in the transmit worker no longer keeps the station off the air for
+  the rest of the session: the supervisor restarts it after a short backoff,
+  within the same 5-restarts-per-10-minutes budget as the other restartable
+  components. Past that budget TX stays disabled until pancetta is
+  restarted, as before (PAN-119).
 
 - Turning Fox mode off (Shift+X) no longer cuts the Hound contacts already in
   progress down to one transmitted stream; they keep transmitting until they
