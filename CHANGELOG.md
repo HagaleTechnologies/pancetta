@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Config hot-reload is now real for remote-access settings (PAN-103): saving
+  `pancetta.toml` while pancetta runs applies remote-access revocations to the
+  running station — `[network.station_agent].remote_tx_enabled = false`,
+  removing a `tx_allow_list` entry, `[network.station_agent].enabled = false`,
+  and the WSJT-X UDP channel's consent. Every save shows a `Config reloaded`
+  line (or the load error) in the TUI diagnostics, and grant-direction or
+  other edits say a restart is required. Deleting the default
+  `~/.pancetta/pancetta.toml` revokes what only it granted; deleting a
+  `--config` file keeps the previous config and says so. `docs/CONFIG.md` now lists exactly
+  which settings apply live and which need a restart, and `docs/RUNBOOK.md`
+  has a procedure for revoking a remote client.
+
 - Readiness strip (PAN-89): row 1 of every view now answers "can I transmit,
   and what's blocking it?" with a TX verdict chip (`✓ TX READY`, `✗ TX HELD`,
   `■ RX ONLY`, `◌ TX WAIT`, `⚠ TX OPEN`) and one chip per active condition.

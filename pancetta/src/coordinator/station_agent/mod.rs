@@ -251,8 +251,9 @@ struct ArmContext {
     /// The authorization generation (PAN-96): bumped by
     /// `poll_authorizations_loop`, after it publishes them, whenever a poll
     /// changes `tx_allow_list` or `tx_arm_allow_list`. Shared with the poll
-    /// task (a SEPARATE tokio task, like `revocation_pending`); never bumped in
-    /// static-config mode.
+    /// task (a SEPARATE tokio task, like `revocation_pending`). In
+    /// static-config mode its only bumper is a saved config edit that removes
+    /// `tx_allow_list` entries (PAN-103, [`revoke_static_allow_list_entries`]).
     authz_generation: Arc<std::sync::atomic::AtomicU64>,
     /// The generation THIS session last reconciled to. When it lags
     /// `authz_generation`, [`reconcile_authorizations`] applies the refresh to
@@ -603,10 +604,17 @@ fn sweep_arm_expiry(ctx: &ArmContext, now: ArmTime) -> Vec<PeerSend> {
 /// flag's state, exactly as round 2 established -- the flag is now only
 /// consulted to narrow the *non-panicking* fallback, never to override a
 /// real panic.
+///
+/// PAN-103: `stop_requested` is this component's own "deliberately stopped"
+/// flag, set by the coordinator right before it aborts the session because a
+/// saved config edit disabled the station agent. It narrows the same
+/// non-panicking fallback as `shutdown` does, so that deliberate stop is
+/// audited as `OperatorDisarm`, never `ComponentCrash`.
 struct RemoteTxDisarmGuard {
     arm: Arc<Mutex<ArmState>>,
     audit: AuditLog,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    stop_requested: Arc<std::sync::atomic::AtomicBool>,
     normal_exit: bool,
 }
 
@@ -621,8 +629,9 @@ impl RemoteTxDisarmGuard {
 
 impl Drop for RemoteTxDisarmGuard {
     fn drop(&mut self) {
-        let non_panicking_shutdown_cancellation =
-            !std::thread::panicking() && self.shutdown.load(Ordering::Acquire);
+        let non_panicking_shutdown_cancellation = !std::thread::panicking()
+            && (self.shutdown.load(Ordering::Acquire)
+                || self.stop_requested.load(Ordering::Acquire));
         let reason = if self.normal_exit || non_panicking_shutdown_cancellation {
             DisarmReason::OperatorDisarm
         } else {
@@ -1540,6 +1549,96 @@ pub(crate) fn station_agent_active(
     has_relay_config(cfg) && (!cfg.tx_allow_list.is_empty() || cqdx_will_populate)
 }
 
+/// PAN-103: shared handles onto a RUNNING station-agent session's live
+/// authorization state, so a saved config edit can revoke access without a
+/// restart. `start_station_agent_component` stashes one on the coordinator
+/// only when it spawns the real session (never on the inert/drain or
+/// `--replay` paths); teardown and the next start clear it. The arm and audit
+/// log are the coordinator's own shared instances and are not repeated here.
+#[derive(Clone)]
+pub(crate) struct StationAgentLiveHandles {
+    pub(crate) tx_allow_list: Arc<std::sync::RwLock<HashSet<String>>>,
+    pub(crate) tx_arm_allow_list: Arc<std::sync::RwLock<HashSet<String>>>,
+    pub(crate) client_keys: Arc<std::sync::RwLock<std::collections::HashMap<String, VerifyingKey>>>,
+    pub(crate) revocation_pending: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) authz_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Set right before the coordinator aborts the session for a config
+    /// disable, so the session's disarm guard audits `OperatorDisarm`.
+    pub(crate) stop_requested: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// PAN-103: remove `removed` keyIds from a running session's authorization
+/// sets, using the same publish protocol as `poll_authorizations_loop`:
+/// under the arm lock, disarm (`authorization-revoked`) if the armed client
+/// was removed and flag `revocation_pending`, then prune the TX-arm set; then
+/// prune the admission set and device keys; then bump `authz_generation`
+/// AFTER publishing so the session loop's [`reconcile_authorizations`] evicts
+/// the removed peers (Noise transport dropped, hello-token `jti`
+/// deny-listed, controller released) on its next tick.
+///
+/// Poisoned locks are entered rather than skipped: a revocation must never be
+/// lost to a poisoned lock. Returns whether anything changed (and so whether
+/// the generation was bumped).
+pub(crate) fn revoke_static_allow_list_entries(
+    live: &StationAgentLiveHandles,
+    arm: &Mutex<ArmState>,
+    audit: &AuditLog,
+    removed: &[String],
+    now_unix_ms: i64,
+) -> bool {
+    if removed.is_empty() {
+        return false;
+    }
+    let arm_changed = {
+        let mut st = match arm.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let armed_removed = st
+            .armed_client_key_id()
+            .is_some_and(|cur| removed.iter().any(|r| r == cur));
+        if armed_removed {
+            let effects = st.disarm_with_reason(DisarmReason::AuthorizationRevoked, now_unix_ms);
+            apply_arm_effects(audit, &effects);
+            live.revocation_pending.store(true, Ordering::Release);
+            warn!(
+                target: "agent.tx",
+                "remote TX disarmed: the armed client was removed from tx_allow_list"
+            );
+        }
+        // Published while still holding the arm lock (the same atomicity
+        // `verify_and_arm`'s re-check relies on for the poller's publish).
+        let mut g = match live.tx_arm_allow_list.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let before = g.len();
+        g.retain(|k| !removed.contains(k));
+        before != g.len()
+    };
+    let allow_changed = {
+        let mut g = match live.tx_allow_list.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let before = g.len();
+        g.retain(|k| !removed.contains(k));
+        before != g.len()
+    };
+    {
+        let mut g = match live.client_keys.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        g.retain(|k, _| !removed.contains(k));
+    }
+    let changed = arm_changed || allow_changed;
+    if changed {
+        live.authz_generation.fetch_add(1, Ordering::AcqRel);
+    }
+    changed
+}
+
 /// The initial seed for `tx_arm_allow_list` — FAIL-CLOSED, not fail-open
 /// (CQD-11 / dispensa Q-0052 follow-up: PR #259 shipped the split with a
 /// fail-open seed; this closes that gap).
@@ -1621,6 +1720,8 @@ impl super::ApplicationCoordinator {
     /// touches nothing off-box, and keeps the arm's values identical to a live
     /// run's — with no session to admit a controller, it can never lead to TX.
     pub(crate) async fn start_station_agent_component(&mut self) -> Result<()> {
+        // PAN-103: set again below only when the real session is spawned.
+        self.station_agent_live = None;
         let config = self.config.read().await;
         let cfg = config.network.station_agent.clone();
         let cqdx_cfg = config.network.cqdx.clone();
@@ -1783,6 +1884,9 @@ impl super::ApplicationCoordinator {
         // changes the admission lists; the session loop reconciles on it (see
         // `ArmContext::authz_generation`).
         let authz_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // PAN-103: set by a config disable just before the abort (see
+        // `RemoteTxDisarmGuard`).
+        let stop_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Task 6: subscribe to the shared display feed (if the localhost
         // gateway or this component's own gating started it — see
@@ -1837,6 +1941,17 @@ impl super::ApplicationCoordinator {
             self.station_agent_poll = Some(poll_handle.abort_handle());
         }
 
+        // PAN-103: live handles for config-edit revocation (see
+        // `coordinator::config_reload`).
+        self.station_agent_live = Some(StationAgentLiveHandles {
+            tx_allow_list: tx_allow_list.clone(),
+            tx_arm_allow_list: tx_arm_allow_list.clone(),
+            client_keys: client_keys.clone(),
+            revocation_pending: revocation_pending.clone(),
+            authz_generation: authz_generation.clone(),
+            stop_requested: stop_requested.clone(),
+        });
+
         let handle = tokio::spawn(async move {
             run_session_loop(RunConfig {
                 relay_url,
@@ -1852,6 +1967,7 @@ impl super::ApplicationCoordinator {
                 revocation_pending,
                 authz_generation,
                 shutdown,
+                stop_requested,
                 timeouts: net::RelayTimeouts::default(),
             })
             .await;
@@ -2117,6 +2233,8 @@ struct RunConfig {
     /// Threaded into `ArmContext::authz_generation` — see there.
     authz_generation: Arc<std::sync::atomic::AtomicU64>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// See [`StationAgentLiveHandles::stop_requested`].
+    stop_requested: Arc<std::sync::atomic::AtomicBool>,
     /// Deadlines for every relay IO wait (PAN-102). `Default` in production.
     timeouts: net::RelayTimeouts,
 }
@@ -2130,6 +2248,7 @@ async fn run_session_loop(mut cfg: RunConfig) {
         arm: cfg.arm.clone(),
         audit: cfg.audit.clone(),
         shutdown: cfg.shutdown.clone(),
+        stop_requested: cfg.stop_requested.clone(),
         normal_exit: false,
     };
     let mut backoff = RECONNECT_BACKOFF_MIN;
@@ -2790,6 +2909,7 @@ mod tests {
                 arm: arm.clone(),
                 audit: audit.clone(),
                 shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 normal_exit: true,
             };
         }
@@ -2825,6 +2945,7 @@ mod tests {
                 arm: arm.clone(),
                 audit: audit.clone(),
                 shutdown: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 normal_exit: false,
             };
             // Guard drops here via ordinary scope exit -- simulating a
@@ -2863,6 +2984,7 @@ mod tests {
                 arm: arm.clone(),
                 audit: audit.clone(),
                 shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 normal_exit: false,
             };
             // Guard drops here via ordinary scope exit -- not a panic, but
@@ -2883,6 +3005,37 @@ mod tests {
         );
     }
 
+    /// PAN-103 (Codex P2 on #436): a saved config edit that disables the
+    /// station agent aborts the session while it may still be armed. That
+    /// abort drops the guard with `normal_exit` unset and the process-wide
+    /// shutdown flag false; the component's own `stop_requested` flag is what
+    /// tells the guard it was a deliberate operator stop, not a crash.
+    #[test]
+    fn drop_after_a_config_stop_request_audits_operator_disarm_not_a_crash() {
+        let arm = Arc::new(Mutex::new(armed_state()));
+        let audit = AuditLog::new(audit_tmp());
+
+        {
+            let _guard = RemoteTxDisarmGuard {
+                arm: arm.clone(),
+                audit: audit.clone(),
+                shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                normal_exit: false,
+            };
+        }
+
+        let log = std::fs::read_to_string(audit.path()).unwrap_or_default();
+        assert!(
+            !log.contains("component-crash"),
+            "a config-driven stop must not be audited as a component crash: {log:?}"
+        );
+        assert!(
+            log.contains("operator-disarm"),
+            "a config-driven stop is an operator disarm: {log:?}"
+        );
+    }
+
     /// The scenario `RemoteTxDisarmGuard` exists for in the first place: a
     /// real panic/unwind, with `normal_exit` never reached. Drives an actual
     /// panic through `catch_unwind` so `std::thread::panicking()` is
@@ -2900,6 +3053,7 @@ mod tests {
                 arm: arm_for_panic,
                 audit: audit_for_panic,
                 shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 normal_exit: false,
             };
             panic!("simulated genuine task panic");
@@ -2942,6 +3096,7 @@ mod tests {
                 arm: arm_for_panic,
                 audit: audit_for_panic,
                 shutdown: shutdown_for_panic,
+                stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 normal_exit: false,
             };
             // A real panic, so the guard drops while genuinely unwinding --
@@ -2987,6 +3142,7 @@ mod tests {
                 arm: arm_for_task,
                 audit: audit_for_task,
                 shutdown: shutdown_for_task,
+                stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 normal_exit: false,
             };
             // Stand-in for `run_one_session` still mid-flight (e.g. awaiting
@@ -3032,6 +3188,7 @@ mod tests {
                 arm: arm_for_task,
                 audit: audit_for_task,
                 shutdown: shutdown_for_task,
+                stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 normal_exit: false,
             };
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -7988,6 +8145,127 @@ mod tests {
         );
     }
 
+    /// PAN-103: the live handles a config edit revokes through, built over
+    /// `ctx`'s own shared state (what `start_station_agent_component` stashes).
+    fn live_handles_for(ctx: &ArmContext) -> StationAgentLiveHandles {
+        StationAgentLiveHandles {
+            tx_allow_list: ctx.tx_allow_list.clone(),
+            tx_arm_allow_list: ctx.tx_arm_allow_list.clone(),
+            client_keys: ctx.client_keys.clone(),
+            revocation_pending: ctx.revocation_pending.clone(),
+            authz_generation: ctx.authz_generation.clone(),
+            stop_requested: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn config_edit_removing_the_armed_controller_disarms_and_reconcile_evicts() {
+        let identity = AgentIdentity::generate();
+        let (mut ctx, mut sess, _outbound, _transports, _ws) = two_authorized_peers(&identity);
+        arm_controller(&mut ctx, CLIENT_KEY_ID);
+        ctx.client_keys.write().unwrap().insert(
+            CLIENT_KEY_ID.to_string(),
+            SigningKey::from_bytes(&[0x22; 32]).verifying_key(),
+        );
+        let live = live_handles_for(&ctx);
+        let generation_before = live.authz_generation.load(Ordering::Acquire);
+        let disarmed_before = disarmed_records(&ctx).len();
+
+        let changed = revoke_static_allow_list_entries(
+            &live,
+            &ctx.arm,
+            &ctx.audit,
+            &[CLIENT_KEY_ID.to_string()],
+            NOW,
+        );
+
+        assert!(changed);
+        assert_eq!(
+            live.authz_generation.load(Ordering::Acquire),
+            generation_before + 1,
+            "generation bumped exactly once, after publishing"
+        );
+        assert!(!live.tx_allow_list.read().unwrap().contains(CLIENT_KEY_ID));
+        assert!(live.tx_allow_list.read().unwrap().contains(PEER_B));
+        assert!(!live
+            .tx_arm_allow_list
+            .read()
+            .unwrap()
+            .contains(CLIENT_KEY_ID));
+        assert!(!live.client_keys.read().unwrap().contains_key(CLIENT_KEY_ID));
+        assert!(
+            live.revocation_pending.load(Ordering::Acquire),
+            "the session loop is told to broadcast the disarm"
+        );
+        // Pending-work invalidation: the gate every key-time TX site and the
+        // playback chunk re-check consult now refuses this client.
+        assert!(!crate::coordinator::tx::remote_tx_permitted_for(
+            &ctx.arm,
+            || at(NOW),
+            Some(CLIENT_KEY_ID)
+        ));
+        let disarmed = disarmed_records(&ctx);
+        assert_eq!(disarmed.len(), disarmed_before + 1);
+        assert!(disarmed
+            .last()
+            .unwrap()
+            .detail
+            .contains("authorization-revoked"));
+
+        // The real session reconcile then evicts the removed peer.
+        reconcile_authorizations(&mut ctx, &mut sess, at(NOW));
+        assert!(!ctx.peers.contains_key(CLIENT_KEY_ID), "PeerCtx removed");
+        assert!(
+            ctx.revoked_jtis.contains(&format!("hello-{CLIENT_KEY_ID}")),
+            "its hello-token jti is deny-listed"
+        );
+        assert_eq!(ctx.controller, None, "control released");
+        assert!(ctx.peers.contains_key(PEER_B), "the other peer stays");
+        assert_eq!(
+            disarmed_records(&ctx).len(),
+            disarmed_before + 1,
+            "no duplicate Disarmed record"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_edit_removing_a_non_armed_peer_keeps_the_arm_and_evicts_only_it() {
+        let identity = AgentIdentity::generate();
+        let (mut ctx, mut sess, _outbound, _transports, _ws) = two_authorized_peers(&identity);
+        arm_controller(&mut ctx, CLIENT_KEY_ID);
+        let live = live_handles_for(&ctx);
+
+        assert!(revoke_static_allow_list_entries(
+            &live,
+            &ctx.arm,
+            &ctx.audit,
+            &[PEER_B.to_string()],
+            NOW,
+        ));
+        assert!(!live.revocation_pending.load(Ordering::Acquire));
+        assert!(crate::coordinator::tx::remote_tx_permitted_for(
+            &ctx.arm,
+            || at(NOW),
+            Some(CLIENT_KEY_ID)
+        ));
+        reconcile_authorizations(&mut ctx, &mut sess, at(NOW));
+        assert!(!ctx.peers.contains_key(PEER_B));
+        assert!(ctx.revoked_jtis.contains(&format!("hello-{PEER_B}")));
+        assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
+
+        // Removing a keyId that is not listed changes nothing and does not
+        // bump the generation.
+        let generation = live.authz_generation.load(Ordering::Acquire);
+        assert!(!revoke_static_allow_list_entries(
+            &live,
+            &ctx.arm,
+            &ctx.audit,
+            &["not-listed".to_string()],
+            NOW,
+        ));
+        assert_eq!(live.authz_generation.load(Ordering::Acquire), generation);
+    }
+
     #[tokio::test]
     async fn reconcile_admits_newly_listed_client_mid_session() {
         let identity = AgentIdentity::generate();
@@ -9227,6 +9505,7 @@ mod tests {
             revocation_pending,
             authz_generation,
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stop_requested: Default::default(),
             timeouts: net::RelayTimeouts {
                 connect: Duration::from_secs(2),
                 hello,

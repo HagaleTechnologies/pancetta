@@ -294,16 +294,43 @@ The autonomous operator will pick up where it left off (worked-station
 history is persisted in the QSO database, rebuilt from ADIF on each
 start).
 
-To suspend autonomous operation without exiting pancetta, edit config
-and toggle `[autonomous].enabled = false`. The hot-reload in
-`pancetta-config` should pick up the change within a few seconds; if
-not, restart.
+To suspend autonomous operation without exiting pancetta, press `a`
+(toggle autonomous mode) or `Shift+P` (pause / resume) in the TUI.
+Editing `[autonomous].enabled` in the config file does **not** change a
+running station: it takes effect at the next restart (see
+[CONFIG.md → Hot reload](CONFIG.md#hot-reload) for the few settings that
+do apply live).
 
 ---
 
 ## Troubleshooting (operational)
 
 For first-run / install issues, see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
+
+### Revoking a suspect remote client
+
+1. Edit `~/.pancetta/pancetta.toml` (or your `--config` file) and remove
+   the client's keyId from `[network.station_agent].tx_allow_list`. Save.
+2. Within a few seconds the TUI diagnostics show
+   `tx_allow_list entry removed: {keyId} — session evicted, authorization
+   revoked`. The client's session is dropped, its hello token is
+   deny-listed, and it is disarmed if it held the arm or control. No
+   restart is needed.
+3. To cut off all remote transmission at once, also set
+   `[network.station_agent].remote_tx_enabled = false` (live: queued
+   remote frames are dropped, a transmission in progress stops).
+4. To shut the whole remote-access channel down, set
+   `[network.station_agent].enabled = false` (live: sessions close and
+   the arm is disarmed).
+5. cqdx-integrated stations: also revoke the client's edge in cqdx —
+   the authorizations poll re-admits edges cqdx still returns.
+6. Re-granting access (adding an entry back, re-enabling) requires a
+   restart; the TUI says so on save.
+
+If the TUI shows no `Config reloaded` line after a save, pancetta is
+not watching that file (see [CONFIG.md → Hot reload](CONFIG.md#hot-reload)):
+press `Shift+Q` to stop transmitting and restart pancetta so the edit
+takes effect.
 
 ### Autonomous mode runs but never transmits
 

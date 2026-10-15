@@ -20,6 +20,7 @@ mod audio;
 mod audio_recovery;
 mod autonomous;
 mod clock_monitor;
+mod config_reload;
 mod dsp;
 mod dx_cluster;
 mod effort;
@@ -70,6 +71,8 @@ pub use health::{
     classify_config_reload, panic_count, record_panic, ConfigReloadApplicability, HealthEdges,
     RfNoDecodeMonitor,
 };
+// PAN-103: the reload apply-plan built on top of `classify_config_reload`.
+pub use config_reload::{ReloadApplyPlan, SecurityConfigDiff, SnapshotAction};
 
 /// Canonical key for the `active_tx_qsos` set: QSO ids are compared
 /// case-insensitively (and trimmed) so the producer (QSO component) and
@@ -795,6 +798,39 @@ pub struct ApplicationCoordinator {
     pub(crate) hamlib_pending_split: Arc<std::sync::Mutex<Option<ComponentMessage>>>,
     /// Authorization refresh child owned by the current StationAgent generation.
     pub(crate) station_agent_poll: Option<tokio::task::AbortHandle>,
+    /// PAN-103: live authorization handles of the running station-agent
+    /// session (`None` when the component is inert). Used by the config
+    /// reload handler to revoke `tx_allow_list` removals without a restart.
+    pub(crate) station_agent_live: Option<station_agent::StationAgentLiveHandles>,
+    /// PAN-103: the config-file watcher. Watching stops when it is dropped.
+    config_reload_watcher: Option<pancetta_config::hot_reload::ConfigHotReload>,
+    /// PAN-103: the config file path as the operator gave it, symlinks NOT
+    /// resolved (`config_path` is the resolved write target). Reloads read
+    /// and watch this path so repointing a symlinked config is picked up.
+    /// Defaults to `config_path`; `main.rs` sets it via
+    /// [`ApplicationCoordinator::set_config_watch_path`].
+    pub(crate) config_watch_path: PathBuf,
+    /// PAN-103: `config_watch_path`'s own directory, as given and resolved.
+    /// The watcher always watches it.
+    config_link_dirs: Vec<PathBuf>,
+    /// PAN-103: the directory of `config_watch_path`'s current symlink
+    /// target, when that is not one of `config_link_dirs`. Also watched.
+    config_target_dir: Option<PathBuf>,
+    /// PAN-103: the watched file's non-fatal load warnings as last loaded.
+    /// A reload shows only warnings not already in this list.
+    config_file_warnings: Vec<String>,
+    /// PAN-103: reload outcomes forwarded from the watcher; taken by
+    /// `run_main_loop` (mirrors `hamlib_reconnect_rx`).
+    config_reload_rx: Option<tokio::sync::mpsc::Receiver<config_reload::ConfigReloadOutcome>>,
+    /// PAN-103: the watched config file's content as last loaded. Saved edits
+    /// are measured against it, not against `config` (which may also hold
+    /// values from other config files or `PANCETTA_*` environment variables).
+    config_file_baseline: Option<Config>,
+    /// PAN-103: loads and validates the merged configuration the way startup
+    /// did, when the watched file is only one of several merged sources (no
+    /// `--config`); reloads apply that. `None` when the watched file is the
+    /// whole configuration (`--config`): reloads load the file alone.
+    config_reload_loader: Option<config_reload::ConfigReloadLoader>,
 
     /// PAN-43/45 follow-up (Codex round 2 on PR #342): self-CQ attempt IDs
     /// whose dispatch failed but whose `AutonomousCqDispatchFailed`
@@ -1999,6 +2035,7 @@ impl ApplicationCoordinator {
         // reports "already in progress" instead of queuing or blocking.
         let (hamlib_reconnect_tx, hamlib_reconnect_rx) =
             tokio::sync::mpsc::channel::<crate::coordinator::hamlib::HamlibReconnectRequest>(1);
+        let config_watch_path = config_path.clone();
 
         let coordinator = Self {
             id,
@@ -2126,6 +2163,15 @@ impl ApplicationCoordinator {
             #[cfg(feature = "pancetta-hamlib")]
             hamlib_pending_split: Arc::new(std::sync::Mutex::new(None)),
             station_agent_poll: None,
+            station_agent_live: None,
+            config_reload_watcher: None,
+            config_watch_path,
+            config_link_dirs: Vec::new(),
+            config_target_dir: None,
+            config_file_warnings: Vec::new(),
+            config_reload_rx: None,
+            config_file_baseline: None,
+            config_reload_loader: None,
             pending_autonomous_cq_dispatch_failures: Arc::new(std::sync::Mutex::new(Vec::new())),
             pending_qso_offset_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
             pending_cq_offset_nudge: Arc::new(std::sync::atomic::AtomicBool::new(false)),
