@@ -454,7 +454,9 @@ fn partition_pending_calls(
 ///
 /// Each promoted entry consumes one slot even if it turns out to resolve to an
 /// existing QSO — conservative: it can delay a queued call by one terminal
-/// event but never exceed the cap.
+/// event but never exceed the cap. An entry that fails to open frees its slot
+/// again: the next pass starts the following matching entries, and the failed
+/// one is re-queued at the front.
 async fn promote_pending_manual_calls(
     qso_manager: &pancetta_qso::QsoManager,
     pending: &PendingManualCalls,
@@ -464,143 +466,155 @@ async fn promote_pending_manual_calls(
     // Capacity and parity are checked and the calls started under the
     // admission lock (see `QsoCapacityLimits::admission`).
     let _admission = limits.admission.lock().await;
-    // The parity our still-active QSOs are committed to (None ⇒ idle).
-    let current_side = qso_manager.current_tx_side().await;
-    // PAN-78: how many more QSOs may start (saturating: a count already above
-    // the cap, e.g. Fox QSOs left over after Fox mode disengaged, frees none).
-    let snap = limits.snapshot(qso_manager).await;
-    let free_slots = snap.cap.saturating_sub(snap.active);
-
-    let (to_start, keep_depth, cross_parity): (Vec<PendingManualCall>, usize, usize) = {
-        let mut q = pending.lock().await;
-        if q.is_empty() {
-            return;
-        }
-        info!(
-            target: "qso",
-            "promote_pending_manual_calls: current_side={:?}, queue_depth={}",
-            current_side,
-            q.len()
-        );
-        let queue = std::mem::take(&mut *q);
-        // The side the partition commits to (for the log line below only).
-        let adopt =
-            current_side.or_else(|| queue.front().and_then(PendingManualCall::desired_tx_parity));
-        let (start, keep) = partition_pending_calls(queue, current_side, free_slots);
-        let keep_depth = keep.len();
-        let cross_parity = keep
-            .iter()
-            .filter(|p| match (p.desired_tx_parity(), adopt) {
-                (None, _) => false,
-                (Some(want), Some(side)) => want != side,
-                (Some(_), None) => true,
-            })
-            .count();
-        *q = keep;
-        (start, keep_depth, cross_parity)
-    };
-
-    if keep_depth > cross_parity {
-        // PAN-78: some calls matched the window but found no free slot.
-        info!(
-            target: "qso",
-            "Promote: {} starting, {} still queued (capacity {}/{}, cross-parity {}); current_side={:?}",
-            to_start.len(),
-            keep_depth,
-            snap.active,
-            snap.cap,
-            cross_parity,
-            current_side
-        );
-    } else if keep_depth > 0 {
-        info!(
-            target: "qso",
-            "Promote: {} call(s) starting, {} still queued (cross-parity); current_side={:?}",
-            to_start.len(),
-            keep_depth,
-            current_side
-        );
-    }
-
     // Collect calls that fail to start so we can re-queue them at the front
     // rather than silently dropping them.
     let mut failed: Vec<PendingManualCall> = Vec::new();
 
-    for p in to_start {
-        info!(
-            target: "qso",
-            "Promoting deferred {} call to {} on {:.0} Hz — window is now free",
-            if p.hound { "Hound" } else { "manual" },
-            p.callsign, p.frequency_hz
-        );
-        let result = if p.hound {
-            // Hound engage: re-derive the low calling offset + install Hound
-            // metadata (partner_freq, hound flag, QSY hook) via engage_hound.
-            qso_manager
-                .engage_hound(
-                    &p.callsign,
-                    p.fox_freq_hz.unwrap_or(p.frequency_hz),
-                    p.fox_grid.as_deref(),
-                    p.dx_parity,
-                )
-                .await
-                .map(|_| ())
-        } else {
-            // Normal manual call: re-run the held-offset + de-confliction
-            // logic at promotion time (not at queue time) so we use the
-            // CURRENT active offset set, not the stale snapshot from when
-            // the call was deferred. The held_hz/hold_mode fields carry the
-            // operator's intent from the original StartQso handler so the
-            // chosen offset is honoured even across the cross-parity deferral.
-            let active = qso_manager.active_tx_offsets().await;
-            let (tx_off, partner) =
-                compute_manual_tx_offset(p.frequency_hz, p.hold_mode, p.held_hz, &active);
-            if tx_off != p.frequency_hz {
-                info!(
-                    target: "qso",
-                    "Promoting queued call to {} — held_hz={} hold_mode={} dx_freq={:.0} \
-                     → tx_off={:.0} Hz (de-conflicted from {} active)",
-                    p.callsign, p.held_hz, p.hold_mode, p.frequency_hz, tx_off, active.len()
-                );
+    // A pass starts calls up to the free slots; a call that fails to start
+    // frees its slot again, so passes repeat (the failed call held aside)
+    // until a pass has no failures or nothing more can start. Nothing else
+    // would retry the calls behind a failed one until the next terminal
+    // event.
+    loop {
+        let mut pass_failed = false;
+        // The parity our still-active QSOs are committed to (None ⇒ idle).
+        let current_side = qso_manager.current_tx_side().await;
+        // PAN-78: how many more QSOs may start (saturating: a count already above
+        // the cap, e.g. Fox QSOs left over after Fox mode disengaged, frees none).
+        let snap = limits.snapshot(qso_manager).await;
+        let free_slots = snap.cap.saturating_sub(snap.active);
+
+        let (to_start, keep_depth, cross_parity): (Vec<PendingManualCall>, usize, usize) = {
+            let mut q = pending.lock().await;
+            if q.is_empty() {
+                break;
             }
-            // Replay via `respond_to_caller`, which degrades a `Grid` step to
-            // exactly the `respond_to_cq_with` call this promotion path used
-            // before `RespondToCaller` entries could be queued here — so a
-            // `StartQso`-originated entry (always `step == Grid`) is
-            // byte-identical to the pre-existing behavior. A
-            // `RespondToCaller`-originated entry opens at its own step
-            // (Report/ReportAck/Rr73/SeventyThree) instead.
-            qso_manager
-                .respond_to_caller(
-                    p.callsign.clone(),
-                    tx_off,
-                    p.dx_parity,
-                    p.step,
-                    p.our_snr_of_them,
-                    p.their_report,
-                    partner,
-                    p.remote_origin,
-                    p.remote_client_key_id.clone(),
-                )
-                .await
-                .map(|_| ())
+            info!(
+                target: "qso",
+                "promote_pending_manual_calls: current_side={:?}, queue_depth={}",
+                current_side,
+                q.len()
+            );
+            let queue = std::mem::take(&mut *q);
+            // The side the partition commits to (for the log line below only).
+            let adopt = current_side
+                .or_else(|| queue.front().and_then(PendingManualCall::desired_tx_parity));
+            let (start, keep) = partition_pending_calls(queue, current_side, free_slots);
+            let keep_depth = keep.len();
+            let cross_parity = keep
+                .iter()
+                .filter(|p| match (p.desired_tx_parity(), adopt) {
+                    (None, _) => false,
+                    (Some(want), Some(side)) => want != side,
+                    (Some(_), None) => true,
+                })
+                .count();
+            *q = keep;
+            (start, keep_depth, cross_parity)
         };
-        match result {
-            Ok(()) => {
-                emit_status(
-                    message_bus,
-                    format!("Now calling {} (was queued)", p.callsign),
-                )
-                .await;
+
+        if keep_depth > cross_parity {
+            // PAN-78: some calls matched the window but found no free slot.
+            info!(
+                target: "qso",
+                "Promote: {} starting, {} still queued (capacity {}/{}, cross-parity {}); current_side={:?}",
+                to_start.len(),
+                keep_depth,
+                snap.active,
+                snap.cap,
+                cross_parity,
+                current_side
+            );
+        } else if keep_depth > 0 {
+            info!(
+                target: "qso",
+                "Promote: {} call(s) starting, {} still queued (cross-parity); current_side={:?}",
+                to_start.len(),
+                keep_depth,
+                current_side
+            );
+        }
+
+        for p in to_start {
+            info!(
+                target: "qso",
+                "Promoting deferred {} call to {} on {:.0} Hz — window is now free",
+                if p.hound { "Hound" } else { "manual" },
+                p.callsign, p.frequency_hz
+            );
+            let result = if p.hound {
+                // Hound engage: re-derive the low calling offset + install Hound
+                // metadata (partner_freq, hound flag, QSY hook) via engage_hound.
+                qso_manager
+                    .engage_hound(
+                        &p.callsign,
+                        p.fox_freq_hz.unwrap_or(p.frequency_hz),
+                        p.fox_grid.as_deref(),
+                        p.dx_parity,
+                    )
+                    .await
+                    .map(|_| ())
+            } else {
+                // Normal manual call: re-run the held-offset + de-confliction
+                // logic at promotion time (not at queue time) so we use the
+                // CURRENT active offset set, not the stale snapshot from when
+                // the call was deferred. The held_hz/hold_mode fields carry the
+                // operator's intent from the original StartQso handler so the
+                // chosen offset is honoured even across the cross-parity deferral.
+                let active = qso_manager.active_tx_offsets().await;
+                let (tx_off, partner) =
+                    compute_manual_tx_offset(p.frequency_hz, p.hold_mode, p.held_hz, &active);
+                if tx_off != p.frequency_hz {
+                    info!(
+                        target: "qso",
+                        "Promoting queued call to {} — held_hz={} hold_mode={} dx_freq={:.0} \
+                         → tx_off={:.0} Hz (de-conflicted from {} active)",
+                        p.callsign, p.held_hz, p.hold_mode, p.frequency_hz, tx_off, active.len()
+                    );
+                }
+                // Replay via `respond_to_caller`, which degrades a `Grid` step to
+                // exactly the `respond_to_cq_with` call this promotion path used
+                // before `RespondToCaller` entries could be queued here — so a
+                // `StartQso`-originated entry (always `step == Grid`) is
+                // byte-identical to the pre-existing behavior. A
+                // `RespondToCaller`-originated entry opens at its own step
+                // (Report/ReportAck/Rr73/SeventyThree) instead.
+                qso_manager
+                    .respond_to_caller(
+                        p.callsign.clone(),
+                        tx_off,
+                        p.dx_parity,
+                        p.step,
+                        p.our_snr_of_them,
+                        p.their_report,
+                        partner,
+                        p.remote_origin,
+                        p.remote_client_key_id.clone(),
+                    )
+                    .await
+                    .map(|_| ())
+            };
+            match result {
+                Ok(()) => {
+                    emit_status(
+                        message_bus,
+                        format!("Now calling {} (was queued)", p.callsign),
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    error!(
+                        target: "qso",
+                        "Promoting queued call to {} failed — re-queuing: {}",
+                        p.callsign, e
+                    );
+                    failed.push(p);
+                    pass_failed = true;
+                }
             }
-            Err(e) => {
-                error!(
-                    target: "qso",
-                    "Promoting queued call to {} failed — re-queuing: {}",
-                    p.callsign, e
-                );
-                failed.push(p);
-            }
+        }
+        if !pass_failed {
+            break;
         }
     }
 
@@ -4842,6 +4856,11 @@ impl super::ApplicationCoordinator {
                                             parity,
                                             cq_attempt_id,
                                         } => {
+                                            // PAN-78: the autonomous task gated on its own view of
+                                            // the active count before sending this; a manual open
+                                            // may have filled the slot since. Re-check capacity and
+                                            // parity and open under the shared admission lock.
+                                            let _admission = qso_admission.lock().await;
                                             // Phase 5: the autonomous operator decided to open
                                             // a QSO. Create it in the QsoManager as an Auto QSO
                                             // so the engine auto-sequences it to completion; the
@@ -4899,6 +4918,29 @@ impl super::ApplicationCoordinator {
                                                 // must be rolled back the
                                                 // same way a downstream
                                                 // failure is.
+                                                notify_autonomous_cq_dispatch_failed_if_self_cq(
+                                                    &message_bus,
+                                                    &callsign,
+                                                    cq_attempt_id,
+                                                    &pending_autonomous_cq_dispatch_failures,
+                                                )
+                                                .await;
+                                                continue;
+                                            }
+                                            if let Some(snap) = manual_open_at_capacity(
+                                                &qso_manager,
+                                                auto_answer_max_concurrent,
+                                                &fox_mode,
+                                                &fox_max_streams,
+                                                &fox_admitted_qsos,
+                                            )
+                                            .await
+                                            {
+                                                info!(
+                                                    target: "qso.autonomous",
+                                                    "Skipping autonomous QSO ({:?}) — at capacity {}/{}",
+                                                    callsign, snap.active, snap.cap
+                                                );
                                                 notify_autonomous_cq_dispatch_failed_if_self_cq(
                                                     &message_bus,
                                                     &callsign,
@@ -6954,6 +6996,29 @@ mod pending_manual_tests {
 
     fn queued_names(q: &VecDeque<super::PendingManualCall>) -> Vec<String> {
         q.iter().map(|p| p.callsign.clone()).collect()
+    }
+
+    /// PAN-78 (Codex P2 on #449): a queued call that fails to start frees
+    /// its slot for the next matching queued call in the same promotion.
+    #[tokio::test]
+    async fn promotion_keeps_filling_after_a_failed_open() {
+        let mgr = test_manager("K5ARH").await;
+        let bus = MessageBus::new(1000).expect("bus");
+        // "<...>" can never open (PAN-23), so it fails at promotion time.
+        let pending: PendingManualCalls = Arc::new(TokioMutex::new(VecDeque::from([
+            even_dx_call_at("<...>", 1000.0),
+            even_dx_call_at("JA2BBB", 1500.0),
+        ])));
+
+        promote_pending_manual_calls(&mgr, &pending, &bus, &limits(1)).await;
+
+        assert_eq!(mgr.active_qso_count().await, 1, "the slot is still filled");
+        assert!(mgr.has_active_qso_with("JA2BBB").await);
+        assert_eq!(
+            queued_names(&*pending.lock().await),
+            vec!["<...>"],
+            "the failed call is re-queued at the front"
+        );
     }
 
     /// PAN-78 (Codex on #449): promotion takes the admission lock, so it
@@ -12950,6 +13015,27 @@ mod manual_capacity_admission_tests {
         );
         assert!(!any_tx_containing(&tx, "K5FOX"), "{tx:?}");
         assert_eq!(h.manager.active_qso_count().await, 1);
+    }
+
+    /// Codex P1 on #449: an autonomous open queued before a manual open
+    /// filled the last slot is re-checked against the cap when handled.
+    #[tokio::test]
+    async fn autonomous_open_is_rechecked_against_the_cap() {
+        let h = harness(1, false).await;
+        h.open_idle_qso_a().await;
+
+        // Same parity as A (DX Even ⇒ we TX Odd), so only capacity can refuse.
+        h.send(QsoMessage::StartAutonomousQso {
+            callsign: Some("K3CCC".to_string()),
+            frequency: 1800.0,
+            parity: Some(SlotParity::Even),
+            cq_attempt_id: None,
+        })
+        .await;
+        let tx = collect_quiet(&h.tx, 500).await;
+        assert!(!any_tx_containing(&tx, "K3CCC"), "{tx:?}");
+        assert_eq!(h.manager.active_qso_count().await, 1);
+        assert!(!h.manager.has_active_qso_with("K3CCC").await);
     }
 
     fn engage_k5fox() -> QsoMessage {
