@@ -154,6 +154,39 @@ baud_rate = 38400
 > The TCP port is unauthenticated; if you do this on anything other
 > than a trusted LAN, anyone who can reach the port can drive your rig.
 
+### `[rig.frequency.band_plan]` — amateur band privileges (TX gate + edge warning)
+
+```toml
+[rig.frequency.band_plan]
+region = 2            # ITU/IARU region 1, 2 or 3 (2 = Americas; default 2)
+edge_warnings = true  # master switch: the band-plan TX gate AND the TUI edge
+                      # warning. false disables BOTH — the operator's opt-out
+                      # (e.g. a CW/SSB station parked outside the FT8 tables).
+                      # Default true.
+
+[rig.frequency.band_plan.custom_bands]   # optional per-band override, keyed by Band::Display
+"40m" = { name = "40m", ranges = [{ start = 7_000_000, end = 7_200_000, modes = [] }], default_mode = "FT8", band_type = "HF" }
+# e.g. a national allocation narrower than the IARU region table
+```
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `region` | integer | `2` | Selects the IARU region tables (1, 2 or 3; they diverge on 40/60/80 m, 2 m, 70 cm). An invalid number falls back to the global table — never panics. |
+| `edge_warnings` | bool | `true` | Master switch for both the hard TX refusal and the TUI's manual-frequency-entry warning. `false` disables both: nothing is refused, nothing warns. |
+| `custom_bands."<band>"` | table | — | Overrides the region table for that band (in-band iff the RF falls within ANY of the entry's `ranges`, OR across ranges). Applies to frequencies the band table resolves to that band — the escape hatch for a national allocation narrower than your region's default. |
+
+Since PAN-118 the band plan is enforced, not just displayed: every path that
+asserts PTT (scheduled FT8 transmissions and multi-TX bundle items, F4 tune,
+manual Shift+T PTT, remote-originated frames) is **refused before keying**
+whenever the absolute TX RF it would transmit on — the effective dial (split
+TX dial when split is active, else the RX dial) plus the frame's audio
+offset — falls outside the plan, with a `TX blocked (TX frequency … Hz is
+outside the configured amateur band plan)` diagnostic. A multi-TX bundle
+drops only its out-of-privilege items; in-privilege siblings still key. The
+check is skipped while the dial is not yet known (mock rig / CAT-disabled
+modes). Edits take effect on restart — config is loaded once at startup, and
+the runtime hot-reload apply task is a documented no-op.
+
 ---
 
 ## `[autonomous]` — the brain

@@ -184,6 +184,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   30 s), so the RIG badge also recovers without a transmission. New `rig.cat`
   and `audio.health` diagnostics mark each loss and recovery.
 
+- The station now refuses to transmit outside the configured amateur band
+  plan instead of only displaying it (PAN-118). Every path that asserts PTT —
+  single `TransmitRequest`, multi-TX bundles (per item), `TuneRequest` (F4),
+  and manual PTT (Shift+T), any origin — is refused before PTT whenever the
+  absolute TX RF it would key on (effective split-aware dial + the request's
+  audio offset) falls outside the plan (region table or `custom_bands`
+  override), with a `TX blocked (TX frequency … Hz is outside the configured
+  amateur band plan)` diagnostic and the same failed-completion reporting
+  every other hard-mute refusal uses. A multi-TX bundle drops only its
+  out-of-privilege items; in-privilege siblings still key (a whole bundle is
+  refused only once the summed waveform makes per-item extraction impossible,
+  mirroring the existing stale-item semantics). The check is skipped while the
+  dial is not yet known (the 0 sentinel — mock-rig and `--no-audio --test-tx`
+  dev modes), and `[rig.frequency.band_plan] edge_warnings = false` disables
+  both the hard refusal and the TUI edge warning (the operator's escape
+  hatch), documented for the first time in `docs/CONFIG.md`. Band-plan edits
+  apply on restart, as all config does.
+
 - Every documented minimal config block now parses on its own (PAN-90): the
   README's `[autonomous] enabled = true`, both GUIDE.md GridTracker
   `[network.wsjtx_udp]` recipes, and CONFIG.md's minimum viable config used

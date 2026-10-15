@@ -231,6 +231,68 @@ Single TX and bundles also re-run the gate synchronously just before Step 4d-arm
 between the post-wait gate and `SetPtt` for faults that land in it. No mid-transmission abort: a fault
 that starts while PTT is already keyed is still ended by the existing PTT watchdog.
 
+## Out-of-band TX is hard-refused by the band-plan gate (PAN-118), 2026-10-14
+
+The configured band plan (`[rig.frequency.band_plan]`) was display-only: it fed exactly one consumer,
+the TUI's manual frequency-entry warning modal. The coordinator's TX gate never consulted it, so a
+transmission whose absolute RF fell inside no amateur allocation (reproduced with the dial parked at
+15.000 MHz — between 20 m and 17 m) still keyed `SetPtt{true}`. PAN-118 reverses the 2026-07-25
+band-plan design's explicit non-goal ("no hard TX block — stays a soft, once-per-session warning"):
+the plan is now load-bearing for TX safety.
+
+**Sibling gate, not a ninth parameter.** Every input to `tx_hard_mute_reason` is global,
+frequency-independent state ("may the station key at all"); band-plan compliance is per-request —
+two bundle items at different audio offsets can straddle an edge at the same instant. Folding it in
+would force the one frequency-less consumer (the QSO stall-evidence closure, `qso.rs`) to grow a
+parameter it cannot have. Instead `tx_band_plan_mute_reason(tx_rf_hz, &band_plan)` is evaluated
+ALONGSIDE the shared gate at every PTT-on decision point: single-TX Step 0 / post-wait /
+last-instant, bundle Step 0 / Step 4b key-time / post-wait / final, TuneRequest (admission and
+last-instant), and manual PTT
+(`ptt_band_plan_refusal`, a sibling of `ptt_on_refusal`). The boolean core stays the single
+`pancetta_tui::app::tx_rf_out_of_band_plan` implementation (region tables + `custom_bands`
+override) shared with the TUI modal; the dial-vs-split resolution stays the single
+`effective_tx_dial`, wrapped by `tx_rf_for_gate` (effective dial + absolute audio offset).
+
+**Dial-0 sentinel skips the check.** An effective TX dial of 0 (`effective_tx_dial` resolved first, so a known split dial with the RX dial still 0 IS gated — PR #446 Codex review) — i.e. `operating_frequency_hz == 0` with no split — is the codebase's "frequency not
+yet known" state (mock rig, rig-disabled dev modes, `--replay` seed); refusing there would
+permanently block TX in exactly the modes where PTT reaches no radio, and churn every worker-gate
+test that legitimately never sets a dial. Production rig paths seed a real dial at startup (the
+Hamlib poll loop's initial `get_frequency`, which startup blocks on), and PAN-115 already refuses
+while the CAT link is `PollingFailed`, so the skip's fail-open window has no RF behind it. Rejected:
+fail-closed on 0.
+
+**`edge_warnings` is the single master switch** for warn + enforce — no new config fields, no `enforce`
+flag. Before PAN-118 the field only suppressed the TUI modal; `edge_warnings = false` now also
+disables the hard refusal, so no working config stops working (the documented escape hatch for a
+station deliberately parked outside the FT8 tables). Config still loads once at startup; the worker
+snapshots `BandPlanConfig` at start, which keeps the last-instant re-check synchronous (atomics + a
+local struct; "nothing else runs between this call and the key" still holds).
+
+**Per-item bundle semantics, with a physics boundary.** At bundle Step 0 (items still separate) and
+the Step 4b key-time mask (where the existing partial-liveness machinery re-encodes the surviving
+subset), an out-of-privilege item is dropped and reported while in-privilege siblings still key —
+mirroring `bundle_live_mask`. At the two post-sum sites (post-wait re-key and final pre-PTT), the
+waveform is one summed buffer: an out-of-privilege item's audio energy cannot be individually
+extracted, so ANY out-of-privilege item holds the whole bundle (nothing keys; every item reported
+unaired) — the same whole-bundle hold the existing final liveness check applies to a stale item.
+
+**Bound: the gate reads the dial atomics, not confirmed RF.** `tx_rf_for_gate` reads the shared
+`operating_frequency_hz` / `split_tx_frequency_hz` atomics, which can disagree with the rig around a
+commanded QSY in both directions. The TUI relay's `SetFrequency` / `SetSplit` handlers and the
+autonomous band hop store the requested value before enqueuing the CAT command, and the Hamlib poll
+loop stores the rig's current reading every tick, so it can revert a requested value while that
+command still sits in the queue. A key-time check in either window gates on a frequency the rig is
+not keyed on: FIFO order applies the queued command before the later `SetPtt`, and the
+pending/in-flight mute covers a command only once the Hamlib loop is applying it (or while it waits
+in a restart pending slot). Closing this needs a confirmed-RF source (the rig's split is never read
+back) or in-flight marking from the requested-value store through CAT application. That producer
+ordering predates PAN-118 and is follow-up scope.
+
+The QSO stall-evidence closure (`qso.rs`) is deliberately untouched; whether band-plan refusals
+should suppress stall-escape counting is follow-up scope. The `coord_sim` fixture mirrors the gate
+in its `drive_slot` chain using the re-exported real gate functions, exactly as it does for the
+coalescer and arm gate.
+
 ## Coordinator-level QSO sim harness
 
 `pancetta/tests/coord_sim.rs`: a durable, reusable `CoordSim` fixture that exercises the *coordinator's* TX gate + mock-rig PTT + multi-stream path, complementing the engine-level state-machine harness in `pancetta-qso/src/sim.rs`. It stands up a real `MessageBus`, a real `QsoManager`, a real `MockRig` behind a hamlib consumer (mirror of `coordinator/hamlib.rs`'s `SetPtt` handling), and the *real* shared `active_tx_qsos` set + `tx_policy` atomic. A scenario starts/advances QSOs via the manager's real entry points (`respond_to_cq_with` / `respond_to_caller` / `start_cq`), calls `pump_qso_events()` (a faithful mirror of `coordinator/qso.rs`'s populater — insert on `StateChanged→active`/`QsoCompleted`, remove on `Failed`/`QsoFailed`, forward `MessageToSend`→`TransmitRequest`), then `drive_slot(pending)` which replicates the worker's keying-decision chain — **policy hard-mute → coalesce (real `coalesce_transmit_requests`) → Step-4b gate (real `tx_qso_is_live` over the real set) → key/audio/unkey** — sending real `RigControl(SetPtt)` over the bus to the mock rig and **asserting at the rig level** (`mock.get_ptt() == On`, offset, release). **Determinism**: no `schedule_tx` UTC math and no slot sleep (that's unit-tested in `tx.rs::schedule_tx_tests`); only bounded ms `await`s — pass/fail never depends on wall-clock slot phase. A `Timeline` (keyed / dropped / per-slot offsets, mirroring `sim::Timeline`'s style + Display) carries the readable assertion helpers. Permanent scenarios: PTT-keys-for-scheduled-QSO (StateChanged-at-start fix), stale-TX-dropped-after-supersede (no PTT), coalesce-backlog (newest wins, older not keyed), two-simultaneous-QSOs on distinct freqs, TX-policy Disabled=silent / RespondOnly=in-progress-keys-but-initiation-suppressed / Full=keys, requested-offset-honored, manual-send-never-gated. Made testable by re-exporting `coalesce_transmit_requests` / `CoalesceEntry` / `resolve_required_parity` and widening `active_tx_qso_key` / `tx_qso_is_live` to `pub` from `coordinator/mod.rs` (visibility-only, behavior-preserving).

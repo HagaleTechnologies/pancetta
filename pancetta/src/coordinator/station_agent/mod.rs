@@ -144,6 +144,12 @@ const RECV_TICK: Duration = Duration::from_millis(200);
 /// `remote_tx_arm`, so arming here is visible to the TX worker immediately.
 struct ArmContext {
     arm: Arc<Mutex<ArmState>>,
+    /// The coordinator's shared split-TX dial (0 = simplex) — the source the
+    /// TX band-plan gate (`tx::tx_rf_for_gate`) and the QSO RF stamp read. A
+    /// remote `SetSplit` writes it (via [`super::record_split_state`], the
+    /// same helper the local TUI path uses) before forwarding to Hamlib, so a
+    /// remote split is gated exactly like a local one (PR #446 Codex review).
+    split_tx_frequency_hz: Arc<std::sync::atomic::AtomicU64>,
     verifier: CapabilityVerifier,
     /// Verifying keys for allow-listed clients, keyed by client keyId. Shared
     /// and periodically refreshed by the Q-0043 auto-populate poll task
@@ -970,9 +976,31 @@ async fn dispatch_action(
                 warn!(target: "agent.control", peer = %peer, "setSplit refused — no currently-valid qsy-scoped hello capability for this peer");
                 return DispatchOutcome::cont_with(grab);
             }
+            let tx_frequency = tx_frequency_hz.max(0.0) as u64;
+            // Update the shared split source BEFORE the rig command, exactly
+            // like the local TUI path, so the TX band-plan gate checks the
+            // remote split dial, never the stale RX dial (PR #446 Codex
+            // review). Split is never polled back from the rig, so this is
+            // the only place a remote split reaches the gate.
+            let store = crate::coordinator::record_split_state(
+                &ctx.split_tx_frequency_hz,
+                enabled,
+                tx_frequency,
+            );
+            info!(target: "rig.split", peer = %peer, "remote SetSplit enabled={enabled} tx={tx_frequency} Hz");
+            // Echo the authoritative split state to the local TUI chip.
+            let status = ComponentMessage::new(
+                ComponentId::StationAgent,
+                ComponentId::Tui,
+                MessageType::SplitStatus { tx_hz: store },
+                std::time::Instant::now(),
+            );
+            if let Err(e) = bus.send_message(status).await {
+                debug!(target: "agent.control", "split status echo failed: {e}");
+            }
             let msg = RigControlMessage::SetSplit {
                 enabled,
-                tx_frequency: tx_frequency_hz.max(0.0) as u64,
+                tx_frequency,
             };
             send_rig(bus, msg).await;
             DispatchOutcome::cont_with(grab)
@@ -1876,6 +1904,7 @@ impl super::ApplicationCoordinator {
         let bus = self.message_bus.clone();
         let shutdown = self.shutdown_signal.clone();
         let arm = self.remote_tx_arm.clone();
+        let split_tx_frequency_hz = self.split_tx_frequency_hz();
         // Round-1 review fix (PR #261): shared with `poll_authorizations_loop`
         // so a poll-driven disarm can flag the session loop to broadcast the
         // updated control state (see `ArmContext::revocation_pending`).
@@ -1964,6 +1993,7 @@ impl super::ApplicationCoordinator {
                 bus,
                 events,
                 arm,
+                split_tx_frequency_hz,
                 revocation_pending,
                 authz_generation,
                 shutdown,
@@ -2228,6 +2258,8 @@ struct RunConfig {
     /// (`drain_read_stream` no-ops on `None`).
     events: Option<tokio::sync::broadcast::Receiver<pancetta_protocol::ServerEvent>>,
     arm: Arc<Mutex<ArmState>>,
+    /// Threaded into `ArmContext::split_tx_frequency_hz` — see there.
+    split_tx_frequency_hz: Arc<std::sync::atomic::AtomicU64>,
     /// Threaded into `ArmContext::revocation_pending` — see there.
     revocation_pending: Arc<std::sync::atomic::AtomicBool>,
     /// Threaded into `ArmContext::authz_generation` — see there.
@@ -2254,6 +2286,7 @@ async fn run_session_loop(mut cfg: RunConfig) {
     let mut backoff = RECONNECT_BACKOFF_MIN;
     let mut ctx = ArmContext {
         arm: cfg.arm.clone(),
+        split_tx_frequency_hz: cfg.split_tx_frequency_hz.clone(),
         verifier: cfg.verifier,
         client_keys: cfg.client_keys,
         tx_allow_list: cfg.tx_allow_list,
@@ -2831,6 +2864,7 @@ mod tests {
         let tx_arm_allow = allow.clone();
         ArmContext {
             arm: Arc::new(Mutex::new(ArmState::new())),
+            split_tx_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             verifier: CapabilityVerifier {
                 agent_key_id: AGENT_KEY_ID.to_string(),
                 pinned_idp_keys: vec![IdpKey {
@@ -3558,6 +3592,125 @@ mod tests {
         assert!(
             hamlib_rx.try_recv().is_ok(),
             "a non-tx-enabled token with qsy scope must still permit setFrequency"
+        );
+    }
+
+    /// PR #446 Codex review: the TX band-plan gate (QSO TX and manual PTT)
+    /// resolves the TX dial from the coordinator's split atomic. A verified
+    /// peer's remote SetSplit must write that atomic, or an out-of-band
+    /// remote split leaves the gate checking the in-band RX dial.
+    fn band_gate_refuses(
+        ctx: &ArmContext,
+        rx_dial: u64,
+        audio_offset_hz: f64,
+        span_hz: f64,
+    ) -> bool {
+        let rx = Arc::new(std::sync::atomic::AtomicU64::new(rx_dial));
+        crate::coordinator::tx_rf_for_gate(&rx, &ctx.split_tx_frequency_hz, audio_offset_hz)
+            .and_then(|rf| {
+                crate::coordinator::tx_band_plan_mute_reason(
+                    rf,
+                    span_hz,
+                    &pancetta_config::BandPlanConfig::default(),
+                )
+            })
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn remote_out_of_band_set_split_makes_the_band_gate_refuse() {
+        let mut ctx = ctx_with(true, true);
+        ctx.peers.insert(
+            CLIENT_KEY_ID.to_string(),
+            PeerCtx::authorized_until(vec!["qsy".to_string()], NOW + 600_000),
+        );
+        let bus = MessageBus::new(64).unwrap();
+        let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let ft8_span = crate::coordinator::tx_signal_span_hz(pancetta_ft8::Protocol::Ft8);
+        // In-band 20m RX dial, simplex: QSO TX and manual PTT both permitted.
+        assert!(!band_gate_refuses(&ctx, 14_074_000, 1_500.0, ft8_span));
+        assert!(!band_gate_refuses(&ctx, 14_074_000, 0.0, 0.0));
+
+        // 15.000 MHz sits between 20m and 17m.
+        dispatch_action(
+            ControlAction::SetSplit {
+                enabled: true,
+                tx_frequency_hz: 15_000_000.0,
+            },
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(
+            hamlib_rx.try_recv().is_ok(),
+            "setSplit still forwarded to Hamlib"
+        );
+        assert_eq!(
+            ctx.split_tx_frequency_hz.load(Ordering::Relaxed),
+            15_000_000,
+            "remote SetSplit must update the shared split source"
+        );
+        assert!(
+            band_gate_refuses(&ctx, 14_074_000, 1_500.0, ft8_span),
+            "QSO TX on an out-of-band remote split must be refused"
+        );
+        assert!(
+            band_gate_refuses(&ctx, 14_074_000, 0.0, 0.0),
+            "manual PTT on an out-of-band remote split must be refused"
+        );
+
+        // Clearing split returns the gate to the in-band RX dial.
+        dispatch_action(
+            ControlAction::SetSplit {
+                enabled: false,
+                tx_frequency_hz: 15_000_000.0,
+            },
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(
+            hamlib_rx.try_recv().is_ok(),
+            "split clear forwarded to Hamlib"
+        );
+        assert_eq!(ctx.split_tx_frequency_hz.load(Ordering::Relaxed), 0);
+        assert!(!band_gate_refuses(&ctx, 14_074_000, 1_500.0, ft8_span));
+        assert!(!band_gate_refuses(&ctx, 14_074_000, 0.0, 0.0));
+    }
+
+    #[tokio::test]
+    async fn refused_remote_set_split_leaves_the_split_source_untouched() {
+        // No qsy scope: the SetSplit is refused, so neither the rig nor the
+        // gate's split source may change.
+        let mut ctx = ctx_with(true, true);
+        ctx.split_tx_frequency_hz
+            .store(14_080_000, Ordering::Relaxed);
+        ctx.peers
+            .insert(CLIENT_KEY_ID.to_string(), PeerCtx::unauthorized());
+        let bus = MessageBus::new(64).unwrap();
+        let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        dispatch_action(
+            ControlAction::SetSplit {
+                enabled: false,
+                tx_frequency_hz: 0.0,
+            },
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(hamlib_rx.try_recv().is_err());
+        assert_eq!(
+            ctx.split_tx_frequency_hz.load(Ordering::Relaxed),
+            14_080_000
         );
     }
 
@@ -5151,6 +5304,7 @@ mod tests {
         let tx_arm_allow = allow.clone();
         let mut ctx = ArmContext {
             arm: Arc::new(Mutex::new(ArmState::new())),
+            split_tx_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             verifier: CapabilityVerifier {
                 agent_key_id: identity.key_id(),
                 pinned_idp_keys: vec![IdpKey {
@@ -5252,6 +5406,7 @@ mod tests {
         let tx_arm_allow = allow.clone();
         ArmContext {
             arm: Arc::new(Mutex::new(ArmState::new())),
+            split_tx_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             verifier: CapabilityVerifier {
                 agent_key_id: agent_kid.to_string(),
                 pinned_idp_keys: vec![IdpKey {
@@ -6281,6 +6436,7 @@ mod tests {
         let tx_arm_allow = allow.clone();
         ArmContext {
             arm: Arc::new(Mutex::new(ArmState::new())),
+            split_tx_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             verifier: CapabilityVerifier {
                 agent_key_id: agent_kid.to_string(),
                 pinned_idp_keys: vec![IdpKey {
@@ -9502,6 +9658,7 @@ mod tests {
             bus: MessageBus::new(64).unwrap(),
             events: None,
             arm: arm.clone(),
+            split_tx_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             revocation_pending,
             authz_generation,
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
