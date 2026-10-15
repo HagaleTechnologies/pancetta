@@ -8383,13 +8383,6 @@ impl super::ApplicationCoordinator {
                                             continue 'worker;
                                         }
 
-<<<<<<< HEAD
-                                        // --- Step 4d-arm: last-instant pre-PTT arm recheck (PAN-134)
-                                        // Authorization runs inside the bus read lock after its wait, with
-                                        // no suspension before enqueue. The mid-TX poll remains a backstop.
-                                        // PTT hardware is not asserted yet. Denial only unwinds the local
-                                        // PTT flag, pivot tombstones, and the announced TX/queue status.
-=======
                                         // PAN-118: the band-plan sibling of the
                                         // final pre-PTT mute above — nothing else
                                         // runs between this synchronous check
@@ -8443,80 +8436,17 @@ impl super::ApplicationCoordinator {
                                             continue 'worker;
                                         }
 
-                                        // --- Step 4d-arm: last-instant pre-PTT arm recheck
-                                        // (round-3 review, Codex P1) — round-2's placement
-                                        // here (before the two awaits above) still left the
-                                        // `send_tx_status`/`send_tx_queue_status` awaits
-                                        // between the check and the actual PTT-on send below,
-                                        // which is exactly the gap this check exists to close.
-                                        // This is the genuine last instant: nothing but the
-                                        // PTT-on send itself follows (PAN-148 extended this
-                                        // final gate above to also cover liveness/DX-parity).
-                                        // PTT hardware was never asserted on this path —
-                                        // `ptt_guard` only flipped the in-process `ptt_active`
-                                        // flag on construction — so denying here needs no
-                                        // PTT-off send, just unwinding that flag and the
-                                        // TX-badge/queue status the two awaits above just
-                                        // (prematurely) announced.
-                                        if origin == crate::message_bus::TxOrigin::Remote
-                                            && !remote_tx_permitted_for(
-                                                &remote_tx_arm,
-                                                pancetta_agent::arm::ArmTime::now,
-                                                remote_client_key_id.as_deref(),
-                                            )
-                                        {
-                                            ptt_active.store(false, Ordering::Release);
-                                            ptt_guard.disarm();
-                                            // Round-6 review (Codex P2): if Step 4c pivoted
-                                            // this cycle, remove the tombstone it inserted —
-                                            // nothing actually reached the air, so the
-                                            // genuinely fresh request still queued behind
-                                            // this one must NOT be discarded by Step 0-dup as
-                                            // an already-sent duplicate of a pivot that never
-                                            // transmitted.
-                                            let pivot_replaced =
-                                                pivoted_this_key.take().and_then(|key| {
-                                                    pivoted_once.remove(&key);
-                                                    pivoted_from.remove(&key)
-                                                });
-                                            let denial_reason = format!(
-                                                "arm went stale in the pre-PTT gap: '{message_text}' at {frequency_offset:.0} Hz"
-                                            );
-                                            let operator_callsign = tx_denied_operator_attribution(
-                                                &remote_tx_arm,
-                                                remote_client_key_id.as_deref(),
-                                            );
-                                            emit_disarm_interrupt_signals(
-                                                &message_bus,
-                                                &audit_log,
-                                                &display_feed_enabled,
-                                                operator_callsign,
-                                                "denied",
-                                                denial_reason,
-                                                qso_id.as_deref(),
-                                            )
-                                            .await;
-                                            send_tx_queue_status(&message_bus, None, Vec::new())
-                                                .await;
-                                            let _ = report_unaired_frame(
-                                                &message_bus,
-                                                message_text,
-                                                qso_id.clone(),
-                                                pivot_replaced,
-                                            )
-                                            .await;
-                                            continue 'worker;
-                                        }
-
                                         // PAN-117 (PR #450 Codex review): the slot-timing
-                                        // half of Step 4d, run LAST — after the liveness/
-                                        // DX-parity gate, the hard mute and the arm recheck
-                                        // above — so `chrono::Utc::now()` here is the true
-                                        // last clock read before the PTT-on send. A frame
-                                        // more than `tx_late_max_ms` into its target slot is
-                                        // dropped here instead of keyed (no receiver could
-                                        // decode the surviving fragment). SYNCHRONOUS:
-                                        // nothing runs between this read and the key.
+                                        // half of Step 4d, run LAST among the pre-send
+                                        // gates — after the liveness/DX-parity gate, the
+                                        // hard mute and the band-plan gate above — so
+                                        // `chrono::Utc::now()` here is the last clock read
+                                        // before the PTT-on send. A frame more than
+                                        // `tx_late_max_ms` into its target slot is dropped
+                                        // here instead of keyed (no receiver could decode
+                                        // the surviving fragment). SYNCHRONOUS up to
+                                        // `send_message_if` below, whose table-lock wait
+                                        // precedes its PAN-134 arm recheck and the enqueue.
                                         if let Some(denial) = key_time_gate_denial(
                                             chrono::Utc::now(),
                                             schedule.target_slot,
@@ -8559,7 +8489,11 @@ impl super::ApplicationCoordinator {
                                             continue 'worker;
                                         }
 
->>>>>>> b51f0b6dd5f217a94d151387265668635beb8210
+                                        // --- Step 4d-arm: last-instant pre-PTT arm recheck (PAN-134)
+                                        // Authorization runs inside the bus read lock after its wait, with
+                                        // no suspension before enqueue. The mid-TX poll remains a backstop.
+                                        // PTT hardware is not asserted yet. Denial only unwinds the local
+                                        // PTT flag, pivot tombstones, and the announced TX/queue status.
                                         let ptt_msg = ComponentMessage::new(
                                             ComponentId::Ft8Transmitter,
                                             ComponentId::Hamlib,
@@ -11336,13 +11270,6 @@ impl super::ApplicationCoordinator {
                                         continue;
                                     }
 
-<<<<<<< HEAD
-                                    // --- Step 4d-arm: last-instant pre-PTT arm recheck (PAN-134)
-                                    // Authorization runs inside the bus read lock after its wait, with
-                                    // no suspension before enqueue. The mid-TX poll remains a backstop.
-                                    // PTT hardware is not asserted yet. Denial only unwinds the local
-                                    // PTT flag, pivot tombstones, and the announced TX/queue status.
-=======
                                     // PAN-118: the band-plan sibling of the final
                                     // pre-PTT mute above — synchronous (atomics +
                                     // the startup band-plan snapshot), so "nothing
@@ -11403,87 +11330,22 @@ impl super::ApplicationCoordinator {
                                         continue;
                                     }
 
-                                    // --- Step 4d-arm: last-instant pre-PTT arm recheck
-                                    // (round-3 review, Codex P1) — mirrors the single-TX
-                                    // Step 4d-arm; round-2's placement here (before the
-                                    // status-send awaits above) left exactly the gap this
-                                    // check exists to close. This is the genuine last
-                                    // instant: nothing but the PTT-on send itself follows
-                                    // (PAN-148 extended this final gate above to also cover
-                                    // liveness/DX-parity). PTT hardware was never asserted
-                                    // on this path — `ptt_guard` only flipped the
-                                    // in-process `ptt_active` flag on construction — so
-                                    // denying here needs no PTT-off send, just unwinding
-                                    // that flag and the TX-badge/queue status the awaits
-                                    // above just (prematurely) announced.
-                                    if origin == crate::message_bus::TxOrigin::Remote
-                                        && !remote_tx_permitted_for(
-                                            &remote_tx_arm,
-                                            pancetta_agent::arm::ArmTime::now,
-                                            remote_client_key_id.as_deref(),
-                                        )
-                                    {
-                                        ptt_active.store(false, Ordering::Release);
-                                        ptt_guard.disarm();
-                                        // Round-6 review (Codex P2): nothing reached the
-                                        // air — remove any tombstone this bundle's Step
-                                        // 4b-pivot just inserted, so the genuinely fresh
-                                        // request still queued behind it isn't discarded by
-                                        // Step 0-dup as an already-sent duplicate.
-                                        let mut bundle_replaced = unwind_bundle_pivots(
-                                            &pivoted_this_bundle_keys,
-                                            &mut pivoted_once,
-                                            &mut pivoted_from,
-                                        );
-                                        let operator_callsign = tx_denied_operator_attribution(
-                                            &remote_tx_arm,
-                                            remote_client_key_id.as_deref(),
-                                        );
-                                        for item in &items {
-                                            let denial_reason = format!(
-                                                "arm went stale in the pre-PTT gap: '{}' at {:.0} Hz",
-                                                item.message_text, item.frequency_offset
-                                            );
-                                            emit_disarm_interrupt_signals(
-                                                &message_bus,
-                                                &audit_log,
-                                                &display_feed_enabled,
-                                                operator_callsign.clone(),
-                                                "denied",
-                                                denial_reason,
-                                                item.qso_id.as_deref(),
-                                            )
-                                            .await;
-                                        }
-                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
-                                        for item in &items {
-                                            let _ = report_unaired_frame(
-                                                &message_bus,
-                                                item.message_text.clone(),
-                                                item.qso_id.clone(),
-                                                take_bundle_replaced(
-                                                    &mut bundle_replaced,
-                                                    item.qso_id.as_deref(),
-                                                ),
-                                            )
-                                            .await;
-                                        }
-                                        continue;
-                                    }
-
                                     // PAN-117 (six-lane review L5 H-7; PR #450 Codex
-                                    // review): re-check slot-timing headroom LAST — after
-                                    // the liveness mask, the hard mute and the arm recheck
-                                    // above — so this clock read is the true last one
-                                    // before the PTT-on send. The whole bundle shares one
-                                    // slot (per `multi_tx_status_items`' doc), so this is a
+                                    // review): re-check slot-timing headroom LAST among the
+                                    // pre-send gates — after the liveness mask, the hard
+                                    // mute and the band-plan gate above — so this clock
+                                    // read is the last one before the PTT-on send. The
+                                    // whole bundle shares one slot (per
+                                    // `multi_tx_status_items`' doc), so this is a
                                     // bundle-level check. A frame keyed more than
                                     // `tx_late_max_ms` past the slot boundary is
                                     // mathematically undecodable for any receiver; the
                                     // queue-time `schedule_tx` decision never sees the
                                     // coalesce/encode/gate delays, so it is dropped HERE
                                     // through the same whole-bundle unwind as the liveness
-                                    // branch above. SYNCHRONOUS up to the key.
+                                    // branch above. SYNCHRONOUS up to `send_message_if`
+                                    // below, whose table-lock wait precedes its PAN-134
+                                    // arm recheck and the enqueue.
                                     let key_time_now = chrono::Utc::now();
                                     let key_time_late_max_ms =
                                         tx_late_max_ms_effective(active_protocol, tx_late_max_ms);
@@ -11533,7 +11395,12 @@ impl super::ApplicationCoordinator {
                                         }
                                         continue;
                                     }
->>>>>>> b51f0b6dd5f217a94d151387265668635beb8210
+
+                                    // --- Step 4d-arm: last-instant pre-PTT arm recheck (PAN-134)
+                                    // Authorization runs inside the bus read lock after its wait, with
+                                    // no suspension before enqueue. The mid-TX poll remains a backstop.
+                                    // PTT hardware is not asserted yet. Denial only unwinds the local
+                                    // PTT flag, pivot tombstones, and the announced TX/queue status.
                                     let ptt_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Hamlib,
