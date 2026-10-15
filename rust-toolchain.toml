@@ -11,7 +11,9 @@
 # user's default and of the toolchain a CI action installs, and auto-install it
 # on first use. Every machine and CI lane therefore builds with this exact
 # version. 1.98.0 matches the Catalyst runner image, so cloud runs don't
-# download a second toolchain. Bump it deliberately, in its own PR.
+# download a second toolchain. Bump it deliberately, in its own PR, together
+# with the `toolchain:` input in .github/workflows/release.yml (it installs the
+# cross-compile targets into this exact version).
 [toolchain]
 channel = "1.98.0"
 components = ["rustfmt", "clippy"]

@@ -103,8 +103,12 @@ jobs:
         #   choco install mingw -y
         run: gcc --version
 
+      # toolchain must match rust-toolchain.toml: the action installs `targets`
+      # into the toolchain it selects, but cargo then runs the pinned one, which
+      # would otherwise lack the matrix target.
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
+          toolchain: 1.98.0
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
