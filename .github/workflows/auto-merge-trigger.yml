@@ -59,6 +59,10 @@ jobs:
           github.event.pull_request.user.login == 'catalyst-cloud-connector[bot]'
         )
       )
+    # Q-0068: CODEX_REVIEW_PAT lives in the main-only codex-review environment.
+    environment:
+      name: codex-review
+      deployment: false
     runs-on: ubuntu-latest
     # Shared with queue-retry-handler.yml's own mutating job -- closes a TOCTOU race where
     # this job could read the pause label as absent and arm moments after queue-retry-

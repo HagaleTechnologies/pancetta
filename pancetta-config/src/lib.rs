@@ -1812,6 +1812,14 @@ mod merge_guard {
 
     #[test]
     fn merge_with_carries_every_field() {
+        assert_carries_all::<network::RemoteGatewayConfig>(
+            "RemoteGatewayConfig",
+            &[
+                ("auth_token", json!("t".repeat(40))),
+                ("allowed_origins", json!(["http://localhost:8081"])),
+            ],
+            |a, b| a.merge_with(b),
+        );
         assert_carries_all::<network::NetworkConfig>("NetworkConfig", &[], |a, b| a.merge_with(b));
 
         assert_carries_all::<station::StationConfig>(

@@ -505,6 +505,75 @@ config validation rejects the file.
 
 ---
 
+### `[network.remote_gateway]` — local read-only view (Panino)
+
+The default-off gateway serves station and contact data to authenticated clients.
+Generate a secret with `openssl rand -hex 32`, put it in `auth_token`, and protect
+this file with `chmod 600`.
+
+```toml
+[network.remote_gateway]
+enabled = true
+bind_addr = "127.0.0.1:4080"
+auth_token = "<paste the generated secret here>"
+allowed_origins = [] # for a browser dev client: ["http://localhost:8081"]
+allow_network_exposure = false
+```
+
+| Key | Default | Rule |
+|-----|---------|------|
+| `enabled` | `false` | Enable the read-only WebSocket listener. Disabled sections are not validated. |
+| `bind_addr` | `"127.0.0.1:4080"` | An IP literal and port, such as `127.0.0.1:4080` or `[::1]:4080`; hostnames are refused. |
+| `auth_token` | absent | Required when enabled; at least 32 characters, with no whitespace or control characters. |
+| `allowed_origins` | `[]` | Bare `http://` or `https://` browser origins, with a host and optional port; no path, query, fragment, credentials, whitespace or trailing slash. Each entry must be written exactly as a browser sends it in `Origin` (ASCII case aside): no default port (`http://localhost`, not `http://localhost:80`) and no host the URL parser would rewrite. A non-canonical entry is refused, and the error names the origin a browser would send. |
+| `allow_network_exposure` | `false` | Explicitly acknowledge serving station and contact data unencrypted over the network when binding a non-loopback address. A token is still required. |
+
+Connect to `ws://<bind_addr>/ws` and send `hello.gatewayToken` as the first text
+frame within 5 seconds. The gateway sends no Welcome, snapshot or live events
+until that token matches. Authentication failure closes with WebSocket code
+1008 and reason `authentication required`. Inbound messages and frames are
+limited to 64 KiB. Authenticated clients can only read; commands are ignored.
+
+Browser requests must carry an Origin matching an entry in `allowed_origins`,
+ignoring ASCII case. Unlisted origins and `null` receive HTTP 403 before upgrade.
+Native requests without Origin still need the token. There is no implicit
+localhost Origin allowance.
+
+Loopback includes 127.0.0.0/8 and ::1. Unspecified addresses, LAN addresses and
+IPv4-mapped IPv6 addresses require `allow_network_exposure = true`. A non-loopback
+bind is still plain `ws://`, without TLS. The listener logs its actual address
+and warns when network-exposed. Gateway settings take effect on restart.
+
+`pancetta config --validate` reports the following exact validation messages:
+
+```text
+# enabled = true, no auth_token (or shorter than 32 chars, or containing whitespace)
+Configuration validation: FAIL
+Error: Validation error: network.remote_gateway.auth_token must be set to a secret of at least 32 characters with no whitespace when the gateway is enabled (generate one with: openssl rand -hex 32)
+exit 1
+
+# enabled = true, auth_token set, bind_addr = "0.0.0.0:4080", allow_network_exposure = false
+Configuration validation: FAIL
+Error: Validation error: network.remote_gateway.bind_addr 0.0.0.0:4080 is not a loopback address, so station and contact data would be served unencrypted to the network; bind to 127.0.0.1 or [::1], or set network.remote_gateway.allow_network_exposure = true to accept that
+exit 1
+
+# enabled = true, bind_addr = "localhost:4080"
+Configuration validation: FAIL
+Error: Validation error: network.remote_gateway.bind_addr "localhost:4080" must be an IP address and port, e.g. "127.0.0.1:4080" or "[::1]:4080"
+exit 1
+
+# enabled = true, allowed_origins = ["https://cqdx.io/app"]
+Configuration validation: FAIL
+Error: Validation error: network.remote_gateway.allowed_origins entry "https://cqdx.io/app" must be a bare browser origin: http:// or https:// followed by a host and optional port, with no path, query or trailing slash
+exit 1
+
+# enabled = true, auth_token set, bind_addr = "0.0.0.0:4080", allow_network_exposure = true
+Configuration validation: PASS
+exit 0
+```
+
+---
+
 ## `[ui]` — TUI behaviour
 
 ```toml
@@ -547,6 +616,7 @@ effect within a second of save. Exceptions:
 - `[audio]` device names — require a TUI restart (cpal streams are bound
   at startup).
 - `[rig.interface]` — same; rigctld is spawned once.
+- `[network.remote_gateway]` changes take effect on restart.
 - `[station].callsign` — never hot-reloaded (active QSOs would mid-flight
   contradict their own metadata).
 

@@ -36,6 +36,7 @@ geographiclib-rs = { workspace = true }
 
 # HTTP server and WebSocket upgrade (remote_gateway)
 axum = { workspace = true }
+subtle = "2.6"
 tower-http = { workspace = true }
 
 # Station-agent transport adapters (relay WebSocket + pairing HTTP)

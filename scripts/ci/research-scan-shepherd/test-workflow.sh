@@ -21,5 +21,10 @@ steps.each do |s|
 end
 text = File.read('.github/workflows/research-scan-shepherd.yml')
 raise 'PAT exposed' unless text.scan('secrets.CODEX_REVIEW_PAT').length == 1
+raise 'app key exposed' unless text.scan('secrets.HAGALE_AGENT_APP_PRIVATE_KEY').length == 1
+mint = steps.find { |s| s['id'] == 'app-token' } or raise 'missing app-token mint'
+raise 'app key scope' unless mint.dig('with', 'private-key') == '${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}'
+raise 'checks token' unless steps.any? { |s| (s['env'] || {})['CHECKS_TOKEN'] == '${{ steps.app-token.outputs.token }}' }
+raise 'environment' unless w['jobs']['shepherd']['environment'] == {'name'=>'codex-review','deployment'=>false}
 puts 'PASS: workflow permissions, triggers, concurrency, pins and inputs'
 RUBY
