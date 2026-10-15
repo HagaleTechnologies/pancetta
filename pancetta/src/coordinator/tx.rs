@@ -2763,29 +2763,38 @@ fn has_undelivered_pending_hamlib_state(
 /// FT8 frame whose base tone is in-band can still put its top tone up to
 /// 43.75 Hz past an upper band edge).
 pub fn tx_band_plan_mute_reason(
-    tx_rf_hz: u64,
+    tx_rf_hz: f64,
     signal_span_hz: f64,
     band_plan: &pancetta_config::BandPlanConfig,
 ) -> Option<String> {
-    // Round the span UP so a fractional top tone (FT4's 62.4999 Hz) is never
-    // checked below where it actually lands; a non-finite / negative span
-    // degrades to the base-tone-only check rather than wrapping.
+    // Conservative integer edges computed from the exact f64 RF (PR #446
+    // Codex review): the low edge rounds DOWN and the high edge rounds UP,
+    // each from the unrounded base, so a fractional offset or span (FT4's
+    // 62.4999 Hz) can never be checked inside the band while the real tone
+    // sits a fraction of a Hz outside it. A non-finite RF fails closed; a
+    // non-finite / negative span degrades to the base-tone-only check.
+    if !tx_rf_hz.is_finite() {
+        return Some(format!(
+            "TX frequency {tx_rf_hz} Hz is not a valid RF frequency"
+        ));
+    }
     let span_hz = if signal_span_hz.is_finite() && signal_span_hz > 0.0 {
-        signal_span_hz.ceil() as u64
+        signal_span_hz
     } else {
-        0
+        0.0
     };
-    let tx_rf_high_hz = tx_rf_hz.saturating_add(span_hz);
-    let low_out = pancetta_tui::app::tx_rf_out_of_band_plan(tx_rf_hz, band_plan);
+    let low_hz = tx_rf_hz.max(0.0).floor() as u64;
+    let high_hz = (tx_rf_hz.max(0.0) + span_hz).ceil() as u64;
+    let low_out = pancetta_tui::app::tx_rf_out_of_band_plan(low_hz, band_plan);
     let high_out =
-        span_hz > 0 && pancetta_tui::app::tx_rf_out_of_band_plan(tx_rf_high_hz, band_plan);
+        high_hz != low_hz && pancetta_tui::app::tx_rf_out_of_band_plan(high_hz, band_plan);
     if low_out {
         Some(format!(
-            "TX frequency {tx_rf_hz} Hz is outside the configured amateur band plan"
+            "TX frequency {low_hz} Hz is outside the configured amateur band plan"
         ))
     } else if high_out {
         Some(format!(
-            "TX signal {tx_rf_hz}-{tx_rf_high_hz} Hz extends outside the configured \
+            "TX signal {low_hz}-{high_hz} Hz extends outside the configured \
              amateur band plan"
         ))
     } else {
@@ -2820,7 +2829,7 @@ pub fn tx_rf_for_gate(
     operating_frequency_hz: &std::sync::Arc<std::sync::atomic::AtomicU64>,
     split_tx_frequency_hz: &std::sync::Arc<std::sync::atomic::AtomicU64>,
     audio_offset_hz: f64,
-) -> Option<u64> {
+) -> Option<f64> {
     let rx_dial = operating_frequency_hz.load(Ordering::Relaxed);
     let split = split_tx_frequency_hz.load(Ordering::Relaxed);
     // Resolve the effective TX dial FIRST (PR #446 Codex review): a known
@@ -2830,7 +2839,9 @@ pub fn tx_rf_for_gate(
     if tx_dial == 0 {
         return None;
     }
-    Some(tx_dial + audio_offset_hz.round() as u64)
+    // Exact f64 RF — NOT rounded here; `tx_band_plan_mute_reason` derives
+    // conservative integer edges from it (PR #446 Codex review).
+    Some(tx_dial as f64 + audio_offset_hz)
 }
 
 #[cfg(test)]
@@ -2841,7 +2852,7 @@ mod pan118_band_plan_gate_tests {
     fn in_band_frequency_is_permitted() {
         assert_eq!(
             tx_band_plan_mute_reason(
-                14_074_000 + 1_500,
+                (14_074_000 + 1_500) as f64,
                 0.0,
                 &pancetta_config::BandPlanConfig::default()
             ),
@@ -2851,9 +2862,12 @@ mod pan118_band_plan_gate_tests {
 
     #[test]
     fn between_bands_frequency_is_refused_with_the_rf_in_the_reason() {
-        let reason =
-            tx_band_plan_mute_reason(15_001_500, 0.0, &pancetta_config::BandPlanConfig::default())
-                .expect("15.0015 MHz sits between 20m and 17m — must refuse");
+        let reason = tx_band_plan_mute_reason(
+            15_001_500.0,
+            0.0,
+            &pancetta_config::BandPlanConfig::default(),
+        )
+        .expect("15.0015 MHz sits between 20m and 17m — must refuse");
         assert!(
             reason.contains("TX frequency 15001500 Hz is outside the configured amateur band plan"),
             "reason names the absolute RF: {reason}"
@@ -2864,7 +2878,10 @@ mod pan118_band_plan_gate_tests {
     fn edge_warnings_false_permits_everything() {
         let mut band_plan = pancetta_config::BandPlanConfig::default();
         band_plan.edge_warnings = false;
-        assert_eq!(tx_band_plan_mute_reason(15_001_500, 0.0, &band_plan), None);
+        assert_eq!(
+            tx_band_plan_mute_reason(15_001_500.0, 0.0, &band_plan),
+            None
+        );
     }
 
     #[test]
@@ -2873,7 +2890,7 @@ mod pan118_band_plan_gate_tests {
         let default_plan = pancetta_config::BandPlanConfig::default();
         // 14.340 MHz is inside 20m's region-2 range (14.000–14.350 MHz).
         assert_eq!(
-            tx_band_plan_mute_reason(14_340_000, 0.0, &default_plan),
+            tx_band_plan_mute_reason(14_340_000.0, 0.0, &default_plan),
             None
         );
         // A custom "20m" entry narrows the allocation to 14.000–14.100 MHz —
@@ -2895,10 +2912,10 @@ mod pan118_band_plan_gate_tests {
                 band_type: BandType::Hf,
             },
         );
-        let reason = tx_band_plan_mute_reason(14_340_000, 0.0, &custom)
+        let reason = tx_band_plan_mute_reason(14_340_000.0, 0.0, &custom)
             .expect("custom 20m narrowed to 14.000-14.100 MHz must refuse 14.340 MHz");
         assert!(reason.contains("TX frequency 14340000 Hz"));
-        assert_eq!(tx_band_plan_mute_reason(14_080_000, 0.0, &custom), None);
+        assert_eq!(tx_band_plan_mute_reason(14_080_000.0, 0.0, &custom), None);
     }
 
     // PR #446 Codex review: the gate must check the OCCUPIED signal — the
@@ -2911,18 +2928,22 @@ mod pan118_band_plan_gate_tests {
         let plan = pancetta_config::BandPlanConfig::default();
         let span = tx_signal_span_hz(protocol);
         // The base tone alone is in-band in both cases...
-        assert_eq!(tx_band_plan_mute_reason(refused_low, 0.0, &plan), None);
+        assert_eq!(
+            tx_band_plan_mute_reason(refused_low as f64, 0.0, &plan),
+            None
+        );
         // ...but here the top tone crosses the band edge: refuse.
         assert!(
             refused_low as f64 + span > TWENTY_M_TOP as f64,
             "fixture: {protocol} top tone must cross the edge"
         );
-        let reason = tx_band_plan_mute_reason(refused_low, span, &plan).unwrap_or_else(|| {
-            panic!(
-                "{protocol}: top tone at {} Hz is past 14.350 MHz — must refuse",
-                refused_low as f64 + span
-            )
-        });
+        let reason =
+            tx_band_plan_mute_reason(refused_low as f64, span, &plan).unwrap_or_else(|| {
+                panic!(
+                    "{protocol}: top tone at {} Hz is past 14.350 MHz — must refuse",
+                    refused_low as f64 + span
+                )
+            });
         assert!(
             reason.contains(&format!(
                 "TX signal {refused_low}-{} Hz extends outside the configured amateur band plan",
@@ -2933,7 +2954,7 @@ mod pan118_band_plan_gate_tests {
         // Whole signal below the edge: permit.
         assert!(ok_low as f64 + span <= TWENTY_M_TOP as f64);
         assert_eq!(
-            tx_band_plan_mute_reason(ok_low, span, &plan),
+            tx_band_plan_mute_reason(ok_low as f64, span, &plan),
             None,
             "{protocol}"
         );
@@ -2971,8 +2992,8 @@ mod pan118_band_plan_gate_tests {
         // Base tone below 20m's lower edge (14.000 MHz), top tone inside it.
         let plan = pancetta_config::BandPlanConfig::default();
         let span = tx_signal_span_hz(pancetta_ft8::Protocol::Ft8);
-        assert!(tx_band_plan_mute_reason(13_999_980, span, &plan).is_some());
-        assert_eq!(tx_band_plan_mute_reason(14_000_000, span, &plan), None);
+        assert!(tx_band_plan_mute_reason(13_999_980.0, span, &plan).is_some());
+        assert_eq!(tx_band_plan_mute_reason(14_000_000.0, span, &plan), None);
     }
 
     #[test]
@@ -2982,7 +3003,46 @@ mod pan118_band_plan_gate_tests {
             ..Default::default()
         };
         let span = tx_signal_span_hz(pancetta_ft8::Protocol::Ft8);
-        assert_eq!(tx_band_plan_mute_reason(14_349_990, span, &plan), None);
+        assert_eq!(tx_band_plan_mute_reason(14_349_990.0, span, &plan), None);
+    }
+
+    // PR #446 Codex review: the gate must not round a fractional audio
+    // offset before comparing — a sub-Hz overshoot past a band edge is
+    // still out of band. Composite (resolver + gate), as every caller uses it.
+    fn gate(dial: u64, audio_offset_hz: f64, span_hz: f64) -> Option<String> {
+        tx_rf_for_gate(
+            &std::sync::Arc::new(std::sync::atomic::AtomicU64::new(dial)),
+            &std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            audio_offset_hz,
+        )
+        .and_then(|rf| {
+            tx_band_plan_mute_reason(rf, span_hz, &pancetta_config::BandPlanConfig::default())
+        })
+    }
+
+    #[test]
+    fn fractional_top_tone_past_upper_edge_is_refused() {
+        // 14_348_000 + 1_956.4 + 43.75 = 14_350_000.15 Hz > 14.350 MHz.
+        let ft8 = tx_signal_span_hz(pancetta_ft8::Protocol::Ft8);
+        assert!(
+            gate(14_348_000, 1_956.4, ft8).is_some(),
+            "top tone 0.15 Hz past the 20m upper edge must refuse"
+        );
+        // 14_348_000 + 1_956.25 + 43.75 = 14_350_000.0 exactly: in band.
+        assert_eq!(gate(14_348_000, 1_956.25, ft8), None);
+    }
+
+    #[test]
+    fn fractional_base_tone_below_lower_edge_is_refused() {
+        // 13_998_000 + 1_999.6 = 13_999_999.6 Hz < 14.000 MHz.
+        let ft8 = tx_signal_span_hz(pancetta_ft8::Protocol::Ft8);
+        assert!(
+            gate(13_998_000, 1_999.6, ft8).is_some(),
+            "base tone 0.4 Hz below the 20m lower edge must refuse"
+        );
+        // Single tone (tune / carrier) too.
+        assert!(gate(13_998_000, 1_999.6, 0.0).is_some());
+        assert_eq!(gate(13_998_000, 2_000.0, ft8), None);
     }
 
     #[test]
@@ -3008,7 +3068,7 @@ mod pan118_band_plan_gate_tests {
                 &std::sync::Arc::new(std::sync::atomic::AtomicU64::new(15_000_000)),
                 1_500.0,
             ),
-            Some(15_001_500)
+            Some(15_001_500.0)
         );
     }
 
@@ -3020,7 +3080,7 @@ mod pan118_band_plan_gate_tests {
                 &std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 1_500.0,
             ),
-            Some(14_075_500)
+            Some(14_075_500.0)
         );
         assert_eq!(
             tx_rf_for_gate(
@@ -3028,7 +3088,8 @@ mod pan118_band_plan_gate_tests {
                 &std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 1_499.6,
             ),
-            Some(14_075_500)
+            // Exact, unrounded (PR #446 Codex review) — the gate floors/ceils.
+            Some(14_075_499.6)
         );
     }
 
@@ -3040,7 +3101,7 @@ mod pan118_band_plan_gate_tests {
                 &std::sync::Arc::new(std::sync::atomic::AtomicU64::new(15_000_000)),
                 1_500.0,
             ),
-            Some(15_001_500)
+            Some(15_001_500.0)
         );
     }
 }
