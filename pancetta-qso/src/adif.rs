@@ -1194,12 +1194,17 @@ fn read_value(data: &[u8], text: Option<&str>, start: usize, len: usize) -> (Str
     (text[start..end].to_string(), end)
 }
 
-/// True when only whitespace separates `at` from the next `<` (or the end).
+/// True when only whitespace separates `at` from the end, or from a `<` that
+/// [`next_tag`] does not start over: no other `<` comes before its `>` (or
+/// the end, for a file cut off inside its last tag). A stray `<` in a value,
+/// such as the one in `üñabc<x<MODE:3>`, is not a tag.
 fn before_tag(data: &[u8], at: usize) -> bool {
-    data[at..]
-        .iter()
-        .find(|b| !b.is_ascii_whitespace())
-        .is_none_or(|&b| b == b'<')
+    match data[at..].iter().position(|b| !b.is_ascii_whitespace()) {
+        None => true,
+        Some(i) => {
+            data[at + i] == b'<' && next_tag(data, at + i).is_none_or(|(open, _)| open == at + i)
+        }
+    }
 }
 
 impl Default for AdifProcessor {
@@ -1814,6 +1819,31 @@ ADIF Export for Test Program
         let record = only_record(&parsed);
         assert_eq!(record.fields["NAME"].value, "Müñoz");
         assert_eq!(record.fields["QTH"].value, "Zürich");
+    }
+
+    #[test]
+    fn parse_bytes_keeps_a_less_than_sign_in_a_character_counted_value() {
+        // Seven characters, nine bytes: the byte count lands before `<x`,
+        // which is part of the value, not a tag.
+        let adif = "<CALL:4>W1AW <NOTES:7>üñabc<x<MODE:3>FT8 <EOR>\n";
+
+        let parsed = AdifProcessor::new().parse_bytes(adif.as_bytes());
+
+        let record = only_record(&parsed);
+        assert_eq!(record.fields["NOTES"].value, "üñabc<x");
+        assert_eq!(record.fields["MODE"].value, "FT8");
+    }
+
+    #[test]
+    fn parse_bytes_cuts_a_byte_counted_value_before_a_truncated_tag() {
+        // A file cut off inside its last tag: the byte count still ends the
+        // value, not a character count that runs into the broken tag.
+        let adif = "<CALL:4>W1AW <NAME:7>Müñoz<E";
+
+        let parsed = AdifProcessor::new().parse_bytes(adif.as_bytes());
+
+        let record = only_record(&parsed);
+        assert_eq!(record.fields["NAME"].value, "Müñoz");
     }
 
     #[test]

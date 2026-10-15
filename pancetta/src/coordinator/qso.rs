@@ -9403,7 +9403,10 @@ async fn prepare_local_qso_index(
         }
     }
 
-    // Case 2: replay — index missing or older than ADIF.
+    // Case 2: replay — index missing or older than ADIF, or marked by a
+    // `pancetta import` that stopped before it finished indexing (PAN-127).
+    let marker = QsoDatabase::rebuild_marker(db_path);
+    let marked = tokio::fs::try_exists(&marker).await.unwrap_or(false);
     let needs_replay = match (
         tokio::fs::metadata(&db_path).await.ok(),
         tokio::fs::metadata(&adif_path).await.ok(),
@@ -9412,6 +9415,14 @@ async fn prepare_local_qso_index(
             info!(
                 "Index missing at {} — replaying from ADIF",
                 db_path.display()
+            );
+            true
+        }
+        (Some(_), Some(_)) if marked => {
+            info!(
+                "Index at {} is missing contacts an interrupted import added to {} — replaying",
+                db_path.display(),
+                adif_path.display(),
             );
             true
         }
@@ -9433,7 +9444,14 @@ async fn prepare_local_qso_index(
     };
 
     if needs_replay {
-        match QsoDatabase::replay_from_adif(&db_path, &adif_path).await {
+        let replayed = QsoDatabase::replay_from_adif(&db_path, &adif_path).await;
+        // The marker asks for one rebuild, as a newer ADIF log does: a replay
+        // that fails has already replaced the index, and retrying it at every
+        // start would only wipe what the station indexed since.
+        if marked {
+            let _ = tokio::fs::remove_file(&marker).await;
+        }
+        match replayed {
             Ok(db) => Some(db),
             Err(e) => {
                 warn!(
@@ -10329,6 +10347,91 @@ mod replay_local_log_tests {
             2,
             "a current index must not be rebuilt"
         );
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// PAN-127: an import stopped part-way leaves a partial index that is
+    /// newer than the ADIF log, plus the rebuild marker. The marker, not the
+    /// mtimes, decides: the index is rebuilt and the marker cleared.
+    #[tokio::test]
+    async fn live_start_rebuilds_an_index_an_interrupted_import_marked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let adif_path = dir.path().join("qsos.adi");
+        let db_path = dir.path().join("qso.db");
+        std::fs::write(&adif_path, TWO_RECORDS).expect("write qsos.adi");
+        let an_hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&adif_path)
+            .and_then(|f| f.set_modified(an_hour_ago))
+            .expect("backdate qsos.adi");
+        // The partial index: the first contact only.
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let first = elsewhere.path().join("first.adi");
+        let one_record = TWO_RECORDS
+            .split_once("<CALL:5>K1ABC")
+            .map(|(head, _)| head)
+            .expect("fixture has two records");
+        std::fs::write(&first, one_record).expect("write first.adi");
+        pancetta_qso::async_database::QsoDatabase::replay_from_adif(&db_path, &first)
+            .await
+            .expect("build partial index")
+            .close()
+            .await;
+        let marker = pancetta_qso::async_database::QsoDatabase::rebuild_marker(&db_path);
+        std::fs::write(&marker, b"").expect("write marker");
+        let manager = manager();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let (_adif_writer, _async_logger, seed_db) = start_local_qso_log_writers(
+            false,
+            &adif_path,
+            &db_path,
+            100,
+            false,
+            &manager,
+            shutdown.clone(),
+        )
+        .await;
+
+        let seed_db = seed_db.expect("a live start returns the seed index");
+        assert_eq!(
+            seed_db.count_qsos().await.expect("count"),
+            2,
+            "a marked index must be rebuilt from the ADIF log"
+        );
+        assert!(!marker.exists(), "the rebuild clears the marker");
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The marker asks for one rebuild. A replay that fails (here, on an
+    /// unreadable record) clears it too, or every later start would wipe
+    /// the index again.
+    #[tokio::test]
+    async fn live_start_clears_the_marker_when_the_rebuild_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let adif_path = dir.path().join("qsos.adi");
+        let db_path = dir.path().join("qso.db");
+        index_with_two_rows(&db_path).await;
+        std::fs::write(&adif_path, "<CALL:4>W1AW <TIME_ON:x>120000 <EOR>\n")
+            .expect("write qsos.adi");
+        let marker = pancetta_qso::async_database::QsoDatabase::rebuild_marker(&db_path);
+        std::fs::write(&marker, b"").expect("write marker");
+        let manager = manager();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let _ = start_local_qso_log_writers(
+            false,
+            &adif_path,
+            &db_path,
+            100,
+            false,
+            &manager,
+            shutdown.clone(),
+        )
+        .await;
+
+        assert!(!marker.exists(), "a failed rebuild still clears the marker");
         shutdown.store(true, std::sync::atomic::Ordering::Release);
     }
 

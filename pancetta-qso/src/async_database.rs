@@ -1082,6 +1082,18 @@ impl QsoDatabase {
         Ok((inserted, skipped))
     }
 
+    /// The file beside the index at `db_path` that marks it as missing rows
+    /// the ADIF log holds. `pancetta import` creates it before writing and
+    /// removes it once the new rows are indexed; startup rebuilds an index it
+    /// finds marked. Each row commits on its own, so an import stopped part-way
+    /// (Ctrl-C, power loss) can leave a partial index newer than the ADIF log,
+    /// which the mtime check alone would trust (PAN-127).
+    pub fn rebuild_marker(db_path: &Path) -> std::path::PathBuf {
+        let mut name = db_path.as_os_str().to_owned();
+        name.push(".rebuild");
+        name.into()
+    }
+
     /// Checkpoint the WAL into the database file, then close the pool, so a
     /// short-lived process (e.g. `pancetta import`) leaves a quiescent
     /// `qso.db` when this returns: every committed frame is in the main file,

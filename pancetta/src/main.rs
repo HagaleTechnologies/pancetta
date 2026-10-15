@@ -810,6 +810,7 @@ async fn import_command(args: ImportArgs) -> Result<()> {
     use pancetta_qso::adif::AdifProcessor;
     use pancetta_qso::adif_import::plan_import;
     use pancetta_qso::adif_log_writer::AdifLogWriter;
+    use pancetta_qso::async_database::QsoDatabase;
 
     let data_dir = pancetta_data_dir();
     let adif = data_dir.join("qsos.adi");
@@ -902,6 +903,14 @@ async fn import_command(args: ImportArgs) -> Result<()> {
         }
     };
 
+    // Marked before the first write and cleared only once every new row is
+    // indexed, so an import stopped part-way still gets its index rebuilt at
+    // the next start. A marker left by an earlier interrupted import is not
+    // ours to clear: its missing rows are not among the ones added here.
+    let marker = QsoDatabase::rebuild_marker(&db);
+    let marked_here = mark_index_incomplete(&marker)
+        .with_context(|| format!("Cannot write {}", marker.display()))?;
+
     let writer = AdifLogWriter::open(&adif)
         .await
         .with_context(|| format!("Cannot open your logbook {}", adif.display()))?;
@@ -920,6 +929,9 @@ async fn import_command(args: ImportArgs) -> Result<()> {
     let indexed = index_imported_contacts(&processor, &plan.to_add, &adif, &db, db_existed).await;
     if index_was_behind || indexed.is_err() {
         mark_newer_than(&adif, &db);
+    }
+    if marked_here && indexed.is_ok() {
+        let _ = std::fs::remove_file(&marker);
     }
     print!(
         "{}",
@@ -985,6 +997,30 @@ async fn index_imported_contacts(
         QsoDatabase::replay_from_adif(db, adif).await?.close().await;
     }
     Ok(())
+}
+
+/// Create the index's rebuild marker and flush it to disk. Returns whether
+/// this call created it; `false` means one was already there.
+fn mark_index_incomplete(marker: &Path) -> std::io::Result<bool> {
+    // A new logbook's directory may not exist yet.
+    let dir = marker.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker)
+    {
+        Ok(file) => {
+            file.sync_all()?;
+            // On Unix a new file's name is durable only once its directory
+            // is flushed; best effort, as Windows cannot open a directory.
+            #[cfg(unix)]
+            let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 fn file_modified(path: &Path) -> Option<std::time::SystemTime> {

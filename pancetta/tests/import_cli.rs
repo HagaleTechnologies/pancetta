@@ -433,6 +433,52 @@ fn a_failed_index_update_leaves_the_logbook_newer() {
     );
 }
 
+/// An import marks the index for a rebuild before it writes, and clears the
+/// mark only once every new row is indexed: an import stopped part-way
+/// (here, by an index failure) leaves it for the next start. A mark left by
+/// an earlier interrupted import survives a later import that succeeds.
+#[test]
+fn an_unfinished_index_update_stays_marked_for_rebuild() {
+    let s = Scratch::new();
+    let marker = QsoDatabase::rebuild_marker(&s.db());
+    s.seed_logbook(
+        &pancetta_logbook(&[pancetta_record("KA1AA", "20231201", "090000")]),
+        true,
+    );
+    let first = s.write_file(
+        "first.adi",
+        wsjtx_file(&[wsjtx_record("W1AW", "FN31", "120000", "14.075123")]),
+    );
+    s.import_ok(&first);
+    assert!(!marker.exists(), "a finished import clears its mark");
+
+    std::fs::write(&marker, b"").unwrap();
+    let second = s.write_file(
+        "second.adi",
+        wsjtx_file(&[wsjtx_record("K1ABC", "FN42", "121500", "14.076000")]),
+    );
+    s.import_ok(&second);
+    assert!(
+        marker.exists(),
+        "an earlier import's mark is not ours to clear"
+    );
+
+    let t = Scratch::new();
+    let logbook = format!(
+        "{}{}",
+        pancetta_logbook(&[pancetta_record("KA1AA", "20231201", "090000")]),
+        "<CALL:4>K1AB <TIME_ON:6>090500 <MODE:3>FT8 <BAND:3>20M <EOR>\n\n"
+    );
+    t.seed_logbook(&logbook, false);
+    let file = t.write_file("wsjtx_log.adi", three_contacts());
+    let out = t.import(&file, false);
+    assert!(!out.status.success(), "stdout: {}", stdout(&out));
+    assert!(
+        QsoDatabase::rebuild_marker(&t.db()).exists(),
+        "an index update that did not finish stays marked"
+    );
+}
+
 #[test]
 fn reimporting_the_same_file_adds_nothing() {
     let s = Scratch::new();
