@@ -253,7 +253,7 @@ last-instant), and manual PTT
 override) shared with the TUI modal; the dial-vs-split resolution stays the single
 `effective_tx_dial`, wrapped by `tx_rf_for_gate` (effective dial + absolute audio offset).
 
-**Dial-0 sentinel skips the check.** `operating_frequency_hz == 0` is the codebase's "frequency not
+**Dial-0 sentinel skips the check.** An effective TX dial of 0 (`effective_tx_dial` resolved first, so a known split dial with the RX dial still 0 IS gated — PR #446 Codex review) — i.e. `operating_frequency_hz == 0` with no split — is the codebase's "frequency not
 yet known" state (mock rig, rig-disabled dev modes, `--replay` seed); refusing there would
 permanently block TX in exactly the modes where PTT reaches no radio, and churn every worker-gate
 test that legitimately never sets a dial. Production rig paths seed a real dial at startup (the

@@ -2769,8 +2769,9 @@ pub fn tx_band_plan_mute_reason(
 
 /// PAN-118: absolute TX RF for gating: effective TX dial (split when
 /// active, else RX dial — `pancetta_qso::qso_manager::effective_tx_dial`)
-/// plus the request's absolute audio offset. `None` while the shared dial
-/// reads 0 — the codebase's "frequency not yet known" sentinel (TUI
+/// plus the request's absolute audio offset. `None` while the effective
+/// TX dial reads 0 (no split set and RX dial 0) — the codebase's
+/// "frequency not yet known" sentinel (TUI
 /// 14.074 fallback, `--replay` seed, mock-rig dev modes) — in which case
 /// the caller skips the band-plan check; every frequency-independent
 /// hard-mute input still applies. Also the dial resolver for the TUI
@@ -2784,14 +2785,15 @@ pub fn tx_rf_for_gate(
     audio_offset_hz: f64,
 ) -> Option<u64> {
     let rx_dial = operating_frequency_hz.load(Ordering::Relaxed);
-    if rx_dial == 0 {
+    let split = split_tx_frequency_hz.load(Ordering::Relaxed);
+    // Resolve the effective TX dial FIRST (PR #446 Codex review): a known
+    // split dial with the RX dial still 0 is a real TX frequency and must
+    // be gated; only an effective dial of 0 means "not yet known".
+    let tx_dial = pancetta_qso::qso_manager::effective_tx_dial(rx_dial, split);
+    if tx_dial == 0 {
         return None;
     }
-    let split = split_tx_frequency_hz.load(Ordering::Relaxed);
-    Some(
-        pancetta_qso::qso_manager::effective_tx_dial(rx_dial, split)
-            + audio_offset_hz.round() as u64,
-    )
+    Some(tx_dial + audio_offset_hz.round() as u64)
 }
 
 #[cfg(test)]
@@ -2867,6 +2869,21 @@ mod pan118_band_plan_gate_tests {
                 1_500.0,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn rf_gate_resolves_split_when_rx_dial_unknown() {
+        // PR #446 Codex review: RX dial still 0 (initial CAT read failed)
+        // but a split TX dial is known — the effective TX dial is the
+        // split, so the gate must check it, not skip.
+        assert_eq!(
+            tx_rf_for_gate(
+                &std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                &std::sync::Arc::new(std::sync::atomic::AtomicU64::new(15_000_000)),
+                1_500.0,
+            ),
+            Some(15_001_500)
         );
     }
 
