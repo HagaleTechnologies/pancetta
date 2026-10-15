@@ -447,6 +447,9 @@ Normative station behaviour for the station agent's relay connection:
   keep reaching the session loop while an outbound write is stuck.
 - **A transport failure ends the session.** A write that cannot finish within the write deadline
   closes the connection; a send that cannot enqueue within the send deadline aborts it at once.
+  Inbound frames still buffered when the outbound side fails are discarded, not delivered, so a
+  queued heartbeat or TX request cannot act after the connection has failed; a read-side close or
+  socket error is reported after the frames that preceded it, which are still delivered.
   Any relay transport error on a send latches in `MultiPeerSession`: the relay socket is shared by
   every peer, so no later send touches it, nothing received afterwards is acted on, and the next
   poll returns the error. `run_session_loop` then disarms (`disarm_on_loss`) and reconnects with

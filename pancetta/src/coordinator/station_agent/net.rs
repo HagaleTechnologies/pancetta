@@ -31,6 +31,8 @@
 //! deadline (PAN-102). That bound is what keeps the session task cancellable,
 //! and what turns a relay that stops responding into a session teardown.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
@@ -115,6 +117,15 @@ pub struct RealWsConn {
     rx: mpsc::Receiver<String>,
     /// The pump task; aborted when a send times out so the socket drops at once.
     pump: tokio::task::AbortHandle,
+    /// Set when the outbound side failed: a socket write timed out or
+    /// errored, or a send timed out. Once set, frames still buffered in `rx`
+    /// are discarded rather than delivered: the connection has already
+    /// failed, and acting on them (a heartbeat extending an arm, a queued TX
+    /// request) would delay the disarm. A read-side error or close is not
+    /// flagged: the reader reports it in stream order, after every frame the
+    /// relay sent before it, so those frames are delivered and then the
+    /// connection reports closed.
+    failed: Arc<AtomicBool>,
     timeouts: RelayTimeouts,
 }
 
@@ -150,12 +161,21 @@ impl RealWsConn {
         // limit.
         let (out_tx, out_rx) = mpsc::channel::<String>(RELAY_QUEUE_DEPTH);
         let (in_tx, in_rx) = mpsc::channel::<String>(RELAY_QUEUE_DEPTH);
-        let pump = tokio::spawn(pump(sink, source, out_rx, in_tx, timeouts.write));
+        let failed = Arc::new(AtomicBool::new(false));
+        let pump = tokio::spawn(pump(
+            sink,
+            source,
+            out_rx,
+            in_tx,
+            timeouts.write,
+            Arc::clone(&failed),
+        ));
         Self {
             handle: Handle::current(),
             tx: out_tx,
             rx: in_rx,
             pump: pump.abort_handle(),
+            failed,
             timeouts,
         }
     }
@@ -164,13 +184,18 @@ impl RealWsConn {
 /// Move frames between the socket halves and the adapter's queues. The writer
 /// and reader run as two concurrent futures, so neither waits on the other.
 /// Returning drops both halves, the socket and both channel ends, which the
-/// adapter sees as a closed connection.
+/// adapter sees as a closed connection. A write failure (timeout or error)
+/// sets `failed` before returning, so the adapter discards inbound frames
+/// still buffered when the connection failed. A read-side end (close or
+/// socket error) does not: it arrives after the frames that preceded it, which
+/// are still delivered in order.
 async fn pump<Si, St, E>(
     mut sink: Si,
     mut source: St,
     mut out_rx: mpsc::Receiver<String>,
     in_tx: mpsc::Sender<String>,
     write_timeout: Duration,
+    failed: Arc<AtomicBool>,
 ) where
     Si: Sink<Message> + Unpin,
     St: Stream<Item = Result<Message, E>> + Unpin,
@@ -180,9 +205,13 @@ async fn pump<Si, St, E>(
         while let Some(text) = out_rx.recv().await {
             match tokio::time::timeout(write_timeout, sink.send(Message::Text(text.into()))).await {
                 Ok(Ok(())) => {}
-                Ok(Err(_)) => return,
+                Ok(Err(_)) => {
+                    failed.store(true, Ordering::Release);
+                    return;
+                }
                 Err(_elapsed) => {
                     debug!(target: "agent", "relay write timed out; closing the connection");
+                    failed.store(true, Ordering::Release);
                     return;
                 }
             }
@@ -250,6 +279,7 @@ impl WsConn for RealWsConn {
             Err(_elapsed) => {
                 // The relay is not draining its queue. Drop the socket now
                 // rather than wait for the pump's own write deadline.
+                self.failed.store(true, Ordering::Release);
                 self.pump.abort();
                 Err(RelayError::Transport("relay send timed out".to_string()))
             }
@@ -267,7 +297,13 @@ impl WsConn for RealWsConn {
         }
     }
 
+    /// Once the connection has failed, reports `Closed` and discards any
+    /// frames still buffered from it (see [`RealWsConn::failed`]).
     fn recv_text_within(&mut self, timeout: Duration) -> Result<RecvOutcome, RelayError> {
+        if self.failed.load(Ordering::Acquire) {
+            self.rx.close();
+            return Ok(RecvOutcome::Closed);
+        }
         let handle = &self.handle;
         let rx = &mut self.rx;
         let out = tokio::task::block_in_place(|| {
@@ -279,6 +315,11 @@ impl WsConn for RealWsConn {
                 }
             })
         });
+        // The failure may have landed while this call waited.
+        if matches!(out, RecvOutcome::Frame(_)) && self.failed.load(Ordering::Acquire) {
+            self.rx.close();
+            return Ok(RecvOutcome::Closed);
+        }
         Ok(out)
     }
 
@@ -696,6 +737,68 @@ mod tests {
                 matches!(&got, RecvOutcome::Frame(f) if f == "disarm"),
                 "got {got:?}"
             );
+        });
+        tokio::time::timeout(Duration::from_secs(10), client)
+            .await
+            .expect("test hung")
+            .expect("client task panicked");
+    }
+
+    /// PAN-102 review: frames the reader buffered before the writer timed out
+    /// must not be delivered after the connection failed. A buffered
+    /// heartbeat or TX request acted on after the failure would delay the
+    /// disarm, or extend the arm.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frames_buffered_before_a_write_timeout_are_discarded() {
+        let (in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel::<InboundItem>();
+        let source = futures_util::stream::poll_fn(move |cx| in_rx.poll_recv(cx));
+        let client = tokio::spawn(async move {
+            let timeouts = RelayTimeouts {
+                write: Duration::from_millis(200),
+                ..test_timeouts()
+            };
+            let mut conn = RealWsConn::spawn(StalledSink, source, timeouts);
+            for i in 0..8 {
+                in_tx
+                    .send(Ok(Message::Text(format!("heartbeat {i}").into())))
+                    .unwrap();
+            }
+            // Let the reader buffer them, then let the writer time out.
+            conn.send_text("x".to_string()).expect("queued");
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            let got = conn.recv_text_within(Duration::from_secs(1)).unwrap();
+            assert!(
+                matches!(got, RecvOutcome::Closed),
+                "a failed connection must not deliver buffered frames, got {got:?}"
+            );
+            let got = conn.recv_text_within(Duration::from_secs(1)).unwrap();
+            assert!(matches!(got, RecvOutcome::Closed), "got {got:?}");
+        });
+        tokio::time::timeout(Duration::from_secs(10), client)
+            .await
+            .expect("test hung")
+            .expect("client task panicked");
+    }
+
+    /// A read-side close is reported in stream order: frames the relay sent
+    /// before its Close still arrive, in order, then the connection reports
+    /// closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frames_sent_before_a_clean_close_are_delivered() {
+        let source = futures_util::stream::iter(vec![
+            Ok::<_, std::io::Error>(Message::Text("presence down".into())),
+            Ok(Message::Close(None)),
+        ]);
+        let client = tokio::spawn(async move {
+            let mut conn = RealWsConn::spawn(StalledSink, source, test_timeouts());
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let got = conn.recv_text_within(Duration::from_secs(1)).unwrap();
+            assert!(
+                matches!(&got, RecvOutcome::Frame(f) if f == "presence down"),
+                "got {got:?}"
+            );
+            let got = conn.recv_text_within(Duration::from_secs(1)).unwrap();
+            assert!(matches!(got, RecvOutcome::Closed), "got {got:?}");
         });
         tokio::time::timeout(Duration::from_secs(10), client)
             .await
