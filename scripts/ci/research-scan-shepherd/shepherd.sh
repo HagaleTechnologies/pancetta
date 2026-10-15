@@ -151,7 +151,9 @@ settle_responses() {
       [[ $(jq 'length' <<< "$runs") == 0 ]] || { busy=1; break; }
     done
     [[ $busy == 1 ]] || return 0
-    (( SECONDS + SETTLE_INTERVAL <= SETTLE_DEADLINE )) || break
+    # Strict `<`: with `<=` a zero budget still allowed every poll that landed in the
+    # same wall-clock second, so the number of polls depended on runner speed.
+    (( SECONDS + SETTLE_INTERVAL < SETTLE_DEADLINE )) || break
     sleep "$SETTLE_INTERVAL"
   done
   echo "::notice::A Wait for Codex response run is still pending; not touching the gate this pass." >&2

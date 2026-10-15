@@ -16,6 +16,7 @@ pub mod bar_fit;
 pub mod callers;
 pub mod dx_hunter;
 pub mod qso_status;
+pub mod readiness_strip;
 pub mod station_card;
 pub mod station_info;
 pub mod tx_placement;
@@ -97,12 +98,16 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
     // Render title bar
     render_title_bar(f, chunks[0], app);
 
+    // PAN-89: readiness strip — TX verdict plus every active blocker/warning,
+    // redrawn from typed state so status-line traffic can't erase it.
+    readiness_strip::render_readiness_strip(f, chunks[1], app);
+
     // Panel zoom (`z`): the focused panel fills the whole content area,
     // bypassing the active view's grid entirely. Orthogonal to the 4-view
     // system — checked before the view dispatch so it applies identically
     // regardless of `app.active_view`.
     if app.zoomed {
-        let (banner, panel) = compute_zoom_rects(chunks[1]);
+        let (banner, panel) = compute_zoom_rects(chunks[2]);
         render_active_qsos(f, banner, app);
         render_zoomed_panel(f, panel, app)?;
     } else {
@@ -112,24 +117,24 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
         // activity narrowed to CQs via `App::displayed_messages`); Run is
         // Callers-first for working a pileup.
         match app.active_view {
-            crate::view::ActiveView::Operate => layout_operate(f, chunks[1], app)?,
-            crate::view::ActiveView::Monitor => layout_monitor(f, chunks[1], app)?,
-            crate::view::ActiveView::Hunt => layout_hunt(f, chunks[1], app)?,
-            crate::view::ActiveView::Run => layout_run(f, chunks[1], app)?,
+            crate::view::ActiveView::Operate => layout_operate(f, chunks[2], app)?,
+            crate::view::ActiveView::Monitor => layout_monitor(f, chunks[2], app)?,
+            crate::view::ActiveView::Hunt => layout_hunt(f, chunks[2], app)?,
+            crate::view::ActiveView::Run => layout_run(f, chunks[2], app)?,
         }
     }
 
     // Render status bar
     // TX queue / now-sending strip (between content and status bar).
-    render_tx_strip(f, chunks[2], app);
+    render_tx_strip(f, chunks[3], app);
 
-    render_status_bar(f, chunks[3], app);
+    render_status_bar(f, chunks[4], app);
 
     Ok(())
 }
 
-/// The top-level vertical split every frame renders from: title bar, main
-/// content, TX strip, status bar. Pulled out of `draw()` (Task 19) so the
+/// The top-level vertical split every frame renders from: title bar,
+/// readiness strip (PAN-89), main content, TX strip, status bar. Pulled out of `draw()` (Task 19) so the
 /// mouse hit-testing path (`App::handle_mouse_event`, which has no `Frame`
 /// to render into) can recover the exact same main-content `Rect` the
 /// renderer used via `content_area`, rather than re-deriving the split by
@@ -139,6 +144,7 @@ fn main_layout_chunks(size: Rect) -> std::rc::Rc<[Rect]> {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // Title bar (incl. bold TX-policy banner)
+            Constraint::Length(1), // Readiness strip (PAN-89)
             Constraint::Min(1),    // Main content
             Constraint::Length(1), // TX queue / now-sending strip
             Constraint::Length(2), // Status bar (status line + help line)
@@ -157,13 +163,13 @@ fn compute_zoom_rects(content_area: Rect) -> (Rect, Rect) {
     (rows[0], rows[1])
 }
 
-/// The main content `Rect` (`chunks[1]` from `draw()`) for a full-terminal
-/// `size` — title bar, TX strip, and status bar stripped off. This is the
+/// The main content `Rect` (`chunks[2]` from `draw()`) for a full-terminal
+/// `size` — title bar, readiness strip, TX strip, and status bar stripped off. This is the
 /// `area` that `view_rects`/`hit_test` expect; a click at absolute
 /// terminal coordinates only needs to be compared against panel rects
 /// computed from THIS rect, not the full terminal.
 pub fn content_area(size: Rect) -> Rect {
-    main_layout_chunks(size)[1]
+    main_layout_chunks(size)[2]
 }
 
 /// Renders the focused panel (`app.active_panel`) full-screen in `area`,
@@ -251,7 +257,7 @@ fn compute_operate_rects(content_area: Rect) -> OperateRects {
     // slot; a static summary of the global focus, not a navigable panel) on
     // top, DX Hunter (moved up) in the middle, Callers on the bottom —
     // aligned with QSO Status across the gutter.
-    let right_chunks = Layout::default()
+    let mut right_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Percentage(20), // Station card
@@ -259,6 +265,20 @@ fn compute_operate_rects(content_area: Rect) -> OperateRects {
             Constraint::Percentage(40), // Callers (bottom; across from QSO Status)
         ])
         .split(lower[1]);
+    // PAN-89: at 80×24 the readiness strip leaves this column 11 rows, where
+    // the card is borders only and Callers has no row below its header (an
+    // `Enter=send` hint with no visible caller). Drop the card there, as
+    // Hunt does below its own height threshold.
+    if right_chunks[0].height < 3 {
+        right_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(0),
+                Constraint::Percentage(50),
+                Constraint::Percentage(50),
+            ])
+            .split(lower[1]);
+    }
 
     OperateRects {
         banner: content[0],
@@ -363,7 +383,7 @@ fn compute_hunt_rects(content_area: Rect) -> HuntRects {
     const STATION_CARD_HEIGHT: u16 = 5;
     // Threshold picked so the `draw()` resize-guard floor (MIN_H=20 →
     // content_area ~15 rows) never shows the card, while a normally-sized
-    // terminal (TestBackend's 120x40 fixture → content_area 35 rows) does.
+    // terminal (TestBackend's 120x40 fixture → content_area 34 rows) does.
     const STATION_CARD_MIN_CONTENT_HEIGHT: u16 = 30;
     let show_card = content_area.height >= STATION_CARD_MIN_CONTENT_HEIGHT;
 
@@ -621,7 +641,6 @@ mod title_rank {
     pub const TX_POLICY: u8 = 0;
     pub const LIVE_TX: u8 = 2;
     pub const PAUSE: u8 = 3;
-    pub const ALARM: u8 = 4;
     pub const MODE: u8 = 5;
     pub const FREQ_BAND: u8 = 6;
     pub const FOX: u8 = 7;
@@ -845,39 +864,6 @@ fn title_bar_segments(app: &App) -> (Vec<BarSegment<'_>>, usize) {
             title_rank::TX_OFFSET,
             title_rank::TX_OFFSET_FULL,
         ));
-    }
-
-    // Health alarm chip — prominent warning for the highest-stakes silent
-    // failures so a new operator (or one whose audio device was hijacked by
-    // a remote-desktop client) sees *why* nothing is decoding, rather than
-    // just an empty waterfall. Driven by the existing pipeline health
-    // snapshot; the bottom status bar still shows the per-stage detail.
-    // PAN-88: shown whole or dropped (admit rank 4), never clipped.
-    //
-    // PAN-114: a clock-skew chip joins the chain at the LOWEST priority, so
-    // it never competes with a second alarm chip for title-bar width. The
-    // coordinator's clock monitor owns the threshold; this only formats.
-    if let Some(ref h) = app.pipeline_health {
-        let alarm = if !h.audio_alive {
-            Some(" ⚠ AUDIO DEAD — press d ".to_string())
-        } else if !h.ft8lib_available {
-            Some(" ⚠ DECODER STUB ".to_string())
-        } else {
-            h.clock_skew_warning_s.map(clock_skew_chip_text)
-        };
-        if let Some(text) = alarm {
-            segs.push(BarSegment::new(
-                " ",
-                vec![Span::styled(
-                    text,
-                    Style::default()
-                        .fg(Color::White)
-                        .bg(Color::Red)
-                        .add_modifier(Modifier::BOLD),
-                )],
-                title_rank::ALARM,
-            ));
-        }
     }
 
     // FCC §97.221 presence prompt: autonomous on, but operator idle → initiation
@@ -1779,28 +1765,71 @@ pub fn render_recent_qsos_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
 /// healthy right now?" snapshot (docs/observability-diagnostics-plan.md
 /// Layer 3), aggregating signals already computed elsewhere rather than
 /// introducing new detection logic. Unlike `render_diagnostics_overlay`
-/// (a scrollback), this is a point-in-time view — no scroll state.
+/// (a scrollback), this is a point-in-time view; it scrolls only when the
+/// readiness section makes it outgrow the panel (`App::health_scroll`).
 pub fn render_health_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
     if area.width < 20 || area.height < 6 {
         return;
     }
-    let modal_width = area.width.saturating_sub(4).min(70);
-    let modal_height = area.height.saturating_sub(4).min(16);
-    let modal_area = Rect {
-        x: (area.width.saturating_sub(modal_width)) / 2,
-        y: (area.height.saturating_sub(modal_height)) / 2,
-        width: modal_width,
-        height: modal_height,
-    };
+    let modal_area = health_panel_rect(area);
     f.render_widget(ratatui::widgets::Clear, modal_area);
 
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .title(" Station Health — k aborts QSO, Esc/S close ")
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(modal_area);
-    f.render_widget(block, modal_area);
 
+    // PAN-89: the readiness section can push the panel past its height
+    // (80×24 fits ~4 items before the rig/audio/clock rows clip), so the
+    // body scrolls; the bottom border says so only while it overflows.
+    let paragraph =
+        Paragraph::new(health_panel_lines(app)).wrap(ratatui::widgets::Wrap { trim: false });
+    let total = u16::try_from(paragraph.line_count(inner.width)).unwrap_or(u16::MAX);
+    let max_scroll = total.saturating_sub(inner.height);
+    let scroll = app.health_scroll.min(max_scroll);
+    if max_scroll > 0 {
+        block = block.title_bottom(format!(
+            " ↑↓ PgUp PgDn scroll · {}–{} of {} ",
+            scroll + 1,
+            scroll + inner.height,
+            total
+        ));
+    }
+    f.render_widget(block, modal_area);
+    f.render_widget(paragraph.scroll((scroll, 0)), inner);
+}
+
+/// PAN-89: the Shift+S modal's rect within a full-terminal `area`.
+fn health_panel_rect(area: Rect) -> Rect {
+    let modal_width = area.width.saturating_sub(4).min(70);
+    let modal_height = area.height.saturating_sub(4).min(24);
+    Rect {
+        x: (area.width.saturating_sub(modal_width)) / 2,
+        y: (area.height.saturating_sub(modal_height)) / 2,
+        width: modal_width,
+        height: modal_height,
+    }
+}
+
+/// PAN-89: the Shift+S panel's `(max_scroll, page)` in rendered (wrapped)
+/// lines for a full-terminal `area`; `max_scroll` is 0 when everything
+/// fits. The key handler clamps with this; the renderer recomputes the
+/// same numbers.
+pub fn health_panel_scroll_bounds(area: Rect, app: &App) -> (u16, u16) {
+    let inner = Block::default()
+        .borders(Borders::ALL)
+        .inner(health_panel_rect(area));
+    let total = Paragraph::new(health_panel_lines(app))
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .line_count(inner.width);
+    let total = u16::try_from(total).unwrap_or(u16::MAX);
+    (total.saturating_sub(inner.height), inner.height.max(1))
+}
+
+/// The Shift+S panel body: readiness section, pipeline health, rig/audio/
+/// clock rows, session counts.
+fn health_panel_lines(app: &App) -> Vec<Line<'static>> {
     fn dot(ok: bool) -> Span<'static> {
         if ok {
             Span::styled("●", Style::default().fg(Color::Green))
@@ -1810,6 +1839,40 @@ pub fn render_health_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     let mut lines: Vec<Line> = Vec::new();
+
+    // PAN-89: readiness section — every active item, acknowledged ones
+    // included (the strip hides those), with its full detail text.
+    let items = crate::readiness::readiness_items(app);
+    let verdict = crate::readiness::verdict(app);
+    let header = match verdict {
+        crate::readiness::Verdict::Checking => "checking…",
+        crate::readiness::Verdict::Ready if items.is_empty() => "TX READY — nothing to report",
+        crate::readiness::Verdict::Ready => "TX READY",
+        crate::readiness::Verdict::Held => "TX HELD",
+        crate::readiness::Verdict::RxOnly => "RX ONLY",
+        crate::readiness::Verdict::Wait => "TX WAIT",
+        crate::readiness::Verdict::Open => "TX OPEN",
+    };
+    lines.push(Line::from(Span::styled(
+        format!("Readiness: {header}"),
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    for item in &items {
+        let detail = if item.acknowledged {
+            // Insert "(ack'd)" after the lead phrase (before " — ").
+            match item.detail.split_once(" — ") {
+                Some((head, tail)) => format!("{head} (ack'd) — {tail}"),
+                None => format!("{} (ack'd)", item.detail),
+            }
+        } else {
+            item.detail.clone()
+        };
+        lines.push(Line::from(vec![
+            readiness_strip::item_dot(item, app),
+            Span::raw(detail),
+        ]));
+    }
+    lines.push(Line::from(""));
 
     match &app.pipeline_health {
         Some(h) => {
@@ -1870,16 +1933,56 @@ pub fn render_health_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
         dot(rig_ok),
         Span::raw(format!(" Rig: {:?}", app.rig_connected)),
     ]));
+    // PAN-89: was inverted (green "system default" for the misconfig).
     lines.push(Line::from(vec![
-        dot(app.tx_output_default),
+        dot(!app.tx_output_default),
         Span::raw(format!(
             " TX audio output: {}",
             if app.tx_output_default {
-                "system default"
+                "SYSTEM DEFAULT — check device"
             } else {
-                "NOT default — check device"
+                "explicit device"
             }
         )),
+    ]));
+    lines.push(Line::from(vec![
+        dot(!app.input_fallback),
+        Span::raw(format!(
+            " RX input: {}",
+            if app.input_fallback {
+                "FALLBACK device — check [audio] input_device"
+            } else {
+                "configured device"
+            }
+        )),
+    ]));
+    let skew = app
+        .pipeline_health
+        .as_ref()
+        .and_then(|h| h.clock_skew_warning_s);
+    let clock = app
+        .station_readiness
+        .as_ref()
+        .map(|r| r.clock)
+        .unwrap_or_default();
+    let (clock_ok, clock_text) = match (skew, clock) {
+        (Some(offset), _) => (false, crate::readiness::clock_skew_detail(offset)),
+        (None, crate::readiness::ClockState::InSpec) => {
+            (true, "in spec (pool.ntp.org)".to_string())
+        }
+        (None, crate::readiness::ClockState::Pending) => (true, "checking…".to_string()),
+        (None, crate::readiness::ClockState::Unreachable) => {
+            (false, "UNVERIFIED — pool.ntp.org unreachable".to_string())
+        }
+        (None, crate::readiness::ClockState::Skewed) => (false, "SKEWED".to_string()),
+        (None, crate::readiness::ClockState::Rechecking) => {
+            (true, "re-checking after a clock step".to_string())
+        }
+        (None, crate::readiness::ClockState::NotMonitored) => (true, "not monitored".to_string()),
+    };
+    lines.push(Line::from(vec![
+        dot(clock_ok),
+        Span::raw(format!(" Clock: {clock_text}")),
     ]));
 
     lines.push(Line::from(""));
@@ -1887,8 +1990,7 @@ pub fn render_health_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
         "  QSOs completed: {}   failed: {}   TX drops: {}",
         app.session_completed, app.session_failed, app.session_tx_drops
     ))));
-
-    f.render_widget(Paragraph::new(lines), inner);
+    lines
 }
 
 /// Render the required out-of-band acknowledgment modal.
@@ -1956,20 +2058,6 @@ pub fn format_time_ago(timestamp: chrono::DateTime<chrono::Utc>) -> String {
     } else {
         format!("{}d", duration.num_days())
     }
-}
-
-/// PAN-114: title-bar clock-skew alarm text for a signed SNTP offset
-/// (positive = local clock behind UTC = SLOW). Two decimals below 10 s,
-/// whole seconds from 10 s up (a Pi booted without an RTC can be a day off).
-fn clock_skew_chip_text(offset_s: f64) -> String {
-    let mag = offset_s.abs();
-    let mag = if mag < 10.0 {
-        format!("{mag:.2}s")
-    } else {
-        format!("{mag:.0}s")
-    };
-    let dir = if offset_s > 0.0 { "SLOW" } else { "FAST" };
-    format!(" ⚠ CLOCK {mag} {dir} ")
 }
 
 #[cfg(test)]
@@ -2146,7 +2234,9 @@ mod view_render_tests {
         }
     }
 
-    async fn title_row_with_clock(
+    /// PAN-89: the clock-skew chip moved from the title bar into the
+    /// readiness strip (row 1).
+    async fn strip_row_with_clock(
         clock_skew_warning_s: Option<f64>,
         audio_alive: bool,
     ) -> (ratatui::buffer::Buffer, String) {
@@ -2158,54 +2248,364 @@ mod view_render_tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, &app).unwrap()).unwrap();
         let buf = term.backend().buffer().clone();
-        let row: String = (0..buf.area.width)
-            .map(|x| buf[(x, 0)].symbol().chars().next().unwrap_or(' '))
-            .collect();
+        let row = row_text(&buf, 1);
         (buf, row)
     }
 
     #[tokio::test]
     async fn title_bar_shows_clock_chip_when_skewed_slow() {
-        let (_, row) = title_row_with_clock(Some(0.42), true).await;
-        assert!(row.contains("⚠ CLOCK 0.42s SLOW"), "row 0: {row}");
+        let (_, row) = strip_row_with_clock(Some(0.42), true).await;
+        assert!(row.contains("⚠ CLOCK 0.42s SLOW"), "row 1: {row}");
     }
 
     #[tokio::test]
     async fn title_bar_shows_clock_chip_when_skewed_fast() {
-        let (_, row) = title_row_with_clock(Some(-1.37), true).await;
-        assert!(row.contains("⚠ CLOCK 1.37s FAST"), "row 0: {row}");
+        let (_, row) = strip_row_with_clock(Some(-1.37), true).await;
+        assert!(row.contains("⚠ CLOCK 1.37s FAST"), "row 1: {row}");
     }
 
     #[tokio::test]
     async fn title_bar_clock_chip_uses_whole_seconds_past_ten() {
-        let (_, row) = title_row_with_clock(Some(86400.0), true).await;
-        assert!(row.contains("⚠ CLOCK 86400s SLOW"), "row 0: {row}");
+        let (_, row) = strip_row_with_clock(Some(86400.0), true).await;
+        assert!(row.contains("⚠ CLOCK 86400s SLOW"), "row 1: {row}");
     }
 
     #[tokio::test]
     async fn title_bar_has_no_clock_chip_when_in_spec() {
-        let (_, row) = title_row_with_clock(None, true).await;
-        assert!(!row.contains("CLOCK"), "row 0: {row}");
+        let (_, row) = strip_row_with_clock(None, true).await;
+        assert!(!row.contains("CLOCK"), "row 1: {row}");
     }
 
     #[tokio::test]
-    async fn audio_dead_alarm_outranks_clock_chip() {
-        let (_, row) = title_row_with_clock(Some(0.42), false).await;
-        assert!(row.contains("AUDIO DEAD"), "row 0: {row}");
-        assert!(!row.contains("CLOCK"), "row 0: {row}");
+    async fn audio_dead_and_clock_skew_both_show_in_strip() {
+        let (_, row) = strip_row_with_clock(Some(0.42), false).await;
+        assert!(row.contains("AUDIO INPUT DEAD — press d"), "row 1: {row}");
+        assert!(row.contains("⚠ CLOCK 0.42s SLOW"), "row 1: {row}");
     }
 
     #[tokio::test]
-    async fn clock_chip_uses_the_alarm_style() {
-        let (buf, row) = title_row_with_clock(Some(0.42), true).await;
+    async fn clock_chip_uses_the_warning_style() {
+        let (buf, row) = strip_row_with_clock(Some(0.42), true).await;
         let chars: Vec<char> = row.chars().collect();
         let x = (0..chars.len())
             .find(|&i| chars[i..].iter().collect::<String>().starts_with("⚠ CLOCK"))
-            .expect("clock chip in row 0");
-        let cell = &buf[(x as u16, 0)];
-        assert_eq!(cell.fg, Color::White);
-        assert_eq!(cell.bg, Color::Red);
+            .expect("clock chip in row 1");
+        let cell = &buf[(x as u16, 1)];
+        assert_eq!(cell.fg, Color::Black);
+        assert_eq!(cell.bg, Color::Yellow);
         assert!(cell.modifier.contains(Modifier::BOLD));
+    }
+
+    fn rig_lost_readiness() -> crate::readiness::StationReadiness {
+        crate::readiness::StationReadiness {
+            tx_mute_causes: vec![crate::readiness::TxMuteCause::RigDisconnected],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn readiness_strip_is_row_one_in_every_view_and_zoom() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.station_readiness = Some(rig_lost_readiness());
+        for (view, zoomed) in [
+            (crate::view::ActiveView::Operate, false),
+            (crate::view::ActiveView::Monitor, false),
+            (crate::view::ActiveView::Hunt, false),
+            (crate::view::ActiveView::Run, false),
+            (crate::view::ActiveView::Operate, true),
+        ] {
+            app.active_view = view;
+            app.zoomed = zoomed;
+            let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            term.draw(|f| draw(f, &app).unwrap()).unwrap();
+            let buf = term.backend().buffer().clone();
+            let row = row_text(&buf, 1);
+            assert!(row.contains("✗ TX HELD"), "{view:?} zoomed={zoomed}: {row}");
+            assert!(
+                row.contains("RIG CAT LINK LOST"),
+                "{view:?} zoomed={zoomed}: {row}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn title_bar_no_longer_carries_alarm_chips() {
+        let (buf, _) = strip_row_with_clock(Some(1.2), false).await;
+        let title = row_text(&buf, 0);
+        assert!(!title.contains("AUDIO DEAD"), "row 0: {title}");
+        assert!(!title.contains("CLOCK"), "row 0: {title}");
+        assert!(title.contains("UTC"), "row 0: {title}");
+    }
+
+    #[tokio::test]
+    async fn calm_strip_shows_subsystem_marks() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.pipeline_health = Some(health_with_clock(None, true));
+        app.station_readiness = Some(crate::readiness::StationReadiness {
+            clock: crate::readiness::ClockState::InSpec,
+            ..Default::default()
+        });
+        app.rig_connected = crate::app::RigConnDisplay::Connected;
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| draw(f, &app).unwrap()).unwrap();
+        let row = row_text(&term.backend().buffer().clone(), 1);
+        assert!(row.contains("✓ TX READY"), "row 1: {row}");
+        assert!(row.contains("rig ✓ · audio ✓ · clock ✓"), "row 1: {row}");
+
+        // Mock rig / rig control off (or a failed connect).
+        app.rig_connected = crate::app::RigConnDisplay::NotConnected;
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| draw(f, &app).unwrap()).unwrap();
+        let row = row_text(&term.backend().buffer().clone(), 1);
+        assert!(row.contains("rig: no CAT"), "row 1: {row}");
+    }
+
+    #[tokio::test]
+    async fn checking_strip_before_first_snapshot() {
+        let buf = render_view(crate::view::ActiveView::Operate).await;
+        let row = row_text(&buf, 1);
+        assert!(
+            row.contains("… CHECKING  waiting for station status"),
+            "row 1: {row}"
+        );
+    }
+
+    #[tokio::test]
+    async fn strip_overflow_shows_more_counter_at_80_columns() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.pipeline_health = Some(health_with_clock(None, false));
+        app.station_readiness = Some(crate::readiness::StationReadiness {
+            tx_mute_causes: vec![
+                crate::readiness::TxMuteCause::RigDisconnected,
+                crate::readiness::TxMuteCause::RigStatePending,
+                crate::readiness::TxMuteCause::RigCommandInFlight,
+            ],
+            ..Default::default()
+        });
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw(f, &app).unwrap()).unwrap();
+        let buf = term.backend().buffer().clone();
+        let row = row_text(&buf, 1);
+        assert!(row.contains("RIG CAT LINK LOST"), "row 1: {row}");
+        assert!(row.contains("AUDIO INPUT DEAD — press d"), "row 1: {row}");
+        assert!(row.contains("+2 more · Shift+S"), "row 1: {row}");
+        assert_eq!(row.chars().count(), 80);
+        assert!(!row.contains("RIG CMD QUEUED"), "row 1: {row}");
+    }
+
+    /// A production-length alert (the Hamlib rig-connect error) is cut to
+    /// fit with `…`, not hidden behind `+1 more · Shift+S`.
+    #[tokio::test]
+    async fn strip_truncates_a_long_alert_instead_of_hiding_it() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.pipeline_health = Some(health_with_clock(None, true));
+        app.station_readiness = Some(crate::readiness::StationReadiness {
+            clock: crate::readiness::ClockState::InSpec,
+            ..Default::default()
+        });
+        app.add_error_message(
+            "Rig connect failed (Connection refused (os error 111)). Check the radio is \
+             powered on and the USB cable; verify with `pancetta test-rig`, then restart \
+             pancetta."
+                .to_string(),
+        );
+        for (w, h) in [(80, 24), (120, 40), (160, 40)] {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| draw(f, &app).unwrap()).unwrap();
+            let row = row_text(&term.backend().buffer().clone(), 1);
+            assert!(
+                row.contains("⚠ Rig connect failed (Connection"),
+                "{w}: {row}"
+            );
+            assert!(row.contains('…'), "{w}: {row}");
+            assert!(!row.contains("more · Shift+S"), "{w}: {row}");
+            assert!(row.trim_end().ends_with("! ack"), "{w}: {row}");
+        }
+    }
+
+    async fn render_health(app: &crate::app::App) -> ratatui::buffer::Buffer {
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| render_health_panel(f, f.area(), app))
+            .unwrap();
+        term.backend().buffer().clone()
+    }
+
+    #[tokio::test]
+    async fn health_panel_lists_readiness_items_including_acknowledged() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.station_readiness = Some(crate::readiness::StationReadiness {
+            ptt_off_unconfirmed: true,
+            clock: crate::readiness::ClockState::Unreachable,
+            ..Default::default()
+        });
+        assert_eq!(app.acknowledge_readiness(), 1);
+        let buf = render_health(&app).await;
+        assert!(buffer_contains(&buf, "Readiness: TX OPEN"));
+        assert!(buffer_contains(&buf, "PTT may still be keyed"));
+        assert!(buffer_contains(&buf, "Clock unverified (ack'd)"));
+    }
+
+    fn render_health_80x24(app: &crate::app::App) -> ratatui::buffer::Buffer {
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| render_health_panel(f, f.area(), app))
+            .unwrap();
+        term.backend().buffer().clone()
+    }
+
+    /// PAN-89 (Codex P2 on PR #420): eight readiness items push the Shift+S
+    /// panel past 80×24; every row must stay reachable by scrolling, and
+    /// the panel only advertises scrolling while it overflows.
+    #[tokio::test]
+    async fn health_panel_scrolls_to_rows_clipped_at_80x24() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        let buf = render_health_80x24(&app);
+        assert!(!buffer_contains(&buf, "scroll"), "fits: no scroll hint");
+
+        app.pipeline_health = Some(health_with_clock(None, true));
+        app.station_readiness = Some(crate::readiness::StationReadiness {
+            ptt_off_unconfirmed: true,
+            clock: crate::readiness::ClockState::Unreachable,
+            tx_mute_causes: vec![crate::readiness::TxMuteCause::RigDisconnected],
+            ..Default::default()
+        });
+        app.tx_output_default = true;
+        app.input_fallback = true;
+        for i in 0..3 {
+            app.add_error_message(format!("config warning {i}"));
+        }
+        let (max_scroll, _) = health_panel_scroll_bounds(Rect::new(0, 0, 80, 24), &app);
+        assert!(max_scroll > 0, "80x24 can't fit eight items");
+
+        let buf = render_health_80x24(&app);
+        assert!(buffer_contains(&buf, "Readiness: TX HELD"));
+        assert!(
+            !buffer_contains(&buf, "QSOs completed"),
+            "clipped at bottom"
+        );
+        assert!(buffer_contains(&buf, "↑↓ PgUp PgDn scroll · 1–18 of"));
+
+        let mut seen = String::new();
+        for scroll in 0..=max_scroll {
+            app.health_scroll = scroll;
+            let buf = render_health_80x24(&app);
+            for y in 0..buf.area.height {
+                seen.push_str(&row_text(&buf, y));
+                seen.push('\n');
+            }
+        }
+        for item in crate::readiness::readiness_items(&app) {
+            let lead = item.detail.split(" — ").next().unwrap().to_string();
+            assert!(seen.contains(&lead), "unreachable: {lead}");
+        }
+        for row in [
+            "Rig:",
+            "TX audio output:",
+            "RX input:",
+            "Clock:",
+            "QSOs completed",
+        ] {
+            assert!(seen.contains(row), "unreachable: {row}");
+        }
+
+        // The renderer clamps an offset past the end (e.g. after a resize).
+        app.health_scroll = u16::MAX;
+        let buf = render_health_80x24(&app);
+        assert!(buffer_contains(&buf, "QSOs completed"));
+    }
+
+    #[tokio::test]
+    async fn health_panel_readiness_header_before_first_snapshot() {
+        let app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        let buf = render_health(&app).await;
+        assert!(buffer_contains(&buf, "Readiness: checking…"));
+    }
+
+    #[tokio::test]
+    async fn health_panel_readiness_header_when_all_clear() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.pipeline_health = Some(health_with_clock(None, true));
+        app.station_readiness = Some(crate::readiness::StationReadiness {
+            clock: crate::readiness::ClockState::InSpec,
+            ..Default::default()
+        });
+        let buf = render_health(&app).await;
+        assert!(buffer_contains(
+            &buf,
+            "Readiness: TX READY — nothing to report"
+        ));
+    }
+
+    /// Dot colour of the first row containing `needle` (the `●` sits right
+    /// before the text).
+    fn dot_fg_for(buf: &ratatui::buffer::Buffer, needle: &str) -> Color {
+        for y in 0..buf.area.height {
+            let row = row_text(buf, y);
+            if let Some(byte_idx) = row.find(needle) {
+                let col = row[..byte_idx].chars().count();
+                let dot_x = (0..col)
+                    .rev()
+                    .find(|&x| buf[(x as u16, y)].symbol() == "●")
+                    .expect("dot before text");
+                return buf[(dot_x as u16, y)].fg;
+            }
+        }
+        panic!("{needle} not rendered");
+    }
+
+    #[tokio::test]
+    async fn health_panel_tx_audio_row_is_red_when_routed_to_system_default() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.tx_output_default = true;
+        let buf = render_health(&app).await;
+        assert!(buffer_contains(&buf, "SYSTEM DEFAULT — check device"));
+        assert_eq!(dot_fg_for(&buf, "TX audio output"), Color::Red);
+
+        app.tx_output_default = false;
+        let buf = render_health(&app).await;
+        assert!(buffer_contains(&buf, "TX audio output: explicit device"));
+        assert_eq!(dot_fg_for(&buf, "TX audio output"), Color::Green);
+    }
+
+    #[tokio::test]
+    async fn health_panel_shows_rx_input_and_clock_rows() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.input_fallback = true;
+        app.station_readiness = Some(crate::readiness::StationReadiness {
+            clock: crate::readiness::ClockState::Unreachable,
+            ..Default::default()
+        });
+        let buf = render_health(&app).await;
+        assert!(buffer_contains(&buf, "RX input: FALLBACK device"));
+        assert!(buffer_contains(
+            &buf,
+            "Clock: UNVERIFIED — pool.ntp.org unreachable"
+        ));
+
+        app.input_fallback = false;
+        app.pipeline_health = Some(health_with_clock(Some(1.2), true));
+        let buf = render_health(&app).await;
+        assert!(buffer_contains(&buf, "RX input: configured device"));
+        assert!(buffer_contains(&buf, "Clock: 1.20 s SLOW"));
     }
 
     #[tokio::test]
@@ -2227,7 +2627,7 @@ mod view_render_tests {
         assert!(buffer_contains(&buf, "Band Activity"));
         assert!(buffer_contains(&buf, "TX Placement"));
         assert!(!buffer_contains(&buf, "Callers"));
-        // TestBackend's 120x40 fixture gives Hunt a 35-row content area,
+        // TestBackend's 120x40 fixture gives Hunt a 34-row content area,
         // comfortably over the `layout_hunt` STATION_CARD_MIN_CONTENT_HEIGHT
         // (30), so the station card (Task 18) should show up below DX Hunter.
         assert!(
@@ -3047,6 +3447,25 @@ mod view_render_tests {
             callers.contains("No one") && callers.contains("calling"),
             "{callers}"
         );
+    }
+
+    /// PAN-89: the readiness strip costs Operate a row; at 80×24 Callers
+    /// must still show a caller under its header (the card yields instead),
+    /// and sizes where the card has content keep it.
+    #[tokio::test]
+    async fn callers_shows_a_caller_row_at_80x24() {
+        let mut app = default_app().await;
+        let caller = fixture_caller(&app, "DL1XYZ");
+        app.decoded_messages.push_back(caller);
+        let rects = compute_operate_rects(content_area(Rect::new(0, 0, 80, 24)));
+        assert_eq!(rects.station_card.height, 0);
+        let buf = render_app(&app, 80, 24);
+        let callers = panel_rows_text(&buf, rects.callers);
+        assert!(callers.contains("DL1XYZ"), "{callers}");
+        for (w, h) in [(100, 30), (120, 40)] {
+            let rects = compute_operate_rects(content_area(Rect::new(0, 0, w, h)));
+            assert!(rects.station_card.height >= 3, "{w}x{h}");
+        }
     }
 
     #[tokio::test]

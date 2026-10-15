@@ -1320,6 +1320,28 @@ pub fn admit_new_qso(
     }
 }
 
+/// Outcome of the concurrent-QSO capacity check for an open that would add one
+/// more ACTIVE QSO (PAN-78). Sibling of [`TxAdmission`]: parity decides which
+/// window a new QSO may use; capacity decides whether there is room at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityAdmission {
+    /// Room for one more active QSO.
+    Admit,
+    /// `active` QSOs already occupy all `cap` slots — refuse the open.
+    AtCapacity { active: usize, cap: usize },
+}
+
+/// Pure capacity decision (see [`CapacityAdmission`]): admit iff
+/// `active < cap`. `cap` is used as given (no floor) so callers reproduce
+/// `maybe_answer_caller`'s historical `active >= cap` refusal exactly.
+pub fn admit_within_capacity(active: usize, cap: usize) -> CapacityAdmission {
+    if active < cap {
+        CapacityAdmission::Admit
+    } else {
+        CapacityAdmission::AtCapacity { active, cap }
+    }
+}
+
 impl QsoManager {
     /// Current true RF frequency for an audio-offset frequency, using the
     /// live rig dial (+ split TX dial if active) -- the same `effective_tx_dial`
@@ -1382,6 +1404,95 @@ impl QsoManager {
                 p.state.is_active() && !matches!(p.state, crate::states::QsoState::CallingCq { .. })
             })
             .count()
+    }
+
+    /// PAN-78: whether a MANUAL open of `callsign` at `step`, on `frequency`'s
+    /// band, would ADD an active QSO, as opposed to resolving to one that
+    /// already exists. Pass the same `frequency` the open call will receive
+    /// (the computed TX offset):
+    /// - `SeventyThree` never adds: it advances an active QSO, re-keys a
+    ///   recently completed one, or opens directly at `Completed` (not active);
+    /// - any active QSO with this callsign on this band → no: FIX 1 continues a
+    ///   manual one, FIX 3 ([`Self::supersede_active_qsos_for`]) replaces any
+    ///   other one-for-one;
+    /// - `Rr73` with a manual QSO completed within
+    ///   [`COMPLETED_QSO_REWORK_GRACE`] → no: FIX B re-keys it;
+    /// - otherwise → yes.
+    ///
+    /// Must stay in lockstep with [`Self::respond_to_cq_with`] /
+    /// [`Self::respond_to_caller`] (pinned by the
+    /// `manual_open_predicate_matches_real_open_effect` test). Read-only: never
+    /// takes a write lock.
+    pub async fn manual_open_adds_active_qso(
+        &self,
+        callsign: &str,
+        frequency: f64,
+        step: pancetta_core::ResponseStep,
+    ) -> bool {
+        if step == pancetta_core::ResponseStep::SeventyThree {
+            return false;
+        }
+        let want_band = crate::utils::frequency_to_band(frequency);
+        let key = callsign.to_uppercase();
+        let ids = self
+            .qsos_by_callsign
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        let has_active_same_band = {
+            let qsos = self.qsos.read().await;
+            ids.iter().any(|id| {
+                qsos.get(id).is_some_and(|p| {
+                    p.state.is_active()
+                        && crate::utils::frequency_to_band(p.metadata.frequency) == want_band
+                })
+            })
+        };
+        if has_active_same_band {
+            return false;
+        }
+        // FIX B only exists on `respond_to_caller`'s non-Grid path; Grid
+        // (ladder rank 0) is routed through `respond_to_cq_with`, which has
+        // no completed-QSO re-key, so the rank gate excludes it here too.
+        if Self::step_ladder_rank(step) >= Some(2)
+            && self
+                .find_recently_completed_manual_qso_for(
+                    callsign,
+                    frequency,
+                    COMPLETED_QSO_REWORK_GRACE,
+                )
+                .await
+                .is_some()
+        {
+            return false;
+        }
+        true
+    }
+
+    /// PAN-78: whether [`Self::engage_hound`] for `fox_call` would ADD an
+    /// active QSO. `engage_hound` is a manual `respond_to_cq_with` at the
+    /// Fox's deterministic low calling offset, so a repeat engage of a Fox we
+    /// are already working continues (FIX 1) or replaces (FIX 3) that QSO and
+    /// adds nothing; this is [`Self::manual_open_adds_active_qso`] at that
+    /// offset and the `Grid` step.
+    pub async fn engage_hound_adds_active_qso(&self, fox_call: &str) -> bool {
+        self.manual_open_adds_active_qso(
+            fox_call,
+            self.hound_calling_offset(fox_call),
+            pancetta_core::ResponseStep::Grid,
+        )
+        .await
+    }
+
+    /// The low calling offset [`Self::engage_hound`] opens a Hound QSO at.
+    fn hound_calling_offset(&self, fox_call: &str) -> f64 {
+        hound_offset_for(
+            fox_call,
+            self.config.hound.call_min_hz,
+            self.config.hound.call_max_hz,
+        )
     }
 
     /// Whether any *active* (non-terminal) QSO already exists with `callsign`
@@ -2136,11 +2247,7 @@ impl QsoManager {
     ) -> Result<QsoId, QsoManagerError> {
         // Compute our deterministic low calling offset for this Fox callsign,
         // using the operator-configured (or default) call region bounds.
-        let low_offset = hound_offset_for(
-            fox_call,
-            self.config.hound.call_min_hz,
-            self.config.hound.call_max_hz,
-        );
+        let low_offset = self.hound_calling_offset(fox_call);
 
         // Store the Fox's grid on `their_callsign`'s QSO (for logging); the TX
         // message itself uses *our* grid (station config), which respond_to_cq_with
@@ -8275,6 +8382,300 @@ mod tests {
         // conflicts — it rides whatever side is already live.
         assert_eq!(admit_new_qso(Some(Even), None), TxAdmission::Admit);
         assert_eq!(admit_new_qso(Some(Odd), None), TxAdmission::Admit);
+    }
+
+    // ── PAN-78: capacity primitives ─────────────────────────────────────
+
+    #[test]
+    fn capacity_admits_below_cap() {
+        assert_eq!(admit_within_capacity(0, 1), CapacityAdmission::Admit);
+        assert_eq!(admit_within_capacity(1, 2), CapacityAdmission::Admit);
+    }
+
+    #[test]
+    fn capacity_refuses_at_and_above_cap() {
+        assert_eq!(
+            admit_within_capacity(1, 1),
+            CapacityAdmission::AtCapacity { active: 1, cap: 1 }
+        );
+        assert_eq!(
+            admit_within_capacity(3, 2),
+            CapacityAdmission::AtCapacity { active: 3, cap: 2 }
+        );
+    }
+
+    #[test]
+    fn capacity_zero_cap_refuses_everything() {
+        // Mirrors maybe_answer_caller's `active >= cap` with a Fox
+        // fox_max_streams of 0.
+        assert_eq!(
+            admit_within_capacity(0, 0),
+            CapacityAdmission::AtCapacity { active: 0, cap: 0 }
+        );
+    }
+
+    const PAN78_DX: &str = "K9XYZ";
+    const PAN78_OTHER: &str = "K8OTH";
+    const PAN78_FREQ: f64 = 1500.0;
+
+    /// Open a manual QSO the way `StartQso` does (Grid, via
+    /// `respond_to_cq_with(..Manual..)`).
+    async fn pan78_open_manual(manager: &QsoManager, call: &str) -> QsoId {
+        manager
+            .respond_to_cq_with(
+                call.to_string(),
+                PAN78_FREQ,
+                Some(pancetta_core::slot::SlotParity::Even),
+                CallInitiation::Manual,
+                None,
+                false,
+                None,
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Open a QSO the way `RespondToCaller` does, at `step`.
+    async fn pan78_reply(
+        manager: &QsoManager,
+        call: &str,
+        step: pancetta_core::ResponseStep,
+    ) -> QsoId {
+        manager
+            .respond_to_caller(
+                call.to_string(),
+                PAN78_FREQ,
+                Some(pancetta_core::slot::SlotParity::Even),
+                step,
+                Some(-8.0),
+                Some(-4),
+                None,
+                false,
+                None,
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn manual_open_adds_for_a_fresh_callsign() {
+        use pancetta_core::ResponseStep;
+        let manager = QsoManager::new(test_config());
+        assert!(
+            manager
+                .manual_open_adds_active_qso(PAN78_DX, PAN78_FREQ, ResponseStep::Grid)
+                .await
+        );
+        assert!(
+            manager
+                .manual_open_adds_active_qso(PAN78_DX, PAN78_FREQ, ResponseStep::Report)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_open_does_not_add_for_active_manual_recall() {
+        use pancetta_core::ResponseStep;
+        let manager = QsoManager::new(test_config());
+        pan78_open_manual(&manager, PAN78_DX).await;
+        assert!(
+            !manager
+                .manual_open_adds_active_qso(PAN78_DX, PAN78_FREQ, ResponseStep::Grid)
+                .await,
+            "re-calling an active manual QSO is FIX 1's idempotent keep-call"
+        );
+        // Case-insensitive, like the `qsos_by_callsign` keying.
+        assert!(
+            !manager
+                .manual_open_adds_active_qso("k9xyz", PAN78_FREQ, ResponseStep::Report)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_open_does_not_add_for_active_auto_supersede() {
+        use pancetta_core::ResponseStep;
+        let manager = QsoManager::new(test_config());
+        manager
+            .respond_to_cq(
+                PAN78_DX.to_string(),
+                PAN78_FREQ,
+                Some(pancetta_core::slot::SlotParity::Even),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !manager
+                .manual_open_adds_active_qso(PAN78_DX, PAN78_FREQ, ResponseStep::Grid)
+                .await,
+            "a manual open over an active auto QSO is FIX 3's one-for-one supersede"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_open_seventy_three_never_adds() {
+        use pancetta_core::ResponseStep;
+        let manager = QsoManager::new(test_config());
+        assert!(
+            !manager
+                .manual_open_adds_active_qso(PAN78_DX, PAN78_FREQ, ResponseStep::SeventyThree)
+                .await,
+            "SeventyThree opens directly at Completed (not active)"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_open_rr73_rekeys_recently_completed() {
+        use pancetta_core::ResponseStep;
+        let manager = QsoManager::new(test_config());
+        // SeventyThree opens a MANUAL QSO directly at Completed.
+        pan78_reply(&manager, PAN78_DX, ResponseStep::SeventyThree).await;
+        assert_eq!(manager.active_qso_count().await, 0);
+        assert!(
+            !manager
+                .manual_open_adds_active_qso(PAN78_DX, PAN78_FREQ, ResponseStep::Rr73)
+                .await,
+            "Rr73 within the rework grace is FIX B's re-key of the completed QSO"
+        );
+        assert!(
+            manager
+                .manual_open_adds_active_qso(PAN78_DX, PAN78_FREQ, ResponseStep::Report)
+                .await,
+            "Report (ladder rank < 2) is the deliberate rework case: a new QSO"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_open_other_callsign_still_adds() {
+        use pancetta_core::ResponseStep;
+        let manager = QsoManager::new(test_config());
+        pan78_open_manual(&manager, PAN78_DX).await;
+        assert!(
+            manager
+                .manual_open_adds_active_qso(PAN78_OTHER, PAN78_FREQ, ResponseStep::Grid)
+                .await
+        );
+        assert!(
+            manager
+                .manual_open_adds_active_qso(PAN78_OTHER, PAN78_FREQ, ResponseStep::Rr73)
+                .await
+        );
+    }
+
+    /// Mirror test: pins `manual_open_adds_active_qso` to the REAL open
+    /// functions' effect on `active_qso_count()`, so a future change to the
+    /// reuse/supersede branches of `respond_to_cq_with` / `respond_to_caller`
+    /// (or to the predicate) fails here.
+    #[tokio::test]
+    async fn manual_open_predicate_matches_real_open_effect() {
+        use pancetta_core::ResponseStep;
+
+        #[derive(Debug, Clone, Copy)]
+        enum Setup {
+            Empty,
+            ActiveManual,
+            ActiveAuto,
+            RecentlyCompletedManual,
+        }
+
+        let cases: &[(Setup, &str, ResponseStep)] = &[
+            (Setup::Empty, PAN78_DX, ResponseStep::Grid),
+            (Setup::Empty, PAN78_DX, ResponseStep::Report),
+            (Setup::Empty, PAN78_DX, ResponseStep::ReportAck),
+            (Setup::Empty, PAN78_DX, ResponseStep::Rr73),
+            (Setup::Empty, PAN78_DX, ResponseStep::SeventyThree),
+            (Setup::ActiveManual, PAN78_DX, ResponseStep::Grid),
+            (Setup::ActiveManual, PAN78_DX, ResponseStep::Report),
+            (Setup::ActiveManual, PAN78_DX, ResponseStep::Rr73),
+            (Setup::ActiveManual, PAN78_OTHER, ResponseStep::Grid),
+            (Setup::ActiveManual, PAN78_OTHER, ResponseStep::Report),
+            (Setup::ActiveAuto, PAN78_DX, ResponseStep::Grid),
+            (Setup::ActiveAuto, PAN78_DX, ResponseStep::Report),
+            (Setup::ActiveAuto, PAN78_DX, ResponseStep::Rr73),
+            (Setup::RecentlyCompletedManual, PAN78_DX, ResponseStep::Grid),
+            (
+                Setup::RecentlyCompletedManual,
+                PAN78_DX,
+                ResponseStep::Report,
+            ),
+            (Setup::RecentlyCompletedManual, PAN78_DX, ResponseStep::Rr73),
+            (
+                Setup::RecentlyCompletedManual,
+                PAN78_DX,
+                ResponseStep::SeventyThree,
+            ),
+        ];
+
+        for &(setup, call, step) in cases {
+            let manager = QsoManager::new(test_config());
+            match setup {
+                Setup::Empty => {}
+                Setup::ActiveManual => {
+                    pan78_open_manual(&manager, PAN78_DX).await;
+                }
+                Setup::ActiveAuto => {
+                    manager
+                        .respond_to_cq(
+                            PAN78_DX.to_string(),
+                            PAN78_FREQ,
+                            Some(pancetta_core::slot::SlotParity::Even),
+                        )
+                        .await
+                        .unwrap();
+                }
+                Setup::RecentlyCompletedManual => {
+                    pan78_reply(&manager, PAN78_DX, ResponseStep::SeventyThree).await;
+                }
+            }
+
+            let before = manager.active_qso_count().await;
+            let adds = manager
+                .manual_open_adds_active_qso(call, PAN78_FREQ, step)
+                .await;
+            if step == ResponseStep::Grid {
+                pan78_open_manual(&manager, call).await;
+            } else {
+                pan78_reply(&manager, call, step).await;
+            }
+            let after = manager.active_qso_count().await;
+            assert_eq!(
+                after,
+                before + usize::from(adds),
+                "predicate disagrees with the real open for {setup:?} / {call} / {step:?} \
+                 (before={before}, adds={adds}, after={after})"
+            );
+        }
+    }
+
+    /// PAN-78: `engage_hound_adds_active_qso` must match what `engage_hound`
+    /// really does — a first engage adds a QSO, a repeat engage of the same
+    /// Fox continues it (same id, no new active QSO), another Fox adds one.
+    #[tokio::test]
+    async fn engage_hound_predicate_matches_real_engage_effect() {
+        use pancetta_core::slot::SlotParity;
+        let manager = QsoManager::new(test_config());
+        let engage = |call: &'static str| {
+            let manager = &manager;
+            async move {
+                manager
+                    .engage_hound(call, 600.0, None, Some(SlotParity::Even))
+                    .await
+                    .unwrap()
+            }
+        };
+
+        assert!(manager.engage_hound_adds_active_qso("K5FOX").await);
+        let first = engage("K5FOX").await;
+        assert_eq!(manager.active_qso_count().await, 1);
+
+        assert!(!manager.engage_hound_adds_active_qso("K5FOX").await);
+        let again = engage("K5FOX").await;
+        assert_eq!(again, first, "a repeat engage continues the Hound QSO");
+        assert_eq!(manager.active_qso_count().await, 1);
+
+        assert!(manager.engage_hound_adds_active_qso("K6FOX").await);
+        engage("K6FOX").await;
+        assert_eq!(manager.active_qso_count().await, 2);
     }
 
     #[tokio::test]

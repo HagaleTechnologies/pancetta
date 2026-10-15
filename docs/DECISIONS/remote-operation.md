@@ -426,6 +426,60 @@ Normative station behaviour for heartbeat timing:
   wake. A wall-clock forward step still does not expire liveness; only real elapsed time does. A
   suspend-aware sample earlier than the stored one denies.
 
+## Relay session IO is bounded (PAN-102), 2026-10-14
+
+Normative station behaviour for the station agent's relay connection:
+
+- **Every relay wait has a deadline.** The constants live in
+  `pancetta/src/coordinator/station_agent/net.rs` (`RelayTimeouts::default()`):
+  `RELAY_CONNECT_TIMEOUT` = 15 s bounds dial + TLS + WebSocket upgrade; `RELAY_HELLO_TIMEOUT` =
+  10 s bounds the wait for the relay's opening `hello` after the upgrade; `RELAY_SEND_TIMEOUT` =
+  5 s bounds a send's wait for room in the 64-slot outbound queue; `RELAY_WRITE_TIMEOUT` = 10 s
+  bounds one frame's socket write + flush. Each is shorter than the 30 s dead-man window
+  (`HEARTBEAT_TIMEOUT_MS`), and a test asserts it. The adapter's `block_in_place` waits cannot be
+  cancelled, so every one of them carries one of these deadlines; that bound is what keeps the
+  session task cancellable.
+- **The `hello` deadline is the authentication deadline.** `MultiPeerSession::authenticate` takes
+  it explicitly. A relay that completes the upgrade but sends no `hello` in time fails the
+  session with `SessionError::Timeout("awaiting hello")`.
+- **Reader and writer progress independently.** The adapter's socket pump runs its reader and
+  writer as two concurrent futures, so inbound frames (a `txDisarm`, a relay `presence: down`)
+  keep reaching the session loop while an outbound write is stuck.
+- **A transport failure ends the session.** A write that cannot finish within the write deadline
+  closes the connection; a send that cannot enqueue within the send deadline aborts it at once.
+  Inbound frames still buffered when the outbound side fails are discarded, not delivered, so a
+  queued heartbeat or TX request cannot act after the connection has failed; a read-side close or
+  socket error is reported after the frames that preceded it, which are still delivered.
+- **The session loop yields every tick.** `run_one_session` awaits `yield_now` once per
+  `RECV_TICK` (200 ms) and ends the session when the component shutdown flag is set, so an
+  `abort()` or a requested shutdown takes effect on a quiet authenticated relay without waiting for
+  a socket event; the caller then disarms.
+  Any relay transport error on a send latches in `MultiPeerSession`: the relay socket is shared by
+  every peer, so no later send touches it, nothing received afterwards is acted on, and the next
+  poll returns the error. `run_session_loop` then disarms (`disarm_on_loss`) and reconnects with
+  the existing 2 s → 60 s backoff. An oversized frame is not a transport failure and stays a
+  per-peer skip.
+- **Display sends never wait, but display frames share the outbound FIFO.** `drain_read_stream`
+  takes display events only while the outbound queue has at least `DISPLAY_FEED_MIN_SEND_CAPACITY`
+  = 16 free slots (two fan-outs at `MAX_PEERS`), so a display fan-out never waits and always leaves
+  at least `MAX_PEERS` free slots, enough for one control fan-out. Under congestion the events stay
+  in the broadcast ring, which drops the oldest. A larger control batch (an `Arm` that implicitly
+  grabs control sends two `controlState` fan-outs) waits for display frames to drain: each send
+  past the free slots can wait up to the send deadline, and a timeout ends the session. Control
+  frames are not prioritised: the queue is one FIFO, so a control frame can sit behind up to
+  `RELAY_QUEUE_DEPTH - DISPLAY_FEED_MIN_SEND_CAPACITY + MAX_PEERS` = 56 queued display frames plus
+  the one being written. The write deadline bounds each of those writes, not their sum: a relay
+  that takes just under 10 s per frame delays that control frame by up to about 57 × 10 s. Frames
+  are encrypted before they are queued and each peer's Noise transport uses implicit nonces, so a
+  peer's queued frames cannot be reordered or dropped. The spec's rule that control frames are
+  never queued behind the lossy read stream
+  (`docs/superpowers/specs/2026-07-20-concurrent-multi-client-station-agent-design.md`) holds for
+  the broadcast ring, which control frames never enter, not for the relay socket's queue.
+- **Constants, not config.** The deadlines are not configuration keys. There is no idle-read
+  timeout for a relay that authenticates and then goes quiet, and no deadline on `ready` after
+  `auth`; adding relay keepalive or changing `ready` timing changes relay.v1 behaviour and is a
+  `dispensa` question first.
+
 ## Local gateway authentication (PAN-99), 2026-10-13
 
 The [design spec](../superpowers/specs/2026-10-13-local-gateway-authentication-design.md)
