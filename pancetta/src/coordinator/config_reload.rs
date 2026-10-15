@@ -722,18 +722,15 @@ impl super::ApplicationCoordinator {
         self.emit_config_reload_lines(lines).await;
     }
 
-    /// Make the running station enforce `diff`'s revocations, and report the
-    /// grant-direction changes as restart-required. Returns the diagnostic
-    /// lines, in order.
-    pub(crate) async fn apply_security_config(
-        &mut self,
+    /// Apply the per-channel consent changes in `diff` whose new value is
+    /// `enabled` (audited `LocalConsentChanged`), adding one line each.
+    fn apply_consent_changes(
+        &self,
         diff: &SecurityConfigDiff,
-    ) -> Vec<(DiagnosticLevel, String)> {
-        let mut lines = Vec::new();
-        let now = chrono::Utc::now().timestamp_millis();
-
-        // 1. Per-channel consent (audited `LocalConsentChanged`). The TX
-        //    worker's key-time and playback re-checks read this bit live.
+        enabled: bool,
+        now: i64,
+        lines: &mut Vec<(DiagnosticLevel, String)>,
+    ) {
         for (channel, value, on_msg, off_msg) in [
             (
                 ConsentChannel::StationAgent,
@@ -748,7 +745,9 @@ impl super::ApplicationCoordinator {
                 MSG_WSJTX_CONSENT_OFF,
             ),
         ] {
-            let Some(enabled) = value else { continue };
+            if value != Some(enabled) {
+                continue;
+            }
             let effects = {
                 // A poisoned arm already refuses all remote TX; the bit is
                 // still written so the state is right once poison clears.
@@ -771,6 +770,24 @@ impl super::ApplicationCoordinator {
                 lines.push((DiagnosticLevel::Warn, off_msg.to_string()));
             }
         }
+    }
+
+    /// Make the running station enforce `diff`'s revocations, and report the
+    /// grant-direction changes as restart-required. Returns the diagnostic
+    /// lines, in order.
+    pub(crate) async fn apply_security_config(
+        &mut self,
+        diff: &SecurityConfigDiff,
+    ) -> Vec<(DiagnosticLevel, String)> {
+        let mut lines = Vec::new();
+        let now = chrono::Utc::now().timestamp_millis();
+
+        // 1. Consent turned OFF (audited `LocalConsentChanged`). The TX
+        //    worker's key-time and playback re-checks read this bit live.
+        //    Consent turned ON is applied last (step 4), after every
+        //    revocation in the same save, so the TX gate never reopens for an
+        //    arm that save is about to revoke.
+        self.apply_consent_changes(diff, false, now, &mut lines);
 
         // 2. tx_allow_list removals: prune the live sets and bump the
         //    authorization generation; the session loop evicts on its next
@@ -822,7 +839,10 @@ impl super::ApplicationCoordinator {
             ));
         }
 
-        // 4. Restart-required: report only.
+        // 4. Consent turned ON, once every revocation above is in place.
+        self.apply_consent_changes(diff, true, now, &mut lines);
+
+        // 5. Restart-required: report only.
         if diff.station_agent_enabled {
             lines.push((DiagnosticLevel::Warn, MSG_STATION_AGENT_ENABLED.to_string()));
         }
@@ -1921,6 +1941,65 @@ mod tests {
         assert!(!permitted(&coordinator, "A"));
         assert!(texts(&diagnostics(&rx))
             .contains(&"tx_allow_list entry removed: A — session evicted, authorization revoked"));
+    }
+
+    /// Codex P1 on #436 (round 5): one save that turns consent back on AND
+    /// removes the armed client must revoke before the TX gate reopens; the
+    /// removed client is never permitted, at any point.
+    #[tokio::test]
+    async fn consent_on_with_a_removal_in_the_same_save_revokes_first() {
+        let mut coordinator = test_coordinator(base()).await;
+        let live = crate::coordinator::station_agent::StationAgentLiveHandles {
+            tx_allow_list: Arc::new(std::sync::RwLock::new(
+                ["A".to_string(), "B".to_string()].into_iter().collect(),
+            )),
+            tx_arm_allow_list: Arc::new(std::sync::RwLock::new(
+                ["A".to_string(), "B".to_string()].into_iter().collect(),
+            )),
+            client_keys: Default::default(),
+            revocation_pending: Default::default(),
+            authz_generation: Default::default(),
+            stop_requested: Default::default(),
+        };
+        coordinator.station_agent_live = Some(live);
+        arm_client(&coordinator, "A");
+        // Consent currently off (the arm is kept while consent is off).
+        let mut off = coordinator.config.read().await.clone();
+        off.network.station_agent.remote_tx_enabled = false;
+        coordinator.config_file_baseline = Some(off.clone());
+        coordinator
+            .remote_tx_arm
+            .lock()
+            .unwrap()
+            .set_channel_consent(ConsentChannel::StationAgent, false, 0);
+        assert!(!permitted(&coordinator, "A"));
+
+        let mut save = off;
+        save.network.station_agent.remote_tx_enabled = true;
+        save.network.station_agent.tx_allow_list = vec!["B".to_string()];
+        let rx = tui_rx(&coordinator).await;
+        coordinator
+            .handle_config_reload(Ok((save, Vec::new())))
+            .await;
+
+        assert!(
+            !permitted(&coordinator, "A"),
+            "A was revoked, not re-enabled"
+        );
+        let lines = diagnostics(&rx);
+        let t = texts(&lines);
+        let removed = t
+            .iter()
+            .position(|l| l.starts_with("tx_allow_list entry removed: A"))
+            .expect("removal reported");
+        let on = t
+            .iter()
+            .position(|l| *l == MSG_STATION_AGENT_CONSENT_ON)
+            .expect("consent on reported");
+        assert!(
+            removed < on,
+            "the revocation is applied before consent reopens: {t:?}"
+        );
     }
 
     #[tokio::test]
