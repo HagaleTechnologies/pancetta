@@ -1120,6 +1120,17 @@ struct ComponentChannel {
     last_heartbeat: Arc<RwLock<Option<Instant>>>,
 }
 
+/// Outcome of [`MessageBus::send_message_if`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendIfOutcome {
+    /// The message was enqueued on the destination's channel.
+    Enqueued,
+    /// Authorization returned false after acquiring the table lock.
+    Denied,
+    /// Delivery failed: expired, full, disconnected, or no destination.
+    Dropped,
+}
+
 /// High-performance message bus for inter-component communication
 #[derive(Clone)]
 pub struct MessageBus {
@@ -1256,6 +1267,62 @@ impl MessageBus {
 
         let channels = self.channels.read().await;
 
+        self.try_send_locked(message, &channels)
+    }
+
+    /// Authorize and enqueue without a suspension point between them (PAN-134).
+    ///
+    /// `authorize` runs inside the table's read lock, after the lock wait and
+    /// immediately before enqueue. State changes while waiting behind a writer
+    /// are therefore observed before sending. Plain sends retain their existing
+    /// best-effort delivery contract.
+    ///
+    /// The closure MUST be a synchronous leaf: no bus calls, awaits, or blocking
+    /// work beyond a short leaf-lock probe such as `remote_tx_permitted_for`.
+    /// Lock order is channels, then the closure's locks (ArmState for TX). Never
+    /// acquire the bus while holding a lock the closure also takes.
+    /// This removes the await gap; it does not hold those leaf locks through
+    /// enqueue or prevent another thread from changing state after the probe.
+    pub async fn send_message_if(
+        &self,
+        mut message: ComponentMessage,
+        authorize: impl FnOnce() -> bool,
+    ) -> Result<SendIfOutcome> {
+        if message.is_expired(self.config.message_timeout_us) {
+            self.expired_messages.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                "Dropping expired message from {} to {} (age: {}μs)",
+                message.source,
+                message.destination,
+                message.age_us()
+            );
+            return Ok(SendIfOutcome::Dropped);
+        }
+        message.latency_tracking.sent_at = Some(Instant::now());
+
+        let channels = self.channels.read().await;
+        if !authorize() {
+            debug!(
+                "Authorization denied message from {} to {}",
+                message.source, message.destination
+            );
+            return Ok(SendIfOutcome::Denied);
+        }
+        self.try_send_locked(message, &channels).map(|enqueued| {
+            if enqueued {
+                SendIfOutcome::Enqueued
+            } else {
+                SendIfOutcome::Dropped
+            }
+        })
+    }
+
+    // Both public delivery APIs use the same synchronous enqueue and accounting.
+    fn try_send_locked(
+        &self,
+        message: ComponentMessage,
+        channels: &HashMap<ComponentId, ComponentChannel>,
+    ) -> Result<bool> {
         if let Some(channel) = channels.get(&message.destination) {
             // Perf (Pass 1 / A8): capture the small Copy fields needed for
             // metrics/tracing/error logs up front so the message can be MOVED
@@ -1506,5 +1573,138 @@ mod tests {
         assert_eq!(message.destination, ComponentId::Dsp);
         assert_eq!(message.priority, 128);
         assert_eq!(message.hop_count, 0);
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn pan134_send_message_if_authorizes_after_lock_wait() {
+        use std::sync::atomic::AtomicBool;
+        let bus = MessageBus::new(16).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Audio).await.unwrap();
+        // Hold the table's write lock the way an in-flight component
+        // restart's create_channel does.
+        let w = bus.channels.write().await;
+        let denied = std::sync::Arc::new(AtomicBool::new(false));
+        let d2 = denied.clone();
+        let bus2 = bus.clone();
+        let msg = ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Audio,
+            MessageType::AudioData(vec![0.5]),
+            Instant::now(),
+        );
+        let task = tokio::spawn(async move {
+            bus2.send_message_if(msg, move || !d2.load(Ordering::SeqCst))
+                .await
+                .unwrap()
+        });
+        // Run the spawned sender to its lock-wait Pending point.
+        tokio::task::yield_now().await;
+        // The disarm lands while the sender is queued behind the writer.
+        denied.store(true, Ordering::SeqCst);
+        drop(w);
+        let outcome = task.await.unwrap();
+        assert!(
+            matches!(outcome, SendIfOutcome::Denied),
+            "mid-wait disarm must deny the enqueue"
+        );
+        assert!(rx.try_recv().is_err(), "nothing may be enqueued");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pan134_plain_send_still_enqueues_despite_mid_wait_disarm() {
+        use std::sync::atomic::AtomicBool;
+        let bus = MessageBus::new(16).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Audio).await.unwrap();
+        let w = bus.channels.write().await;
+        let denied = std::sync::Arc::new(AtomicBool::new(false));
+        let d2 = denied.clone();
+        let bus2 = bus.clone();
+        let task = tokio::spawn(async move {
+            // Today's tx.rs shape: synchronous check BEFORE the bus send.
+            if d2.load(Ordering::SeqCst) {
+                return false;
+            }
+            bus2.send_message(ComponentMessage::new(
+                ComponentId::Ft8Transmitter,
+                ComponentId::Audio,
+                MessageType::AudioData(vec![0.5]),
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+            true
+        });
+        tokio::task::yield_now().await;
+        denied.store(true, Ordering::SeqCst);
+        drop(w);
+        let enqueued = task.await.unwrap();
+        assert!(
+            enqueued && rx.try_recv().is_ok(),
+            "hazard pinned: plain check-then-send enqueues across a mid-wait disarm"
+        );
+        // Documents today's hazard for plain send_message; it must KEEP passing
+        // after PAN-134 (plain-send semantics are unchanged) — the fix is the
+        // send_message_if test above.
+    }
+
+    #[tokio::test]
+    async fn pan134_conditional_delivery_preserves_drop_accounting() {
+        let bus = MessageBus::new(1).unwrap();
+        let (_tx, rx) = bus.create_channel(ComponentId::Audio).await.unwrap();
+        let message = || {
+            ComponentMessage::new(
+                ComponentId::Ft8Transmitter,
+                ComponentId::Audio,
+                MessageType::AudioData(vec![0.5]),
+                Instant::now(),
+            )
+        };
+        assert_eq!(
+            bus.send_message_if(message(), || false).await.unwrap(),
+            SendIfOutcome::Denied
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(bus.get_statistics().total_messages, 0);
+        assert_eq!(bus.get_statistics().dropped_messages, 0);
+        assert_eq!(
+            bus.send_message_if(message(), || true).await.unwrap(),
+            SendIfOutcome::Enqueued
+        );
+        assert_eq!(
+            bus.send_message_if(message(), || true).await.unwrap(),
+            SendIfOutcome::Dropped
+        );
+        assert!(!bus.send_message_checked(message()).await.unwrap());
+        assert!(bus.send_message(message()).await.is_ok());
+        assert_eq!(bus.get_statistics().total_messages, 1);
+        assert_eq!(bus.get_statistics().dropped_messages, 3);
+        let received = rx.try_recv().unwrap();
+        assert!(received.latency_tracking.sent_at.is_some());
+        assert!(rx.try_recv().is_err());
+
+        let absent = ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Hamlib,
+            MessageType::RigControl(RigControlMessage::SetPtt { state: true }),
+            Instant::now(),
+        );
+        assert_eq!(
+            bus.send_message_if(absent, || true).await.unwrap(),
+            SendIfOutcome::Dropped
+        );
+        assert_eq!(bus.get_statistics().dropped_messages, 4);
+        let expired = ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Audio,
+            MessageType::AudioData(vec![0.5]),
+            Instant::now() - Duration::from_secs(60),
+        );
+        assert_eq!(
+            bus.send_message_if(expired, || panic!("expired messages must not authorize"))
+                .await
+                .unwrap(),
+            SendIfOutcome::Dropped
+        );
+        assert_eq!(bus.get_statistics().expired_messages, 1);
+        assert!(rx.try_recv().is_err());
     }
 }

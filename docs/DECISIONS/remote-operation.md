@@ -528,3 +528,39 @@ unaffected. Token and bind changes require restart. There is no data migration.
 Merge prerequisite: file the dispensa question in the design spec's
 `Proposed dispensa question` section before merging. Panino's `?gateway=` mode
 cannot connect until it sends `hello.gatewayToken`.
+
+## PAN-134: authorize PTT and audio after the bus lock wait
+
+`MessageBus::send_message_if` waits for the channel table's read lock, calls a
+synchronous authorization predicate, then enqueues with `try_send`. No await
+separates the predicate from enqueue. Both single-TX and multi-TX use it for
+PTT-on and audio output. A disarm or control transfer during the table-lock wait
+is therefore observed before either message can reach its consumer.
+
+The predicate must be a leaf with no bus calls, awaits, or blocking work beyond
+a short arm-state probe. Lock order is `channels` then `ArmState`; callers must
+never acquire the bus while holding a lock the predicate takes. The shared
+private enqueue helper preserves plain-send delivery semantics, counters, and
+logging. `Denied` runs the existing cleanup: clear the local PTT flag, unwind
+pivot tombstones, report each unaired frame, and emit denial signals. Audio
+rejection also sends PTT-off first because PTT is already asserted at that stage.
+
+The planning phase refuted converting the table to `std::sync::RwLock` alone.
+Its probe C held a writer for 80 ms and disarmed at 20 ms; the pre-lock check
+still authorized the later enqueue. The recorded result was
+`probe_c_std_conversion_still_leaves_gap ... ok`, with the assertion
+`std conversion leaves the gap open under contention`. Blocking a worker thread
+instead of suspending a task leaves the same stale check before the wait.
+
+This change closes the await gap. Another core can still change `ArmState`
+after the predicate releases its guard and before `try_send` commits. There is
+no wall-clock bound on that instruction-level interval; full cross-thread
+atomicity would require holding the arm guard across enqueue. The existing
+mid-TX poll remains the backstop.
+
+Following round 9's log-ordering requirement, `TxFrameLogged` is emitted only
+on `Enqueued`. Denied or dropped audio no longer appears as an aired frame in
+Band Activity. Concurrent bundle items retain a shared timestamp. Delivery
+confirmation for PTT-off and audio flush remains PAN-135; those safe-direction
+sends keep the existing best-effort contract. Tune, config, and wire formats
+are unchanged.
