@@ -1471,6 +1471,30 @@ impl QsoManager {
         true
     }
 
+    /// PAN-78: whether [`Self::engage_hound`] for `fox_call` would ADD an
+    /// active QSO. `engage_hound` is a manual `respond_to_cq_with` at the
+    /// Fox's deterministic low calling offset, so a repeat engage of a Fox we
+    /// are already working continues (FIX 1) or replaces (FIX 3) that QSO and
+    /// adds nothing; this is [`Self::manual_open_adds_active_qso`] at that
+    /// offset and the `Grid` step.
+    pub async fn engage_hound_adds_active_qso(&self, fox_call: &str) -> bool {
+        self.manual_open_adds_active_qso(
+            fox_call,
+            self.hound_calling_offset(fox_call),
+            pancetta_core::ResponseStep::Grid,
+        )
+        .await
+    }
+
+    /// The low calling offset [`Self::engage_hound`] opens a Hound QSO at.
+    fn hound_calling_offset(&self, fox_call: &str) -> f64 {
+        hound_offset_for(
+            fox_call,
+            self.config.hound.call_min_hz,
+            self.config.hound.call_max_hz,
+        )
+    }
+
     /// Whether any *active* (non-terminal) QSO already exists with `callsign`
     /// (compound-call-aware via [`crate::exchange::callsigns_match`], so
     /// `EA8/G8BCG` and `G8BCG` count as the same station). Used by the
@@ -2223,11 +2247,7 @@ impl QsoManager {
     ) -> Result<QsoId, QsoManagerError> {
         // Compute our deterministic low calling offset for this Fox callsign,
         // using the operator-configured (or default) call region bounds.
-        let low_offset = hound_offset_for(
-            fox_call,
-            self.config.hound.call_min_hz,
-            self.config.hound.call_max_hz,
-        );
+        let low_offset = self.hound_calling_offset(fox_call);
 
         // Store the Fox's grid on `their_callsign`'s QSO (for logging); the TX
         // message itself uses *our* grid (station config), which respond_to_cq_with
@@ -8625,6 +8645,37 @@ mod tests {
                  (before={before}, adds={adds}, after={after})"
             );
         }
+    }
+
+    /// PAN-78: `engage_hound_adds_active_qso` must match what `engage_hound`
+    /// really does — a first engage adds a QSO, a repeat engage of the same
+    /// Fox continues it (same id, no new active QSO), another Fox adds one.
+    #[tokio::test]
+    async fn engage_hound_predicate_matches_real_engage_effect() {
+        use pancetta_core::slot::SlotParity;
+        let manager = QsoManager::new(test_config());
+        let engage = |call: &'static str| {
+            let manager = &manager;
+            async move {
+                manager
+                    .engage_hound(call, 600.0, None, Some(SlotParity::Even))
+                    .await
+                    .unwrap()
+            }
+        };
+
+        assert!(manager.engage_hound_adds_active_qso("K5FOX").await);
+        let first = engage("K5FOX").await;
+        assert_eq!(manager.active_qso_count().await, 1);
+
+        assert!(!manager.engage_hound_adds_active_qso("K5FOX").await);
+        let again = engage("K5FOX").await;
+        assert_eq!(again, first, "a repeat engage continues the Hound QSO");
+        assert_eq!(manager.active_qso_count().await, 1);
+
+        assert!(manager.engage_hound_adds_active_qso("K6FOX").await);
+        engage("K6FOX").await;
+        assert_eq!(manager.active_qso_count().await, 2);
     }
 
     #[tokio::test]

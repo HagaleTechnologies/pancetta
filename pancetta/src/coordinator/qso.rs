@@ -5113,28 +5113,32 @@ impl super::ApplicationCoordinator {
                                                 .await;
                                                 continue;
                                             }
-                                            // PAN-78: capacity gate. `engage_hound` always opens a new
-                                            // QSO (no reuse path), so no predicate. EngageHound carries
-                                            // no remote origin.
-                                            if let Some(snap) = manual_open_at_capacity(
-                                                &qso_manager,
-                                                auto_answer_max_concurrent,
-                                                &fox_mode,
-                                                &fox_max_streams,
-                                                &fox_admitted_qsos,
-                                            )
-                                            .await
-                                            {
-                                                refuse_manual_open_at_capacity(
-                                                    &message_bus,
-                                                    &display_feed_for_admission,
-                                                    ManualOpen::Hound,
-                                                    Some(&callsign),
-                                                    snap,
-                                                    false,
+                                            // PAN-78: capacity gate. Only an engage that would ADD an
+                                            // active QSO is refused: `engage_hound` is a manual
+                                            // `respond_to_cq_with`, so pressing Shift+H again on a Fox
+                                            // already being worked continues or replaces that QSO.
+                                            // EngageHound carries no remote origin.
+                                            if qso_manager.engage_hound_adds_active_qso(&callsign).await {
+                                                if let Some(snap) = manual_open_at_capacity(
+                                                    &qso_manager,
+                                                    auto_answer_max_concurrent,
+                                                    &fox_mode,
+                                                    &fox_max_streams,
+                                                    &fox_admitted_qsos,
                                                 )
-                                                .await;
-                                                continue;
+                                                .await
+                                                {
+                                                    refuse_manual_open_at_capacity(
+                                                        &message_bus,
+                                                        &display_feed_for_admission,
+                                                        ManualOpen::Hound,
+                                                        Some(&callsign),
+                                                        snap,
+                                                        false,
+                                                    )
+                                                    .await;
+                                                    continue;
+                                                }
                                             }
                                             // Same/idle parity: start the Hound QSO now.
                                             // engage_hound sets hound=true, partner_freq,
@@ -12840,6 +12844,53 @@ mod manual_capacity_admission_tests {
         );
         assert!(!any_tx_containing(&tx, "K5FOX"), "{tx:?}");
         assert_eq!(h.manager.active_qso_count().await, 1);
+    }
+
+    fn engage_k5fox() -> QsoMessage {
+        QsoMessage::EngageHound {
+            callsign: "K5FOX".to_string(),
+            fox_freq: 600,
+            dx_parity: Some(SlotParity::Even),
+            fox_grid: None,
+        }
+    }
+
+    /// Validation finding on PAN-78: at the cap, pressing Shift+H again on a
+    /// Fox already being worked was refused ("Not calling Fox K5FOX — 1/1 QSOs
+    /// active"), because the EngageHound gate assumed `engage_hound` always
+    /// opens a new QSO. It is a manual `respond_to_cq_with`, so the repeat
+    /// press continues the existing Hound QSO and adds nothing.
+    #[tokio::test]
+    async fn repeat_engage_of_the_fox_being_worked_is_not_refused_at_capacity() {
+        let h = harness(1, false).await;
+        h.send(engage_k5fox()).await;
+        let tx = collect_until(&h.tx, |m| tx_text(m).is_some_and(|t| t.contains("K5FOX"))).await;
+        assert!(any_tx_containing(&tx, "K5FOX"), "{tx:?}");
+        assert_eq!(h.manager.active_qso_count().await, 1);
+        let (first_id, _) = h.manager.get_active_qsos().await.remove(0);
+        let _ = collect_quiet(&h.tui, 300).await;
+
+        // At capacity (1/1) with the Hound QSO itself; press Shift+H again.
+        assert!(!h.manager.engage_hound_adds_active_qso("K5FOX").await);
+        h.send(engage_k5fox()).await;
+        let tx = collect_until(&h.tx, |m| tx_text(m).is_some_and(|t| t.contains("K5FOX"))).await;
+        let tui = collect_quiet(&h.tui, 300).await;
+        assert!(
+            !statuses(&tui).iter().any(|s| s.starts_with("Not calling")),
+            "a repeat engage adds no QSO and must not be refused: {:?}",
+            statuses(&tui)
+        );
+        assert!(!has_capacity_diagnostic(&tui, Some("K5FOX")), "{tui:?}");
+        assert!(
+            any_tx_containing(&tx, "K5FOX"),
+            "the repeat engage re-sends the Hound call: {tx:?}"
+        );
+        let active = h.manager.get_active_qsos().await;
+        assert_eq!(active.len(), 1, "still exactly one active QSO");
+        assert_eq!(active[0].0, first_id, "the existing Hound QSO is continued");
+
+        // A different Fox at the cap is still refused.
+        assert!(h.manager.engage_hound_adds_active_qso("K6FOX").await);
     }
 
     fn remote_start_k2bbb() -> QsoMessage {
