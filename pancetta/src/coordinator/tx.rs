@@ -12254,16 +12254,16 @@ mod schedule_tx_tests {
         // window (800ms) + safety margin (500ms) eat 1300ms of it, leaving
         // 700ms of extension headroom. (PAN-117 PR review: arrivals later
         // than cap − 1300ms — e.g. 7.5s here — now resolve DEFERRED at the
-        // queue-time acceptance check, so they take the probe's full-ceiling
-        // deferred branch instead of this headroom math; see
+        // queue-time acceptance check, so their headroom is measured against
+        // that deferred slot's own start instead; see
         // current_slot_acceptance_reserves_the_base_coalesce_wait.)
         // at(6.0) falls inside slot 0, which is Even (base timestamp
         // 1767225600 / 15 % 2 == 0, per `at()`'s own doc comment) — so the
         // request must target Even parity for this to be a same-slot late
         // arrival (`use_current = true`) rather than a parity-mismatch
-        // defer to the next Odd slot, which would exercise the unrelated
-        // `probe.deferred` branch instead of the headroom math this test
-        // is for.
+        // defer to the next Odd slot, whose headroom would be measured
+        // against that later slot instead of the late same-slot arrival
+        // this test is for.
         use pancetta_config::station::TxSelfParity;
         let head = tx_request(Some(SlotParity::Even));
         let cap = adaptive_coalesce_cap_ms(
@@ -12286,9 +12286,9 @@ mod schedule_tx_tests {
         // Even (base timestamp 1767225600 / 15 % 2 == 0, per `at()`'s own doc
         // comment) — so the request must target Even parity for this to be a
         // same-slot early arrival (`use_current = true`, `deferred = false`)
-        // and actually exercise `headroom.min(protocol_ceiling)`, rather than
-        // parity-mismatch deferring to the next Odd slot and short-circuiting
-        // at `if probe.deferred { return protocol_ceiling; }` before that line.
+        // whose `headroom.min(protocol_ceiling)` is measured against the
+        // current slot, rather than parity-mismatch deferring to the next Odd
+        // slot and measuring the headroom from that slot's later start.
         use pancetta_config::station::TxSelfParity;
         let head = tx_request(Some(SlotParity::Even));
         let cap = adaptive_coalesce_cap_ms(
@@ -12310,9 +12310,8 @@ mod schedule_tx_tests {
         // at(0.5) on FT4's 7.5s slot grid is also slot 0 = Even, so — same
         // reasoning as adaptive_cap_has_room_for_an_early_arriving_head above
         // — the request must target Even parity to hit `use_current = true`
-        // / `deferred = false` and actually exercise
-        // `headroom.min(protocol_ceiling)`, instead of deferring to the next
-        // Odd slot and short-circuiting before that line.
+        // / `deferred = false`, so `headroom.min(protocol_ceiling)` is
+        // measured against the current slot instead of the next Odd slot.
         use pancetta_config::station::TxSelfParity;
         let head = tx_request(Some(SlotParity::Even));
         let cap = adaptive_coalesce_cap_ms(
@@ -12330,8 +12329,11 @@ mod schedule_tx_tests {
     #[test]
     fn adaptive_cap_full_ceiling_when_already_deferred() {
         // A head that's already past tx_late_max_ms for the current slot
-        // (deferred to the next one) has no current-slot cliff to protect —
-        // cap is the full protocol ceiling.
+        // defers to the next Odd slot, which begins 16s later at :45. Its
+        // headroom against that slot's own cap is far above the protocol
+        // ceiling, so the cap is the ceiling. Deferral alone does not grant
+        // it: a deferred slot that begins moments away is still bounded
+        // (adaptive_cap_bounds_a_deferred_head_by_the_imminent_target_slot).
         use pancetta_config::station::TxSelfParity;
         let head = tx_request(Some(SlotParity::Odd));
         let cap = adaptive_coalesce_cap_ms(
