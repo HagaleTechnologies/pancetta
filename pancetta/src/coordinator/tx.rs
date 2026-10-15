@@ -134,6 +134,27 @@ fn coalesce_max_extension_ms(protocol: pancetta_ft8::Protocol) -> u64 {
     ((COALESCE_MAX_EXTENSION_MS as f64) * (cycle / FT8_CYCLE_SECS)).round() as u64
 }
 
+/// PAN-117 (PR #450 review): the cap the QUEUE-TIME current-slot
+/// acceptance decision (`schedule_tx`'s `use_current`) is decided
+/// against. Between the frozen `request_received_at` timestamp and the
+/// key-time final gate, the unconditional base coalesce window
+/// (`coalesce_collect_window_ms`, 800ms FT8) ALWAYS elapses first, and
+/// the encode/modulate + gate-await overhead the safety margin covers
+/// follows it. Deciding `use_current` against the raw effective cap
+/// therefore accepted a request arriving 2.2-3.0s into its FT8 slot
+/// (1.1-1.5s FT4) into the CURRENT slot while the same fresh-clock gate
+/// was guaranteed to drop it — scheduled, dropped, never deferred.
+/// Reserving both quantities below the cap makes such a request DEFER
+/// to the next slot (30s) instead; the key-time gate keeps the raw
+/// effective cap as its unconditional backstop, and
+/// `adaptive_coalesce_cap_ms`'s probe passes this same value so its
+/// deferred branch matches the decision the worker actually makes.
+fn current_slot_acceptance_cap_ms(protocol: pancetta_ft8::Protocol, tx_late_max_ms: u64) -> u64 {
+    tx_late_max_ms_effective(protocol, tx_late_max_ms)
+        .saturating_sub(coalesce_collect_window_ms(protocol))
+        .saturating_sub(COALESCE_CAP_SAFETY_MARGIN_MS)
+}
+
 /// Remaining `tx_late_max_ms` headroom, in ms, available to extend the
 /// Symptom-C adaptive coalesce window for the given head request — bounds
 /// the window so it can never push a request past the late-skip cliff.
@@ -161,10 +182,16 @@ fn adaptive_coalesce_cap_ms(
     let required_parity =
         resolve_required_parity(*tx_parity, tx_self_parity, request_received_at, slot_ns);
     let tx_late_max_ms_eff = tx_late_max_ms_effective(protocol, tx_late_max_ms);
+    // PAN-117 (PR #450 review): probe with the SAME acceptance cap the
+    // worker's queue-time decision uses, so `probe.deferred` answers the
+    // question the real decision will answer — a head in the reserved
+    // band below the raw cap defers at the decision, so the probe must
+    // say deferred and grant the full ceiling, not compute a saturated
+    // zero headroom against a current-slot target it will never get.
     let probe = schedule_tx(
         request_received_at,
         required_parity,
-        tx_late_max_ms_eff,
+        current_slot_acceptance_cap_ms(protocol, tx_late_max_ms),
         sample_rate,
         slot_ns,
     );
@@ -463,6 +490,13 @@ pub fn classify_incoming_during_tx(
 /// `slot_ns` is the active slot period (FT8 = 15e9, FT4 = 7.5e9). All
 /// slot-grid math is computed against it; passing
 /// `pancetta_core::slot::SLOT_NS` is byte-identical to the FT8 behavior.
+///
+/// PAN-117 (PR #450 review): both worker arms pass
+/// `current_slot_acceptance_cap_ms(protocol, tx_late_max_ms)` here — not
+/// the raw effective cap — so the current slot is only accepted when the
+/// request can absorb the coalesce/encode overhead that always runs
+/// before the key; the key-time final gate keeps enforcing the raw
+/// effective cap.
 pub fn schedule_tx(
     now: chrono::DateTime<chrono::Utc>,
     required_parity: pancetta_core::slot::SlotParity,
@@ -6713,10 +6747,22 @@ impl super::ApplicationCoordinator {
                                             slot_ns,
                                         );
 
+                                        // PAN-117 (PR #450 review): decide
+                                        // `use_current` against the acceptance
+                                        // cap, not the raw effective cap — the
+                                        // base coalesce window plus the safety
+                                        // margin's overhead always elapse
+                                        // between the frozen
+                                        // `request_received_at` and the
+                                        // key-time gate, so a head accepted on
+                                        // the raw cap in the 2.2-3.0s band
+                                        // (FT8, 3000ms default) could only
+                                        // ever be dropped there. Reserving the
+                                        // overhead makes it defer 30s instead.
                                         let mut schedule = schedule_tx(
                                             request_received_at,
                                             required_parity,
-                                            tx_late_max_ms_effective(
+                                            current_slot_acceptance_cap_ms(
                                                 active_protocol,
                                                 tx_late_max_ms,
                                             ),
@@ -8999,10 +9045,23 @@ impl super::ApplicationCoordinator {
                                         slot_ns,
                                     );
 
+                                    // PAN-117 (PR #450 review): same
+                                    // acceptance-cap reservation as the
+                                    // single-TX arm's Step 2 — a bundle head
+                                    // frozen at `request_received_at` (either
+                                    // a coalesced single request, which
+                                    // already waited the base window, or a
+                                    // direct multi whose N-item encode the
+                                    // margin covers) must not be accepted
+                                    // into a slot the key-time gate is
+                                    // guaranteed to drop.
                                     let mut schedule = schedule_tx(
                                         request_received_at,
                                         required_parity,
-                                        tx_late_max_ms_effective(active_protocol, tx_late_max_ms),
+                                        current_slot_acceptance_cap_ms(
+                                            active_protocol,
+                                            tx_late_max_ms,
+                                        ),
                                         sample_rate,
                                         slot_ns,
                                     );
@@ -12082,27 +12141,32 @@ mod schedule_tx_tests {
 
     #[test]
     fn adaptive_cap_shrinks_for_a_late_arriving_head() {
-        // Arrives 7.5s into an 8000ms tx_late_max_ms budget: only 500ms of
-        // headroom remains before the safety margin (500ms) eats the rest —
-        // cap should be at or near zero. at(7.5) falls inside slot 0, which
-        // is Even (base timestamp 1767225600 / 15 % 2 == 0, per `at()`'s own
-        // doc comment) — so the request must target Even parity for this to
-        // be a same-slot late arrival (`use_current = true`) rather than a
-        // parity-mismatch defer to the next Odd slot, which would exercise
-        // the unrelated `probe.deferred` branch instead of the headroom math
-        // this test is for.
+        // Arrives 6.0s into an 8000ms tx_late_max_ms budget: the base
+        // window (800ms) + safety margin (500ms) eat 1300ms of it, leaving
+        // 700ms of extension headroom. (PAN-117 PR review: arrivals later
+        // than cap − 1300ms — e.g. 7.5s here — now resolve DEFERRED at the
+        // queue-time acceptance check, so they take the probe's full-ceiling
+        // deferred branch instead of this headroom math; see
+        // current_slot_acceptance_reserves_the_base_coalesce_wait.)
+        // at(6.0) falls inside slot 0, which is Even (base timestamp
+        // 1767225600 / 15 % 2 == 0, per `at()`'s own doc comment) — so the
+        // request must target Even parity for this to be a same-slot late
+        // arrival (`use_current = true`) rather than a parity-mismatch
+        // defer to the next Odd slot, which would exercise the unrelated
+        // `probe.deferred` branch instead of the headroom math this test
+        // is for.
         use pancetta_config::station::TxSelfParity;
         let head = tx_request(Some(SlotParity::Even));
         let cap = adaptive_coalesce_cap_ms(
             &head,
-            at(7.5),
+            at(6.0),
             TxSelfParity::Auto,
             8000,
             12_000,
             SLOT_NS,
             pancetta_ft8::Protocol::Ft8,
         );
-        assert_eq!(cap, 0);
+        assert_eq!(cap, 700);
     }
 
     #[test]
@@ -12311,6 +12375,80 @@ mod schedule_tx_tests {
             target_slot,
             3000
         ));
+    }
+
+    #[test]
+    fn current_slot_acceptance_reserves_the_base_coalesce_wait() {
+        // PAN-117 PR #450 review finding: the queue-time `use_current`
+        // decision is made from `request_received_at`, frozen BEFORE the
+        // unconditional base coalesce wait (800ms FT8) and the overhead the
+        // safety margin (500ms) covers — while the key-time gate compares a
+        // FRESH clock against the raw effective cap. A request arriving in
+        // the band between the reserved overhead and the cap (2.2-3.0s at
+        // the 3000ms FT8 default; 1.1-1.5s FT4) was therefore accepted into
+        // the current slot and then ALWAYS dropped at the gate — never
+        // deferred. The worker now decides against the acceptance cap, so
+        // such a request defers 30s instead.
+        use pancetta_config::station::TxSelfParity;
+        assert_eq!(
+            current_slot_acceptance_cap_ms(pancetta_ft8::Protocol::Ft8, 3000),
+            1700,
+            "FT8 default: 3000 − 800 base window − 500 margin"
+        );
+        assert_eq!(
+            current_slot_acceptance_cap_ms(pancetta_ft8::Protocol::Ft4, 3000),
+            600,
+            "FT4: 1500 effective − 400 base window − 500 margin"
+        );
+        // Band edge: 2.3s into an Even slot (slot 0 is Even per at()'s
+        // doc) is inside the raw 3000ms cap but past the acceptance cap —
+        // scheduling with what the worker arms pass must DEFER, not accept
+        // the current slot the key-time gate would drop.
+        let s = schedule_tx(
+            at(2.3),
+            SlotParity::Even,
+            current_slot_acceptance_cap_ms(pancetta_ft8::Protocol::Ft8, 3000),
+            12_000,
+            SLOT_NS,
+        );
+        assert!(s.deferred, "2.3s arrival must defer at the 3000ms default");
+        assert_eq!(
+            (s.target_slot - at(0.0)).num_milliseconds(),
+            30_000,
+            "deferral targets the next Even slot, 30s out"
+        );
+        // An early-enough arrival still makes the current slot.
+        let s = schedule_tx(
+            at(1.0),
+            SlotParity::Even,
+            current_slot_acceptance_cap_ms(pancetta_ft8::Protocol::Ft8, 3000),
+            12_000,
+            SLOT_NS,
+        );
+        assert!(!s.deferred, "a 1.0s arrival still makes the current slot");
+        assert_eq!(
+            (s.target_slot - at(0.0)).num_milliseconds(),
+            0,
+            "same-slot acceptance targets the current Even slot"
+        );
+        // Coherence: the adaptive-coalesce probe answers with the SAME
+        // decision the worker makes, so a band head resolves DEFERRED and
+        // grants the full protocol ceiling (not a saturated-zero headroom
+        // against a current-slot target it will never get).
+        let head = tx_request(Some(SlotParity::Even));
+        let cap = adaptive_coalesce_cap_ms(
+            &head,
+            at(2.3),
+            TxSelfParity::Auto,
+            3000,
+            12_000,
+            SLOT_NS,
+            pancetta_ft8::Protocol::Ft8,
+        );
+        assert_eq!(
+            cap, 3000,
+            "a 2.3s head resolves deferred, so extension gets the full ceiling"
+        );
     }
 
     #[test]

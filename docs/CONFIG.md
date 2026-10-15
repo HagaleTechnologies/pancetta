@@ -86,7 +86,7 @@ additionally needs `[autonomous] enabled = true` (see below).
 | `itu_zone` | integer | `8` | Used by some contest exchanges. |
 | `cq_zone` | integer | `5` | Same. |
 | `operator_name` | string | `""` | Your name (optional, for log export). |
-| `tx_late_max_ms` | integer | `3000` | Maximum latency past the slot boundary at which the TX scheduler will still attempt a late-start TX via audio cursor skip-ahead. Beyond this, defers to the next opposite-parity slot (30s later); a frame that slips past the cap between queue time and key time is dropped at the final pre-PTT gate. 3s keeps both the middle and end Costas sync arrays and 49 of 58 data symbols (147 of the 91 needed information bits) on the air. |
+| `tx_late_max_ms` | integer | `3000` | Hard cap on elapsed slot time at keying: a frame that would key past it is dropped at the final pre-PTT gate, never keyed undecodably. The queue-time same-slot acceptance reserves the unconditional coalesce window + safety margin below the cap — at the default, a request within roughly the first 1.7s of the slot still keys the current slot; later arrivals defer 30s to the next opposite-parity slot. 3s keeps both the middle and end Costas sync arrays and 49 of 58 data symbols (147 coded bits vs the 91 information bits LDPC needs) on the air. |
 | `tx_self_parity` | string | `"auto"` | When calling CQ (no DX heard), pick TX slot parity by this rule. `"auto"` picks whichever next slot is closer; `"even"` / `"odd"` lock to the named parity. |
 | `ptt_lead_ms` | integer | `80` | PTT engage lead time before the slot boundary. Drop to 50ms for fast solid-state keying; bump up to 150–200ms for slow mechanical relays. |
 

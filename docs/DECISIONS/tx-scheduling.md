@@ -5,7 +5,7 @@
 
 ## DX-slot-aware TX scheduling
 
-`pancetta/src/coordinator/tx.rs`: WSJT-X-style. Every `DecodedMessage` carries `slot_parity`; the QSO state machine latches `tx_parity = opposite_of(dx_parity)` at QSO start; the TX scheduler picks the next slot of that parity, padding silent samples if early or skip-ahead-cursoring into the modulated waveform if late (up to `tx_late_max_ms`, default 8s). Past that, defers 30s. Never collides with the DX's parity. See `docs/superpowers/specs/2026-04-27-dx-slot-aware-tx-design.md` — its "the first received decode will refine the parity for any subsequent QSO responses" promise is now implemented (2026-07-18 review, Batch 2): a QSO opened with no observed `dx_parity` (a cluster/DX-Hunter spot pick) latches a provisional parity and refines it to the true opposite-of-DX value on the first genuine decode from the latched partner.
+`pancetta/src/coordinator/tx.rs`: WSJT-X-style. Every `DecodedMessage` carries `slot_parity`; the QSO state machine latches `tx_parity = opposite_of(dx_parity)` at QSO start; the TX scheduler picks the next slot of that parity, padding silent samples if early or skip-ahead-cursoring into the modulated waveform if late (up to `tx_late_max_ms`, default 3s, minus the unconditional coalesce window + safety margin reserved at the queue-time acceptance check). Past that, defers 30s. Never collides with the DX's parity. See `docs/superpowers/specs/2026-04-27-dx-slot-aware-tx-design.md` — its "the first received decode will refine the parity for any subsequent QSO responses" promise is now implemented (2026-07-18 review, Batch 2): a QSO opened with no observed `dx_parity` (a cluster/DX-Hunter spot pick) latches a provisional parity and refines it to the true opposite-of-DX value on the first genuine decode from the latched partner.
 
 ## Half-duplex parity scheduler + always-answer-callers (#39)
 
@@ -513,3 +513,14 @@ awaits was keyed anyway.
   request to base + (cap − margin) ms under pileup load and have the new key-time gate drop it —
   a self-inflicted TX outage. Under the 3000 ms default a slot-start FT8 request's maximum
   extension drops 2500 → 1700 ms; the reclaimed time is decode margin on the air.
+- **Queue-time acceptance reserves the overhead too** (PR #450 review round): the first cut
+  enforced the cap only at key time, so an FT8 request arriving 2.2–3.0 s into its slot (FT4
+  1.1–1.5 s) passed the queue-time `mstr <= cap` check, sat through the unconditional 800 ms
+  base coalesce wait, and was then ALWAYS dropped at the gate — scheduled, dropped, never
+  deferred. Both worker arms now decide `use_current` against
+  `current_slot_acceptance_cap_ms` = effective cap − base window − safety margin (1700 ms at
+  the FT8 3000 ms default), so such a request defers 30 s instead; `adaptive_coalesce_cap_ms`'s
+  probe uses the same value so its deferred branch matches the decision the worker actually
+  makes. The key-time gate keeps the raw effective cap as its unconditional backstop, and
+  mid-TX re-keys (which re-read the clock at the decision, with no coalesce wait in between)
+  keep the raw cap.
