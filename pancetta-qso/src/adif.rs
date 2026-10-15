@@ -895,6 +895,34 @@ impl AdifProcessor {
         ))
     }
 
+    /// [`Self::format_field`] for a field that was read from a file: a type
+    /// indicator (`<APP_LOGGER_SCORE:2:N>`) is kept, so an imported record
+    /// re-renders exactly as it was read (PAN-127).
+    fn format_kept_field(&self, field: &AdifField) -> Result<String, AdifError> {
+        if field.value.is_empty() {
+            return Ok(String::new());
+        }
+        let data_type = field
+            .data_type
+            .as_deref()
+            .filter(|data_type| !data_type.is_empty());
+        Ok(match data_type {
+            Some(data_type) => format!(
+                "<{}:{}:{}>{} ",
+                field.name.to_uppercase(),
+                field.value.len(),
+                data_type,
+                field.value
+            ),
+            None => format!(
+                "<{}:{}>{} ",
+                field.name.to_uppercase(),
+                field.value.len(),
+                field.value
+            ),
+        })
+    }
+
     fn parse_datetime(&self, datetime: &str) -> Result<DateTime<Utc>, AdifError> {
         // Try different datetime formats
         let formats = vec!["%Y%m%d %H%M%S", "%Y-%m-%d %H:%M:%S", "%Y%m%d_%H%M%S"];
@@ -1070,11 +1098,11 @@ impl AdifProcessor {
         let mut out = String::new();
         for name in FIRST {
             if let Some(field) = record.fields.get(name) {
-                out.push_str(&self.format_field(name, &field.value)?);
+                out.push_str(&self.format_kept_field(field)?);
             }
         }
-        for (name, field) in rest {
-            out.push_str(&self.format_field(name, &field.value)?);
+        for (_, field) in rest {
+            out.push_str(&self.format_kept_field(field)?);
         }
         out.push_str("<EOR>\n\n");
         Ok(out)
@@ -1824,6 +1852,35 @@ ADIF Export for Test Program
             .filter(|(_, f)| !f.value.is_empty())
             .map(|(name, f)| (name.clone(), f.value.clone()))
             .collect()
+    }
+
+    /// An explicit type indicator (`<APP_LOGGER_SCORE:2:N>`) is part of how
+    /// the field is written, so an imported record keeps it (PAN-127).
+    #[test]
+    fn render_record_keeps_a_field_type_indicator() {
+        let processor = AdifProcessor::new();
+        let parsed = processor.parse_bytes(
+            b"<CALL:4>W1AW <QSO_DATE:8>20240101 <TIME_ON:6>120000 <MODE:3>FT8 \
+              <APP_LOGGER_SCORE:2:N>42 <EOR>",
+        );
+        let record = only_record(&parsed);
+        assert_eq!(
+            record.fields["APP_LOGGER_SCORE"].data_type.as_deref(),
+            Some("N")
+        );
+
+        let rendered = processor.render_record(record).unwrap();
+        assert!(rendered.contains("<APP_LOGGER_SCORE:2:N>42 "), "{rendered}");
+
+        let reread = processor.parse_string(&rendered).unwrap();
+        assert_eq!(reread.records.len(), 1);
+        assert_eq!(
+            reread.records[0].fields["APP_LOGGER_SCORE"]
+                .data_type
+                .as_deref(),
+            Some("N")
+        );
+        assert_eq!(reread.records[0].fields["APP_LOGGER_SCORE"].value, "42");
     }
 
     #[test]

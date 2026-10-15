@@ -9,7 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-<<<<<<< HEAD
 - `pancetta import <FILE> [--dry-run]` (PAN-127): bring an existing ADIF
   log from WSJT-X, N1MM, LoTW, QRZ or another logger into Pancetta. New
   contacts are appended to `~/.pancetta/qsos.adi` with every field kept as
@@ -22,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   free `.bak.N`) and the copy checked before anything is written; the output
   names it and prints the undo steps. `--dry-run` shows the result and
   changes nothing. Imported contacts are never uploaded.
-=======
+
 - Config hot-reload is now real for remote-access settings (PAN-103): saving
   `pancetta.toml` while pancetta runs applies remote-access revocations to the
   running station — `[network.station_agent].remote_tx_enabled = false`,
@@ -34,7 +33,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--config` file keeps the previous config and says so. `docs/CONFIG.md` now lists exactly
   which settings apply live and which need a restart, and `docs/RUNBOOK.md`
   has a procedure for revoking a remote client.
->>>>>>> 869164e3d51f07641f47693f16644d76bc7ef23f
 
 - Readiness strip (PAN-89): row 1 of every view now answers "can I transmit,
   and what's blocking it?" with a TX verdict chip (`✓ TX READY`, `✗ TX HELD`,

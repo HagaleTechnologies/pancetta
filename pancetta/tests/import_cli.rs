@@ -398,6 +398,41 @@ fn import_keeps_a_stale_index_looking_stale() {
     );
 }
 
+/// When indexing fails part-way, the partial `qso.db` is newer than the
+/// finished `qsos.adi` (some rows were committed after the logbook was
+/// written), so the logbook must be left looking newer: otherwise the next
+/// start treats the partial index as current and never repairs it. Here the
+/// logbook's second record cannot be converted, so the index build commits
+/// the first record and then errors.
+#[test]
+fn a_failed_index_update_leaves_the_logbook_newer() {
+    let s = Scratch::new();
+    let logbook = format!(
+        "{}{}",
+        pancetta_logbook(&[pancetta_record("KA1AA", "20231201", "090000")]),
+        "<CALL:4>K1AB <TIME_ON:6>090500 <MODE:3>FT8 <BAND:3>20M <EOR>\n\n"
+    );
+    s.seed_logbook(&logbook, false);
+    let file = s.write_file(
+        "wsjtx_log.adi",
+        wsjtx_file(&[wsjtx_record("W1AW", "FN31", "120000", "14.075123")]),
+    );
+
+    let out = s.import(&file, false);
+    assert!(!out.status.success(), "stdout: {}", stdout(&out));
+    assert!(
+        stderr(&out).contains("could not be updated"),
+        "stderr: {}",
+        stderr(&out)
+    );
+
+    let modified = |p: PathBuf| std::fs::metadata(p).unwrap().modified().unwrap();
+    assert!(
+        modified(s.adif()) > modified(s.db()),
+        "qso.db must stay older than qsos.adi so the next start rebuilds it"
+    );
+}
+
 #[test]
 fn reimporting_the_same_file_adds_nothing() {
     let s = Scratch::new();

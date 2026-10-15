@@ -846,7 +846,7 @@ async fn import_command(args: ImportArgs) -> Result<()> {
         None
     };
     let logbook = logbook_bytes.as_deref().map(|b| processor.parse_bytes(b));
-    let plan = plan_import(&processor, &incoming, logbook.as_ref());
+    let mut plan = plan_import(&processor, &incoming, logbook.as_ref());
     print!(
         "{}",
         format_import_header(&args.file, &adif, &plan, adif_exists)
@@ -867,6 +867,10 @@ async fn import_command(args: ImportArgs) -> Result<()> {
     // Startup rebuilds the index when qsos.adi is newer than qso.db. If the
     // index was already behind before this import, adding the new rows would
     // make it look current and hide that, so it is kept looking behind below.
+    // An indexing that fails part-way leaves a partial index that also looks
+    // current (some rows were committed after the logbook was written), so
+    // the same marking applies: the logbook must stay newer than the index,
+    // or the next start never repairs the missing rows (PAN-127).
     let index_was_behind = matches!(
         (file_modified(&db), file_modified(&adif)),
         (Some(d), Some(a)) if a > d
@@ -886,6 +890,9 @@ async fn import_command(args: ImportArgs) -> Result<()> {
                     bak.display()
                 );
             }
+            // A longer copy holds contacts the plan never checked for
+            // duplicates; replan against it before writing (PAN-127).
+            plan = replan_after_logbook_growth(&processor, &incoming, &copied, before, plan);
             println!("{}", import_header_line("Backup:", bak.display()));
             Some(bak)
         }
@@ -911,7 +918,7 @@ async fn import_command(args: ImportArgs) -> Result<()> {
     drop(writer);
 
     let indexed = index_imported_contacts(&processor, &plan.to_add, &adif, &db, db_existed).await;
-    if index_was_behind {
+    if index_was_behind || indexed.is_err() {
         mark_newer_than(&adif, &db);
     }
     print!(
@@ -935,6 +942,26 @@ async fn import_command(args: ImportArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The verified backup `copied` is the logbook as it stood at backup time.
+/// When it is longer than `before` — the bytes [`import_command`] planned
+/// against — the running station completed a QSO in between that was never
+/// checked for duplicates, so the plan is rebuilt against the copy: an
+/// incoming record matching that contact must be skipped, not appended a
+/// second time. An unchanged logbook returns the plan as it came (PAN-127).
+fn replan_after_logbook_growth(
+    processor: &pancetta_qso::adif::AdifProcessor,
+    incoming: &pancetta_qso::adif::AdifParse,
+    copied: &[u8],
+    before: &[u8],
+    plan: pancetta_qso::adif_import::ImportPlan,
+) -> pancetta_qso::adif_import::ImportPlan {
+    if copied.len() <= before.len() {
+        return plan;
+    }
+    let grown = processor.parse_bytes(copied);
+    pancetta_qso::adif_import::plan_import(processor, incoming, Some(&grown))
 }
 
 /// Index the contacts `import_command` just appended. An existing index only
@@ -3034,7 +3061,7 @@ mod tests {
 
     // ---- PAN-127: `pancetta import` output wording ----
 
-    use pancetta_qso::adif::AdifRecord;
+    use pancetta_qso::adif::{AdifProcessor, AdifRecord};
     use pancetta_qso::adif_import::{ImportPlan, UnreadableRecord};
 
     const IMPORT_FILE: &str = "/home/op/wsjtx_log.adi";
@@ -3088,6 +3115,57 @@ mod tests {
             adif: Path::new(LOGBOOK),
             db: Path::new(INDEX),
         }
+    }
+
+    /// A backup longer than the bytes the plan was built from means the
+    /// running station completed a QSO between the read and the copy: the
+    /// replan must check incoming records against those contacts too, or a
+    /// matching one is appended a second time (PAN-127).
+    #[test]
+    fn replan_after_logbook_growth_skips_a_contact_logged_meanwhile() {
+        let processor = AdifProcessor::new();
+        let before: &[u8] = b"pancetta log\n<EOH>\n<CALL:5>KA1AA <QSO_DATE:8>20231201 \
+             <TIME_ON:6>090000 <MODE:3>FT8 <BAND:3>20M <EOR>\n";
+        let logged_meanwhile: &[u8] =
+            b"<CALL:4>W1AW <QSO_DATE:8>20240101 <TIME_ON:6>120000 <MODE:3>FT8 <BAND:3>20M <EOR>\n";
+        let grown = [before, logged_meanwhile].concat();
+        let incoming = processor.parse_bytes(
+            b"WSJT-X export<EOH>\n<call:4>W1AW <qso_date:8>20240101 <time_on:4>1205 \
+              <mode:3>FT8 <band:3>20m <eor>\n<call:5>K1ABC <qso_date:8>20240101 \
+              <time_on:6>121500 <mode:3>FT8 <band:3>20m <eor>\n",
+        );
+        let plan_against = |logbook: &[u8]| {
+            let parsed = processor.parse_bytes(logbook);
+            pancetta_qso::adif_import::plan_import(&processor, &incoming, Some(&parsed))
+        };
+
+        let stale = plan_against(before);
+        assert_eq!(stale.to_add.len(), 2);
+        assert_eq!(stale.duplicates_in_logbook, 0);
+
+        // An unchanged logbook returns the plan as it came.
+        let unchanged = replan_after_logbook_growth(
+            &processor,
+            &incoming,
+            before,
+            before,
+            plan_against(before),
+        );
+        assert_eq!(unchanged.to_add.len(), 2);
+        assert_eq!(unchanged.duplicates_in_logbook, 0);
+
+        // The W1AW the station logged meanwhile is now a duplicate of the
+        // incoming W1AW, so only K1ABC is added.
+        let replanned = replan_after_logbook_growth(
+            &processor,
+            &incoming,
+            &grown,
+            before,
+            plan_against(before),
+        );
+        assert_eq!(replanned.to_add.len(), 1);
+        assert_eq!(replanned.to_add[0].fields["CALL"].value, "K1ABC");
+        assert_eq!(replanned.duplicates_in_logbook, 1);
     }
 
     #[test]
