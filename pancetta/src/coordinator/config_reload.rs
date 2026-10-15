@@ -467,7 +467,7 @@ impl super::ApplicationCoordinator {
             running.metadata = None;
             running
         };
-        let (baseline, baseline_warnings, load_error) = if !present {
+        let (mut baseline, mut baseline_warnings, mut load_error) = if !present {
             info!(
                 "{} is missing right now; watching for it to be re-created",
                 watch_path.display()
@@ -499,6 +499,35 @@ impl super::ApplicationCoordinator {
         tokio::spawn(forward_config_reload_events(events, tx, load, settle));
         self.config_reload_watcher = Some(watcher);
         self.config_reload_rx = Some(rx);
+        // `start_watching` already watches the path's own directory; record
+        // its resolved form too so a target in that same directory is not
+        // watched twice.
+        self.config_link_dirs.clear();
+        self.config_target_dir = None;
+        if let Some(dir) = watch_path.parent() {
+            self.config_link_dirs.push(dir.to_path_buf());
+            if let Ok(resolved) = std::fs::canonicalize(dir) {
+                self.config_link_dirs.push(resolved);
+            }
+        }
+        self.config_watch_path = watch_path;
+        self.watch_config_target_dir().await;
+        // Every watch is installed now. A save that landed after the read
+        // above but before the watches existed produced no event, so read
+        // once more: from here on every save is an event.
+        let mut present = present;
+        match run_reload_loader(self.reload_loader()).await {
+            Ok((config, warnings)) => {
+                baseline = config;
+                baseline_warnings = warnings;
+                load_error = None;
+                present = true;
+            }
+            // Broken since the first read: report it, keep the last good
+            // content as the baseline, apply nothing.
+            Err(e) if load_error.is_none() && present => load_error = Some(e),
+            Err(_) => {}
+        }
         // Startup showed its own load warnings (`config_warnings`); one
         // introduced by a save since then has not been shown yet.
         let mut lines: Vec<(DiagnosticLevel, String)> = baseline_warnings
@@ -519,19 +548,6 @@ impl super::ApplicationCoordinator {
         }
         self.config_file_baseline = Some(baseline);
         self.config_file_warnings = baseline_warnings;
-        // `start_watching` already watches the path's own directory; record
-        // its resolved form too so a target in that same directory is not
-        // watched twice.
-        self.config_link_dirs.clear();
-        self.config_target_dir = None;
-        if let Some(dir) = watch_path.parent() {
-            self.config_link_dirs.push(dir.to_path_buf());
-            if let Ok(resolved) = std::fs::canonicalize(dir) {
-                self.config_link_dirs.push(resolved);
-            }
-        }
-        self.config_watch_path = watch_path;
-        self.watch_config_target_dir().await;
         info!(
             "Watching {} for config changes (remote-access revocations apply live)",
             self.config_watch_path.display()
@@ -1680,6 +1696,70 @@ mod tests {
         assert!(
             !station_agent_consent(&coordinator),
             "the re-created file applies"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Codex P1 on #436 (round 6): a save that lands after the watcher's first
+    /// read but before its watches are installed produces no event; the
+    /// watcher re-reads once watching and applies it.
+    #[tokio::test]
+    async fn a_save_between_the_first_read_and_watch_start_is_applied() {
+        let dir = temp_path("read-watch-gap");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pancetta.toml");
+        let mut config = base();
+        config.station.callsign = "K1TEST".to_string();
+        config.station.grid_square = "FN42".to_string();
+        let mut coordinator = test_coordinator(config).await;
+        coordinator
+            .remote_tx_arm
+            .lock()
+            .unwrap()
+            .set_channel_consent(ConsentChannel::StationAgent, true, 0);
+        let running = coordinator.config.read().await.clone();
+        std::fs::write(&path, toml::to_string(&running).unwrap()).unwrap();
+        let mut revoked = running.clone();
+        revoked.network.station_agent.remote_tx_enabled = false;
+        let revoked_text = toml::to_string(&revoked).unwrap();
+
+        // The first read returns the file as it was, and the operator's save
+        // lands right after it (before any watch exists).
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (load_path, load_calls) = (path.clone(), calls.clone());
+        coordinator.set_config_reload_loader(move || {
+            let outcome = load_config_for_reload(&load_path);
+            if load_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                std::fs::write(&load_path, &revoked_text).unwrap();
+            }
+            outcome
+        });
+        let rx = tui_rx(&coordinator).await;
+        coordinator.set_config_watch_path(path.clone());
+        coordinator
+            .start_config_reload_watcher_with_settle(Duration::from_millis(100))
+            .await
+            .unwrap();
+
+        // Checked as soon as the watcher has started, before any event.
+        assert!(
+            !station_agent_consent(&coordinator),
+            "the save made before watching started is applied"
+        );
+        assert!(
+            !coordinator
+                .config_file_baseline
+                .as_ref()
+                .unwrap()
+                .network
+                .station_agent
+                .remote_tx_enabled,
+            "the baseline is the post-watch read"
+        );
+        let lines = diagnostics(&rx);
+        assert!(
+            texts(&lines).contains(&MSG_STATION_AGENT_CONSENT_OFF),
+            "{lines:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
