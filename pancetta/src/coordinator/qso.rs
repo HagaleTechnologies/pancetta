@@ -461,6 +461,9 @@ async fn promote_pending_manual_calls(
     message_bus: &MessageBus,
     limits: &QsoCapacityLimits,
 ) {
+    // Capacity and parity are checked and the calls started under the
+    // admission lock (see `QsoCapacityLimits::admission`).
+    let _admission = limits.admission.lock().await;
     // The parity our still-active QSOs are committed to (None ⇒ idle).
     let current_side = qso_manager.current_tx_side().await;
     // PAN-78: how many more QSOs may start (saturating: a count already above
@@ -1196,12 +1199,35 @@ fn caller_creation_slot_key(timestamp: std::time::SystemTime) -> u64 {
 /// still hold a TX stream for their final RR73/73, so they count against the
 /// Fox cap too (see [`fox_grace_hound_count`]); otherwise a full fresh set of
 /// Hounds on top of them could reach the coalescer's hard clamp and cut those
-/// closing frames.
+/// closing frames. Only the Fox's own CQ (Fox-admitted) is a free stream: any
+/// other active `CallingCq` QSO (a manual `StartCq` while Fox mode is on)
+/// counts too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CapacitySnapshot {
     pub active: usize,
     pub cap: usize,
     pub fox_mode: bool,
+}
+
+/// Active `CallingCq` QSOs that Fox mode did not open — CQs started by hand
+/// (`StartCq`) while Fox mode is on. `active_caller_qso_count` leaves every
+/// CQ out so the Fox's own CQ does not eat a Hound slot; these extra CQs are
+/// ordinary streams and count. A poisoned Fox set counts every CQ.
+async fn non_fox_cq_count(
+    qso_manager: &pancetta_qso::QsoManager,
+    fox_admitted_qsos: &std::sync::RwLock<std::collections::HashSet<String>>,
+) -> usize {
+    let active = qso_manager.get_active_qsos().await;
+    let fox = fox_admitted_qsos.read().ok();
+    active
+        .iter()
+        .filter(|(id, progress)| {
+            matches!(progress.state, pancetta_qso::QsoState::CallingCq { .. })
+                && !fox
+                    .as_ref()
+                    .is_some_and(|f| f.contains(&super::active_tx_qso_key(&id.to_string())))
+        })
+        .count()
 }
 
 /// Read the current [`CapacitySnapshot`] (see its doc for the rule).
@@ -1221,6 +1247,7 @@ pub(crate) async fn capacity_snapshot(
     let active_count = if is_fox {
         qso_manager.active_caller_qso_count().await
             + fox_grace_hound_count(qso_manager, fox_admitted_qsos).await
+            + non_fox_cq_count(qso_manager, fox_admitted_qsos).await
     } else {
         qso_manager.active_qso_count().await
     };
@@ -1239,6 +1266,10 @@ pub(crate) struct QsoCapacityLimits {
     pub fox_mode: Arc<std::sync::atomic::AtomicBool>,
     pub fox_max_streams: Arc<std::sync::atomic::AtomicUsize>,
     pub fox_admitted_qsos: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    /// Held across every capacity/parity check and the QSO open it admits
+    /// (manual opens, auto-answer, queued-call promotion), so two paths can
+    /// never both take the same free slot.
+    pub admission: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl QsoCapacityLimits {
@@ -2923,6 +2954,10 @@ impl super::ApplicationCoordinator {
         // `maybe_answer_caller`; drained by the event forwarder below at the
         // same points as `active_tx_qsos`.
         let fox_admitted_qsos = self.fox_admitted_qsos.clone();
+        // PAN-78: the admission lock (see `QsoCapacityLimits::admission`):
+        // the message loop's opens and the event forwarder's queued-call
+        // promotion run in different tasks and must not both take one slot.
+        let qso_admission = Arc::new(tokio::sync::Mutex::new(()));
         // FQ-F3: active QSO id -> TX offset (Hz), mirroring `active_tx_qsos`'s
         // exact insert/remove points (including the 45s completed-grace
         // window) so the autonomous frequency allocator's own-frequency
@@ -3499,6 +3534,7 @@ impl super::ApplicationCoordinator {
                     fox_mode: fox_mode.clone(),
                     fox_max_streams: fox_max_streams.clone(),
                     fox_admitted_qsos: fox_admitted_qsos.clone(),
+                    admission: qso_admission.clone(),
                 };
                 tokio::spawn(async move {
                     // Task 5 (gap 2/4): built once for this task's lifetime,
@@ -4465,6 +4501,7 @@ impl super::ApplicationCoordinator {
                                             if let Some(ref base) = caller_base {
                                                 caller_dedup.1.insert(base.clone());
                                             }
+                                            let _admission = qso_admission.lock().await;
                                             maybe_answer_caller(
                                                 &msg_type,
                                                 &our_callsign,
@@ -4505,6 +4542,9 @@ impl super::ApplicationCoordinator {
                                             remote_origin,
                                             remote_client_key_id,
                                         } => {
+                                            // PAN-78: capacity/parity checks and the open run
+                                            // under the admission lock.
+                                            let _admission = qso_admission.lock().await;
                                             // PAN-23 round-2 (Codex review of #283): reject the
                                             // unresolved-hash placeholder "<...>" at ADMISSION
                                             // time, before it can ever be queued. Same bug class
@@ -5021,6 +5061,9 @@ impl super::ApplicationCoordinator {
                                             dx_parity,
                                             fox_grid,
                                         } => {
+                                            // PAN-78: capacity/parity checks and the open run
+                                            // under the admission lock.
+                                            let _admission = qso_admission.lock().await;
                                             // Belt-and-suspenders: refuse to Hound our own call.
                                             if pancetta_qso::exchange::callsigns_match(
                                                 &callsign,
@@ -5197,6 +5240,9 @@ impl super::ApplicationCoordinator {
                                             remote_origin,
                                             remote_client_key_id,
                                         } => {
+                                            // PAN-78: capacity/parity checks and the open run
+                                            // under the admission lock.
+                                            let _admission = qso_admission.lock().await;
                                             // PAN-23 round-2 (Codex review of #283): reject the
                                             // unresolved-hash placeholder "<...>" at ADMISSION
                                             // time, before it can ever be queued. The guard in
@@ -5577,6 +5623,9 @@ impl super::ApplicationCoordinator {
                                             remote_origin,
                                             remote_client_key_id,
                                         } => {
+                                            // PAN-78: capacity/parity checks and the open run
+                                            // under the admission lock.
+                                            let _admission = qso_admission.lock().await;
                                             // PAN-78: capacity gate. A manual CQ always opens a new
                                             // `CallingCq` QSO, a stream the TX cap counts. (Fox engage
                                             // starts its CQ via `start_cq_manual` directly, not here.)
@@ -6892,6 +6941,7 @@ mod pending_manual_tests {
             fox_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fox_max_streams: Arc::new(std::sync::atomic::AtomicUsize::new(5)),
             fox_admitted_qsos: Arc::new(std::sync::RwLock::new(Default::default())),
+            admission: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -6904,6 +6954,62 @@ mod pending_manual_tests {
 
     fn queued_names(q: &VecDeque<super::PendingManualCall>) -> Vec<String> {
         q.iter().map(|p| p.callsign.clone()).collect()
+    }
+
+    /// PAN-78 (Codex on #449): promotion takes the admission lock, so it
+    /// cannot take a slot a manual open holding the lock is about to fill.
+    #[tokio::test]
+    async fn promotion_waits_for_the_admission_lock() {
+        let mgr = Arc::new(test_manager("K5ARH").await);
+        let bus = Arc::new(MessageBus::new(1000).expect("bus"));
+        let pending: PendingManualCalls =
+            Arc::new(TokioMutex::new(VecDeque::from([even_dx_call_at(
+                "JA1AAA", 1000.0,
+            )])));
+        let lim = limits(1);
+        let held = lim.admission.clone().lock_owned().await;
+
+        let task = {
+            let (mgr, bus, pending, lim) = (mgr.clone(), bus.clone(), pending.clone(), lim.clone());
+            tokio::spawn(async move {
+                promote_pending_manual_calls(&mgr, &pending, &bus, &lim).await;
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            mgr.active_qso_count().await,
+            0,
+            "blocked while the lock is held"
+        );
+        assert!(!task.is_finished());
+
+        drop(held);
+        task.await.unwrap();
+        assert_eq!(mgr.active_qso_count().await, 1, "promotes once released");
+    }
+
+    /// PAN-78 (Codex on #449): in Fox mode only the Fox's own CQ is a free
+    /// stream; a CQ started by hand counts against `fox_max_streams`.
+    #[tokio::test]
+    async fn fox_capacity_counts_manual_cqs_but_not_the_fox_cq() {
+        let mgr = test_manager("K5ARH").await;
+        let fox_mode = std::sync::atomic::AtomicBool::new(true);
+        let fox_max = std::sync::atomic::AtomicUsize::new(5);
+        let fox_set = std::sync::RwLock::new(std::collections::HashSet::new());
+
+        let fox_cq = mgr
+            .start_cq_manual(1000.0, None, false, None)
+            .await
+            .unwrap();
+        super::record_fox_admitted(&fox_set, &fox_cq);
+        let snap = super::capacity_snapshot(&mgr, 1, &fox_mode, &fox_max, &fox_set).await;
+        assert_eq!(snap.active, 0, "the Fox CQ is not counted");
+
+        mgr.start_cq_manual(1500.0, None, false, None)
+            .await
+            .unwrap();
+        let snap = super::capacity_snapshot(&mgr, 1, &fox_mode, &fox_max, &fox_set).await;
+        assert_eq!(snap.active, 1, "a manual CQ in Fox mode is counted");
     }
 
     /// PAN-78: the scratch reproduction (`pan78_scratch_promotion_ignores_cap`)
