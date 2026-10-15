@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+<<<<<<< HEAD
 - `pancetta import <FILE> [--dry-run]` (PAN-127): bring an existing ADIF
   log from WSJT-X, N1MM, LoTW, QRZ or another logger into Pancetta. New
   contacts are appended to `~/.pancetta/qsos.adi` with every field kept as
@@ -21,6 +22,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   free `.bak.N`) and the copy checked before anything is written; the output
   names it and prints the undo steps. `--dry-run` shows the result and
   changes nothing. Imported contacts are never uploaded.
+=======
+- Config hot-reload is now real for remote-access settings (PAN-103): saving
+  `pancetta.toml` while pancetta runs applies remote-access revocations to the
+  running station — `[network.station_agent].remote_tx_enabled = false`,
+  removing a `tx_allow_list` entry, `[network.station_agent].enabled = false`,
+  and the WSJT-X UDP channel's consent. Every save shows a `Config reloaded`
+  line (or the load error) in the TUI diagnostics, and grant-direction or
+  other edits say a restart is required. Deleting the default
+  `~/.pancetta/pancetta.toml` revokes what only it granted; deleting a
+  `--config` file keeps the previous config and says so. `docs/CONFIG.md` now lists exactly
+  which settings apply live and which need a restart, and `docs/RUNBOOK.md`
+  has a procedure for revoking a remote client.
+>>>>>>> 869164e3d51f07641f47693f16644d76bc7ef23f
 
 - Readiness strip (PAN-89): row 1 of every view now answers "can I transmit,
   and what's blocking it?" with a TX verdict chip (`✓ TX READY`, `✗ TX HELD`,
@@ -143,6 +157,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decode; they stay on the readiness strip until acknowledged. When the
   readiness list outgrows the panel (80×24), Shift+S scrolls (↑/↓, PgUp/PgDn,
   Home/End).
+
+- A crash in the transmit worker no longer keeps the station off the air for
+  the rest of the session: the supervisor restarts it after a short backoff,
+  within the same 5-restarts-per-10-minutes budget as the other restartable
+  components. Past that budget TX stays disabled until pancetta is
+  restarted, as before (PAN-119).
 
 - Turning Fox mode off (Shift+X) no longer cuts the Hound contacts already in
   progress down to one transmitted stream; they keep transmitting until they

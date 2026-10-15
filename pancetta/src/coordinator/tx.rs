@@ -6223,9 +6223,14 @@ impl super::ApplicationCoordinator {
 
         info!("Starting FT8 transmitter component");
 
+        // `get_or_create_channel` (not the strict `create_channel`): the
+        // supervisor restarts this component after a panic (PAN-119), and a
+        // re-invocation of this method must not fail on the channel that
+        // the first run already registered — the same idempotency every
+        // other restartable component's `start_*` relies on.
         let (_tx_sender, tx_rx) = self
             .message_bus
-            .create_channel(ComponentId::Ft8Transmitter)
+            .get_or_create_channel(ComponentId::Ft8Transmitter)
             .await?;
         let message_bus = self.message_bus.clone();
 
@@ -17797,6 +17802,72 @@ mod pan115_worker_gate_tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         false
+    }
+
+    /// PAN-119: a single TX-worker panic must not end the operating session.
+    /// The supervisor (`check_task_handles` → `component_restart_policy` →
+    /// `restart_component`) has to restart the worker within its restart
+    /// budget, and transmission must resume with no operator intervention:
+    /// a CQ sent after the restart keys PTT again. Before PAN-119 the
+    /// policy was `DegradeOnly`, so this same sequence left the component
+    /// `Failed` for the rest of the session and no PTT ever arrived.
+    ///
+    /// This test also guards the two hidden prerequisites of a working
+    /// restart: `restart_component` must have an `Ft8Transmitter` arm, and
+    /// `start_transmitter_component` must register its channel with
+    /// `get_or_create_channel` so the second invocation does not fail with
+    /// "Channel already exists" (the failure mode the DxCluster analog
+    /// documented before `get_or_create_channel` existed).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tx_worker_panic_is_restarted_and_keys_again() {
+        let mut h = worker_harness().await;
+
+        // Remove the real TX worker's handle and stop the task itself: the
+        // bus receiver is multi-consumer, so if the original worker kept
+        // running it could key the CQ below itself and the test would pass
+        // without any restart actually happening.
+        let real = h
+            .coordinator
+            .named_task_handles
+            .iter()
+            .position(|(id, _)| *id == ComponentId::Ft8Transmitter)
+            .map(|i| h.coordinator.named_task_handles.remove(i).1)
+            .expect("worker_harness registers the TX worker handle");
+        real.abort();
+        let _ = real.await;
+
+        // A task that panics immediately under ComponentId::Ft8Transmitter —
+        // exactly what the supervisor observes on a real TX-worker panic.
+        h.coordinator.named_task_handles.push((
+            ComponentId::Ft8Transmitter,
+            tokio::spawn(async {
+                panic!("injected TX-worker panic");
+                #[allow(unreachable_code)]
+                Ok(())
+            }),
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // One supervisor pass: detects the panic and applies the policy.
+        h.coordinator.check_task_handles().await;
+
+        assert_eq!(
+            h.coordinator
+                .component_status
+                .read()
+                .await
+                .get(&ComponentId::Ft8Transmitter)
+                .map(|s| &s.state),
+            Some(&super::super::ComponentState::Running),
+            "a single TX-worker panic must be restarted, not left Failed"
+        );
+
+        // Transmission resumes without operator intervention.
+        request(&h, "CQ N0CALL FN20").await;
+        assert!(
+            await_ptt_on(&h, Duration::from_secs(40)).await,
+            "the restarted TX worker must key PTT again"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

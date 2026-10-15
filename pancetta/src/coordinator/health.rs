@@ -110,9 +110,13 @@ pub fn panic_count() -> u64 {
 /// mid-QSO, would invalidate the latched identity/parity.
 ///
 /// This enum is the single decision point a hot-reload apply-handler must
-/// consult before touching anything. Today the wired hot-reload task is a
-/// no-op (config is loaded once at startup), so this is also a regression
-/// guard: it documents and pins down which fields are unsafe to apply live.
+/// consult before touching anything. The wired handler
+/// (`coordinator::config_reload::ReloadApplyPlan::decide`, PAN-103) consults
+/// it for every saved edit, so it also pins down which fields are unsafe to
+/// apply while a QSO is active. The handler writes only the live
+/// remote-access fields to running state, so `SafeLive` does not mean a
+/// running component applies the change: everything else is
+/// restart-required.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigReloadApplicability {
     /// Nothing changed that matters; ignore.
@@ -372,24 +376,20 @@ impl super::ApplicationCoordinator {
         // Health monitoring task -- checks task handles and message bus health
         let health_handle = self.start_health_monitor().await;
 
-        // Configuration hot-reload task.
-        //
-        // C19 — by design this task does NOT apply any reloaded config to the
-        // running QSO / autonomous state. Config is snapshotted once at startup
-        // into the task-local `QsoManager` (callsign/grid, owned by value with
-        // no setter) and `AutonomousOperator`; nothing here rebuilds them or
-        // mutates a latched partner/`tx_parity`. This is the C19 guarantee:
-        // a hot-reload can never clobber an in-progress QSO or drop active
-        // QSOs, because no reload path reaches QSO state. Should a real apply
-        // handler ever be wired here, it MUST gate every change through
-        // `classify_config_reload(...)` and refuse/defer `DeferQsoLatched`
-        // changes while a QSO is active (see `active_tx_qsos`).
-        // Perf (Pass 1 / infra-A5): the former `config_handle` here was a
-        // do-nothing placeholder task (`while !shutdown { sleep(1s) }`) with no
-        // config-apply logic wired — a pure 1 Hz wakeup forever. Removed. If a
-        // real hot-reload apply handler is ever added, it MUST gate every
-        // change through `classify_config_reload(...)` and refuse/defer
-        // `DeferQsoLatched` changes while a QSO is active (see `active_tx_qsos`).
+        // Configuration hot-reload (PAN-103). The watcher forwards saved edits
+        // to `run_main_loop`, whose `handle_config_reload`
+        // (`coordinator/config_reload.rs`) classifies every change through
+        // `classify_config_reload(...)`. C19: only the live remote-access
+        // fields are ever written to running state, so a QSO-latched change
+        // (callsign / grid / slot parity) is refused as restart-required --
+        // no reload path rebuilds the task-local `QsoManager` /
+        // `AutonomousOperator` or touches a latched partner/`tx_parity`.
+        // Remote-access revocations apply live; everything else is
+        // restart-required (docs/CONFIG.md "Hot reload"). A watcher that
+        // cannot start leaves the station running exactly as before.
+        // (Perf, Pass 1 / infra-A5: the former 1 Hz placeholder task stays
+        // removed; the watcher is event-driven.)
+        self.start_config_reload_watcher().await?;
 
         self.named_task_handles
             .push((ComponentId::Coordinator, health_handle));
@@ -455,6 +455,8 @@ impl super::ApplicationCoordinator {
             .hamlib_reconnect_rx
             .take()
             .expect("run_main_loop must only be called once per coordinator lifetime");
+        // PAN-103: `None` when no config file is being watched.
+        let mut config_reload_rx = self.config_reload_rx.take();
 
         while !self.shutdown_signal.load(Ordering::Acquire) {
             tokio::select! {
@@ -466,6 +468,9 @@ impl super::ApplicationCoordinator {
                 }
                 Some(req) = hamlib_reconnect_rx.recv() => {
                     self.handle_hamlib_reconnect_request(req).await;
+                }
+                Some(outcome) = super::config_reload::recv_config_reload(&mut config_reload_rx) => {
+                    self.handle_config_reload(outcome).await;
                 }
                 _ = sleep(Duration::from_secs(1)) => {
                     // Perf (Pass 1 / infra-A4): this arm only bounds how quickly
@@ -847,6 +852,7 @@ impl super::ApplicationCoordinator {
                 if let Some(poll) = self.station_agent_poll.take() {
                     poll.abort();
                 }
+                self.station_agent_live = None;
                 self.fail_safe_disarm_remote_tx("station-agent component crash")
                     .await;
             }
@@ -870,10 +876,10 @@ impl super::ApplicationCoordinator {
         let _ = self.message_bus.send_message(error_msg).await;
     }
 
-    /// Re-invoke the given component's start method. Only the seven components
-    /// this plan covers are wired; anything else reaching here is a bug
-    /// (Task 2's `component_restart_policy` should have already routed it
-    /// to `DegradeOnly`).
+    /// Re-invoke the given component's start method. Every component that
+    /// `component_restart_policy` classifies `Restartable` must have an
+    /// arm here; anything else reaching here is a bug (the policy match
+    /// should have already routed it to `DegradeOnly`).
     async fn restart_component(&mut self, id: ComponentId) -> Result<()> {
         match id {
             ComponentId::Autonomous => self.start_autonomous_component().await,
@@ -886,6 +892,7 @@ impl super::ApplicationCoordinator {
             #[cfg(feature = "pancetta-hamlib")]
             ComponentId::Hamlib => self.start_hamlib_component().await,
             ComponentId::StationAgent => self.start_station_agent_component().await,
+            ComponentId::Ft8Transmitter => self.start_transmitter_component().await,
             other => anyhow::bail!("restart_component called for non-restartable {other}"),
         }
     }

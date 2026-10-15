@@ -8,9 +8,11 @@
 
 # Known gaps and TODOs
 
-- **Supervisor coverage:** the cheap-restartable set now includes Dsp and Ft8Decoder (PAN-4),
-  using retained `DecodePipelineHandles`. Hamlib, StationAgent, and Audio remain intentionally
-  uncovered pending teardown semantics for hardware and TX safety.
+- **Supervisor coverage:** the restartable set includes Dsp/Ft8Decoder (PAN-4, using retained
+  `DecodePipelineHandles`), Hamlib/StationAgent (PAN-5, with pre-restart teardown) and
+  Ft8Transmitter (PAN-119, cheap restart relying on `PttGuard`'s `Drop` for PTT release). Audio
+  stays intentionally `DegradeOnly` — its in-place device-recovery path owns rollback semantics a
+  task restart cannot reproduce.
 
 - **Silent audio-output stall does not auto-reopen (PAN-115):** a stall where output callbacks
   stop without a cpal error mutes TX (`audio output device is dead`) but does not trigger an
