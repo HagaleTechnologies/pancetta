@@ -182,11 +182,15 @@ fn multi_tx_acceptance_cap_ms(
 /// (`coalesce_collect_window_ms`) explicitly: the base wait always runs in
 /// full before any extension, so extension headroom that ignored it would
 /// deliberately stretch a request past the very cap the key-time final
-/// gate enforces (PAN-117). Returns the full (protocol-scaled)
-/// `COALESCE_MAX_EXTENSION_MS` when the head has already resolved to a
-/// DEFERRED (next-slot) target, since there's no current-slot cliff to
-/// protect in that case, and `0` if `head` isn't a `TransmitRequest`
-/// (defensive — the only caller checks this first).
+/// gate enforces (PAN-117). The headroom is measured against whichever
+/// slot the head resolves to, current or DEFERRED: a deferred target that
+/// begins a whole slot later leaves headroom far above the protocol-scaled
+/// `COALESCE_MAX_EXTENSION_MS` ceiling (so the ceiling applies), but one
+/// that begins moments away (a head arriving at :14.5 for the :15 slot)
+/// is bounded by its own cliff too (PAN-117, PR #450 Codex review), or the
+/// stretch would carry it past the key-time cap. Returns `0` if `head`
+/// isn't a `TransmitRequest` (defensive — the only caller checks this
+/// first).
 fn adaptive_coalesce_cap_ms(
     head: &MessageType,
     request_received_at: chrono::DateTime<chrono::Utc>,
@@ -203,11 +207,11 @@ fn adaptive_coalesce_cap_ms(
         resolve_required_parity(*tx_parity, tx_self_parity, request_received_at, slot_ns);
     let tx_late_max_ms_eff = tx_late_max_ms_effective(protocol, tx_late_max_ms);
     // PAN-117 (PR #450 review): probe with the SAME acceptance cap the
-    // worker's queue-time decision uses, so `probe.deferred` answers the
-    // question the real decision will answer — a head in the reserved
-    // band below the raw cap defers at the decision, so the probe must
-    // say deferred and grant the full ceiling, not compute a saturated
-    // zero headroom against a current-slot target it will never get.
+    // worker's queue-time decision uses, so `probe.target_slot` is the
+    // slot the real decision will pick — a head in the reserved band
+    // below the raw cap defers at the decision, so the headroom must be
+    // measured against that deferred slot, not a current-slot target it
+    // will never get.
     let probe = schedule_tx(
         request_received_at,
         required_parity,
@@ -216,16 +220,15 @@ fn adaptive_coalesce_cap_ms(
         slot_ns,
     );
     let protocol_ceiling = coalesce_max_extension_ms(protocol);
-    if probe.deferred {
-        return protocol_ceiling;
-    }
-    let elapsed_in_slot_ms = (request_received_at - probe.target_slot)
-        .num_milliseconds()
-        .max(0) as u64;
-    let headroom = tx_late_max_ms_eff
+    // Signed: negative when the target slot (a deferred one) has not begun
+    // yet, which ADDS the time until it starts to the headroom. A current
+    // slot target is never ahead of `request_received_at`.
+    let elapsed_in_slot_ms = (request_received_at - probe.target_slot).num_milliseconds();
+    let headroom = (tx_late_max_ms_eff as i64)
         .saturating_sub(elapsed_in_slot_ms)
-        .saturating_sub(coalesce_collect_window_ms(protocol))
-        .saturating_sub(COALESCE_CAP_SAFETY_MARGIN_MS);
+        .saturating_sub(coalesce_collect_window_ms(protocol) as i64)
+        .saturating_sub(COALESCE_CAP_SAFETY_MARGIN_MS as i64)
+        .max(0) as u64;
     headroom.min(protocol_ceiling)
 }
 
@@ -3540,13 +3543,12 @@ async fn resolve_callsigns(
 /// before `SetPtt`, and nothing async can suspend between Step 3's trim and
 /// the key.
 ///
-/// PAN-117 adds the slot-timing re-check: `now` is the caller's true last
-/// clock read, and if more than `tx_late_max_ms_eff` of `target_slot` has
-/// elapsed by that read the gate denies with `TooLateToDecode` — a frame
-/// keyed that late is mathematically undecodable for any receiver, so it is
-/// dropped rather than keyed (the QSO engine's existing retry timers own
-/// the re-send).
-#[allow(clippy::too_many_arguments)]
+/// PAN-117's slot-timing re-check is deliberately NOT here: it reads the
+/// clock, so it runs as its own [`key_time_gate_denial`] call after every
+/// other synchronous pre-PTT gate (this one, the hard mute, the remote arm
+/// recheck), immediately before the `SetPtt{true}` send — PR #450 Codex
+/// review: a clock read taken here could go stale while this function's
+/// `RwLock` reads and the later gates ran.
 fn final_single_tx_gate_denial(
     qso_id: Option<&str>,
     required_parity: pancetta_core::slot::SlotParity,
@@ -3554,9 +3556,6 @@ fn final_single_tx_gate_denial(
     their_callsign: Option<&str>,
     cross_time_state: &pancetta_qso::CrossTimeState,
     freshness_window: std::time::Duration,
-    now: chrono::DateTime<chrono::Utc>,
-    target_slot: chrono::DateTime<chrono::Utc>,
-    tx_late_max_ms_eff: u64,
 ) -> Option<FinalGateDenial> {
     if !tx_qso_is_live(qso_id, active_tx_qsos) {
         return Some(FinalGateDenial::StaleQso);
@@ -3573,13 +3572,65 @@ fn final_single_tx_gate_denial(
     if conflict {
         return Some(FinalGateDenial::DxParityConflict);
     }
-    if key_time_too_late(now, target_slot, tx_late_max_ms_eff) {
-        return Some(FinalGateDenial::TooLateToDecode {
-            elapsed_ms: (now - target_slot).num_milliseconds().max(0) as u64,
-            late_max_ms: tx_late_max_ms_eff,
-        });
-    }
     None
+}
+
+/// PAN-117: the slot-timing half of the Step 4d final gate, shared by both
+/// worker arms. `now` must be the caller's TRUE last clock read — taken
+/// after every other synchronous pre-PTT gate, immediately before the
+/// `SetPtt{true}` send — and if more than `late_max_ms` of `target_slot`
+/// has elapsed by then the frame is denied with `TooLateToDecode`: keyed
+/// that late it is mathematically undecodable for any receiver, so it is
+/// dropped rather than keyed (the QSO engine's existing retry timers own
+/// the re-send).
+fn key_time_gate_denial(
+    now: chrono::DateTime<chrono::Utc>,
+    target_slot: chrono::DateTime<chrono::Utc>,
+    late_max_ms: u64,
+) -> Option<FinalGateDenial> {
+    key_time_too_late(now, target_slot, late_max_ms).then(|| FinalGateDenial::TooLateToDecode {
+        elapsed_ms: (now - target_slot).num_milliseconds().max(0) as u64,
+        late_max_ms,
+    })
+}
+
+/// Log + diagnostic text for a single-TX Step 4d denial, `(log, diagnostic)`.
+fn final_gate_denial_text(
+    denial: FinalGateDenial,
+    qso_id: Option<&str>,
+    required_parity: pancetta_core::slot::SlotParity,
+    message_text: &str,
+) -> (String, String) {
+    match denial {
+        FinalGateDenial::StaleQso => (
+            format!(
+                "dropping stale TX at final pre-PTT check for ended QSO {}: '{message_text}'",
+                qso_id.unwrap_or("?")
+            ),
+            format!("dropping stale TX at final pre-PTT check for ended QSO: '{message_text}'"),
+        ),
+        FinalGateDenial::DxParityConflict => (
+            format!(
+                "holding TX at final pre-PTT check for QSO {}: DX observed transmitting on the colliding parity {required_parity:?}: '{message_text}'",
+                qso_id.unwrap_or("?")
+            ),
+            format!(
+                "holding TX at final pre-PTT check: DX observed transmitting on the colliding parity {required_parity:?}: '{message_text}'"
+            ),
+        ),
+        FinalGateDenial::TooLateToDecode {
+            elapsed_ms,
+            late_max_ms,
+        } => (
+            format!(
+                "dropping stale TX at final pre-PTT check for QSO {}: {elapsed_ms}ms into the slot exceeds tx_late_max_ms={late_max_ms}ms — no receiver could decode it: '{message_text}'",
+                qso_id.unwrap_or("?")
+            ),
+            format!(
+                "dropping stale TX at final pre-PTT check: {elapsed_ms}ms into the slot exceeds tx_late_max_ms={late_max_ms}ms — no receiver could decode it: '{message_text}'"
+            ),
+        ),
+    }
 }
 
 /// PAN-141 (Step 4b) / PAN-148 (Step 4d): per-item liveness+DX-parity mask
@@ -7428,12 +7479,10 @@ impl super::ApplicationCoordinator {
                                         // between this call and the key. SYNCHRONOUS (uses
                                         // `final_gate_callsign`, resolved before Step 3's
                                         // trim above — see that call site's comment).
-                                        // PAN-117: the same gate now also re-checks
-                                        // slot-timing headroom — `chrono::Utc::now()` is the
-                                        // true last clock read before the key, and a frame
-                                        // more than `tx_late_max_ms` into its target slot is
-                                        // dropped here instead of keyed (no receiver could
-                                        // decode the surviving fragment).
+                                        // PAN-117: the slot-timing re-check is NOT part of
+                                        // this gate — it reads the clock, so it runs last,
+                                        // just before the PTT-on send below (see
+                                        // `key_time_gate_denial`).
                                         if let Some(denial) = final_single_tx_gate_denial(
                                             qso_id.as_deref(),
                                             required_parity,
@@ -7441,12 +7490,6 @@ impl super::ApplicationCoordinator {
                                             final_gate_callsign.as_deref(),
                                             &cross_time_state,
                                             dx_parity_freshness_window(slot_ns),
-                                            chrono::Utc::now(),
-                                            schedule.target_slot,
-                                            tx_late_max_ms_effective(
-                                                active_protocol,
-                                                tx_late_max_ms,
-                                            ),
                                         ) {
                                             ptt_active.store(false, Ordering::Release);
                                             ptt_guard.disarm();
@@ -7457,38 +7500,12 @@ impl super::ApplicationCoordinator {
                                                     pivoted_once.remove(&key);
                                                     pivoted_from.remove(&key)
                                                 });
-                                            let (log_msg, diag_msg) = match denial {
-                                                FinalGateDenial::StaleQso => (
-                                                    format!(
-                                                        "dropping stale TX at final pre-PTT check for ended QSO {}: '{message_text}'",
-                                                        qso_id.as_deref().unwrap_or("?")
-                                                    ),
-                                                    format!(
-                                                        "dropping stale TX at final pre-PTT check for ended QSO: '{message_text}'"
-                                                    ),
-                                                ),
-                                                FinalGateDenial::DxParityConflict => (
-                                                    format!(
-                                                        "holding TX at final pre-PTT check for QSO {}: DX observed transmitting on the colliding parity {required_parity:?}: '{message_text}'",
-                                                        qso_id.as_deref().unwrap_or("?")
-                                                    ),
-                                                    format!(
-                                                        "holding TX at final pre-PTT check: DX observed transmitting on the colliding parity {required_parity:?}: '{message_text}'"
-                                                    ),
-                                                ),
-                                                FinalGateDenial::TooLateToDecode {
-                                                    elapsed_ms,
-                                                    late_max_ms,
-                                                } => (
-                                                    format!(
-                                                        "dropping stale TX at final pre-PTT check for QSO {}: {elapsed_ms}ms into the slot exceeds tx_late_max_ms={late_max_ms}ms — no receiver could decode it: '{message_text}'",
-                                                        qso_id.as_deref().unwrap_or("?")
-                                                    ),
-                                                    format!(
-                                                        "dropping stale TX at final pre-PTT check: {elapsed_ms}ms into the slot exceeds tx_late_max_ms={late_max_ms}ms — no receiver could decode it: '{message_text}'"
-                                                    ),
-                                                ),
-                                            };
+                                            let (log_msg, diag_msg) = final_gate_denial_text(
+                                                denial,
+                                                qso_id.as_deref(),
+                                                required_parity,
+                                                &message_text,
+                                            );
                                             info!(target: "pancetta::tx.policy", "{log_msg}");
                                             emit_diagnostic(
                                                 &message_bus,
@@ -7612,6 +7629,57 @@ impl super::ApplicationCoordinator {
                                                 operator_callsign,
                                                 "denied",
                                                 denial_reason,
+                                                qso_id.as_deref(),
+                                            )
+                                            .await;
+                                            send_tx_queue_status(&message_bus, None, Vec::new())
+                                                .await;
+                                            let _ = report_unaired_frame(
+                                                &message_bus,
+                                                message_text,
+                                                qso_id.clone(),
+                                                pivot_replaced,
+                                            )
+                                            .await;
+                                            continue 'worker;
+                                        }
+
+                                        // PAN-117 (PR #450 Codex review): the slot-timing
+                                        // half of Step 4d, run LAST — after the liveness/
+                                        // DX-parity gate, the hard mute and the arm recheck
+                                        // above — so `chrono::Utc::now()` here is the true
+                                        // last clock read before the PTT-on send. A frame
+                                        // more than `tx_late_max_ms` into its target slot is
+                                        // dropped here instead of keyed (no receiver could
+                                        // decode the surviving fragment). SYNCHRONOUS:
+                                        // nothing runs between this read and the key.
+                                        if let Some(denial) = key_time_gate_denial(
+                                            chrono::Utc::now(),
+                                            schedule.target_slot,
+                                            tx_late_max_ms_effective(
+                                                active_protocol,
+                                                tx_late_max_ms,
+                                            ),
+                                        ) {
+                                            ptt_active.store(false, Ordering::Release);
+                                            ptt_guard.disarm();
+                                            let pivot_replaced =
+                                                pivoted_this_key.take().and_then(|key| {
+                                                    pivoted_once.remove(&key);
+                                                    pivoted_from.remove(&key)
+                                                });
+                                            let (log_msg, diag_msg) = final_gate_denial_text(
+                                                denial,
+                                                qso_id.as_deref(),
+                                                required_parity,
+                                                &message_text,
+                                            );
+                                            info!(target: "pancetta::tx.policy", "{log_msg}");
+                                            emit_diagnostic(
+                                                &message_bus,
+                                                "tx.policy",
+                                                pancetta_core::DiagnosticLevel::Info,
+                                                diag_msg,
                                                 qso_id.as_deref(),
                                             )
                                             .await;
@@ -10018,66 +10086,8 @@ impl super::ApplicationCoordinator {
                                     // SYNCHRONOUS (uses `final_gate_callsigns`, resolved
                                     // before Step 3's trim above).
                                     //
-                                    // PAN-117 (six-lane review L5 H-7): before the
-                                    // liveness mask, re-check slot-timing headroom — the
-                                    // whole bundle shares one slot (per
-                                    // `multi_tx_status_items`' doc), so this is a
-                                    // bundle-level check. A frame keyed more than
-                                    // `tx_late_max_ms` past the slot boundary is
-                                    // mathematically undecodable for any receiver; the
-                                    // queue-time `schedule_tx` decision never sees the
-                                    // coalesce/encode/gate delays, so it is dropped HERE,
-                                    // at the true last instant, through the same
-                                    // whole-bundle unwind as the liveness branch below.
-                                    let key_time_now = chrono::Utc::now();
-                                    let key_time_late_max_ms =
-                                        tx_late_max_ms_effective(active_protocol, tx_late_max_ms);
-                                    if key_time_too_late(
-                                        key_time_now,
-                                        schedule.target_slot,
-                                        key_time_late_max_ms,
-                                    ) {
-                                        ptt_active.store(false, Ordering::Release);
-                                        ptt_guard.disarm();
-                                        let mut bundle_replaced = unwind_bundle_pivots(
-                                            &pivoted_this_bundle_keys,
-                                            &mut pivoted_once,
-                                            &mut pivoted_from,
-                                        );
-                                        let elapsed_ms = (key_time_now - schedule.target_slot)
-                                            .num_milliseconds()
-                                            .max(0)
-                                            as u64;
-                                        let n = items.len();
-                                        info!(
-                                            target: "pancetta::tx.policy",
-                                            "dropping multi-TX bundle at final pre-PTT check: {elapsed_ms}ms into the slot exceeds tx_late_max_ms={key_time_late_max_ms}ms — no receiver could decode it ({n} frame(s))"
-                                        );
-                                        emit_diagnostic(
-                                            &message_bus,
-                                            "tx.policy",
-                                            pancetta_core::DiagnosticLevel::Info,
-                                            format!(
-                                                "dropping multi-TX bundle at final pre-PTT check: {elapsed_ms}ms into the slot exceeds tx_late_max_ms={key_time_late_max_ms}ms — no receiver could decode it ({n} frame(s))"
-                                            ),
-                                            None,
-                                        )
-                                        .await;
-                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
-                                        for item in &items {
-                                            let _ = report_unaired_frame(
-                                                &message_bus,
-                                                item.message_text.clone(),
-                                                item.qso_id.clone(),
-                                                take_bundle_replaced(
-                                                    &mut bundle_replaced,
-                                                    item.qso_id.as_deref(),
-                                                ),
-                                            )
-                                            .await;
-                                        }
-                                        continue;
-                                    }
+                                    // PAN-117: the slot-timing re-check runs LAST, just
+                                    // before the PTT-on send below, not here.
                                     let (final_live_mask, final_parity_hold_mask) =
                                         bundle_live_mask(
                                             &encoded_qso_ids_final,
@@ -10258,6 +10268,68 @@ impl super::ApplicationCoordinator {
                                         continue;
                                     }
 
+                                    // PAN-117 (six-lane review L5 H-7; PR #450 Codex
+                                    // review): re-check slot-timing headroom LAST — after
+                                    // the liveness mask, the hard mute and the arm recheck
+                                    // above — so this clock read is the true last one
+                                    // before the PTT-on send. The whole bundle shares one
+                                    // slot (per `multi_tx_status_items`' doc), so this is a
+                                    // bundle-level check. A frame keyed more than
+                                    // `tx_late_max_ms` past the slot boundary is
+                                    // mathematically undecodable for any receiver; the
+                                    // queue-time `schedule_tx` decision never sees the
+                                    // coalesce/encode/gate delays, so it is dropped HERE
+                                    // through the same whole-bundle unwind as the liveness
+                                    // branch above. SYNCHRONOUS up to the key.
+                                    let key_time_now = chrono::Utc::now();
+                                    let key_time_late_max_ms =
+                                        tx_late_max_ms_effective(active_protocol, tx_late_max_ms);
+                                    if key_time_too_late(
+                                        key_time_now,
+                                        schedule.target_slot,
+                                        key_time_late_max_ms,
+                                    ) {
+                                        ptt_active.store(false, Ordering::Release);
+                                        ptt_guard.disarm();
+                                        let mut bundle_replaced = unwind_bundle_pivots(
+                                            &pivoted_this_bundle_keys,
+                                            &mut pivoted_once,
+                                            &mut pivoted_from,
+                                        );
+                                        let elapsed_ms = (key_time_now - schedule.target_slot)
+                                            .num_milliseconds()
+                                            .max(0)
+                                            as u64;
+                                        let n = items.len();
+                                        info!(
+                                            target: "pancetta::tx.policy",
+                                            "dropping multi-TX bundle at final pre-PTT check: {elapsed_ms}ms into the slot exceeds tx_late_max_ms={key_time_late_max_ms}ms — no receiver could decode it ({n} frame(s))"
+                                        );
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "tx.policy",
+                                            pancetta_core::DiagnosticLevel::Info,
+                                            format!(
+                                                "dropping multi-TX bundle at final pre-PTT check: {elapsed_ms}ms into the slot exceeds tx_late_max_ms={key_time_late_max_ms}ms — no receiver could decode it ({n} frame(s))"
+                                            ),
+                                            None,
+                                        )
+                                        .await;
+                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                        for item in &items {
+                                            let _ = report_unaired_frame(
+                                                &message_bus,
+                                                item.message_text.clone(),
+                                                item.qso_id.clone(),
+                                                take_bundle_replaced(
+                                                    &mut bundle_replaced,
+                                                    item.qso_id.as_deref(),
+                                                ),
+                                            )
+                                            .await;
+                                        }
+                                        continue;
+                                    }
                                     let ptt_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Hamlib,
@@ -11792,10 +11864,6 @@ mod schedule_tx_tests {
             None,
             &cts,
             std::time::Duration::from_secs(30),
-            // PAN-117 args: on-time key against its own target slot.
-            at(30.0),
-            at(30.0),
-            3000,
         )
         .is_none());
     }
@@ -11830,9 +11898,6 @@ mod schedule_tx_tests {
                 None,
                 &cts,
                 std::time::Duration::from_secs(30),
-                at(30.0),
-                at(30.0),
-                3000,
             )
             .is_none(),
             "Step 4b's check must see the QSO as live"
@@ -11854,9 +11919,6 @@ mod schedule_tx_tests {
                 None,
                 &cts,
                 std::time::Duration::from_secs(30),
-                at(30.0),
-                at(30.0),
-                3000,
             ),
             Some(super::FinalGateDenial::StaleQso),
             "Step 4d's final check must catch a cancellation Step 4b could not have seen"
@@ -11897,9 +11959,6 @@ mod schedule_tx_tests {
                 their_callsign.as_deref(),
                 &cts,
                 std::time::Duration::from_secs(30),
-                at(30.0),
-                at(30.0),
-                3000,
             )
             .is_none(),
             "Step 4b's check must see no conflict yet"
@@ -11921,22 +11980,60 @@ mod schedule_tx_tests {
                 their_callsign.as_deref(),
                 &cts,
                 std::time::Duration::from_secs(30),
-                at(30.0),
-                at(30.0),
-                3000,
             ),
             Some(super::FinalGateDenial::DxParityConflict),
             "Step 4d's final check must catch a collision decode Step 4b could not have seen"
         );
     }
 
-    /// PAN-117: the same final gate must also deny a frame that is only
-    /// ready to key several seconds past its slot boundary — the ticket's
-    /// gherkin scenario. A live QSO, resolved callsign, no DX conflict:
-    /// none of PAN-148's reasons fire, but the elapsed-slot-time check
-    /// must. On-time key against the same setup denies nothing.
+    /// PAN-117: the key-time slot-timing gate must deny a frame that is
+    /// only ready to key several seconds past its slot boundary — the
+    /// ticket's gherkin scenario — carrying the elapsed time and cap for
+    /// the denial's log/diagnostic. An on-time key, a key exactly at the
+    /// cap, and a deferred (future) target deny nothing.
     #[test]
-    fn final_single_tx_gate_denial_flags_key_time_late_frame() {
+    fn key_time_gate_denial_flags_key_time_late_frame() {
+        let target_slot = at(30.0);
+        assert_eq!(
+            super::key_time_gate_denial(
+                target_slot + chrono::Duration::seconds(9),
+                target_slot,
+                3000
+            ),
+            Some(super::FinalGateDenial::TooLateToDecode {
+                elapsed_ms: 9000,
+                late_max_ms: 3000,
+            }),
+            "a frame only ready to key 9s into its slot must be refused, not keyed"
+        );
+        assert_eq!(
+            super::key_time_gate_denial(
+                target_slot + chrono::Duration::milliseconds(3001),
+                target_slot,
+                3000
+            ),
+            Some(super::FinalGateDenial::TooLateToDecode {
+                elapsed_ms: 3001,
+                late_max_ms: 3000,
+            }),
+        );
+        assert!(super::key_time_gate_denial(target_slot, target_slot, 3000).is_none());
+        assert!(super::key_time_gate_denial(
+            target_slot + chrono::Duration::milliseconds(3000),
+            target_slot,
+            3000
+        )
+        .is_none());
+        assert!(super::key_time_gate_denial(at(29.92), target_slot, 3000).is_none());
+    }
+
+    /// PAN-117 (PR #450 Codex review): the liveness/DX-parity gate no
+    /// longer carries the slot-timing check — that reads the clock, so it
+    /// runs separately as the last check before `SetPtt`. A live QSO with
+    /// no conflict clears this gate however late the frame is; only
+    /// `key_time_gate_denial` refuses it.
+    #[test]
+    fn final_single_tx_gate_denial_has_no_clock_dependency() {
         use std::collections::HashSet;
         use std::sync::{Arc, RwLock};
         let active: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
@@ -11945,44 +12042,27 @@ mod schedule_tx_tests {
             .unwrap()
             .insert(super::super::active_tx_qso_key("qso-peru"));
         let cts = pancetta_qso::CrossTimeState::empty();
-        let target_slot = at(30.0);
-
-        // 9s into the slot against a 3000ms cap: TooLateToDecode, with the
-        // elapsed time and cap carried for the denial's log/diagnostic.
+        assert!(super::final_single_tx_gate_denial(
+            Some("qso-peru"),
+            SlotParity::Odd,
+            &active,
+            None,
+            &cts,
+            std::time::Duration::from_secs(30),
+        )
+        .is_none());
         assert_eq!(
-            super::final_single_tx_gate_denial(
+            super::final_gate_denial_text(
+                super::FinalGateDenial::TooLateToDecode {
+                    elapsed_ms: 9000,
+                    late_max_ms: 3000,
+                },
                 Some("qso-peru"),
                 SlotParity::Odd,
-                &active,
-                None,
-                &cts,
-                std::time::Duration::from_secs(30),
-                target_slot + chrono::Duration::seconds(9),
-                target_slot,
-                3000,
-            ),
-            Some(super::FinalGateDenial::TooLateToDecode {
-                elapsed_ms: 9000,
-                late_max_ms: 3000,
-            }),
-            "a frame only ready to key 9s into its slot must be refused, not keyed"
-        );
-
-        // Same setup, on-time key: no denial.
-        assert!(
-            super::final_single_tx_gate_denial(
-                Some("qso-peru"),
-                SlotParity::Odd,
-                &active,
-                None,
-                &cts,
-                std::time::Duration::from_secs(30),
-                target_slot,
-                target_slot,
-                3000,
+                "K1ABC W5AU R-05",
             )
-            .is_none(),
-            "an on-time frame must clear the final gate"
+            .1,
+            "dropping stale TX at final pre-PTT check: 9000ms into the slot exceeds tx_late_max_ms=3000ms — no receiver could decode it: 'K1ABC W5AU R-05'"
         );
     }
 
@@ -12297,6 +12377,63 @@ mod schedule_tx_tests {
             pancetta_ft8::Protocol::Ft4,
         );
         assert_eq!(cap, 600);
+    }
+
+    #[test]
+    fn adaptive_cap_bounds_a_deferred_head_by_the_imminent_target_slot() {
+        // PAN-117 (PR #450 Codex review): a head arriving at :14.5 in the
+        // Even slot 0 but requiring Odd parity defers to slot 1, which
+        // begins only 500ms later at :15.0. The full 3000ms ceiling would
+        // let base (800) + extension (3000) run to :18.3 before encode,
+        // past the 3000ms key-time cap, so the final gate would drop it.
+        // Headroom must be measured against the deferred target too:
+        // 3000 + 500 (time until :15.0) - 800 - 500 = 2200ms.
+        use pancetta_config::station::TxSelfParity;
+        let head = tx_request(Some(SlotParity::Odd));
+        let cap = adaptive_coalesce_cap_ms(
+            &head,
+            at(14.5),
+            TxSelfParity::Auto,
+            3000,
+            12_000,
+            SLOT_NS,
+            pancetta_ft8::Protocol::Ft8,
+        );
+        assert_eq!(cap, 2200);
+        // 100ms before the boundary: 3000 + 100 - 1300 = 1800.
+        let cap = adaptive_coalesce_cap_ms(
+            &head,
+            at(14.9),
+            TxSelfParity::Auto,
+            3000,
+            12_000,
+            SLOT_NS,
+            pancetta_ft8::Protocol::Ft8,
+        );
+        assert_eq!(cap, 1800);
+        // A deferred target a whole slot or more away keeps the ceiling.
+        let cap = adaptive_coalesce_cap_ms(
+            &head,
+            at(1.0),
+            TxSelfParity::Auto,
+            3000,
+            12_000,
+            SLOT_NS,
+            pancetta_ft8::Protocol::Ft8,
+        );
+        assert_eq!(cap, 3000);
+        // FT4 (7.5s slots, Odd slot 1 at 7.5s): effective cap 1500,
+        // base 400, margin 500, 300ms until the boundary → 900.
+        let cap = adaptive_coalesce_cap_ms(
+            &head,
+            at(7.2),
+            TxSelfParity::Auto,
+            3000,
+            12_000,
+            FT4_SLOT_NS,
+            pancetta_ft8::Protocol::Ft4,
+        );
+        assert_eq!(cap, 900);
     }
 
     #[test]

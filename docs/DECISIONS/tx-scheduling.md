@@ -494,10 +494,12 @@ awaits was keyed anyway.
   `now - target_slot > tx_late_max_ms_effective` denies. The boundary is inclusive on the key
   side, mirroring `schedule_tx`'s queue-time `mstr <= tx_late_max_ms`; a deferred target (slot in
   the future) is naturally not late. Single-TX: a third `FinalGateDenial` variant,
-  `TooLateToDecode { elapsed_ms, late_max_ms }`, returned by `final_single_tx_gate_denial` (the
-  PAN-148 Step 4d final gate, synchronous, `Utc::now()` passed by the caller as the true last
-  read). Multi-TX: a bundle-level check beside `bundle_live_mask` in the Step 4d region — the
-  whole bundle shares one slot — taking the same whole-bundle unwind.
+  `TooLateToDecode { elapsed_ms, late_max_ms }`, returned by `key_time_gate_denial`. Multi-TX: a
+  bundle-level check in the Step 4d region — the whole bundle shares one slot — taking the same
+  whole-bundle unwind. In both arms the check runs LAST, after the liveness/DX-parity gate, the
+  hard mute and the remote-arm recheck, immediately before the `SetPtt{true}` send, so its
+  `Utc::now()` is the true last clock read (PR #450 Codex review: sampling it before the other
+  synchronous gates' lock reads let the read go stale before the key).
 - **Drop, not defer.** The `use_current` slot decision stays frozen at `request_received_at`
   (Symptom-B protection); an over-cap frame at key time is dropped through the existing
   final-gate unwind (`tx.policy` Info diagnostic, strip clear, `report_unaired_frame` per frame
@@ -512,7 +514,11 @@ awaits was keyed anyway.
   time and safety margin. Without this, the scheduler could deliberately stretch a slot-start
   request to base + (cap − margin) ms under pileup load and have the new key-time gate drop it —
   a self-inflicted TX outage. Under the 3000 ms default a slot-start FT8 request's maximum
-  extension drops 2500 → 1700 ms; the reclaimed time is decode margin on the air.
+  extension drops 2500 → 1700 ms; the reclaimed time is decode margin on the air. The headroom
+  is measured against the slot the head resolves to even when that slot is DEFERRED (PR #450
+  Codex review): a head arriving at :14.5 for the :15 slot gets 3000 + 500 − 800 − 500 = 2200 ms
+  of extension, not the full 3000 ms ceiling that would carry it to :18.3 and into the
+  key-time drop. A deferred slot a whole cycle away still gets the ceiling.
 - **Queue-time acceptance reserves the overhead too** (PR #450 review round): the first cut
   enforced the cap only at key time, so an FT8 request arriving 2.2–3.0 s into its slot (FT4
   1.1–1.5 s) passed the queue-time `mstr <= cap` check, sat through the unconditional 800 ms
