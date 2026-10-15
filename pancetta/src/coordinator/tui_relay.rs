@@ -3651,7 +3651,7 @@ fn ptt_band_plan_refusal(
 ) -> Option<String> {
     // A raw carrier keys AT the dial — offset 0.0.
     super::tx::tx_rf_for_gate(operating_freq_hz, split_tx_hz, 0.0).and_then(|rf| {
-        if super::tx::tx_band_plan_mute_reason(rf, band_plan).is_some() {
+        if super::tx::tx_band_plan_mute_reason(rf, 0.0, band_plan).is_some() {
             Some(format!(
                 "Can't key PTT — TX dial {rf} Hz is outside the configured amateur band plan"
             ))

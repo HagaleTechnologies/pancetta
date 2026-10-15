@@ -70,9 +70,9 @@ use std::time::{Duration, Instant};
 use pancetta_config::OperatingMode;
 use pancetta_hamlib::{MockRig, PttState, RigControl, Vfo};
 use pancetta_lib::coordinator::{
-    active_tx_qso_key, coalesce_transmit_requests, compute_manual_tx_offset,
+    active_tx_qso_key, coalesce_transmit_requests, compute_manual_tx_offset, protocol_from_mode,
     remote_tx_permitted_for, try_switch_operating_mode, tx_band_plan_mute_reason, tx_qso_is_live,
-    tx_rf_for_gate, CoalesceEntry, ModeSwitchError,
+    tx_rf_for_gate, tx_signal_span_hz, CoalesceEntry, ModeSwitchError,
 };
 use pancetta_lib::message_bus::{
     ComponentId, ComponentMessage, MessageBus, MessageType, RigControlMessage,
@@ -742,7 +742,15 @@ impl CoordSim {
                 &self.split_tx_frequency_hz,
                 entry.frequency_offset,
             )
-            .and_then(|rf| tx_band_plan_mute_reason(rf, &self.band_plan))
+            .and_then(|rf| {
+                tx_band_plan_mute_reason(
+                    rf,
+                    tx_signal_span_hz(protocol_from_mode(OperatingMode::from_u8(
+                        self.active_protocol_mode.load(Ordering::Relaxed),
+                    ))),
+                    &self.band_plan,
+                )
+            })
             .is_some()
             {
                 self.timeline.dropped.push(DroppedTx {

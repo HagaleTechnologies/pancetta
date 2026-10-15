@@ -46,7 +46,7 @@ pub(crate) mod wsjtx_udp;
 pub use tx::{
     coalesce_transmit_requests, coalesce_transmit_requests_with_fox_priority, remote_tx_permitted,
     remote_tx_permitted_for, resolve_required_parity, schedule_tx, tx_band_plan_mute_reason,
-    tx_rf_for_gate, CoalesceEntry, CoalesceOutcome, TxSchedule,
+    tx_rf_for_gate, tx_signal_span_hz, CoalesceEntry, CoalesceOutcome, TxSchedule,
 };
 
 pub use qso::compute_manual_tx_offset;
@@ -465,8 +465,9 @@ pub(crate) const FT8_SAMPLE_RATE: usize = 12000;
 /// Map the config-local [`pancetta_config::OperatingMode`] to a concrete
 /// [`pancetta_ft8::Protocol`]. The config crate intentionally does not depend
 /// on `pancetta-ft8`, so the coordinator owns this mapping. Derived once at
-/// startup from `rig_config.operating_mode()`.
-pub(crate) fn protocol_from_mode(mode: pancetta_config::OperatingMode) -> pancetta_ft8::Protocol {
+/// startup from `rig_config.operating_mode()`. `pub` so the `coord_sim`
+/// fixture resolves its band-plan gate's signal span the same way.
+pub fn protocol_from_mode(mode: pancetta_config::OperatingMode) -> pancetta_ft8::Protocol {
     match mode {
         pancetta_config::OperatingMode::Ft8 => pancetta_ft8::Protocol::Ft8,
         pancetta_config::OperatingMode::Ft4 => pancetta_ft8::Protocol::Ft4,
