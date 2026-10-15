@@ -1,0 +1,16 @@
+{
+  "number": 420,
+  "eligible": false,
+  "ineligible_reasons": [
+    "base"
+  ],
+  "codex_rounds": 1,
+  "resolve": [],
+  "request_codex_verdict": false,
+  "rerun_ci_failed_jobs": false,
+  "clear_pause": false,
+  "arm": false,
+  "disarm": false,
+  "blockers": [],
+  "report": false
+}

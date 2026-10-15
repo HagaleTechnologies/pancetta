@@ -15,6 +15,9 @@ use std::collections::HashMap;
 use tokio::time::{sleep, Duration as TokioDuration};
 use tracing::{debug, error, info, warn};
 
+/// Most bytes read from one `query_spots` JSON response.
+const PSKREPORTER_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
 /// PSKReporter API configuration
 #[derive(Debug, Clone)]
 pub struct PskReporterConfig {
@@ -207,12 +210,7 @@ impl PskReporterClient {
         let url = self.build_query_url(&params)?;
         debug!("Querying PSKReporter: {}", url);
 
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .map_err(DxError::Network)?;
+        let response = self.client.get(url).send().await?;
 
         if !response.status().is_success() {
             return Err(DxError::ExternalService(format!(
@@ -221,9 +219,8 @@ impl PskReporterClient {
             )));
         }
 
-        let psk_response: PskReporterResponse = response
-            .json()
-            .await
+        let bytes = crate::body::bytes_within(response, PSKREPORTER_MAX_BODY_BYTES).await?;
+        let psk_response: PskReporterResponse = serde_json::from_slice(&bytes)
             .map_err(|e| DxError::Parse(format!("Failed to parse PSKReporter response: {}", e)))?;
 
         if psk_response.status != "OK" {
@@ -1164,5 +1161,28 @@ mod tests {
         // Should fail because reporter callsign is empty
         let result = uploader.flush().await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn query_spots_over_budget_is_refused() {
+        let (addr, h) = crate::test_support::serve_chunked(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json",
+            b"",
+            PSKREPORTER_MAX_BODY_BYTES + 1,
+        );
+        let mut client = PskReporterClient::with_config(PskReporterConfig {
+            base_url: format!("http://{addr}/query"),
+            rate_limit_ms: 0,
+            ..Default::default()
+        });
+        let err = client
+            .query_spots(QueryParams::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DxError::ResponseTooLarge { limit } if limit == PSKREPORTER_MAX_BODY_BYTES),
+            "got {err:?}"
+        );
+        crate::test_support::served(h).await;
     }
 }

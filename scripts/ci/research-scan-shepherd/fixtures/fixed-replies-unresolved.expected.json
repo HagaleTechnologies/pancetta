@@ -1,0 +1,30 @@
+{
+  "number": 420,
+  "eligible": true,
+  "ineligible_reasons": [],
+  "codex_rounds": 1,
+  "resolve": [
+    {
+      "thread_id": "PRRT_1",
+      "kind": "fixed",
+      "sha": "1a2b3c4000000000000000000000000000000000"
+    },
+    {
+      "thread_id": "PRRT_2",
+      "kind": "fixed",
+      "sha": "1a2b3c4000000000000000000000000000000000"
+    },
+    {
+      "thread_id": "PRRT_3",
+      "kind": "fixed",
+      "sha": "1a2b3c4000000000000000000000000000000000"
+    }
+  ],
+  "request_codex_verdict": false,
+  "rerun_ci_failed_jobs": false,
+  "clear_pause": false,
+  "arm": false,
+  "disarm": false,
+  "blockers": [],
+  "report": false
+}

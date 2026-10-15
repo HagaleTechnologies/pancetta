@@ -109,6 +109,16 @@ else they are silently dropped-and-audited.
   listener and the shared-arm decision, before the Reply-initiation task merges. If
   dispensa review rejects the shared arm, Option B is the fallback and only the
   seeding + one gate callsite change.
+- **Correction (2026-10-13, PAN-98).** Option A's stated safety argument ("both channels
+  still carry their own upstream consent") held only for the WSJT-X UDP channel.
+  Consent is now tracked per channel inside the shared `ArmState`
+  (`ConsentChannel::{StationAgent, WsjtxUdp}`), each bit seeded only from its own
+  channel's settings, and the originating channel's own consent is required at arm
+  (station agent only — the bridge never arms), intent-acceptance (station-agent
+  `txRequest`; Reply gate 2) and transmission (gate 5 selects the bit by
+  `remote_client_key_id`: `Some` → station agent, `None` → this bridge). With
+  `remote_tx_enabled = false` nothing can arm, so Reply-initiated frames are dropped at
+  gate 5 even with `allow_tx_initiation = true`.
 
 Additional caps: Reply-initiated QSOs are subject to the same duplicate check, parity
 admission, and N0CALL refusal as every other QSO (they flow through the identical

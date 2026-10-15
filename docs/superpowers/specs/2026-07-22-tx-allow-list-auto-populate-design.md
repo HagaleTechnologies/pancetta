@@ -62,6 +62,10 @@ shape isn't yet contractually pinned.
    until the next reconnect. Fixing that needs a separate change to a third crate's admission
    internals and is out of scope for this pass (matches cqdx's own "bounded by poll interval, not
    instant" framing for the general case).
+   **Resolved by PAN-96 (2026-10-12):** `MultiPeerSession::replace_allowed` now refreshes the
+   demux's admission set whenever an authorization poll changes the lists. A newly authorized
+   client can establish mid-session, and an established client the poll drops is evicted (see
+   `docs/DECISIONS/remote-operation.md`).
 3. **Source of truth:** when cqdx integration is enabled (`network.cqdx.token` configured), cqdx's
    authorization data is authoritative — the static config `tx_allow_list` is used only as the
    fallback/seed when cqdx integration is disabled or the token is missing (today's existing
@@ -149,7 +153,8 @@ second task alongside it:
   empty, false when cqdx is disabled and the static list is empty, and true when the static list is
   non-empty regardless of cqdx — this is the actual "does a live cqdx-driven update make the feature
   visible" coverage this feature ended up needing, since `MultiPeerSession` itself stays out of scope
-  (see §2's "Explicitly deferred" note above).
+  (see §2's "Explicitly deferred" note above; resolved later by PAN-96, which added
+  `MultiPeerSession::replace_allowed`).
 
 ### 5. Documentation
 

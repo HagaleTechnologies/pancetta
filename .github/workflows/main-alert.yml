@@ -1,0 +1,181 @@
+name: Main Alert
+
+# One "main is red: <workflow>" issue per workflow while it fails on main (or
+# on a v* release tag), assigned so the owner gets one email; closed by the
+# next green run. Workflows that already file their own alert issue are
+# deliberately not listed.
+#
+# INLINED COPY of HagaleTechnologies/credenza .github/workflows/main-alert.yml
+# @ 5142af1a6791bea56f5de0752bbebdccc7d94cc3 -- this repo is public and cannot call a reusable workflow in a
+# private repo. Logic and its tests live there (scripts/main-alert/); change it
+# there first, then re-copy. Inputs are fixed here: assignee thagale, label
+# main-red, events push/schedule/workflow_run, tags '^v[0-9]', recovery_jobs {}. Runs on
+# ubuntu-latest: public repos can't use the fleet's self-hosted runner groups,
+# and hosted minutes are free for public repos. Branch/tag filtering happens in
+# the step (the trigger's branches filter already narrows it).
+on:
+  workflow_run:
+    workflows:
+      - CI
+      - Docs
+      - Release
+      - Semgrep
+      - Research Scan Shepherd
+    types: [completed]
+    branches: [main, 'v[0-9]*']
+
+permissions: {}
+
+jobs:
+  alert:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      contains(fromJSON('["push","schedule","workflow_run"]'), github.event.workflow_run.event) &&
+      contains(fromJSON('["success","failure","timed_out","startup_failure"]'), github.event.workflow_run.conclusion)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      actions: read
+    # queue: max (GitHub, 2026-05-07): by default a group keeps ONE pending job
+    # and a newer arrival cancels it, so an older run's delivery could replace a
+    # newer one's, see the newer run as already reported, and exit -- losing it.
+    # Queued deliveries now each run, in arrival order.
+    concurrency:
+      group: main-alert-${{ github.event.workflow_run.workflow_id }}
+      cancel-in-progress: false
+      queue: max
+    steps:
+      - name: Open, comment on, or close the main-red issue
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ASSIGNEE: thagale
+          EVENTS: '["push","schedule","workflow_run"]'
+          LABEL: main-red
+          TAGS: '^v[0-9]'
+          RECOVERY_JOBS: '{}'
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+          WORKFLOW_ID: ${{ github.event.workflow_run.workflow_id }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          RUN_EVENT: ${{ github.event.workflow_run.event }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_MSG: ${{ github.event.workflow_run.head_commit.message }}
+        run: |
+          set -euo pipefail
+          if [ "$BRANCH" != "$DEFAULT_BRANCH" ]; then
+            if [ -z "$TAGS" ] || [ "$RUN_EVENT" != push ] || ! grep -qE -e "$TAGS" <<<"$BRANCH"; then
+              echo "$BRANCH is neither $DEFAULT_BRANCH nor a release tag -- nothing to do."
+              exit 0
+            fi
+          fi
+          title="main is red: $WORKFLOW_NAME"
+          marker="<!-- main-alert run=$RUN_ID attempt=$RUN_ATTEMPT -->"
+          # Parameter expansion, not `| head -n1`: with a body past the pipe
+          # buffer, head's early exit SIGPIPEs printf and pipefail aborts.
+          subject=${HEAD_MSG%%$'\n'*}
+          subject=${subject:0:120}
+          commit="\`${HEAD_SHA:0:7}\` $subject"
+
+          # Whether a run's success actually did something: some job ran, and
+          # for workflows listed in RECOVERY_JOBS, a matching job succeeded.
+          # $2 picks the attempt; omitted, the run's latest attempt.
+          effective_success() {
+            local path="repos/$REPO/actions/runs/$1/jobs?per_page=100"
+            [ -z "${2:-}" ] || path="repos/$REPO/actions/runs/$1/attempts/$2/jobs?per_page=100"
+            local jobs
+            # An unreadable job list must abort, not read as "did nothing".
+            jobs=$(gh api "$path") || exit 1
+            jq -e --arg wf "$WORKFLOW_NAME" --argjson req "$RECOVERY_JOBS" '
+              [.jobs[] | select(.conclusion != "skipped")] as $ran
+              | ($ran | length) > 0
+                and (($req[$wf] // null) as $re
+                     | $re == null or any($ran[]; .conclusion == "success" and (.name | test($re))))' <<<"$jobs" >/dev/null
+          }
+
+          if [ "$CONCLUSION" = success ] && ! effective_success "$RUN_ID" "$RUN_ATTEMPT"; then
+            echo "Run #$RUN_NUMBER succeeded without doing anything (jobs skipped) -- a no-op, not a recovery."
+            exit 0
+          fi
+
+          # A slower, older run must not reopen (or close) the issue after a
+          # newer run of the same workflow has already reported. "Newer" spans
+          # every watched ref (overlapping release tags share one issue) and
+          # includes a later attempt of this same run. A newer success that
+          # did nothing does not count. One query per counted event, so PR,
+          # dispatch and merge-queue runs (the bulk of a shared CI workflow's
+          # history) can't page a newer main run out of view.
+          newer=$(for ev in $(jq -r '.[]' <<<"$EVENTS"); do
+              # A missing event's history would make a stale run look current.
+              gh api "repos/$REPO/actions/workflows/$WORKFLOW_ID/runs?status=completed&event=$ev&per_page=100" || exit 1
+            done \
+            | jq -rs --argjson ev "$EVENTS" --arg def "$DEFAULT_BRANCH" --arg tags "$TAGS" \
+                --argjson n "$RUN_NUMBER" --argjson id "$RUN_ID" --argjson att "$RUN_ATTEMPT" '[.[].workflow_runs[]] | .[]
+                | select(.event as $e | $ev | index($e))
+                | select(.head_branch == $def or ($tags != "" and .event == "push" and (.head_branch | test($tags))))
+                | select(.conclusion as $c | ["success","failure","timed_out","startup_failure"] | index($c))
+                | select(.run_number > $n or (.id == $id and (.run_attempt // 1) > $att))
+                | "\(.id) \(.run_number) \(.conclusion)"')
+          while read -r id number conclusion; do
+            [ -n "$id" ] || continue
+            if [ "$conclusion" != success ] || effective_success "$id"; then
+              echo "Run #$RUN_NUMBER (attempt $RUN_ATTEMPT) is older than already-reported run #$number -- nothing to do."
+              exit 0
+            fi
+          done <<<"$newer"
+
+          issue=$(gh api "repos/$REPO/issues?labels=$LABEL&state=open&per_page=100" \
+            | jq -r --arg t "$title" '[.[] | select(.pull_request | not) | select(.title == $t) | .number] | first // empty')
+
+          if [ "$CONCLUSION" = success ]; then
+            if [ -n "$issue" ]; then
+              gh issue comment "$issue" -R "$REPO" --body "Green again: [$WORKFLOW_NAME #$RUN_NUMBER]($RUN_URL) on $commit."
+              gh issue close "$issue" -R "$REPO" --reason completed
+            else
+              echo "$WORKFLOW_NAME is green and no issue is open."
+            fi
+            exit 0
+          fi
+
+          # Abort on an unreadable job list rather than posting the generic
+          # line below in place of the real job links; a rerun reports properly.
+          run_jobs=$(gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100")
+          failed=$(jq -rs '[.[].jobs[]] | .[] | select(.conclusion == "failure" or .conclusion == "timed_out")
+              | "- [\(.name)](\(.html_url))"' <<<"$run_jobs")
+          [ -n "$failed" ] || failed="- (no failed job reported; conclusion: $CONCLUSION)"
+          report="$marker
+          [$WORKFLOW_NAME #$RUN_NUMBER]($RUN_URL) ($RUN_EVENT, attempt $RUN_ATTEMPT) **$CONCLUSION** on $commit.
+
+          Failed jobs:
+          $failed"
+
+          if [ -n "$issue" ]; then
+            # The opening report lives in the issue body, later ones in comments.
+            # Fetched separately so either failing aborts the step (a missed
+            # marker would re-post).
+            # Only this workflow's own writes count: on a public repo anyone can
+            # comment, and a pasted marker would otherwise suppress a real report.
+            body=$(gh api "repos/$REPO/issues/$issue" --jq 'select(.user.login == "github-actions[bot]") | .body // ""')
+            comments=$(gh api --paginate "repos/$REPO/issues/$issue/comments?per_page=100" \
+              --jq '.[] | select(.user.login == "github-actions[bot]") | .body')
+            seen="$body"$'\n'"$comments"
+            if grep -qF "$marker" <<<"$seen"; then
+              echo "Issue #$issue already has this run -- duplicate delivery."
+              exit 0
+            fi
+            gh issue comment "$issue" -R "$REPO" --body "$report"
+          else
+            gh label create "$LABEL" -R "$REPO" --color B60205 \
+              --description "A workflow is failing on the default branch (credenza main-alert)" --force >/dev/null
+            gh issue create -R "$REPO" --title "$title" --label "$LABEL" --assignee "$ASSIGNEE" \
+              --body "$report
+
+          Closes itself on the next green run of $WORKFLOW_NAME on \`$BRANCH\`."
+          fi

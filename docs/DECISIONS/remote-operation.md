@@ -9,7 +9,7 @@
 
 ## Read-only remote gateway (Panino client, v1)
 
-`pancetta/src/coordinator/remote_gateway/{mod.rs,translate.rs}`, `pancetta-protocol` crate, `pancetta-config/src/network.rs`: a **default-OFF, localhost-bound** axum WebSocket component that serves the read-only remote view (decodes + QSO progress + scalar status) to WebSocket clients (panino) using the `pancetta_protocol` wire types. **NO control / NO remote-TX** in v1 — inbound `clientCommand` frames are accepted but ignored (logged); the control/relay/auth path is gated behind dispensa ADR-0002 (Accepted) and is not built here. Started in `start_remote_gateway_component` (mirrors `start_pskreporter_component`: disabled → drain channel, enabled → bus-pump + axum-serve tasks). The pure `translate.rs` maps bus payloads → protocol types (`ActiveQsoSnapshotItem`→`QsoProgress`, `DecodedMessage`→`DecodedView` enriched with worked/needed/atno from `CachedStationLookup`, etc.). Live feed via **additive dual-destination** bus sends gated on a cached `gateway_enabled: Arc<AtomicBool>` (zero overhead when off): decode fan-out (`ft8.rs`), `ActiveQsosSnapshot` ×3 (`qso.rs`), Frequency+SignalStrength (`hamlib.rs`), Split-clear (`autonomous.rs`), Mode (`tui_relay.rs`, see below) — the existing `→Tui` sends are **untouched** (additive-only invariant; `pancetta-tui` diff empty). On connect: `Welcome{StateSnapshot}` (full state, sent every reconnect) then `event` deltas; `protocolVersion = 1`. v1 emits `decoded`/`activeQsos`/`frequency`/`signalStrength`/`split`/`mode`/`spectrum` (NOT `dxHunter` rows — client builds DX Hunter from the decode stream; NOT live `txStatus`/`txPolicy`). **`mode` field** (2026-07-06, dispensa Q-0027 — fulfills the Q-0009 promise made when FT4 landed): `StateSnapshot.mode: String` (station-wide operating mode, "FT8"/"FT4"/"FT2"; `#[serde(default)]` ⇒ "FT8" for back-compat) seeded from the live `active_protocol_mode` atomic at gateway startup, plus a new `ServerEvent::Mode` pushed on every successful Shift+M switch (`tui_relay.rs`'s `CycleOperatingMode` handler, gated through `relay_to_gateway` same as Frequency/Split) so already-connected clients see a live mode change without reconnecting. Additive/optional on the wire — no schema-breaking change. **`spectrum` event** (2026-07-22, dispensa Q-0024, rig-api v1.2): `ServerEvent::Spectrum{spectrum: {binStartHz, binWidthHz, magsDb, seq, timestamp}}`, event-only (not carried in `StateSnapshot` — consumers key off `seq` and tolerate gaps). Source is `pancetta-ft8::decoder::generate_waterfall_data` — raw, pre-normalization dB (distinct from the TUI's own 0-1 color-mapped waterfall, which is untouched). `ft8.rs` forwards one `MessageType::SpectrumRow` (native ~2.93 Hz/bin resolution, audio-baseband `audio_bin_start_hz`) per waterfall row (~4 per FT8 decode window) to the gateway, gated by `display_feed_enabled` exactly like the `DecodedMessage` relay. The pure `translate::spectrum_row_to_event` pair-averages bins down to ~5.86 Hz/bin (matching panino's fixture default) and converts `audio_bin_start_hz` → RF-absolute by adding the live dial frequency (mirrors `decoded_to_view`'s enrichment); `handle_bus_msg` assigns `seq` from a per-display-feed-session `AtomicU64`. Config: `[network.remote_gateway]` (`enabled`=false, `bind_addr`=`127.0.0.1:4080`). Plain `ws://` localhost only (wss/TLS deferred to Sub-plan C). Cross-repo: dispensa ADR-0003 (rig-API) + ADR-0009 (this v1 implemented profile) + `contracts/rig/rig-api.v1.schema.json`. Spec: `docs/superpowers/specs/2026-06-26-remote-operation-design.md`; plan: `docs/superpowers/plans/2026-06-27-remote-gateway.md`.
+`pancetta/src/coordinator/remote_gateway/{mod.rs,translate.rs}`, `pancetta-protocol` crate, `pancetta-config/src/network.rs`: a **default-OFF, localhost-bound** axum WebSocket component that serves the read-only remote view (decodes + QSO progress + scalar status) to WebSocket clients (panino) using the `pancetta_protocol` wire types. **NO control / NO remote-TX** in v1 — inbound `clientCommand` frames are accepted but ignored (logged); the control/relay/auth path is gated behind dispensa ADR-0002 (Accepted) and is not built here. Started in `start_remote_gateway_component` (mirrors `start_pskreporter_component`: disabled → drain channel, enabled → bus-pump + axum-serve tasks). The pure `translate.rs` maps bus payloads → protocol types (`ActiveQsoSnapshotItem`→`QsoProgress`, `DecodedMessage`→`DecodedView` enriched with worked/needed/atno from `CachedStationLookup`, etc.). Live feed via **additive dual-destination** bus sends gated on a cached `gateway_enabled: Arc<AtomicBool>` (zero overhead when off): decode fan-out (`ft8.rs`), `ActiveQsosSnapshot` ×3 (`qso.rs`), Frequency+SignalStrength (`hamlib.rs`), Split-clear (`autonomous.rs`), Mode (`tui_relay.rs`, see below) — the existing `→Tui` sends are **untouched** (additive-only invariant; `pancetta-tui` diff empty). After an authenticated `hello`: `Welcome{StateSnapshot}` (full state, sent every reconnect) then `event` deltas; `protocolVersion = 1`. v1 emits `decoded`/`activeQsos`/`frequency`/`signalStrength`/`split`/`mode`/`spectrum` (NOT `dxHunter` rows — client builds DX Hunter from the decode stream; NOT live `txStatus`/`txPolicy`). **`mode` field** (2026-07-06, dispensa Q-0027 — fulfills the Q-0009 promise made when FT4 landed): `StateSnapshot.mode: String` (station-wide operating mode, "FT8"/"FT4"/"FT2"; `#[serde(default)]` ⇒ "FT8" for back-compat) seeded from the live `active_protocol_mode` atomic at gateway startup, plus a new `ServerEvent::Mode` pushed on every successful Shift+M switch (`tui_relay.rs`'s `CycleOperatingMode` handler, gated through `relay_to_gateway` same as Frequency/Split) so already-connected clients see a live mode change without reconnecting. Additive/optional on the wire — no schema-breaking change. **`spectrum` event** (2026-07-22, dispensa Q-0024, rig-api v1.2): `ServerEvent::Spectrum{spectrum: {binStartHz, binWidthHz, magsDb, seq, timestamp}}`, event-only (not carried in `StateSnapshot` — consumers key off `seq` and tolerate gaps). Source is `pancetta-ft8::decoder::generate_waterfall_data` — raw, pre-normalization dB (distinct from the TUI's own 0-1 color-mapped waterfall, which is untouched). `ft8.rs` forwards one `MessageType::SpectrumRow` (native ~2.93 Hz/bin resolution, audio-baseband `audio_bin_start_hz`) per waterfall row (~4 per FT8 decode window) to the gateway, gated by `display_feed_enabled` exactly like the `DecodedMessage` relay. The pure `translate::spectrum_row_to_event` pair-averages bins down to ~5.86 Hz/bin (matching panino's fixture default) and converts `audio_bin_start_hz` → RF-absolute by adding the live dial frequency (mirrors `decoded_to_view`'s enrichment); `handle_bus_msg` assigns `seq` from a per-display-feed-session `AtomicU64`. Config: `[network.remote_gateway]` (`enabled`=false, `bind_addr`=`127.0.0.1:4080`, required `auth_token` when enabled, `allowed_origins`=[], `allow_network_exposure`=false). Clients must authenticate with `hello.gatewayToken` before receiving station data. Plain `ws://` is loopback-only unless explicitly exposed; wss/TLS remains deferred. See [gateway configuration](../CONFIG.md#networkremote_gateway--local-read-only-view-panino). Cross-repo: dispensa ADR-0003 (rig-API) + ADR-0009 (this v1 implemented profile) + `contracts/rig/rig-api.v1.schema.json`. Spec: `docs/superpowers/specs/2026-06-26-remote-operation-design.md`; plan: `docs/superpowers/plans/2026-06-27-remote-gateway.md`.
 
 ## Station agent — remote rig control (P0–P2 safety core + P3 relay/pairing wire landed offline; the FINAL TX authority)
 
@@ -61,6 +61,22 @@ the seeding call sites. This decision was filed as a cross-repo question — dis
 Q-0031 (<https://github.com/HagaleTechnologies/dispensa/pull/16>, merged) — per the
 5-check remote-TX security spine and CLAUDE.md's cross-repo contract-first policy; the
 merged PR is the concurrence record for shipping Option A.
+
+**Correction (2026-10-13, PAN-98): per-channel consent.** Option A's safety argument
+("each channel still carries its own upstream consent") held only for the WSJT-X UDP
+channel. The shared `ArmState` remains (one arm, one TX-worker gate); the shared
+consent boolean is gone. `ArmState` now holds one consent bit per channel
+(`ConsentChannel::{StationAgent, WsjtxUdp}`), seeded independently at both seeding sites
+from `remote_tx_enabled` and `enabled && allow_tx_initiation`;
+`remote_tx_arm_consent` is deleted. The originating channel's own current consent is
+required at every enforcement point: **arm**: `verify_and_arm` and `ArmState::arm` refuse
+without station-agent consent, since arming is a station-agent-only act. **Intent**: a
+station-agent `txRequest` is refused, audited `TxDenied`; WSJT-X Reply keeps its gate 2.
+**Transmission**: `remote_tx_permitted_for` and `ArmSnapshot` pick the bit from
+`remote_client_key_id`: `Some` means station agent, `None` means the WSJT-X UDP bridge.
+Consequence: with `remote_tx_enabled = false` nothing can arm, so WSJT-X-UDP-originated
+frames are dropped `not-armed` even with `allow_tx_initiation = true`. A follow-up
+dispensa question should record this correction against Q-0031's concurrence record.
 
 **v1 non-goals.** No IPv6 (multicast destinations are IPv4-only; an IPv6 `destination`
 falls back to non-multicast socket-option handling and — deliberately fail-closed for the
@@ -166,7 +182,8 @@ panino's operator hit this live: `armedUntil`'s v1 conservative 10-minute ceilin
 arbitrary `N` instantiation in dispensa ADR-0002 §Decision #5, never derived from a Part-97 number or
 specific threat model) forced a full re-arm ceremony every 10 minutes during any real operating
 session. Confirmed via `docs/fcc-part97-compliance.md`: §97.109(c) control-operator presence is what
-the 5-15s dead-man heartbeat already enforces on a fast, continuous cadence; `armedUntil` is a
+the dead-man heartbeat already enforces continuously (the client sends every 5-15 s; the station
+disarms after 30 s of silence); `armedUntil` is a
 coarser, independent worst-case-exposure backstop, not doing compliance work the heartbeat isn't
 already doing. cqdx concurred (2026-07-28) on 60 minutes as a fixed contract constant (not
 station-configurable — matches the existing `MIN_HEARTBEAT_SEC`/`MAX_HEARTBEAT_SEC` pattern).
@@ -235,3 +252,225 @@ The crash invalidates only remote-origin QSOs (`QsoMetadata.remote_origin == tru
 `QsoFailureReason::ComponentCrash("StationAgent")`. Local QSOs do not depend on StationAgent and
 continue unchanged. A restarted StationAgent keeps the same shared arm object but cannot inherit an
 authorization: re-arming must pass through the normal capability and grant-verification path.
+
+## Client identity binding + hello-gated read stream (PAN-95, 2026-10-12)
+
+The station agent's multi-peer session now establishes a relay peer only under the keyId it proves
+inside the Noise IK handshake, and it sends a peer nothing until that peer holds a currently-valid
+`status`-or-higher capability from a verified `hello`. This brings pancetta in line with dispensa
+Q-0019 §5 and Q-0023. The TX-arm chain (`capabilityToken`, `txArmGrant.clientSig`,
+`tx_arm_allow_list`, `ArmState`) is unchanged. Spec, including the ready-to-file dispensa question:
+`docs/superpowers/specs/2026-10-12-client-identity-binding-design.md`.
+
+Decisions:
+
+- **D1 — proof in msg1.** The client puts a JSON identity proof in its Noise IK msg1 payload: its
+  Ed25519 identity public key and its pairing.v1 `idSig`. The station verifies `idSig` over the
+  initiator static key the handshake authenticated (`get_remote_static()`), and the peer's identity
+  is the keyId derived from the proven Ed25519 key. keyIds are self-certifying, so no registry or
+  provisioning is needed, and it works in both static-config and cqdx-poll modes. Rejected:
+  cqdx-delivered client keys on authorization edges (no static-config coverage, couples handshakes
+  to poll freshness), TOFU pinning (first contact unverified), a `cnf` claim in `capabilityToken`
+  (binds at `hello`, after per-peer state exists).
+- **D2 — `src` is routing metadata.** It stays the cheap allow-list/capacity pre-filter before any
+  handshake state is allocated, but a peer is established only if the proven keyId equals it.
+- **D3 — fail closed, no config opt-out.** No proof means refused.
+- **D4 — one outbound predicate.** `peer_may_receive` (status tier, unexpired) is applied in
+  `deliver_sends` and `drain_read_stream`, the only two station→client paths. Nothing goes to an
+  unauthorized peer, `error` frames included.
+- **D5 — greeting on hello.** The `controlState` greeting is sent on a successful `hello`, not on
+  establishment.
+- **D6 — expiry-aware scopes.** `PeerCtx` holds `PeerAuth { scopes, exp_ms }`; `qsy`/`setSplit`
+  use the same `PeerCtx::grants` predicate at the `qsy` tier. `sweep_expired_peer_auth` clears
+  expired auth once per loop and logs each peer once. If the expired peer is the controller,
+  `expire_peer_auth` also disarms and releases control (fail TX-off, as on controller loss), so an
+  armed controller is never left transmitting while the station sends it nothing
+  (`controller_capability_expiry_disarms_and_releases_control`).
+- **D7 — no unfiltered fan-out.** `MultiPeerSession::broadcast` is replaced by `broadcast_to`,
+  where the caller names who may receive.
+- **D8 — refusal reasons.** `Poll::PeerRefused` carries a `RefuseReason` (`NotAllowListed`,
+  `AtCapacity`, `Handshake`, `IdentityProofMissing`, `IdentityProofInvalid`, `IdentityMismatch`),
+  logged at WARN so operators can tell an outdated client from an unlisted one.
+- **D9 — proof format.** UTF-8 JSON `{"v":1,"identityPublicKey","idSig"}`, camelCase, at most 1024
+  bytes, unknown fields ignored, `v` must be 1. The client reuses its enrollment `idSig`.
+- **D10 — dispensa first.** The dispensa question is drafted in the spec; the PR merges only after
+  a human files it.
+
+Files touched: `pancetta-agent/src/peer_identity.rs` (new; `verify_client_identity_proof`),
+`pancetta-agent/src/noise.rs` (`ResponderHandshake::remote_static`),
+`pancetta-agent/src/multi_session.rs` (`bootstrap_peer`, `RefuseReason`, `broadcast_to`),
+`pancetta-agent/src/keys.rs` (`key_id_from_identity_public`, `AgentIdentity::from_secret_bytes`),
+`pancetta-agent/src/lib.rs`, `pancetta-agent/src/session.rs` (doc warning only: the single-peer
+reference does not bind client identity and is not the production path),
+`pancetta-agent/tests/pairing_sig_vectors.rs`, and
+`pancetta/src/coordinator/station_agent/mod.rs` (`PeerAuth`, `PeerCtx::grants`,
+`peer_may_receive`, `sweep_expired_peer_auth`).
+
+Gherkin scenarios and their tests:
+
+- **Scenario 1 — a peer is identified only by the identity it proves in the handshake.**
+  `relay_key_claiming_admitted_client_is_refused`,
+  `relay_key_with_its_own_proof_under_client_label_is_refused` (`multi_session.rs`), and
+  `run_one_session_refuses_relay_keyed_impersonation` (`station_agent/mod.rs`).
+- **Scenario 2 — station data reaches a peer only after a valid `hello`.**
+  `read_stream_events_reach_only_hello_authorized_peers`,
+  `no_frame_reaches_a_peer_until_it_sends_a_valid_hello`, and
+  `read_stream_withheld_after_capability_expiry` (`station_agent/mod.rs`).
+
+Rollout: the station enforces both rules on release (the station agent stays default-OFF).
+Clients must send the identity proof in msg1 and re-send `hello` with a fresh token before `exp`
+(non-TX tokens last at most 900 s). Until panino and cqdx `/rig` ship that, their connections are
+refused with `reason=IdentityProofMissing`. **Merge prerequisite:** file the dispensa question from
+the spec's "Proposed dispensa question" section.
+
+Coordination with PAN-96: PAN-96 (expiry and revocation of existing peers' authority) should build
+on `PeerAuth`, `PeerCtx::grants` and `sweep_expired_peer_auth` rather than add a parallel
+mechanism. PAN-95 already makes `qsy`/`setSplit` check expiry. PAN-96 still owns evicting or
+de-authorizing established peers when an authorization poll revokes them.
+
+Follow-up: `takeControl` and implicit control grabs do not yet require a currently-valid
+`status`+ capability. That is an inbound control-rule change left for a separate ticket.
+
+## Live authority checks + eviction on revocation (PAN-96, 2026-10-12)
+
+PAN-95 made a peer's hello capability expire at use time. PAN-96 makes the rest of a peer's
+authority live too: revoking a client's authorization (or letting its token expire) now stops it
+on its current connection, not only the next time it reconnects. Plan:
+`thoughts/shared/plans/2026-10-12-PAN-96-revoking-or-expiring-a-remote-clients-authority-should-stop.md`.
+
+Decisions:
+
+- **D1 — per-use checks.** `peer_grants` is now admitted ∧ unexpired ∧ not deny-listed ∧ scope.
+  `peer_admitted` reads the live `tx_allow_list` on every call and fails closed on a poisoned lock.
+  `qsy`/`setSplit` and the outbound predicate `peer_may_receive` all go through it, so a peer the
+  poll task drops is refused and sent nothing from the moment the new list is published, before any
+  eviction runs.
+- **D2 — a dropped peer may only reduce authority.** At the top of `dispatch_action`, a peer that
+  is no longer admitted gets every action refused except `Disarm` and `ReleaseControl`. This runs
+  before `controller_gate`, so a revoked peer cannot implicitly grab control either. `Heartbeat` is
+  refused too: refusing it can only shorten an arm.
+- **D3 — token identity.** `PeerAuth` keeps the hello token's `jti`. Client identity is the
+  `PeerCtx` key (the handshake-proven keyId, equal to the token's `clientKeyId`), so no copy is kept.
+- **D4 — authorization generation.** `poll_authorizations_loop` bumps a shared
+  `authz_generation` counter after publishing the lists, and only when either list's contents
+  changed. A failed poll, or one that changes nothing, bumps nothing. Static-config stations never
+  bump it, so their session path is unchanged.
+- **D5 — reconcile in the session task.** `session_housekeeping` (the end of every loop iteration
+  and the PAN-34 malformed-frame path) first runs `reconcile_authorizations`. When the session's
+  `authz_generation_seen` lags the counter, it replaces the demux admission set and, for every peer
+  the live list no longer holds, drops its Noise transport, removes its `PeerCtx`, and adds its
+  hello `jti` to `revoked_jtis`. If an evicted peer held control or the arm, it disarms with
+  `authorization-revoked` (a no-op when the poll task already did, so no duplicate audit record),
+  releases control and sends the remaining peers the updated `controlState`. The step has no
+  `.await`, so no frame from the evicted peer is processed in between. Latency is one `RECV_TICK`
+  (200 ms) after the poll publishes.
+- **D6 — `MultiPeerSession::replace_allowed`.** Replaces the admission set and returns the evicted
+  keyIds. This also resolves the 2026-07-22 auto-populate spec's deferred non-goal: a client
+  authorized mid-session can now connect without waiting for the relay session to cycle.
+- **D7 — re-authentication.** An evicted client must be re-admitted, run a fresh Noise handshake
+  (its old transport keys are gone), and present a token with a new `jti`. The old token is refused
+  at `hello` and, through the existing `CapError::Revoked`, at arm.
+- **D8 — silent eviction.** No new wire frame, config key, CLI output or `AuditKind`. relay.v1 has
+  no kick frame, and an evicted client's unanswered requests and stopped display drive its own
+  reconnect. New `agent.control` log lines: "control frame refused — peer is no longer authorized
+  on this station", "remote peer evicted — its authorization was revoked; it must be re-authorized
+  and reconnect" and "hello capabilityToken was revoked on this station — fetch a fresh token".
+  A controller eviction also logs "controller evicted with a live arm — disarming" on `agent.tx`.
+
+Known limits:
+
+- `revoked_jtis` is process-lifetime and best-effort. A StationAgent restart clears it. The token's
+  own `exp` still bounds it, and the client also needs re-admission plus a new handshake.
+- A revoke followed by a re-authorization inside one poll interval is never observed, so nothing is
+  evicted. That is inherent to polling.
+- A scope downgrade on an edge that stays admitted takes effect at token expiry (at most 900 s for
+  non-TX tokens). The token's IdP-signed scopes stay the authority, and arm is still gated live by
+  `tx_arm_allow_list`.
+
+Tests: `expired_hello_capability_cannot_qsy_or_split` (the ticket's
+`security_review_expired_hello_still_controls_rig` evidence),
+`real_poll_revocation_stops_qsy_split_and_reads` and
+`revoking_a_connected_client_evicts_its_live_session` (`station_agent/mod.rs`), and the three
+`replace_allowed_*` tests (`multi_session.rs`).
+
+## Dead-man loss needs a fresh signed arm (PAN-97), 2026-10-13
+
+Normative station behaviour for heartbeat timing:
+
+- **Cadence vs. silence limit.** `heartbeatIntervalSec` (validated to [5,15] s) is how often the
+  client *sends*. The station's silence limit is the fixed `HEARTBEAT_TIMEOUT_MS` = 30 s for every
+  accepted cadence; it is not derived from the cadence. The verified cadence and the signed
+  `armedUntil` are carried on `VerifiedArmGrant` and recorded in the arm audit
+  (`armed ttl_ms=… heartbeat_interval_sec=… heartbeat_timeout_ms=30000`). Changing the limit, or
+  tying it to the cadence, is a dispensa contract question, not a local tweak.
+- **Expiry is terminal.** Once 30 s pass without an accepted heartbeat, or the arm's lifetime ends,
+  the arm is gone. `ArmState::heartbeat` runs the same expiry transition as `tick` *before* any
+  `armJti`/`seq` check, so a heartbeat at or after the deadline (`>=`) cannot refresh anything, even
+  on the same still-connected session. The only way back is a newly signed, previously unseen
+  `txArm` grant (`seen_jtis` still refuses the consumed one). Dead-man expiry removes arm authority
+  only; the Noise peer, the controller slot and `seen_jtis` stay.
+- **Independent sweep.** `run_one_session` calls `ArmState::tick` on every receive-loop iteration,
+  before acting on the received frame (valid, malformed or idle), and broadcasts the existing
+  `controlState` (`transmitArmed:false`) on a real transition. The display drain is capped at 64
+  items per iteration so a busy read stream cannot hold the sweep off. The TX worker's key-time
+  check stays independent of both.
+- **Two clocks.** Local liveness (silence, the arm's maximum lifetime) is measured on the monotonic
+  clock, so a wall-clock step cannot stretch it. The signed `armedUntil` is checked against wall
+  time. At acceptance the lifetime is `min(verified ttl, armedUntil − now)`, so a delay between
+  verification and acceptance cannot extend the grant. Production gates take their `ArmTime`
+  sample after acquiring the arm lock. A monotonic sample earlier than a stored instant denies.
+- **Suspend counts as silence.** `Instant`'s monotonic clock stops while the host sleeps on Linux
+  and macOS, so silence and lifetime are also measured on a suspend-aware clock (Linux
+  `CLOCK_BOOTTIME`, Apple `CLOCK_MONOTONIC`; elsewhere it follows `Instant`). Either clock reaching
+  a limit expires the arm, so an operator silent through a suspend longer than 30 s must re-arm on
+  wake. A wall-clock forward step still does not expire liveness; only real elapsed time does. A
+  suspend-aware sample earlier than the stored one denies.
+
+## Local gateway authentication (PAN-99), 2026-10-13
+
+The [design spec](../superpowers/specs/2026-10-13-local-gateway-authentication-design.md)
+defines admission for the read-only local gateway. It leaves the relay-connected
+station agent, display-feed translation and TUI behavior unchanged.
+
+| Decision | Required behavior |
+|----------|-------------------|
+| D1 | The first text frame must be a `hello` with `gatewayToken` within 5 seconds. Subscribe and send station data only after authentication. |
+| D2 | An enabled gateway requires a configured secret of at least 32 characters, without whitespace or control characters. |
+| D3 | Compare token bytes with `subtle::ConstantTimeEq`. |
+| D4 | A present Origin must match the explicit allow-list, ignoring ASCII case. Reject `null`. Native clients without Origin still authenticate. |
+| D5 | Parse an IP-literal socket address. A non-loopback IP requires `allow_network_exposure = true`. |
+| D6 | Validate enabled sections at config load and again at component start; invalid runtime config leaves the listener unstarted. |
+| D7 | Authentication failure closes with 1008 and `authentication required`; log only a fixed local reason. |
+| D8 | Cap inbound frames and messages at 64 KiB. |
+| D9 | TLS remains deferred. Network-exposed `ws://` requires the explicit acknowledgement and logs a warning. |
+| D10 | Keep protocol version 1 and omit `gatewayToken` when absent. File the dispensa proposal before merge. |
+| D11 | Commit messages describe the required behavior in generic terms. |
+| D12 | Bind the parsed address and log the real `listener.local_addr()`. |
+
+Implementation is in `pancetta/src/coordinator/remote_gateway/{auth.rs,mod.rs}`,
+with component tests in `pancetta/src/coordinator/mod.rs`, the optional wire field
+in `pancetta-protocol/src/session.rs`, config validation and redaction in
+`pancetta-config/src/network.rs`, the merge guardrail in `pancetta-config/src/lib.rs`,
+and regenerated `pancetta-config/defaults.toml`. `pancetta/Cargo.toml` and
+`Cargo.lock` make the existing `subtle` dependency direct. The config reference,
+changelog and AGENTS.md record the operator requirements and invariant.
+
+| Scenario | Regression tests |
+|----------|------------------|
+| No credential, no station data | `client_without_credential_gets_no_welcome`, `hello_without_token_is_closed_without_welcome`, `hello_with_wrong_token_is_closed_without_welcome`, `non_hello_first_frame_is_closed_without_welcome`, `oversized_first_message_is_rejected_without_welcome`; `auth::tests::*` |
+| Browser admission | `untrusted_browser_origin_is_refused_before_upgrade`, `null_origin_is_refused_before_upgrade`, `allowed_browser_origin_with_token_gets_welcome` |
+| Authenticated view | `authenticated_client_gets_welcome_then_events`, `welcome_snapshot_reflects_initial_state` |
+| Bind opt-in and validation | `remote_gateway_non_loopback_bind_requires_explicit_opt_in`, `remote_gateway_loopback_bind_needs_no_opt_in`, `remote_gateway_bind_addr_must_be_ip_and_port`, `remote_gateway_allowed_origins_must_be_bare_origins`, `network_validation_covers_remote_gateway`, `remote_gateway_disabled_is_not_validated` |
+| Component backstop | `remote_gateway_does_not_bind_non_loopback_without_opt_in`, `remote_gateway_binds_on_loopback_with_auth_token`, `remote_gateway_does_not_bind_without_auth_token` |
+| Secret handling | `remote_gateway_enabled_requires_auth_token`, `credential_debug_is_redacted`, `hello_debug_redacts_gateway_token` |
+| Config merge | `merge_with_carries_over_every_opt_in_integration`, `merge_with_carries_every_field` |
+| Wire compatibility | `hello_without_gateway_token_serializes_unchanged`, `hello_missing_gateway_token_key_deserializes_none`, `hello_gateway_token_round_trips_camel_case`, `frames_roundtrip`, `frame_shapes_match_schema` |
+
+On upgrade, enabled gateways need `auth_token` or startup fails with the named
+fix. Panino's `?gateway=` transport must send `hello.gatewayToken` first; browser
+dev-server Origins must also be configured. Production relay transport is
+unaffected. Token and bind changes require restart. There is no data migration.
+
+Merge prerequisite: file the dispensa question in the design spec's
+`Proposed dispensa question` section before merging. Panino's `?gateway=` mode
+cannot connect until it sends `hello.gatewayToken`.

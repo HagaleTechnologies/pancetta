@@ -8,14 +8,67 @@ use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::Duration;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async_with_config,
+    tungstenite::{protocol::WebSocketConfig, Message},
+};
 use tracing::{debug, error, info, warn};
 use url::Url;
+
+/// Longest telnet line kept, line ending included. Spot lines are ~80 bytes.
+const MAX_CLUSTER_LINE_BYTES: usize = 4096;
+/// Spots queued for [`DxClusterClient::receive_spot`] before new ones are dropped.
+const SPOT_QUEUE_CAPACITY: usize = 1024;
+/// Outgoing commands queued for the writer task.
+const COMMAND_QUEUE_CAPACITY: usize = 64;
+
+/// Result of [`read_capped_line`].
+#[derive(Debug, PartialEq, Eq)]
+enum CappedLine {
+    Eof,
+    Line,
+    TooLong,
+}
+
+/// Read one `\n`-terminated line into `buf`, holding at most `max` bytes
+/// (line ending included). A longer line is consumed through its `\n` and
+/// discarded, leaving `buf` empty, so its length never grows memory.
+async fn read_capped_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<CappedLine> {
+    buf.clear();
+    let n = (&mut *reader)
+        .take(max as u64)
+        .read_until(b'\n', buf)
+        .await?;
+    if n == 0 {
+        return Ok(CappedLine::Eof);
+    }
+    if buf.last() == Some(&b'\n') || n < max {
+        return Ok(CappedLine::Line);
+    }
+    loop {
+        buf.clear();
+        let n = (&mut *reader)
+            .take(max as u64)
+            .read_until(b'\n', buf)
+            .await?;
+        if n == 0 || buf.last() == Some(&b'\n') {
+            break;
+        }
+    }
+    buf.clear();
+    Ok(CappedLine::TooLong)
+}
 
 /// DX Cluster configuration
 #[derive(Debug, Clone)]
@@ -130,11 +183,13 @@ pub struct DxClusterClient {
     /// Connection status
     status: Arc<Mutex<ConnectionStatus>>,
     /// Message sender for outgoing commands
-    command_sender: Option<mpsc::UnboundedSender<String>>,
+    command_sender: Option<mpsc::Sender<String>>,
     /// Spot receiver
-    spot_receiver: Option<mpsc::UnboundedReceiver<DxSpot>>,
+    spot_receiver: Option<mpsc::Receiver<DxSpot>>,
     /// Recently seen spots (for duplicate filtering)
     recent_spots: Arc<Mutex<HashMap<String, DateTime<Utc>>>>,
+    /// Spots dropped because the spot queue was full
+    dropped_spots: Arc<AtomicU64>,
 }
 
 impl DxClusterClient {
@@ -156,6 +211,7 @@ impl DxClusterClient {
             command_sender: None,
             spot_receiver: None,
             recent_spots: Arc::new(Mutex::new(HashMap::new())),
+            dropped_spots: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -167,6 +223,7 @@ impl DxClusterClient {
             command_sender: None,
             spot_receiver: None,
             recent_spots: Arc::new(Mutex::new(HashMap::new())),
+            dropped_spots: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -183,6 +240,11 @@ impl DxClusterClient {
     /// Get connection status
     pub async fn status(&self) -> ConnectionStatus {
         self.status.lock().await.clone()
+    }
+
+    /// Spots dropped because the spot queue was full, since the client was created
+    pub fn dropped_spot_count(&self) -> u64 {
+        self.dropped_spots.load(Ordering::Relaxed)
     }
 
     /// Connect to DX cluster
@@ -221,8 +283,8 @@ impl DxClusterClient {
         let mut reader = BufReader::new(reader);
 
         // Create channels for communication
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<String>();
-        let (spot_tx, spot_rx) = mpsc::unbounded_channel::<DxSpot>();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<String>(COMMAND_QUEUE_CAPACITY);
+        let (spot_tx, spot_rx) = mpsc::channel::<DxSpot>(SPOT_QUEUE_CAPACITY);
 
         let login_cmd_tx = cmd_tx.clone();
         self.command_sender = Some(cmd_tx);
@@ -230,6 +292,7 @@ impl DxClusterClient {
 
         let status = self.status.clone();
         let recent_spots = self.recent_spots.clone();
+        let dropped_spots = self.dropped_spots.clone();
         let filter = self.config.filter_settings.clone();
         let callsign = self.config.callsign.clone();
 
@@ -252,19 +315,46 @@ impl DxClusterClient {
 
         // Spawn reader task
         tokio::spawn(async move {
-            let mut line = String::new();
+            let mut buf = Vec::with_capacity(256);
             let mut logged_in = false;
+            let mut warned_long_line = false;
 
             loop {
-                line.clear();
-                match reader.read_line(&mut line).await {
-                    Ok(0) => {
+                let read = match read_capped_line(&mut reader, &mut buf, MAX_CLUSTER_LINE_BYTES)
+                    .await
+                {
+                    Ok(CappedLine::Eof) => Ok(None),
+                    Ok(CappedLine::TooLong) => {
+                        if !warned_long_line {
+                            warned_long_line = true;
+                            warn!(
+                                "DX cluster sent a line longer than {MAX_CLUSTER_LINE_BYTES} bytes; discarding lines over that length"
+                            );
+                        } else {
+                            debug!(
+                                "Discarded a DX cluster line over {MAX_CLUSTER_LINE_BYTES} bytes"
+                            );
+                        }
+                        continue;
+                    }
+                    // Same outcome as `read_line` for an in-cap line that
+                    // is not UTF-8: the session ends with this error.
+                    Ok(CappedLine::Line) => std::str::from_utf8(&buf).map(Some).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "stream did not contain valid UTF-8",
+                        )
+                    }),
+                    Err(e) => Err(e),
+                };
+                match read {
+                    Ok(None) => {
                         warn!("DX cluster connection closed");
                         *status.lock().await = ConnectionStatus::Disconnected;
                         break;
                     }
-                    Ok(_) => {
-                        let line = line.trim();
+                    Ok(Some(text)) => {
+                        let line = text.trim();
                         if line.is_empty() {
                             continue;
                         }
@@ -278,8 +368,15 @@ impl DxClusterClient {
                                 || line.contains("Please enter your call")
                             {
                                 info!("Login prompt detected — sending callsign");
-                                if let Err(e) = login_cmd_tx.send(callsign.clone()) {
-                                    error!("Failed to send callsign for login: {}", e);
+                                // A repeated prompt needs no queued duplicates.
+                                match login_cmd_tx.try_send(callsign.clone()) {
+                                    Ok(()) => {}
+                                    Err(TrySendError::Full(_)) => {
+                                        debug!("Command queue full; dropping login reply");
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to send callsign for login: {}", e);
+                                    }
                                 }
                             } else if line.contains("Hello") || line.contains("Welcome") {
                                 logged_in = true;
@@ -300,8 +397,7 @@ impl DxClusterClient {
                                     )
                                     .await
                                     {
-                                        if spot_tx.send(dx_spot).is_err() {
-                                            warn!("Spot receiver dropped");
+                                        if !Self::queue_spot(&spot_tx, &dropped_spots, dx_spot) {
                                             break;
                                         }
                                     }
@@ -332,21 +428,26 @@ impl DxClusterClient {
         let _url = Url::parse(ws_url)
             .map_err(|e| DxError::Configuration(format!("Invalid WebSocket URL: {}", e)))?;
 
-        let (ws_stream, _response) = connect_async(ws_url)
+        // One cluster line per message, so the line limit is the message limit.
+        let ws_config = WebSocketConfig::default()
+            .max_message_size(Some(MAX_CLUSTER_LINE_BYTES))
+            .max_frame_size(Some(MAX_CLUSTER_LINE_BYTES));
+        let (ws_stream, _response) = connect_async_with_config(ws_url, Some(ws_config), false)
             .await
             .map_err(|e| DxError::ExternalService(format!("WebSocket connection failed: {}", e)))?;
 
         let (mut write, mut read) = ws_stream.split();
 
         // Create channels
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<String>();
-        let (spot_tx, spot_rx) = mpsc::unbounded_channel::<DxSpot>();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<String>(COMMAND_QUEUE_CAPACITY);
+        let (spot_tx, spot_rx) = mpsc::channel::<DxSpot>(SPOT_QUEUE_CAPACITY);
 
         self.command_sender = Some(cmd_tx);
         self.spot_receiver = Some(spot_rx);
 
         let status = self.status.clone();
         let recent_spots = self.recent_spots.clone();
+        let dropped_spots = self.dropped_spots.clone();
         let filter = self.config.filter_settings.clone();
 
         // Spawn writer task
@@ -377,8 +478,7 @@ impl DxClusterClient {
                                 Self::convert_cluster_spot(cluster_spot, &filter, &recent_spots)
                                     .await
                             {
-                                if spot_tx.send(dx_spot).is_err() {
-                                    warn!("Spot receiver dropped");
+                                if !Self::queue_spot(&spot_tx, &dropped_spots, dx_spot) {
                                     break;
                                 }
                             }
@@ -406,7 +506,7 @@ impl DxClusterClient {
     /// Login to cluster
     pub async fn login(&self) -> Result<()> {
         if let Some(sender) = &self.command_sender {
-            sender.send(self.config.callsign.clone()).map_err(|_| {
+            sender.try_send(self.config.callsign.clone()).map_err(|_| {
                 DxError::ExternalService("Failed to send login command".to_string())
             })?;
         }
@@ -417,7 +517,7 @@ impl DxClusterClient {
     pub async fn send_command(&self, command: &str) -> Result<()> {
         if let Some(sender) = &self.command_sender {
             sender
-                .send(command.to_string())
+                .try_send(command.to_string())
                 .map_err(|_| DxError::ExternalService("Failed to send command".to_string()))?;
             Ok(())
         } else {
@@ -495,7 +595,7 @@ impl DxClusterClient {
     /// Disconnect from cluster
     pub async fn disconnect(&mut self) {
         if let Some(sender) = &self.command_sender {
-            let _ = sender.send("BYE".to_string());
+            let _ = sender.try_send("BYE".to_string());
         }
 
         self.command_sender = None;
@@ -503,6 +603,28 @@ impl DxClusterClient {
         *self.status.lock().await = ConnectionStatus::Disconnected;
 
         info!("Disconnected from DX cluster");
+    }
+
+    /// Queue a spot for [`Self::receive_spot`] without waiting. When the queue
+    /// is full the new spot is dropped and counted, so the reader keeps
+    /// draining the connection. Returns `false` once the receiver is gone.
+    fn queue_spot(spot_tx: &mpsc::Sender<DxSpot>, dropped_spots: &AtomicU64, spot: DxSpot) -> bool {
+        match spot_tx.try_send(spot) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                let n = dropped_spots.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == 1 || n.is_multiple_of(1000) {
+                    warn!(
+                        "DX cluster spot queue full ({SPOT_QUEUE_CAPACITY}); dropped {n} new spot(s) so far"
+                    );
+                }
+                true
+            }
+            Err(TrySendError::Closed(_)) => {
+                warn!("Spot receiver dropped");
+                false
+            }
+        }
     }
 
     /// Parse cluster line into message
@@ -896,5 +1018,240 @@ mod tests {
         } else {
             panic!("Failed to parse login");
         }
+    }
+
+    async fn capped(reader: &mut BufReader<&[u8]>, buf: &mut Vec<u8>) -> CappedLine {
+        read_capped_line(reader, buf, 16).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn capped_line_keeps_lines_that_fit_including_crlf() {
+        let bytes = b"short\r\nexactly16bytes\r\n";
+        let mut reader = BufReader::new(&bytes[..]);
+        let mut buf = Vec::new();
+        assert_eq!(capped(&mut reader, &mut buf).await, CappedLine::Line);
+        assert_eq!(buf, b"short\r\n");
+        assert_eq!(capped(&mut reader, &mut buf).await, CappedLine::Line);
+        assert_eq!(buf, b"exactly16bytes\r\n");
+        assert_eq!(capped(&mut reader, &mut buf).await, CappedLine::Eof);
+    }
+
+    #[tokio::test]
+    async fn capped_line_discards_an_over_length_line_and_resyncs() {
+        let bytes = b"seventeen_bytes\r\nafter\r\n";
+        let mut reader = BufReader::new(&bytes[..]);
+        let mut buf = Vec::new();
+        assert_eq!(capped(&mut reader, &mut buf).await, CappedLine::TooLong);
+        assert!(buf.is_empty());
+        assert_eq!(capped(&mut reader, &mut buf).await, CappedLine::Line);
+        assert_eq!(buf, b"after\r\n");
+    }
+
+    #[tokio::test]
+    async fn capped_line_never_grows_past_max() {
+        let mut bytes = vec![b'x'; 1024 * 1024];
+        bytes.extend_from_slice(b"\r\nnext\r\n");
+        let mut reader = BufReader::new(&bytes[..]);
+        let mut buf = Vec::new();
+        assert_eq!(capped(&mut reader, &mut buf).await, CappedLine::TooLong);
+        assert!(buf.capacity() <= 64, "capacity {}", buf.capacity());
+        assert_eq!(capped(&mut reader, &mut buf).await, CappedLine::Line);
+        assert_eq!(buf, b"next\r\n");
+        assert!(buf.capacity() <= 64, "capacity {}", buf.capacity());
+    }
+
+    #[tokio::test]
+    async fn capped_line_returns_a_final_line_without_newline() {
+        let bytes = b"tail";
+        let mut reader = BufReader::new(&bytes[..]);
+        let mut buf = Vec::new();
+        assert_eq!(capped(&mut reader, &mut buf).await, CappedLine::Line);
+        assert_eq!(buf, b"tail");
+        assert_eq!(capped(&mut reader, &mut buf).await, CappedLine::Eof);
+    }
+
+    /// Client config pointed at a local mock cluster.
+    fn local_config(port: u16) -> ClusterConfig {
+        ClusterConfig {
+            hostname: "127.0.0.1".to_string(),
+            port,
+            callsign: "N0CALL".to_string(),
+            timeout_seconds: 5,
+            reconnect_delay_seconds: 1,
+            auto_reconnect: false,
+            filter_settings: ClusterFilter::default(),
+            use_websocket: false,
+            websocket_url: None,
+        }
+    }
+
+    /// Local plaintext "cluster" on a std thread: accepts one connection,
+    /// writes `Welcome\r\n` so the reader logs in, runs `script`, then holds
+    /// the socket open until the returned sender is dropped (test end).
+    fn serve_cluster<F>(script: F) -> (u16, std::sync::mpsc::Sender<()>)
+    where
+        F: FnOnce(&mut std::net::TcpStream) + Send + 'static,
+    {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (hold_tx, hold_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.write_all(b"Welcome\r\n");
+            script(&mut stream);
+            let _ = hold_rx.recv();
+        });
+        (port, hold_tx)
+    }
+
+    fn spot_line(call: &str, freq_khz: u32) -> String {
+        format!("DX de W1AW:     {freq_khz}.0  {call}        FT8 test     1234Z\r\n")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn telnet_reader_skips_an_over_length_line_and_keeps_reading() {
+        let (port, _hold) = serve_cluster(|stream| {
+            use std::io::Write;
+            let prefix = b"DX de W1AW:     14074.0  GIANT        FT8 ";
+            if stream.write_all(prefix).is_err() {
+                return;
+            }
+            let chunk = vec![b'x'; 64 * 1024];
+            let mut written = prefix.len();
+            while written < 8 * 1024 * 1024 {
+                if stream.write_all(&chunk).is_err() {
+                    return;
+                }
+                written += chunk.len();
+            }
+            let _ = stream.write_all(b" 1234Z\r\n");
+            let _ = stream.write_all(spot_line("K1ABC", 14074).as_bytes());
+        });
+
+        let mut client = DxClusterClient::with_config(local_config(port));
+        client.connect().await.unwrap();
+
+        let first = tokio::time::timeout(Duration::from_secs(5), client.receive_spot())
+            .await
+            .expect("a spot within 5 s")
+            .expect("spot channel open");
+        assert_eq!(first.callsign, "K1ABC");
+
+        let next = tokio::time::timeout(Duration::from_millis(300), client.receive_spot()).await;
+        if let Ok(Some(spot)) = next {
+            assert_ne!(spot.callsign, "GIANT");
+        }
+        assert_eq!(client.status().await, ConnectionStatus::Connected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn telnet_spot_queue_is_bounded_and_drops_new_spots() {
+        let total = SPOT_QUEUE_CAPACITY + 200;
+        let (port, _hold) = serve_cluster(move |stream| {
+            use std::io::Write;
+            let mut lines = String::new();
+            for i in 0..total {
+                lines.push_str(&spot_line(&format!("K{i:04}X"), 14_000 + i as u32));
+            }
+            let _ = stream.write_all(lines.as_bytes());
+        });
+
+        let mut client = DxClusterClient::with_config(local_config(port));
+        client.connect().await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while client.dropped_spot_count() < 200 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("200 spots dropped within 5 s");
+        assert_eq!(client.dropped_spot_count(), 200);
+
+        let mut received = Vec::new();
+        while let Ok(Some(spot)) =
+            tokio::time::timeout(Duration::from_millis(300), client.receive_spot()).await
+        {
+            received.push(spot.callsign);
+        }
+        assert_eq!(received.len(), SPOT_QUEUE_CAPACITY);
+        assert_eq!(received[0], "K0000X");
+        assert_eq!(client.dropped_spot_count(), 200);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_command_fails_fast_when_the_command_queue_is_full() {
+        // The mock never reads, so the writer task stalls once the socket
+        // buffers fill.
+        let (port, _hold) = serve_cluster(|_| {});
+
+        let mut client = DxClusterClient::with_config(local_config(port));
+        client.connect().await.unwrap();
+
+        let command = "x".repeat(64 * 1024);
+        let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+            for _ in 0..2_000 {
+                if let Err(e) = client.send_command(&command).await {
+                    return Some(e);
+                }
+                tokio::task::yield_now().await;
+            }
+            None
+        })
+        .await
+        .expect("send_command loop finished within 10 s");
+
+        let err = outcome.expect("a send_command call failed once the queue was full");
+        assert!(
+            err.to_string().contains("Failed to send command"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_branch_refuses_messages_over_the_line_limit() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let line = spot_line("K1ABC", 14074);
+            let _ = ws.send(Message::Text(line.trim_end().into())).await;
+            // Wait until the test has seen the spot, so `connect()` has
+            // already stored `Connected` before the large message arrives.
+            let _ = go_rx.await;
+            let _ = ws.send(Message::Text("x".repeat(1024 * 1024).into())).await;
+            std::future::pending::<()>().await;
+        });
+
+        let mut config = local_config(addr.port());
+        config.use_websocket = true;
+        config.websocket_url = Some(format!("ws://{addr}"));
+        let mut client = DxClusterClient::with_config(config);
+        client.connect().await.unwrap();
+
+        let spot = tokio::time::timeout(Duration::from_secs(5), client.receive_spot())
+            .await
+            .expect("a spot within 5 s")
+            .expect("spot channel open");
+        assert_eq!(spot.callsign, "K1ABC");
+        let _ = go_tx.send(());
+
+        let status = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let ConnectionStatus::Error(e) = client.status().await {
+                    return e;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("status became Error within 5 s");
+        assert!(
+            status.contains("Message too long"),
+            "unexpected error: {status}"
+        );
     }
 }

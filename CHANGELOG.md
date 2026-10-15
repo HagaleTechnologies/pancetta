@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- In-session clock-skew monitor (PAN-114): a live session (TUI or
+  `--headless`; never `--replay`/`--wav`) sends one SNTP query to
+  pool.ntp.org 30 s after start and then every 30 minutes, plus one re-check
+  after a detected clock step (never sooner than 30 minutes after the last
+  query, per the NTP pool's SNTP client terms). When the system clock is
+  0.3 s or more off UTC — FT8's decode margin — the title bar shows
+  `⚠ CLOCK 0.42s SLOW` (or `FAST`) in the alarm slot, after `AUDIO DEAD` and
+  `DECODER STUB`, and Diagnostics (Shift+D) plus the headless console log a
+  `clock.skew` Warn with the per-OS NTP fix. Sleep/wake and NTP steps log a
+  `clock.step` entry and clear the chip until the next reading.
+  `pancetta doctor` now reports WARN (exit code unchanged) for offsets from
+  0.3 s to under 1.0 s, which it used to PASS.
+
 - Adaptive TX-offset switching (PAN-72): in `AUTO` TX-frequency mode, an
   in-progress QSO that goes `[autonomous] qso_stall_switch_after` slots (default
   4) without the DX advancing — **silence now counts, not just a repeated
@@ -86,6 +99,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   other window now start only as slots free up, oldest first, instead of all
   at once. To work several QSOs at the same time, raise `max_concurrent_qsos`.
 
+- Turning Fox mode off (Shift+X) no longer cuts the Hound contacts already in
+  progress down to one transmitted stream; they keep transmitting until they
+  finish, while new QSOs wait for the normal `max_concurrent_qsos` limit
+  (PAN-76).
+
+- Narrow terminals keep the station state that matters (PAN-88). At 80×24
+  and 100×30 the title bar now always shows the UTC clock, callsign and TX
+  policy, and drops lower-priority chips in a documented order instead of
+  pushing the clock off the right edge. DX Hunter and Callers hide
+  lower-priority columns instead of cutting headings to single letters
+  (`G S R R L P`). The footer key hints fit at 80 columns, and `?` help
+  scrolls (↑/↓, PgUp/PgDn, Home/End) and always names `Shift+Q`. Nothing
+  changes at sizes where everything already fit.
+
+- A QSO whose frame the TX worker drops before it reaches the air (concurrent-QSO cap, F8 abort, supersede, arm or mute refusal) no longer spends a call from its keep-calling budget, advances the stall detector toward a TX-offset switch, or shows the unsent frame as sent (PAN-75).
+
+- Ctrl/Alt chords no longer trigger transmit keys at the main view (PAN-112).
+  Ctrl+C previously started a CQ because crossterm reports it as `c` with a
+  separate modifier. The same guard now covers PTT, autonomous mode, TX policy,
+  re-send, the `u` offset nudge (which re-keys the current frame in Auto
+  TX-frequency mode), Space-to-call, tune, Fox and Hound, plus Enter-to-reply
+  on Callers where the terminal reports the modifier (legacy Unix terminals
+  send Ctrl+Enter as a plain Enter). Bare and Shift bindings still work.
+
+- Slot timing stays on UTC across clock steps and sleep/wake (PAN-114). After
+  a backward clock step (e.g. NTP correcting a fast RTC), the autonomous
+  scheduler and the decoder re-anchor to the UTC slot grid within one slot
+  instead of stalling for the size of the step (a 10-minute step meant 10
+  minutes with no decisions and no decodes). A frame waiting for PTT across a
+  clock jump is dropped with a `tx.policy` "dropping stale TX after a … clock
+  jump" entry instead of being keyed seconds late, holding PTT for the length
+  of the step, or being skipped as an "internal scheduling error"; PTT is
+  never held more than `ptt_lead_ms` + 1 s before the slot boundary. After
+  sleep/wake, decodes and audio from before the sleep are discarded rather
+  than answered or spotted.
+
 - Autonomous and manual TX no longer key the rig while the rig's CAT link is
   lost or the audio output device has stopped delivering samples (PAN-115).
   The TX gate reports `rig is disconnected` (after 5 s of failed rig polls) or
@@ -141,6 +190,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `pancetta-config/examples/config.toml`: unreferenced, did not parse, and
   duplicated the generated, drift-tested `pancetta-config/defaults.toml`.
+
+### Security
+
+- Local gateway: clients must now authenticate with the configured `[network.remote_gateway].auth_token` (sent as `hello.gatewayToken`) before receiving any station data; browser origins must be listed in `allowed_origins`, and a non-loopback `bind_addr` requires `allow_network_exposure = true`. Enabling the gateway now requires `auth_token` (PAN-99).
+- Station agent: a remote client must now prove its device identity inside the encrypted handshake, and it receives station data only after a valid `hello`; clients must be updated to connect (PAN-95).
+- Station agent: remote clients' authority is now re-checked on every use, and an authorization refresh applies to already-connected clients immediately (PAN-96).
+- Remote-TX consent is now tracked per channel: `[network.station_agent].remote_tx_enabled` alone governs arming, TX requests and transmission over the station agent, and `[network.wsjtx_udp].allow_tx_initiation` governs only WSJT-X UDP Reply-initiated TX. With `remote_tx_enabled = false` nothing can arm, so Reply-initiated QSOs no longer transmit; set `remote_tx_enabled = true` to allow remote TX (PAN-98).
+- Network errors from the QRZ XML lookup and LoTW clients no longer carry account credentials or session keys into log lines or error messages (PAN-100).
+- Responses from cqdx.io, QRZ, the online logbooks, the DX cluster and the station-agent relay are now read within fixed size limits (PAN-101).
+- Release workflow: every GitHub Action is pinned to a full commit SHA, and only the job that creates the draft release can write to the repository (PAN-106).
 
 ## [0.9.6] - 2026-09-02
 

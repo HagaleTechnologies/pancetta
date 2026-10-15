@@ -62,6 +62,13 @@ arrive in bursts at the end of each 15-second slot — within two slots the
 again, then `Shift+D` (diagnostics history) and `Shift+S` (station health)
 inside the TUI.
 
+**Terminal size.** Pancetta lays out its panels from 80×20; 80×24 is the
+smallest size it's tested at. Below about 120 columns the title bar keeps
+the UTC clock, callsign and TX policy, and drops lower-priority chips
+(app name, grid, decode timing) first. DX Hunter and Callers show fewer
+columns in narrow panels — call, entity/message and SNR always stay. `?`
+help scrolls with ↑/↓ when it doesn't fit.
+
 That's the whole path. With a rig configured you are now one keypress from
 transmitting.
 
@@ -282,7 +289,17 @@ Miss any one of the three and the double-click is refused (and logged —
 `remote.wsjtx`). Two more gates apply but aren't config toggles — the
 `Reply` must match a CQ decode pancetta itself sent, and the TX policy
 must permit initiation — so if the three above are all set correctly and
-a double-click is still refused, check those next. For a unicast `destination` the peer host is inferred
+a double-click is still refused, check those next.
+
+Those three settings only get the QSO **created**. Before anything keys
+the air, the frame also has to pass the shared remote-TX arm gate, and
+arming is exclusively a station-agent-channel act: it needs
+`[network.station_agent].remote_tx_enabled = true` and a paired,
+TX-arm-eligible remote client that has armed and keeps heartbeating
+(the arm drops ~30 s after the client goes silent). With no live arm,
+the double-click still creates the QSO but every transmission it asks
+for is dropped and audited `not-armed` — the WSJT-X settings alone
+never put a signal on the air. For a unicast `destination` the peer host is inferred
 automatically, so `allowed_request_hosts` isn't needed in that case —
 but `accept_udp_requests` and `allow_tx_initiation` are still both
 required. GridTracker's "Halt TX" button (`HaltTx`) is always honored

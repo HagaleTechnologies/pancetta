@@ -324,6 +324,11 @@ pub struct PipelineHealth {
     /// Total top-level process panics caught this session (already existed
     /// as `PANIC_COUNT` in `main.rs`; not previously surfaced to the TUI).
     pub wdt_panic_count: u64,
+    /// PAN-114: `Some(offset_s)` only while the coordinator's clock-skew
+    /// monitor is warning (|offset| ≥ 0.3 s vs pool.ntp.org); `None` while
+    /// the first probe is pending, the server is unreachable, or the clock
+    /// is in spec. Positive = local clock behind UTC (SLOW).
+    pub clock_skew_warning_s: Option<f64>,
 }
 
 /// Per-QSO entry for the QSO-detail panel. Batch 94: populated live
@@ -1392,6 +1397,10 @@ pub struct App {
 
     // Help overlay
     pub help_visible: bool,
+    /// PAN-88: first visible body line of the `?` overlay (rendered lines,
+    /// after wrapping). Reset to 0 every time the overlay opens; clamped by
+    /// the key handler and again by the renderer.
+    pub help_scroll: u16,
 
     /// True while the operator-confirm-quit modal is visible. `q` opens
     /// it; `y`/`Enter` confirms (sends `TuiCommand::Quit`); `n`/`Esc`/`q`
@@ -1656,6 +1665,7 @@ impl App {
             device_selection: DeviceSelectionState::new(),
             rig_selection: RigSelectionState::new(),
             help_visible: false,
+            help_scroll: 0,
             quit_confirm_visible: false,
             freq_modal: FreqModalState::default(),
             offset_modal: OffsetModalState::default(),
@@ -3246,6 +3256,7 @@ impl App {
     pub fn toggle_help(&mut self) {
         self.help_visible = !self.help_visible;
         if self.help_visible {
+            self.help_scroll = 0;
             self.status_message = "Help — press Escape or ? to close".to_string();
         } else {
             self.status_message = "Pancetta TUI Ready".to_string();

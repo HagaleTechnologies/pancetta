@@ -17,6 +17,13 @@
 //!
 //! Error handling: a terminal `error` stops the session and surfaces; a
 //! transient `error` is ignored (keep waiting). The dial/reconnect loop is P3.4.
+//!
+//! **Not the production path.** This single-peer reference does NOT bind the
+//! client's identity to its Noise static key: it reads no client identity
+//! proof from msg1, so its notion of "the client" is only the relay's label.
+//! The station agent drives [`crate::multi_session::MultiPeerSession`], which
+//! verifies the msg1 identity proof before establishing a peer (PAN-95). Do
+//! not route production traffic through `AgentSession`.
 
 use crate::keys::AgentIdentity;
 use crate::noise::{NoiseTransport, ResponderHandshake};

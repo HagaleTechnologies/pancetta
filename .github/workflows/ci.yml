@@ -22,22 +22,11 @@ on:
   # report on its own synthetic SHA, or it sits pending until the queue's check-response
   # timeout and gets dequeued.
   #
-  # Job-level changes WERE needed (Codex P1, this rollout's own review): the `changes` job
-  # (line ~107) only triggers its diff-filter step on push/pull_request, so its `code`
-  # output is empty on merge_group -- every downstream job gated on
-  # `needs.changes.outputs.code == 'true'` would then skip, and this file's own aggregator
-  # (bottom of file) treats "skipped" as passing, meaning a merge-group entry could
-  # previously report a fully green "CI" check having run NOTHING at all: no clippy, no
-  # fmt, no tests, no cargo-deny -- exactly the integration-only failure a merge queue
-  # exists to catch. Each real lane's own `if:` now also runs unconditionally on
-  # `merge_group` (not diff-gated there), since a merge-group entry represents a genuine
-  # integration point against the current tip of main and always warrants a full check,
-  # not a cost-optimized diff. `cross-platform-check` is deliberately NOT included in this
-  # -- it already only ran for `pull_request` even on a push to main (its own existing
-  # `if:`), a pre-existing PR-review-time-only lane this change doesn't alter.
-  # `codex-clean` also correctly stays `pull_request`-only: a merge-group entry's
-  # constituent PR already passed a real Codex review during its own PR phase, and there's
-  # no PR to review against a synthetic integration commit.
+  # Merge groups run every Rust lane unless their cumulative diff is non-empty and
+  # entirely under research/notes/. Detect Code Changes uses a narrow allowlist and
+  # fails closed. A notes-only group cannot change the Rust tree, so running Cargo
+  # Deny there would only re-test main and could eject a note for an unrelated advisory.
+  # cross-platform-check and codex-clean retain their PR-time behavior.
   merge_group:
     types: [checks_requested]
 
@@ -103,6 +92,8 @@ env:
 #     that traffic doesn't spend CI minutes while the required `CI` check
 #     still always runs and reports (see the `on:` comment above for why this
 #     replaced top-level `paths:` filtering).
+#   - merge_group: all five Rust lanes, except research/notes-only groups.
+#     A failed scope detector runs every lane.
 #   - cross-platform-check: PR + schedule + dispatch only (macos runners ~10x
 #     cost; not worth gating every main push), same code-changed gate.
 
@@ -115,6 +106,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      merge_group_notes_only: ${{ steps.merge-group-scope.outputs.notes_only }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -133,7 +125,34 @@ jobs:
               - '**/*.rs'
               - '**/Cargo.toml'
               - '**/Cargo.lock'
+              - 'rust-toolchain.toml'
               - '.github/workflows/ci.yml'
+
+      # PAN-172: a merge group whose cumulative diff (base_sha..head_sha covers every PR
+      # ahead in the queue plus this one) touches nothing outside research/notes/ has a
+      # Rust tree byte-identical to main's tip -- running the Rust lanes there can only
+      # re-test main, and a RustSec advisory published since main's last run then ejects a
+      # note that cannot have caused it (#396). Narrow allowlist, not the PR-time `code`
+      # filter: that filter misses deny.toml, rust-toolchain.toml and vendored C sources.
+      # --no-renames: a rename is otherwise reported only by its destination, so a .rs file
+      # moved into research/notes/ would read as notes-only. Fails closed: if this step
+      # fails or prints nothing, the lanes' `!= 'true'` check runs them.
+      - name: Detect a research-notes-only merge group
+        id: merge-group-scope
+        if: github.event_name == 'merge_group'
+        env:
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          changed=$(git -c core.quotePath=false diff --name-only --no-renames "$BASE_SHA" "$HEAD_SHA")
+          if [ -n "$changed" ] && ! grep -qv '^research/notes/' <<< "$changed"; then
+            notes_only=true
+          else
+            notes_only=false
+          fi
+          echo "notes_only=$notes_only" >> "$GITHUB_OUTPUT"
+          printf 'merge group %s..%s notes_only=%s\n%s\n' "$BASE_SHA" "$HEAD_SHA" "$notes_only" "$changed"
 
   # codex-clean gate: defers the heavier lanes below (ft8-tests,
   # workspace-check, cross-platform-check, deny) until wait-for-codex.yml
@@ -280,6 +299,47 @@ jobs:
           echo "::error::$target never appeared within the gate's timeout budget -- this revision's Codex round either hasn't converged or the label failed to apply. See wait-for-codex.yml's own run for this SHA."
           exit 1
 
+  # PAN-172: the weekly research-scan routine must not ship AI trailers (fleet rule).
+  # Scoped by title so no other PR -- including harness-driven PRs that add their own
+  # attribution -- is affected. Feeds the required `CI` aggregator below.
+  scan-trailers:
+    name: Research scan commit trailers
+    if: github.event_name == 'pull_request' && startsWith(github.event.pull_request.title, 'Weekly research scan ')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - name: Reject Co-Authored-By and Claude-Session trailers
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          bad=0
+          commits=$(git rev-list "$BASE_SHA..$HEAD_SHA")
+          for c in $commits; do
+            if git log -1 --format=%B "$c" | grep -iE '^[[:space:]]*(co-authored-by|claude-session):' >/dev/null; then
+              echo "::error::Commit $(git rev-parse --short "$c") ($(git log -1 --format=%s "$c")) carries a Co-Authored-By or Claude-Session line. Reword it without the trailer and force-push."
+              bad=1
+            fi
+          done
+          exit "$bad"
+
+  # These tests run on the workflow and scripts that ship, including on docs-only PRs.
+  research-scan-tests:
+    name: Research scan automation tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Test research-scan automation offline
+        run: |
+          set -euo pipefail
+          for test in scripts/ci/test-ci-*.sh scripts/ci/research-scan-shepherd/test*.sh; do
+            bash "$test"
+          done
+          shellcheck -s bash scripts/ci/*.sh scripts/ci/research-scan-shepherd/*.sh scripts/ci/research-scan-shepherd/stub/gh scripts/ci/research-scan-shepherd/stub/date
+
   # Fast checks — run on every push and PR (~2 min)
   clippy:
     name: Clippy
@@ -291,7 +351,7 @@ jobs:
     # checkout failure) would silently skip this job too, and the aggregator's own
     # `needs.*.result` check doesn't reject "skipped" -- a merge-group entry could report a
     # fully green "CI" with Clippy never having run.
-    if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group')
+    if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'merge_group' && needs.changes.outputs.merge_group_notes_only != 'true'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -319,7 +379,7 @@ jobs:
     name: Format
     needs: changes
     # always() is load-bearing -- see clippy's own comment above, same reasoning applies here.
-    if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group')
+    if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'merge_group' && needs.changes.outputs.merge_group_notes_only != 'true'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -344,7 +404,7 @@ jobs:
     # even though the `changes` condition below explicitly allows it. The
     # `changes`-gate itself is untouched -- that's a real, intentional skip
     # unrelated to codex-clean.
-    if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group')
+    if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'merge_group' && needs.changes.outputs.merge_group_notes_only != 'true'))
     runs-on: ubuntu-latest
     steps:
       # Explicit first step, not a richer `if:`: a bare
@@ -388,7 +448,7 @@ jobs:
     name: Workspace Check
     needs: [changes, codex-clean]
     # See ft8-tests's own comment above for why always() is load-bearing.
-    if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group')
+    if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'merge_group' && needs.changes.outputs.merge_group_notes_only != 'true'))
     runs-on: ubuntu-latest
     env:
       # This lane links the whole workspace THREE times (check, examples,
@@ -497,6 +557,8 @@ jobs:
       - name: Check workspace (default members)
         run: cargo check
 
+  # PAN-172: advisories still run on code PRs, pushes and the weekly schedule.
+  # Only research-notes-only merge groups skip this integration lane.
   # cargo-deny enforces license whitelist, banned-crate-source policy,
   # multi-version warnings, AND RustSec advisories — the latter subsumes
   # what cargo-audit would do separately. Single source of truth in
@@ -506,7 +568,7 @@ jobs:
     name: Cargo Deny
     needs: [changes, codex-clean]
     # See ft8-tests's own comment above for why always() is load-bearing.
-    if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group')
+    if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'merge_group' && needs.changes.outputs.merge_group_notes_only != 'true'))
     runs-on: ubuntu-latest
     steps:
       # See ft8-tests's own comment above for why this explicit step exists
@@ -533,7 +595,7 @@ jobs:
     # failure|cancelled grep below wouldn't otherwise catch on its own --
     # codex-clean's own result flows into the SAME toJSON(needs.*.result)
     # string via this needs: entry, so a real gate failure still fails CI.
-    needs: [clippy, fmt, ft8-tests, workspace-check, deny, codex-clean]
+    needs: [clippy, fmt, ft8-tests, workspace-check, deny, codex-clean, scan-trailers, research-scan-tests]
     runs-on: ubuntu-latest
     if: always()
     steps:

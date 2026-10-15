@@ -561,6 +561,157 @@ async fn interruptible_sleep(
     false
 }
 
+/// PAN-114 (lane5 H-16): one evaluation of the pre-PTT wait, re-derived
+/// from a fresh wall-clock read each chunk. The old single monotonic sleep
+/// keyed a frame 4.5 s into its waveform after a 5 s forward jump, and held
+/// PTT 600 s after a 600 s backward step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PttWaitStep {
+    Sleep(Duration),
+    Reached,
+    ClockJumped(pancetta_core::slot_clock::WallClockJump),
+}
+
+/// Pure decision behind [`wait_for_ptt_instant`]. Drops the frame only if
+/// (a) the PTT instant is now more than two periods away (a backward step:
+/// `schedule_tx` never targets further ahead than that), or (b) the wait
+/// started before the PTT instant and `now` is more than `late_max_ms` past
+/// `target_slot` (a forward jump past the late-start policy). A request that
+/// was already late when the wait began keeps today's path exactly.
+fn ptt_wait_step(
+    now: chrono::DateTime<chrono::Utc>,
+    ptt_target: chrono::DateTime<chrono::Utc>,
+    target_slot: chrono::DateTime<chrono::Utc>,
+    waited_from_before_target: bool,
+    late_max_ms: u64,
+    slot_ns: i64,
+) -> PttWaitStep {
+    use pancetta_core::slot_clock::WallClockJump;
+    let remaining = ptt_target - now;
+    // schedule_tx never targets more than two slots ahead.
+    if remaining > chrono::Duration::nanoseconds(2 * slot_ns) {
+        return PttWaitStep::ClockJumped(WallClockJump::Backward(remaining));
+    }
+    if remaining > chrono::Duration::zero() {
+        let chunk = remaining
+            .to_std()
+            .unwrap_or(Duration::ZERO)
+            .min(Duration::from_millis(50));
+        return PttWaitStep::Sleep(chunk);
+    }
+    if waited_from_before_target
+        && now - target_slot > chrono::Duration::milliseconds(late_max_ms as i64)
+    {
+        return PttWaitStep::ClockJumped(WallClockJump::Forward(now - ptt_target));
+    }
+    PttWaitStep::Reached
+}
+
+/// Outcome of [`wait_for_ptt_instant`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PttWait {
+    /// The wall clock reached the PTT instant (or the frame ships as a
+    /// policy late start).
+    Reached,
+    /// Shutdown or F8 abort flipped; same caller handling as
+    /// `interruptible_sleep` returning `true`.
+    Interrupted,
+    /// A wall-clock jump moved the PTT instant out of reach; drop the frame.
+    ClockJumped(pancetta_core::slot_clock::WallClockJump),
+}
+
+/// PAN-114: wait for the PTT engage instant on the WALL clock (re-read via
+/// `wall_now` every <= 50 ms chunk) instead of one monotonic sleep computed
+/// up front. Checks `shutdown`/`abort` before each evaluation, exactly like
+/// [`interruptible_sleep`], so wake latency stays ~50 ms. With no clock
+/// jump this returns `Reached` at the same wall instant the old monotonic
+/// sleep ended.
+async fn wait_for_ptt_instant(
+    ptt_target: chrono::DateTime<chrono::Utc>,
+    target_slot: chrono::DateTime<chrono::Utc>,
+    late_max_ms: u64,
+    slot_ns: i64,
+    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    abort: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    wall_now: impl Fn() -> chrono::DateTime<chrono::Utc>,
+) -> PttWait {
+    use std::sync::atomic::Ordering;
+    let mut waited_from_before_target: Option<bool> = None;
+    loop {
+        if shutdown.load(Ordering::Acquire) || abort.load(Ordering::Acquire) {
+            return PttWait::Interrupted;
+        }
+        let now = wall_now();
+        let waited = *waited_from_before_target.get_or_insert(ptt_target > now);
+        match ptt_wait_step(now, ptt_target, target_slot, waited, late_max_ms, slot_ns) {
+            PttWaitStep::Sleep(chunk) => sleep(chunk).await,
+            PttWaitStep::Reached => return PttWait::Reached,
+            PttWaitStep::ClockJumped(jump) => return PttWait::ClockJumped(jump),
+        }
+    }
+}
+
+/// PAN-114 (D6): slack over `ptt_lead_ms` allowed between PTT-on (Step 5)
+/// and the slot boundary (Step 6) before the hold is treated as a clock step.
+const PTT_HOLD_SLACK_MS: u64 = 1000;
+
+/// `true` when Step 6 would hold PTT keyed (for `hold`, the Step 6
+/// `to_slot`) longer than `ptt_lead_ms` + [`PTT_HOLD_SLACK_MS`]. Nothing
+/// between Step 4 and Step 6 reassigns the schedule, so after a normal
+/// Step 4 the hold is <= `ptt_lead_ms`; anything past the bound means the
+/// wall clock stepped back in between.
+fn ptt_hold_exceeds_bound(hold: Duration, ptt_lead_ms: u64) -> bool {
+    hold > Duration::from_millis(ptt_lead_ms + PTT_HOLD_SLACK_MS)
+}
+
+/// PAN-114 (D7): drop frame(s) a wall-clock jump made unsendable. Mirrors
+/// the neighbouring stale-TX drops: one `tx.policy` tracing line and Warn
+/// diagnostic per frame (text starts "dropping stale TX" so it counts in the
+/// TUI's TX-drops tally), clear the TX strip, then one failed
+/// `TransmitComplete` per frame (via `report_transmit_complete`) so a
+/// tracked self-CQ rolls back and the QSO engine reverses the frame's
+/// keep-call accounting (PAN-75) while the attempt is still inside its
+/// four-slot rollback window; a longer forward jump leaves it counted.
+/// Callers that hold PTT must release it BEFORE calling this (it awaits).
+async fn drop_frames_for_clock_jump(
+    message_bus: &MessageBus,
+    frames: &[(String, Option<String>)],
+    jump: pancetta_core::slot_clock::WallClockJump,
+    pivot_replaced: &mut PivotReplaced,
+) {
+    let secs = jump.signed_secs();
+    for (message_text, qso_id) in frames {
+        warn!(
+            target: "pancetta::tx.policy",
+            "dropping stale TX for QSO {} after a {secs:+.1} s clock jump: '{message_text}' — next frame uses the current UTC slot",
+            qso_id.as_deref().unwrap_or("-")
+        );
+        emit_diagnostic(
+            message_bus,
+            "tx.policy",
+            pancetta_core::DiagnosticLevel::Warn,
+            format!(
+                "dropping stale TX after a {secs:+.1} s clock jump: '{message_text}' — next frame uses the current UTC slot"
+            ),
+            qso_id.as_deref(),
+        )
+        .await;
+    }
+    send_tx_queue_status(message_bus, None, Vec::new()).await;
+    for (message_text, qso_id) in frames {
+        if let Err(e) = report_unaired_frame(
+            message_bus,
+            message_text.clone(),
+            qso_id.clone(),
+            take_bundle_replaced(pivot_replaced, qso_id.as_deref()),
+        )
+        .await
+        {
+            warn!("Failed to send TransmitComplete: {}", e);
+        }
+    }
+}
+
 /// Outcome of `interruptible_sleep_or_supersede`.
 ///
 /// Deliberately does NOT derive `PartialEq`/`Eq`: `Superseded` carries the
@@ -737,11 +888,7 @@ async fn interruptible_sleep_or_supersede(
             // heartbeat-lost, TTL-expired, or local-kill) must stop a
             // transmission ALREADY keyed, not just block the next one.
             if let Some((arm, client_key_id)) = remote_tx_arm {
-                if !remote_tx_permitted_for(
-                    arm,
-                    chrono::Utc::now().timestamp_millis(),
-                    client_key_id,
-                ) {
+                if !remote_tx_permitted_for(arm, pancetta_agent::arm::ArmTime::now, client_key_id) {
                     return Some(SleepOutcome::AbortedByDisarm(std::mem::take(siphoned)));
                 }
             }
@@ -1040,17 +1187,24 @@ mod interruptible_sleep_tests {
 
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut st = pancetta_agent::arm::ArmState::new();
+        st.set_channel_consent(
+            pancetta_agent::arm::ConsentChannel::StationAgent,
+            true,
+            now_ms,
+        );
+        st.set_channel_consent(pancetta_agent::arm::ConsentChannel::WsjtxUdp, true, now_ms);
         st.arm(
             pancetta_agent::arm::VerifiedArmGrant {
                 operator_callsign: "K5ARH".to_string(),
                 ttl_ms: 120_000,
+                armed_until_ms: now_ms + 120_000,
+                heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "disarm-preserves-siphoned-jti".to_string(),
                 client_key_id: "client-a".to_string(),
             },
-            now_ms,
+            pancetta_agent::arm::ArmTime::now(),
         );
-        st.set_local_consent(true, now_ms);
         let arm = Arc::new(std::sync::Mutex::new(st));
 
         let arm_clone = arm.clone();
@@ -1133,17 +1287,24 @@ mod interruptible_sleep_tests {
 
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut st = pancetta_agent::arm::ArmState::new();
+        st.set_channel_consent(
+            pancetta_agent::arm::ConsentChannel::StationAgent,
+            true,
+            now_ms,
+        );
+        st.set_channel_consent(pancetta_agent::arm::ConsentChannel::WsjtxUdp, true, now_ms);
         st.arm(
             pancetta_agent::arm::VerifiedArmGrant {
                 operator_callsign: "K5ARH".to_string(),
                 ttl_ms: 120_000,
+                armed_until_ms: now_ms + 120_000,
+                heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "disarm-preserves-fifo-jti".to_string(),
                 client_key_id: "client-a".to_string(),
             },
-            now_ms,
+            pancetta_agent::arm::ArmTime::now(),
         );
-        st.set_local_consent(true, now_ms);
         let arm = Arc::new(std::sync::Mutex::new(st));
 
         // Newer message: arrives at ~10ms, after the pre-sleep poll already
@@ -1279,17 +1440,24 @@ mod interruptible_sleep_tests {
 
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut st = pancetta_agent::arm::ArmState::new();
+        st.set_channel_consent(
+            pancetta_agent::arm::ConsentChannel::StationAgent,
+            true,
+            now_ms,
+        );
+        st.set_channel_consent(pancetta_agent::arm::ConsentChannel::WsjtxUdp, true, now_ms);
         st.arm(
             pancetta_agent::arm::VerifiedArmGrant {
                 operator_callsign: "K5ARH".to_string(),
                 ttl_ms: 120_000,
+                armed_until_ms: now_ms + 120_000,
+                heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "disarm-mid-sleep-jti".to_string(),
                 client_key_id: "client-a".to_string(),
             },
-            now_ms,
+            pancetta_agent::arm::ArmTime::now(),
         );
-        st.set_local_consent(true, now_ms);
         let arm = Arc::new(std::sync::Mutex::new(st));
 
         let arm_clone = arm.clone();
@@ -2155,6 +2323,162 @@ async fn send_tx_queue_status(
     }
 }
 
+/// Report every TX outcome to Autonomous, preserving its self-CQ correlation.
+/// PAN-75 also mirrors failed QSO frames to the QSO engine, which reverses
+/// their keep-call accounting. Covers cap truncation, F8, supersede, denial,
+/// hard mute, PAN-141 hold, PAN-114 clock-jump drops, and encode/PTT failure
+/// through the same path.
+/// Shutdown branches deliberately send nothing: the QSO loop stops on the
+/// same flag and its in-memory accounting is discarded at exit.
+/// Returns the Autonomous send result to preserve callers' error handling.
+async fn report_transmit_complete(
+    message_bus: &MessageBus,
+    success: bool,
+    message_text: String,
+    duration_ms: u64,
+    qso_id: Option<String>,
+) -> Result<()> {
+    let not_sent = (!success)
+        .then(|| qso_id.clone())
+        .flatten()
+        .map(|id| (id, message_text.clone()));
+    let result = report_transmit_complete_to_autonomous(
+        message_bus,
+        success,
+        message_text,
+        duration_ms,
+        qso_id,
+    )
+    .await;
+    if let Some((qso_id, message_text)) = not_sent {
+        report_frame_not_sent(message_bus, qso_id, message_text, None).await;
+    }
+    result
+}
+
+/// Pivot sources cleared from a refused frame or bundle, keyed by
+/// `active_tx_qso_key` (PAN-75).
+type PivotReplaced =
+    std::collections::HashMap<String, (String, pancetta_qso::UnsentAttemptPayload)>;
+
+/// A bundle refused before it aired: clear the tombstones its Step 4b pivot
+/// inserted and return the frames those pivots replaced, so each item's
+/// failure rolls back the replaced frame (see [`report_unaired_frame`]).
+fn unwind_bundle_pivots(
+    keys: &[String],
+    pivoted_once: &mut std::collections::HashMap<String, (String, f64)>,
+    pivoted_from: &mut PivotReplaced,
+) -> PivotReplaced {
+    keys.iter()
+        .filter_map(|key| {
+            pivoted_once.remove(key);
+            pivoted_from
+                .remove(key)
+                .map(|replaced| (key.clone(), replaced))
+        })
+        .collect()
+}
+
+/// The replaced frame recorded for `qso_id`'s pivot, if any.
+fn take_bundle_replaced(
+    replaced: &mut PivotReplaced,
+    qso_id: Option<&str>,
+) -> Option<(String, pancetta_qso::UnsentAttemptPayload)> {
+    qso_id.and_then(|id| replaced.remove(&super::active_tx_qso_key(id)))
+}
+
+/// A frame that never aired after Step 4c may have pivoted to it. Then the
+/// request that produced `message_text` is still queued and accounts for
+/// itself, so the QSO engine instead rolls back the frame the pivot
+/// replaced (`pivot_replaced`), which never aired either (PAN-75).
+/// Autonomous gets the usual failed completion either way (follow-up:
+/// PAN-185).
+async fn report_unaired_frame(
+    message_bus: &MessageBus,
+    message_text: String,
+    qso_id: Option<String>,
+    pivot_replaced: Option<(String, pancetta_qso::UnsentAttemptPayload)>,
+) -> Result<()> {
+    if pivot_replaced.is_none() {
+        return report_transmit_complete(message_bus, false, message_text, 0, qso_id).await;
+    }
+    let result =
+        report_transmit_complete_to_autonomous(message_bus, false, message_text, 0, qso_id.clone())
+            .await;
+    if let (Some(qso_id), Some((replaced_text, replaced))) = (qso_id, pivot_replaced) {
+        report_frame_not_sent(message_bus, qso_id, replaced_text, Some(replaced)).await;
+    }
+    result
+}
+
+/// PAN-75: tell the QSO engine `message_text` never aired for `qso_id`.
+/// `replaced` carries the payload of a frame a pivot replaced.
+async fn report_frame_not_sent(
+    message_bus: &MessageBus,
+    qso_id: String,
+    message_text: String,
+    replaced: Option<pancetta_qso::UnsentAttemptPayload>,
+) {
+    let _ = message_bus
+        .send_message(ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Qso,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent {
+                qso_id,
+                message_text,
+                replaced,
+            }),
+            Instant::now(),
+        ))
+        .await;
+}
+
+/// Step 0-dup: this request's payload already aired through an earlier
+/// request's pivot. Autonomous gets the usual failed completion. The QSO
+/// engine keeps this request's attempt and instead rolls back the frame the
+/// pivot replaced (`pivoted_from`: its text and payload), which never aired
+/// as itself (PAN-75). The payload tells the two apart when the pivot changed
+/// only the offset or the remote binding.
+async fn report_pivot_duplicate_dropped(
+    message_bus: &MessageBus,
+    message_text: String,
+    qso_id: Option<String>,
+    pivoted_from: Option<(String, pancetta_qso::UnsentAttemptPayload)>,
+) {
+    if let Err(e) =
+        report_transmit_complete_to_autonomous(message_bus, false, message_text, 0, qso_id.clone())
+            .await
+    {
+        warn!("Failed to send TransmitComplete: {}", e);
+    }
+    if let (Some(qso_id), Some((pivoted_from_text, replaced))) = (qso_id, pivoted_from) {
+        report_frame_not_sent(message_bus, qso_id, pivoted_from_text, Some(replaced)).await;
+    }
+}
+
+/// The Autonomous half of [`report_transmit_complete`] alone.
+async fn report_transmit_complete_to_autonomous(
+    message_bus: &MessageBus,
+    success: bool,
+    message_text: String,
+    duration_ms: u64,
+    qso_id: Option<String>,
+) -> Result<()> {
+    message_bus
+        .send_message(ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Autonomous,
+            MessageType::TransmitComplete {
+                success,
+                message_text,
+                duration_ms,
+                qso_id,
+            },
+            Instant::now(),
+        ))
+        .await
+}
+
 /// PAN-38 round 4 (Codex): report a failed `TransmitComplete` for a
 /// single-item `TransmitRequest` that's being abandoned before it was ever
 /// sent to the radio (operator F8 abort, shutdown-adjacent abandonment,
@@ -2174,18 +2498,10 @@ async fn emit_failed_transmit_complete_for_request(
         ..
     } = message_type
     {
-        let complete_msg = ComponentMessage::new(
-            ComponentId::Ft8Transmitter,
-            ComponentId::Autonomous,
-            MessageType::TransmitComplete {
-                success: false,
-                message_text: message_text.clone(),
-                duration_ms: 0,
-                qso_id: qso_id.clone(),
-            },
-            Instant::now(),
-        );
-        if let Err(e) = message_bus.send_message(complete_msg).await {
+        if let Err(e) =
+            report_transmit_complete(message_bus, false, message_text.clone(), 0, qso_id.clone())
+                .await
+        {
             warn!("Failed to send TransmitComplete: {}", e);
         }
     }
@@ -3377,25 +3693,42 @@ fn encode_and_modulate_multi_tx(
     }
 }
 
-/// Whether a **remote-originated** TX request is permitted to key PTT right now,
-/// per the station-agent arm gate.
+/// Whether a **remote-originated** TX request from `channel` is permitted to
+/// key PTT right now, per the shared arm gate.
 ///
 /// This is the safety gate for `TxOrigin::Remote` requests only — the worker
 /// never calls it for `TxOrigin::Local` (local TX is byte-identical). It reads
 /// the shared [`ArmState`](pancetta_agent::arm::ArmState) and returns
-/// `arm.tx_permitted(now_ms)`.
+/// `arm.tx_permitted(now(), channel)` — `channel`'s own consent bit, never
+/// another channel's. A diagnostic entry point: production gates go through
+/// [`remote_tx_permitted_for`], which derives the channel from the frame.
 ///
 /// **Fail-CLOSED on a poisoned lock** — the OPPOSITE of [`tx_qso_is_live`]'s
 /// fail-open. This is a safety gate: if the arm mutex is poisoned we can no
-/// longer prove the station consented, so remote TX is DENIED. `now_ms` is unix
-/// milliseconds (the one clock read; `ArmState` itself is pure).
+/// longer prove the station consented, so remote TX is DENIED. `now` is the
+/// one clock read (`ArmState` itself is pure); it runs only AFTER the lock is
+/// acquired, so a lock wait cannot make the sample stale. Production passes
+/// [`ArmTime::now`](pancetta_agent::arm::ArmTime::now).
 pub fn remote_tx_permitted(
     arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
-    now_ms: i64,
+    now: impl FnOnce() -> pancetta_agent::arm::ArmTime,
+    channel: pancetta_agent::arm::ConsentChannel,
 ) -> bool {
     match arm.lock() {
-        Ok(state) => state.tx_permitted(now_ms),
+        Ok(state) => state.tx_permitted(now(), channel),
         Err(_) => false,
+    }
+}
+
+/// The remote-TX channel a frame originated on, derived from its bound client
+/// identity: every station-agent producer binds `Some(peer)`
+/// (`tx_kind_to_qso_message`), while the WSJT-X UDP bridge — which has no
+/// client identity concept — binds `None`. Selects which channel's own
+/// consent bit the TX-time gate requires.
+fn consent_channel_for(remote_client_key_id: Option<&str>) -> pancetta_agent::arm::ConsentChannel {
+    match remote_client_key_id {
+        Some(_) => pancetta_agent::arm::ConsentChannel::StationAgent,
+        None => pancetta_agent::arm::ConsentChannel::WsjtxUdp,
     }
 }
 
@@ -3412,21 +3745,29 @@ pub fn remote_tx_permitted(
 /// FIRST peer, because the old gate only checked "is the shared `ArmState`
 /// armed", never "armed by the same client this frame is bound to".
 ///
-/// `remote_client_key_id` is `None` for every producer that predates PAN-91
-/// (or has no client identity concept — e.g. the WSJT-X UDP bridge's own
-/// remote-TX path) and for those frames this degrades to exactly
-/// [`remote_tx_permitted`]'s boolean-only check, so existing non-station-agent
-/// remote-TX integrations are unaffected. `Some(id)` requires that `id` is
-/// the client `ArmState::armed_client_key_id()` currently reports — a
-/// mismatch (including "armed, but by someone else") denies fail-closed.
+/// `remote_client_key_id` also names the ORIGINATING channel, whose own
+/// current consent is required (PAN-98; one channel's consent never permits
+/// another channel's TX):
+///
+/// - `None` — the WSJT-X UDP bridge (no client identity concept): requires
+///   the WSJT-X UDP channel's consent ([`ConsentChannel::WsjtxUdp`]) plus the
+///   rest of the boolean arm gate, with no identity binding.
+/// - `Some(id)` — the station-agent channel: requires the station-agent
+///   channel's consent ([`ConsentChannel::StationAgent`]) plus the rest of the
+///   boolean arm gate, AND that `id` is the client
+///   `ArmState::armed_client_key_id()` currently reports — a mismatch
+///   (including "armed, but by someone else") denies fail-closed.
+///
+/// [`ConsentChannel::WsjtxUdp`]: pancetta_agent::arm::ConsentChannel::WsjtxUdp
+/// [`ConsentChannel::StationAgent`]: pancetta_agent::arm::ConsentChannel::StationAgent
 pub fn remote_tx_permitted_for(
     arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
-    now_ms: i64,
+    now: impl FnOnce() -> pancetta_agent::arm::ArmTime,
     remote_client_key_id: Option<&str>,
 ) -> bool {
     match arm.lock() {
         Ok(state) => {
-            if !state.tx_permitted(now_ms) {
+            if !state.tx_permitted(now(), consent_channel_for(remote_client_key_id)) {
                 return false;
             }
             match remote_client_key_id {
@@ -3449,7 +3790,12 @@ pub fn remote_tx_permitted_for(
 /// authorizing the other under a mismatched identity.
 #[derive(Clone)]
 struct ArmSnapshot {
-    tx_permitted: bool,
+    /// The boolean arm gate for a station-agent-originated frame (`Some`
+    /// client identity) — reads the station-agent channel's consent.
+    station_agent_permitted: bool,
+    /// The boolean arm gate for a WSJT-X-UDP-originated frame (`None` client
+    /// identity) — reads the WSJT-X UDP channel's consent.
+    wsjtx_permitted: bool,
     armed_client_key_id: Option<String>,
     /// Round-10 review (Codex P2): captured under the SAME lock as the
     /// other two fields, so audit attribution for a denial this snapshot
@@ -3462,31 +3808,54 @@ struct ArmSnapshot {
     /// task finally runs, not whoever was (or wasn't) armed when the
     /// denial was actually decided.
     operator_callsign: Option<String>,
+    /// The wall-clock instant (unix ms) the permission was decided at, taken
+    /// with the lock held — the timestamp for any audit this snapshot feeds.
+    decided_at_unix_ms: i64,
 }
 
 impl ArmSnapshot {
+    /// `now` is sampled only after the lock is acquired (see
+    /// [`remote_tx_permitted`]).
     fn take(
         arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
-        now_ms: i64,
+        now: impl FnOnce() -> pancetta_agent::arm::ArmTime,
     ) -> Self {
         match arm.lock() {
-            Ok(state) => Self {
-                tx_permitted: state.tx_permitted(now_ms),
-                armed_client_key_id: state.armed_client_key_id().map(str::to_string),
-                operator_callsign: state.operator_callsign().map(str::to_string),
-            },
+            Ok(state) => {
+                let now = now();
+                Self {
+                    station_agent_permitted: state
+                        .tx_permitted(now, pancetta_agent::arm::ConsentChannel::StationAgent),
+                    wsjtx_permitted: state
+                        .tx_permitted(now, pancetta_agent::arm::ConsentChannel::WsjtxUdp),
+                    armed_client_key_id: state.armed_client_key_id().map(str::to_string),
+                    operator_callsign: state.operator_callsign().map(str::to_string),
+                    decided_at_unix_ms: now.unix_ms,
+                }
+            }
             Err(_) => Self {
-                tx_permitted: false,
+                station_agent_permitted: false,
+                wsjtx_permitted: false,
                 armed_client_key_id: None,
                 operator_callsign: None,
+                decided_at_unix_ms: now().unix_ms,
             },
+        }
+    }
+
+    /// The boolean arm gate (no identity binding) for the channel
+    /// `remote_client_key_id` originated on — see [`consent_channel_for`].
+    fn channel_permitted(&self, remote_client_key_id: Option<&str>) -> bool {
+        match consent_channel_for(remote_client_key_id) {
+            pancetta_agent::arm::ConsentChannel::StationAgent => self.station_agent_permitted,
+            pancetta_agent::arm::ConsentChannel::WsjtxUdp => self.wsjtx_permitted,
         }
     }
 
     /// Mirrors [`remote_tx_permitted_for`]'s logic against this frozen
     /// snapshot instead of a fresh lock.
     fn permits(&self, remote_client_key_id: Option<&str>) -> bool {
-        if !self.tx_permitted {
+        if !self.channel_permitted(remote_client_key_id) {
             return false;
         }
         match remote_client_key_id {
@@ -3502,7 +3871,7 @@ impl ArmSnapshot {
     /// TTL expired, local consent/kill), which is not an identity problem
     /// at all and must not be reported as one.
     fn is_identity_mismatch(&self, remote_client_key_id: Option<&str>) -> bool {
-        self.tx_permitted
+        self.channel_permitted(remote_client_key_id)
             && remote_client_key_id
                 .is_some_and(|id| self.armed_client_key_id.as_deref() != Some(id))
     }
@@ -3752,8 +4121,11 @@ pub struct CoalesceEntry {
 pub struct CoalesceOutcome {
     /// The requests to actually transmit, after coalescing per `qso_id`
     /// (newest wins), dropping terminal-QSO requests, and capping the
-    /// distinct-stream count. Order is the order each retained key was first
-    /// seen, so the head entry is the oldest-surviving stream.
+    /// distinct-stream count. QSO-keyed streams Fox mode opened come first
+    /// (PAN-76, see [`coalesce_transmit_requests_with_fox_priority`]), then
+    /// the other QSO-keyed streams, then manual sends; each group keeps the
+    /// order its keys were first seen, so with no Fox-admitted stream present
+    /// the head entry is the oldest-surviving stream.
     pub retained: Vec<CoalesceEntry>,
     /// How many requests were superseded by a newer request for the SAME
     /// `qso_id` (i.e. older keep-call frames dropped in favor of the latest).
@@ -3773,13 +4145,15 @@ pub struct CoalesceOutcome {
     /// stream represents an ADMITTED, still-live QSO whose call-bookkeeping
     /// (call_count, last_call_at, Sent timeline) already advanced as if this
     /// frame would transmit. The caller must report a failed
-    /// `TransmitComplete` for each so that bookkeeping doesn't silently drift
+    /// completion through `report_transmit_complete`, which sends
+    /// `TxFrameNotSent` to `QsoManager::roll_back_unsent_attempt`, so it does not drift
     /// from reality (a stream that's always last in FIFO order would
     /// otherwise burn through its retry budget or time out having never
     /// actually gone on air).
     pub truncated_entries: Vec<CoalesceEntry>,
     /// The effective concurrent-QSO cap actually applied to QSO-keyed
-    /// streams this cycle (`max_concurrent_qsos`, clamped into
+    /// streams this cycle (`max_concurrent_qsos`, raised to the number of
+    /// Fox-admitted streams present in this backlog (PAN-76), clamped into
     /// `1..=MAX_RETAINED_TX_STREAMS`) — exposed so a truncation diagnostic
     /// can report the cap that actually did the truncating instead of always
     /// citing the (possibly much larger) hard backstop.
@@ -3838,20 +4212,19 @@ impl CoalesceOutcome {
 /// limit would truncate its own intended multi-stream Hound-answer bundle
 /// down to one signal.
 ///
-/// PR #348 review round 4 (Codex P1) proposed additionally flooring this at
-/// `active_tx_qsos.len()`, to protect active Hound exchanges left running
-/// after `SetFoxMode(false)` (which only cancels the `CallingCq` QSO —
-/// `coordinator/qso.rs`'s Fox-disengage handling). Round 5 review found that
-/// floor defeats the cap entirely for ordinary manual QSOs: `StartQso`
-/// inserts a QSO into `active_tx_qsos` before its first `TransmitRequest` is
-/// even coalesced, so simply opening `max_concurrent_qsos + N` manual QSOs
-/// in quick succession would raise `active_count` to admit all of them —
-/// exactly the pileup this cap exists to prevent. The floor was reverted;
-/// the Fox-disengage gap is tracked separately (a real fix needs `qso.rs` to
-/// distinguish Fox-admitted QSOs from ordinary ones, e.g. by explicitly
-/// tearing them down on disengage or tracking them in a dedicated set — not
-/// something `active_tx_qsos`'s undifferentiated membership can answer).
-fn effective_max_concurrent_qsos(
+/// Hound exchanges still running after `SetFoxMode(false)` (PAN-76): a floor
+/// at `active_tx_qsos.len()` was tried and reverted in PR #348 rounds 4-5,
+/// because `active_tx_qsos` cannot tell a Fox-admitted Hound from an
+/// ordinary over-cap manual QSO, so that floor let a manual pileup through.
+/// The QSO component now records the QSOs Fox mode opened in the
+/// coordinator's `fox_admitted_qsos`. The backlog coalescer gets this
+/// UNRAISED value plus that set, and
+/// [`coalesce_transmit_requests_with_fox_priority`] raises its cap only to
+/// the Fox-admitted streams actually present in the backlog — never the
+/// set's size, which would lend the slots of Hounds idling in their 45 s
+/// completed grace to ordinary QSOs. The mid-TX supersede sites use
+/// [`supersede_max_concurrent_qsos`] over [`live_fox_admitted_count`].
+pub(crate) fn effective_max_concurrent_qsos(
     max_concurrent_qsos: u32,
     fox_mode: &std::sync::atomic::AtomicBool,
     fox_max_streams: &std::sync::atomic::AtomicUsize,
@@ -3862,6 +4235,30 @@ fn effective_max_concurrent_qsos(
     } else {
         max_concurrent_qsos
     }
+}
+
+/// PAN-76: Fox-admitted QSOs that are still TX-live (in `active_tx_qsos`).
+/// Either lock poisoned → 0, i.e. no raise over today's ceiling.
+pub(crate) fn live_fox_admitted_count(
+    fox_admitted_qsos: &std::sync::RwLock<std::collections::HashSet<String>>,
+    active_tx_qsos: &std::sync::RwLock<std::collections::HashSet<String>>,
+) -> u32 {
+    let (Ok(fox), Ok(active)) = (fox_admitted_qsos.read(), active_tx_qsos.read()) else {
+        return 0;
+    };
+    fox.iter().filter(|k| active.contains(*k)).count() as u32
+}
+
+/// PAN-76: ceiling for the mid-TX supersede paths: the live Fox-admitted
+/// streams on top of the normal cap, the same shape as the coalescer's rule
+/// (Fox-admitted streams are never truncated; ordinary ones are capped). A
+/// mixed in-flight bundle of Hounds plus ordinary QSOs therefore stays under
+/// it, so a Hound's fresh frame folds in instead of collapsing the bundle
+/// (PR #421 review). A supersede never adds a QSO stream
+/// (`classify_incoming_during_tx` only supersedes on an in-flight QSO or a
+/// manual send), so this never admits more than the coalescer already did.
+pub(crate) fn supersede_max_concurrent_qsos(effective: u32, live_fox_admitted: u32) -> u32 {
+    effective.saturating_add(live_fox_admitted)
 }
 
 #[cfg(test)]
@@ -3908,6 +4305,61 @@ mod effective_max_concurrent_qsos_tests {
     }
 }
 
+#[cfg(test)]
+mod fox_admitted_ceiling_tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::RwLock;
+
+    fn set(ids: &[&str]) -> RwLock<HashSet<String>> {
+        RwLock::new(
+            ids.iter()
+                .map(|s| super::super::active_tx_qso_key(s))
+                .collect(),
+        )
+    }
+
+    fn poison(lock: &RwLock<HashSet<String>>) {
+        std::thread::scope(|scope| {
+            let _ = scope
+                .spawn(|| {
+                    let _guard = lock.write().unwrap();
+                    panic!("poisoning the lock on purpose");
+                })
+                .join();
+        });
+        assert!(lock.is_poisoned());
+    }
+
+    #[test]
+    fn pan76_live_fox_admitted_count_ignores_keys_no_longer_tx_live() {
+        let fox = set(&["A", "B", "C", "STALE"]);
+        let active = set(&["A", "B", "C", "X"]);
+        assert_eq!(live_fox_admitted_count(&fox, &active), 3);
+    }
+
+    #[test]
+    fn pan76_live_fox_admitted_count_is_zero_when_either_lock_is_poisoned() {
+        let fox = set(&["A", "B"]);
+        let active = set(&["A", "B"]);
+        poison(&fox);
+        assert_eq!(live_fox_admitted_count(&fox, &active), 0);
+
+        let fox = set(&["A", "B"]);
+        let active = set(&["A", "B"]);
+        poison(&active);
+        assert_eq!(live_fox_admitted_count(&fox, &active), 0);
+    }
+
+    #[test]
+    fn pan76_supersede_ceiling_covers_live_fox_admitted_qsos() {
+        assert_eq!(supersede_max_concurrent_qsos(1, 3), 4);
+        assert_eq!(supersede_max_concurrent_qsos(6, 3), 9);
+        assert_eq!(supersede_max_concurrent_qsos(1, 0), 1);
+        assert_eq!(supersede_max_concurrent_qsos(u32::MAX, 3), u32::MAX);
+    }
+}
+
 /// Pure backlog coalescer for the single-threaded TX worker.
 ///
 /// Given the requests drained from the channel (oldest first — the channel is
@@ -3948,10 +4400,37 @@ mod effective_max_concurrent_qsos_tests {
 /// supersede path (`supersede_and_rekey_or_bundle`) enforces. Without this,
 /// several manual QSOs opened in the same pre-PTT window bundled unconditionally
 /// up to [`MAX_RETAINED_TX_STREAMS`], silently exceeding the configured cap.
+///
+/// Equivalent to [`coalesce_transmit_requests_with_fox_priority`] with no
+/// Fox-admitted QSOs.
 pub fn coalesce_transmit_requests(
     drained: Vec<CoalesceEntry>,
     max_concurrent_qsos: u32,
+    qso_is_live: impl FnMut(Option<&str>) -> bool,
+) -> CoalesceOutcome {
+    coalesce_transmit_requests_with_fox_priority(drained, max_concurrent_qsos, qso_is_live, |_| {
+        false
+    })
+}
+
+/// [`coalesce_transmit_requests`] plus one rule for QSOs Fox mode opened:
+///
+/// 6. **Fox-admitted streams go first and are never cap-truncated (PAN-76).**
+///    `is_fox_admitted` receives the canonical [`super::active_tx_qso_key`]
+///    of each QSO-keyed stream. Fox-admitted streams are ordered before the
+///    other QSO-keyed streams (each group keeps first-seen order), so they
+///    anchor the bundle parity and win frequency-conflict tie-breaks, and the
+///    QSO cap is raised to the number of Fox-admitted streams that survive
+///    into this cycle's bundle. Only ordinary streams are truncated, and only
+///    to the room `max_concurrent_qsos` leaves. A Fox-admitted QSO with no
+///    frame in this backlog (e.g. a completed Hound in its grace window)
+///    lends no slot to anyone. With no Fox-admitted stream present the
+///    outcome is identical to [`coalesce_transmit_requests`].
+pub fn coalesce_transmit_requests_with_fox_priority(
+    drained: Vec<CoalesceEntry>,
+    max_concurrent_qsos: u32,
     mut qso_is_live: impl FnMut(Option<&str>) -> bool,
+    mut is_fox_admitted: impl FnMut(&str) -> bool,
 ) -> CoalesceOutcome {
     use std::collections::HashMap;
 
@@ -3994,12 +4473,21 @@ pub fn coalesce_transmit_requests(
     // conflict, leaving just A; filtering conflicts first correctly leaves
     // [A, C] as the surviving two-stream bundle). Manual sends go last so a
     // single-stream QSO backlog keeps the QSO as the headline item.
+    // Fox-admitted streams go before the other QSO-keyed streams (PAN-76) so
+    // the cap below truncates only ordinary streams and a Hound anchors the
+    // bundle parity whenever one is present.
     let mut retained: Vec<CoalesceEntry> = Vec::with_capacity(order.len() + manual.len());
+    let mut ordinary: Vec<CoalesceEntry> = Vec::new();
     for key in order {
         if let Some(e) = by_qso.remove(&key) {
-            retained.push(e);
+            if is_fox_admitted(&key) {
+                retained.push(e);
+            } else {
+                ordinary.push(e);
+            }
         }
     }
+    retained.append(&mut ordinary);
     retained.append(&mut manual);
 
     // Bundle-parity conflict check. When ≥2 distinct streams survive, they may
@@ -4089,10 +4577,21 @@ pub fn coalesce_transmit_requests(
     // entry represents an ADMITTED, still-live QSO whose call-bookkeeping
     // has already advanced as if this frame would transmit, so its
     // `CoalesceEntry` is retained in `truncated_entries` for the caller to
-    // report a failed `TransmitComplete` — silently dropping it here would
-    // let that QSO's retry/timeout accounting drift from what actually went
-    // on air.
-    let qso_cap = (max_concurrent_qsos.max(1) as usize).min(MAX_RETAINED_TX_STREAMS);
+    // use `report_transmit_complete`, which routes `TxFrameNotSent` to
+    // `QsoManager::roll_back_unsent_attempt` (PAN-75).
+    // PAN-76: raise the cap to the Fox-admitted streams present — they sit at
+    // the front, so `split_off` only ever truncates ordinary streams.
+    let fox_present = qso_survivors
+        .iter()
+        .filter(|e| {
+            e.qso_id
+                .as_deref()
+                .is_some_and(|id| is_fox_admitted(&super::active_tx_qso_key(id)))
+        })
+        .count();
+    let qso_cap = (max_concurrent_qsos.max(1) as usize)
+        .max(fox_present)
+        .min(MAX_RETAINED_TX_STREAMS);
     outcome.qso_cap = qso_cap;
     if qso_survivors.len() > qso_cap {
         let overflow = qso_survivors.split_off(qso_cap);
@@ -4158,15 +4657,20 @@ pub fn coalesce_transmit_requests(
 /// A `tx.policy` warning is logged whenever anything was coalesced, dropped, or
 /// truncated, so silent backlog reduction is always operator-visible.
 #[allow(clippy::too_many_arguments)]
-async fn coalesce_backlog_into(
+pub(crate) async fn coalesce_backlog_into(
     head: MessageType,
     tx_rx: &crossbeam_channel::Receiver<ComponentMessage>,
     message_bus: &MessageBus,
     active_tx_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    fox_admitted_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
     max_concurrent_qsos: u32,
     remote_tx_arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
     audit_log: &pancetta_agent::audit::AuditLog,
     display_feed_enabled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pivots: Option<(
+        &mut std::collections::HashMap<String, (String, f64)>,
+        &mut PivotReplaced,
+    )>,
 ) -> MessageType {
     // Decompose the head into a CoalesceEntry. (Caller guarantees the variant.)
     let head_entry = match head {
@@ -4257,8 +4761,57 @@ async fn coalesce_backlog_into(
     // Round-3 review (Codex P1): ONE arm snapshot for the WHOLE partition,
     // not a fresh lock per entry — see [`ArmSnapshot`]'s doc for the TOCTOU
     // this closes.
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let arm_snapshot = ArmSnapshot::take(remote_tx_arm, now_ms);
+    // PAN-75 (Codex P2 on PR #418): consume pivot duplicates BEFORE
+    // newest-per-QSO coalescing. A request whose payload already aired via an
+    // earlier pivot could otherwise be discarded here in favour of a newer
+    // same-QSO request, so Step 0-dup never sees it: its tombstone goes stale
+    // and the frame the pivot replaced, which never aired, stays counted.
+    // The newest entry is left for Step 0-dup when every entry is a duplicate.
+    if let Some((pivoted_once, pivoted_from)) = pivots {
+        if drained.len() > 1 {
+            let mut duplicates = Vec::new();
+            let mut kept = Vec::with_capacity(drained.len());
+            let last = drained.len() - 1;
+            for (i, entry) in drained.into_iter().enumerate() {
+                let spare = i < last || !kept.is_empty();
+                if spare
+                    && super::is_pivot_duplicate(
+                        entry.qso_id.as_deref(),
+                        &entry.message_text,
+                        entry.frequency_offset,
+                        pivoted_once,
+                    )
+                {
+                    let replaced = entry.qso_id.as_deref().and_then(|id| {
+                        let key = super::active_tx_qso_key(id);
+                        pivoted_once.remove(&key);
+                        pivoted_from.remove(&key)
+                    });
+                    duplicates.push((entry, replaced));
+                } else {
+                    kept.push(entry);
+                }
+            }
+            drained = kept;
+            for (entry, replaced) in duplicates {
+                info!(
+                    target: "pancetta::tx.policy",
+                    "dropping stale TX for '{}' before coalescing — already sent via pivot",
+                    entry.message_text
+                );
+                report_pivot_duplicate_dropped(
+                    message_bus,
+                    entry.message_text,
+                    entry.qso_id,
+                    replaced,
+                )
+                .await;
+            }
+        }
+    }
+
+    let arm_snapshot = ArmSnapshot::take(remote_tx_arm, pancetta_agent::arm::ArmTime::now);
+    let now_ms = arm_snapshot.decided_at_unix_ms;
     let (admitted, identity_denied): (Vec<_>, Vec<_>) = drained.into_iter().partition(|e| {
         e.origin != crate::message_bus::TxOrigin::Remote
             || arm_snapshot.permits(e.remote_client_key_id.as_deref())
@@ -4342,18 +4895,15 @@ async fn coalesce_backlog_into(
                     },
                 )
                 .await;
-                let complete_msg = ComponentMessage::new(
-                    ComponentId::Ft8Transmitter,
-                    ComponentId::Autonomous,
-                    MessageType::TransmitComplete {
-                        success: false,
-                        message_text: entry.message_text.clone(),
-                        duration_ms: 0,
-                        qso_id: entry.qso_id.clone(),
-                    },
-                    Instant::now(),
-                );
-                if let Err(e) = message_bus.send_message(complete_msg).await {
+                if let Err(e) = report_transmit_complete(
+                    &message_bus,
+                    false,
+                    entry.message_text.clone(),
+                    0,
+                    entry.qso_id.clone(),
+                )
+                .await
+                {
                     warn!(
                         "Failed to send TransmitComplete for an identity-denied stream: {}",
                         e
@@ -4390,9 +4940,18 @@ async fn coalesce_backlog_into(
     }
 
     let backlog_total = admitted.len();
-    let outcome = coalesce_transmit_requests(admitted, max_concurrent_qsos, |id| {
-        tx_qso_is_live(id, active_tx_qsos)
-    });
+    // PAN-76: snapshot the Fox-admitted set (poisoned → empty, i.e. today's
+    // cap) so the coalescer keeps Hound exchanges Fox mode already opened.
+    let fox_admitted: std::collections::HashSet<String> = fox_admitted_qsos
+        .read()
+        .map(|s| s.clone())
+        .unwrap_or_default();
+    let mut outcome = coalesce_transmit_requests_with_fox_priority(
+        admitted,
+        max_concurrent_qsos,
+        |id| tx_qso_is_live(id, active_tx_qsos),
+        |key| fox_admitted.contains(key),
+    );
 
     if !outcome.is_noop() {
         let text = format!(
@@ -4423,26 +4982,62 @@ async fn coalesce_backlog_into(
 
     // A truncated entry is an ADMITTED, still-live QSO whose call-bookkeeping
     // (call_count, last_call_at, Sent timeline) already advanced as if this
-    // frame would transmit — report a failed TransmitComplete for each so
-    // that bookkeeping doesn't silently drift from what actually went on
-    // air (see `CoalesceOutcome::truncated_entries`'s doc comment).
+    // frame would transmit. report_transmit_complete mirrors each failure as
+    // TxFrameNotSent to QsoManager::roll_back_unsent_attempt (PAN-75).
     for entry in &outcome.truncated_entries {
-        let complete_msg = ComponentMessage::new(
-            ComponentId::Ft8Transmitter,
-            ComponentId::Autonomous,
-            MessageType::TransmitComplete {
-                success: false,
-                message_text: entry.message_text.clone(),
-                duration_ms: 0,
-                qso_id: entry.qso_id.clone(),
-            },
-            Instant::now(),
-        );
-        if let Err(e) = message_bus.send_message(complete_msg).await {
+        if let Err(e) = report_transmit_complete(
+            message_bus,
+            false,
+            entry.message_text.clone(),
+            0,
+            entry.qso_id.clone(),
+        )
+        .await
+        {
             warn!(
                 "Failed to send TransmitComplete for a cap-truncated stream: {}",
                 e
             );
+        }
+    }
+
+    // A bundle has only one remote identity and therefore one consent channel.
+    // Keep the first retained remote channel and defer the other, preserving
+    // its identity for the next worker pass and the final key-time check.
+    // Do this after newest-per-QSO selection so an older frame cannot survive
+    // just because a newer request for that QSO came from the other channel.
+    let bundle_channel = outcome
+        .retained
+        .iter()
+        .find(|e| e.origin == crate::message_bus::TxOrigin::Remote)
+        .map(|e| consent_channel_for(e.remote_client_key_id.as_deref()));
+    let (retained, deferred): (Vec<_>, Vec<_>) = outcome.retained.into_iter().partition(|e| {
+        e.origin != crate::message_bus::TxOrigin::Remote
+            || Some(consent_channel_for(e.remote_client_key_id.as_deref())) == bundle_channel
+    });
+    outcome.retained = retained;
+    for entry in deferred {
+        let request = ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Ft8Transmitter,
+            MessageType::TransmitRequest {
+                message_text: entry.message_text.clone(),
+                frequency_offset: entry.frequency_offset,
+                qso_id: entry.qso_id.clone(),
+                tx_parity: entry.tx_parity,
+                origin: entry.origin,
+                remote_client_key_id: entry.remote_client_key_id,
+            },
+            Instant::now(),
+        );
+        if !matches!(message_bus.send_message_checked(request).await, Ok(true)) {
+            warn!(target: "pancetta::tx.policy", "failed to re-enqueue TX from a different consent channel");
+            if let Err(e) =
+                report_transmit_complete(message_bus, false, entry.message_text, 0, entry.qso_id)
+                    .await
+            {
+                warn!("Failed to report a dropped channel-deferred stream: {}", e);
+            }
         }
     }
 
@@ -4495,18 +5090,9 @@ async fn coalesce_backlog_into(
     } else {
         crate::message_bus::TxOrigin::Local
     };
-    // PAN-91: mirror the origin fold for client identity. `find_map`, NOT
-    // `find().and_then()` (round 2, Codex P1): a `None`-bound legacy Remote
-    // entry (the WSJT-X UDP bridge's own path, which has no client identity
-    // concept) can legitimately sit alongside a bound entry in the same
-    // retained set — by this point every bound entry has already been
-    // filtered to agree with the currently-armed client (see the identity
-    // filter above), so ANY `Some` found here is safe to use for the whole
-    // bundle. `find().and_then()` instead stops at the FIRST Remote entry
-    // regardless of whether it's bound, so an unbound entry appearing
-    // before a bound one would erase the bound identity and fold the whole
-    // bundle down to the boolean-only `None` check — silently re-opening
-    // the PAN-91 gap for whichever entry actually needed the identity bind.
+    // All retained remote entries now share one consent channel, and the
+    // snapshot already checked every bound identity against the armed client.
+    // Folding that identity preserves the channel for the final key-time gate.
     let bundle_remote_client_key_id = outcome
         .retained
         .iter()
@@ -4845,19 +5431,23 @@ async fn supersede_and_rekey_or_bundle(
         // filter closes for a drained backlog. This function only ever
         // sees TWO identities (the whole in-flight side's, and the new
         // item's own), so a genuine conflict is a straight inequality
-        // check: `None` on either side means "no bound identity" (a
-        // pre-PAN-91 producer, degrades to the boolean-only gate) and is
-        // never itself a conflict. On a real conflict, refuse to bundle —
-        // fall through to the existing over-capacity path below, which
-        // abandons the in-flight side and replaces it with just the new
-        // request; the retry loop's own key-time gate re-verifies the new
-        // request's identity independently before it actually keys.
+        // check. PAN-98: `None` (the WSJT-X UDP bridge) and `Some` (the
+        // station agent) are also a conflict — they are different channels
+        // with independent consent, and the bundle's single folded identity
+        // would make its key-time gate check only ONE channel's consent.
+        // Two `None` sides share a channel and are never a conflict. On a
+        // real conflict, refuse to bundle — fall through to the existing
+        // over-capacity path below, which abandons the in-flight side and
+        // replaces it with just the new request; the retry loop's own
+        // key-time gate re-verifies the new request's channel and identity
+        // independently before it actually keys.
         let identity_conflict = in_flight_origin == crate::message_bus::TxOrigin::Remote
             && new_origin == crate::message_bus::TxOrigin::Remote
-            && matches!(
-                (&in_flight_remote_client_key_id, &new_remote_client_key_id),
-                (Some(a), Some(b)) if a != b
-            );
+            && match (&in_flight_remote_client_key_id, &new_remote_client_key_id) {
+                (Some(a), Some(b)) => a != b,
+                (None, Some(_)) | (Some(_), None) => true,
+                (None, None) => false,
+            };
         if identity_conflict {
             warn!(
                 target: "pancetta::tx.policy",
@@ -4942,6 +5532,73 @@ async fn supersede_and_rekey_or_bundle(
 ///
 /// In every case `supersede_and_rekey_or_bundle` has already deasserted PTT, so
 /// the caller safely disarms its `PttGuard` and `continue`s after this returns.
+/// In-flight bundle items a `NotViable` multi-TX supersede really abandons:
+/// every item, except those `reenqueued` (the incoming bundle put back on the
+/// queue) carries unchanged for the same QSO under the same authorization,
+/// which will still air (PAN-75). An authorization change (origin or bound
+/// client) carries nothing: the old-authority attempt is abandoned.
+fn items_abandoned_by_supersede<'a>(
+    in_flight_items: &'a [crate::message_bus::TransmitRequestItem],
+    in_flight_auth: (crate::message_bus::TxOrigin, Option<&str>),
+    reenqueued: Option<&MessageType>,
+) -> Vec<&'a crate::message_bus::TransmitRequestItem> {
+    let carried: &[crate::message_bus::TransmitRequestItem] = match reenqueued {
+        Some(MessageType::MultiTransmitRequest {
+            items,
+            origin,
+            remote_client_key_id,
+            ..
+        }) if (*origin, remote_client_key_id.as_deref()) == in_flight_auth => items,
+        _ => &[],
+    };
+    in_flight_items
+        .iter()
+        .filter(|item| {
+            !carried.iter().any(|c| {
+                c.qso_id == item.qso_id
+                    && c.message_text == item.message_text
+                    && (c.frequency_offset - item.frequency_offset).abs()
+                        < super::PIVOT_OFFSET_EPSILON_HZ
+            })
+        })
+        .collect()
+}
+
+/// Report an in-flight bundle item a supersede abandoned. The QSO engine gets
+/// the item's own offset (and, when known, the bundle's binding) so the
+/// rollback cannot land on a newer same-text attempt at another offset or
+/// authority (PAN-75). Autonomous gets the usual failed completion
+/// (follow-up: PAN-185).
+async fn report_abandoned_bundle_item(
+    message_bus: &MessageBus,
+    item: &crate::message_bus::TransmitRequestItem,
+    remote_binding: Option<(bool, Option<String>)>,
+) {
+    if let Err(e) = report_transmit_complete_to_autonomous(
+        message_bus,
+        false,
+        item.message_text.clone(),
+        0,
+        item.qso_id.clone(),
+    )
+    .await
+    {
+        warn!("Failed to send TransmitComplete: {}", e);
+    }
+    if let Some(qso_id) = item.qso_id.clone() {
+        report_frame_not_sent(
+            message_bus,
+            qso_id,
+            item.message_text.clone(),
+            Some(pancetta_qso::UnsentAttemptPayload {
+                frequency_hz: item.frequency_offset,
+                remote_binding,
+            }),
+        )
+        .await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn supersede_multi_reenqueue(
     new_request: MessageType,
@@ -5024,20 +5681,51 @@ async fn supersede_multi_reenqueue(
             // the next dequeue transmits it via the unmodified Steps 1-10 — the
             // newer bundle supersedes the abandoned in-flight one, so exactly
             // one bundle stays pending (no duplicate). A `None` here is the
-            // too-late-for-slot case, which stays a drop.
+            // too-late-for-slot case, which stays a drop. Delivery is checked:
+            // the reports below may lean on the re-enqueued bundle only once it
+            // is actually queued (Codex P2 on PR #419).
+            let mut reenqueued = None;
             if let Some(bundle) = reenqueue_on_notviable {
                 let reenqueue = ComponentMessage::new(
                     ComponentId::Ft8Transmitter,
                     ComponentId::Ft8Transmitter,
-                    bundle,
+                    bundle.clone(),
                     Instant::now(),
                 );
-                if let Err(e) = message_bus.send_message(reenqueue).await {
-                    warn!(
+                match message_bus.send_message_checked(reenqueue).await {
+                    Ok(true) => reenqueued = Some(bundle),
+                    Ok(false) => {
+                        warn!("supersede (multi-TX): superseding bundle was dropped on re-enqueue")
+                    }
+                    Err(e) => warn!(
                         "supersede (multi-TX): failed to re-enqueue superseding bundle: {}",
                         e
-                    );
+                    ),
                 }
+            }
+            // PAN-75 (Codex P2 on PR #418): report each abandoned item, as the
+            // `Replace` arm does, so its keep-call accounting is reversed. Items
+            // the re-enqueued bundle carries over unchanged will still air, so
+            // they are not reported (Codex P1 on PR #419). Each is reported
+            // with its own offset, and with the bundle's binding when the
+            // supersede changed authorization (Codex on PR #419).
+            let auth_changed = matches!(
+                &reenqueued,
+                Some(MessageType::MultiTransmitRequest { origin: o, remote_client_key_id: k, .. })
+                    if (*o, k.as_deref()) != (origin, remote_client_key_id.as_deref())
+            );
+            let binding = auth_changed.then(|| {
+                (
+                    origin == crate::message_bus::TxOrigin::Remote,
+                    remote_client_key_id.clone(),
+                )
+            });
+            for item in items_abandoned_by_supersede(
+                in_flight_items,
+                (origin, remote_client_key_id.as_deref()),
+                reenqueued.as_ref(),
+            ) {
+                report_abandoned_bundle_item(message_bus, item, binding.clone()).await;
             }
         }
         SupersedeOutcome::Bundle {
@@ -5124,18 +5812,15 @@ async fn supersede_multi_reenqueue(
             // collide with.
             if identity_conflict {
                 for item in in_flight_items {
-                    let complete_msg = ComponentMessage::new(
-                        ComponentId::Ft8Transmitter,
-                        ComponentId::Autonomous,
-                        MessageType::TransmitComplete {
-                            success: false,
-                            message_text: item.message_text.clone(),
-                            duration_ms: 0,
-                            qso_id: item.qso_id.clone(),
-                        },
-                        Instant::now(),
-                    );
-                    if let Err(e) = message_bus.send_message(complete_msg).await {
+                    if let Err(e) = report_transmit_complete(
+                        message_bus,
+                        false,
+                        item.message_text.clone(),
+                        0,
+                        item.qso_id.clone(),
+                    )
+                    .await
+                    {
                         warn!("Failed to send TransmitComplete: {}", e);
                     }
                 }
@@ -5213,18 +5898,9 @@ async fn supersede_multi_reenqueue(
                  behind the preserved bundle (would livelock); its own cadence will retry next cycle",
                 scratch_text
             );
-            let complete_msg = ComponentMessage::new(
-                ComponentId::Ft8Transmitter,
-                ComponentId::Autonomous,
-                MessageType::TransmitComplete {
-                    success: false,
-                    message_text: scratch_text,
-                    duration_ms: 0,
-                    qso_id: new_qso_id,
-                },
-                Instant::now(),
-            );
-            if let Err(e) = message_bus.send_message(complete_msg).await {
+            if let Err(e) =
+                report_transmit_complete(message_bus, false, scratch_text, 0, new_qso_id).await
+            {
                 warn!("Failed to send TransmitComplete: {}", e);
             }
             let _ = scratch_freq; // written by supersede_and_rekey_or_bundle, unused on this path
@@ -5292,6 +5968,8 @@ impl super::ApplicationCoordinator {
             // the worker refuses to key PTT for a request whose `qso_id` is no
             // longer present (superseded / cancelled / completed-past-grace).
             let active_tx_qsos = self.active_tx_qsos.clone();
+            // PAN-76: QSOs Fox mode opened keep their TX slots after Fox mode is turned off.
+            let fox_admitted_qsos = self.fox_admitted_qsos.clone();
             // PAN-141: DX-parity freshness check (Step 4b-adjacent, see
             // `dx_parity_conflict_for_qso`). `cross_time_state` is coordinator-
             // owned and outlives a supervised Qso-component restart, so a plain
@@ -5403,6 +6081,14 @@ impl super::ApplicationCoordinator {
                 // (coordinator/mod.rs) for the pure membership check.
                 let mut pivoted_once: std::collections::HashMap<String, (String, f64)> =
                     std::collections::HashMap::new();
+                // PAN-75: the text and payload each tombstoned pivot replaced.
+                // Written with every `pivoted_once` insert and read only on a
+                // Step 0-dup hit, so entries left behind when a tombstone is
+                // cleared are inert.
+                let mut pivoted_from: std::collections::HashMap<
+                    String,
+                    (String, pancetta_qso::UnsentAttemptPayload),
+                > = std::collections::HashMap::new();
 
                 'worker: while !shutdown.load(Ordering::Acquire) {
                     // Reset the per-message abort flag at the start of every
@@ -5613,6 +6299,10 @@ impl super::ApplicationCoordinator {
                                     &tx_rx,
                                     &message_bus,
                                     &active_tx_qsos,
+                                    &fox_admitted_qsos,
+                                    // Deliberately the UNRAISED ceiling (PAN-76): the
+                                    // coalescer raises it only to the Fox-admitted
+                                    // streams present in this backlog.
                                     effective_max_concurrent_qsos(
                                         max_concurrent_qsos,
                                         &fox_mode,
@@ -5621,6 +6311,7 @@ impl super::ApplicationCoordinator {
                                     &remote_tx_arm,
                                     &audit_log,
                                     &display_feed_enabled,
+                                    Some((&mut pivoted_once, &mut pivoted_from)),
                                 )
                                 .await;
 
@@ -5712,21 +6403,18 @@ impl super::ApplicationCoordinator {
                                         )
                                         .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
-                                        if let Some(id) = qso_id.as_deref() {
-                                            pivoted_once.remove(&super::active_tx_qso_key(id));
-                                        }
-                                        let complete_msg = ComponentMessage::new(
-                                            ComponentId::Ft8Transmitter,
-                                            ComponentId::Autonomous,
-                                            MessageType::TransmitComplete {
-                                                success: false,
-                                                message_text,
-                                                duration_ms: 0,
-                                                qso_id: qso_id.clone(),
-                                            },
-                                            Instant::now(),
-                                        );
-                                        let _ = message_bus.send_message(complete_msg).await;
+                                        let replaced = qso_id.as_deref().and_then(|id| {
+                                            let key = super::active_tx_qso_key(id);
+                                            pivoted_once.remove(&key);
+                                            pivoted_from.remove(&key)
+                                        });
+                                        report_pivot_duplicate_dropped(
+                                            &message_bus,
+                                            message_text,
+                                            qso_id.clone(),
+                                            replaced,
+                                        )
+                                        .await;
                                         continue;
                                     }
 
@@ -5763,18 +6451,14 @@ impl super::ApplicationCoordinator {
                                         )
                                         .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
-                                        let complete_msg = ComponentMessage::new(
-                                            ComponentId::Ft8Transmitter,
-                                            ComponentId::Autonomous,
-                                            MessageType::TransmitComplete {
-                                                success: false,
-                                                message_text,
-                                                duration_ms: 0,
-                                                qso_id: qso_id.clone(),
-                                            },
-                                            Instant::now(),
-                                        );
-                                        let _ = message_bus.send_message(complete_msg).await;
+                                        let _ = report_transmit_complete(
+                                            &message_bus,
+                                            false,
+                                            message_text,
+                                            0,
+                                            qso_id.clone(),
+                                        )
+                                        .await;
                                         continue;
                                     }
 
@@ -5791,7 +6475,7 @@ impl super::ApplicationCoordinator {
                                     if origin == crate::message_bus::TxOrigin::Remote
                                         && !remote_tx_permitted_for(
                                             &remote_tx_arm,
-                                            chrono::Utc::now().timestamp_millis(),
+                                            pancetta_agent::arm::ArmTime::now,
                                             remote_client_key_id.as_deref(),
                                         )
                                     {
@@ -5838,18 +6522,14 @@ impl super::ApplicationCoordinator {
                                         )
                                         .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
-                                        let complete_msg = ComponentMessage::new(
-                                            ComponentId::Ft8Transmitter,
-                                            ComponentId::Autonomous,
-                                            MessageType::TransmitComplete {
-                                                success: false,
-                                                message_text,
-                                                duration_ms: 0,
-                                                qso_id: qso_id.clone(),
-                                            },
-                                            Instant::now(),
-                                        );
-                                        let _ = message_bus.send_message(complete_msg).await;
+                                        let _ = report_transmit_complete(
+                                            &message_bus,
+                                            false,
+                                            message_text,
+                                            0,
+                                            qso_id.clone(),
+                                        )
+                                        .await;
                                         continue;
                                     }
 
@@ -5912,18 +6592,14 @@ impl super::ApplicationCoordinator {
                                                 ),
                                             )
                                             .await;
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text,
-                                                    duration_ms: 0,
-                                                    qso_id: qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                message_text,
+                                                0,
+                                                qso_id.clone(),
+                                            )
+                                            .await;
                                             continue 'worker;
                                         }
                                         // Encode + modulate under the active protocol.
@@ -5969,19 +6645,14 @@ impl super::ApplicationCoordinator {
                                                     &format!("encode/modulate error ({e})"),
                                                 )
                                                 .await;
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text,
-                                                        duration_ms: 0,
-                                                        qso_id: qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                let _ =
-                                                    message_bus.send_message(complete_msg).await;
+                                                let _ = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    message_text,
+                                                    0,
+                                                    qso_id.clone(),
+                                                )
+                                                .await;
                                                 continue 'worker;
                                             }
                                         };
@@ -6061,19 +6732,14 @@ impl super::ApplicationCoordinator {
                                                     Vec::new(),
                                                 )
                                                 .await;
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text,
-                                                        duration_ms: 0,
-                                                        qso_id: qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                let _ =
-                                                    message_bus.send_message(complete_msg).await;
+                                                let _ = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    message_text,
+                                                    0,
+                                                    qso_id.clone(),
+                                                )
+                                                .await;
                                                 continue 'worker;
                                             }
                                             send_tx_queue_status(
@@ -6089,51 +6755,79 @@ impl super::ApplicationCoordinator {
                                             .await;
                                         }
 
-                                        // --- Step 4: Sleep until PTT engage instant ---
+                                        // --- Step 4: Wait until PTT engage instant ---
+                                        // PAN-114: waits on the wall clock (re-read every
+                                        // 50 ms chunk), so a clock jump during the wait is
+                                        // seen before PTT instead of keying a late or
+                                        // garbage frame — see `wait_for_ptt_instant`.
                                         let ptt_target_utc = schedule.target_slot
                                             - chrono::Duration::milliseconds(ptt_lead_ms as i64);
-                                        let to_ptt = pancetta_core::slot::duration_until(
+                                        match wait_for_ptt_instant(
                                             ptt_target_utc,
-                                            chrono::Utc::now(),
-                                        );
-                                        if interruptible_sleep(to_ptt, &shutdown, &abort_current_tx)
-                                            .await
+                                            schedule.target_slot,
+                                            tx_late_max_ms_effective(
+                                                active_protocol,
+                                                tx_late_max_ms,
+                                            ),
+                                            slot_ns,
+                                            &shutdown,
+                                            &abort_current_tx,
+                                            chrono::Utc::now,
+                                        )
+                                        .await
                                         {
-                                            if shutdown.load(Ordering::Acquire) {
-                                                info!("TX aborted before PTT engage by shutdown");
-                                                break 'worker;
-                                            }
-                                            info!("TX aborted before PTT engage by operator (F8)");
-                                            // This abort happens BEFORE the TxStatusGuard is
-                                            // constructed, so its Drop-based clear never runs.
-                                            // Clear the strip explicitly so the QUEUED row
-                                            // doesn't sit stale until the next status push.
-                                            send_tx_queue_status(&message_bus, None, Vec::new())
+                                            PttWait::Reached => {}
+                                            PttWait::ClockJumped(jump) => {
+                                                drop_frames_for_clock_jump(
+                                                    &message_bus,
+                                                    &[(message_text.clone(), qso_id.clone())],
+                                                    jump,
+                                                    &mut PivotReplaced::new(),
+                                                )
                                                 .await;
-                                            // PAN-38 round 3 (Codex): an F8 abort here is the
-                                            // one path in this worker that previously sent NO
-                                            // TransmitComplete at all -- for a self-CQ whose
-                                            // QSO was already opened (AutonomousCqOpened
-                                            // registered it in the coordinator's
-                                            // pending_self_cq_qsos map), that left the entry
-                                            // permanently leaked and the speculative "+1"
-                                            // streak never rolled back, since nothing ever
-                                            // told the autonomous operator this attempt did
-                                            // not actually transmit. Report it exactly like
-                                            // the drop-stale-TX case above.
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: message_text.clone(),
-                                                    duration_ms: 0,
-                                                    qso_id: qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
-                                            continue 'worker;
+                                                continue 'worker;
+                                            }
+                                            PttWait::Interrupted => {
+                                                if shutdown.load(Ordering::Acquire) {
+                                                    info!(
+                                                        "TX aborted before PTT engage by shutdown"
+                                                    );
+                                                    break 'worker;
+                                                }
+                                                info!(
+                                                    "TX aborted before PTT engage by operator (F8)"
+                                                );
+                                                // This abort happens BEFORE the TxStatusGuard is
+                                                // constructed, so its Drop-based clear never runs.
+                                                // Clear the strip explicitly so the QUEUED row
+                                                // doesn't sit stale until the next status push.
+                                                send_tx_queue_status(
+                                                    &message_bus,
+                                                    None,
+                                                    Vec::new(),
+                                                )
+                                                .await;
+                                                // PAN-38 round 3 (Codex): an F8 abort here is the
+                                                // one path in this worker that previously sent NO
+                                                // TransmitComplete at all -- for a self-CQ whose
+                                                // QSO was already opened (AutonomousCqOpened
+                                                // registered it in the coordinator's
+                                                // pending_self_cq_qsos map), that left the entry
+                                                // permanently leaked and the speculative "+1"
+                                                // streak never rolled back, since nothing ever
+                                                // told the autonomous operator this attempt did
+                                                // not actually transmit. Report it exactly like
+                                                // the drop-stale-TX case above.
+                                                let _ = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    message_text.clone(),
+                                                    0,
+                                                    qso_id.clone(),
+                                                )
+                                                .await;
+                                                continue 'worker;
+                                            }
                                         }
 
                                         // --- Step 4b-parity: DX-parity freshness gate (PAN-141) ---
@@ -6185,18 +6879,14 @@ impl super::ApplicationCoordinator {
                                             .await;
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text,
-                                                    duration_ms: 0,
-                                                    qso_id: qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                message_text,
+                                                0,
+                                                qso_id.clone(),
+                                            )
+                                            .await;
                                             continue 'worker;
                                         }
 
@@ -6236,20 +6926,18 @@ impl super::ApplicationCoordinator {
                                             // can't grow unboundedly across a long-running
                                             // process.
                                             if let Some(id) = qso_id.as_deref() {
-                                                pivoted_once.remove(&super::active_tx_qso_key(id));
+                                                let key = super::active_tx_qso_key(id);
+                                                pivoted_once.remove(&key);
+                                                pivoted_from.remove(&key);
                                             }
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text,
-                                                    duration_ms: 0,
-                                                    qso_id: qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                message_text,
+                                                0,
+                                                qso_id.clone(),
+                                            )
+                                            .await;
                                             continue 'worker;
                                         }
 
@@ -6266,7 +6954,7 @@ impl super::ApplicationCoordinator {
                                         if origin == crate::message_bus::TxOrigin::Remote
                                             && !remote_tx_permitted_for(
                                                 &remote_tx_arm,
-                                                chrono::Utc::now().timestamp_millis(),
+                                                pancetta_agent::arm::ArmTime::now,
                                                 remote_client_key_id.as_deref(),
                                             )
                                         {
@@ -6295,18 +6983,14 @@ impl super::ApplicationCoordinator {
                                             .await;
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text,
-                                                    duration_ms: 0,
-                                                    qso_id: qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                message_text,
+                                                0,
+                                                qso_id.clone(),
+                                            )
+                                            .await;
                                             continue 'worker;
                                         }
 
@@ -6330,18 +7014,14 @@ impl super::ApplicationCoordinator {
                                             .await;
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text,
-                                                    duration_ms: 0,
-                                                    qso_id: qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                message_text,
+                                                0,
+                                                qso_id.clone(),
+                                            )
+                                            .await;
                                             continue 'worker;
                                         }
 
@@ -6412,18 +7092,14 @@ impl super::ApplicationCoordinator {
                                             "internal scheduling error (cursor exceeded waveform at key-time)",
                                         )
                                         .await;
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text,
-                                                    duration_ms: 0,
-                                                    qso_id: qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                message_text,
+                                                0,
+                                                qso_id.clone(),
+                                            )
+                                            .await;
                                             continue 'worker;
                                         }
                                         let audio_duration_ms =
@@ -6529,7 +7205,19 @@ impl super::ApplicationCoordinator {
                                                         new_freq,
                                                         qso_id.as_deref().unwrap_or("-")
                                                     );
-                                                    message_text = new_text;
+                                                    let replaced =
+                                                        pancetta_qso::UnsentAttemptPayload {
+                                                            frequency_hz: frequency_offset,
+                                                            remote_binding: Some((
+                                                                origin
+                                                                    == crate::message_bus::TxOrigin::Remote,
+                                                                remote_client_key_id.clone(),
+                                                            )),
+                                                        };
+                                                    let pivoted_from_text = std::mem::replace(
+                                                        &mut message_text,
+                                                        new_text,
+                                                    );
                                                     frequency_offset = new_freq;
                                                     audio_out = rebuilt;
                                                     // Round-4 review (Codex P1): the
@@ -6563,6 +7251,10 @@ impl super::ApplicationCoordinator {
                                                                 message_text.clone(),
                                                                 frequency_offset,
                                                             ),
+                                                        );
+                                                        pivoted_from.insert(
+                                                            key.clone(),
+                                                            (pivoted_from_text, replaced),
                                                         );
                                                         pivoted_this_key = Some(key);
                                                     }
@@ -6626,9 +7318,11 @@ impl super::ApplicationCoordinator {
                                             ptt_guard.disarm();
                                             // Same tombstone cleanup as the arm-denial branch
                                             // below — nothing reached the air.
-                                            if let Some(key) = pivoted_this_key.take() {
-                                                pivoted_once.remove(&key);
-                                            }
+                                            let pivot_replaced =
+                                                pivoted_this_key.take().and_then(|key| {
+                                                    pivoted_once.remove(&key);
+                                                    pivoted_from.remove(&key)
+                                                });
                                             let (log_msg, diag_msg) = match denial {
                                                 FinalGateDenial::StaleQso => (
                                                     format!(
@@ -6660,18 +7354,13 @@ impl super::ApplicationCoordinator {
                                             .await;
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text,
-                                                    duration_ms: 0,
-                                                    qso_id: qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_unaired_frame(
+                                                &message_bus,
+                                                message_text,
+                                                qso_id.clone(),
+                                                pivot_replaced,
+                                            )
+                                            .await;
                                             continue 'worker;
                                         }
 
@@ -6695,9 +7384,11 @@ impl super::ApplicationCoordinator {
                                         ) {
                                             ptt_active.store(false, Ordering::Release);
                                             ptt_guard.disarm();
-                                            if let Some(key) = pivoted_this_key.take() {
-                                                pivoted_once.remove(&key);
-                                            }
+                                            let pivot_replaced =
+                                                pivoted_this_key.take().and_then(|key| {
+                                                    pivoted_once.remove(&key);
+                                                    pivoted_from.remove(&key)
+                                                });
                                             info!(
                                                 target: "pancetta::tx.policy",
                                                 "TX blocked at final pre-PTT check ({reason}): '{message_text}' (qso: {:?})",
@@ -6715,18 +7406,13 @@ impl super::ApplicationCoordinator {
                                             .await;
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text,
-                                                    duration_ms: 0,
-                                                    qso_id: qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_unaired_frame(
+                                                &message_bus,
+                                                message_text,
+                                                qso_id.clone(),
+                                                pivot_replaced,
+                                            )
+                                            .await;
                                             continue 'worker;
                                         }
 
@@ -6748,7 +7434,7 @@ impl super::ApplicationCoordinator {
                                         if origin == crate::message_bus::TxOrigin::Remote
                                             && !remote_tx_permitted_for(
                                                 &remote_tx_arm,
-                                                chrono::Utc::now().timestamp_millis(),
+                                                pancetta_agent::arm::ArmTime::now,
                                                 remote_client_key_id.as_deref(),
                                             )
                                         {
@@ -6761,9 +7447,11 @@ impl super::ApplicationCoordinator {
                                             // this one must NOT be discarded by Step 0-dup as
                                             // an already-sent duplicate of a pivot that never
                                             // transmitted.
-                                            if let Some(key) = pivoted_this_key.take() {
-                                                pivoted_once.remove(&key);
-                                            }
+                                            let pivot_replaced =
+                                                pivoted_this_key.take().and_then(|key| {
+                                                    pivoted_once.remove(&key);
+                                                    pivoted_from.remove(&key)
+                                                });
                                             let denial_reason = format!(
                                                 "arm went stale in the pre-PTT gap: '{message_text}' at {frequency_offset:.0} Hz"
                                             );
@@ -6783,18 +7471,13 @@ impl super::ApplicationCoordinator {
                                             .await;
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text,
-                                                    duration_ms: 0,
-                                                    qso_id: qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_unaired_frame(
+                                                &message_bus,
+                                                message_text,
+                                                qso_id.clone(),
+                                                pivot_replaced,
+                                            )
+                                            .await;
                                             continue 'worker;
                                         }
 
@@ -6827,6 +7510,59 @@ impl super::ApplicationCoordinator {
                                             schedule.target_slot,
                                             chrono::Utc::now(),
                                         );
+                                        // PAN-114 (D6): a backward clock step between Step 4
+                                        // and here would hold PTT keyed for the size of the
+                                        // step (measured: 600 s). Never hold it past
+                                        // `ptt_lead_ms` + PTT_HOLD_SLACK_MS; release PTT
+                                        // FIRST, exactly like `SleepOutcome::AbortedByDisarm`.
+                                        if ptt_hold_exceeds_bound(to_slot, ptt_lead_ms) {
+                                            let ptt_off_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Hamlib,
+                                                MessageType::RigControl(
+                                                    crate::message_bus::RigControlMessage::SetPtt {
+                                                        state: false,
+                                                    },
+                                                ),
+                                                Instant::now(),
+                                            );
+                                            if let Err(e) =
+                                                message_bus.send_message(ptt_off_msg).await
+                                            {
+                                                warn!(
+                                                    "Clock-step PTT hold guard: PTT OFF failed: {}",
+                                                    e
+                                                );
+                                            }
+                                            ptt_active.store(false, Ordering::Release);
+                                            ptt_guard.disarm();
+                                            // Pre-slot abort: nothing reached the air, so a
+                                            // Step 4c pivot tombstone must go too (same as
+                                            // the AbortedByDisarm branch below).
+                                            let pivot_replaced =
+                                                pivoted_this_key.take().and_then(|key| {
+                                                    pivoted_once.remove(&key);
+                                                    pivoted_from.remove(&key)
+                                                });
+                                            drop_frames_for_clock_jump(
+                                                &message_bus,
+                                                &[(message_text.clone(), qso_id.clone())],
+                                                pancetta_core::slot_clock::WallClockJump::Backward(
+                                                    chrono::Duration::from_std(to_slot)
+                                                        .unwrap_or(chrono::Duration::MAX),
+                                                ),
+                                                &mut qso_id
+                                                    .as_deref()
+                                                    .zip(pivot_replaced)
+                                                    .map(|(id, r)| {
+                                                        (super::active_tx_qso_key(id), r)
+                                                    })
+                                                    .into_iter()
+                                                    .collect(),
+                                            )
+                                            .await;
+                                            continue 'worker;
+                                        }
                                         // ptt_guard in scope — drop on any loop exit fires
                                         // PTT-off. A qualifying request arriving here supersedes
                                         // the in-flight frame (aborts + re-keys).
@@ -6868,19 +7604,14 @@ impl super::ApplicationCoordinator {
                                                 // completion here too -- see the "aborted before
                                                 // PTT engage" comment earlier in this worker for
                                                 // the full leak this closes.
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: message_text.clone(),
-                                                        duration_ms: 0,
-                                                        qso_id: qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                if let Err(e) =
-                                                    message_bus.send_message(complete_msg).await
+                                                if let Err(e) = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    message_text.clone(),
+                                                    0,
+                                                    qso_id.clone(),
+                                                )
+                                                .await
                                                 {
                                                     warn!("Failed to send TransmitComplete: {}", e);
                                                 }
@@ -6923,9 +7654,11 @@ impl super::ApplicationCoordinator {
                                                 // the genuinely fresh, still-queued request is
                                                 // wrongly discarded as an already-sent pivot
                                                 // duplicate.
-                                                if let Some(key) = pivoted_this_key.take() {
-                                                    pivoted_once.remove(&key);
-                                                }
+                                                let pivot_replaced =
+                                                    pivoted_this_key.take().and_then(|key| {
+                                                        pivoted_once.remove(&key);
+                                                        pivoted_from.remove(&key)
+                                                    });
                                                 // Round-9 review (Codex P1): drain HERE,
                                                 // after PTT is already off, not inside
                                                 // `interruptible_sleep_or_supersede` before
@@ -6949,19 +7682,13 @@ impl super::ApplicationCoordinator {
                                                     qso_id.as_deref(),
                                                 )
                                                 .await;
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: message_text.clone(),
-                                                        duration_ms: 0,
-                                                        qso_id: qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                if let Err(e) =
-                                                    message_bus.send_message(complete_msg).await
+                                                if let Err(e) = report_unaired_frame(
+                                                    &message_bus,
+                                                    message_text.clone(),
+                                                    qso_id.clone(),
+                                                    pivot_replaced,
+                                                )
+                                                .await
                                                 {
                                                     warn!("Failed to send TransmitComplete: {}", e);
                                                 }
@@ -6993,10 +7720,16 @@ impl super::ApplicationCoordinator {
                                                     slot_ns,
                                                     tx_self_parity,
                                                     request_received_at,
-                                                    effective_max_concurrent_qsos(
-                                                        max_concurrent_qsos,
-                                                        &fox_mode,
-                                                        &fox_max_streams,
+                                                    supersede_max_concurrent_qsos(
+                                                        effective_max_concurrent_qsos(
+                                                            max_concurrent_qsos,
+                                                            &fox_mode,
+                                                            &fox_max_streams,
+                                                        ),
+                                                        live_fox_admitted_count(
+                                                            &fox_admitted_qsos,
+                                                            &active_tx_qsos,
+                                                        ),
                                                     ),
                                                     origin,
                                                     remote_client_key_id.clone(),
@@ -7013,6 +7746,29 @@ impl super::ApplicationCoordinator {
                                                         // explicit send failed. No competing enqueue
                                                         // here, so `pending` can go back immediately
                                                         // (PAN-73 round 4).
+                                                        // PAN-75: the abandoned frame gets the same
+                                                        // failed completion as the `Replace` arm's
+                                                        // below, so the QSO engine hands back its
+                                                        // keep-call bookkeeping.
+                                                        if let Some(abandoned) =
+                                                            in_flight_items.first()
+                                                        {
+                                                            if let Err(e) =
+                                                                report_transmit_complete(
+                                                                    &message_bus,
+                                                                    false,
+                                                                    abandoned.message_text.clone(),
+                                                                    0,
+                                                                    abandoned.qso_id.clone(),
+                                                                )
+                                                                .await
+                                                            {
+                                                                warn!(
+                                                                    "Failed to send TransmitComplete: {}",
+                                                                    e
+                                                                );
+                                                            }
+                                                        }
                                                         reenqueue_pending(&message_bus, pending)
                                                             .await;
                                                         break 'key_and_send;
@@ -7053,24 +7809,14 @@ impl super::ApplicationCoordinator {
                                                         if let Some(abandoned) =
                                                             in_flight_items.first()
                                                         {
-                                                            let complete_msg =
-                                                                ComponentMessage::new(
-                                                                    ComponentId::Ft8Transmitter,
-                                                                    ComponentId::Autonomous,
-                                                                    MessageType::TransmitComplete {
-                                                                        success: false,
-                                                                        message_text: abandoned
-                                                                            .message_text
-                                                                            .clone(),
-                                                                        duration_ms: 0,
-                                                                        qso_id: abandoned
-                                                                            .qso_id
-                                                                            .clone(),
-                                                                    },
-                                                                    Instant::now(),
-                                                                );
-                                                            if let Err(e) = message_bus
-                                                                .send_message(complete_msg)
+                                                            if let Err(e) =
+                                                                report_transmit_complete(
+                                                                    &message_bus,
+                                                                    false,
+                                                                    abandoned.message_text.clone(),
+                                                                    0,
+                                                                    abandoned.qso_id.clone(),
+                                                                )
                                                                 .await
                                                             {
                                                                 warn!(
@@ -7182,24 +7928,14 @@ impl super::ApplicationCoordinator {
                                                         if let Some(abandoned) =
                                                             in_flight_items.first()
                                                         {
-                                                            let complete_msg =
-                                                                ComponentMessage::new(
-                                                                    ComponentId::Ft8Transmitter,
-                                                                    ComponentId::Autonomous,
-                                                                    MessageType::TransmitComplete {
-                                                                        success: false,
-                                                                        message_text: abandoned
-                                                                            .message_text
-                                                                            .clone(),
-                                                                        duration_ms: 0,
-                                                                        qso_id: abandoned
-                                                                            .qso_id
-                                                                            .clone(),
-                                                                    },
-                                                                    Instant::now(),
-                                                                );
-                                                            if let Err(e) = message_bus
-                                                                .send_message(complete_msg)
+                                                            if let Err(e) =
+                                                                report_transmit_complete(
+                                                                    &message_bus,
+                                                                    false,
+                                                                    abandoned.message_text.clone(),
+                                                                    0,
+                                                                    abandoned.qso_id.clone(),
+                                                                )
                                                                 .await
                                                             {
                                                                 warn!("Failed to send TransmitComplete: {}", e);
@@ -7245,7 +7981,7 @@ impl super::ApplicationCoordinator {
                                         if origin == crate::message_bus::TxOrigin::Remote
                                             && !remote_tx_permitted_for(
                                                 &remote_tx_arm,
-                                                chrono::Utc::now().timestamp_millis(),
+                                                pancetta_agent::arm::ArmTime::now,
                                                 remote_client_key_id.as_deref(),
                                             )
                                         {
@@ -7269,9 +8005,11 @@ impl super::ApplicationCoordinator {
                                             }
                                             ptt_active.store(false, Ordering::Release);
                                             ptt_guard.disarm();
-                                            if let Some(key) = pivoted_this_key.take() {
-                                                pivoted_once.remove(&key);
-                                            }
+                                            let pivot_replaced =
+                                                pivoted_this_key.take().and_then(|key| {
+                                                    pivoted_once.remove(&key);
+                                                    pivoted_from.remove(&key)
+                                                });
                                             let denial_reason = format!(
                                                 "arm went stale before audio delivery: '{message_text}' at {frequency_offset:.0} Hz"
                                             );
@@ -7291,18 +8029,13 @@ impl super::ApplicationCoordinator {
                                             .await;
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text,
-                                                    duration_ms: 0,
-                                                    qso_id: qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_unaired_frame(
+                                                &message_bus,
+                                                message_text,
+                                                qso_id.clone(),
+                                                pivot_replaced,
+                                            )
+                                            .await;
                                             continue 'worker;
                                         }
 
@@ -7380,19 +8113,14 @@ impl super::ApplicationCoordinator {
                                                 // PAN-38 round 4 (Codex): report the failed
                                                 // completion here too -- see the "aborted before
                                                 // PTT engage" comment earlier in this worker.
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: message_text.clone(),
-                                                        duration_ms: 0,
-                                                        qso_id: qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                if let Err(e) =
-                                                    message_bus.send_message(complete_msg).await
+                                                if let Err(e) = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    message_text.clone(),
+                                                    0,
+                                                    qso_id.clone(),
+                                                )
+                                                .await
                                                 {
                                                     warn!("Failed to send TransmitComplete: {}", e);
                                                 }
@@ -7476,19 +8204,14 @@ impl super::ApplicationCoordinator {
                                                     qso_id.as_deref(),
                                                 )
                                                 .await;
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: message_text.clone(),
-                                                        duration_ms: 0,
-                                                        qso_id: qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                if let Err(e) =
-                                                    message_bus.send_message(complete_msg).await
+                                                if let Err(e) = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    message_text.clone(),
+                                                    0,
+                                                    qso_id.clone(),
+                                                )
+                                                .await
                                                 {
                                                     warn!("Failed to send TransmitComplete: {}", e);
                                                 }
@@ -7518,10 +8241,16 @@ impl super::ApplicationCoordinator {
                                                     slot_ns,
                                                     tx_self_parity,
                                                     request_received_at,
-                                                    effective_max_concurrent_qsos(
-                                                        max_concurrent_qsos,
-                                                        &fox_mode,
-                                                        &fox_max_streams,
+                                                    supersede_max_concurrent_qsos(
+                                                        effective_max_concurrent_qsos(
+                                                            max_concurrent_qsos,
+                                                            &fox_mode,
+                                                            &fox_max_streams,
+                                                        ),
+                                                        live_fox_admitted_count(
+                                                            &fox_admitted_qsos,
+                                                            &active_tx_qsos,
+                                                        ),
                                                     ),
                                                     origin,
                                                     remote_client_key_id.clone(),
@@ -7535,6 +8264,27 @@ impl super::ApplicationCoordinator {
                                                         // retry loop and fall through to next
                                                         // dequeue. No competing enqueue, so
                                                         // `pending` goes back now (PAN-73 round 4).
+                                                        // PAN-75: report the abandoned frame as
+                                                        // the Step 6 `NotViable` arm does.
+                                                        if let Some(abandoned) =
+                                                            in_flight_items.first()
+                                                        {
+                                                            if let Err(e) =
+                                                                report_transmit_complete(
+                                                                    &message_bus,
+                                                                    false,
+                                                                    abandoned.message_text.clone(),
+                                                                    0,
+                                                                    abandoned.qso_id.clone(),
+                                                                )
+                                                                .await
+                                                            {
+                                                                warn!(
+                                                                    "Failed to send TransmitComplete: {}",
+                                                                    e
+                                                                );
+                                                            }
+                                                        }
                                                         reenqueue_pending(&message_bus, pending)
                                                             .await;
                                                         break 'key_and_send;
@@ -7565,24 +8315,14 @@ impl super::ApplicationCoordinator {
                                                         if let Some(abandoned) =
                                                             in_flight_items.first()
                                                         {
-                                                            let complete_msg =
-                                                                ComponentMessage::new(
-                                                                    ComponentId::Ft8Transmitter,
-                                                                    ComponentId::Autonomous,
-                                                                    MessageType::TransmitComplete {
-                                                                        success: false,
-                                                                        message_text: abandoned
-                                                                            .message_text
-                                                                            .clone(),
-                                                                        duration_ms: 0,
-                                                                        qso_id: abandoned
-                                                                            .qso_id
-                                                                            .clone(),
-                                                                    },
-                                                                    Instant::now(),
-                                                                );
-                                                            if let Err(e) = message_bus
-                                                                .send_message(complete_msg)
+                                                            if let Err(e) =
+                                                                report_transmit_complete(
+                                                                    &message_bus,
+                                                                    false,
+                                                                    abandoned.message_text.clone(),
+                                                                    0,
+                                                                    abandoned.qso_id.clone(),
+                                                                )
                                                                 .await
                                                             {
                                                                 warn!(
@@ -7672,24 +8412,14 @@ impl super::ApplicationCoordinator {
                                                         if let Some(abandoned) =
                                                             in_flight_items.first()
                                                         {
-                                                            let complete_msg =
-                                                                ComponentMessage::new(
-                                                                    ComponentId::Ft8Transmitter,
-                                                                    ComponentId::Autonomous,
-                                                                    MessageType::TransmitComplete {
-                                                                        success: false,
-                                                                        message_text: abandoned
-                                                                            .message_text
-                                                                            .clone(),
-                                                                        duration_ms: 0,
-                                                                        qso_id: abandoned
-                                                                            .qso_id
-                                                                            .clone(),
-                                                                    },
-                                                                    Instant::now(),
-                                                                );
-                                                            if let Err(e) = message_bus
-                                                                .send_message(complete_msg)
+                                                            if let Err(e) =
+                                                                report_transmit_complete(
+                                                                    &message_bus,
+                                                                    false,
+                                                                    abandoned.message_text.clone(),
+                                                                    0,
+                                                                    abandoned.qso_id.clone(),
+                                                                )
                                                                 .await
                                                             {
                                                                 warn!(
@@ -7749,19 +8479,14 @@ impl super::ApplicationCoordinator {
                                             // pending_self_cq_qsos and, if `success` is false,
                                             // never roll back the streak) or fabricating a
                                             // failure for a CQ that may have transmitted fine.
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success,
-                                                    message_text: message_text.clone(),
-                                                    duration_ms,
-                                                    qso_id: qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            if let Err(e) =
-                                                message_bus.send_message(complete_msg).await
+                                            if let Err(e) = report_transmit_complete(
+                                                &message_bus,
+                                                success,
+                                                message_text.clone(),
+                                                duration_ms,
+                                                qso_id.clone(),
+                                            )
+                                            .await
                                             {
                                                 warn!("Failed to send TransmitComplete: {}", e);
                                             }
@@ -7787,18 +8512,14 @@ impl super::ApplicationCoordinator {
                                         ptt_guard.disarm();
 
                                         // --- Step 10: Send TransmitComplete ---
-                                        let complete_msg = ComponentMessage::new(
-                                            ComponentId::Ft8Transmitter,
-                                            ComponentId::Autonomous,
-                                            MessageType::TransmitComplete {
-                                                success,
-                                                message_text,
-                                                duration_ms,
-                                                qso_id: qso_id.clone(),
-                                            },
-                                            Instant::now(),
-                                        );
-                                        if let Err(e) = message_bus.send_message(complete_msg).await
+                                        if let Err(e) = report_transmit_complete(
+                                            &message_bus,
+                                            success,
+                                            message_text,
+                                            duration_ms,
+                                            qso_id.clone(),
+                                        )
+                                        .await
                                         {
                                             warn!("Failed to send TransmitComplete: {}", e);
                                         }
@@ -7860,23 +8581,19 @@ impl super::ApplicationCoordinator {
                                                     item.qso_id.as_deref(),
                                                 )
                                                 .await;
-                                                if let Some(id) = item.qso_id.as_deref() {
-                                                    pivoted_once
-                                                        .remove(&super::active_tx_qso_key(id));
-                                                }
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: item.message_text.clone(),
-                                                        duration_ms: 0,
-                                                        qso_id: item.qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                let _ =
-                                                    message_bus.send_message(complete_msg).await;
+                                                let replaced =
+                                                    item.qso_id.as_deref().and_then(|id| {
+                                                        let key = super::active_tx_qso_key(id);
+                                                        pivoted_once.remove(&key);
+                                                        pivoted_from.remove(&key)
+                                                    });
+                                                report_pivot_duplicate_dropped(
+                                                    &message_bus,
+                                                    item.message_text.clone(),
+                                                    item.qso_id.clone(),
+                                                    replaced,
+                                                )
+                                                .await;
                                             } else {
                                                 kept.push(item);
                                             }
@@ -7935,18 +8652,14 @@ impl super::ApplicationCoordinator {
                                         .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: item.message_text.clone(),
-                                                    duration_ms: 0,
-                                                    qso_id: item.qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                item.message_text.clone(),
+                                                0,
+                                                item.qso_id.clone(),
+                                            )
+                                            .await;
                                         }
                                         continue;
                                     }
@@ -7960,7 +8673,7 @@ impl super::ApplicationCoordinator {
                                     if origin == crate::message_bus::TxOrigin::Remote
                                         && !remote_tx_permitted_for(
                                             &remote_tx_arm,
-                                            chrono::Utc::now().timestamp_millis(),
+                                            pancetta_agent::arm::ArmTime::now,
                                             remote_client_key_id.as_deref(),
                                         )
                                     {
@@ -8010,18 +8723,14 @@ impl super::ApplicationCoordinator {
                                         .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: item.message_text.clone(),
-                                                    duration_ms: 0,
-                                                    qso_id: item.qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                item.message_text.clone(),
+                                                0,
+                                                item.qso_id.clone(),
+                                            )
+                                            .await;
                                         }
                                         continue;
                                     }
@@ -8059,19 +8768,14 @@ impl super::ApplicationCoordinator {
                                                     item.qso_id.as_deref(),
                                                 )
                                                 .await;
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: item.message_text.clone(),
-                                                        duration_ms: 0,
-                                                        qso_id: item.qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                let _ =
-                                                    message_bus.send_message(complete_msg).await;
+                                                let _ = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    item.message_text.clone(),
+                                                    0,
+                                                    item.qso_id.clone(),
+                                                )
+                                                .await;
                                             }
                                         }
                                         items = kept;
@@ -8141,18 +8845,14 @@ impl super::ApplicationCoordinator {
                                             "encoding error",
                                         )
                                         .await;
-                                        let complete_msg = ComponentMessage::new(
-                                            ComponentId::Ft8Transmitter,
-                                            ComponentId::Autonomous,
-                                            MessageType::TransmitComplete {
-                                                success: false,
-                                                message_text: item.message_text.clone(),
-                                                duration_ms: 0,
-                                                qso_id: item.qso_id.clone(),
-                                            },
-                                            Instant::now(),
-                                        );
-                                        let _ = message_bus.send_message(complete_msg).await;
+                                        let _ = report_transmit_complete(
+                                            &message_bus,
+                                            false,
+                                            item.message_text.clone(),
+                                            0,
+                                            item.qso_id.clone(),
+                                        )
+                                        .await;
                                     }
 
                                     // 2026-07-17 (post-review): rebind `items` itself to
@@ -8206,19 +8906,14 @@ impl super::ApplicationCoordinator {
                                             for (text, qso_id) in
                                                 item_texts.into_iter().zip(encoded_qso_ids)
                                             {
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: text,
-                                                        duration_ms: 0,
-                                                        qso_id,
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                let _ =
-                                                    message_bus.send_message(complete_msg).await;
+                                                let _ = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    text,
+                                                    0,
+                                                    qso_id,
+                                                )
+                                                .await;
                                             }
                                             continue;
                                         }
@@ -8300,19 +8995,14 @@ impl super::ApplicationCoordinator {
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
                                             for item in &items {
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: item.message_text.clone(),
-                                                        duration_ms: 0,
-                                                        qso_id: item.qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                let _ =
-                                                    message_bus.send_message(complete_msg).await;
+                                                let _ = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    item.message_text.clone(),
+                                                    0,
+                                                    item.qso_id.clone(),
+                                                )
+                                                .await;
                                             }
                                             continue;
                                         }
@@ -8342,22 +9032,14 @@ impl super::ApplicationCoordinator {
                                                             item.qso_id.as_deref(),
                                                         )
                                                         .await;
-                                                        let complete_msg = ComponentMessage::new(
-                                                            ComponentId::Ft8Transmitter,
-                                                            ComponentId::Autonomous,
-                                                            MessageType::TransmitComplete {
-                                                                success: false,
-                                                                message_text: item
-                                                                    .message_text
-                                                                    .clone(),
-                                                                duration_ms: 0,
-                                                                qso_id: item.qso_id.clone(),
-                                                            },
-                                                            Instant::now(),
-                                                        );
-                                                        let _ = message_bus
-                                                            .send_message(complete_msg)
-                                                            .await;
+                                                        let _ = report_transmit_complete(
+                                                            &message_bus,
+                                                            false,
+                                                            item.message_text.clone(),
+                                                            0,
+                                                            item.qso_id.clone(),
+                                                        )
+                                                        .await;
                                                     }
                                                 }
 
@@ -8385,20 +9067,14 @@ impl super::ApplicationCoordinator {
                                                         "defer-time re-encode error",
                                                     )
                                                     .await;
-                                                    let complete_msg = ComponentMessage::new(
-                                                        ComponentId::Ft8Transmitter,
-                                                        ComponentId::Autonomous,
-                                                        MessageType::TransmitComplete {
-                                                            success: false,
-                                                            message_text: item.message_text.clone(),
-                                                            duration_ms: 0,
-                                                            qso_id: item.qso_id.clone(),
-                                                        },
-                                                        Instant::now(),
-                                                    );
-                                                    let _ = message_bus
-                                                        .send_message(complete_msg)
-                                                        .await;
+                                                    let _ = report_transmit_complete(
+                                                        &message_bus,
+                                                        false,
+                                                        item.message_text.clone(),
+                                                        0,
+                                                        item.qso_id.clone(),
+                                                    )
+                                                    .await;
                                                 }
 
                                                 // Rebind to `rebuild.encoded_items`, not the
@@ -8447,21 +9123,14 @@ impl super::ApplicationCoordinator {
                                                             .into_iter()
                                                             .zip(rebuilt_qso_ids)
                                                         {
-                                                            let complete_msg =
-                                                                ComponentMessage::new(
-                                                                    ComponentId::Ft8Transmitter,
-                                                                    ComponentId::Autonomous,
-                                                                    MessageType::TransmitComplete {
-                                                                        success: false,
-                                                                        message_text: text,
-                                                                        duration_ms: 0,
-                                                                        qso_id,
-                                                                    },
-                                                                    Instant::now(),
-                                                                );
-                                                            let _ = message_bus
-                                                                .send_message(complete_msg)
-                                                                .await;
+                                                            let _ = report_transmit_complete(
+                                                                &message_bus,
+                                                                false,
+                                                                text,
+                                                                0,
+                                                                qso_id,
+                                                            )
+                                                            .await;
                                                         }
                                                         continue;
                                                     }
@@ -8502,47 +9171,67 @@ impl super::ApplicationCoordinator {
                                     // to be sent.
                                     let raw_samples = samples;
 
-                                    // --- Step 4: Sleep until PTT engage instant ---
+                                    // --- Step 4: Wait until PTT engage instant ---
+                                    // PAN-114: wall-clock wait, same as the single-TX
+                                    // arm — see `wait_for_ptt_instant`.
                                     let ptt_target_utc = schedule.target_slot
                                         - chrono::Duration::milliseconds(ptt_lead_ms as i64);
-                                    let to_ptt = pancetta_core::slot::duration_until(
+                                    match wait_for_ptt_instant(
                                         ptt_target_utc,
-                                        chrono::Utc::now(),
-                                    );
-                                    if interruptible_sleep(to_ptt, &shutdown, &abort_current_tx)
-                                        .await
+                                        schedule.target_slot,
+                                        tx_late_max_ms_effective(active_protocol, tx_late_max_ms),
+                                        slot_ns,
+                                        &shutdown,
+                                        &abort_current_tx,
+                                        chrono::Utc::now,
+                                    )
+                                    .await
                                     {
-                                        if shutdown.load(Ordering::Acquire) {
-                                            info!("Multi-TX aborted before PTT by shutdown");
-                                            break;
+                                        PttWait::Reached => {}
+                                        PttWait::ClockJumped(jump) => {
+                                            // One drop per bundle item, like the F8
+                                            // abort below.
+                                            let frames: Vec<(String, Option<String>)> = item_texts
+                                                .into_iter()
+                                                .zip(encoded_qso_ids)
+                                                .collect();
+                                            drop_frames_for_clock_jump(
+                                                &message_bus,
+                                                &frames,
+                                                jump,
+                                                &mut PivotReplaced::new(),
+                                            )
+                                            .await;
+                                            continue;
                                         }
-                                        info!("Multi-TX aborted before PTT by operator (F8)");
-                                        // PAN-38 round 3 (Codex): same gap as the single-item
-                                        // worker's F8-before-PTT path -- no TransmitComplete
-                                        // was ever sent for any bundle item, leaking a
-                                        // self-CQ's pending_self_cq_qsos entry and never
-                                        // rolling back its speculative streak/offset.
-                                        for (text, qso_id) in
-                                            item_texts.into_iter().zip(encoded_qso_ids)
-                                        {
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: text,
-                                                    duration_ms: 0,
-                                                    qso_id,
-                                                },
-                                                Instant::now(),
-                                            );
-                                            if let Err(e) =
-                                                message_bus.send_message(complete_msg).await
-                                            {
-                                                warn!("Failed to send TransmitComplete: {}", e);
+                                        PttWait::Interrupted => {
+                                            if shutdown.load(Ordering::Acquire) {
+                                                info!("Multi-TX aborted before PTT by shutdown");
+                                                break;
                                             }
+                                            info!("Multi-TX aborted before PTT by operator (F8)");
+                                            // PAN-38 round 3 (Codex): same gap as the single-item
+                                            // worker's F8-before-PTT path -- no TransmitComplete
+                                            // was ever sent for any bundle item, leaking a
+                                            // self-CQ's pending_self_cq_qsos entry and never
+                                            // rolling back its speculative streak/offset.
+                                            for (text, qso_id) in
+                                                item_texts.into_iter().zip(encoded_qso_ids)
+                                            {
+                                                if let Err(e) = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    text,
+                                                    0,
+                                                    qso_id,
+                                                )
+                                                .await
+                                                {
+                                                    warn!("Failed to send TransmitComplete: {}", e);
+                                                }
+                                            }
+                                            continue;
                                         }
-                                        continue;
                                     }
 
                                     // --- Step 4b: Drop-stale-TX gate (key-time) ---
@@ -8630,18 +9319,14 @@ impl super::ApplicationCoordinator {
                                         .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: item.message_text.clone(),
-                                                    duration_ms: 0,
-                                                    qso_id: item.qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                item.message_text.clone(),
+                                                0,
+                                                item.qso_id.clone(),
+                                            )
+                                            .await;
                                         }
                                         continue;
                                     }
@@ -8677,6 +9362,28 @@ impl super::ApplicationCoordinator {
                                         .filter(|(_, &live)| live)
                                         .map(|(item, _)| item.clone())
                                         .collect();
+                                    // Bundle items carry no remote binding, and bundle
+                                    // pivots compare only text and offset.
+                                    let pre_pivot_frames: std::collections::HashMap<
+                                        String,
+                                        (String, pancetta_qso::UnsentAttemptPayload),
+                                    > = live_items_pre
+                                        .iter()
+                                        .filter_map(|item| {
+                                            item.qso_id.as_deref().map(|id| {
+                                                (
+                                                    super::active_tx_qso_key(id),
+                                                    (
+                                                        item.message_text.clone(),
+                                                        pancetta_qso::UnsentAttemptPayload {
+                                                            frequency_hz: item.frequency_offset,
+                                                            remote_binding: None,
+                                                        },
+                                                    ),
+                                                )
+                                            })
+                                        })
+                                        .collect();
                                     let (pivoted_live_items, pivots) =
                                         super::pivot_bundle_items(live_items_pre, &latest_snapshot);
                                     for (qso_key, new_text, new_freq) in &pivots {
@@ -8688,6 +9395,17 @@ impl super::ApplicationCoordinator {
                                             new_freq
                                         );
                                     }
+                                    // PAN-75: a refusal before the tombstones below are installed leaves each
+                                    // pivoted item's own request queued, so it reports the frame the pivot
+                                    // replaced instead (Codex P2 on PR #418).
+                                    let mut early_replaced: PivotReplaced = pivots
+                                        .iter()
+                                        .filter_map(|(key, _, _)| {
+                                            pre_pivot_frames
+                                                .get(key)
+                                                .map(|frame| (key.clone(), frame.clone()))
+                                        })
+                                        .collect();
                                     let mut piv_iter = pivoted_live_items.into_iter();
                                     let items: Vec<crate::message_bus::TransmitRequestItem> = items
                                         .into_iter()
@@ -8769,20 +9487,16 @@ impl super::ApplicationCoordinator {
                                                         )
                                                         .await;
                                                     }
-                                                    let complete_msg = ComponentMessage::new(
-                                                        ComponentId::Ft8Transmitter,
-                                                        ComponentId::Autonomous,
-                                                        MessageType::TransmitComplete {
-                                                            success: false,
-                                                            message_text: item.message_text.clone(),
-                                                            duration_ms: 0,
-                                                            qso_id: item.qso_id.clone(),
-                                                        },
-                                                        Instant::now(),
-                                                    );
-                                                    let _ = message_bus
-                                                        .send_message(complete_msg)
-                                                        .await;
+                                                    let _ = report_unaired_frame(
+                                                        &message_bus,
+                                                        item.message_text.clone(),
+                                                        item.qso_id.clone(),
+                                                        take_bundle_replaced(
+                                                            &mut early_replaced,
+                                                            item.qso_id.as_deref(),
+                                                        ),
+                                                    )
+                                                    .await;
                                                 }
                                             }
 
@@ -8810,19 +9524,16 @@ impl super::ApplicationCoordinator {
                                                     "key-time re-encode error",
                                                 )
                                                 .await;
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: item.message_text.clone(),
-                                                        duration_ms: 0,
-                                                        qso_id: item.qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                let _ =
-                                                    message_bus.send_message(complete_msg).await;
+                                                let _ = report_unaired_frame(
+                                                    &message_bus,
+                                                    item.message_text.clone(),
+                                                    item.qso_id.clone(),
+                                                    take_bundle_replaced(
+                                                        &mut early_replaced,
+                                                        item.qso_id.as_deref(),
+                                                    ),
+                                                )
+                                                .await;
                                             }
 
                                             // Rebind to `rebuild.encoded_items`, not the
@@ -8866,20 +9577,16 @@ impl super::ApplicationCoordinator {
                                                         .into_iter()
                                                         .zip(rebuilt_qso_ids)
                                                     {
-                                                        let complete_msg = ComponentMessage::new(
-                                                            ComponentId::Ft8Transmitter,
-                                                            ComponentId::Autonomous,
-                                                            MessageType::TransmitComplete {
-                                                                success: false,
-                                                                message_text: text,
-                                                                duration_ms: 0,
-                                                                qso_id,
-                                                            },
-                                                            Instant::now(),
-                                                        );
-                                                        let _ = message_bus
-                                                            .send_message(complete_msg)
-                                                            .await;
+                                                        let _ = report_unaired_frame(
+                                                            &message_bus,
+                                                            text,
+                                                            qso_id.clone(),
+                                                            take_bundle_replaced(
+                                                                &mut early_replaced,
+                                                                qso_id.as_deref(),
+                                                            ),
+                                                        )
+                                                        .await;
                                                     }
                                                     continue;
                                                 }
@@ -8910,7 +9617,7 @@ impl super::ApplicationCoordinator {
                                     if origin == crate::message_bus::TxOrigin::Remote
                                         && !remote_tx_permitted_for(
                                             &remote_tx_arm,
-                                            chrono::Utc::now().timestamp_millis(),
+                                            pancetta_agent::arm::ArmTime::now,
                                             remote_client_key_id.as_deref(),
                                         )
                                     {
@@ -8939,18 +9646,16 @@ impl super::ApplicationCoordinator {
                                         }
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: item.message_text.clone(),
-                                                    duration_ms: 0,
-                                                    qso_id: item.qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_unaired_frame(
+                                                &message_bus,
+                                                item.message_text.clone(),
+                                                item.qso_id.clone(),
+                                                take_bundle_replaced(
+                                                    &mut early_replaced,
+                                                    item.qso_id.as_deref(),
+                                                ),
+                                            )
+                                            .await;
                                         }
                                         continue;
                                     }
@@ -8978,18 +9683,16 @@ impl super::ApplicationCoordinator {
                                         .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: item.message_text.clone(),
-                                                    duration_ms: 0,
-                                                    qso_id: item.qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_unaired_frame(
+                                                &message_bus,
+                                                item.message_text.clone(),
+                                                item.qso_id.clone(),
+                                                take_bundle_replaced(
+                                                    &mut early_replaced,
+                                                    item.qso_id.as_deref(),
+                                                ),
+                                            )
+                                            .await;
                                         }
                                         continue;
                                     }
@@ -9009,6 +9712,9 @@ impl super::ApplicationCoordinator {
                                     let pivoted_this_bundle_keys: Vec<String> =
                                         pivots.iter().map(|(k, _, _)| k.clone()).collect();
                                     for (qso_key, new_text, new_freq) in pivots {
+                                        if let Some(frame) = pre_pivot_frames.get(&qso_key) {
+                                            pivoted_from.insert(qso_key.clone(), frame.clone());
+                                        }
                                         pivoted_once.insert(qso_key, (new_text, new_freq));
                                     }
 
@@ -9067,18 +9773,14 @@ impl super::ApplicationCoordinator {
                                         for (text, qso_id) in
                                             item_texts.into_iter().zip(encoded_qso_ids_final)
                                         {
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: text,
-                                                    duration_ms: 0,
-                                                    qso_id,
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                text,
+                                                0,
+                                                qso_id,
+                                            )
+                                            .await;
                                         }
                                         continue;
                                     }
@@ -9168,9 +9870,11 @@ impl super::ApplicationCoordinator {
                                     if !final_live_mask.iter().all(|&live| live) {
                                         ptt_active.store(false, Ordering::Release);
                                         ptt_guard.disarm();
-                                        for key in &pivoted_this_bundle_keys {
-                                            pivoted_once.remove(key);
-                                        }
+                                        let mut bundle_replaced = unwind_bundle_pivots(
+                                            &pivoted_this_bundle_keys,
+                                            &mut pivoted_once,
+                                            &mut pivoted_from,
+                                        );
                                         let newly_stale =
                                             final_live_mask.iter().filter(|&&live| !live).count();
                                         let held = final_parity_hold_mask
@@ -9196,18 +9900,16 @@ impl super::ApplicationCoordinator {
                                         .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: item.message_text.clone(),
-                                                    duration_ms: 0,
-                                                    qso_id: item.qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_unaired_frame(
+                                                &message_bus,
+                                                item.message_text.clone(),
+                                                item.qso_id.clone(),
+                                                take_bundle_replaced(
+                                                    &mut bundle_replaced,
+                                                    item.qso_id.as_deref(),
+                                                ),
+                                            )
+                                            .await;
                                         }
                                         continue;
                                     }
@@ -9232,9 +9934,11 @@ impl super::ApplicationCoordinator {
                                     ) {
                                         ptt_active.store(false, Ordering::Release);
                                         ptt_guard.disarm();
-                                        for key in &pivoted_this_bundle_keys {
-                                            pivoted_once.remove(key);
-                                        }
+                                        let mut bundle_replaced = unwind_bundle_pivots(
+                                            &pivoted_this_bundle_keys,
+                                            &mut pivoted_once,
+                                            &mut pivoted_from,
+                                        );
                                         let n = items.len();
                                         info!(
                                             target: "pancetta::tx.policy",
@@ -9252,18 +9956,16 @@ impl super::ApplicationCoordinator {
                                         .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: item.message_text.clone(),
-                                                    duration_ms: 0,
-                                                    qso_id: item.qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_unaired_frame(
+                                                &message_bus,
+                                                item.message_text.clone(),
+                                                item.qso_id.clone(),
+                                                take_bundle_replaced(
+                                                    &mut bundle_replaced,
+                                                    item.qso_id.as_deref(),
+                                                ),
+                                            )
+                                            .await;
                                         }
                                         continue;
                                     }
@@ -9284,7 +9986,7 @@ impl super::ApplicationCoordinator {
                                     if origin == crate::message_bus::TxOrigin::Remote
                                         && !remote_tx_permitted_for(
                                             &remote_tx_arm,
-                                            chrono::Utc::now().timestamp_millis(),
+                                            pancetta_agent::arm::ArmTime::now,
                                             remote_client_key_id.as_deref(),
                                         )
                                     {
@@ -9295,9 +9997,11 @@ impl super::ApplicationCoordinator {
                                         // 4b-pivot just inserted, so the genuinely fresh
                                         // request still queued behind it isn't discarded by
                                         // Step 0-dup as an already-sent duplicate.
-                                        for key in &pivoted_this_bundle_keys {
-                                            pivoted_once.remove(key);
-                                        }
+                                        let mut bundle_replaced = unwind_bundle_pivots(
+                                            &pivoted_this_bundle_keys,
+                                            &mut pivoted_once,
+                                            &mut pivoted_from,
+                                        );
                                         let operator_callsign = tx_denied_operator_attribution(
                                             &remote_tx_arm,
                                             remote_client_key_id.as_deref(),
@@ -9320,18 +10024,16 @@ impl super::ApplicationCoordinator {
                                         }
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: item.message_text.clone(),
-                                                    duration_ms: 0,
-                                                    qso_id: item.qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_unaired_frame(
+                                                &message_bus,
+                                                item.message_text.clone(),
+                                                item.qso_id.clone(),
+                                                take_bundle_replaced(
+                                                    &mut bundle_replaced,
+                                                    item.qso_id.as_deref(),
+                                                ),
+                                            )
+                                            .await;
                                         }
                                         continue;
                                     }
@@ -9364,6 +10066,52 @@ impl super::ApplicationCoordinator {
                                         schedule.target_slot,
                                         chrono::Utc::now(),
                                     );
+                                    // PAN-114 (D6): never hold PTT through a backward clock
+                                    // step — see the single-TX arm's identical guard.
+                                    if ptt_hold_exceeds_bound(to_slot, ptt_lead_ms) {
+                                        let ptt_off_msg = ComponentMessage::new(
+                                            ComponentId::Ft8Transmitter,
+                                            ComponentId::Hamlib,
+                                            MessageType::RigControl(
+                                                crate::message_bus::RigControlMessage::SetPtt {
+                                                    state: false,
+                                                },
+                                            ),
+                                            Instant::now(),
+                                        );
+                                        if let Err(e) = message_bus.send_message(ptt_off_msg).await
+                                        {
+                                            warn!(
+                                                "Clock-step PTT hold guard: PTT OFF failed: {}",
+                                                e
+                                            );
+                                        }
+                                        ptt_active.store(false, Ordering::Release);
+                                        ptt_guard.disarm();
+                                        // Pre-slot abort: nothing reached the air yet.
+                                        let mut bundle_replaced = unwind_bundle_pivots(
+                                            &pivoted_this_bundle_keys,
+                                            &mut pivoted_once,
+                                            &mut pivoted_from,
+                                        );
+                                        let frames: Vec<(String, Option<String>)> = items
+                                            .iter()
+                                            .map(|item| {
+                                                (item.message_text.clone(), item.qso_id.clone())
+                                            })
+                                            .collect();
+                                        drop_frames_for_clock_jump(
+                                            &message_bus,
+                                            &frames,
+                                            pancetta_core::slot_clock::WallClockJump::Backward(
+                                                chrono::Duration::from_std(to_slot)
+                                                    .unwrap_or(chrono::Duration::MAX),
+                                            ),
+                                            &mut bundle_replaced,
+                                        )
+                                        .await;
+                                        continue;
+                                    }
                                     match interruptible_sleep_or_supersede(
                                         to_slot,
                                         &shutdown,
@@ -9397,19 +10145,14 @@ impl super::ApplicationCoordinator {
                                             // "Multi-TX aborted before PTT" comment earlier
                                             // in this worker for the full leak this closes.
                                             for item in &items {
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: item.message_text.clone(),
-                                                        duration_ms: 0,
-                                                        qso_id: item.qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                if let Err(e) =
-                                                    message_bus.send_message(complete_msg).await
+                                                if let Err(e) = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    item.message_text.clone(),
+                                                    0,
+                                                    item.qso_id.clone(),
+                                                )
+                                                .await
                                                 {
                                                     warn!("Failed to send TransmitComplete: {}", e);
                                                 }
@@ -9445,9 +10188,11 @@ impl super::ApplicationCoordinator {
                                             // Round-7 review (Codex P2): pre-slot abort —
                                             // nothing reached the air yet (Step 7 never ran)
                                             // — see the single-TX arm's identical fix.
-                                            for key in &pivoted_this_bundle_keys {
-                                                pivoted_once.remove(key);
-                                            }
+                                            let mut bundle_replaced = unwind_bundle_pivots(
+                                                &pivoted_this_bundle_keys,
+                                                &mut pivoted_once,
+                                                &mut pivoted_from,
+                                            );
                                             // Round-9 review (Codex P1): drain HERE, after
                                             // PTT is already off — see
                                             // `drain_and_merge_pending`'s doc for why.
@@ -9468,19 +10213,16 @@ impl super::ApplicationCoordinator {
                                             )
                                             .await;
                                             for item in &items {
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: item.message_text.clone(),
-                                                        duration_ms: 0,
-                                                        qso_id: item.qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                if let Err(e) =
-                                                    message_bus.send_message(complete_msg).await
+                                                if let Err(e) = report_unaired_frame(
+                                                    &message_bus,
+                                                    item.message_text.clone(),
+                                                    item.qso_id.clone(),
+                                                    take_bundle_replaced(
+                                                        &mut bundle_replaced,
+                                                        item.qso_id.as_deref(),
+                                                    ),
+                                                )
+                                                .await
                                                 {
                                                     warn!("Failed to send TransmitComplete: {}", e);
                                                 }
@@ -9508,10 +10250,16 @@ impl super::ApplicationCoordinator {
                                                 slot_ns,
                                                 tx_self_parity,
                                                 request_received_at,
-                                                effective_max_concurrent_qsos(
-                                                    max_concurrent_qsos,
-                                                    &fox_mode,
-                                                    &fox_max_streams,
+                                                supersede_max_concurrent_qsos(
+                                                    effective_max_concurrent_qsos(
+                                                        max_concurrent_qsos,
+                                                        &fox_mode,
+                                                        &fox_max_streams,
+                                                    ),
+                                                    live_fox_admitted_count(
+                                                        &fox_admitted_qsos,
+                                                        &active_tx_qsos,
+                                                    ),
                                                 ),
                                             )
                                             .await;
@@ -9540,7 +10288,7 @@ impl super::ApplicationCoordinator {
                                     if origin == crate::message_bus::TxOrigin::Remote
                                         && !remote_tx_permitted_for(
                                             &remote_tx_arm,
-                                            chrono::Utc::now().timestamp_millis(),
+                                            pancetta_agent::arm::ArmTime::now,
                                             remote_client_key_id.as_deref(),
                                         )
                                     {
@@ -9563,9 +10311,11 @@ impl super::ApplicationCoordinator {
                                         }
                                         ptt_active.store(false, Ordering::Release);
                                         ptt_guard.disarm();
-                                        for key in &pivoted_this_bundle_keys {
-                                            pivoted_once.remove(key);
-                                        }
+                                        let mut bundle_replaced = unwind_bundle_pivots(
+                                            &pivoted_this_bundle_keys,
+                                            &mut pivoted_once,
+                                            &mut pivoted_from,
+                                        );
                                         let operator_callsign = tx_denied_operator_attribution(
                                             &remote_tx_arm,
                                             remote_client_key_id.as_deref(),
@@ -9588,18 +10338,16 @@ impl super::ApplicationCoordinator {
                                         }
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: item.message_text.clone(),
-                                                    duration_ms: 0,
-                                                    qso_id: item.qso_id.clone(),
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
+                                            let _ = report_unaired_frame(
+                                                &message_bus,
+                                                item.message_text.clone(),
+                                                item.qso_id.clone(),
+                                                take_bundle_replaced(
+                                                    &mut bundle_replaced,
+                                                    item.qso_id.as_deref(),
+                                                ),
+                                            )
+                                            .await;
                                         }
                                         continue;
                                     }
@@ -9673,19 +10421,14 @@ impl super::ApplicationCoordinator {
                                             // "Multi-TX aborted before PTT" comment earlier
                                             // in this worker.
                                             for item in &items {
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: item.message_text.clone(),
-                                                        duration_ms: 0,
-                                                        qso_id: item.qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                if let Err(e) =
-                                                    message_bus.send_message(complete_msg).await
+                                                if let Err(e) = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    item.message_text.clone(),
+                                                    0,
+                                                    item.qso_id.clone(),
+                                                )
+                                                .await
                                                 {
                                                     warn!("Failed to send TransmitComplete: {}", e);
                                                 }
@@ -9760,19 +10503,14 @@ impl super::ApplicationCoordinator {
                                             )
                                             .await;
                                             for item in &items {
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: item.message_text.clone(),
-                                                        duration_ms: 0,
-                                                        qso_id: item.qso_id.clone(),
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                if let Err(e) =
-                                                    message_bus.send_message(complete_msg).await
+                                                if let Err(e) = report_transmit_complete(
+                                                    &message_bus,
+                                                    false,
+                                                    item.message_text.clone(),
+                                                    0,
+                                                    item.qso_id.clone(),
+                                                )
+                                                .await
                                                 {
                                                     warn!("Failed to send TransmitComplete: {}", e);
                                                 }
@@ -9800,10 +10538,16 @@ impl super::ApplicationCoordinator {
                                                 slot_ns,
                                                 tx_self_parity,
                                                 request_received_at,
-                                                effective_max_concurrent_qsos(
-                                                    max_concurrent_qsos,
-                                                    &fox_mode,
-                                                    &fox_max_streams,
+                                                supersede_max_concurrent_qsos(
+                                                    effective_max_concurrent_qsos(
+                                                        max_concurrent_qsos,
+                                                        &fox_mode,
+                                                        &fox_max_streams,
+                                                    ),
+                                                    live_fox_admitted_count(
+                                                        &fox_admitted_qsos,
+                                                        &active_tx_qsos,
+                                                    ),
                                                 ),
                                             )
                                             .await;
@@ -9841,19 +10585,14 @@ impl super::ApplicationCoordinator {
                                         for (text, qso_id) in
                                             item_texts.into_iter().zip(encoded_qso_ids_final)
                                         {
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success,
-                                                    message_text: text,
-                                                    duration_ms,
-                                                    qso_id,
-                                                },
-                                                Instant::now(),
-                                            );
-                                            if let Err(e) =
-                                                message_bus.send_message(complete_msg).await
+                                            if let Err(e) = report_transmit_complete(
+                                                &message_bus,
+                                                success,
+                                                text,
+                                                duration_ms,
+                                                qso_id,
+                                            )
+                                            .await
                                             {
                                                 warn!("Failed to send TransmitComplete: {}", e);
                                             }
@@ -9879,18 +10618,14 @@ impl super::ApplicationCoordinator {
                                     for (text, qso_id) in
                                         item_texts.into_iter().zip(encoded_qso_ids_final)
                                     {
-                                        let complete_msg = ComponentMessage::new(
-                                            ComponentId::Ft8Transmitter,
-                                            ComponentId::Autonomous,
-                                            MessageType::TransmitComplete {
-                                                success,
-                                                message_text: text,
-                                                duration_ms,
-                                                qso_id,
-                                            },
-                                            Instant::now(),
-                                        );
-                                        if let Err(e) = message_bus.send_message(complete_msg).await
+                                        if let Err(e) = report_transmit_complete(
+                                            &message_bus,
+                                            success,
+                                            text,
+                                            duration_ms,
+                                            qso_id,
+                                        )
+                                        .await
                                         {
                                             warn!("Failed to send TransmitComplete: {}", e);
                                         }
@@ -11254,6 +11989,324 @@ mod schedule_tx_tests {
         );
         assert_eq!(cap, 0);
     }
+
+    // --- PAN-114: wall-clock pre-PTT wait and the Step 6 PTT-hold bound ---
+
+    /// Default `ptt_lead_ms` (`pancetta-config/src/station.rs`).
+    const PTT_LEAD_MS: i64 = 80;
+
+    /// `(ptt_target, target_slot)` for an FT8 frame keyed at `slot_s`.
+    fn ptt_and_slot(slot_s: f64) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) {
+        let target_slot = at(slot_s);
+        (
+            target_slot - chrono::Duration::milliseconds(PTT_LEAD_MS),
+            target_slot,
+        )
+    }
+
+    #[test]
+    fn ptt_wait_sleeps_in_chunks_until_the_target() {
+        let (ptt_target, target_slot) = ptt_and_slot(30.0);
+        let far = ptt_target - chrono::Duration::seconds(20);
+        assert_eq!(
+            ptt_wait_step(far, ptt_target, target_slot, true, 8000, SLOT_NS),
+            PttWaitStep::Sleep(Duration::from_millis(50))
+        );
+        let near = ptt_target - chrono::Duration::milliseconds(30);
+        assert_eq!(
+            ptt_wait_step(near, ptt_target, target_slot, true, 8000, SLOT_NS),
+            PttWaitStep::Sleep(Duration::from_millis(30))
+        );
+    }
+
+    #[test]
+    fn ptt_wait_reaches_on_time() {
+        let (ptt_target, target_slot) = ptt_and_slot(30.0);
+        assert_eq!(
+            ptt_wait_step(ptt_target, ptt_target, target_slot, true, 8000, SLOT_NS),
+            PttWaitStep::Reached
+        );
+    }
+
+    #[test]
+    fn ptt_wait_already_late_request_keeps_todays_path() {
+        // A request that was already a late start when the wait began keeps
+        // today's path, even past late_max: schedule_tx already decided it.
+        let (ptt_target, target_slot) = ptt_and_slot(30.0);
+        let now = target_slot + chrono::Duration::seconds(9);
+        assert_eq!(
+            ptt_wait_step(now, ptt_target, target_slot, false, 8000, SLOT_NS),
+            PttWaitStep::Reached
+        );
+    }
+
+    #[test]
+    fn ptt_wait_forward_jump_within_late_policy_ships_late() {
+        let (ptt_target, target_slot) = ptt_and_slot(30.0);
+        let now = target_slot + chrono::Duration::seconds(5);
+        assert_eq!(
+            ptt_wait_step(now, ptt_target, target_slot, true, 8000, SLOT_NS),
+            PttWaitStep::Reached
+        );
+    }
+
+    #[test]
+    fn ptt_wait_forward_jump_past_late_policy_is_dropped() {
+        let (ptt_target, target_slot) = ptt_and_slot(30.0);
+        let now = target_slot + chrono::Duration::seconds(3600);
+        match ptt_wait_step(now, ptt_target, target_slot, true, 8000, SLOT_NS) {
+            PttWaitStep::ClockJumped(pancetta_core::slot_clock::WallClockJump::Forward(d)) => {
+                assert_eq!(d, now - ptt_target);
+            }
+            other => panic!("expected ClockJumped(Forward), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ptt_wait_backward_step_beyond_two_slots_is_dropped() {
+        let (ptt_target, target_slot) = ptt_and_slot(30.0);
+        let now = ptt_target - chrono::Duration::seconds(620);
+        match ptt_wait_step(now, ptt_target, target_slot, true, 8000, SLOT_NS) {
+            PttWaitStep::ClockJumped(pancetta_core::slot_clock::WallClockJump::Backward(d)) => {
+                assert_eq!(d, chrono::Duration::seconds(620));
+            }
+            other => panic!("expected ClockJumped(Backward), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ptt_wait_small_backward_step_is_waited_out() {
+        // 25 s ahead is inside schedule_tx's two-slot horizon (30 s for FT8).
+        let (ptt_target, target_slot) = ptt_and_slot(30.0);
+        let now = ptt_target - chrono::Duration::seconds(25);
+        assert_eq!(
+            ptt_wait_step(now, ptt_target, target_slot, true, 8000, SLOT_NS),
+            PttWaitStep::Sleep(Duration::from_millis(50))
+        );
+    }
+
+    #[test]
+    fn ptt_wait_bounds_scale_with_ft4() {
+        // 16 s ahead: beyond FT4's 2 × 7.5 s horizon, inside FT8's 30 s.
+        let (ptt_target, target_slot) = ptt_and_slot(30.0);
+        let now = ptt_target - chrono::Duration::seconds(16);
+        assert!(matches!(
+            ptt_wait_step(now, ptt_target, target_slot, true, 8000, FT4_SLOT_NS),
+            PttWaitStep::ClockJumped(pancetta_core::slot_clock::WallClockJump::Backward(_))
+        ));
+        assert_eq!(
+            ptt_wait_step(now, ptt_target, target_slot, true, 8000, SLOT_NS),
+            PttWaitStep::Sleep(Duration::from_millis(50))
+        );
+    }
+
+    #[test]
+    fn ptt_hold_bound_allows_normal_lead_and_rejects_a_step() {
+        assert!(!ptt_hold_exceeds_bound(Duration::from_millis(80), 80));
+        assert!(!ptt_hold_exceeds_bound(Duration::from_millis(1080), 80));
+        assert!(ptt_hold_exceeds_bound(Duration::from_millis(1081), 80));
+        assert!(ptt_hold_exceeds_bound(Duration::from_secs(600), 80));
+    }
+
+    /// Injectable wall clock for the `wait_for_ptt_instant` tests.
+    fn test_wall_clock(
+        start: chrono::DateTime<chrono::Utc>,
+    ) -> std::sync::Arc<std::sync::Mutex<chrono::DateTime<chrono::Utc>>> {
+        std::sync::Arc::new(std::sync::Mutex::new(start))
+    }
+
+    fn shift_clock(
+        clock: &std::sync::Arc<std::sync::Mutex<chrono::DateTime<chrono::Utc>>>,
+        by: chrono::Duration,
+    ) {
+        let mut now = clock.lock().unwrap();
+        *now += by;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_ptt_instant_reaches_target_on_the_wall_clock() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let start_wall = at(10.0);
+        let clock = test_wall_clock(start_wall);
+        let ticker_clock = clock.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                shift_clock(&ticker_clock, chrono::Duration::milliseconds(20));
+            }
+        });
+        let ptt_target = start_wall + chrono::Duration::milliseconds(200);
+        let target_slot = ptt_target + chrono::Duration::milliseconds(PTT_LEAD_MS);
+        let reader = clock.clone();
+        let started = std::time::Instant::now();
+        let outcome = wait_for_ptt_instant(
+            ptt_target,
+            target_slot,
+            8000,
+            SLOT_NS,
+            &shutdown,
+            &abort,
+            move || *reader.lock().unwrap(),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        ticker.abort();
+        assert_eq!(outcome, PttWait::Reached);
+        assert!(
+            *clock.lock().unwrap() >= ptt_target,
+            "must not report Reached before the wall clock reaches the PTT instant"
+        );
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "should reach a 200 ms target within 400 ms (elapsed={elapsed:?})"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_ptt_instant_detects_a_backward_step_mid_wait() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let start_wall = at(10.0);
+        let clock = test_wall_clock(start_wall);
+        let stepper_clock = clock.clone();
+        let stepper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            shift_clock(&stepper_clock, -chrono::Duration::seconds(600));
+        });
+        let ptt_target = start_wall + chrono::Duration::milliseconds(200);
+        let target_slot = ptt_target + chrono::Duration::milliseconds(PTT_LEAD_MS);
+        let reader = clock.clone();
+        let started = std::time::Instant::now();
+        let outcome = wait_for_ptt_instant(
+            ptt_target,
+            target_slot,
+            8000,
+            SLOT_NS,
+            &shutdown,
+            &abort,
+            move || *reader.lock().unwrap(),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let _ = stepper.await;
+        match outcome {
+            PttWait::ClockJumped(pancetta_core::slot_clock::WallClockJump::Backward(d)) => {
+                assert!(d > chrono::Duration::seconds(600), "jump size {d:?}");
+            }
+            other => panic!("expected ClockJumped(Backward), got {other:?}"),
+        }
+        // Step at ~60 ms + at most one 50 ms chunk ≈ 110-150 ms; slack for jitter.
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "backward step must be seen within about one chunk (elapsed={elapsed:?})"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_ptt_instant_detects_a_forward_jump_mid_wait() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let start_wall = at(10.0);
+        let clock = test_wall_clock(start_wall);
+        let jumper_clock = clock.clone();
+        let jumper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            shift_clock(&jumper_clock, chrono::Duration::seconds(3600));
+        });
+        let ptt_target = start_wall + chrono::Duration::seconds(10);
+        let target_slot = ptt_target + chrono::Duration::milliseconds(PTT_LEAD_MS);
+        let reader = clock.clone();
+        let started = std::time::Instant::now();
+        let outcome = wait_for_ptt_instant(
+            ptt_target,
+            target_slot,
+            8000,
+            SLOT_NS,
+            &shutdown,
+            &abort,
+            move || *reader.lock().unwrap(),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let _ = jumper.await;
+        match outcome {
+            PttWait::ClockJumped(pancetta_core::slot_clock::WallClockJump::Forward(d)) => {
+                assert_eq!(d, chrono::Duration::seconds(3590));
+            }
+            other => panic!("expected ClockJumped(Forward), got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "forward jump must be seen within about one chunk (elapsed={elapsed:?})"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_ptt_instant_still_honours_shutdown_and_abort() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        // A frozen wall clock 10 s short of the target: only a flag can end
+        // the wait.
+        let start_wall = at(10.0);
+        let ptt_target = start_wall + chrono::Duration::seconds(10);
+        let target_slot = ptt_target + chrono::Duration::milliseconds(PTT_LEAD_MS);
+
+        for flip_shutdown in [false, true] {
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let abort = Arc::new(AtomicBool::new(false));
+            let flag = if flip_shutdown {
+                shutdown.clone()
+            } else {
+                abort.clone()
+            };
+            let flipper = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                flag.store(true, Ordering::Release);
+            });
+            let started = std::time::Instant::now();
+            let outcome = wait_for_ptt_instant(
+                ptt_target,
+                target_slot,
+                8000,
+                SLOT_NS,
+                &shutdown,
+                &abort,
+                move || start_wall,
+            )
+            .await;
+            let elapsed = started.elapsed();
+            let _ = flipper.await;
+            assert_eq!(outcome, PttWait::Interrupted, "shutdown={flip_shutdown}");
+            // Same ~50 ms wake-latency guarantee as `interruptible_sleep`
+            // (flag flips at ~20 ms).
+            assert!(
+                elapsed < Duration::from_millis(200),
+                "shutdown={flip_shutdown}: wake latency exceeded one chunk (elapsed={elapsed:?})"
+            );
+        }
+
+        // Already-set flags return without evaluating the clock at all.
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(true));
+        let outcome = wait_for_ptt_instant(
+            ptt_target,
+            target_slot,
+            8000,
+            SLOT_NS,
+            &shutdown,
+            &abort,
+            || -> chrono::DateTime<chrono::Utc> { panic!("clock read after abort") },
+        )
+        .await;
+        assert_eq!(outcome, PttWait::Interrupted);
+    }
 }
 
 /// Regression coverage for the silent-TX-failure gap: an encode/modulate
@@ -11486,17 +12539,24 @@ mod disarm_interrupt_signal_tests {
         // pre-PTT gap.
         let mut st = pancetta_agent::arm::ArmState::new();
         let now_ms = chrono::Utc::now().timestamp_millis();
+        st.set_channel_consent(
+            pancetta_agent::arm::ConsentChannel::StationAgent,
+            true,
+            now_ms,
+        );
+        st.set_channel_consent(pancetta_agent::arm::ConsentChannel::WsjtxUdp, true, now_ms);
         st.arm(
             pancetta_agent::arm::VerifiedArmGrant {
                 operator_callsign: "K5ARH".to_string(),
                 ttl_ms: 120_000,
+                armed_until_ms: now_ms + 120_000,
+                heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "pre-ptt-recheck-jti".to_string(),
                 client_key_id: "client-a".to_string(),
             },
-            now_ms,
+            pancetta_agent::arm::ArmTime::now(),
         );
-        st.set_local_consent(true, now_ms);
         let arm = Arc::new(std::sync::Mutex::new(st));
 
         let denial_reason =
@@ -11928,6 +12988,99 @@ mod supersede_rekey_tests {
         // Working state also mutated to the new item (collision fallback).
         assert_eq!(message_text, "CQ K5ARH EM12");
         assert_eq!(frequency_offset, 1400.0);
+    }
+
+    /// PAN-98: a station-agent-bound in-flight stream (`Some` identity) and a
+    /// superseding WSJT-X UDP request (`None` identity) — or the reverse —
+    /// are different channels with independent consent. Folding them would
+    /// tag the bundle with ONE identity, so its key-time gate would check
+    /// only one channel's consent and the other channel's frame would key by
+    /// proxy. This must produce an identity-conflict `Replace`, never
+    /// `Bundle`, in both directions.
+    #[tokio::test]
+    async fn supersede_refuses_to_bundle_across_consent_channels() {
+        for (in_flight_id, new_id) in [(Some("client-a"), None), (None, Some("client-a"))] {
+            let bus = MessageBus::new(16).unwrap();
+            let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+
+            let now = chrono::Utc::now();
+            let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
+                pancetta_core::slot::current_slot_start_with_period(
+                    now,
+                    pancetta_core::slot::SLOT_NS,
+                ),
+                pancetta_core::slot::SLOT_NS,
+            );
+
+            let mut message_text = "OLD TEXT".to_string();
+            let mut frequency_offset = 1000.0;
+            let mut schedule = super::schedule_tx(
+                now,
+                cur_parity,
+                20_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+            );
+            let ptt_active = Arc::new(AtomicBool::new(true));
+            let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+
+            let in_flight = [crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH R-15".to_string(),
+                frequency_offset: 1000.0,
+                qso_id: Some("qso-1".to_string()),
+            }];
+
+            let new_request = MessageType::TransmitRequest {
+                message_text: "CQ K5ARH EM12".to_string(),
+                frequency_offset: 1400.0,
+                qso_id: Some("qso-2".to_string()),
+                tx_parity: Some(cur_parity),
+                origin: crate::message_bus::TxOrigin::Remote,
+                remote_client_key_id: new_id.map(str::to_string),
+            };
+
+            let outcome = super::supersede_and_rekey_or_bundle(
+                new_request,
+                &mut message_text,
+                &mut frequency_offset,
+                &mut schedule,
+                &bus,
+                &ptt_active,
+                &last_ptt_on_ms,
+                20_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+                pancetta_config::station::TxSelfParity::Auto,
+                now,
+                2,
+                crate::message_bus::TxOrigin::Remote,
+                in_flight_id.map(str::to_string),
+                &in_flight,
+            )
+            .await;
+
+            match outcome {
+                super::SupersedeOutcome::Replace {
+                    remote_client_key_id,
+                    identity_conflict,
+                    ..
+                } => {
+                    assert_eq!(
+                        remote_client_key_id.as_deref(),
+                        new_id,
+                        "Replace must carry the NEW request's own identity (channel)"
+                    );
+                    assert!(
+                        identity_conflict,
+                        "a cross-channel Replace must be flagged as a conflict"
+                    );
+                }
+                other => panic!(
+                    "cross-channel in-flight/new streams ({in_flight_id:?} / {new_id:?}) \
+                     must never fold into a Bundle, got {other:?}"
+                ),
+            }
+        }
     }
 
     /// PAN-91 review follow-up: an in-flight stream bound to one remote
@@ -13156,6 +14309,182 @@ mod supersede_rekey_tests {
             "expected the frequency collision to be rejected"
         );
     }
+
+    /// PAN-76: a fresher frame for one of three in-flight Hounds after Fox
+    /// mode is turned off. With the supersede ceiling raised to the live
+    /// Fox-admitted count it folds into the bundle; with the restored cap of
+    /// 1 the whole bundle collapses to the refreshed Hound (the old bug).
+    #[tokio::test(flavor = "current_thread")]
+    async fn pan76_supersede_refresh_of_one_hound_bundles_with_the_other_two() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+
+        let now = chrono::Utc::now();
+        let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
+            pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
+            pancetta_core::slot::SLOT_NS,
+        );
+
+        let in_flight = [
+            crate::message_bus::TransmitRequestItem {
+                message_text: "W1AAA K5ARH -10".to_string(),
+                frequency_offset: 1000.0,
+                qso_id: Some("hound-1".to_string()),
+            },
+            crate::message_bus::TransmitRequestItem {
+                message_text: "W2BBB K5ARH -12".to_string(),
+                frequency_offset: 1300.0,
+                qso_id: Some("hound-2".to_string()),
+            },
+            crate::message_bus::TransmitRequestItem {
+                message_text: "W3CCC K5ARH -08".to_string(),
+                frequency_offset: 1600.0,
+                qso_id: Some("hound-3".to_string()),
+            },
+        ];
+        let refresh = || MessageType::TransmitRequest {
+            message_text: "W1AAA K5ARH RR73".to_string(),
+            frequency_offset: 1000.0,
+            qso_id: Some("hound-1".to_string()),
+            tx_parity: Some(cur_parity),
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
+        };
+
+        let mut outcomes = Vec::new();
+        for max_concurrent_qsos in [super::supersede_max_concurrent_qsos(1, 3), 1] {
+            let mut message_text = "W1AAA K5ARH -10".to_string();
+            let mut frequency_offset = 1000.0;
+            let mut schedule = super::schedule_tx(
+                now,
+                cur_parity,
+                20_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+            );
+            let ptt_active = Arc::new(AtomicBool::new(true));
+            let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+            outcomes.push(
+                super::supersede_and_rekey_or_bundle(
+                    refresh(),
+                    &mut message_text,
+                    &mut frequency_offset,
+                    &mut schedule,
+                    &bus,
+                    &ptt_active,
+                    &last_ptt_on_ms,
+                    20_000,
+                    12_000,
+                    pancetta_core::slot::SLOT_NS,
+                    pancetta_config::station::TxSelfParity::Auto,
+                    now,
+                    max_concurrent_qsos,
+                    crate::message_bus::TxOrigin::Local,
+                    None,
+                    &in_flight,
+                )
+                .await,
+            );
+        }
+
+        match &outcomes[0] {
+            super::SupersedeOutcome::Bundle { items, .. } => {
+                assert_eq!(
+                    items.len(),
+                    3,
+                    "all three Hounds stay in the bundle: {items:?}"
+                );
+                let hound1 = items
+                    .iter()
+                    .find(|it| it.qso_id.as_deref() == Some("hound-1"))
+                    .expect("hound-1 must still be present");
+                assert_eq!(hound1.message_text, "W1AAA K5ARH RR73");
+            }
+            other => panic!("expected Bundle under the raised ceiling, got {other:?}"),
+        }
+        assert!(
+            matches!(outcomes[1], super::SupersedeOutcome::Replace { .. }),
+            "under the restored cap of 1 the bundle collapses (today's behaviour), got {:?}",
+            outcomes[1]
+        );
+    }
+
+    /// PR #421 review (Codex P1): an in-flight bundle of two Hounds plus one
+    /// ordinary QSO (admitted under the restored cap of 1) after Fox mode is
+    /// turned off. The coalescer kept all three: the Fox-admitted streams on
+    /// top of the normal cap. A fresher frame for one Hound must fold into
+    /// that bundle, not trip a ceiling of only the live Fox count (2) and
+    /// collapse the bundle to the refreshed Hound, keying it stale later.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pan76_supersede_refresh_of_a_hound_in_a_mixed_bundle_keeps_every_stream() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+
+        let now = chrono::Utc::now();
+        let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
+            pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
+            pancetta_core::slot::SLOT_NS,
+        );
+        let item = |text: &str, freq: f64, id: &str| crate::message_bus::TransmitRequestItem {
+            message_text: text.to_string(),
+            frequency_offset: freq,
+            qso_id: Some(id.to_string()),
+        };
+        let in_flight = [
+            item("W1AAA K5ARH -10", 1000.0, "hound-1"),
+            item("W2BBB K5ARH -12", 1300.0, "hound-2"),
+            item("W9ZZZ K5ARH R-05", 1600.0, "ordinary"),
+        ];
+
+        let mut message_text = "W1AAA K5ARH -10".to_string();
+        let mut frequency_offset = 1000.0;
+        let mut schedule = super::schedule_tx(
+            now,
+            cur_parity,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+        );
+        let outcome = super::supersede_and_rekey_or_bundle(
+            MessageType::TransmitRequest {
+                message_text: "W1AAA K5ARH RR73".to_string(),
+                frequency_offset: 1000.0,
+                qso_id: Some("hound-1".to_string()),
+                tx_parity: Some(cur_parity),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
+            },
+            &mut message_text,
+            &mut frequency_offset,
+            &mut schedule,
+            &bus,
+            &Arc::new(AtomicBool::new(true)),
+            &Arc::new(AtomicU64::new(0)),
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+            pancetta_config::station::TxSelfParity::Auto,
+            now,
+            // Fox off: normal cap 1, two Hounds still live.
+            super::supersede_max_concurrent_qsos(1, 2),
+            crate::message_bus::TxOrigin::Local,
+            None,
+            &in_flight,
+        )
+        .await;
+
+        match &outcome {
+            super::SupersedeOutcome::Bundle { items, .. } => {
+                assert_eq!(items.len(), 3, "every in-flight stream stays: {items:?}");
+                let hound1 = items
+                    .iter()
+                    .find(|it| it.qso_id.as_deref() == Some("hound-1"))
+                    .expect("hound-1 must still be present");
+                assert_eq!(hound1.message_text, "W1AAA K5ARH RR73");
+            }
+            other => panic!("expected the refresh to bundle, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -13792,6 +15121,7 @@ mod coalesce_tests {
         let bus = MessageBus::new(16).unwrap();
         let (_autonomous_tx, autonomous_rx) =
             bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_, qso_rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
         let (backlog_tx, backlog_rx) = crossbeam_channel::unbounded();
         let active_tx_qsos = Arc::new(std::sync::RwLock::new(liveset(&[
             "qso-a", "qso-b", "qso-c",
@@ -13834,10 +15164,12 @@ mod coalesce_tests {
             &backlog_rx,
             &bus,
             &active_tx_qsos,
+            &Arc::new(std::sync::RwLock::new(HashSet::new())),
             1,
             &arm,
             &audit_log,
             &display_feed_enabled,
+            None,
         )
         .await;
 
@@ -13861,6 +15193,128 @@ mod coalesce_tests {
                 other => panic!("expected TransmitComplete, got {other:?}"),
             }
         }
+        let mut notices = Vec::new();
+        while let Ok(msg) = qso_rx.try_recv() {
+            if let MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent {
+                qso_id,
+                message_text,
+                replaced: None,
+            }) = msg.message_type
+            {
+                notices.push((qso_id, message_text));
+            } else {
+                panic!("unexpected QSO notification");
+            }
+        }
+        notices.sort();
+        assert_eq!(
+            notices,
+            vec![
+                ("qso-b".to_string(), "B".to_string()),
+                ("qso-c".to_string(), "C".to_string())
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn backlog_preserves_consent_channels_until_key_time() {
+        use pancetta_agent::arm::{ArmState, ConsentChannel, VerifiedArmGrant};
+        use std::sync::{Arc, Mutex, RwLock};
+
+        // Exercise both FIFO orders: neither channel may borrow the other's
+        // consent when the TX worker rechecks after coalescing.
+        for udp_first in [true, false] {
+            let bus = MessageBus::new(16).unwrap();
+            let (_, deferred_rx) = bus
+                .create_channel(ComponentId::Ft8Transmitter)
+                .await
+                .unwrap();
+            let (backlog_tx, backlog_rx) = crossbeam_channel::unbounded();
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let mut state = ArmState::new();
+            state.set_channel_consent(ConsentChannel::StationAgent, true, now_ms);
+            state.set_channel_consent(ConsentChannel::WsjtxUdp, true, now_ms);
+            state.arm(
+                VerifiedArmGrant {
+                    operator_callsign: "K5ARH".into(),
+                    ttl_ms: 120_000,
+                    armed_until_ms: now_ms + 120_000,
+                    heartbeat_interval_sec: 10,
+                    scope_tx: true,
+                    jti: "channel-backlog".into(),
+                    client_key_id: "client-a".into(),
+                },
+                pancetta_agent::arm::ArmTime::now(),
+            );
+            let arm = Arc::new(Mutex::new(state));
+            let request = |udp| MessageType::TransmitRequest {
+                message_text: if udp { "UDP" } else { "AGENT" }.into(),
+                frequency_offset: if udp { 1000.0 } else { 1300.0 },
+                qso_id: Some(if udp { "udp-qso" } else { "agent-qso" }.into()),
+                tx_parity: None,
+                origin: crate::message_bus::TxOrigin::Remote,
+                remote_client_key_id: if udp { None } else { Some("client-a".into()) },
+            };
+            backlog_tx
+                .send(ComponentMessage::new(
+                    ComponentId::Ft8Transmitter,
+                    ComponentId::Ft8Transmitter,
+                    request(!udp_first),
+                    Instant::now(),
+                ))
+                .unwrap();
+            let result = coalesce_backlog_into(
+                request(udp_first),
+                &backlog_rx,
+                &bus,
+                &Arc::new(RwLock::new(liveset(&["udp-qso", "agent-qso"]))),
+                &Arc::new(RwLock::new(HashSet::new())),
+                2,
+                &arm,
+                &pancetta_agent::audit::AuditLog::new(audit_tmp()),
+                &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                None,
+            )
+            .await;
+            assert!(
+                matches!(result, MessageType::TransmitRequest { .. }),
+                "different consent channels must remain separate: {result:?}"
+            );
+            let deferred = deferred_rx
+                .try_recv()
+                .expect("other channel must be requeued");
+            assert!(deferred_rx.is_empty());
+
+            // Revoke only UDP after the snapshot. The actual final gate must
+            // refuse its frame while still permitting the station-agent frame.
+            arm.lock()
+                .unwrap()
+                .set_channel_consent(ConsentChannel::WsjtxUdp, false, now_ms);
+            let mut payloads = Vec::new();
+            for message in [result, deferred.message_type] {
+                let MessageType::TransmitRequest {
+                    message_text,
+                    remote_client_key_id,
+                    origin,
+                    ..
+                } = message
+                else {
+                    panic!("expected a separate request");
+                };
+                assert_eq!(origin, crate::message_bus::TxOrigin::Remote);
+                assert_eq!(
+                    super::remote_tx_permitted_for(
+                        &arm,
+                        pancetta_agent::arm::ArmTime::now,
+                        remote_client_key_id.as_deref()
+                    ),
+                    message_text == "AGENT"
+                );
+                payloads.push(message_text);
+            }
+            payloads.sort();
+            assert_eq!(payloads, ["AGENT", "UDP"]);
+        }
     }
 
     /// PAN-91 review follow-up: a backlog containing entries bound to TWO
@@ -13877,23 +15331,31 @@ mod coalesce_tests {
         let bus = MessageBus::new(16).unwrap();
         let (_autonomous_tx, autonomous_rx) =
             bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_, qso_rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
         let (backlog_tx, backlog_rx) = crossbeam_channel::unbounded();
         let active_tx_qsos = Arc::new(std::sync::RwLock::new(liveset(&["qso-a", "qso-b"])));
 
         // client-a is armed; client-b is not.
         let mut st = pancetta_agent::arm::ArmState::new();
         let now_ms = chrono::Utc::now().timestamp_millis();
+        st.set_channel_consent(
+            pancetta_agent::arm::ConsentChannel::StationAgent,
+            true,
+            now_ms,
+        );
+        st.set_channel_consent(pancetta_agent::arm::ConsentChannel::WsjtxUdp, true, now_ms);
         st.arm(
             pancetta_agent::arm::VerifiedArmGrant {
                 operator_callsign: "K5ARH".to_string(),
                 ttl_ms: 120_000,
+                armed_until_ms: now_ms + 120_000,
+                heartbeat_interval_sec: 10,
                 scope_tx: true,
                 jti: "mixed-bundle-jti".to_string(),
                 client_key_id: "client-a".to_string(),
             },
-            now_ms,
+            pancetta_agent::arm::ArmTime::now(),
         );
-        st.set_local_consent(true, now_ms);
         let arm = Arc::new(std::sync::Mutex::new(st));
 
         // Head entry: bound to client-a (armed) — must survive.
@@ -13930,10 +15392,12 @@ mod coalesce_tests {
             &backlog_rx,
             &bus,
             &active_tx_qsos,
+            &Arc::new(std::sync::RwLock::new(HashSet::new())),
             2,
             &arm,
             &audit_log,
             &display_feed_enabled,
+            None,
         )
         .await;
 
@@ -13979,6 +15443,385 @@ mod coalesce_tests {
             }
             other => panic!("expected TransmitComplete, got {other:?}"),
         }
+        let mut notices = Vec::new();
+        while let Ok(msg) = qso_rx.try_recv() {
+            if let MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent {
+                qso_id,
+                message_text,
+                replaced: None,
+            }) = msg.message_type
+            {
+                notices.push((qso_id, message_text));
+            } else {
+                panic!("unexpected QSO notification");
+            }
+        }
+        notices.sort();
+        assert_eq!(notices, vec![("qso-b".to_string(), "B".to_string())]);
+    }
+
+    /// PAN-75 (Codex P2 on PR #418): a pivot duplicate queued ahead of a
+    /// newer same-QSO request is consumed before coalescing, so its tombstone
+    /// clears and the frame the pivot replaced is rolled back.
+    #[tokio::test(flavor = "current_thread")]
+    async fn backlog_into_consumes_pivot_duplicates_before_coalescing() {
+        use crate::message_bus::MessageBus;
+        use std::sync::Arc;
+
+        let bus = MessageBus::new(16).unwrap();
+        let (_, _autonomous_rx) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_, qso_rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        let (backlog_tx, backlog_rx) = crossbeam_channel::unbounded();
+        let active_tx_qsos = Arc::new(std::sync::RwLock::new(liveset(&["qso-a"])));
+        let arm = Arc::new(std::sync::Mutex::new(pancetta_agent::arm::ArmState::new()));
+        let request = |text: &str| MessageType::TransmitRequest {
+            message_text: text.to_string(),
+            frequency_offset: 1000.0,
+            qso_id: Some("qso-a".to_string()),
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
+        };
+        backlog_tx
+            .send(ComponentMessage::new(
+                ComponentId::Ft8Transmitter,
+                ComponentId::Ft8Transmitter,
+                request("K1ABC N0CALL RR73"),
+                Instant::now(),
+            ))
+            .unwrap();
+
+        let key = super::super::active_tx_qso_key("qso-a");
+        let mut pivoted_once = std::collections::HashMap::new();
+        pivoted_once.insert(key.clone(), ("K1ABC N0CALL R-07".to_string(), 1000.0));
+        let replaced = pancetta_qso::UnsentAttemptPayload {
+            frequency_hz: 1000.0,
+            remote_binding: Some((false, None)),
+        };
+        let mut pivoted_from = PivotReplaced::new();
+        pivoted_from.insert(
+            key.clone(),
+            ("K1ABC N0CALL -07".to_string(), replaced.clone()),
+        );
+
+        let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp());
+        let display_feed_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let result = coalesce_backlog_into(
+            request("K1ABC N0CALL R-07"),
+            &backlog_rx,
+            &bus,
+            &active_tx_qsos,
+            &Arc::new(std::sync::RwLock::new(HashSet::new())),
+            2,
+            &arm,
+            &audit_log,
+            &display_feed_enabled,
+            Some((&mut pivoted_once, &mut pivoted_from)),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            MessageType::TransmitRequest { ref message_text, .. } if message_text == "K1ABC N0CALL RR73"
+        ));
+        assert!(pivoted_once.is_empty() && pivoted_from.is_empty());
+        assert!(matches!(
+            qso_rx.try_recv().unwrap().message_type,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { ref message_text, replaced: Some(ref payload), .. })
+                if message_text == "K1ABC N0CALL -07" && *payload == replaced
+        ));
+    }
+
+    // ── PAN-76: Fox-admitted streams keep their slots after Fox mode is off ──
+
+    fn texts(entries: &[CoalesceEntry]) -> Vec<&str> {
+        entries.iter().map(|e| e.message_text.as_str()).collect()
+    }
+
+    /// The ticket's bug: Fox mode is off again, so the effective cap is back
+    /// to 1, but the three Hound exchanges Fox mode admitted are still live.
+    /// None of them may be truncated.
+    #[test]
+    fn pan76_fox_admitted_streams_survive_the_restored_normal_cap() {
+        let live = liveset(&["h1", "h2", "h3"]);
+        let fox = liveset(&["h1", "h2", "h3"]);
+        let out = coalesce_transmit_requests_with_fox_priority(
+            vec![
+                entry_freq("H1", Some("h1"), 1000.0),
+                entry_freq("H2", Some("h2"), 1300.0),
+                entry_freq("H3", Some("h3"), 1600.0),
+            ],
+            1,
+            live_in(&live),
+            |k: &str| fox.contains(k),
+        );
+        assert_eq!(texts(&out.retained), vec!["H1", "H2", "H3"]);
+        assert_eq!(out.truncated, 0);
+        assert!(out.truncated_entries.is_empty());
+        assert_eq!(out.qso_cap, 3);
+    }
+
+    /// An ordinary stream seen before the Hounds must not take a Hound's slot:
+    /// the Hounds are ordered first, so the cap truncates the ordinary one.
+    #[test]
+    fn pan76_ordinary_stream_seen_first_is_truncated_not_a_hound() {
+        let live = liveset(&["o", "h1", "h2", "h3"]);
+        let fox = liveset(&["h1", "h2", "h3"]);
+        let out = coalesce_transmit_requests_with_fox_priority(
+            vec![
+                entry_freq("O", Some("o"), 700.0),
+                entry_freq("H1", Some("h1"), 1000.0),
+                entry_freq("H2", Some("h2"), 1300.0),
+                entry_freq("H3", Some("h3"), 1600.0),
+            ],
+            1,
+            live_in(&live),
+            |k: &str| fox.contains(k),
+        );
+        assert_eq!(texts(&out.retained), vec!["H1", "H2", "H3"]);
+        assert_eq!(out.truncated, 1);
+        assert_eq!(texts(&out.truncated_entries), vec!["O"]);
+        assert_eq!(out.qso_cap, 3);
+    }
+
+    /// Round 5's regression in its narrower form: Hounds idling in their
+    /// completed grace (in the Fox set, no frames this cycle) must lend no
+    /// capacity to an ordinary pileup.
+    #[test]
+    fn pan76_fox_admitted_without_frames_lend_no_slots_to_ordinary_streams() {
+        let live = liveset(&["h1", "h2", "h3", "o1", "o2", "o3"]);
+        let fox = liveset(&["h1", "h2", "h3"]);
+        let out = coalesce_transmit_requests_with_fox_priority(
+            vec![
+                entry_freq("O1", Some("o1"), 1000.0),
+                entry_freq("O2", Some("o2"), 1300.0),
+                entry_freq("O3", Some("o3"), 1600.0),
+            ],
+            1,
+            live_in(&live),
+            |k: &str| fox.contains(k),
+        );
+        assert_eq!(texts(&out.retained), vec!["O1"]);
+        assert_eq!(out.truncated, 2);
+        assert_eq!(out.qso_cap, 1);
+    }
+
+    /// Present Hounds take their slots; ordinary streams get only what the
+    /// configured cap has left over.
+    #[test]
+    fn pan76_ordinary_streams_fill_only_the_room_present_hounds_leave() {
+        let live = liveset(&["h1", "o1", "o2", "o3"]);
+        let fox = liveset(&["h1"]);
+        let out = coalesce_transmit_requests_with_fox_priority(
+            vec![
+                entry_freq("O1", Some("o1"), 700.0),
+                entry_freq("H1", Some("h1"), 1000.0),
+                entry_freq("O2", Some("o2"), 1300.0),
+                entry_freq("O3", Some("o3"), 1600.0),
+            ],
+            2,
+            live_in(&live),
+            |k: &str| fox.contains(k),
+        );
+        assert_eq!(texts(&out.retained), vec!["H1", "O1"]);
+        assert_eq!(out.truncated, 2);
+        assert_eq!(texts(&out.truncated_entries), vec!["O2", "O3"]);
+        assert_eq!(out.qso_cap, 2);
+    }
+
+    /// With a Hound present, the bundle parity anchor is a Hound, so an
+    /// ordinary stream on the other parity is the one excluded.
+    #[test]
+    fn pan76_fox_admitted_stream_anchors_bundle_parity() {
+        use pancetta_core::slot::SlotParity;
+
+        let live = liveset(&["o", "h1", "h2"]);
+        let fox = liveset(&["h1", "h2"]);
+        let out = coalesce_transmit_requests_with_fox_priority(
+            vec![
+                entry_with_parity_freq("O", Some("o"), Some(SlotParity::Odd), 700.0),
+                entry_with_parity_freq("H1", Some("h1"), Some(SlotParity::Even), 1000.0),
+                entry_with_parity_freq("H2", Some("h2"), Some(SlotParity::Even), 1300.0),
+            ],
+            1,
+            live_in(&live),
+            |k: &str| fox.contains(k),
+        );
+        assert_eq!(texts(&out.retained), vec!["H1", "H2"]);
+        assert_eq!(out.retained[0].tx_parity, Some(SlotParity::Even));
+        assert_eq!(out.parity_excluded, 1);
+        assert_eq!(out.truncated, 0);
+    }
+
+    #[test]
+    fn pan76_manual_sends_still_bypass_the_cap_with_fox_priority() {
+        let live = liveset(&["h1"]);
+        let fox = liveset(&["h1"]);
+        let out = coalesce_transmit_requests_with_fox_priority(
+            vec![
+                entry_freq("H1", Some("h1"), 1000.0),
+                entry_freq("M", None, 1600.0),
+            ],
+            1,
+            live_in(&live),
+            |k: &str| fox.contains(k),
+        );
+        assert_eq!(texts(&out.retained), vec!["H1", "M"]);
+        assert_eq!(out.truncated, 0);
+    }
+
+    /// A Fox set that names none of the backlog's QSOs leaves the outcome
+    /// exactly as the plain coalescer's.
+    #[test]
+    fn pan76_unrelated_fox_keys_change_nothing() {
+        use pancetta_core::slot::SlotParity;
+
+        let cases: Vec<(Vec<CoalesceEntry>, u32, HashSet<String>)> = vec![
+            (
+                vec![
+                    entry_freq("A", Some("qso-a"), 1000.0),
+                    entry_freq("B", Some("qso-b"), 1300.0),
+                    entry_freq("C", Some("qso-c"), 1600.0),
+                ],
+                2,
+                liveset(&["qso-a", "qso-b", "qso-c"]),
+            ),
+            (
+                vec![
+                    entry_freq("QSO", Some("qso-a"), 1000.0),
+                    entry_freq("MANUAL-1", None, 1300.0),
+                    entry_freq("MANUAL-2", None, 1600.0),
+                ],
+                1,
+                liveset(&["qso-a"]),
+            ),
+            (
+                vec![
+                    entry_with_parity("A", Some("qso-a"), Some(SlotParity::Even)),
+                    entry_with_parity_freq("B", Some("qso-b"), Some(SlotParity::Even), 3000.0),
+                    entry_with_parity("C", Some("qso-c"), Some(SlotParity::Odd)),
+                ],
+                UNBOUNDED,
+                liveset(&["qso-a", "qso-b", "qso-c"]),
+            ),
+            (
+                vec![
+                    entry_freq("A", Some("qso-a"), 1000.0),
+                    entry_freq("B", Some("qso-b"), 1050.0),
+                    entry_freq("C", Some("qso-c"), 1300.0),
+                ],
+                2,
+                liveset(&["qso-a", "qso-b", "qso-c"]),
+            ),
+        ];
+        for (drained, cap, live) in cases {
+            let plain = coalesce_transmit_requests(drained.clone(), cap, live_in(&live));
+            let with_fox = coalesce_transmit_requests_with_fox_priority(
+                drained,
+                cap,
+                live_in(&live),
+                |k: &str| k == "SOMEONE-ELSE",
+            );
+            assert_eq!(with_fox, plain);
+        }
+    }
+
+    /// End to end through the real backlog drain: an ordinary head request
+    /// plus three Hound frames under the restored cap of 1. The Hounds are
+    /// bundled; the ordinary frame is reported as not sent (PAN-75).
+    #[tokio::test(flavor = "current_thread")]
+    async fn pan76_coalesce_backlog_into_keeps_fox_admitted_hounds_and_reports_the_ordinary_stream()
+    {
+        use crate::message_bus::MessageBus;
+        use std::sync::Arc;
+
+        let bus = MessageBus::new(16).unwrap();
+        let (_autonomous_tx, autonomous_rx) =
+            bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_, qso_rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        let (backlog_tx, backlog_rx) = crossbeam_channel::unbounded();
+        let active_tx_qsos = Arc::new(std::sync::RwLock::new(liveset(&[
+            "qso-o", "hound-1", "hound-2", "hound-3",
+        ])));
+        let fox_admitted_qsos = Arc::new(std::sync::RwLock::new(liveset(&[
+            "hound-1", "hound-2", "hound-3",
+        ])));
+
+        let head = MessageType::TransmitRequest {
+            message_text: "O".to_string(),
+            frequency_offset: 700.0,
+            qso_id: Some("qso-o".to_string()),
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
+        };
+        for (text, id, freq) in [
+            ("H1", "hound-1", 1000.0),
+            ("H2", "hound-2", 1300.0),
+            ("H3", "hound-3", 1600.0),
+        ] {
+            backlog_tx
+                .send(ComponentMessage::new(
+                    ComponentId::Ft8Transmitter,
+                    ComponentId::Ft8Transmitter,
+                    MessageType::TransmitRequest {
+                        message_text: text.to_string(),
+                        frequency_offset: freq,
+                        qso_id: Some(id.to_string()),
+                        tx_parity: None,
+                        origin: crate::message_bus::TxOrigin::Local,
+                        remote_client_key_id: None,
+                    },
+                    Instant::now(),
+                ))
+                .unwrap();
+        }
+
+        let arm = Arc::new(std::sync::Mutex::new(pancetta_agent::arm::ArmState::new()));
+        let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp());
+        let display_feed_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let result = coalesce_backlog_into(
+            head,
+            &backlog_rx,
+            &bus,
+            &active_tx_qsos,
+            &fox_admitted_qsos,
+            1,
+            &arm,
+            &audit_log,
+            &display_feed_enabled,
+            None,
+        )
+        .await;
+
+        match result {
+            MessageType::MultiTransmitRequest { items, .. } => {
+                let ids: Vec<Option<&str>> = items.iter().map(|it| it.qso_id.as_deref()).collect();
+                assert_eq!(ids, vec![Some("hound-1"), Some("hound-2"), Some("hound-3")]);
+            }
+            other => panic!("expected a MultiTransmitRequest of the three Hounds, got {other:?}"),
+        }
+
+        let mut completes = Vec::new();
+        while let Ok(msg) = autonomous_rx.try_recv() {
+            completes.push(msg);
+        }
+        assert_eq!(completes.len(), 1);
+        assert!(matches!(
+            completes[0].message_type,
+            MessageType::TransmitComplete { success: false, .. }
+        ));
+        let mut notices = Vec::new();
+        while let Ok(msg) = qso_rx.try_recv() {
+            if let MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent {
+                qso_id,
+                ..
+            }) = msg.message_type
+            {
+                notices.push(qso_id);
+            }
+        }
+        assert_eq!(notices, vec!["qso-o".to_string()]);
     }
 }
 
@@ -14392,15 +16235,28 @@ mod protocol_tx_tests {
 #[cfg(test)]
 mod remote_arm_gate_tests {
     use super::remote_tx_permitted;
-    use pancetta_agent::arm::{ArmState, VerifiedArmGrant};
+    use pancetta_agent::arm::{ArmState, ConsentChannel, VerifiedArmGrant};
     use std::sync::{Arc, Mutex};
 
     const NOW: i64 = 1_000_000;
+
+    /// Both clocks at `ms`: wall = `ms` unix ms, monotonic = a shared origin + `ms`.
+    fn at(ms: i64) -> pancetta_agent::arm::ArmTime {
+        static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let base = *BASE.get_or_init(std::time::Instant::now);
+        pancetta_agent::arm::ArmTime {
+            unix_ms: ms,
+            monotonic: base + std::time::Duration::from_millis(ms.unsigned_abs()),
+            suspend_aware_ms: ms,
+        }
+    }
 
     fn grant() -> VerifiedArmGrant {
         VerifiedArmGrant {
             operator_callsign: "K5ARH".to_string(),
             ttl_ms: 120_000,
+            armed_until_ms: NOW + 120_000,
+            heartbeat_interval_sec: 10,
             scope_tx: true,
             jti: "tx-test-arm-jti".to_string(),
             client_key_id: "tx-test-client-key-id".to_string(),
@@ -14411,7 +16267,7 @@ mod remote_arm_gate_tests {
     fn fresh_unarmed_state_denies() {
         let arm = Arc::new(Mutex::new(ArmState::new()));
         assert!(
-            !remote_tx_permitted(&arm, NOW),
+            !remote_tx_permitted(&arm, || at(NOW), ConsentChannel::StationAgent),
             "a fresh (unarmed) ArmState must deny remote TX"
         );
     }
@@ -14419,25 +16275,32 @@ mod remote_arm_gate_tests {
     #[test]
     fn armed_consented_fresh_heartbeat_permits() {
         let mut st = ArmState::new();
-        st.arm(grant(), NOW);
-        st.set_local_consent(true, NOW);
+        st.set_channel_consent(ConsentChannel::StationAgent, true, NOW);
+        st.set_channel_consent(ConsentChannel::WsjtxUdp, true, NOW);
+        st.arm(grant(), at(NOW));
         let arm = Arc::new(Mutex::new(st));
         assert!(
-            remote_tx_permitted(&arm, NOW),
+            remote_tx_permitted(&arm, || at(NOW), ConsentChannel::StationAgent),
             "armed + tx-scope + consent + fresh heartbeat must permit"
         );
     }
 
     #[test]
     fn armed_without_local_consent_denies() {
-        // Consent (remote_tx_enabled) is the LOCAL operator gate: default OFF.
+        // Consent is the LOCAL operator gate, per channel: default OFF. Arm
+        // with only the station-agent channel's consent on; the WSJT-X UDP
+        // channel (no consent of its own) must still be denied.
         let mut st = ArmState::new();
-        st.arm(grant(), NOW);
-        // no set_local_consent(true)
+        st.set_channel_consent(ConsentChannel::StationAgent, true, NOW);
+        st.arm(grant(), at(NOW));
         let arm = Arc::new(Mutex::new(st));
         assert!(
-            !remote_tx_permitted(&arm, NOW),
-            "armed but no local consent must deny"
+            !remote_tx_permitted(&arm, || at(NOW), ConsentChannel::WsjtxUdp),
+            "armed but no local consent on the queried channel must deny"
+        );
+        assert!(
+            remote_tx_permitted(&arm, || at(NOW), ConsentChannel::StationAgent),
+            "the channel whose own consent is on stays permitted"
         );
     }
 
@@ -14445,8 +16308,9 @@ mod remote_arm_gate_tests {
     fn poisoned_lock_fails_closed() {
         // Arm + consent so that IF the lock were readable, it would permit.
         let mut st = ArmState::new();
-        st.arm(grant(), NOW);
-        st.set_local_consent(true, NOW);
+        st.set_channel_consent(ConsentChannel::StationAgent, true, NOW);
+        st.set_channel_consent(ConsentChannel::WsjtxUdp, true, NOW);
+        st.arm(grant(), at(NOW));
         let arm = Arc::new(Mutex::new(st));
 
         // Poison the mutex by panicking while holding the guard.
@@ -14460,9 +16324,64 @@ mod remote_arm_gate_tests {
         // Even though the underlying state WOULD permit, the poisoned lock must
         // fail CLOSED (deny) — the opposite of tx_qso_is_live's fail-open.
         assert!(
-            !remote_tx_permitted(&arm, NOW),
+            !remote_tx_permitted(&arm, || at(NOW), ConsentChannel::StationAgent),
             "SAFETY: a poisoned arm lock must fail CLOSED (deny remote TX)"
         );
+    }
+
+    /// Wall clock rolled back `back_ms`, monotonic clock at `mono_ms`.
+    fn wall_rolled_back(mono_ms: i64, back_ms: i64) -> pancetta_agent::arm::ArmTime {
+        pancetta_agent::arm::ArmTime {
+            unix_ms: NOW - back_ms,
+            monotonic: at(mono_ms).monotonic,
+            suspend_aware_ms: at(mono_ms).suspend_aware_ms,
+        }
+    }
+
+    /// PAN-97: a wall-clock step backwards cannot keep a silent arm alive —
+    /// heartbeat silence is measured on the monotonic clock.
+    #[test]
+    fn wall_rollback_cannot_extend_the_heartbeat_window() {
+        use pancetta_agent::arm::HEARTBEAT_TIMEOUT_MS;
+        let mut st = ArmState::new();
+        st.set_channel_consent(ConsentChannel::StationAgent, true, NOW);
+        st.arm(grant(), at(NOW));
+        let arm = Arc::new(Mutex::new(st));
+        assert!(remote_tx_permitted(
+            &arm,
+            || wall_rolled_back(NOW + HEARTBEAT_TIMEOUT_MS - 1, 60_000),
+            ConsentChannel::StationAgent
+        ));
+        assert!(
+            !remote_tx_permitted(
+                &arm,
+                || wall_rolled_back(NOW + HEARTBEAT_TIMEOUT_MS, 60_000),
+                ConsentChannel::StationAgent
+            ),
+            "monotonic silence expires the arm whatever the wall clock says"
+        );
+    }
+
+    /// PAN-97: the gate samples the clock only once it holds the arm lock, so
+    /// a lock wait cannot leave it judging an older instant.
+    #[test]
+    fn clock_is_sampled_with_the_lock_held() {
+        let mut st = ArmState::new();
+        st.set_channel_consent(ConsentChannel::StationAgent, true, NOW);
+        st.arm(grant(), at(NOW));
+        let arm = Arc::new(Mutex::new(st));
+        let probe = arm.clone();
+        assert!(remote_tx_permitted(
+            &arm,
+            || {
+                assert!(
+                    probe.try_lock().is_err(),
+                    "clock read before the lock was taken"
+                );
+                at(NOW)
+            },
+            ConsentChannel::StationAgent
+        ));
     }
 }
 
@@ -14475,15 +16394,28 @@ mod remote_arm_gate_tests {
 #[cfg(test)]
 mod remote_arm_gate_identity_tests {
     use super::remote_tx_permitted_for;
-    use pancetta_agent::arm::{ArmState, VerifiedArmGrant};
+    use pancetta_agent::arm::{ArmState, ConsentChannel, VerifiedArmGrant};
     use std::sync::{Arc, Mutex};
 
     const NOW: i64 = 1_000_000;
+
+    /// Both clocks at `ms`: wall = `ms` unix ms, monotonic = a shared origin + `ms`.
+    fn at(ms: i64) -> pancetta_agent::arm::ArmTime {
+        static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let base = *BASE.get_or_init(std::time::Instant::now);
+        pancetta_agent::arm::ArmTime {
+            unix_ms: ms,
+            monotonic: base + std::time::Duration::from_millis(ms.unsigned_abs()),
+            suspend_aware_ms: ms,
+        }
+    }
 
     fn grant_for(client_key_id: &str) -> VerifiedArmGrant {
         VerifiedArmGrant {
             operator_callsign: "K5ARH".to_string(),
             ttl_ms: 120_000,
+            armed_until_ms: NOW + 120_000,
+            heartbeat_interval_sec: 10,
             scope_tx: true,
             jti: "tx-test-arm-jti".to_string(),
             client_key_id: client_key_id.to_string(),
@@ -14492,8 +16424,9 @@ mod remote_arm_gate_identity_tests {
 
     fn armed_and_consented(client_key_id: &str) -> Arc<Mutex<ArmState>> {
         let mut st = ArmState::new();
-        st.arm(grant_for(client_key_id), NOW);
-        st.set_local_consent(true, NOW);
+        st.set_channel_consent(ConsentChannel::StationAgent, true, NOW);
+        st.set_channel_consent(ConsentChannel::WsjtxUdp, true, NOW);
+        st.arm(grant_for(client_key_id), at(NOW));
         Arc::new(Mutex::new(st))
     }
 
@@ -14501,7 +16434,7 @@ mod remote_arm_gate_identity_tests {
     fn matching_client_is_permitted() {
         let arm = armed_and_consented("client-a");
         assert!(
-            remote_tx_permitted_for(&arm, NOW, Some("client-a")),
+            remote_tx_permitted_for(&arm, || at(NOW), Some("client-a")),
             "the client that is actually armed must be permitted to TX"
         );
     }
@@ -14512,7 +16445,7 @@ mod remote_arm_gate_identity_tests {
         // authorized just because client-a happens to be armed right now.
         let arm = armed_and_consented("client-a");
         assert!(
-            !remote_tx_permitted_for(&arm, NOW, Some("client-b")),
+            !remote_tx_permitted_for(&arm, || at(NOW), Some("client-b")),
             "PAN-91: a frame bound to a different client than the one \
              currently armed must be denied, not authorized by proxy"
         );
@@ -14525,7 +16458,7 @@ mod remote_arm_gate_identity_tests {
         // boolean-only check.
         let arm = armed_and_consented("client-a");
         assert!(
-            remote_tx_permitted_for(&arm, NOW, None),
+            remote_tx_permitted_for(&arm, || at(NOW), None),
             "a frame with no bound client identity must fall back to the \
              plain armed/permitted check, preserving pre-PAN-91 behavior"
         );
@@ -14535,24 +16468,107 @@ mod remote_arm_gate_identity_tests {
     fn bound_identity_denied_when_nobody_armed() {
         let arm = Arc::new(Mutex::new(ArmState::new()));
         assert!(
-            !remote_tx_permitted_for(&arm, NOW, Some("client-a")),
+            !remote_tx_permitted_for(&arm, || at(NOW), Some("client-a")),
             "an unarmed station must deny regardless of the frame's bound identity"
         );
+    }
+
+    /// PAN-98: a `None`-identity frame originates on the WSJT-X UDP channel
+    /// and requires THAT channel's own consent — the station-agent channel's
+    /// consent (which the arm itself needed) never satisfies it.
+    #[test]
+    fn none_origin_requires_wsjtx_channel_consent() {
+        let mut st = ArmState::new();
+        st.set_channel_consent(ConsentChannel::StationAgent, true, NOW);
+        st.arm(grant_for("client-a"), at(NOW));
+        let arm = Arc::new(Mutex::new(st));
+        assert!(
+            !remote_tx_permitted_for(&arm, || at(NOW), None),
+            "a WSJT-X-UDP-origin frame must be denied while that channel's own \
+             consent is off, even though the arm is live"
+        );
+        arm.lock()
+            .unwrap()
+            .set_channel_consent(ConsentChannel::WsjtxUdp, true, NOW);
+        assert!(
+            remote_tx_permitted_for(&arm, || at(NOW), None),
+            "with the WSJT-X UDP channel's own consent on, its frame is permitted"
+        );
+    }
+
+    /// PAN-98: transmission-time re-checks the ORIGINATING channel's own
+    /// CURRENT consent — revoking the station-agent channel's consent after
+    /// a valid arm denies that channel's frames even though the WSJT-X UDP
+    /// channel's consent is still on.
+    #[test]
+    fn some_origin_denied_when_station_agent_consent_revoked_after_arm() {
+        let arm = armed_and_consented("client-a");
+        assert!(remote_tx_permitted_for(&arm, || at(NOW), Some("client-a")));
+        arm.lock()
+            .unwrap()
+            .set_channel_consent(ConsentChannel::StationAgent, false, NOW);
+        assert!(
+            !remote_tx_permitted_for(&arm, || at(NOW), Some("client-a")),
+            "transmission-time must re-check the ORIGINATING channel's own current consent"
+        );
+        assert!(
+            remote_tx_permitted_for(&arm, || at(NOW), None),
+            "the WSJT-X UDP channel's own consent still governs its frames"
+        );
+    }
+
+    /// Wall clock rolled back `back_ms`, monotonic clock at `mono_ms`.
+    fn wall_rolled_back(mono_ms: i64, back_ms: i64) -> pancetta_agent::arm::ArmTime {
+        pancetta_agent::arm::ArmTime {
+            unix_ms: NOW - back_ms,
+            monotonic: at(mono_ms).monotonic,
+            suspend_aware_ms: at(mono_ms).suspend_aware_ms,
+        }
+    }
+
+    /// PAN-97: the identity-bound gate also measures liveness monotonically.
+    #[test]
+    fn wall_rollback_cannot_extend_the_heartbeat_window_for_a_bound_client() {
+        use pancetta_agent::arm::HEARTBEAT_TIMEOUT_MS;
+        let arm = armed_and_consented("client-a");
+        assert!(remote_tx_permitted_for(
+            &arm,
+            || wall_rolled_back(NOW + HEARTBEAT_TIMEOUT_MS - 1, 60_000),
+            Some("client-a")
+        ));
+        assert!(!remote_tx_permitted_for(
+            &arm,
+            || wall_rolled_back(NOW + HEARTBEAT_TIMEOUT_MS, 60_000),
+            Some("client-a")
+        ));
     }
 }
 
 #[cfg(test)]
 mod arm_snapshot_attribution_tests {
     use super::ArmSnapshot;
-    use pancetta_agent::arm::{ArmState, VerifiedArmGrant};
+    use pancetta_agent::arm::{ArmState, ConsentChannel, VerifiedArmGrant};
     use std::sync::{Arc, Mutex};
 
     const NOW: i64 = 1_000_000;
+
+    /// Both clocks at `ms`: wall = `ms` unix ms, monotonic = a shared origin + `ms`.
+    fn at(ms: i64) -> pancetta_agent::arm::ArmTime {
+        static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let base = *BASE.get_or_init(std::time::Instant::now);
+        pancetta_agent::arm::ArmTime {
+            unix_ms: ms,
+            monotonic: base + std::time::Duration::from_millis(ms.unsigned_abs()),
+            suspend_aware_ms: ms,
+        }
+    }
 
     fn grant_for(operator_callsign: &str, client_key_id: &str) -> VerifiedArmGrant {
         VerifiedArmGrant {
             operator_callsign: operator_callsign.to_string(),
             ttl_ms: 120_000,
+            armed_until_ms: NOW + 120_000,
+            heartbeat_interval_sec: 10,
             scope_tx: true,
             jti: "tx-snapshot-test-jti".to_string(),
             client_key_id: client_key_id.to_string(),
@@ -14565,18 +16581,19 @@ mod arm_snapshot_attribution_tests {
     #[test]
     fn attribution_reflects_the_snapshot_instant_not_a_later_live_lock() {
         let mut st = ArmState::new();
-        st.arm(grant_for("K5ARH", "client-a"), NOW);
-        st.set_local_consent(true, NOW);
+        st.set_channel_consent(ConsentChannel::StationAgent, true, NOW);
+        st.set_channel_consent(ConsentChannel::WsjtxUdp, true, NOW);
+        st.arm(grant_for("K5ARH", "client-a"), at(NOW));
         let arm = Arc::new(Mutex::new(st));
 
-        let snapshot = ArmSnapshot::take(&arm, NOW);
+        let snapshot = ArmSnapshot::take(&arm, || at(NOW));
 
         // A DIFFERENT operator arms the live state AFTER the snapshot was
         // taken — simulating the race a detached spawn's later re-lock
         // would be vulnerable to.
         arm.lock()
             .unwrap()
-            .arm(grant_for("W1AW", "client-b"), NOW + 10);
+            .arm(grant_for("W1AW", "client-b"), at(NOW + 10));
 
         assert_eq!(
             snapshot.operator_attribution(Some("client-a")).as_deref(),
@@ -14589,10 +16606,11 @@ mod arm_snapshot_attribution_tests {
     #[test]
     fn identity_mismatch_never_attributes_to_the_armed_operator() {
         let mut st = ArmState::new();
-        st.arm(grant_for("K5ARH", "client-a"), NOW);
-        st.set_local_consent(true, NOW);
+        st.set_channel_consent(ConsentChannel::StationAgent, true, NOW);
+        st.set_channel_consent(ConsentChannel::WsjtxUdp, true, NOW);
+        st.arm(grant_for("K5ARH", "client-a"), at(NOW));
         let arm = Arc::new(Mutex::new(st));
-        let snapshot = ArmSnapshot::take(&arm, NOW);
+        let snapshot = ArmSnapshot::take(&arm, || at(NOW));
 
         assert_eq!(
             snapshot.operator_attribution(Some("client-b")),
@@ -14605,10 +16623,11 @@ mod arm_snapshot_attribution_tests {
     #[test]
     fn unbound_frame_attributes_to_whoever_is_armed() {
         let mut st = ArmState::new();
-        st.arm(grant_for("K5ARH", "client-a"), NOW);
-        st.set_local_consent(true, NOW);
+        st.set_channel_consent(ConsentChannel::StationAgent, true, NOW);
+        st.set_channel_consent(ConsentChannel::WsjtxUdp, true, NOW);
+        st.arm(grant_for("K5ARH", "client-a"), at(NOW));
         let arm = Arc::new(Mutex::new(st));
-        let snapshot = ArmSnapshot::take(&arm, NOW);
+        let snapshot = ArmSnapshot::take(&arm, || at(NOW));
 
         assert_eq!(
             snapshot.operator_attribution(None).as_deref(),
@@ -14629,15 +16648,21 @@ mod arm_snapshot_attribution_tests {
     #[test]
     fn identity_mismatch_refuses_attribution_even_when_tx_is_not_permitted_for_another_reason() {
         let mut st = ArmState::new();
-        st.arm(grant_for("K5ARH", "client-b"), NOW);
-        // Local consent OFF: tx_permitted is false for an UNRELATED reason,
-        // not because of the identity mismatch below.
-        st.set_local_consent(false, NOW);
+        st.set_channel_consent(ConsentChannel::StationAgent, true, NOW);
+        st.arm(grant_for("K5ARH", "client-b"), at(NOW));
+        // Local consent OFF (revoked after the arm): tx_permitted is false
+        // for an UNRELATED reason, not because of the identity mismatch below.
+        st.set_channel_consent(ConsentChannel::StationAgent, false, NOW);
         let arm = Arc::new(Mutex::new(st));
-        let snapshot = ArmSnapshot::take(&arm, NOW);
+        let snapshot = ArmSnapshot::take(&arm, || at(NOW));
         assert!(
-            !snapshot.tx_permitted,
+            !snapshot.station_agent_permitted,
             "test setup: tx must not be permitted here"
+        );
+        assert_eq!(
+            snapshot.armed_client_key_id.as_deref(),
+            Some("client-b"),
+            "test setup: client-b holds the arm"
         );
 
         assert_eq!(
@@ -14646,6 +16671,78 @@ mod arm_snapshot_attribution_tests {
             "a frame bound to client-a must never be attributed to client-b's \
              operator, even when the denial's proximate cause is something \
              else entirely (local consent off)"
+        );
+    }
+
+    /// PAN-98: the snapshot mirrors `remote_tx_permitted_for`'s channel
+    /// selection — a `None`-identity frame reads the WSJT-X UDP channel's
+    /// consent, a `Some` frame the station-agent channel's.
+    #[test]
+    fn snapshot_permits_none_uses_wsjtx_bit_and_some_uses_station_agent_bit() {
+        let mut st = ArmState::new();
+        st.set_channel_consent(ConsentChannel::StationAgent, true, NOW);
+        st.arm(grant_for("K5ARH", "client-a"), at(NOW));
+        let arm = Arc::new(Mutex::new(st));
+
+        // SA consent on, wsjtx consent off.
+        let snapshot = ArmSnapshot::take(&arm, || at(NOW));
+        assert!(snapshot.permits(Some("client-a")));
+        assert!(
+            !snapshot.permits(None),
+            "a None-origin frame needs the WSJT-X UDP channel's own consent"
+        );
+
+        // Revoke SA consent, grant wsjtx consent.
+        {
+            let mut st = arm.lock().unwrap();
+            st.set_channel_consent(ConsentChannel::StationAgent, false, NOW);
+            st.set_channel_consent(ConsentChannel::WsjtxUdp, true, NOW);
+        }
+        let snapshot = ArmSnapshot::take(&arm, || at(NOW));
+        assert!(
+            !snapshot.permits(Some("client-a")),
+            "a Some-origin frame needs the station-agent channel's own consent"
+        );
+        assert!(
+            !snapshot.is_identity_mismatch(Some("client-a")),
+            "a consent denial is not an identity problem"
+        );
+        assert!(snapshot.permits(None));
+    }
+
+    /// Wall clock rolled back `back_ms`, monotonic clock at `mono_ms`.
+    fn wall_rolled_back(mono_ms: i64, back_ms: i64) -> pancetta_agent::arm::ArmTime {
+        pancetta_agent::arm::ArmTime {
+            unix_ms: NOW - back_ms,
+            monotonic: at(mono_ms).monotonic,
+            suspend_aware_ms: at(mono_ms).suspend_aware_ms,
+        }
+    }
+
+    /// PAN-97: the snapshot's permission bit uses the monotonic dead-man
+    /// window, and its audit timestamp is the wall time sampled under the
+    /// same lock.
+    #[test]
+    fn snapshot_denies_after_monotonic_expiry_despite_wall_rollback() {
+        use pancetta_agent::arm::HEARTBEAT_TIMEOUT_MS;
+        let mut st = ArmState::new();
+        st.set_channel_consent(ConsentChannel::StationAgent, true, NOW);
+        st.arm(grant_for("K5ARH", "client-a"), at(NOW));
+        let arm = Arc::new(Mutex::new(st));
+
+        let fresh = ArmSnapshot::take(&arm, || wall_rolled_back(NOW + 1_000, 60_000));
+        assert!(fresh.permits(Some("client-a")));
+        assert_eq!(fresh.decided_at_unix_ms, NOW - 60_000);
+
+        let lapsed = ArmSnapshot::take(&arm, || {
+            wall_rolled_back(NOW + HEARTBEAT_TIMEOUT_MS, 60_000)
+        });
+        assert!(!lapsed.permits(Some("client-a")));
+        assert!(!lapsed.permits(None));
+        // Attribution is still frozen under the same lock.
+        assert_eq!(
+            lapsed.operator_attribution(Some("client-a")).as_deref(),
+            Some("K5ARH")
         );
     }
 }
@@ -15242,6 +17339,7 @@ mod pan115_worker_gate_tests {
         hamlib_rx: Receiver<ComponentMessage>,
         autonomous_rx: Receiver<ComponentMessage>,
         tui_rx: Receiver<ComponentMessage>,
+        qso_rx: Receiver<ComponentMessage>,
     }
 
     impl Drop for Harness {
@@ -15291,6 +17389,7 @@ mod pan115_worker_gate_tests {
             .get_or_create_channel(ComponentId::Autonomous)
             .await
             .unwrap();
+        let (_, qso_rx) = bus.get_or_create_channel(ComponentId::Qso).await.unwrap();
         let (_, tui_rx) = bus.get_or_create_channel(ComponentId::Tui).await.unwrap();
         coordinator
             .start_transmitter_component()
@@ -15302,6 +17401,7 @@ mod pan115_worker_gate_tests {
             hamlib_rx,
             autonomous_rx,
             tui_rx,
+            qso_rx,
         }
     }
 
@@ -15393,6 +17493,156 @@ mod pan115_worker_gate_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn operator_f8_abort_reports_frame_not_sent_to_qso() {
+        let h = worker_harness().await;
+        h.coordinator
+            .active_tx_qsos
+            .write()
+            .unwrap()
+            .insert(super::super::active_tx_qso_key("qso-f8"));
+        let text = "K1ABC N0CALL FN20";
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Qso,
+                ComponentId::Ft8Transmitter,
+                MessageType::TransmitRequest {
+                    message_text: text.into(),
+                    frequency_offset: 1500.0,
+                    qso_id: Some("qso-f8".into()),
+                    tx_parity: None,
+                    origin: TxOrigin::Local,
+                    remote_client_key_id: None,
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if h.tui_rx.try_iter().any(|msg| matches!(msg.message_type, MessageType::TxQueueStatus { queued, .. } if queued.iter().any(|item| item.text == text))) { break; }
+            assert!(Instant::now() < deadline, "worker did not queue the frame");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        h.coordinator
+            .abort_current_tx
+            .store(true, Ordering::Release);
+        assert_eq!(
+            await_completion(&h, text, Duration::from_secs(5)).await.0,
+            Some(false)
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(msg) = h.qso_rx.try_recv() {
+                assert!(
+                    matches!(msg.message_type, MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { qso_id, message_text, replaced: None }) if qso_id == "qso-f8" && message_text == text)
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "F8 failed to notify QSO accounting"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// PAN-75: a keyed frame superseded by fresher content the single-TX
+    /// re-key path cannot use (`SupersedeOutcome::NotViable`; here a bundle,
+    /// which that path never folds) is abandoned. It must be reported as not
+    /// sent, like the `Replace` arm's abandoned frame.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn not_viable_supersede_reports_abandoned_frame_not_sent_to_qso() {
+        assert_not_viable_supersede_reports_abandoned_frame(false).await;
+    }
+
+    /// The same, superseding only once Step 7 has routed the audio, so the
+    /// Step 8 playback wait's `NotViable` arm handles it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn not_viable_supersede_during_playback_reports_abandoned_frame_not_sent_to_qso() {
+        assert_not_viable_supersede_reports_abandoned_frame(true).await;
+    }
+
+    async fn assert_not_viable_supersede_reports_abandoned_frame(during_playback: bool) {
+        let h = worker_harness().await;
+        h.coordinator
+            .active_tx_qsos
+            .write()
+            .unwrap()
+            .insert(super::super::active_tx_qso_key("qso-sv"));
+        let text = "K1ABC N0CALL FN20";
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Qso,
+                ComponentId::Ft8Transmitter,
+                MessageType::TransmitRequest {
+                    message_text: text.into(),
+                    frequency_offset: 1500.0,
+                    qso_id: Some("qso-sv".into()),
+                    tx_parity: None,
+                    origin: TxOrigin::Local,
+                    remote_client_key_id: None,
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            await_ptt_on(&h, Duration::from_secs(20)).await,
+            "worker did not key the frame"
+        );
+        if during_playback {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !h
+                .tui_rx
+                .try_iter()
+                .any(|msg| matches!(msg.message_type, MessageType::TxFrameLogged { .. }))
+            {
+                assert!(Instant::now() < deadline, "worker did not start the audio");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Autonomous,
+                ComponentId::Ft8Transmitter,
+                MessageType::MultiTransmitRequest {
+                    items: vec![crate::message_bus::TransmitRequestItem {
+                        message_text: "K1ABC N0CALL -10".into(),
+                        frequency_offset: 1500.0,
+                        qso_id: Some("qso-sv".into()),
+                    }],
+                    tx_parity: None,
+                    origin: TxOrigin::Local,
+                    remote_client_key_id: None,
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            await_completion(&h, text, Duration::from_secs(5)).await.0,
+            Some(false)
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(msg) = h.qso_rx.try_recv() {
+                assert!(
+                    matches!(msg.message_type, MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { qso_id, message_text, replaced: None }) if qso_id == "qso-sv" && message_text == text)
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "abandoned frame was not reported to QSO accounting"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn lost_rig_blocks_ptt_until_the_link_recovers() {
         let h = worker_harness().await;
         h.coordinator
@@ -15413,6 +17663,7 @@ mod pan115_worker_gate_tests {
                 .any(|d| d.contains("TX blocked (rig is disconnected)")),
             "the key-time gate must report the rig as disconnected, got {diagnostics:?}"
         );
+        assert!(h.qso_rx.try_recv().is_err());
         assert!(!ptt_on, "no PTT keying while the rig is disconnected");
 
         // The link recovers: the next request keys again (a different text,
@@ -15448,6 +17699,227 @@ mod pan115_worker_gate_tests {
                 .any(|d| d.contains("TX blocked (audio output device is dead)")),
             "the key-time gate must report the dead output device, got {diagnostics:?}"
         );
+        assert!(h.qso_rx.try_recv().is_err());
         assert!(!ptt_on, "no PTT keying while the audio output is dead");
+    }
+}
+
+#[cfg(test)]
+mod report_transmit_complete_tests {
+    use super::*;
+
+    async fn check(success: bool, qso_id: Option<&str>) {
+        let bus = MessageBus::new(16).unwrap();
+        let (_, autonomous) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        report_transmit_complete(
+            &bus,
+            success,
+            "K1ABC N0CALL FN20".into(),
+            0,
+            qso_id.map(str::to_string),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(autonomous.try_recv().unwrap().message_type, MessageType::TransmitComplete { success: got, message_text, duration_ms: 0, qso_id: id } if got == success && id.as_deref() == qso_id && message_text == "K1ABC N0CALL FN20")
+        );
+        assert!(autonomous.try_recv().is_err());
+        if !success && qso_id.is_some() {
+            assert!(
+                matches!(qso.try_recv().unwrap().message_type, MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { qso_id: id, message_text, replaced: None }) if Some(id.as_str()) == qso_id && message_text == "K1ABC N0CALL FN20")
+            );
+        }
+        assert!(qso.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn successful_frame_only_notifies_autonomous() {
+        check(true, Some("q1")).await;
+    }
+    #[tokio::test]
+    async fn unkeyed_frame_only_notifies_autonomous() {
+        check(false, None).await;
+    }
+    #[tokio::test]
+    async fn failed_qso_frame_also_notifies_qso() {
+        check(false, Some("q1")).await;
+    }
+
+    /// A pivot-duplicate's payload already aired via the pivot, so the QSO
+    /// engine must roll back the frame the pivot replaced, never this one.
+    #[tokio::test]
+    async fn pivot_duplicate_drop_rolls_back_the_replaced_frame() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_, autonomous) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        let replaced = pancetta_qso::UnsentAttemptPayload {
+            frequency_hz: 1500.0,
+            remote_binding: Some((false, None)),
+        };
+        report_pivot_duplicate_dropped(
+            &bus,
+            "K1ABC N0CALL R-07".into(),
+            Some("q1".into()),
+            Some(("K1ABC N0CALL FN20".into(), replaced.clone())),
+        )
+        .await;
+        assert!(matches!(
+            autonomous.try_recv().unwrap().message_type,
+            MessageType::TransmitComplete { success: false, qso_id: Some(ref id), ref message_text, .. }
+                if id == "q1" && message_text == "K1ABC N0CALL R-07"
+        ));
+        assert!(matches!(
+            qso.try_recv().unwrap().message_type,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { ref qso_id, ref message_text, replaced: Some(ref payload) })
+                if qso_id == "q1" && message_text == "K1ABC N0CALL FN20" && *payload == replaced
+        ));
+        assert!(qso.try_recv().is_err());
+
+        // No recorded pivot source: nothing reaches the QSO engine.
+        report_pivot_duplicate_dropped(&bus, "K1ABC N0CALL R-07".into(), Some("q1".into()), None)
+            .await;
+        assert!(autonomous.try_recv().is_ok());
+        assert!(qso.try_recv().is_err());
+    }
+
+    /// A refused bundle clears only its own pivots' tombstones and hands back
+    /// each replaced frame once, keyed by QSO (Codex P2 on PR #418).
+    #[test]
+    fn unwind_bundle_pivots_returns_each_replaced_frame_once() {
+        let payload = pancetta_qso::UnsentAttemptPayload {
+            frequency_hz: 1500.0,
+            remote_binding: None,
+        };
+        let a = super::super::active_tx_qso_key("qa");
+        let b = super::super::active_tx_qso_key("qb");
+        let other = super::super::active_tx_qso_key("qz");
+        let mut once = std::collections::HashMap::new();
+        let mut from = PivotReplaced::new();
+        for key in [&a, &b, &other] {
+            once.insert(key.clone(), ("NEW".to_string(), 1500.0));
+        }
+        from.insert(a.clone(), ("A OLD".to_string(), payload.clone()));
+        from.insert(other.clone(), ("Z OLD".to_string(), payload.clone()));
+        let mut replaced = unwind_bundle_pivots(&[a.clone(), b.clone()], &mut once, &mut from);
+        assert_eq!(once.keys().collect::<Vec<_>>(), vec![&other]);
+        assert_eq!(from.keys().collect::<Vec<_>>(), vec![&other]);
+        assert_eq!(
+            take_bundle_replaced(&mut replaced, Some("qa")).map(|(t, _)| t),
+            Some("A OLD".to_string())
+        );
+        assert!(take_bundle_replaced(&mut replaced, Some("qa")).is_none());
+        assert!(take_bundle_replaced(&mut replaced, Some("qb")).is_none());
+        assert!(take_bundle_replaced(&mut replaced, None).is_none());
+    }
+
+    /// PAN-75 (Codex P1 on PR #419): items a re-enqueued superseding bundle
+    /// carries over unchanged still air, so only the others are abandoned.
+    #[test]
+    fn notviable_supersede_skips_items_the_new_bundle_carries_over() {
+        let item = |q: &str, text: &str| crate::message_bus::TransmitRequestItem {
+            message_text: text.to_string(),
+            frequency_offset: 1500.0,
+            qso_id: Some(q.to_string()),
+        };
+        let in_flight = vec![item("qa", "K1A N0CALL -07"), item("qb", "K2B N0CALL R-10")];
+        let reenqueued = MessageType::MultiTransmitRequest {
+            items: vec![item("qa", "K1A N0CALL RR73"), item("qb", "K2B N0CALL R-10")],
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
+        };
+        let local = (crate::message_bus::TxOrigin::Local, None);
+        let abandoned = items_abandoned_by_supersede(&in_flight, local, Some(&reenqueued));
+        assert_eq!(abandoned.len(), 1);
+        assert!(std::ptr::eq(abandoned[0], &in_flight[0]));
+        assert_eq!(
+            items_abandoned_by_supersede(&in_flight, local, None).len(),
+            2
+        );
+        // Sub-epsilon offset noise still counts as carried (Codex P2 on PR #419).
+        let mut noisy = reenqueued.clone();
+        if let MessageType::MultiTransmitRequest { items, .. } = &mut noisy {
+            items[1].frequency_offset += 0.1;
+        }
+        assert_eq!(
+            items_abandoned_by_supersede(&in_flight, local, Some(&noisy)).len(),
+            1
+        );
+        // An authorization change carries nothing over (Codex P2 on PR #419).
+        let remote = (crate::message_bus::TxOrigin::Remote, Some("client-a"));
+        assert_eq!(
+            items_abandoned_by_supersede(&in_flight, remote, Some(&reenqueued)).len(),
+            2
+        );
+    }
+
+    /// An abandoned bundle item is rolled back by its own offset, so a newer
+    /// same-text attempt at another offset is not hit (Codex P1 on PR #419).
+    #[tokio::test]
+    async fn abandoned_bundle_item_reports_its_own_offset() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_, autonomous) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        let item = crate::message_bus::TransmitRequestItem {
+            message_text: "K1A N0CALL -07".to_string(),
+            frequency_offset: 1250.0,
+            qso_id: Some("qa".to_string()),
+        };
+        report_abandoned_bundle_item(&bus, &item, Some((true, Some("client-a".into())))).await;
+        assert!(matches!(
+            autonomous.try_recv().unwrap().message_type,
+            MessageType::TransmitComplete { success: false, .. }
+        ));
+        assert!(matches!(
+            qso.try_recv().unwrap().message_type,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { ref message_text, replaced: Some(ref p), .. })
+                if message_text == "K1A N0CALL -07"
+                    && p.frequency_hz == 1250.0
+                    && p.remote_binding == Some((true, Some("client-a".to_string())))
+        ));
+    }
+
+    /// A pivoted frame refused before PTT: its producing request is still
+    /// queued, so the QSO engine rolls back the replaced frame instead
+    /// (Codex P2 on PR #418). Without a pivot it rolls back this frame.
+    #[tokio::test]
+    async fn unaired_pivoted_frame_rolls_back_the_replaced_frame() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_, autonomous) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        let replaced = pancetta_qso::UnsentAttemptPayload {
+            frequency_hz: 1500.0,
+            remote_binding: Some((false, None)),
+        };
+        report_unaired_frame(
+            &bus,
+            "K1ABC N0CALL R-07".into(),
+            Some("q1".into()),
+            Some(("K1ABC N0CALL FN20".into(), replaced.clone())),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            autonomous.try_recv().unwrap().message_type,
+            MessageType::TransmitComplete { success: false, qso_id: Some(ref id), ref message_text, .. }
+                if id == "q1" && message_text == "K1ABC N0CALL R-07"
+        ));
+        assert!(matches!(
+            qso.try_recv().unwrap().message_type,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { ref qso_id, ref message_text, replaced: Some(ref payload) })
+                if qso_id == "q1" && message_text == "K1ABC N0CALL FN20" && *payload == replaced
+        ));
+        assert!(qso.try_recv().is_err());
+
+        report_unaired_frame(&bus, "K1ABC N0CALL R-07".into(), Some("q1".into()), None)
+            .await
+            .unwrap();
+        assert!(autonomous.try_recv().is_ok());
+        assert!(matches!(
+            qso.try_recv().unwrap().message_type,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { ref message_text, replaced: None, .. })
+                if message_text == "K1ABC N0CALL R-07"
+        ));
     }
 }

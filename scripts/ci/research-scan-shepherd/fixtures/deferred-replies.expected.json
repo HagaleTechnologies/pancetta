@@ -1,0 +1,25 @@
+{
+  "number": 420,
+  "eligible": true,
+  "ineligible_reasons": [],
+  "codex_rounds": 1,
+  "resolve": [
+    {
+      "thread_id": "PRRT_1",
+      "kind": "deferred",
+      "ticket": "PAN-180"
+    },
+    {
+      "thread_id": "PRRT_2",
+      "kind": "deferred",
+      "ticket": "PAN-180"
+    }
+  ],
+  "request_codex_verdict": false,
+  "rerun_ci_failed_jobs": false,
+  "clear_pause": false,
+  "arm": false,
+  "disarm": false,
+  "blockers": [],
+  "report": false
+}

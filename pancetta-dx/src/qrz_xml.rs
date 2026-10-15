@@ -45,6 +45,9 @@ use tracing::debug;
 /// Default request timeout for QRZ XML calls (seconds).
 const QRZ_XML_TIMEOUT_SECS: u64 = 30;
 
+/// Most bytes read from one QRZ XML response; a callsign record is ~2 KiB.
+const QRZ_XML_MAX_BODY_BYTES: usize = 64 * 1024;
+
 /// Parsed result of a QRZ callsign lookup.
 ///
 /// Every field is optional: QRZ records vary widely in completeness and some
@@ -108,9 +111,12 @@ impl QrzXmlClient {
         }
     }
 
-    /// Override the base URL (used only by tests / mock servers).
-    #[cfg(test)]
-    fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+    /// Point the client at another endpoint. Test and mock-server seam only:
+    /// production builds the client with [`new`](Self::new), which always uses
+    /// QRZ's HTTPS endpoint. `pub` so the coordinator's tests can drive a
+    /// failing server; hidden from rustdoc like `pancetta_qso::sim`.
+    #[doc(hidden)]
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
     }
@@ -121,7 +127,9 @@ impl QrzXmlClient {
     /// once if QRZ reports the session has expired (`Session Timeout`). Any
     /// QRZ-reported error (bad credentials, callsign not found, …) maps to a
     /// [`DxError`]; **no credential or session-key value is ever included** in
-    /// an error or log line.
+    /// an error or log line; network failures carry no URL (see
+    /// [`NetworkError`](crate::NetworkError)). A response body over 64 KiB is
+    /// refused with [`DxError::ResponseTooLarge`] once that much has been read.
     pub async fn lookup(&self, callsign: &str) -> Result<QrzLookup> {
         // Ensure we hold a session key (auth on first use).
         let key = self.session_key().await?;
@@ -168,17 +176,8 @@ impl QrzXmlClient {
         );
         let url = format!("{}?{}", self.base_url, query);
 
-        let body = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(DxError::Network)?
-            .error_for_status()
-            .map_err(DxError::Network)?
-            .text()
-            .await
-            .map_err(DxError::Network)?;
+        let resp = self.client.get(&url).send().await?.error_for_status()?;
+        let body = crate::body::text_within(resp, QRZ_XML_MAX_BODY_BYTES).await?;
 
         match parse_session(&body)? {
             SessionResult::Key(key) => {
@@ -203,17 +202,8 @@ impl QrzXmlClient {
         let query = format!("s={};callsign={}", urlencode(key), urlencode(callsign));
         let url = format!("{}?{}", self.base_url, query);
 
-        let body = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(DxError::Network)?
-            .error_for_status()
-            .map_err(DxError::Network)?
-            .text()
-            .await
-            .map_err(DxError::Network)?;
+        let resp = self.client.get(&url).send().await?.error_for_status()?;
+        let body = crate::body::text_within(resp, QRZ_XML_MAX_BODY_BYTES).await?;
 
         // A session error in the response (timeout/invalid) is surfaced as an
         // ExternalService error so `lookup` can decide whether to re-auth.
@@ -617,5 +607,153 @@ mod tests {
         assert!(msg.contains("authentication failed"), "msg: {msg}");
         // The error must NOT leak the password.
         assert!(!msg.contains("wrong"), "error leaked credential: {msg}");
+    }
+
+    // ----- Network failures: no credential or session key in any rendering. --
+
+    use crate::test_support::{
+        assert_network_error_omits, closed_port, serve_raw, serve_redirect_loop, STATUS_503,
+        TRUNCATED_BODY,
+    };
+
+    const SECRET_PASSWORD: &str = "pw-7Hq2-secret";
+    const SECRET_KEY: &str = "sk-4c1e9b7f-secret";
+
+    fn client_at(addr: std::net::SocketAddr) -> QrzXmlClient {
+        QrzXmlClient::new("user", SECRET_PASSWORD, "pancetta-test")
+            .with_base_url(format!("http://{addr}/xml/current/"))
+    }
+
+    /// A client that already holds a session key, so `lookup` goes straight to
+    /// the session-keyed request.
+    async fn session_client_at(addr: std::net::SocketAddr) -> QrzXmlClient {
+        let client = client_at(addr);
+        *client.session_key.lock().await = Some(SECRET_KEY.to_string());
+        client
+    }
+
+    #[tokio::test]
+    async fn auth_status_error_omits_password() {
+        let err = client_at(serve_raw(1, STATUS_503))
+            .lookup("AA7BQ")
+            .await
+            .unwrap_err();
+        assert_network_error_omits(&err, &[SECRET_PASSWORD]);
+        assert!(err.to_string().contains("503"), "status text lost: {err}");
+    }
+
+    #[tokio::test]
+    async fn auth_connect_error_omits_password() {
+        let err = client_at(closed_port()).lookup("AA7BQ").await.unwrap_err();
+        assert_network_error_omits(&err, &[SECRET_PASSWORD]);
+    }
+
+    #[tokio::test]
+    async fn auth_redirect_error_omits_password() {
+        let err = client_at(serve_redirect_loop())
+            .lookup("AA7BQ")
+            .await
+            .unwrap_err();
+        assert_network_error_omits(&err, &[SECRET_PASSWORD]);
+    }
+
+    #[tokio::test]
+    async fn auth_body_error_omits_password() {
+        let err = client_at(serve_raw(1, TRUNCATED_BODY))
+            .lookup("AA7BQ")
+            .await
+            .unwrap_err();
+        assert_network_error_omits(&err, &[SECRET_PASSWORD]);
+    }
+
+    #[tokio::test]
+    async fn lookup_status_error_omits_session_key() {
+        let err = session_client_at(serve_raw(1, STATUS_503))
+            .await
+            .lookup("AA7BQ")
+            .await
+            .unwrap_err();
+        assert_network_error_omits(&err, &[SECRET_KEY, SECRET_PASSWORD]);
+        assert!(err.to_string().contains("503"), "status text lost: {err}");
+    }
+
+    #[tokio::test]
+    async fn lookup_connect_error_omits_session_key() {
+        let err = session_client_at(closed_port())
+            .await
+            .lookup("AA7BQ")
+            .await
+            .unwrap_err();
+        assert_network_error_omits(&err, &[SECRET_KEY, SECRET_PASSWORD]);
+    }
+
+    #[tokio::test]
+    async fn lookup_redirect_error_omits_session_key() {
+        let err = session_client_at(serve_redirect_loop())
+            .await
+            .lookup("AA7BQ")
+            .await
+            .unwrap_err();
+        assert_network_error_omits(&err, &[SECRET_KEY, SECRET_PASSWORD]);
+    }
+
+    #[tokio::test]
+    async fn lookup_body_error_omits_session_key() {
+        let err = session_client_at(serve_raw(1, TRUNCATED_BODY))
+            .await
+            .lookup("AA7BQ")
+            .await
+            .unwrap_err();
+        assert_network_error_omits(&err, &[SECRET_KEY, SECRET_PASSWORD]);
+    }
+
+    // ----- Byte budget: oversized bodies are refused while being read. -------
+
+    use crate::test_support::{serve_chunked, served};
+
+    const MIB: usize = 1024 * 1024;
+
+    #[tokio::test]
+    async fn auth_response_over_budget_is_refused_early() {
+        let (addr, h) = serve_chunked(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/xml",
+            AUTH_OK.as_bytes(),
+            64 * MIB,
+        );
+        let err = client_at(addr).lookup("AA7BQ").await.unwrap_err();
+        assert!(
+            matches!(err, DxError::ResponseTooLarge { limit } if limit == QRZ_XML_MAX_BODY_BYTES),
+            "got {err:?}"
+        );
+        let s = served(h).await;
+        assert!(!s.completed && s.written < 32 * MIB, "wrote {}", s.written);
+    }
+
+    #[tokio::test]
+    async fn lookup_response_over_budget_is_refused_early() {
+        let (addr, h) = serve_chunked(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/xml",
+            LOOKUP_OK.as_bytes(),
+            64 * MIB,
+        );
+        let result = session_client_at(addr).await.lookup("AA7BQ").await;
+        assert!(
+            matches!(result, Err(DxError::ResponseTooLarge { limit }) if limit == QRZ_XML_MAX_BODY_BYTES),
+            "got {result:?}"
+        );
+        let s = served(h).await;
+        assert!(!s.completed && s.written < 32 * MIB, "wrote {}", s.written);
+    }
+
+    #[tokio::test]
+    async fn chunked_lookup_within_budget_still_parses() {
+        let (addr, h) = serve_chunked(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/xml",
+            LOOKUP_OK.as_bytes(),
+            0,
+        );
+        let lookup = session_client_at(addr).await.lookup("AA7BQ").await.unwrap();
+        assert_eq!(lookup.call.as_deref(), Some("AA7BQ"));
+        assert!(served(h).await.completed);
     }
 }

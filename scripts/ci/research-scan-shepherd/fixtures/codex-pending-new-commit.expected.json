@@ -1,0 +1,34 @@
+{
+  "arm": false,
+  "blockers": [
+    {
+      "kind": "check-failing",
+      "name": "CI"
+    },
+    {
+      "kind": "check-pending",
+      "name": "Codex review clean (gate before expensive downstream jobs)"
+    }
+  ],
+  "clear_pause": false,
+  "codex_rounds": 4,
+  "disarm": false,
+  "eligible": true,
+  "ineligible_reasons": [],
+  "number": 420,
+  "report": true,
+  "request_codex_verdict": false,
+  "rerun_ci_failed_jobs": false,
+  "resolve": [
+    {
+      "kind": "deferred",
+      "thread_id": "PRRT_1",
+      "ticket": "PAN-180"
+    },
+    {
+      "kind": "deferred",
+      "thread_id": "PRRT_2",
+      "ticket": "PAN-180"
+    }
+  ]
+}

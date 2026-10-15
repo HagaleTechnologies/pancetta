@@ -450,3 +450,105 @@ a hard `missing field` error. Worse, the auto-discovery loader swallowed that er
 - **Search path** deduplicated (keep last occurrence) and documented in `docs/CONFIG.md`.
 - `pancetta-config/examples/config.toml` deleted: unreferenced, unparseable, and a duplicate of
   the generated `defaults.toml`.
+
+## In-session clock-skew monitor (PAN-114, 2026-10-10)
+
+`pancetta/src/clock_skew.rs` (SNTP client, thresholds, pure `ClockSkewMonitorCore`),
+`pancetta/src/coordinator/clock_monitor.rs` (`spawn_clock_skew_monitor`): before this, the only clock
+check was `pancetta doctor`'s one-shot SNTP probe with a 1.0 s threshold, coarser than FT8's ~0.3 s
+decode margin (the live capture window spans DT ≈ −0.66…+0.36 s). The SNTP code moved from the
+binary-only `doctor.rs` into `pancetta_lib` so the coordinator can use it; doctor imports it back.
+
+- **Cadence.** First probe 30 s after start, then every 30 min. The NTP pool's SNTP client terms
+  ([ntppool.org/vendors](https://ntppool.org/vendors)) ask for at most one query per 30 minutes,
+  which rules out a fast "re-probe until clear" loop. 30 min of drift at a 50 ppm crystal is
+  0.09 s, well below the threshold.
+- **Steps.** A `ClockStepDetector` (wall vs monotonic, ≥ 250 ms) on the monitor's 1 s tick detects
+  NTP steps and, where the monotonic clock stops in suspend (Linux, macOS), sleep/wake. A step
+  clears the warning at once, logs a `clock.step` Warn (at most one per 60 s), and schedules a
+  re-check at `max(last_probe + 30 min, step + 30 s)`.
+- **Surfacing.** Each `clock.skew` / `clock.step` entry goes to the Diagnostics overlay through
+  `emit_diagnostic_full` **and** to `tracing` (`clock skew:` / `clock step:`), because headless mode
+  drops the TUI bus receiver. An unreachable server logs one Info entry and shows no chip.
+- **Gating.** Started in `ApplicationCoordinator::run` only when `!replay_mode()`, so no SNTP query
+  leaves a replay (`--wav` returns before it). Not registered with the supervisor: it is advisory
+  and must not trigger restart semantics. Aborted after the main loop exits.
+- **No config key.** Always on in live sessions; this avoids a new `merge_with` field. Thresholds
+  are shared with doctor: `CLOCK_SKEW_WARN_S` (0.3) and `CLOCK_SKEW_FAIL_S` (1.0). Doctor gained a
+  WARN tier for 0.3 s ≤ |offset| < 1.0 s; PASS, FAIL and unreachable texts and the exit code are
+  unchanged.
+
+## Research-scan PRs land themselves (PAN-172, 2026-10-11)
+
+- Merge groups skip the five Rust lanes only when their non-empty cumulative diff is
+  entirely under `research/notes/`. The path allowlist includes `--no-renames`, so moving
+  code into the notes directory cannot hide its deletion. Detection fails closed. Other
+  groups run every Rust lane, including Cargo Deny advisories; a note cannot repair an
+  advisory already present on main.
+- `CI` rejects commit trailer lines on PRs whose title starts with `Weekly research scan `.
+  The check covers every commit in the PR and rejects both AI attribution and session lines.
+- `research-scan-shepherd.yml` runs at 02:17 and 14:17 UTC. It handles only ready, same-repo,
+  notes-only scan PRs into main from the existing trusted authors. It uses the review PAT
+  only for thread resolution and arming. It has its own concurrency group and checks that
+  Auto-Merge Trigger and Queue Retry Handler are quiet before acting, avoiding eviction
+  of a pending run in their shared lock. Stuck scans get a PR comment, a maintainer issue,
+  and a failed workflow run.
+- The shepherd may clear a handler-attached pause at most twice per head SHA. A pause
+  attached by anyone except `github-actions[bot]` remains in force. Exhausting the budget
+  produces a report instead of another retry.
+- The [routine lifecycle](../routines/pancetta-research-scan.md) is the source for the
+  scan-only review policy. Round 1 fixes reasonable findings; rounds 2 and 3 fix P0/P1
+  and defer P2 and lower; round 4 and later defer everything without more commits.
+  This local override leaves the synced general convergence policy unchanged. The external
+  claude.ai routine must receive the documented prompt pointer, daily schedule and Linear
+  connector edits before the full lifecycle is operational.
+
+## Network input budgets (PAN-101), 2026-10-14
+
+HTTP response bodies in `pancetta-cqdx`, `pancetta-dx` and the `pancetta pair` client, DX cluster
+lines, and relay WebSocket frames are read through a reader that stops at a fixed byte budget, so
+none of them is buffered whole before its size is known. This record does not cover the
+remote-gateway WebSocket acceptor; its limits are tracked in PAN-99. The budgets are `const`s
+beside each client, not config:
+
+- **HTTP bodies.** `pancetta-cqdx` (`client.rs::read_body_capped`) and `pancetta-dx`
+  (`body::{bytes_within, text_within, text_prefix}`) read with `Response::chunk()` and stop once the
+  budget is passed. A body that is read whole fails when it is over budget, or before reading when
+  its declared `Content-Length` is (`CqdxError::ResponseTooLarge`, `DxError::ResponseTooLarge`,
+  `PairingError::MalformedResponse` for `pancetta pair`). Two success bodies are read only up to
+  their budget and never fail on size: a cqdx `log_qso` 2xx body over 64 KiB is not checked for a
+  duplicate marker and counts as logged, and ClubLog's body is read only up to 4 KiB whatever the
+  status, with the outcome set by the HTTP status. The cqdx, QRZ Logbook and eQSL error bodies are
+  read only up to 4 KiB, so an error message carries at most that much of the body. Budgets: cqdx
+  JSON 10 MiB, cqdx `log_qso` 2xx 64 KiB, QRZ XML 64 KiB, QRZ Logbook/eQSL 64 KiB, ClubLog 4 KiB,
+  LoTW pages 1 MiB and report 64 MiB, PSKReporter query 16 MiB, `pancetta pair` 64 KiB with a 30 s
+  timeout. `pancetta-dx` decodes text the way `Response::text` does (Content-Type charset, BOM
+  sniffing).
+- **DX cluster.** Telnet lines longer than 4096 bytes (line ending included) are discarded without
+  being buffered (`cluster.rs::read_capped_line`). The spot queue holds 1024 and drops new spots when
+  full (`DxClusterClient::dropped_spot_count`); the command queue holds 64. The WebSocket branch
+  refuses messages over 4096 bytes.
+- **Relay WebSocket.** `RealWsConn` sets tungstenite's `max_message_size` and `max_frame_size` to
+  relay.v1's `MAX_FRAME_BYTES` (65536), so a larger frame is refused from its header and the session
+  closes, the same outcome `parse_frame` already produced.
+
+Rule: do not call `.text()`, `.bytes()` or `.json()` on a `reqwest::Response` in these crates, and
+do not dial or accept a WebSocket without a `WebSocketConfig` sized to its protocol. The
+remote-gateway acceptor does not follow this rule yet (PAN-99).
+
+## Release workflow pins and token scope (PAN-106, 2026-10-14)
+
+- **Pins.** `.github/workflows/release.yml` pins every action to a full commit SHA, with the
+  version in a trailing comment. `dtolnay/rust-toolchain` follows its `stable` branch at a pinned
+  SHA (the commit `stable` resolved to when pinned), so a toolchain-action update is an explicit
+  pin bump. `supply-chain.yml` still pins an older `dtolnay/rust-toolchain` commit; aligning the
+  two is a follow-up.
+- **Token.** The workflow-level token is `contents: read`. Only the `release` job, which runs
+  `gh release create`, declares `contents: write`; `build` inherits read-only. Both checkouts set
+  `persist-credentials: false`; the `ft8_lib` submodule is public and fetches anonymously.
+- **Rule.** Add new actions to `release.yml` SHA-pinned, and do not give `build` any write scope.
+  The `Supply Chain` pin check only covers newly added `uses:` lines, so it does not catch an
+  existing ref being left mutable.
+- **Deferred.** Artifact attestation and signing (it needs `id-token: write` and
+  `attestations: write` on `build`, so it gets its own decision), and pinning plus permission
+  scoping for `demo-assets.yml`, `docs.yml`, `dependabot-auto-merge.yml` and `ci.yml`.

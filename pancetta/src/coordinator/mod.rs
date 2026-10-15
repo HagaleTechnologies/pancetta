@@ -19,6 +19,7 @@
 mod audio;
 mod audio_recovery;
 mod autonomous;
+mod clock_monitor;
 mod dsp;
 mod dx_cluster;
 mod effort;
@@ -42,8 +43,9 @@ mod wav_playback;
 pub(crate) mod wsjtx_udp;
 
 pub use tx::{
-    coalesce_transmit_requests, remote_tx_permitted, remote_tx_permitted_for,
-    resolve_required_parity, schedule_tx, CoalesceEntry, CoalesceOutcome, TxSchedule,
+    coalesce_transmit_requests, coalesce_transmit_requests_with_fox_priority, remote_tx_permitted,
+    remote_tx_permitted_for, resolve_required_parity, schedule_tx, CoalesceEntry, CoalesceOutcome,
+    TxSchedule,
 };
 
 pub use qso::compute_manual_tx_offset;
@@ -1147,6 +1149,15 @@ pub struct ApplicationCoordinator {
     /// TUI relay OS thread handle (joined on shutdown)
     tui_relay_handle: Option<std::thread::JoinHandle<()>>,
 
+    /// PAN-114: current clock-skew warning, written by the clock-skew
+    /// monitor task (`clock_monitor.rs`) and read by the TUI relay's 2 s
+    /// `PipelineHealth` tick.
+    clock_skew: crate::clock_skew::ClockSkewShared,
+
+    /// PAN-114: clock-skew monitor task. `None` until `run()` starts it, and
+    /// always `None` under `--replay` / `--wav`. Aborted on shutdown.
+    clock_monitor_handle: Option<JoinHandle<()>>,
+
     /// Current operating frequency in Hz, shared across components.
     /// Updated by the hamlib polling task; read by cqdx.io and PSKReporter
     /// to compute absolute RF frequency from audio offsets.
@@ -1413,6 +1424,16 @@ pub struct ApplicationCoordinator {
     /// closes that gap. Requests with `qso_id == None` (manual free-text,
     /// tune, test-TX) are never gated by this set.
     pub(crate) active_tx_qsos: Arc<std::sync::RwLock<HashSet<String>>>,
+    /// PAN-76: canonical keys (`active_tx_qso_key`) of QSOs Fox mode opened —
+    /// the Fox CQ `SetFoxMode { on: true }` starts, and every caller
+    /// `maybe_answer_caller` answers while `fox_mode` is set. Written only by
+    /// the QSO component; entries leave at the same points as
+    /// `active_tx_qsos` (including the 45 s completed grace). Read by the TX
+    /// worker so turning Fox mode off never truncates the Hound exchanges it
+    /// already admitted: the coalescer keeps Fox-admitted streams first and
+    /// raises its cap to the number actually present, and mid-TX supersede
+    /// keeps their bundle intact.
+    pub(crate) fox_admitted_qsos: Arc<std::sync::RwLock<HashSet<String>>>,
     /// FQ-F3: active QSO id -> its current TX audio-offset frequency (Hz).
     /// Maintained by the SAME QSO-event-forwarding task, at the SAME
     /// insert/remove points (including the 45s completed-grace window), as
@@ -1432,13 +1453,16 @@ pub struct ApplicationCoordinator {
     /// the QSO component as it forwards each `MessageToSend`; read by the TX
     /// worker at key-time to pivot to the freshest message for the QSO.
     pub(crate) latest_tx_intent: Arc<std::sync::RwLock<HashMap<String, LatestTxIntent>>>,
-    /// Station-agent remote-TX arm gate. The FINAL TX authority for
+    /// Shared remote-TX arm gate. The FINAL TX authority for
     /// remote-originated (`TxOrigin::Remote`) transmit requests: the TX worker
-    /// checks `tx_permitted(now_ms)` before keying PTT for any remote request
-    /// and drops it (fail-closed) if not permitted. Seeded at startup with the
-    /// LOCAL operator consent from `[network.station_agent].remote_tx_enabled`
-    /// (default OFF), so with nothing arming it and no remote requests being
-    /// constructed (P0–P2), this gate is inert. Local TX never consults it.
+    /// checks `tx_permitted(now_ms, channel)` — for the channel the request
+    /// originated on — before keying PTT for any remote request and drops it
+    /// (fail-closed) if not permitted. Seeded at startup with PER-CHANNEL
+    /// local operator consent (PAN-98): the station-agent channel's from
+    /// `[network.station_agent].remote_tx_enabled`, the WSJT-X UDP channel's
+    /// from `[network.wsjtx_udp] enabled && allow_tx_initiation` (both default
+    /// OFF); one channel's consent never satisfies the other's. Local TX never
+    /// consults it.
     pub(crate) remote_tx_arm: Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
     /// The station-agent audit log, shared so more than just
     /// `run_session_loop`'s own `ArmContext` can append to it — notably the
@@ -1769,31 +1793,23 @@ impl ApplicationCoordinator {
         // the Arc<RwLock> — mirrors `display_feed_enabled_init` above.
         let wsjtx_enabled_init = config.network.wsjtx_udp.enabled;
         // Snapshot the LOCAL remote-TX consent before config is moved into the
-        // Arc<RwLock>. Seeds the shared remote-TX arm's local-consent gate.
-        // Option A of the WSJT-X-UDP design spec: the arm is the operator's
-        // channel-independent "I consent to remote TX" bit, so EITHER channel's
-        // consent seeds it — the station agent's `remote_tx_enabled` OR the
-        // WSJT-X-UDP `allow_tx_initiation` (both default OFF, so remote TX can
-        // never be permitted this phase unless the operator opts in).
+        // Arc<RwLock>. The shared remote-TX arm tracks consent PER CHANNEL
+        // (PAN-98), each seeded only from that channel's own settings (both
+        // default OFF, so remote TX can never be permitted unless the operator
+        // opts in on that channel):
+        // - station-agent channel: `[network.station_agent].remote_tx_enabled`;
+        // - WSJT-X UDP channel: `[network.wsjtx_udp] enabled &&
+        //   allow_tx_initiation`.
+        // Neither channel's consent ever satisfies the other's gate.
         //
-        // The wsjtx contribution is additionally gated on `enabled`: when the
-        // component is disabled there is no Reply-handling code path at all,
-        // so seeding the arm from a disabled component's flag is pure risk
-        // (an armed-but-unreachable seed) with no functional benefit. This
-        // also closes an audit-visibility gap — with `enabled = false`, the
-        // startup DiagnosticEvent in `start_wsjtx_udp_component` never fires
-        // (it's behind that component's own enabled check), so an operator
-        // with `enabled = false, allow_tx_initiation = true` would otherwise
-        // get only a `warn!` log line for a misconfiguration that still arms
-        // remote TX. `enabled && allow_tx_initiation` equals
-        // `allow_tx_initiation` whenever `enabled` is already true, so this
-        // is a no-op for the `enabled = true` case.
+        // The wsjtx bit is additionally gated on `enabled`: when the component
+        // is disabled there is no Reply-handling code path at all, so consent
+        // from a disabled component's flag is pure risk with no functional
+        // benefit. `enabled && allow_tx_initiation` equals
+        // `allow_tx_initiation` whenever `enabled` is already true.
+        let station_agent_tx_consent_init = config.network.station_agent.remote_tx_enabled;
         let wsjtx_allow_tx_initiation_init =
             wsjtx_enabled_init && config.network.wsjtx_udp.allow_tx_initiation;
-        let remote_tx_consent_init = crate::coordinator::wsjtx_udp::remote_tx_arm_consent(
-            config.network.station_agent.remote_tx_enabled,
-            wsjtx_allow_tx_initiation_init,
-        );
         // Snapshot the audit log path before config is moved into the
         // Arc<RwLock> — mirrors the other "snapshot before move" fields
         // above. Constructed unconditionally (cheap, no I/O until the first
@@ -1809,13 +1825,6 @@ impl ApplicationCoordinator {
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(pancetta_agent::audit::default_audit_path),
         );
-        if wsjtx_allow_tx_initiation_init {
-            warn!(
-                target: "remote.wsjtx",
-                "remote-TX arm seeded by [network.wsjtx_udp].allow_tx_initiation \
-                 — UDP Reply may initiate QSOs"
-            );
-        }
         // Snapshot fox.max_streams before config is moved into the Arc<RwLock>.
         // The QSO component reads this to cap concurrent caller-answer QSOs
         // while Fox mode is engaged.
@@ -2028,6 +2037,8 @@ impl ApplicationCoordinator {
                 pancetta_qso::CrossSequenceCallCache::default(),
             )),
             tui_relay_handle: None,
+            clock_skew: crate::clock_skew::ClockSkewShared::new(),
+            clock_monitor_handle: None,
             // Initialize to 0 — hamlib will read the actual rig frequency on startup.
             // If hamlib isn't available, the TUI default (14.074) takes over.
             operating_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2100,15 +2111,26 @@ impl ApplicationCoordinator {
             ft8_config,
             config_warnings,
             active_tx_qsos: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            fox_admitted_qsos: Arc::new(std::sync::RwLock::new(HashSet::new())),
             latest_tx_intent: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            // Station-agent remote-TX arm. Fresh (unarmed, not killed), then
-            // seed the LOCAL operator consent from config. With consent OFF (the
-            // default) `tx_permitted()` is always false; nothing arms and no
-            // remote request is constructed in P0–P2, so the gate is inert.
+            // Shared remote-TX arm. Fresh (unarmed, not killed), then seed
+            // each channel's LOCAL operator consent from its own config. With
+            // a channel's consent OFF (the default) `tx_permitted(_, channel)`
+            // is always false for that channel, and with the station-agent
+            // channel's consent OFF nothing can arm at all.
             remote_tx_arm: {
                 let mut st = pancetta_agent::arm::ArmState::new();
                 let now_ms = chrono::Utc::now().timestamp_millis();
-                let _ = st.set_local_consent(remote_tx_consent_init, now_ms);
+                let _ = st.set_channel_consent(
+                    pancetta_agent::arm::ConsentChannel::StationAgent,
+                    station_agent_tx_consent_init,
+                    now_ms,
+                );
+                let _ = st.set_channel_consent(
+                    pancetta_agent::arm::ConsentChannel::WsjtxUdp,
+                    wsjtx_allow_tx_initiation_init,
+                    now_ms,
+                );
                 Arc::new(std::sync::Mutex::new(st))
             },
             audit_log: audit_log_init,
@@ -2396,6 +2418,21 @@ impl ApplicationCoordinator {
         // Start coordinator tasks
         self.start_coordinator_tasks().await?;
 
+        // PAN-114: in-session clock-skew monitor (one SNTP query to
+        // pool.ntp.org 30 s after start, then every 30 min). Never under
+        // `--replay`: no SNTP query leaves a replay. (`--wav` returned above.)
+        if !self.replay_mode() {
+            use crate::clock_skew::{sntp_clock_offset, NTP_SERVER, SNTP_TIMEOUT};
+            self.clock_monitor_handle = Some(clock_monitor::spawn_clock_skew_monitor(
+                self.message_bus.clone(),
+                self.clock_skew.clone(),
+                self.shutdown_signal.clone(),
+                clock_monitor::ClockMonitorSchedule::default(),
+                Arc::new(|| sntp_clock_offset(NTP_SERVER, SNTP_TIMEOUT).map_err(|e| e.to_string())),
+                Arc::new(chrono::Utc::now),
+            ));
+        }
+
         let startup_duration = self.startup_time.elapsed();
         info!(
             "Application startup completed in {:.2}s",
@@ -2403,7 +2440,15 @@ impl ApplicationCoordinator {
         );
 
         // Main application loop
-        self.run_main_loop().await?;
+        let main_loop_result = self.run_main_loop().await;
+
+        // The clock-skew monitor is advisory and holds no resources; stop it
+        // before the component teardown (or an early error return) rather
+        // than waiting out its tick.
+        if let Some(handle) = self.clock_monitor_handle.take() {
+            handle.abort();
+        }
+        main_loop_result?;
 
         // Graceful shutdown
         self.shutdown().await?;
@@ -2484,6 +2529,8 @@ impl ApplicationCoordinator {
     ///   dialing the relay, so replayed decodes are never broadcast to relay
     ///   peers AND no remote peer can send control frames (QSY/QSO actions)
     ///   into a demo process.
+    /// - Clock-skew monitor (`coordinator/clock_monitor.rs`) — not started, so
+    ///   no SNTP query leaves a replay.
     ///
     /// Add new outbound integrations — and any new persistence of a
     /// "completed" contact — to that list rather than inventing a second
@@ -2540,9 +2587,10 @@ impl ApplicationCoordinator {
         self.resolved_hardware_tier.clone()
     }
 
-    /// Station-agent remote-TX arm gate (shared handle). Cloned into the TX
-    /// worker, which checks `tx_permitted(now_ms)` before keying PTT for any
-    /// `TxOrigin::Remote` request and drops it (fail-closed) if not permitted.
+    /// Shared remote-TX arm gate (shared handle). Cloned into the TX worker,
+    /// which checks `tx_permitted(now_ms, channel)` for the request's
+    /// originating channel before keying PTT for any `TxOrigin::Remote`
+    /// request and drops it (fail-closed) if not permitted.
     /// In P0–P2 nothing arms it and no remote request is constructed, so it is
     /// inert; local TX never consults it.
     pub(crate) fn remote_tx_arm(&self) -> Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>> {
@@ -3171,14 +3219,70 @@ mod tests {
         );
     }
 
+    /// Build a coordinator with the given gateway bind/token, start the
+    /// display feed, and assert how many `RemoteGateway` tasks
+    /// `start_remote_gateway_component` added: 0 when the fail-closed
+    /// backstop refuses the config (no token, or a non-loopback bind
+    /// without opt-in), 1 when it binds.
+    async fn assert_remote_gateway_task_count(
+        bind: &str,
+        token: Option<&str>,
+        expected_added: usize,
+    ) {
+        let mut config = Config::default();
+        config.network.remote_gateway.enabled = true;
+        config.network.remote_gateway.bind_addr = bind.into();
+        config.network.remote_gateway.auth_token = token.map(str::to_owned);
+        let mut coordinator = build_coordinator_with_config_and_replay(config, None).await;
+        coordinator.start_display_feed().await.unwrap();
+        let before = coordinator
+            .named_task_handles
+            .iter()
+            .filter(|(id, _)| *id == ComponentId::RemoteGateway)
+            .count();
+        coordinator.start_remote_gateway_component().await.unwrap();
+        let after = coordinator
+            .named_task_handles
+            .iter()
+            .filter(|(id, _)| *id == ComponentId::RemoteGateway)
+            .count();
+        coordinator.shutdown_signal.store(true, Ordering::Release);
+        assert_eq!(after, before + expected_added);
+    }
+
+    #[tokio::test]
+    async fn remote_gateway_does_not_bind_without_auth_token() {
+        assert_remote_gateway_task_count("127.0.0.1:0", None, 0).await;
+    }
+
+    #[tokio::test]
+    async fn remote_gateway_does_not_bind_non_loopback_without_opt_in() {
+        assert_remote_gateway_task_count(
+            "0.0.0.0:0",
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef"),
+            0,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn remote_gateway_binds_on_loopback_with_auth_token() {
+        assert_remote_gateway_task_count(
+            "127.0.0.1:0",
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef"),
+            1,
+        )
+        .await;
+    }
+
     /// Round-4 regression: `[network.remote_gateway].enabled = true` under
     /// `--replay` must never bind a listener or feed one, even though
     /// neither `start_display_feed` nor `start_remote_gateway_component`
     /// consult `replay_mode` through the same `config.network.remote_gateway
     /// .enabled` flag every other outbound integration in this list checks.
-    /// `bind_addr` is pinned to an ephemeral loopback port so a live run
-    /// would succeed here too — the assertion is entirely on replay-mode
-    /// behavior, not on some other reason the bind failed.
+    /// No `auth_token` is set: the component's `replay_mode()` early return
+    /// precedes its config re-validation, so the assertion below is entirely
+    /// on replay-mode behavior.
     #[tokio::test]
     async fn replay_mode_suppresses_remote_gateway_even_when_configured_enabled() {
         let mut config = Config::default();

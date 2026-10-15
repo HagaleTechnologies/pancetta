@@ -525,6 +525,8 @@ pub struct QsoMetadata {
     /// (relevant only for manual keep-calling). Starts at 1 when the QSO
     /// is created (the first call is emitted immediately) and increments
     /// on each watchdog re-arm. Drives the `manual_call_max_calls` cap.
+    /// PAN-75 reverses remembered keep-call emissions reported as not sent;
+    /// the opening call and silently coalesced emissions remain counted.
     #[serde(default)]
     pub call_count: u32,
 
@@ -534,7 +536,9 @@ pub struct QsoMetadata {
     pub first_call_at: Option<DateTime<Utc>>,
 
     /// Timestamp of the most recent call transmitted (manual keep-calling).
-    /// Used to rate-limit re-arms to roughly one per FT8 slot.
+    /// PAN-75 restores this stamp for a remembered emission reported as not
+    /// sent. Rearm pacing uses the later of this stamp and the separate
+    /// ledger last-emitted anchor, so rollback cannot accelerate cadence.
     #[serde(default)]
     pub last_call_at: Option<DateTime<Utc>>,
 
@@ -577,7 +581,8 @@ pub struct QsoMetadata {
     /// TX worker applies to every `TxOrigin::Remote` frame (Codex round 7,
     /// finding 3). Silence we caused ourselves is not evidence about the DX.
     /// Whatever was already accumulated from real transmissions is kept, not
-    /// reset.
+    /// reset. PAN-75 also reverses remembered rearm increments when the TX
+    /// worker later reports the frame as not sent.
     #[serde(default)]
     pub stall_cycles: u32,
 
