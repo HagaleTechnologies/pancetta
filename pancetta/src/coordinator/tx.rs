@@ -11291,6 +11291,45 @@ impl super::ApplicationCoordinator {
                                     // exit path (complete / abort / shutdown).
                                     let _tx_status_guard = TxStatusGuard::new(message_bus.clone());
                                     send_tx_status(&message_bus, true).await;
+
+                                    // PAN-118: last-instant band-plan re-check.
+                                    // The tone-buffer build, `PttGuard::new`'s
+                                    // sync-gate wait and the TX-status send
+                                    // above all ran since the admission check,
+                                    // and the effective TX dial may have moved
+                                    // meanwhile. Nothing but the PTT-on send
+                                    // follows. PTT hardware was never asserted
+                                    // (`ptt_guard` only flipped the in-process
+                                    // flag), so unwind that flag and disarm
+                                    // rather than send PTT-off; the TX-badge
+                                    // guard's drop clears the badge.
+                                    if let Some(reason) = tx_rf_for_gate(
+                                        &operating_frequency_hz,
+                                        &split_tx_frequency_hz,
+                                        tone_offset_hz,
+                                    )
+                                    .and_then(|rf| tx_band_plan_mute_reason(rf, &band_plan))
+                                    {
+                                        ptt_active.store(false, Ordering::Release);
+                                        ptt_guard.disarm();
+                                        info!(
+                                            target: "pancetta::tx.policy",
+                                            "TX blocked at final pre-PTT check ({}): tune ({}s @ {} Hz)",
+                                            reason, duration_secs, tone_offset_hz
+                                        );
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "tx.policy",
+                                            pancetta_core::DiagnosticLevel::Info,
+                                            format!(
+                                                "TX blocked at final pre-PTT check ({reason}): tune ({duration_secs}s @ {tone_offset_hz} Hz)"
+                                            ),
+                                            None,
+                                        )
+                                        .await;
+                                        continue;
+                                    }
+
                                     let ptt_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Hamlib,
@@ -18737,6 +18776,96 @@ mod pan118_worker_band_plan_tests {
         assert!(
             await_ptt_on(&h, Duration::from_secs(10)).await,
             "an in-band tune must still key"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tune_dial_moved_out_of_band_before_ptt_is_refused_at_last_instant() {
+        let h = worker_harness().await;
+        h.coordinator
+            .operating_frequency_hz
+            .store(IN_BAND_DIAL_HZ, Ordering::Relaxed);
+        // Hold the PAN-143 PTT sync gate so the worker parks inside
+        // `PttGuard::new` — after the tune's admission band-plan check
+        // passed on the in-band dial, before the PTT-on send.
+        let ptt_sync_gate = h.coordinator.ptt_sync_gate.clone();
+        let held = ptt_sync_gate.lock().await;
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Tui,
+                ComponentId::Ft8Transmitter,
+                MessageType::TuneRequest {
+                    duration_secs: 1,
+                    tone_offset_hz: 1500.0,
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+        // Wait for the worker to dequeue the request. From there the tune's
+        // admission checks and tone build run without yielding until the
+        // held gate, so a short settle covers them.
+        let (worker_inbox, _) = h
+            .coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !worker_inbox.is_empty() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            worker_inbox.is_empty(),
+            "the TX worker must dequeue the tune request"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut diagnostics = Vec::new();
+        while let Ok(msg) = h.tui_rx.try_recv() {
+            if let MessageType::DiagnosticEvent { text, .. } = msg.message_type {
+                diagnostics.push(text);
+            }
+        }
+        assert!(
+            diagnostics.iter().all(|d| !d.contains("TX blocked")),
+            "the in-band tune must pass admission before the dial moves: {diagnostics:?}"
+        );
+
+        // The effective TX dial leaves the band plan while the worker waits.
+        h.coordinator
+            .operating_frequency_hz
+            .store(OUT_OF_BAND_DIAL_HZ, Ordering::Relaxed);
+        drop(held);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_refusal = false;
+        let mut ptt_on = false;
+        while Instant::now() < deadline && !saw_refusal && !ptt_on {
+            while let Ok(msg) = h.hamlib_rx.try_recv() {
+                ptt_on |= matches!(
+                    msg.message_type,
+                    MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt {
+                        state: true
+                    })
+                );
+            }
+            while let Ok(msg) = h.tui_rx.try_recv() {
+                if let MessageType::DiagnosticEvent { text, .. } = msg.message_type {
+                    saw_refusal |= text.contains("final pre-PTT check")
+                        && text.contains("outside the configured amateur band plan")
+                        && text.contains("tune");
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !ptt_on,
+            "no SetPtt(true) for a tune whose dial left the band plan before PTT"
+        );
+        assert!(
+            saw_refusal,
+            "the tune must be refused at the final pre-PTT check with a band-plan diagnostic"
         );
     }
 

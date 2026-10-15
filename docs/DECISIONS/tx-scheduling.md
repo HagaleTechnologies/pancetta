@@ -230,7 +230,8 @@ two bundle items at different audio offsets can straddle an edge at the same ins
 would force the one frequency-less consumer (the QSO stall-evidence closure, `qso.rs`) to grow a
 parameter it cannot have. Instead `tx_band_plan_mute_reason(tx_rf_hz, &band_plan)` is evaluated
 ALONGSIDE the shared gate at every PTT-on decision point: single-TX Step 0 / post-wait /
-last-instant, bundle Step 0 / Step 4b key-time / post-wait / final, TuneRequest, and manual PTT
+last-instant, bundle Step 0 / Step 4b key-time / post-wait / final, TuneRequest (admission and
+last-instant), and manual PTT
 (`ptt_band_plan_refusal`, a sibling of `ptt_on_refusal`). The boolean core stays the single
 `pancetta_tui::app::tx_rf_out_of_band_plan` implementation (region tables + `custom_bands`
 override) shared with the TUI modal; the dial-vs-split resolution stays the single
@@ -258,6 +259,18 @@ mirroring `bundle_live_mask`. At the two post-sum sites (post-wait re-key and fi
 waveform is one summed buffer: an out-of-privilege item's audio energy cannot be individually
 extracted, so ANY out-of-privilege item holds the whole bundle (nothing keys; every item reported
 unaired) — the same whole-bundle hold the existing final liveness check applies to a stale item.
+
+**Bound: the gate reads the dial atomics, not confirmed RF.** `tx_rf_for_gate` reads the shared
+`operating_frequency_hz` / `split_tx_frequency_hz` atomics, which can disagree with the rig around a
+commanded QSY in both directions. The TUI relay's `SetFrequency` / `SetSplit` handlers and the
+autonomous band hop store the requested value before enqueuing the CAT command, and the Hamlib poll
+loop stores the rig's current reading every tick, so it can revert a requested value while that
+command still sits in the queue. A key-time check in either window gates on a frequency the rig is
+not keyed on: FIFO order applies the queued command before the later `SetPtt`, and the
+pending/in-flight mute covers a command only once the Hamlib loop is applying it (or while it waits
+in a restart pending slot). Closing this needs a confirmed-RF source (the rig's split is never read
+back) or in-flight marking from the requested-value store through CAT application. That producer
+ordering predates PAN-118 and is follow-up scope.
 
 The QSO stall-evidence closure (`qso.rs`) is deliberately untouched; whether band-plan refusals
 should suppress stall-escape counting is follow-up scope. The `coord_sim` fixture mirrors the gate
