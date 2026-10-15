@@ -3491,6 +3491,7 @@ async fn resolve_callsigns(
 /// keyed that late is mathematically undecodable for any receiver, so it is
 /// dropped rather than keyed (the QSO engine's existing retry timers own
 /// the re-send).
+#[allow(clippy::too_many_arguments)]
 fn final_single_tx_gate_denial(
     qso_id: Option<&str>,
     required_parity: pancetta_core::slot::SlotParity,

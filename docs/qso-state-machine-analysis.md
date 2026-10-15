@@ -117,7 +117,7 @@ disagree.
 # Part B — TX timing "jank" (the three symptoms)
 
 Files: `pancetta/src/coordinator/{tx.rs,qso.rs}`, `pancetta-qso/src/qso_manager.rs`,
-`pancetta-core/src/slot.rs`. Defaults: `tx_late_max_ms = 8000`, `ptt_lead_ms = 80`,
+`pancetta-core/src/slot.rs`. Defaults: `tx_late_max_ms = 3000` (PAN-117), `ptt_lead_ms = 80`,
 `COALESCE_COLLECT_WINDOW_MS = 800`, `DELAY_MS = 500`. The decoder yields a DX decode only
 ~13 s into the DX's 15 s window. Two tasks touch a QSO: the decode loop
 (`process_message` on every decode) and a 5 s ticker (`rearm_manual_calls` →
