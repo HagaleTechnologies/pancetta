@@ -102,6 +102,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `max_concurrent_qsos` now also limits QSOs you open by hand (PAN-78). With
+  the default of 1, calling a second station while a QSO is waiting for a
+  reply used to open it anyway and transmit it alongside the first. Now the
+  call, caller reply, Hound engage or CQ is refused with a status line such as
+  `Not calling K2BBB — 1/1 QSOs active (max_concurrent_qsos); finish or abort
+  one first`, a Warn Diagnostics entry, and an `error` event for remote
+  clients. Re-calling a station you are already working (including Shift+H
+  again on a Fox you are already calling), sending 73, and RR73 to a station
+  you just completed are still allowed. Calls queued for the
+  other window now start only as slots free up, oldest first, instead of all
+  at once. To work several QSOs at the same time, raise `max_concurrent_qsos`.
+
 - Shift+S station health (PAN-89): the TX-audio row was inverted — routing TX
   to the system default showed green. It is now red `SYSTEM DEFAULT — check
   device`. Errors and startup config warnings are no longer erased by the next
