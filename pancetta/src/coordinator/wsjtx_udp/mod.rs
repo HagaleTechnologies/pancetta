@@ -174,6 +174,12 @@ impl super::ApplicationCoordinator {
         // spawned task.
         let message_bus = self.message_bus.clone();
         let abort_current_tx = self.abort_current_tx.clone();
+        // PAN-103: the shared arm's WsjtxUdp consent bit is this channel's
+        // LIVE consent. Gate 2 (below) reads it per inbound Reply so a saved
+        // `[network.wsjtx_udp] enabled`/`allow_tx_initiation` edit reaches
+        // the running task; the `cfg` snapshot above stays authoritative for
+        // the restart-required socket/source settings.
+        let remote_tx_arm = self.remote_tx_arm.clone();
 
         // Task 5 (QSOLogged/LoggedADIF): `qso.rs` populates this field
         // synchronously while constructing `QsoManager`, before
@@ -443,6 +449,28 @@ impl super::ApplicationCoordinator {
                                     // doesn't number — it must pass regardless
                                     // of gate state. ANY failure ⇒
                                     // refuse-with-audit, no side effect.
+                                    // Gate 2 (`allow_tx_initiation`) reads
+                                    // the channel's LIVE consent bit from
+                                    // the shared arm — the same bit
+                                    // `apply_security_config` flips (audited)
+                                    // when `[network.wsjtx_udp].enabled`/
+                                    // `allow_tx_initiation` is saved — so the
+                                    // advertised live toggle controls
+                                    // Reply-initiated QSO creation here too,
+                                    // in both directions, instead of the
+                                    // startup `cfg` snapshot. (A poisoned
+                                    // lock still yields the state, mirroring
+                                    // the config-apply path; a poisoned arm
+                                    // refuses all remote TX anyway.)
+                                    let allow_tx_initiation = {
+                                        let st = match remote_tx_arm.lock() {
+                                            Ok(guard) => guard,
+                                            Err(poisoned) => poisoned.into_inner(),
+                                        };
+                                        st.channel_consent(
+                                            pancetta_agent::arm::ConsentChannel::WsjtxUdp,
+                                        )
+                                    };
                                     match reply_to_call(&reply, &decode_ring) {
                                         None => {
                                             emit_diagnostic(
@@ -455,7 +483,7 @@ impl super::ApplicationCoordinator {
                                             )
                                             .await;
                                         }
-                                        Some(intent) if !cfg.allow_tx_initiation || !intent.is_cq => {
+                                        Some(intent) if !allow_tx_initiation || !intent.is_cq => {
                                             // Non-CQ replies are targeting-only
                                             // upstream too (protocol notes §5);
                                             // v1 treats both !consent and
@@ -468,7 +496,7 @@ impl super::ApplicationCoordinator {
                                                     "Reply({}) from {from} refused: \
                                                      allow_tx_initiation={}, is_cq={}",
                                                     intent.callsign,
-                                                    cfg.allow_tx_initiation,
+                                                    allow_tx_initiation,
                                                     intent.is_cq
                                                 ),
                                             )
@@ -2350,5 +2378,294 @@ mod replay_gate_tests {
             !wait_for_datagram(&listener).await,
             "--replay must not broadcast replayed decodes to companion apps"
         );
+    }
+
+    // --- PAN-103: gate 2 (`allow_tx_initiation`) must follow the channel's
+    // LIVE consent bit (the one a saved config edit flips), not the `cfg`
+    // snapshot the task captured at startup. --------------------------------
+
+    /// A coordinator with caller-owned `[network.wsjtx_udp]` settings. The
+    /// agent audit log is pointed at a temp file because flipping consent
+    /// through `handle_config_reload` appends `LocalConsentChanged` audit
+    /// events.
+    async fn wsjtx_coordinator(mut config: Config) -> ApplicationCoordinator {
+        config.network.station_agent.audit_log_path = Some(
+            std::env::temp_dir()
+                .join(format!(
+                    "pancetta-pan103-wsjtx-{}-{}.log",
+                    std::process::id(),
+                    uuid::Uuid::new_v4()
+                ))
+                .to_string_lossy()
+                .into_owned(),
+        );
+        ApplicationCoordinator::new(
+            config,
+            None,
+            true,  // no_audio
+            true,  // headless
+            false, // metrics
+            9090,
+            None, // no WAV
+            None, // no replay
+            None, // no test-tx
+            1500.0,
+            Arc::new(AtomicBool::new(false)),
+            Vec::new(), // no config warnings
+            std::env::temp_dir().join("pancetta-test-config.toml"),
+            true, // test-only: assume TOML
+        )
+        .await
+        .expect("coordinator creation should succeed")
+    }
+
+    /// A retained CQ decode fixture: stored under the wire triple
+    /// (message "CQ W1AW FN31", time 45_296_000 ms, delta_freq 1302).
+    fn cq_decode_fixture() -> pancetta_ft8::DecodedMessage {
+        use chrono::TimeZone as _;
+        let mut d =
+            pancetta_ft8::DecodedMessage::new(Ft8Message::default(), -5.0, 1.0, 1302.0, 0.2);
+        d.text = "CQ W1AW FN31".to_string();
+        // 2026-07-15 12:34:56 UTC → ((12*3600 + 34*60 + 56) * 1000) ms.
+        d.timestamp = chrono::Utc
+            .with_ymd_and_hms(2026, 7, 15, 12, 34, 56)
+            .unwrap()
+            .into();
+        d
+    }
+
+    /// Encode an inbound `Reply(4)` datagram the way a companion app would.
+    /// `MAGIC`/`TYPE_REPLY` are private to `codec`, so their wire values are
+    /// spelled out here (codec.rs's golden tests pin them).
+    fn reply_datagram(id: &str, message: &str, time_ms: u32, delta_freq: u32) -> Vec<u8> {
+        let mut w = codec::Writer::new();
+        w.u32(0xadbc_cbda); // MAGIC
+        w.u32(2); // schema
+        w.u32(4); // TYPE_REPLY
+        w.utf8(id);
+        w.qtime_ms(time_ms);
+        w.i32(-5);
+        w.f64(0.2);
+        w.u32(delta_freq);
+        w.utf8("~");
+        w.utf8(message);
+        w.bool(false);
+        w.u8(0); // Modifiers — GridTracker always sends 0
+        w.into_vec()
+    }
+
+    /// Wait for the next datagram on the companion socket; returns its
+    /// source address (the component's ephemeral socket).
+    async fn recv_source(listener: &tokio::net::UdpSocket) -> Option<std::net::SocketAddr> {
+        let mut buf = [0u8; 2048];
+        match tokio::time::timeout(Duration::from_millis(1500), listener.recv_from(&mut buf)).await
+        {
+            Ok(Ok((_, from))) => Some(from),
+            _ => None,
+        }
+    }
+
+    /// Collect every message currently pending on a bus channel.
+    fn drain(rx: &crossbeam_channel::Receiver<ComponentMessage>) -> Vec<ComponentMessage> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            out.push(msg);
+        }
+        out
+    }
+
+    /// Drive one Reply through the RUNNING component: seed the retention
+    /// ring via the decoder's bus tap (the same `MessageType::DecodedMessage`
+    /// fan-in `ft8.rs` produces), wait for the forwarded Decode datagram
+    /// (proof the ring was drained and populated), then echo the decode back
+    /// as a `Reply(4)` datagram from the companion socket (unicast source
+    /// host == destination host, so gate 3 passes).
+    async fn send_reply(
+        coordinator: &ApplicationCoordinator,
+        listener: &tokio::net::UdpSocket,
+        component: std::net::SocketAddr,
+    ) {
+        let decode = ComponentMessage::new(
+            ComponentId::Ft8Decoder,
+            ComponentId::WsjtxUdp,
+            MessageType::DecodedMessage(cq_decode_fixture()),
+            Instant::now(),
+        );
+        coordinator
+            .message_bus
+            .send_message(decode)
+            .await
+            .expect("decode fan-in delivery");
+        recv_source(listener)
+            .await
+            .expect("decode forwarded to the companion socket");
+        let datagram = reply_datagram("WSJT-X - pancetta", "CQ W1AW FN31", 45_296_000, 1302);
+        listener.send_to(&datagram, component).await.unwrap();
+    }
+
+    /// Wait for a `StartQso` caused by an accepted Reply; returns
+    /// (callsign, remote_origin).
+    async fn wait_for_start_qso(
+        rx: &crossbeam_channel::Receiver<ComponentMessage>,
+    ) -> Option<(String, bool)> {
+        let deadline = Instant::now() + Duration::from_millis(2500);
+        while Instant::now() < deadline {
+            for msg in drain(rx) {
+                if let MessageType::QsoMessage(QsoMessage::StartQso {
+                    callsign,
+                    remote_origin,
+                    ..
+                }) = msg.message_type
+                {
+                    return Some((callsign, remote_origin));
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        None
+    }
+
+    /// Wait for a `remote.wsjtx` diagnostic whose text contains `needle`.
+    async fn wait_for_wsjtx_diagnostic(
+        rx: &crossbeam_channel::Receiver<ComponentMessage>,
+        needle: &str,
+    ) -> bool {
+        let deadline = Instant::now() + Duration::from_millis(2500);
+        while Instant::now() < deadline {
+            for msg in drain(rx) {
+                if let MessageType::DiagnosticEvent { target, text, .. } = msg.message_type {
+                    if target == "remote.wsjtx" && text.contains(needle) {
+                        return true;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    /// Saving `allow_tx_initiation = false` must stop a RUNNING component
+    /// from creating remote QSOs on an inbound Reply — gate 2 reads the
+    /// channel's live consent bit (the one the config-reload path flips and
+    /// audits), not the `cfg` snapshot captured at startup. Re-saving `true`
+    /// restores initiation without a restart.
+    #[tokio::test]
+    async fn saved_consent_off_stops_reply_qso_initiation_live_and_on_restores_it() {
+        let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut config = Config::default();
+        config.network.wsjtx_udp.enabled = true;
+        config.network.wsjtx_udp.allow_tx_initiation = true;
+        config.network.wsjtx_udp.accept_udp_requests = true;
+        config.network.wsjtx_udp.destination = format!("127.0.0.1:{port}");
+        let mut coordinator = wsjtx_coordinator(config).await;
+        let qso_rx = coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Qso)
+            .await
+            .unwrap()
+            .1;
+        let tui_rx = coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Tui)
+            .await
+            .unwrap()
+            .1;
+        coordinator.start_wsjtx_udp_component().await.unwrap();
+        let component = recv_source(&listener).await.expect("startup Status");
+
+        // Baseline: consent on → the Reply initiates a remote QSO.
+        send_reply(&coordinator, &listener, component).await;
+        let (callsign, remote_origin) = wait_for_start_qso(&qso_rx)
+            .await
+            .expect("consent on: Reply initiates a remote QSO");
+        assert_eq!((callsign.as_str(), remote_origin), ("W1AW", true));
+
+        // Save `allow_tx_initiation = false` (the PAN-103 live-apply path).
+        let mut off = coordinator.config.read().await.clone();
+        off.network.wsjtx_udp.allow_tx_initiation = false;
+        coordinator
+            .handle_config_reload(Ok((off, Vec::new())))
+            .await;
+        assert!(
+            !coordinator
+                .remote_tx_arm
+                .lock()
+                .unwrap()
+                .channel_consent(pancetta_agent::arm::ConsentChannel::WsjtxUdp),
+            "the live consent bit flipped"
+        );
+
+        // The same Reply must now be refused at gate 2: no remote QSO
+        // object created (the downstream arm gate must not be the only
+        // effect of the save).
+        send_reply(&coordinator, &listener, component).await;
+        assert!(
+            wait_for_wsjtx_diagnostic(&tui_rx, "refused: allow_tx_initiation=false").await,
+            "gate 2 must refuse with the live consent bit off"
+        );
+        assert!(
+            drain(&qso_rx).iter().all(|m| !matches!(
+                m.message_type,
+                MessageType::QsoMessage(QsoMessage::StartQso { .. })
+            )),
+            "no StartQso may be created while consent is off"
+        );
+
+        // Re-saving `true` restores initiation live — no restart.
+        let mut on = coordinator.config.read().await.clone();
+        on.network.wsjtx_udp.allow_tx_initiation = true;
+        coordinator.handle_config_reload(Ok((on, Vec::new()))).await;
+        send_reply(&coordinator, &listener, component).await;
+        assert!(
+            wait_for_start_qso(&qso_rx).await.is_some(),
+            "re-enabling consent must re-allow Reply initiation without a restart"
+        );
+    }
+
+    /// Grant direction, same channel: the component started with consent
+    /// OFF; a saved `allow_tx_initiation = true` must re-allow Reply
+    /// initiation live (the startup snapshot said `false`).
+    #[tokio::test]
+    async fn saved_consent_on_re_allows_reply_initiation_without_restart() {
+        let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut config = Config::default();
+        config.network.wsjtx_udp.enabled = true;
+        config.network.wsjtx_udp.allow_tx_initiation = false;
+        config.network.wsjtx_udp.accept_udp_requests = true;
+        config.network.wsjtx_udp.destination = format!("127.0.0.1:{port}");
+        let mut coordinator = wsjtx_coordinator(config).await;
+        let qso_rx = coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Qso)
+            .await
+            .unwrap()
+            .1;
+        let tui_rx = coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Tui)
+            .await
+            .unwrap()
+            .1;
+        coordinator.start_wsjtx_udp_component().await.unwrap();
+        let component = recv_source(&listener).await.expect("startup Status");
+
+        // Baseline: consent off at startup → refused, nothing initiated.
+        send_reply(&coordinator, &listener, component).await;
+        assert!(
+            wait_for_wsjtx_diagnostic(&tui_rx, "refused: allow_tx_initiation=false").await,
+            "consent off at startup: gate 2 refuses"
+        );
+
+        // Save `allow_tx_initiation = true` → the same Reply initiates live.
+        let mut on = coordinator.config.read().await.clone();
+        on.network.wsjtx_udp.allow_tx_initiation = true;
+        coordinator.handle_config_reload(Ok((on, Vec::new()))).await;
+        send_reply(&coordinator, &listener, component).await;
+        let (callsign, remote_origin) = wait_for_start_qso(&qso_rx)
+            .await
+            .expect("consent re-enabled live: Reply initiates a remote QSO");
+        assert_eq!((callsign.as_str(), remote_origin), ("W1AW", true));
     }
 }

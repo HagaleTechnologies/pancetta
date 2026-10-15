@@ -20,6 +20,7 @@ mod audio;
 mod audio_recovery;
 mod autonomous;
 mod clock_monitor;
+mod config_reload;
 mod dsp;
 mod dx_cluster;
 mod effort;
@@ -45,8 +46,8 @@ pub(crate) mod wsjtx_udp;
 
 pub use tx::{
     coalesce_transmit_requests, coalesce_transmit_requests_with_fox_priority, remote_tx_permitted,
-    remote_tx_permitted_for, resolve_required_parity, schedule_tx, CoalesceEntry, CoalesceOutcome,
-    TxSchedule,
+    remote_tx_permitted_for, resolve_required_parity, schedule_tx, tx_band_plan_mute_reason,
+    tx_rf_for_gate, tx_signal_span_hz, CoalesceEntry, CoalesceOutcome, TxSchedule,
 };
 
 pub use qso::compute_manual_tx_offset;
@@ -70,6 +71,8 @@ pub use health::{
     classify_config_reload, panic_count, record_panic, ConfigReloadApplicability, HealthEdges,
     RfNoDecodeMonitor,
 };
+// PAN-103: the reload apply-plan built on top of `classify_config_reload`.
+pub use config_reload::{ReloadApplyPlan, SecurityConfigDiff, SnapshotAction};
 
 /// Canonical key for the `active_tx_qsos` set: QSO ids are compared
 /// case-insensitively (and trimmed) so the producer (QSO component) and
@@ -462,11 +465,31 @@ pub(crate) fn resolve_window_lead_secs(decoder_cfg: &pancetta_config::DecoderCon
 /// derived sample counts (`DspTiming`) are expressed at this rate.
 pub(crate) const FT8_SAMPLE_RATE: usize = 12000;
 
+/// Record an operator-requested split change in the coordinator's shared
+/// split-TX dial atomic (0 = simplex) and return the stored value. The single
+/// writer rule for `SetSplit` requests: the local TUI relay and a verified
+/// station-agent peer both call this BEFORE forwarding the
+/// `RigControlMessage::SetSplit` to Hamlib, so the TX band-plan gate
+/// (`tx::tx_rf_for_gate`, which resolves split-vs-RX-dial from this atomic)
+/// never checks a stale dial after a split change (PR #446 Codex review:
+/// the remote path used to bypass it). Clearing split (`enabled = false`)
+/// stores 0 regardless of `tx_frequency`.
+pub(crate) fn record_split_state(
+    split_tx_frequency_hz: &std::sync::atomic::AtomicU64,
+    enabled: bool,
+    tx_frequency: u64,
+) -> u64 {
+    let store = if enabled { tx_frequency } else { 0 };
+    split_tx_frequency_hz.store(store, std::sync::atomic::Ordering::Relaxed);
+    store
+}
+
 /// Map the config-local [`pancetta_config::OperatingMode`] to a concrete
 /// [`pancetta_ft8::Protocol`]. The config crate intentionally does not depend
 /// on `pancetta-ft8`, so the coordinator owns this mapping. Derived once at
-/// startup from `rig_config.operating_mode()`.
-pub(crate) fn protocol_from_mode(mode: pancetta_config::OperatingMode) -> pancetta_ft8::Protocol {
+/// startup from `rig_config.operating_mode()`. `pub` so the `coord_sim`
+/// fixture resolves its band-plan gate's signal span the same way.
+pub fn protocol_from_mode(mode: pancetta_config::OperatingMode) -> pancetta_ft8::Protocol {
     match mode {
         pancetta_config::OperatingMode::Ft8 => pancetta_ft8::Protocol::Ft8,
         pancetta_config::OperatingMode::Ft4 => pancetta_ft8::Protocol::Ft4,
@@ -795,6 +818,39 @@ pub struct ApplicationCoordinator {
     pub(crate) hamlib_pending_split: Arc<std::sync::Mutex<Option<ComponentMessage>>>,
     /// Authorization refresh child owned by the current StationAgent generation.
     pub(crate) station_agent_poll: Option<tokio::task::AbortHandle>,
+    /// PAN-103: live authorization handles of the running station-agent
+    /// session (`None` when the component is inert). Used by the config
+    /// reload handler to revoke `tx_allow_list` removals without a restart.
+    pub(crate) station_agent_live: Option<station_agent::StationAgentLiveHandles>,
+    /// PAN-103: the config-file watcher. Watching stops when it is dropped.
+    config_reload_watcher: Option<pancetta_config::hot_reload::ConfigHotReload>,
+    /// PAN-103: the config file path as the operator gave it, symlinks NOT
+    /// resolved (`config_path` is the resolved write target). Reloads read
+    /// and watch this path so repointing a symlinked config is picked up.
+    /// Defaults to `config_path`; `main.rs` sets it via
+    /// [`ApplicationCoordinator::set_config_watch_path`].
+    pub(crate) config_watch_path: PathBuf,
+    /// PAN-103: `config_watch_path`'s own directory, as given and resolved.
+    /// The watcher always watches it.
+    config_link_dirs: Vec<PathBuf>,
+    /// PAN-103: the directory of `config_watch_path`'s current symlink
+    /// target, when that is not one of `config_link_dirs`. Also watched.
+    config_target_dir: Option<PathBuf>,
+    /// PAN-103: the watched file's non-fatal load warnings as last loaded.
+    /// A reload shows only warnings not already in this list.
+    config_file_warnings: Vec<String>,
+    /// PAN-103: reload outcomes forwarded from the watcher; taken by
+    /// `run_main_loop` (mirrors `hamlib_reconnect_rx`).
+    config_reload_rx: Option<tokio::sync::mpsc::Receiver<config_reload::ConfigReloadOutcome>>,
+    /// PAN-103: the watched config file's content as last loaded. Saved edits
+    /// are measured against it, not against `config` (which may also hold
+    /// values from other config files or `PANCETTA_*` environment variables).
+    config_file_baseline: Option<Config>,
+    /// PAN-103: loads and validates the merged configuration the way startup
+    /// did, when the watched file is only one of several merged sources (no
+    /// `--config`); reloads apply that. `None` when the watched file is the
+    /// whole configuration (`--config`): reloads load the file alone.
+    config_reload_loader: Option<config_reload::ConfigReloadLoader>,
 
     /// PAN-43/45 follow-up (Codex round 2 on PR #342): self-CQ attempt IDs
     /// whose dispatch failed but whose `AutonomousCqDispatchFailed`
@@ -1690,16 +1746,15 @@ pub(crate) fn component_restart_policy(id: ComponentId) -> RestartPolicy {
         | ComponentId::Dsp
         | ComponentId::Ft8Decoder
         | ComponentId::Hamlib
-        | ComponentId::StationAgent => RestartPolicy::Restartable,
+        | ComponentId::StationAgent
+        | ComponentId::Ft8Transmitter => RestartPolicy::Restartable,
         // Audio device recovery happens inside AudioManager; restarting the
         // relays would compete for the same device and lose rollback state.
         ComponentId::Audio => RestartPolicy::DegradeOnly,
         // Owns the terminal; restart is awkward — degrade + notify.
         ComponentId::Tui => RestartPolicy::DegradeOnly,
         // Never a real task-handle target for this supervisor.
-        ComponentId::Config | ComponentId::Coordinator | ComponentId::Ft8Transmitter => {
-            RestartPolicy::DegradeOnly
-        }
+        ComponentId::Config | ComponentId::Coordinator => RestartPolicy::DegradeOnly,
         // Companion protocol integration; not critical for autonomous operation.
         ComponentId::WsjtxUdp => RestartPolicy::DegradeOnly,
     }
@@ -1999,6 +2054,7 @@ impl ApplicationCoordinator {
         // reports "already in progress" instead of queuing or blocking.
         let (hamlib_reconnect_tx, hamlib_reconnect_rx) =
             tokio::sync::mpsc::channel::<crate::coordinator::hamlib::HamlibReconnectRequest>(1);
+        let config_watch_path = config_path.clone();
 
         let coordinator = Self {
             id,
@@ -2126,6 +2182,15 @@ impl ApplicationCoordinator {
             #[cfg(feature = "pancetta-hamlib")]
             hamlib_pending_split: Arc::new(std::sync::Mutex::new(None)),
             station_agent_poll: None,
+            station_agent_live: None,
+            config_reload_watcher: None,
+            config_watch_path,
+            config_link_dirs: Vec::new(),
+            config_target_dir: None,
+            config_file_warnings: Vec::new(),
+            config_reload_rx: None,
+            config_file_baseline: None,
+            config_reload_loader: None,
             pending_autonomous_cq_dispatch_failures: Arc::new(std::sync::Mutex::new(Vec::new())),
             pending_qso_offset_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
             pending_cq_offset_nudge: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -4227,7 +4292,7 @@ mod tests {
         );
         assert_eq!(
             component_restart_policy(ComponentId::Ft8Transmitter),
-            DegradeOnly
+            Restartable
         );
         assert_eq!(component_restart_policy(ComponentId::WsjtxUdp), DegradeOnly);
     }

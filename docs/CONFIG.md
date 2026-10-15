@@ -1,8 +1,10 @@
 # Pancetta Configuration Reference
 
 Pancetta's configuration lives in a single TOML file at
-`~/.pancetta/pancetta.toml`. The file is loaded at startup and watched for
-changes; most keys hot-reload without a restart.
+`~/.pancetta/pancetta.toml`. The file is loaded at startup. It is also
+watched for changes, but only the remote-access revocations listed under
+[Hot reload](#hot-reload) apply to a running station; every other key
+needs a restart.
 
 This document covers the keys you'll actually touch, with explanations.
 The complete schema — every section, every key, every default — is
@@ -86,7 +88,7 @@ additionally needs `[autonomous] enabled = true` (see below).
 | `itu_zone` | integer | `8` | Used by some contest exchanges. |
 | `cq_zone` | integer | `5` | Same. |
 | `operator_name` | string | `""` | Your name (optional, for log export). |
-| `tx_late_max_ms` | integer | `8000` | Maximum latency past the slot boundary at which the TX scheduler will still attempt a late-start TX via audio cursor skip-ahead. Beyond this, defers to the next opposite-parity slot (30s later). 8s leaves ~5s of audio on the air, which is enough for the receiver to lock onto the middle and end Costas sync arrays. |
+| `tx_late_max_ms` | integer | `3000` | Hard cap on elapsed slot time at keying: a frame that would key past it is dropped at the final pre-PTT gate, never keyed undecodably. The queue-time same-slot acceptance reserves the unconditional coalesce window + safety margin below the cap — at the default, a request within roughly the first 1.7s of the slot still keys the current slot; later arrivals defer 30s to the next opposite-parity slot. A multi-TX bundle the worker receives already assembled skips that coalesce wait, so it reserves only the 0.5s margin and still keys the current slot if it arrives within roughly the first 2.5s at the default. 3s keeps both the middle and end Costas sync arrays and 49 of 58 data symbols (147 coded bits vs the 91 information bits LDPC needs) on the air. |
 | `tx_self_parity` | string | `"auto"` | When calling CQ (no DX heard), pick TX slot parity by this rule. `"auto"` picks whichever next slot is closer; `"even"` / `"odd"` lock to the named parity. |
 | `ptt_lead_ms` | integer | `80` | PTT engage lead time before the slot boundary. Drop to 50ms for fast solid-state keying; bump up to 150–200ms for slow mechanical relays. |
 
@@ -151,6 +153,39 @@ baud_rate = 38400
 > non-loopback address tells Pancetta to talk to a remote `rigctld`.
 > The TCP port is unauthenticated; if you do this on anything other
 > than a trusted LAN, anyone who can reach the port can drive your rig.
+
+### `[rig.frequency.band_plan]` — amateur band privileges (TX gate + edge warning)
+
+```toml
+[rig.frequency.band_plan]
+region = 2            # ITU/IARU region 1, 2 or 3 (2 = Americas; default 2)
+edge_warnings = true  # master switch: the band-plan TX gate AND the TUI edge
+                      # warning. false disables BOTH — the operator's opt-out
+                      # (e.g. a CW/SSB station parked outside the FT8 tables).
+                      # Default true.
+
+[rig.frequency.band_plan.custom_bands]   # optional per-band override, keyed by Band::Display
+"40m" = { name = "40m", ranges = [{ start = 7_000_000, end = 7_200_000, modes = [] }], default_mode = "FT8", band_type = "HF" }
+# e.g. a national allocation narrower than the IARU region table
+```
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `region` | integer | `2` | Selects the IARU region tables (1, 2 or 3; they diverge on 40/60/80 m, 2 m, 70 cm). An invalid number falls back to the global table — never panics. |
+| `edge_warnings` | bool | `true` | Master switch for both the hard TX refusal and the TUI's manual-frequency-entry warning. `false` disables both: nothing is refused, nothing warns. |
+| `custom_bands."<band>"` | table | — | Overrides the region table for that band (in-band iff the RF falls within ANY of the entry's `ranges`, OR across ranges). Applies to frequencies the band table resolves to that band — the escape hatch for a national allocation narrower than your region's default. |
+
+Since PAN-118 the band plan is enforced, not just displayed: every path that
+asserts PTT (scheduled FT8 transmissions and multi-TX bundle items, F4 tune,
+manual Shift+T PTT, remote-originated frames) is **refused before keying**
+whenever the absolute TX RF it would transmit on — the effective dial (split
+TX dial when split is active, else the RX dial) plus the frame's audio
+offset — falls outside the plan, with a `TX blocked (TX frequency … Hz is
+outside the configured amateur band plan)` diagnostic. A multi-TX bundle
+drops only its out-of-privilege items; in-privilege siblings still key. The
+check is skipped while the dial is not yet known (mock rig / CAT-disabled
+modes). Edits take effect on restart — config is loaded once at startup, and
+the runtime hot-reload apply task is a documented no-op.
 
 ---
 
@@ -503,6 +538,17 @@ allowed_request_hosts = []          # required for multicast inbound; unicast in
 `instance_id` must be non-empty, whenever `enabled = true` — otherwise
 config validation rejects the file.
 
+### `[network.station_agent]` — remote operation
+
+The station agent's keys (`enabled`, `remote_tx_enabled`, `relay_url`,
+`pairing_api_url`, `key_dir`, `tx_allow_list`, …) and their defaults are
+in [`defaults.toml`](../pancetta-config/defaults.toml); the design is in
+[`docs/DECISIONS/remote-operation.md`](DECISIONS/remote-operation.md).
+Revocations — `remote_tx_enabled = false`, removing a `tx_allow_list`
+entry, `enabled = false` — apply to a running station when you save;
+every other change to this table needs a restart. See
+[Hot reload](#hot-reload).
+
 ---
 
 ### `[network.remote_gateway]` — local read-only view (Panino)
@@ -610,20 +656,85 @@ priority over both config and environment.
 
 ## Hot reload
 
-Pancetta watches `~/.pancetta/pancetta.toml` for changes. Most keys take
-effect within a second of save. Exceptions:
+Pancetta watches its config file for changes while it runs: the file
+given with `--config`, otherwise `~/.pancetta/pancetta.toml`. If that
+path is a symlink, both edits to the file it points at and repointing
+the symlink itself are picked up. The file's directory is watched even
+while the file does not exist, so creating it later is picked up too
+(when the directory itself does not exist, nothing is watched and every
+change needs a restart). A save is picked up within a few seconds. With
+`--config`, each save is compared with that file's previous content.
+Without `--config`, each save re-loads and validates every config file and
+`PANCETTA_*` environment variable the way startup does, and the merged
+result is compared with the previous one: a setting a higher-priority file
+(for example `~/.config/pancetta/pancetta.toml`) overrides does not change
+when you edit it in `~/.pancetta/pancetta.toml`, and an edit to that other
+file is applied the next time the watched file is saved. A save made while
+pancetta is starting is applied when watching begins.
 
-- `[audio]` device names — require a TUI restart (cpal streams are bound
-  at startup).
-- `[rig.interface]` — same; rigctld is spawned once.
-- `[network.remote_gateway]` changes take effect on restart.
-- `[station].callsign` — never hot-reloaded (active QSOs would mid-flight
-  contradict their own metadata).
+Deleting the watched file is a change too. Without `--config`, the
+remaining config files, environment variables and defaults then apply,
+so a remote-TX consent or `tx_allow_list` entry that only the deleted
+file granted is revoked live. With `--config`, the file is the whole
+configuration: deleting it keeps the previous config active and shows
+`Config reload failed: … — previous configuration still active`.
+Editors that save by removing the file and writing a new one are read
+as a save, not a deletion: while the file is missing, pancetta waits a
+moment longer before reloading.
 
-When a hot-reload succeeds you'll see a TUI status line like
-`Config reloaded: 12 keys updated`. When it fails (typo, schema
-violation), the previous config stays active and the parse error shows
-in the TUI error log.
+**Applied live — remote-access revocations (security):**
+
+- `[network.station_agent].remote_tx_enabled` — the station-agent
+  channel's local consent. Setting it to `false` immediately refuses all
+  remote transmission: queued remote frames are dropped and audited
+  `not-armed`, and a transmission in progress stops within ~50 ms (PTT
+  off). The arm record itself is kept; re-enabling consent re-allows an
+  existing arm within its TTL and heartbeat. To kill a client's arm,
+  remove it from `tx_allow_list` (below) or disarm from the TUI.
+- `[network.wsjtx_udp].enabled` / `allow_tx_initiation` — the WSJT-X UDP
+  channel's own consent bit (`enabled && allow_tx_initiation`), same
+  mechanics. It never arms anything and never satisfies the
+  station-agent channel's consent. Only the consent bit is live: the UDP
+  socket itself opens and closes on a restart.
+- Removing an entry from `[network.station_agent].tx_allow_list` — the
+  client's session is evicted (Noise transport dropped, hello-token JTI
+  deny-listed), and it is disarmed and loses control if it held either.
+  On cqdx-integrated stations (`[network.cqdx]` enabled with a token)
+  the authorization poll stays authoritative: a removed entry is evicted
+  immediately but is re-admitted by the next successful poll if cqdx
+  still returns its edge — revoke it there too.
+- `[network.station_agent].enabled` set to `false` — the relay session
+  and authorization poll stop and remote TX is disarmed, live.
+
+**Explicitly restart-required (a diagnostic says so on save):**
+
+- Adding a `tx_allow_list` entry, `station_agent.enabled = true` on a
+  disabled station, and the station agent's `relay_url`,
+  `pairing_api_url`, `pairing_origin`, `key_dir` and `audit_log_path`.
+- `[network.remote_gateway]` changes take effect on restart, including
+  `auth_token` and `allowed_origins`: until pancetta restarts, the
+  running gateway still accepts the old token and origins and keeps
+  clients that are already connected.
+- Every other key: `[audio]` device names, `[rig.interface]`,
+  `[station]`, `[autonomous]`, `[ui]`, upload/logging settings, …
+  Nothing outside the live list above is applied to a running process,
+  not even to its in-memory copy of the config; restart pancetta to
+  enforce them. (`[station].callsign`, `[station].grid_square` and
+  `[autonomous].slot_parity` in particular can never change under an
+  in-progress QSO.)
+
+When a reload succeeds you see a `Config reloaded` line in the TUI
+diagnostics, plus one line per security action and, when other keys
+changed, `Saved changes take effect after a restart: …` naming them. A
+misspelled or unrecognized key shows a `Config warning: …` line on the
+save that introduces it; that key has no effect. Otherwise a save that
+changes nothing shows nothing. When a reload fails (typo, schema violation), the
+previous config stays active and
+`Config reload failed: … — previous configuration still active` shows
+in the TUI diagnostics.
+
+To revoke a suspect remote client step by step, see
+[RUNBOOK.md → Revoking a suspect remote client](RUNBOOK.md#revoking-a-suspect-remote-client).
 
 ---
 

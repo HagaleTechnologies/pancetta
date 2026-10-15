@@ -144,6 +144,12 @@ const RECV_TICK: Duration = Duration::from_millis(200);
 /// `remote_tx_arm`, so arming here is visible to the TX worker immediately.
 struct ArmContext {
     arm: Arc<Mutex<ArmState>>,
+    /// The coordinator's shared split-TX dial (0 = simplex) — the source the
+    /// TX band-plan gate (`tx::tx_rf_for_gate`) and the QSO RF stamp read. A
+    /// remote `SetSplit` writes it (via [`super::record_split_state`], the
+    /// same helper the local TUI path uses) before forwarding to Hamlib, so a
+    /// remote split is gated exactly like a local one (PR #446 Codex review).
+    split_tx_frequency_hz: Arc<std::sync::atomic::AtomicU64>,
     verifier: CapabilityVerifier,
     /// Verifying keys for allow-listed clients, keyed by client keyId. Shared
     /// and periodically refreshed by the Q-0043 auto-populate poll task
@@ -251,8 +257,9 @@ struct ArmContext {
     /// The authorization generation (PAN-96): bumped by
     /// `poll_authorizations_loop`, after it publishes them, whenever a poll
     /// changes `tx_allow_list` or `tx_arm_allow_list`. Shared with the poll
-    /// task (a SEPARATE tokio task, like `revocation_pending`); never bumped in
-    /// static-config mode.
+    /// task (a SEPARATE tokio task, like `revocation_pending`). In
+    /// static-config mode its only bumper is a saved config edit that removes
+    /// `tx_allow_list` entries (PAN-103, [`revoke_static_allow_list_entries`]).
     authz_generation: Arc<std::sync::atomic::AtomicU64>,
     /// The generation THIS session last reconciled to. When it lags
     /// `authz_generation`, [`reconcile_authorizations`] applies the refresh to
@@ -603,10 +610,17 @@ fn sweep_arm_expiry(ctx: &ArmContext, now: ArmTime) -> Vec<PeerSend> {
 /// flag's state, exactly as round 2 established -- the flag is now only
 /// consulted to narrow the *non-panicking* fallback, never to override a
 /// real panic.
+///
+/// PAN-103: `stop_requested` is this component's own "deliberately stopped"
+/// flag, set by the coordinator right before it aborts the session because a
+/// saved config edit disabled the station agent. It narrows the same
+/// non-panicking fallback as `shutdown` does, so that deliberate stop is
+/// audited as `OperatorDisarm`, never `ComponentCrash`.
 struct RemoteTxDisarmGuard {
     arm: Arc<Mutex<ArmState>>,
     audit: AuditLog,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    stop_requested: Arc<std::sync::atomic::AtomicBool>,
     normal_exit: bool,
 }
 
@@ -621,8 +635,9 @@ impl RemoteTxDisarmGuard {
 
 impl Drop for RemoteTxDisarmGuard {
     fn drop(&mut self) {
-        let non_panicking_shutdown_cancellation =
-            !std::thread::panicking() && self.shutdown.load(Ordering::Acquire);
+        let non_panicking_shutdown_cancellation = !std::thread::panicking()
+            && (self.shutdown.load(Ordering::Acquire)
+                || self.stop_requested.load(Ordering::Acquire));
         let reason = if self.normal_exit || non_panicking_shutdown_cancellation {
             DisarmReason::OperatorDisarm
         } else {
@@ -961,9 +976,31 @@ async fn dispatch_action(
                 warn!(target: "agent.control", peer = %peer, "setSplit refused — no currently-valid qsy-scoped hello capability for this peer");
                 return DispatchOutcome::cont_with(grab);
             }
+            let tx_frequency = tx_frequency_hz.max(0.0) as u64;
+            // Update the shared split source BEFORE the rig command, exactly
+            // like the local TUI path, so the TX band-plan gate checks the
+            // remote split dial, never the stale RX dial (PR #446 Codex
+            // review). Split is never polled back from the rig, so this is
+            // the only place a remote split reaches the gate.
+            let store = crate::coordinator::record_split_state(
+                &ctx.split_tx_frequency_hz,
+                enabled,
+                tx_frequency,
+            );
+            info!(target: "rig.split", peer = %peer, "remote SetSplit enabled={enabled} tx={tx_frequency} Hz");
+            // Echo the authoritative split state to the local TUI chip.
+            let status = ComponentMessage::new(
+                ComponentId::StationAgent,
+                ComponentId::Tui,
+                MessageType::SplitStatus { tx_hz: store },
+                std::time::Instant::now(),
+            );
+            if let Err(e) = bus.send_message(status).await {
+                debug!(target: "agent.control", "split status echo failed: {e}");
+            }
             let msg = RigControlMessage::SetSplit {
                 enabled,
-                tx_frequency: tx_frequency_hz.max(0.0) as u64,
+                tx_frequency,
             };
             send_rig(bus, msg).await;
             DispatchOutcome::cont_with(grab)
@@ -1540,6 +1577,96 @@ pub(crate) fn station_agent_active(
     has_relay_config(cfg) && (!cfg.tx_allow_list.is_empty() || cqdx_will_populate)
 }
 
+/// PAN-103: shared handles onto a RUNNING station-agent session's live
+/// authorization state, so a saved config edit can revoke access without a
+/// restart. `start_station_agent_component` stashes one on the coordinator
+/// only when it spawns the real session (never on the inert/drain or
+/// `--replay` paths); teardown and the next start clear it. The arm and audit
+/// log are the coordinator's own shared instances and are not repeated here.
+#[derive(Clone)]
+pub(crate) struct StationAgentLiveHandles {
+    pub(crate) tx_allow_list: Arc<std::sync::RwLock<HashSet<String>>>,
+    pub(crate) tx_arm_allow_list: Arc<std::sync::RwLock<HashSet<String>>>,
+    pub(crate) client_keys: Arc<std::sync::RwLock<std::collections::HashMap<String, VerifyingKey>>>,
+    pub(crate) revocation_pending: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) authz_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Set right before the coordinator aborts the session for a config
+    /// disable, so the session's disarm guard audits `OperatorDisarm`.
+    pub(crate) stop_requested: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// PAN-103: remove `removed` keyIds from a running session's authorization
+/// sets, using the same publish protocol as `poll_authorizations_loop`:
+/// under the arm lock, disarm (`authorization-revoked`) if the armed client
+/// was removed and flag `revocation_pending`, then prune the TX-arm set; then
+/// prune the admission set and device keys; then bump `authz_generation`
+/// AFTER publishing so the session loop's [`reconcile_authorizations`] evicts
+/// the removed peers (Noise transport dropped, hello-token `jti`
+/// deny-listed, controller released) on its next tick.
+///
+/// Poisoned locks are entered rather than skipped: a revocation must never be
+/// lost to a poisoned lock. Returns whether anything changed (and so whether
+/// the generation was bumped).
+pub(crate) fn revoke_static_allow_list_entries(
+    live: &StationAgentLiveHandles,
+    arm: &Mutex<ArmState>,
+    audit: &AuditLog,
+    removed: &[String],
+    now_unix_ms: i64,
+) -> bool {
+    if removed.is_empty() {
+        return false;
+    }
+    let arm_changed = {
+        let mut st = match arm.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let armed_removed = st
+            .armed_client_key_id()
+            .is_some_and(|cur| removed.iter().any(|r| r == cur));
+        if armed_removed {
+            let effects = st.disarm_with_reason(DisarmReason::AuthorizationRevoked, now_unix_ms);
+            apply_arm_effects(audit, &effects);
+            live.revocation_pending.store(true, Ordering::Release);
+            warn!(
+                target: "agent.tx",
+                "remote TX disarmed: the armed client was removed from tx_allow_list"
+            );
+        }
+        // Published while still holding the arm lock (the same atomicity
+        // `verify_and_arm`'s re-check relies on for the poller's publish).
+        let mut g = match live.tx_arm_allow_list.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let before = g.len();
+        g.retain(|k| !removed.contains(k));
+        before != g.len()
+    };
+    let allow_changed = {
+        let mut g = match live.tx_allow_list.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let before = g.len();
+        g.retain(|k| !removed.contains(k));
+        before != g.len()
+    };
+    {
+        let mut g = match live.client_keys.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        g.retain(|k, _| !removed.contains(k));
+    }
+    let changed = arm_changed || allow_changed;
+    if changed {
+        live.authz_generation.fetch_add(1, Ordering::AcqRel);
+    }
+    changed
+}
+
 /// The initial seed for `tx_arm_allow_list` — FAIL-CLOSED, not fail-open
 /// (CQD-11 / dispensa Q-0052 follow-up: PR #259 shipped the split with a
 /// fail-open seed; this closes that gap).
@@ -1621,6 +1748,8 @@ impl super::ApplicationCoordinator {
     /// touches nothing off-box, and keeps the arm's values identical to a live
     /// run's — with no session to admit a controller, it can never lead to TX.
     pub(crate) async fn start_station_agent_component(&mut self) -> Result<()> {
+        // PAN-103: set again below only when the real session is spawned.
+        self.station_agent_live = None;
         let config = self.config.read().await;
         let cfg = config.network.station_agent.clone();
         let cqdx_cfg = config.network.cqdx.clone();
@@ -1775,6 +1904,7 @@ impl super::ApplicationCoordinator {
         let bus = self.message_bus.clone();
         let shutdown = self.shutdown_signal.clone();
         let arm = self.remote_tx_arm.clone();
+        let split_tx_frequency_hz = self.split_tx_frequency_hz();
         // Round-1 review fix (PR #261): shared with `poll_authorizations_loop`
         // so a poll-driven disarm can flag the session loop to broadcast the
         // updated control state (see `ArmContext::revocation_pending`).
@@ -1783,6 +1913,9 @@ impl super::ApplicationCoordinator {
         // changes the admission lists; the session loop reconciles on it (see
         // `ArmContext::authz_generation`).
         let authz_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // PAN-103: set by a config disable just before the abort (see
+        // `RemoteTxDisarmGuard`).
+        let stop_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Task 6: subscribe to the shared display feed (if the localhost
         // gateway or this component's own gating started it — see
@@ -1837,6 +1970,17 @@ impl super::ApplicationCoordinator {
             self.station_agent_poll = Some(poll_handle.abort_handle());
         }
 
+        // PAN-103: live handles for config-edit revocation (see
+        // `coordinator::config_reload`).
+        self.station_agent_live = Some(StationAgentLiveHandles {
+            tx_allow_list: tx_allow_list.clone(),
+            tx_arm_allow_list: tx_arm_allow_list.clone(),
+            client_keys: client_keys.clone(),
+            revocation_pending: revocation_pending.clone(),
+            authz_generation: authz_generation.clone(),
+            stop_requested: stop_requested.clone(),
+        });
+
         let handle = tokio::spawn(async move {
             run_session_loop(RunConfig {
                 relay_url,
@@ -1849,9 +1993,11 @@ impl super::ApplicationCoordinator {
                 bus,
                 events,
                 arm,
+                split_tx_frequency_hz,
                 revocation_pending,
                 authz_generation,
                 shutdown,
+                stop_requested,
                 timeouts: net::RelayTimeouts::default(),
             })
             .await;
@@ -2112,11 +2258,15 @@ struct RunConfig {
     /// (`drain_read_stream` no-ops on `None`).
     events: Option<tokio::sync::broadcast::Receiver<pancetta_protocol::ServerEvent>>,
     arm: Arc<Mutex<ArmState>>,
+    /// Threaded into `ArmContext::split_tx_frequency_hz` — see there.
+    split_tx_frequency_hz: Arc<std::sync::atomic::AtomicU64>,
     /// Threaded into `ArmContext::revocation_pending` — see there.
     revocation_pending: Arc<std::sync::atomic::AtomicBool>,
     /// Threaded into `ArmContext::authz_generation` — see there.
     authz_generation: Arc<std::sync::atomic::AtomicU64>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// See [`StationAgentLiveHandles::stop_requested`].
+    stop_requested: Arc<std::sync::atomic::AtomicBool>,
     /// Deadlines for every relay IO wait (PAN-102). `Default` in production.
     timeouts: net::RelayTimeouts,
 }
@@ -2130,11 +2280,13 @@ async fn run_session_loop(mut cfg: RunConfig) {
         arm: cfg.arm.clone(),
         audit: cfg.audit.clone(),
         shutdown: cfg.shutdown.clone(),
+        stop_requested: cfg.stop_requested.clone(),
         normal_exit: false,
     };
     let mut backoff = RECONNECT_BACKOFF_MIN;
     let mut ctx = ArmContext {
         arm: cfg.arm.clone(),
+        split_tx_frequency_hz: cfg.split_tx_frequency_hz.clone(),
         verifier: cfg.verifier,
         client_keys: cfg.client_keys,
         tx_allow_list: cfg.tx_allow_list,
@@ -2712,6 +2864,7 @@ mod tests {
         let tx_arm_allow = allow.clone();
         ArmContext {
             arm: Arc::new(Mutex::new(ArmState::new())),
+            split_tx_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             verifier: CapabilityVerifier {
                 agent_key_id: AGENT_KEY_ID.to_string(),
                 pinned_idp_keys: vec![IdpKey {
@@ -2790,6 +2943,7 @@ mod tests {
                 arm: arm.clone(),
                 audit: audit.clone(),
                 shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 normal_exit: true,
             };
         }
@@ -2825,6 +2979,7 @@ mod tests {
                 arm: arm.clone(),
                 audit: audit.clone(),
                 shutdown: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 normal_exit: false,
             };
             // Guard drops here via ordinary scope exit -- simulating a
@@ -2863,6 +3018,7 @@ mod tests {
                 arm: arm.clone(),
                 audit: audit.clone(),
                 shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 normal_exit: false,
             };
             // Guard drops here via ordinary scope exit -- not a panic, but
@@ -2883,6 +3039,37 @@ mod tests {
         );
     }
 
+    /// PAN-103 (Codex P2 on #436): a saved config edit that disables the
+    /// station agent aborts the session while it may still be armed. That
+    /// abort drops the guard with `normal_exit` unset and the process-wide
+    /// shutdown flag false; the component's own `stop_requested` flag is what
+    /// tells the guard it was a deliberate operator stop, not a crash.
+    #[test]
+    fn drop_after_a_config_stop_request_audits_operator_disarm_not_a_crash() {
+        let arm = Arc::new(Mutex::new(armed_state()));
+        let audit = AuditLog::new(audit_tmp());
+
+        {
+            let _guard = RemoteTxDisarmGuard {
+                arm: arm.clone(),
+                audit: audit.clone(),
+                shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                normal_exit: false,
+            };
+        }
+
+        let log = std::fs::read_to_string(audit.path()).unwrap_or_default();
+        assert!(
+            !log.contains("component-crash"),
+            "a config-driven stop must not be audited as a component crash: {log:?}"
+        );
+        assert!(
+            log.contains("operator-disarm"),
+            "a config-driven stop is an operator disarm: {log:?}"
+        );
+    }
+
     /// The scenario `RemoteTxDisarmGuard` exists for in the first place: a
     /// real panic/unwind, with `normal_exit` never reached. Drives an actual
     /// panic through `catch_unwind` so `std::thread::panicking()` is
@@ -2900,6 +3087,7 @@ mod tests {
                 arm: arm_for_panic,
                 audit: audit_for_panic,
                 shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 normal_exit: false,
             };
             panic!("simulated genuine task panic");
@@ -2942,6 +3130,7 @@ mod tests {
                 arm: arm_for_panic,
                 audit: audit_for_panic,
                 shutdown: shutdown_for_panic,
+                stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 normal_exit: false,
             };
             // A real panic, so the guard drops while genuinely unwinding --
@@ -2987,6 +3176,7 @@ mod tests {
                 arm: arm_for_task,
                 audit: audit_for_task,
                 shutdown: shutdown_for_task,
+                stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 normal_exit: false,
             };
             // Stand-in for `run_one_session` still mid-flight (e.g. awaiting
@@ -3032,6 +3222,7 @@ mod tests {
                 arm: arm_for_task,
                 audit: audit_for_task,
                 shutdown: shutdown_for_task,
+                stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 normal_exit: false,
             };
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -3401,6 +3592,125 @@ mod tests {
         assert!(
             hamlib_rx.try_recv().is_ok(),
             "a non-tx-enabled token with qsy scope must still permit setFrequency"
+        );
+    }
+
+    /// PR #446 Codex review: the TX band-plan gate (QSO TX and manual PTT)
+    /// resolves the TX dial from the coordinator's split atomic. A verified
+    /// peer's remote SetSplit must write that atomic, or an out-of-band
+    /// remote split leaves the gate checking the in-band RX dial.
+    fn band_gate_refuses(
+        ctx: &ArmContext,
+        rx_dial: u64,
+        audio_offset_hz: f64,
+        span_hz: f64,
+    ) -> bool {
+        let rx = Arc::new(std::sync::atomic::AtomicU64::new(rx_dial));
+        crate::coordinator::tx_rf_for_gate(&rx, &ctx.split_tx_frequency_hz, audio_offset_hz)
+            .and_then(|rf| {
+                crate::coordinator::tx_band_plan_mute_reason(
+                    rf,
+                    span_hz,
+                    &pancetta_config::BandPlanConfig::default(),
+                )
+            })
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn remote_out_of_band_set_split_makes_the_band_gate_refuse() {
+        let mut ctx = ctx_with(true, true);
+        ctx.peers.insert(
+            CLIENT_KEY_ID.to_string(),
+            PeerCtx::authorized_until(vec!["qsy".to_string()], NOW + 600_000),
+        );
+        let bus = MessageBus::new(64).unwrap();
+        let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let ft8_span = crate::coordinator::tx_signal_span_hz(pancetta_ft8::Protocol::Ft8);
+        // In-band 20m RX dial, simplex: QSO TX and manual PTT both permitted.
+        assert!(!band_gate_refuses(&ctx, 14_074_000, 1_500.0, ft8_span));
+        assert!(!band_gate_refuses(&ctx, 14_074_000, 0.0, 0.0));
+
+        // 15.000 MHz sits between 20m and 17m.
+        dispatch_action(
+            ControlAction::SetSplit {
+                enabled: true,
+                tx_frequency_hz: 15_000_000.0,
+            },
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(
+            hamlib_rx.try_recv().is_ok(),
+            "setSplit still forwarded to Hamlib"
+        );
+        assert_eq!(
+            ctx.split_tx_frequency_hz.load(Ordering::Relaxed),
+            15_000_000,
+            "remote SetSplit must update the shared split source"
+        );
+        assert!(
+            band_gate_refuses(&ctx, 14_074_000, 1_500.0, ft8_span),
+            "QSO TX on an out-of-band remote split must be refused"
+        );
+        assert!(
+            band_gate_refuses(&ctx, 14_074_000, 0.0, 0.0),
+            "manual PTT on an out-of-band remote split must be refused"
+        );
+
+        // Clearing split returns the gate to the in-band RX dial.
+        dispatch_action(
+            ControlAction::SetSplit {
+                enabled: false,
+                tx_frequency_hz: 15_000_000.0,
+            },
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(
+            hamlib_rx.try_recv().is_ok(),
+            "split clear forwarded to Hamlib"
+        );
+        assert_eq!(ctx.split_tx_frequency_hz.load(Ordering::Relaxed), 0);
+        assert!(!band_gate_refuses(&ctx, 14_074_000, 1_500.0, ft8_span));
+        assert!(!band_gate_refuses(&ctx, 14_074_000, 0.0, 0.0));
+    }
+
+    #[tokio::test]
+    async fn refused_remote_set_split_leaves_the_split_source_untouched() {
+        // No qsy scope: the SetSplit is refused, so neither the rig nor the
+        // gate's split source may change.
+        let mut ctx = ctx_with(true, true);
+        ctx.split_tx_frequency_hz
+            .store(14_080_000, Ordering::Relaxed);
+        ctx.peers
+            .insert(CLIENT_KEY_ID.to_string(), PeerCtx::unauthorized());
+        let bus = MessageBus::new(64).unwrap();
+        let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        dispatch_action(
+            ControlAction::SetSplit {
+                enabled: false,
+                tx_frequency_hz: 0.0,
+            },
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(hamlib_rx.try_recv().is_err());
+        assert_eq!(
+            ctx.split_tx_frequency_hz.load(Ordering::Relaxed),
+            14_080_000
         );
     }
 
@@ -4994,6 +5304,7 @@ mod tests {
         let tx_arm_allow = allow.clone();
         let mut ctx = ArmContext {
             arm: Arc::new(Mutex::new(ArmState::new())),
+            split_tx_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             verifier: CapabilityVerifier {
                 agent_key_id: identity.key_id(),
                 pinned_idp_keys: vec![IdpKey {
@@ -5095,6 +5406,7 @@ mod tests {
         let tx_arm_allow = allow.clone();
         ArmContext {
             arm: Arc::new(Mutex::new(ArmState::new())),
+            split_tx_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             verifier: CapabilityVerifier {
                 agent_key_id: agent_kid.to_string(),
                 pinned_idp_keys: vec![IdpKey {
@@ -6124,6 +6436,7 @@ mod tests {
         let tx_arm_allow = allow.clone();
         ArmContext {
             arm: Arc::new(Mutex::new(ArmState::new())),
+            split_tx_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             verifier: CapabilityVerifier {
                 agent_key_id: agent_kid.to_string(),
                 pinned_idp_keys: vec![IdpKey {
@@ -7988,6 +8301,127 @@ mod tests {
         );
     }
 
+    /// PAN-103: the live handles a config edit revokes through, built over
+    /// `ctx`'s own shared state (what `start_station_agent_component` stashes).
+    fn live_handles_for(ctx: &ArmContext) -> StationAgentLiveHandles {
+        StationAgentLiveHandles {
+            tx_allow_list: ctx.tx_allow_list.clone(),
+            tx_arm_allow_list: ctx.tx_arm_allow_list.clone(),
+            client_keys: ctx.client_keys.clone(),
+            revocation_pending: ctx.revocation_pending.clone(),
+            authz_generation: ctx.authz_generation.clone(),
+            stop_requested: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn config_edit_removing_the_armed_controller_disarms_and_reconcile_evicts() {
+        let identity = AgentIdentity::generate();
+        let (mut ctx, mut sess, _outbound, _transports, _ws) = two_authorized_peers(&identity);
+        arm_controller(&mut ctx, CLIENT_KEY_ID);
+        ctx.client_keys.write().unwrap().insert(
+            CLIENT_KEY_ID.to_string(),
+            SigningKey::from_bytes(&[0x22; 32]).verifying_key(),
+        );
+        let live = live_handles_for(&ctx);
+        let generation_before = live.authz_generation.load(Ordering::Acquire);
+        let disarmed_before = disarmed_records(&ctx).len();
+
+        let changed = revoke_static_allow_list_entries(
+            &live,
+            &ctx.arm,
+            &ctx.audit,
+            &[CLIENT_KEY_ID.to_string()],
+            NOW,
+        );
+
+        assert!(changed);
+        assert_eq!(
+            live.authz_generation.load(Ordering::Acquire),
+            generation_before + 1,
+            "generation bumped exactly once, after publishing"
+        );
+        assert!(!live.tx_allow_list.read().unwrap().contains(CLIENT_KEY_ID));
+        assert!(live.tx_allow_list.read().unwrap().contains(PEER_B));
+        assert!(!live
+            .tx_arm_allow_list
+            .read()
+            .unwrap()
+            .contains(CLIENT_KEY_ID));
+        assert!(!live.client_keys.read().unwrap().contains_key(CLIENT_KEY_ID));
+        assert!(
+            live.revocation_pending.load(Ordering::Acquire),
+            "the session loop is told to broadcast the disarm"
+        );
+        // Pending-work invalidation: the gate every key-time TX site and the
+        // playback chunk re-check consult now refuses this client.
+        assert!(!crate::coordinator::tx::remote_tx_permitted_for(
+            &ctx.arm,
+            || at(NOW),
+            Some(CLIENT_KEY_ID)
+        ));
+        let disarmed = disarmed_records(&ctx);
+        assert_eq!(disarmed.len(), disarmed_before + 1);
+        assert!(disarmed
+            .last()
+            .unwrap()
+            .detail
+            .contains("authorization-revoked"));
+
+        // The real session reconcile then evicts the removed peer.
+        reconcile_authorizations(&mut ctx, &mut sess, at(NOW));
+        assert!(!ctx.peers.contains_key(CLIENT_KEY_ID), "PeerCtx removed");
+        assert!(
+            ctx.revoked_jtis.contains(&format!("hello-{CLIENT_KEY_ID}")),
+            "its hello-token jti is deny-listed"
+        );
+        assert_eq!(ctx.controller, None, "control released");
+        assert!(ctx.peers.contains_key(PEER_B), "the other peer stays");
+        assert_eq!(
+            disarmed_records(&ctx).len(),
+            disarmed_before + 1,
+            "no duplicate Disarmed record"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_edit_removing_a_non_armed_peer_keeps_the_arm_and_evicts_only_it() {
+        let identity = AgentIdentity::generate();
+        let (mut ctx, mut sess, _outbound, _transports, _ws) = two_authorized_peers(&identity);
+        arm_controller(&mut ctx, CLIENT_KEY_ID);
+        let live = live_handles_for(&ctx);
+
+        assert!(revoke_static_allow_list_entries(
+            &live,
+            &ctx.arm,
+            &ctx.audit,
+            &[PEER_B.to_string()],
+            NOW,
+        ));
+        assert!(!live.revocation_pending.load(Ordering::Acquire));
+        assert!(crate::coordinator::tx::remote_tx_permitted_for(
+            &ctx.arm,
+            || at(NOW),
+            Some(CLIENT_KEY_ID)
+        ));
+        reconcile_authorizations(&mut ctx, &mut sess, at(NOW));
+        assert!(!ctx.peers.contains_key(PEER_B));
+        assert!(ctx.revoked_jtis.contains(&format!("hello-{PEER_B}")));
+        assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
+
+        // Removing a keyId that is not listed changes nothing and does not
+        // bump the generation.
+        let generation = live.authz_generation.load(Ordering::Acquire);
+        assert!(!revoke_static_allow_list_entries(
+            &live,
+            &ctx.arm,
+            &ctx.audit,
+            &["not-listed".to_string()],
+            NOW,
+        ));
+        assert_eq!(live.authz_generation.load(Ordering::Acquire), generation);
+    }
+
     #[tokio::test]
     async fn reconcile_admits_newly_listed_client_mid_session() {
         let identity = AgentIdentity::generate();
@@ -9224,9 +9658,11 @@ mod tests {
             bus: MessageBus::new(64).unwrap(),
             events: None,
             arm: arm.clone(),
+            split_tx_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             revocation_pending,
             authz_generation,
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stop_requested: Default::default(),
             timeouts: net::RelayTimeouts {
                 connect: Duration::from_secs(2),
                 hello,

@@ -60,8 +60,10 @@ pub struct StationConfig {
 
     /// Maximum latency past the slot boundary at which we still attempt
     /// late-start TX via audio skip-ahead. Beyond this, defer to the
-    /// next opposite-parity slot. Default 8000ms — leaves ~5s of audio
-    /// on the air with two of three Costas sync arrays still in window.
+    /// next opposite-parity slot. Default 3000ms — keeps both the middle
+    /// and end Costas sync arrays and 49 of 58 data symbols (147 coded
+    /// bits, vs the 91 information bits LDPC(174,91) needs) on the air;
+    /// anything past ~5940ms elapsed is undecodable in principle.
     #[serde(default = "default_tx_late_max_ms")]
     pub tx_late_max_ms: u64,
 
@@ -78,7 +80,7 @@ pub struct StationConfig {
 }
 
 fn default_tx_late_max_ms() -> u64 {
-    8000
+    3000
 }
 
 fn default_ptt_lead_ms() -> u64 {
@@ -184,7 +186,7 @@ impl Default for StationConfig {
             operator_name: None,
             contest_category: None,
             custom_fields: HashMap::new(),
-            tx_late_max_ms: 8000,
+            tx_late_max_ms: 3000,
             tx_self_parity: TxSelfParity::Auto,
             ptt_lead_ms: 80,
         }
@@ -609,7 +611,7 @@ mod tests {
             antennas = []
         "#;
         let cfg: StationConfig = toml::from_str(toml).expect("parse");
-        assert_eq!(cfg.tx_late_max_ms, 8000);
+        assert_eq!(cfg.tx_late_max_ms, 3000);
         assert_eq!(cfg.tx_self_parity, TxSelfParity::Auto);
         assert_eq!(cfg.ptt_lead_ms, 80);
     }

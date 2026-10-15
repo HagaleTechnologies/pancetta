@@ -40,6 +40,51 @@ through a new channel `run_main_loop` consumes (Hamlib's reconnect needs `&mut
 ApplicationCoordinator`, unlike audio's independent cpal-stream-reopen). No named rig-profile
 concept added — out of scope. Full design: `docs/superpowers/specs/2026-09-02-pan-59-live-rig-switch-design.md`.
 
+## Config file watch: live remote-access revocations, everything else restart-required (2026-10-14)
+
+PAN-103. `docs/CONFIG.md` promised that most keys hot-reload within a second, but nothing in the
+binary constructed the watcher, so every edit — including revoking a remote client — needed a
+restart. The coordinator now starts `pancetta_config::ConfigHotReload` on its `config_path` when
+that file's directory exists, re-reads the file once a burst of watcher events settles, and hands the result to
+`run_main_loop` → `handle_config_reload` (`pancetta/src/coordinator/config_reload.rs`). Each edit is
+measured against the file's previous content, not the running config, because the running config
+can also hold values from other config files and `PANCETTA_*` environment variables.
+
+- **Live, never deferred (revocation direction):** the station-agent and WSJT-X UDP consent bits
+  (audited `LocalConsentChanged`), `tx_allow_list` removals (sets pruned under the arm lock, armed
+  client disarmed `authorization-revoked`, `authz_generation` bumped so the session loop's
+  `reconcile_authorizations` evicts the peer and deny-lists its hello `jti` — the PAN-96 path; the
+  config edit is now the only static-config bumper), and `station_agent.enabled = false` (session
+  and poll tasks removed from `named_task_handles` before abort so the supervisor never counts a
+  crash, `fail_safe_disarm_remote_tx`, restart into the inert drain). The TX worker's key-time and
+  ≤50 ms playback re-checks do the pending-work invalidation and playback interruption; the TX path
+  is unchanged.
+- **Consent off gates, it does not disarm.** Re-enabling consent re-allows an arm that is still
+  inside its TTL and heartbeat window. Removing the client from `tx_allow_list` is the kill path.
+- **Restart-required, said in a diagnostic naming the keys:** allow-list additions,
+  `enabled = true`, the agent's transport/identity fields, and every other key. Only the applied
+  remote-access fields are written into the shared `config` snapshot. Writing the whole reloaded
+  config there was rejected: running code reads that snapshot (the shutdown PTT-off safety net reads
+  `rig.interface.enabled`), so a restart-required key would be half-applied. Every edit still goes
+  through `classify_config_reload`; C19-latched fields are never written, so they cannot clobber a
+  QSO.
+- **cqdx-integrated stations:** the authorization poll stays authoritative; a TOML removal is
+  evicted at once but a later poll re-admits an edge cqdx still returns.
+- The PAN-59 decision above (live rig switch via a TUI command rather than the watcher) stands; the
+  watcher now exists but does not reconnect the rig.
+- **Deletion is a change; the directory is always watched.** `should_reload` used to drop every
+  `Remove` event, so on a backend that reports a deletion only as a removal (Windows), deleting
+  `~/.pancetta/pancetta.toml` left the consent and allow-list it granted live. A removal now
+  triggers the merged reload, which falls back to the remaining sources; with `--config` the loader
+  fails and the last good config stays (falling back to defaults there would silently replace the
+  operator's whole configuration). When the file is missing after the settle, the forwarder settles
+  once more before loading, so an editor's remove-then-create save is not read as a deletion (a
+  spurious revocation would hold until restart, since grants are restart-required). The watcher
+  starts whenever the path's directory exists rather than only when the file existed: sampling
+  existence after the startup load raced a deployment replacing the file and could leave the
+  station unwatched for its lifetime. Plumbing "did the loader read this path" out of the loader
+  was rejected as more code for the same result.
+
 ## Decoder speed overhaul — budget-governed anytime decoder
 
 PAN-7 added the default-off `Ft8Config::ft8lib_sync_seeds_enabled` research path, which runs the vendored MIT ft8_lib candidate finder on pass-0 audio, translates and re-scores its positions on pancetta's Costas lattice, and unions them before truncation. The design is in `docs/superpowers/specs/2026-08-03-ft8lib-sync-seed-union-design.md`; the sixteen cap-200/cap-400 scorecards are under `research/scorecards/pan7/`; and the verdict is recorded in `research/experiments/2026-08-03-ft8lib-sync-seed-union-declined.md`. Both caps produced exact seeded/control nulls: hard-jt9-rich and curated-hard ΔTP=0 with 95% CI `[0,0]`, Δunverified=0, synth recovery unchanged, and noise stayed at the same 1/1000 baseline (incremental ΔFP=0). Seed-survival counters confirmed that representable ft8_lib positions were already present on the exhaustive native lattice and did not survive as novel candidates. The standing TP gate therefore failed and the flag remains `false`; only a separate negative-dt/slot-edge design warrants reopening.
