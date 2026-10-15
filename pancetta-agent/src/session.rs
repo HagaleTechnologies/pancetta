@@ -77,6 +77,10 @@ pub enum SessionError {
     /// The challenge in `hello` did not decode as base64url.
     #[error("bad challenge encoding: {0}")]
     BadChallenge(String),
+
+    /// The relay did not send the expected frame before the deadline.
+    #[error("timed out during {0}")]
+    Timeout(&'static str),
 }
 
 /// Where in the leg the session currently is.

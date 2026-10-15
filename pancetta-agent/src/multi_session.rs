@@ -29,6 +29,9 @@
 //!   the Noise handshake authenticated, and whose derived keyId equals `src`.
 //!   Every check runs before msg2 is sent or any [`PeerState`] is inserted, so
 //!   a relay label alone never makes a session that client's.
+//! - **Shared transport.** Peer isolation is cryptographic, but every peer
+//!   rides the one relay socket. A relay transport failure on any send ends
+//!   every peer's session (PAN-102), and no later send touches the socket.
 //!
 //! The per-peer state is deliberately minimal: Noise IK completes in one round
 //! trip from the responder's view, so a peer needs only its established
@@ -41,8 +44,8 @@ use crate::keys::AgentIdentity;
 use crate::noise::{NoiseTransport, ResponderHandshake};
 use crate::peer_identity::{verify_client_identity_proof, PeerIdentityError};
 use crate::relay::{
-    decode_env_payload, encode_env_payload, is_terminal, parse_frame, RecvOutcome, RelayFrame,
-    WsConn,
+    decode_env_payload, encode_env_payload, is_terminal, parse_frame, RecvOutcome, RelayError,
+    RelayFrame, WsConn,
 };
 use crate::session::SessionError;
 
@@ -146,6 +149,10 @@ pub struct MultiPeerSession<'a, W: WsConn> {
     /// Established (or in-transport) peers, keyed by the keyId each PROVED in
     /// its Noise msg1. Each entry owns an INDEPENDENT Noise transport.
     peers: HashMap<String, PeerState>,
+    /// Set by the first relay transport error on a send. The relay socket is
+    /// shared by every peer, so it ends the session: no later send touches
+    /// the socket and the next [`Self::process_next`] returns the error.
+    transport_failed: bool,
 }
 
 impl<'a, W: WsConn> MultiPeerSession<'a, W> {
@@ -157,17 +164,21 @@ impl<'a, W: WsConn> MultiPeerSession<'a, W> {
             identity,
             allowed,
             peers: HashMap::new(),
+            transport_failed: false,
         }
     }
 
-    /// Recv `hello`, then send `auth`. A byte-for-byte copy of
-    /// `AgentSession::authenticate` — the plan keeps the single-peer reference
-    /// untouched, so this leg is duplicated rather than shared.
-    pub fn authenticate(&mut self) -> Result<(), SessionError> {
-        let text = self
-            .ws
-            .recv_text()?
-            .ok_or(SessionError::UnexpectedClose("awaiting hello"))?;
+    /// Recv `hello` within `timeout`, then send `auth`. The same leg as
+    /// `AgentSession::authenticate` (the plan keeps the single-peer reference
+    /// untouched, so it is duplicated rather than shared), but deadline-bounded:
+    /// a relay that withholds `hello` past `timeout` fails the session with
+    /// [`SessionError::Timeout`] (PAN-102).
+    pub fn authenticate(&mut self, timeout: Duration) -> Result<(), SessionError> {
+        let text = match self.ws.recv_text_within(timeout)? {
+            RecvOutcome::Frame(t) => t,
+            RecvOutcome::Quiet => return Err(SessionError::Timeout("awaiting hello")),
+            RecvOutcome::Closed => return Err(SessionError::UnexpectedClose("awaiting hello")),
+        };
         let frame = parse_frame(&text)?;
         let challenge_b64 = match frame {
             RelayFrame::Hello { challenge } => challenge,
@@ -187,13 +198,43 @@ impl<'a, W: WsConn> MultiPeerSession<'a, W> {
             agent_key_id: self.identity.key_id(),
             sig: encode_env_payload(&sig),
         };
-        self.ws.send_text(auth.to_json()?)?;
+        self.send_frame(auth.to_json()?)?;
         Ok(())
     }
 
+    /// Send one text frame on the shared relay socket. The only call site of
+    /// `ws.send_text`, and the only place the transport latch is set: once a
+    /// send has failed with [`RelayError::Transport`], every later call fails
+    /// fast without touching the socket.
+    fn send_frame(&mut self, json: String) -> Result<(), RelayError> {
+        if self.transport_failed {
+            return Err(transport_failed_error());
+        }
+        let sent = self.ws.send_text(json);
+        if let Err(RelayError::Transport(_)) = &sent {
+            self.transport_failed = true;
+        }
+        sent
+    }
+
+    /// Whether a relay transport error on a send has ended this session.
+    pub fn transport_failed(&self) -> bool {
+        self.transport_failed
+    }
+
+    /// Free slots in the relay connection's outbound queue, if known. See
+    /// [`WsConn::send_capacity`].
+    pub fn send_capacity(&self) -> Option<usize> {
+        self.ws.send_capacity()
+    }
+
     /// Process a single inbound frame (bounded by `timeout`), demuxing to the
-    /// right peer. See [`Poll`] for the outcomes.
+    /// right peer. See [`Poll`] for the outcomes. After a relay transport
+    /// failure this returns that error without reading the socket.
     pub fn process_next(&mut self, timeout: Duration) -> Result<Poll, SessionError> {
+        if self.transport_failed {
+            return Err(SessionError::Relay(transport_failed_error()));
+        }
         let text = match self.ws.recv_text_within(timeout)? {
             RecvOutcome::Frame(t) => t,
             RecvOutcome::Quiet => return Ok(Poll::Quiet),
@@ -323,9 +364,7 @@ impl<'a, W: WsConn> MultiPeerSession<'a, W> {
             src: None,
         };
         let json = out.to_json().map_err(|_| RefuseReason::Handshake)?;
-        self.ws
-            .send_text(json)
-            .map_err(|_| RefuseReason::Handshake)?;
+        self.send_frame(json).map_err(|_| RefuseReason::Handshake)?;
         // Capture the handshake hash BEFORE `into_transport` consumes `hs`
         // (Q-0022 channel binding — available only pre-transport).
         let session_id = b64url_unpadded(&hs.handshake_hash());
@@ -341,8 +380,12 @@ impl<'a, W: WsConn> MultiPeerSession<'a, W> {
     }
 
     /// Encrypt `plaintext` under `peer`'s transport and send it as an `env`.
-    /// Errors if `peer` is not an established peer.
+    /// Errors if `peer` is not an established peer, or (before encrypting, so
+    /// no peer nonce is spent) once the relay transport has failed.
     pub fn send_to(&mut self, peer: &str, plaintext: &[u8]) -> Result<(), SessionError> {
+        if self.transport_failed {
+            return Err(SessionError::Relay(transport_failed_error()));
+        }
         // Scope the peers borrow to just the encrypt so `self.ws` is free after.
         let ct = {
             let state = self
@@ -359,7 +402,7 @@ impl<'a, W: WsConn> MultiPeerSession<'a, W> {
             payload: encode_env_payload(&ct),
             src: None,
         };
-        self.ws.send_text(env.to_json()?)?;
+        self.send_frame(env.to_json()?)?;
         Ok(())
     }
 
@@ -368,13 +411,19 @@ impl<'a, W: WsConn> MultiPeerSession<'a, W> {
     /// ciphertext is ever reused across peers — and send. The caller decides
     /// who is authorized to receive; this type knows nothing about scopes, and
     /// there is deliberately no unfiltered fan-out (PAN-95). Best-effort: a
-    /// peer whose encrypt/send fails is removed and skipped (never torn down as
-    /// a session error). Returns the number of successful sends.
+    /// peer whose encrypt/send fails is removed and skipped. A relay transport
+    /// failure stops the fan-out (every peer whose frame was encrypted but not
+    /// sent is removed, its nonce being spent) and ends the session on the next
+    /// [`Self::process_next`]; after it, nothing is encrypted at all. Returns
+    /// the number of successful sends.
     pub fn broadcast_to<F: FnMut(&str) -> bool>(
         &mut self,
         plaintext: &[u8],
         mut recipient: F,
     ) -> usize {
+        if self.transport_failed {
+            return 0;
+        }
         // Phase 1: encrypt per selected peer (needs &mut on each transport).
         // Collect the ready-to-send env JSON so the peers borrow is released
         // before we touch `self.ws`.
@@ -399,10 +448,11 @@ impl<'a, W: WsConn> MultiPeerSession<'a, W> {
                 Err(_) => failed.push(peer.clone()),
             }
         }
-        // Phase 2: send.
+        // Phase 2: send. After a transport failure `send_frame` fails fast
+        // without touching the socket, so every remaining peer is removed.
         let mut sent = 0;
         for (peer, json) in outbound {
-            match self.ws.send_text(json) {
+            match self.send_frame(json) {
                 Ok(()) => sent += 1,
                 Err(_) => failed.push(peer),
             }
@@ -453,6 +503,11 @@ impl<'a, W: WsConn> MultiPeerSession<'a, W> {
             Ok(())
         }
     }
+}
+
+/// The error every send and poll returns once the relay transport has failed.
+fn transport_failed_error() -> RelayError {
+    RelayError::Transport("relay transport failed".to_string())
 }
 
 /// A short human description of a frame for error messages (no secret content).
@@ -510,6 +565,86 @@ mod tests {
         }
         fn recv_text(&mut self) -> Result<Option<String>, crate::relay::RelayError> {
             Ok(self.inbound.pop_front())
+        }
+    }
+
+    /// A [`MockWs`] that can fail a chosen send, report a quiet socket, and
+    /// report an outbound queue capacity, counting every socket call.
+    struct FaultWs {
+        inner: MockWs,
+        recv_calls: usize,
+        send_calls: usize,
+        /// Fail the Nth send (1-based, counting every `send_text` call) with
+        /// this error. Failed sends are not captured in `inner.outbound`.
+        fail_send_at: Option<(usize, RelayError)>,
+        /// When set, `recv_text_within` returns `Quiet` without reading.
+        quiet: bool,
+        /// The timeout `recv_text_within` was last called with.
+        last_timeout: Option<Duration>,
+        capacity: Option<usize>,
+    }
+    impl FaultWs {
+        fn new(inbound: Vec<String>) -> Self {
+            Self {
+                inner: MockWs::new(inbound),
+                recv_calls: 0,
+                send_calls: 0,
+                fail_send_at: None,
+                quiet: false,
+                last_timeout: None,
+                capacity: None,
+            }
+        }
+        /// Fail the next send with `err`.
+        fn fail_next_send(&mut self, err: RelayError) {
+            self.fail_send_at = Some((self.send_calls + 1, err));
+        }
+    }
+    impl WsConn for FaultWs {
+        fn send_text(&mut self, s: String) -> Result<(), RelayError> {
+            self.send_calls += 1;
+            if self
+                .fail_send_at
+                .as_ref()
+                .is_some_and(|(n, _)| *n == self.send_calls)
+            {
+                let (_, err) = self.fail_send_at.take().expect("checked above");
+                return Err(err);
+            }
+            self.inner.send_text(s)
+        }
+        fn recv_text(&mut self) -> Result<Option<String>, RelayError> {
+            self.recv_calls += 1;
+            self.inner.recv_text()
+        }
+        fn recv_text_within(&mut self, timeout: Duration) -> Result<RecvOutcome, RelayError> {
+            self.last_timeout = Some(timeout);
+            if self.quiet {
+                return Ok(RecvOutcome::Quiet);
+            }
+            Ok(match self.recv_text()? {
+                Some(t) => RecvOutcome::Frame(t),
+                None => RecvOutcome::Closed,
+            })
+        }
+        fn send_capacity(&self) -> Option<usize> {
+            self.capacity
+        }
+    }
+
+    /// Access to the scripted [`MockWs`] behind a test WS, so the shared
+    /// helpers work over both mocks.
+    trait Scripted {
+        fn mock(&mut self) -> &mut MockWs;
+    }
+    impl Scripted for MockWs {
+        fn mock(&mut self) -> &mut MockWs {
+            self
+        }
+    }
+    impl Scripted for FaultWs {
+        fn mock(&mut self) -> &mut MockWs {
+            &mut self.inner
         }
     }
 
@@ -577,6 +712,22 @@ mod tests {
 
     /// Drive the shared relay auth leg to admitted (hello → auth → ready).
     fn admit(identity: &AgentIdentity, allowed: HashSet<String>) -> MultiPeerSession<'_, MockWs> {
+        admit_over(identity, allowed, MockWs::new(Vec::new()))
+    }
+
+    /// [`admit`] over a [`FaultWs`].
+    fn admit_faulty(
+        identity: &AgentIdentity,
+        allowed: HashSet<String>,
+    ) -> MultiPeerSession<'_, FaultWs> {
+        admit_over(identity, allowed, FaultWs::new(Vec::new()))
+    }
+
+    fn admit_over<W: WsConn + Scripted>(
+        identity: &AgentIdentity,
+        allowed: HashSet<String>,
+        mut ws: W,
+    ) -> MultiPeerSession<'_, W> {
         let hello = RelayFrame::Hello {
             challenge: b64url(&[9u8; 32]),
         }
@@ -588,9 +739,10 @@ mod tests {
         }
         .to_json()
         .unwrap();
-        let ws = MockWs::new(vec![hello, ready]);
+        ws.mock().push_inbound(hello);
+        ws.mock().push_inbound(ready);
         let mut sess = MultiPeerSession::new(ws, identity, allowed);
-        sess.authenticate().unwrap();
+        sess.authenticate(TIMEOUT).unwrap();
         assert_eq!(sess.process_next(TIMEOUT).unwrap(), Poll::Idle); // ready
         sess
     }
@@ -629,8 +781,8 @@ mod tests {
     /// Push a device's msg1 (with its identity proof, `src` = its keyId), run
     /// one step, assert PeerEstablished, feed msg2 back to the initiator, and
     /// return the agent-reported session_id.
-    fn bootstrap(
-        sess: &mut MultiPeerSession<'_, MockWs>,
+    fn bootstrap<W: WsConn + Scripted>(
+        sess: &mut MultiPeerSession<'_, W>,
         initiator: &mut TestInitiator,
         device: &TestDevice,
         agent_key_id: &str,
@@ -638,6 +790,7 @@ mod tests {
         let peer_id = device.kid();
         let msg1 = initiator.write_msg1(&device.proof());
         sess.ws
+            .mock()
             .push_inbound(env_json(agent_key_id, &msg1, Some(&peer_id)));
         let sid = match sess.process_next(TIMEOUT).unwrap() {
             Poll::PeerEstablished { peer, session_id } => {
@@ -647,7 +800,7 @@ mod tests {
             other => panic!("expected PeerEstablished for {peer_id}, got {other:?}"),
         };
         // The msg2 env just emitted must be addressed to this peer.
-        let msg2 = match parse_frame(sess.ws.outbound.last().unwrap()).unwrap() {
+        let msg2 = match parse_frame(sess.ws.mock().outbound.last().unwrap()).unwrap() {
             RelayFrame::Env { dst, payload, src } => {
                 assert_eq!(dst, peer_id, "msg2 addressed to the right peer");
                 assert!(src.is_none(), "agent never sets src");
@@ -1206,5 +1359,193 @@ mod tests {
             "B still established"
         );
         assert_eq!(sess.established_peers().count(), 2);
+    }
+
+    fn ready_json(identity: &AgentIdentity) -> String {
+        RelayFrame::Ready {
+            key_id: identity.key_id(),
+            peer_present: true,
+        }
+        .to_json()
+        .unwrap()
+    }
+
+    #[test]
+    fn authenticate_times_out_when_hello_never_arrives() {
+        let identity = AgentIdentity::generate();
+        let mut ws = FaultWs::new(Vec::new());
+        ws.quiet = true;
+        let mut sess = MultiPeerSession::new(ws, &identity, HashSet::new());
+        assert!(matches!(
+            sess.authenticate(Duration::from_secs(7)),
+            Err(SessionError::Timeout("awaiting hello"))
+        ));
+        assert_eq!(
+            sess.ws.last_timeout,
+            Some(Duration::from_secs(7)),
+            "the wait for hello is bounded by the caller's deadline"
+        );
+        assert_eq!(sess.ws.send_calls, 0, "no auth is sent without a hello");
+    }
+
+    #[test]
+    fn authenticate_reports_close_before_hello() {
+        let identity = AgentIdentity::generate();
+        let mut sess = MultiPeerSession::new(MockWs::new(Vec::new()), &identity, HashSet::new());
+        assert!(matches!(
+            sess.authenticate(TIMEOUT),
+            Err(SessionError::UnexpectedClose("awaiting hello"))
+        ));
+    }
+
+    #[test]
+    fn transport_failure_ends_the_session_on_the_next_poll() {
+        let identity = AgentIdentity::generate();
+        let agent_pub = identity.agreement_public_raw();
+        let dev = TestDevice::new(0xAA);
+        let mut sess = admit_faulty(&identity, allow(&[&dev]));
+        let mut a = dev.initiator(&agent_pub);
+        bootstrap(&mut sess, &mut a, &dev, &identity.key_id());
+
+        sess.ws.inner.push_inbound(ready_json(&identity));
+        sess.ws
+            .fail_next_send(RelayError::Transport("x".to_string()));
+        let recv_before = sess.ws.recv_calls;
+
+        assert!(sess.send_to(&dev.kid(), b"state").is_err());
+        assert!(sess.transport_failed());
+        assert!(matches!(
+            sess.process_next(TIMEOUT),
+            Err(SessionError::Relay(RelayError::Transport(_)))
+        ));
+        assert_eq!(sess.ws.recv_calls, recv_before, "the socket was not read");
+        assert_eq!(
+            sess.ws.inner.inbound.len(),
+            1,
+            "the scripted frame stays unread"
+        );
+    }
+
+    #[test]
+    fn no_socket_send_after_a_transport_failure() {
+        let identity = AgentIdentity::generate();
+        let agent_pub = identity.agreement_public_raw();
+        let (dev_a, dev_b) = (TestDevice::new(0xAA), TestDevice::new(0xBB));
+        let mut sess = admit_faulty(&identity, allow(&[&dev_a, &dev_b]));
+        let mut a = dev_a.initiator(&agent_pub);
+        let mut b = dev_b.initiator(&agent_pub);
+        bootstrap(&mut sess, &mut a, &dev_a, &identity.key_id());
+        bootstrap(&mut sess, &mut b, &dev_b, &identity.key_id());
+
+        sess.ws
+            .fail_next_send(RelayError::Transport("x".to_string()));
+        assert!(sess.send_to(&dev_a.kid(), b"state").is_err());
+        assert!(sess.transport_failed());
+
+        let sends_before = sess.ws.send_calls;
+        let mut peers_before: Vec<String> = sess.established_peers().map(str::to_string).collect();
+        peers_before.sort();
+
+        assert!(sess.send_to(&dev_b.kid(), b"state").is_err());
+        assert_eq!(sess.broadcast_to(b"evt", |_| true), 0);
+        assert_eq!(
+            sess.ws.send_calls, sends_before,
+            "no send touches the socket after the failure"
+        );
+        let mut peers_after: Vec<String> = sess.established_peers().map(str::to_string).collect();
+        peers_after.sort();
+        assert_eq!(
+            peers_after, peers_before,
+            "nothing was encrypted, so no peer lost a nonce"
+        );
+    }
+
+    #[test]
+    fn broadcast_to_stops_at_the_first_transport_failure() {
+        let identity = AgentIdentity::generate();
+        let agent_pub = identity.agreement_public_raw();
+        let devs = [
+            TestDevice::new(0xA1),
+            TestDevice::new(0xB2),
+            TestDevice::new(0xC3),
+        ];
+        let mut sess = admit_faulty(&identity, allow(&[&devs[0], &devs[1], &devs[2]]));
+        for dev in &devs {
+            let mut init = dev.initiator(&agent_pub);
+            bootstrap(&mut sess, &mut init, dev, &identity.key_id());
+        }
+        assert_eq!(sess.established_peers().count(), 3);
+
+        sess.ws
+            .fail_next_send(RelayError::Transport("x".to_string()));
+        let sends_before = sess.ws.send_calls;
+        assert_eq!(sess.broadcast_to(b"evt", |_| true), 0);
+        assert_eq!(
+            sess.ws.send_calls,
+            sends_before + 1,
+            "the fan-out stops at the first transport failure"
+        );
+        assert_eq!(
+            sess.established_peers().count(),
+            0,
+            "every peer whose frame was encrypted but not sent is removed"
+        );
+        assert!(sess.transport_failed());
+    }
+
+    #[test]
+    fn msg2_send_failure_latches_the_transport_failure() {
+        let identity = AgentIdentity::generate();
+        let agent_pub = identity.agreement_public_raw();
+        let dev = TestDevice::new(0xAA);
+        let mut sess = admit_faulty(&identity, allow(&[&dev]));
+        let mut init = dev.initiator(&agent_pub);
+        let msg1 = init.write_msg1(&dev.proof());
+        sess.ws
+            .inner
+            .push_inbound(env_json(&identity.key_id(), &msg1, Some(&dev.kid())));
+        sess.ws
+            .fail_next_send(RelayError::Transport("x".to_string()));
+
+        assert_eq!(
+            sess.process_next(TIMEOUT).unwrap(),
+            Poll::PeerRefused {
+                peer: dev.kid(),
+                reason: RefuseReason::Handshake,
+            }
+        );
+        assert!(sess.transport_failed());
+        assert!(sess.process_next(TIMEOUT).is_err());
+    }
+
+    #[test]
+    fn oversized_frame_send_error_does_not_end_the_session() {
+        let identity = AgentIdentity::generate();
+        let agent_pub = identity.agreement_public_raw();
+        let dev = TestDevice::new(0xAA);
+        let mut sess = admit_faulty(&identity, allow(&[&dev]));
+        let mut init = dev.initiator(&agent_pub);
+        bootstrap(&mut sess, &mut init, &dev, &identity.key_id());
+
+        sess.ws
+            .fail_next_send(RelayError::FrameTooLarge { len: 2, max: 1 });
+        assert!(sess.send_to(&dev.kid(), b"state").is_err());
+        assert!(
+            !sess.transport_failed(),
+            "an oversized frame is not a transport failure"
+        );
+        sess.ws.inner.push_inbound(ready_json(&identity));
+        assert_eq!(sess.process_next(TIMEOUT).unwrap(), Poll::Idle);
+    }
+
+    #[test]
+    fn send_capacity_passes_through_the_ws() {
+        let identity = AgentIdentity::generate();
+        let mut ws = FaultWs::new(Vec::new());
+        ws.capacity = Some(5);
+        let sess = MultiPeerSession::new(ws, &identity, HashSet::new());
+        assert_eq!(sess.send_capacity(), Some(5));
+        let sess = MultiPeerSession::new(MockWs::new(Vec::new()), &identity, HashSet::new());
+        assert_eq!(sess.send_capacity(), None);
     }
 }

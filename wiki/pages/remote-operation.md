@@ -40,6 +40,12 @@ cited, not restated. Spec:
   a pure AND of armed ∧ scope ∧ TTL ∧ heartbeat-fresh ∧ consent ∧ ¬kill; the
   coordinator gate [[fail-closed-arm-gate]] fails CLOSED and ANDs under
   `TxPolicy`.
+- **Gotcha: relay IO must stay bounded (PAN-102).** Never add an untimed
+  `block_in_place` wait to `RealWsConn`: code inside `block_in_place` cannot
+  be cancelled, so an unbounded wait can hold the session task past
+  `abort()`. Every wait takes a `RelayTimeouts` deadline, and a relay
+  transport failure must end the whole session (the socket is shared by every
+  peer), which then disarms and reconnects.
 
 ## Why it is shaped this way
 
