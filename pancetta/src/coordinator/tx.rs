@@ -155,6 +155,26 @@ fn current_slot_acceptance_cap_ms(protocol: pancetta_ft8::Protocol, tx_late_max_
         .saturating_sub(COALESCE_CAP_SAFETY_MARGIN_MS)
 }
 
+/// PAN-117 (PR #450 review round 2): the multi-TX arm's queue-time
+/// acceptance cap. Only a bundle COALESCED from a `TransmitRequest` head
+/// sat through the unconditional base coalesce window after its frozen
+/// `request_received_at`; a `MultiTransmitRequest` dequeued directly (an
+/// autonomous bundle, or a mid-TX supersede re-enqueue) skips that wait.
+/// Reserving the base window for it too would defer a bundle that can
+/// still key before the raw cap, so it reserves only the safety margin.
+fn multi_tx_acceptance_cap_ms(
+    protocol: pancetta_ft8::Protocol,
+    tx_late_max_ms: u64,
+    waited_base_window: bool,
+) -> u64 {
+    if waited_base_window {
+        current_slot_acceptance_cap_ms(protocol, tx_late_max_ms)
+    } else {
+        tx_late_max_ms_effective(protocol, tx_late_max_ms)
+            .saturating_sub(COALESCE_CAP_SAFETY_MARGIN_MS)
+    }
+}
+
 /// Remaining `tx_late_max_ms` headroom, in ms, available to extend the
 /// Symptom-C adaptive coalesce window for the given head request — bounds
 /// the window so it can never push a request past the late-skip cliff.
@@ -491,12 +511,13 @@ pub fn classify_incoming_during_tx(
 /// slot-grid math is computed against it; passing
 /// `pancetta_core::slot::SLOT_NS` is byte-identical to the FT8 behavior.
 ///
-/// PAN-117 (PR #450 review): both worker arms pass
-/// `current_slot_acceptance_cap_ms(protocol, tx_late_max_ms)` here — not
-/// the raw effective cap — so the current slot is only accepted when the
-/// request can absorb the coalesce/encode overhead that always runs
-/// before the key; the key-time final gate keeps enforcing the raw
-/// effective cap.
+/// PAN-117 (PR #450 review): the worker arms pass an acceptance cap here —
+/// not the raw effective cap — so the current slot is only accepted when
+/// the request can absorb the coalesce/encode overhead that runs before
+/// the key: `current_slot_acceptance_cap_ms` for a request that took the
+/// base coalesce wait, `multi_tx_acceptance_cap_ms` (margin only) for a
+/// directly dequeued bundle that did not. The key-time final gate keeps
+/// enforcing the raw effective cap.
 pub fn schedule_tx(
     now: chrono::DateTime<chrono::Utc>,
     required_parity: pancetta_core::slot::SlotParity,
@@ -6257,6 +6278,14 @@ impl super::ApplicationCoordinator {
                             // scheduling decision being made ~800ms later than the
                             // request actually arrived — an unforced ~30s defer.
                             let request_received_at = chrono::Utc::now();
+                            // PAN-117 (PR #450 review round 2): only a
+                            // `TransmitRequest` head takes the base coalesce wait
+                            // below. Captured before coalescing can fold it into a
+                            // `MultiTransmitRequest`, so the multi-TX arm can tell
+                            // a coalesced bundle (waited) from a directly dequeued
+                            // one (did not) when it picks its acceptance cap.
+                            let head_takes_base_wait =
+                                matches!(message.message_type, MessageType::TransmitRequest { .. });
 
                             // --- Backpressure / staleness coalescing ---
                             // The worker processes one request at a time and a
@@ -6275,7 +6304,7 @@ impl super::ApplicationCoordinator {
                             // dropped. Single-request (no-backlog) case rewrites
                             // back to exactly that one request — normal path
                             // unchanged.
-                            if matches!(message.message_type, MessageType::TransmitRequest { .. }) {
+                            if head_takes_base_wait {
                                 // Adaptive collection window (Symptom C fix): take
                                 // the base wait once, unconditionally (same as
                                 // before — this is the byte-identical baseline for
@@ -9045,22 +9074,22 @@ impl super::ApplicationCoordinator {
                                         slot_ns,
                                     );
 
-                                    // PAN-117 (PR #450 review): same
-                                    // acceptance-cap reservation as the
-                                    // single-TX arm's Step 2 — a bundle head
-                                    // frozen at `request_received_at` (either
-                                    // a coalesced single request, which
-                                    // already waited the base window, or a
-                                    // direct multi whose N-item encode the
-                                    // margin covers) must not be accepted
-                                    // into a slot the key-time gate is
-                                    // guaranteed to drop.
+                                    // PAN-117 (PR #450 review): a bundle frozen
+                                    // at `request_received_at` must not be
+                                    // accepted into a slot the key-time gate is
+                                    // guaranteed to drop. A bundle coalesced
+                                    // from a single request already waited the
+                                    // base window, so it reserves that plus the
+                                    // margin like the single-TX arm's Step 2; a
+                                    // directly dequeued bundle never waited, so
+                                    // it reserves only the margin (round 2).
                                     let mut schedule = schedule_tx(
                                         request_received_at,
                                         required_parity,
-                                        current_slot_acceptance_cap_ms(
+                                        multi_tx_acceptance_cap_ms(
                                             active_protocol,
                                             tx_late_max_ms,
+                                            head_takes_base_wait,
                                         ),
                                         sample_rate,
                                         slot_ns,
@@ -12449,6 +12478,50 @@ mod schedule_tx_tests {
             cap, 3000,
             "a 2.3s head resolves deferred, so extension gets the full ceiling"
         );
+    }
+
+    #[test]
+    fn multi_tx_acceptance_reserves_the_base_wait_only_for_coalesced_bundles() {
+        // PAN-117 PR #450 review round 2: a `MultiTransmitRequest` dequeued
+        // directly (mid-TX supersede re-enqueue, autonomous bundle) never
+        // takes the base coalesce wait, so the multi-TX arm must not
+        // reserve it — only the 500ms margin.
+        assert_eq!(
+            multi_tx_acceptance_cap_ms(pancetta_ft8::Protocol::Ft8, 3000, true),
+            1700,
+            "coalesced FT8 bundle: 3000 − 800 base window − 500 margin"
+        );
+        assert_eq!(
+            multi_tx_acceptance_cap_ms(pancetta_ft8::Protocol::Ft8, 3000, false),
+            2500,
+            "direct FT8 bundle: 3000 − 500 margin"
+        );
+        assert_eq!(
+            multi_tx_acceptance_cap_ms(pancetta_ft8::Protocol::Ft4, 3000, false),
+            1000,
+            "direct FT4 bundle: 1500 effective − 500 margin"
+        );
+        // A direct bundle re-key 2.0s into its Even slot keys in the
+        // current slot instead of deferring 30s.
+        let s = schedule_tx(
+            at(2.0),
+            SlotParity::Even,
+            multi_tx_acceptance_cap_ms(pancetta_ft8::Protocol::Ft8, 3000, false),
+            12_000,
+            SLOT_NS,
+        );
+        assert!(!s.deferred, "a direct 2.0s bundle makes the current slot");
+        assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 0);
+        // A coalesced bundle frozen at the same instant already lost 800ms
+        // to the base wait, so it still defers.
+        let s = schedule_tx(
+            at(2.0),
+            SlotParity::Even,
+            multi_tx_acceptance_cap_ms(pancetta_ft8::Protocol::Ft8, 3000, true),
+            12_000,
+            SLOT_NS,
+        );
+        assert!(s.deferred, "a coalesced 2.0s bundle defers");
     }
 
     #[test]

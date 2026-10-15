@@ -517,10 +517,14 @@ awaits was keyed anyway.
   enforced the cap only at key time, so an FT8 request arriving 2.2–3.0 s into its slot (FT4
   1.1–1.5 s) passed the queue-time `mstr <= cap` check, sat through the unconditional 800 ms
   base coalesce wait, and was then ALWAYS dropped at the gate — scheduled, dropped, never
-  deferred. Both worker arms now decide `use_current` against
+  deferred. Requests that took the base wait (every single `TransmitRequest`, and bundles
+  coalesced from one) now decide `use_current` against
   `current_slot_acceptance_cap_ms` = effective cap − base window − safety margin (1700 ms at
   the FT8 3000 ms default), so such a request defers 30 s instead; `adaptive_coalesce_cap_ms`'s
   probe uses the same value so its deferred branch matches the decision the worker actually
-  makes. The key-time gate keeps the raw effective cap as its unconditional backstop, and
-  mid-TX re-keys (which re-read the clock at the decision, with no coalesce wait in between)
-  keep the raw cap.
+  makes. A `MultiTransmitRequest` dequeued directly (autonomous bundle, mid-TX supersede
+  re-enqueue) never takes the base wait, so the multi-TX arm reserves only the safety margin
+  for it (`multi_tx_acceptance_cap_ms`: 2500 ms FT8, 1000 ms FT4 at the default) instead of
+  deferring a bundle that can still key before the raw cap (review round 2). The key-time gate
+  keeps the raw effective cap as its unconditional backstop, and single-TX mid-TX re-keys
+  (which re-read the clock at the decision, with no coalesce wait in between) keep the raw cap.
