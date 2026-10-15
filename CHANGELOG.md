@@ -15,7 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removing a `tx_allow_list` entry, `[network.station_agent].enabled = false`,
   and the WSJT-X UDP channel's consent. Every save shows a `Config reloaded`
   line (or the load error) in the TUI diagnostics, and grant-direction or
-  other edits say a restart is required. `docs/CONFIG.md` now lists exactly
+  other edits say a restart is required. Deleting the default
+  `~/.pancetta/pancetta.toml` revokes what only it granted; deleting a
+  `--config` file keeps the previous config and says so. `docs/CONFIG.md` now lists exactly
   which settings apply live and which need a restart, and `docs/RUNBOOK.md`
   has a procedure for revoking a remote client.
 

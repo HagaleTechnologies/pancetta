@@ -14,6 +14,10 @@ use tracing::{debug, error, info};
 
 use crate::Config;
 
+/// Start of [`ConfigReloadEvent::error`] when the watched file no longer
+/// exists. The current and last good configuration are kept.
+pub const CONFIG_FILE_REMOVED: &str = "Configuration file removed";
+
 /// Configuration reload event
 #[derive(Debug, Clone)]
 pub struct ConfigReloadEvent {
@@ -132,6 +136,31 @@ impl ConfigHotReload {
                             let last_good = last_good.clone();
 
                             runtime_handle.spawn(async move {
+                                // The file is gone (deleted, or mid-way
+                                // through an editor's remove-then-create
+                                // save). There is nothing to load: report
+                                // the removal and keep the current and last
+                                // good configuration. A caller that can load
+                                // without this file (e.g. a merged loader)
+                                // reloads on this event itself.
+                                if !config_path.exists() {
+                                    info!("Configuration file removed: {}", config_path.display());
+                                    let event = ConfigReloadEvent {
+                                        path: config_path.clone(),
+                                        config: None,
+                                        error: Some(format!(
+                                            "{CONFIG_FILE_REMOVED}: {}",
+                                            config_path.display()
+                                        )),
+                                        warnings: Vec::new(),
+                                        timestamp: Instant::now(),
+                                    };
+                                    if let Err(e) = event_tx.send(event) {
+                                        debug!("No receivers for config removal event: {}", e);
+                                    }
+                                    return;
+                                }
+
                                 // Debounce check
                                 {
                                     let last = last_reload.read().await;
@@ -316,13 +345,14 @@ impl ConfigHotReload {
         self.validate_before_reload = enabled;
     }
 
-    /// Check if an event should trigger reload
+    /// Check if an event should trigger reload. A removal counts: deleting
+    /// the file is a configuration change too (PAN-103). The handler then
+    /// reports the removal instead of loading (see `start_watching`).
     fn should_reload(event: &Event) -> bool {
-        match event.kind {
-            EventKind::Modify(_) | EventKind::Create(_) => true,
-            EventKind::Remove(_) => false, // Don't reload on removal
-            _ => false,
-        }
+        matches!(
+            event.kind,
+            EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+        )
     }
 
     /// Reload configuration from file, along with any non-fatal load
@@ -499,6 +529,75 @@ enabled = true
             "unknown [autonomous_operator] section must warn: {warnings:?}"
         );
         assert!(warnings[0].contains("autonomous_operator"));
+    }
+
+    /// PAN-103 (Codex P1 on #436): `should_reload` discarded every `Remove`,
+    /// so a backend that reports a deletion only as a removal (Windows'
+    /// `ReadDirectoryChangesW`, or inotify's parent-directory watch) never
+    /// told the consumer the file was deleted. Synthetic events: macOS
+    /// FSEvents attaches sticky modify flags to a deletion and Linux sends
+    /// `IN_ATTRIB` to the file watch, so a real deletion there does not
+    /// isolate the removal kind.
+    #[test]
+    fn should_reload_counts_a_removal() {
+        use notify::event::{CreateKind, ModifyKind, RemoveKind};
+        let path = PathBuf::from("/x/pancetta.toml");
+        for kind in [
+            EventKind::Remove(RemoveKind::File),
+            EventKind::Remove(RemoveKind::Any),
+            EventKind::Create(CreateKind::File),
+            EventKind::Modify(ModifyKind::Any),
+        ] {
+            let event = Event::new(kind).add_path(path.clone());
+            assert!(ConfigHotReload::should_reload(&event), "{kind:?}");
+        }
+        assert!(!ConfigHotReload::should_reload(&Event::new(
+            EventKind::Access(notify::event::AccessKind::Any)
+        )));
+    }
+
+    /// PAN-103 (Codex P1 on #436): deleting the watched file used to produce
+    /// no event at all (`should_reload` discarded every `Remove`), so a
+    /// consumer never learned the configuration changed. It now gets a
+    /// removal event, and the last good configuration is kept.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn removing_the_watched_file_emits_a_removal_event_and_keeps_last_good() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        let mut config = Config::default();
+        config.station.callsign = "TEST1".to_string();
+        config.save_to_file(&path).unwrap();
+
+        let (mut manager, mut event_rx) = ConfigHotReload::new(config, &path).unwrap();
+        manager.start_watching().await.unwrap();
+        // macOS FSEvents registers the watch asynchronously and can deliver a
+        // late event for the initial write: let it settle, then drain.
+        sleep(Duration::from_millis(500)).await;
+        while event_rx.try_recv().is_ok() {}
+
+        std::fs::remove_file(&path).unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = event_rx.recv().await.expect("channel open");
+                if event.config.is_none() {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("a removal event within 10 s");
+        let error = event.error.expect("removal reported as an error");
+        assert!(error.starts_with(CONFIG_FILE_REMOVED), "{error}");
+        assert_eq!(manager.get_config().await.station.callsign, "TEST1");
+        assert_eq!(
+            manager
+                .get_last_good_config()
+                .await
+                .unwrap()
+                .station
+                .callsign,
+            "TEST1"
+        );
     }
 
     #[tokio::test]

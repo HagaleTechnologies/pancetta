@@ -377,8 +377,6 @@ async fn main() -> Result<()> {
 async fn run_application(cli: Cli) -> Result<()> {
     // Load configuration
     let (config, config_warnings) = load_configuration_with_warnings(&cli).await?;
-    // PAN-103: whether the watched config file existed when it was loaded.
-    let config_watch_existed = config_raw_path(&cli).is_file();
 
     info!("Configuration loaded successfully");
     debug!("Configuration: {}", config.summary());
@@ -446,7 +444,6 @@ async fn run_application(cli: Cli) -> Result<()> {
     )
     .await?;
     coordinator.set_config_watch_path(config_watch_path);
-    coordinator.set_config_watch_existed_at_startup(config_watch_existed);
     if cli_config_given.is_none() {
         // PAN-103: without `--config`, startup merged every discovered config
         // source and the watched file is only one of them. Reloads load and

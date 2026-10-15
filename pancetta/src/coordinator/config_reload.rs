@@ -334,10 +334,19 @@ fn load_config_for_reload(path: &Path) -> ConfigReloadOutcome {
 /// Turn watcher events into reload outcomes for the main loop. Each burst of
 /// events is settled for `settle`, then the file is read once from disk, so
 /// the outcome always reflects the file's final content.
+///
+/// A removal of `watch_path` is a burst like any other (PAN-103): deleting
+/// the file changes the effective configuration. When the file is absent
+/// once the burst settled, the forwarder settles once more before loading,
+/// so an editor's remove-then-create save is read as the new file rather
+/// than as a deletion. A file still absent then is loaded as deleted: the
+/// merged loader falls back to the remaining sources, and the `--config`
+/// loader fails, which keeps the previous configuration and reports it.
 async fn forward_config_reload_events(
     mut events: broadcast::Receiver<ConfigReloadEvent>,
     tx: mpsc::Sender<ConfigReloadOutcome>,
     load: ConfigReloadLoader,
+    watch_path: PathBuf,
     settle: Duration,
 ) {
     use tokio::sync::broadcast::error::{RecvError, TryRecvError};
@@ -346,19 +355,33 @@ async fn forward_config_reload_events(
             Ok(_) | Err(RecvError::Lagged(_)) => {}
             Err(RecvError::Closed) => return,
         }
-        tokio::time::sleep(settle).await;
+        let mut grace_used = false;
         loop {
-            match events.try_recv() {
-                Ok(_) | Err(TryRecvError::Lagged(_)) => continue,
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Closed) => return,
+            tokio::time::sleep(settle).await;
+            loop {
+                match events.try_recv() {
+                    Ok(_) | Err(TryRecvError::Lagged(_)) => continue,
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Closed) => return,
+                }
             }
+            if grace_used || path_exists(watch_path.clone()).await {
+                break;
+            }
+            grace_used = true;
         }
         let outcome = run_reload_loader(load.clone()).await;
         if tx.send(outcome).await.is_err() {
             return;
         }
     }
+}
+
+/// Whether `path` exists (following symlinks), checked off the async runtime.
+async fn path_exists(path: PathBuf) -> bool {
+    tokio::task::spawn_blocking(move || path.exists())
+        .await
+        .unwrap_or(false)
 }
 
 /// Run a reload loader off the async runtime (it reads files).
@@ -387,16 +410,7 @@ impl super::ApplicationCoordinator {
     /// default location), symlinks NOT resolved. Reloads read and watch this
     /// path, so repointing a symlinked config at a new file is picked up.
     pub fn set_config_watch_path(&mut self, path: PathBuf) {
-        self.config_watch_existed_at_startup = path.is_file();
         self.config_watch_path = path;
-    }
-
-    /// Record whether the watched path held a file when startup loaded the
-    /// configuration (see `start_config_reload_watcher`). Defaults to what
-    /// [`Self::set_config_watch_path`] saw; `main.rs` sets it from the
-    /// moment of the startup load.
-    pub fn set_config_watch_existed_at_startup(&mut self, existed: bool) {
-        self.config_watch_existed_at_startup = existed;
     }
 
     /// Set how a reload loads the configuration when the watched file is
@@ -421,13 +435,16 @@ impl super::ApplicationCoordinator {
         }
     }
 
-    /// Start watching `config_watch_path` for saved edits. Only runs when
-    /// that path is an existing file (a defaults-only run has nothing to
-    /// watch). The path's own directory is watched (a symlink repoint shows
-    /// up there), and so is the directory of its current symlink target (an
-    /// edit to the target shows up there). A watcher that fails to start is
-    /// logged and skipped: the station then runs exactly as it did before
-    /// PAN-103, with every edit needing a restart.
+    /// Start watching `config_watch_path` for saved edits, created files and
+    /// deletions. Runs whenever the path's directory exists, whether or not
+    /// the file does right now: whether it existed is never sampled (a
+    /// sample taken after the startup load races a deployment replacing the
+    /// file). The path's own directory is watched (a symlink repoint and a
+    /// re-created file show up there), and so is the directory of its
+    /// current symlink target (an edit to the target shows up there). A
+    /// watcher that fails to start is logged and skipped: the station then
+    /// runs exactly as it did before PAN-103, with every edit needing a
+    /// restart.
     pub(crate) async fn start_config_reload_watcher(&mut self) -> anyhow::Result<()> {
         self.start_config_reload_watcher_with_settle(RELOAD_SETTLE)
             .await
@@ -441,19 +458,12 @@ impl super::ApplicationCoordinator {
         // path's parent, which a bare relative file name does not have.
         let watch_path = std::path::absolute(&self.config_watch_path)
             .unwrap_or_else(|_| self.config_watch_path.clone());
-        // A path that is absent now but existed at startup is mid-way
-        // through a replacement (or was removed after startup loaded it):
-        // watch its directory anyway, measured from the running config, so
-        // the re-created file is applied. A path that never existed (config
-        // only in another search location) is not watched.
+        // A path that is absent now is mid-way through a replacement, was
+        // removed after startup loaded it, or never existed (a defaults-only
+        // run, or a config only in another search location). Its directory
+        // is watched anyway, measured from the running config, so a file
+        // created there later is applied.
         let present = watch_path.is_file();
-        if !present && !self.config_watch_existed_at_startup {
-            info!(
-                "Config hot reload not started: {} is not a file",
-                watch_path.display()
-            );
-            return Ok(());
-        }
         // What the loader returns now is the baseline edits are measured
         // from (see the module doc).
         self.config_watch_path = watch_path.clone();
@@ -469,7 +479,7 @@ impl super::ApplicationCoordinator {
         };
         let (mut baseline, mut baseline_warnings, mut load_error) = if !present {
             info!(
-                "{} is missing right now; watching for it to be re-created",
+                "{} is missing right now; watching for it to be created",
                 watch_path.display()
             );
             (running_baseline().await, self.config_warnings.clone(), None)
@@ -496,7 +506,13 @@ impl super::ApplicationCoordinator {
             return Ok(());
         }
         let (tx, rx) = mpsc::channel(8);
-        tokio::spawn(forward_config_reload_events(events, tx, load, settle));
+        tokio::spawn(forward_config_reload_events(
+            events,
+            tx,
+            load,
+            watch_path.clone(),
+            settle,
+        ));
         self.config_reload_watcher = Some(watcher);
         self.config_reload_rx = Some(rx);
         // `start_watching` already watches the path's own directory; record
@@ -1675,7 +1691,6 @@ mod tests {
             .unwrap()
             .set_channel_consent(ConsentChannel::StationAgent, true, 0);
         coordinator.set_config_watch_path(path.clone());
-        coordinator.set_config_watch_existed_at_startup(true);
         coordinator
             .start_config_reload_watcher_with_settle(Duration::from_millis(100))
             .await
@@ -2232,8 +2247,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watcher_is_not_started_without_a_config_file() {
+    async fn watcher_is_not_started_without_a_config_directory() {
         let mut coordinator = test_coordinator(base()).await;
+        coordinator.set_config_watch_path(temp_path("no-such-dir").join("pancetta.toml"));
         coordinator.start_config_reload_watcher().await.unwrap();
         assert!(coordinator.config_reload_rx.is_none());
         assert!(coordinator.config_reload_watcher.is_none());
@@ -2273,6 +2289,198 @@ mod tests {
         .await;
         let (reloaded, _) = outcome.expect("the saved file loads and validates");
         assert!(!reloaded.network.station_agent.remote_tx_enabled);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Codex P1 on #436 (round 7, `main.rs`): the watcher used to start only
+    /// when the config path existed, sampled AFTER the startup load. A
+    /// deployment that replaced the file across that sample left the station
+    /// unwatched for its lifetime. Without `--config` the merged loader now
+    /// gets a watcher whether the file exists or not; the deletion is
+    /// reconciled at watcher start (merged mode falls back to the remaining
+    /// sources) and the re-created file is still applied.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn merged_mode_config_removed_before_the_watcher_started_is_still_watched() {
+        let root = temp_path("merged-removed-at-start");
+        let watched = root.join("watched");
+        std::fs::create_dir_all(&watched).unwrap();
+        let path = watched.join("pancetta.toml");
+        std::fs::write(&path, station_agent_toml(true)).unwrap();
+        let (mut coordinator, _load) = merged_coordinator(vec![watched.clone()]).await;
+        coordinator.config_file_baseline = None;
+        assert!(station_agent_consent(&coordinator), "setup: consent on");
+        let rx = tui_rx(&coordinator).await;
+
+        // Loaded at startup, gone by the time startup looks at the path.
+        std::fs::remove_file(&path).unwrap();
+        coordinator.set_config_watch_path(path.clone());
+        coordinator
+            .start_config_reload_watcher_with_settle(Duration::from_millis(100))
+            .await
+            .unwrap();
+        let mut reload_rx = coordinator
+            .config_reload_rx
+            .take()
+            .expect("watcher started although the file was missing");
+        assert!(
+            !station_agent_consent(&coordinator),
+            "the deleted file's consent is reconciled away"
+        );
+        assert!(
+            texts(&diagnostics(&rx)).contains(&MSG_STATION_AGENT_CONSENT_OFF),
+            "the revocation is reported"
+        );
+
+        // Re-created: the watcher sees it (consent grants are restart-only,
+        // so only the outcome is checked).
+        let text = station_agent_toml(true);
+        let outcome = resave_until_consent(&mut reload_rx, true, || {
+            std::fs::write(&path, &text).unwrap();
+        })
+        .await;
+        assert!(outcome.is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Codex P1 on #436 (round 7): without `--config`, deleting the watched
+    /// file is an effective-config change (the merged loader falls back to
+    /// the remaining sources). `should_reload` used to discard every removal
+    /// event, so a consent granted by the deleted file stayed live. The
+    /// deletion now reaches the main loop and revokes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn merged_mode_deleting_the_watched_file_revokes_its_grants() {
+        let root = temp_path("merged-delete");
+        let watched = root.join("watched");
+        std::fs::create_dir_all(&watched).unwrap();
+        let path = watched.join("pancetta.toml");
+        let text = station_agent_toml(true);
+        std::fs::write(&path, &text).unwrap();
+        let (mut coordinator, _load) = merged_coordinator(vec![watched.clone()]).await;
+        assert!(station_agent_consent(&coordinator), "setup: consent on");
+        arm_client(&coordinator, "A");
+        assert!(permitted(&coordinator, "A"), "setup: armed");
+        coordinator.set_config_watch_path(path.clone());
+        coordinator
+            .start_config_reload_watcher_with_settle(Duration::from_millis(100))
+            .await
+            .unwrap();
+        let mut reload_rx = coordinator
+            .config_reload_rx
+            .take()
+            .expect("watcher started");
+        let rx = tui_rx(&coordinator).await;
+
+        // macOS FSEvents registers watches asynchronously: re-save until the
+        // watcher demonstrably sees the file, then delete it. Repeat if the
+        // deletion itself is missed, so a slow watch cannot fail the test.
+        let outcome = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                resave_until_consent(&mut reload_rx, true, || {
+                    std::fs::write(&path, &text).unwrap();
+                })
+                .await;
+                std::fs::remove_file(&path).unwrap();
+                let wait = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let outcome = reload_rx.recv().await.expect("channel open");
+                        if matches!(&outcome, Ok((c, _)) if !c.network.station_agent.remote_tx_enabled)
+                        {
+                            return outcome;
+                        }
+                    }
+                });
+                if let Ok(outcome) = wait.await {
+                    return outcome;
+                }
+            }
+        })
+        .await
+        .expect("the deletion reaches the main loop within 60 s");
+        coordinator.handle_config_reload(outcome).await;
+
+        assert!(!station_agent_consent(&coordinator), "consent revoked");
+        assert!(!permitted(&coordinator, "A"), "remote TX refused");
+        assert!(
+            texts(&diagnostics(&rx)).contains(&MSG_STATION_AGENT_CONSENT_OFF),
+            "the revocation is reported"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An editor's remove-then-create save must not be read as a deletion:
+    /// the forwarder settles once more while the file is absent, so it loads
+    /// the new file instead of falling back without it (which would revoke a
+    /// grant only a restart restores).
+    #[tokio::test]
+    async fn forwarder_waits_out_a_remove_then_create_save() {
+        let dir = temp_path("remove-create");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pancetta.toml");
+        let settle = Duration::from_millis(200);
+        let (event_tx, events) = broadcast::channel(16);
+        let (tx, mut rx) = mpsc::channel(8);
+        let probe = path.clone();
+        let load: ConfigReloadLoader = std::sync::Arc::new(move || {
+            if probe.exists() {
+                Ok((Config::default(), Vec::new()))
+            } else {
+                Err("loaded while the file was absent".to_string())
+            }
+        });
+        tokio::spawn(forward_config_reload_events(
+            events,
+            tx,
+            load,
+            path.clone(),
+            settle,
+        ));
+
+        // The removal event; the new file lands 1.5 settle periods later.
+        event_tx
+            .send(ConfigReloadEvent {
+                path: path.clone(),
+                config: None,
+                error: Some("removed".to_string()),
+                warnings: Vec::new(),
+                timestamp: std::time::Instant::now(),
+            })
+            .unwrap();
+        tokio::time::sleep(settle * 3 / 2).await;
+        std::fs::write(&path, "").unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("an outcome")
+            .expect("channel open");
+        assert!(outcome.is_ok(), "{outcome:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With `--config` the watched file is the whole configuration: a
+    /// deletion keeps the previous configuration (no fallback to defaults)
+    /// and says so, like any other failed reload.
+    #[tokio::test]
+    async fn deleting_an_explicit_config_keeps_the_previous_config_and_reports_it() {
+        let dir = temp_path("explicit-delete");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pancetta.toml");
+        let mut coordinator = test_coordinator(base()).await;
+        coordinator
+            .remote_tx_arm
+            .lock()
+            .unwrap()
+            .set_channel_consent(ConsentChannel::StationAgent, true, 0);
+        coordinator.set_config_watch_path(path.clone());
+        let rx = tui_rx(&coordinator).await;
+
+        let outcome = run_reload_loader(coordinator.reload_loader()).await;
+        coordinator.handle_config_reload(outcome).await;
+
+        assert!(station_agent_consent(&coordinator), "previous config kept");
+        let lines = diagnostics(&rx);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].0, DiagnosticLevel::Error);
+        assert!(lines[0].1.contains("previous configuration still active"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

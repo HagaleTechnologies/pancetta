@@ -626,10 +626,10 @@ priority over both config and environment.
 Pancetta watches its config file for changes while it runs: the file
 given with `--config`, otherwise `~/.pancetta/pancetta.toml`. If that
 path is a symlink, both edits to the file it points at and repointing
-the symlink itself are picked up. If that
-file does not exist (for example, your config lives only in one of the
-other search locations above), nothing is watched and every change
-needs a restart. A save is picked up within a few seconds. With
+the symlink itself are picked up. The file's directory is watched even
+while the file does not exist, so creating it later is picked up too
+(when the directory itself does not exist, nothing is watched and every
+change needs a restart). A save is picked up within a few seconds. With
 `--config`, each save is compared with that file's previous content.
 Without `--config`, each save re-loads and validates every config file and
 `PANCETTA_*` environment variable the way startup does, and the merged
@@ -638,6 +638,16 @@ result is compared with the previous one: a setting a higher-priority file
 when you edit it in `~/.pancetta/pancetta.toml`, and an edit to that other
 file is applied the next time the watched file is saved. A save made while
 pancetta is starting is applied when watching begins.
+
+Deleting the watched file is a change too. Without `--config`, the
+remaining config files, environment variables and defaults then apply,
+so a remote-TX consent or `tx_allow_list` entry that only the deleted
+file granted is revoked live. With `--config`, the file is the whole
+configuration: deleting it keeps the previous config active and shows
+`Config reload failed: … — previous configuration still active`.
+Editors that save by removing the file and writing a new one are read
+as a save, not a deletion: while the file is missing, pancetta waits a
+moment longer before reloading.
 
 **Applied live — remote-access revocations (security):**
 

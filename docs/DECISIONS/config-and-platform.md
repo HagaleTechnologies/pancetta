@@ -45,7 +45,7 @@ concept added — out of scope. Full design: `docs/superpowers/specs/2026-09-02-
 PAN-103. `docs/CONFIG.md` promised that most keys hot-reload within a second, but nothing in the
 binary constructed the watcher, so every edit — including revoking a remote client — needed a
 restart. The coordinator now starts `pancetta_config::ConfigHotReload` on its `config_path` when
-that file exists, re-reads the file once a burst of watcher events settles, and hands the result to
+that file's directory exists, re-reads the file once a burst of watcher events settles, and hands the result to
 `run_main_loop` → `handle_config_reload` (`pancetta/src/coordinator/config_reload.rs`). Each edit is
 measured against the file's previous content, not the running config, because the running config
 can also hold values from other config files and `PANCETTA_*` environment variables.
@@ -72,6 +72,18 @@ can also hold values from other config files and `PANCETTA_*` environment variab
   evicted at once but a later poll re-admits an edge cqdx still returns.
 - The PAN-59 decision above (live rig switch via a TUI command rather than the watcher) stands; the
   watcher now exists but does not reconnect the rig.
+- **Deletion is a change; the directory is always watched.** `should_reload` used to drop every
+  `Remove` event, so on a backend that reports a deletion only as a removal (Windows), deleting
+  `~/.pancetta/pancetta.toml` left the consent and allow-list it granted live. A removal now
+  triggers the merged reload, which falls back to the remaining sources; with `--config` the loader
+  fails and the last good config stays (falling back to defaults there would silently replace the
+  operator's whole configuration). When the file is missing after the settle, the forwarder settles
+  once more before loading, so an editor's remove-then-create save is not read as a deletion (a
+  spurious revocation would hold until restart, since grants are restart-required). The watcher
+  starts whenever the path's directory exists rather than only when the file existed: sampling
+  existence after the startup load raced a deployment replacing the file and could leave the
+  station unwatched for its lifetime. Plumbing "did the loader read this path" out of the loader
+  was rejected as more code for the same result.
 
 ## Decoder speed overhaul — budget-governed anytime decoder
 
