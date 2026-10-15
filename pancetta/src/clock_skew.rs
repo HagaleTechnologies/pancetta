@@ -10,7 +10,7 @@
 use chrono::{DateTime, Utc};
 use pancetta_core::slot_clock::ClockStepDetector;
 use pancetta_core::DiagnosticLevel;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -118,27 +118,100 @@ pub fn describe_offset(offset_s: f64) -> String {
     format!("{:.2} s {dir}", offset_s.abs())
 }
 
+/// PAN-89: the clock-skew monitor's state as the operator sees it.
+/// `Pending`, `InSpec` and `Unreachable` all mean "no warning" to
+/// [`ClockSkewShared::warning`]; this tells them apart (an unreachable
+/// SNTP server means the clock is unverified).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClockStatus {
+    /// No monitor runs (`--replay` / `--wav`).
+    #[default]
+    NotMonitored,
+    /// The monitor runs but no probe has completed yet.
+    Pending,
+    /// The latest probe is within [`CLOCK_SKEW_WARN_S`].
+    InSpec,
+    /// The latest probe is at or past [`CLOCK_SKEW_WARN_S`].
+    Skewed,
+    /// The latest probe could not reach the SNTP server: clock unverified.
+    Unreachable,
+    /// A clock step invalidated the latest in-spec/skewed reading; waiting
+    /// for the re-check probe.
+    Rechecking,
+}
+
+impl ClockStatus {
+    /// Stable `u8` encoding for atomic storage.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            ClockStatus::NotMonitored => 0,
+            ClockStatus::Pending => 1,
+            ClockStatus::InSpec => 2,
+            ClockStatus::Skewed => 3,
+            ClockStatus::Unreachable => 4,
+            ClockStatus::Rechecking => 5,
+        }
+    }
+
+    /// Decode [`ClockStatus::as_u8`]; unknown values map to `NotMonitored`.
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => ClockStatus::Pending,
+            2 => ClockStatus::InSpec,
+            3 => ClockStatus::Skewed,
+            4 => ClockStatus::Unreachable,
+            5 => ClockStatus::Rechecking,
+            _ => ClockStatus::NotMonitored,
+        }
+    }
+}
+
 /// Lock-free handoff of the current clock-skew warning from the monitor task
 /// to the TUI relay thread. Stores f64 bits; NaN means "no warning".
+///
+/// PAN-89: also carries the monitor's [`ClockStatus`] (`NotMonitored` until
+/// a monitor publishes), read by the relay's readiness snapshot.
 #[derive(Debug, Clone)]
-pub struct ClockSkewShared(Arc<AtomicU64>);
+pub struct ClockSkewShared {
+    warning: Arc<AtomicU64>,
+    status: Arc<AtomicU8>,
+}
 
 impl ClockSkewShared {
     /// A handle with no warning set.
     pub fn new() -> Self {
-        Self(Arc::new(AtomicU64::new(f64::NAN.to_bits())))
+        Self {
+            warning: Arc::new(AtomicU64::new(f64::NAN.to_bits())),
+            status: Arc::new(AtomicU8::new(ClockStatus::NotMonitored.as_u8())),
+        }
     }
 
     /// Publish `Some(offset_s)` while warning, `None` otherwise.
     pub fn set_warning(&self, warning: Option<f64>) {
         let bits = warning.unwrap_or(f64::NAN).to_bits();
-        self.0.store(bits, Ordering::Release);
+        self.warning.store(bits, Ordering::Release);
     }
 
     /// The offset currently warned about, if any.
     pub fn warning(&self) -> Option<f64> {
-        let v = f64::from_bits(self.0.load(Ordering::Acquire));
+        let v = f64::from_bits(self.warning.load(Ordering::Acquire));
         (!v.is_nan()).then_some(v)
+    }
+
+    /// Publish the monitor's current [`ClockStatus`].
+    pub fn set_status(&self, status: ClockStatus) {
+        self.status.store(status.as_u8(), Ordering::Release);
+    }
+
+    /// The monitor's last published [`ClockStatus`].
+    pub fn status(&self) -> ClockStatus {
+        ClockStatus::from_u8(self.status.load(Ordering::Acquire))
+    }
+
+    /// Publish both the warning and the status of `core`.
+    pub fn publish(&self, core: &ClockSkewMonitorCore) {
+        self.set_warning(core.warning());
+        self.set_status(core.status());
     }
 }
 
@@ -342,6 +415,21 @@ impl ClockSkewMonitorCore {
         match self.reading {
             Reading::Skewed(offset) if !self.invalidated_by_step => Some(offset),
             _ => None,
+        }
+    }
+
+    /// PAN-89: the operator-facing state of the latest reading. A clock step
+    /// since an in-spec or skewed reading makes it `Rechecking` until the
+    /// next probe.
+    pub fn status(&self) -> ClockStatus {
+        match self.reading {
+            Reading::Pending => ClockStatus::Pending,
+            Reading::InSpec | Reading::Skewed(_) if self.invalidated_by_step => {
+                ClockStatus::Rechecking
+            }
+            Reading::Skewed(_) => ClockStatus::Skewed,
+            Reading::InSpec => ClockStatus::InSpec,
+            Reading::Unreachable => ClockStatus::Unreachable,
         }
     }
 }
@@ -561,6 +649,89 @@ mod tests {
         assert_eq!(sim.core.next_probe_at(), secs(4030));
         assert!(!sim.tick_at(4029).probe_due);
         assert!(sim.tick_at(4030).probe_due);
+    }
+
+    #[test]
+    fn status_tracks_pending_inspec_skewed_unreachable() {
+        let mut sim = Sim::new();
+        assert_eq!(sim.core.status(), ClockStatus::Pending);
+        sim.tick_at(10);
+        assert_eq!(sim.core.status(), ClockStatus::Pending);
+        sim.probe_at(30, Ok(0.012));
+        assert_eq!(sim.core.status(), ClockStatus::InSpec);
+        sim.probe_at(1830, Ok(0.42));
+        assert_eq!(sim.core.status(), ClockStatus::Skewed);
+        sim.probe_at(3630, Err("timed out".to_string()));
+        assert_eq!(sim.core.status(), ClockStatus::Unreachable);
+        sim.probe_at(5430, Ok(-0.01));
+        assert_eq!(sim.core.status(), ClockStatus::InSpec);
+    }
+
+    #[test]
+    fn status_is_rechecking_after_a_step_until_the_next_probe() {
+        // Skewed → step → Rechecking → probe → InSpec.
+        let mut sim = Sim::new();
+        sim.probe_at(100, Ok(0.42));
+        assert_eq!(sim.core.status(), ClockStatus::Skewed);
+        sim.jump_ms(5_000);
+        assert!(sim.tick_at(200).step_diag.is_some());
+        assert_eq!(sim.core.status(), ClockStatus::Rechecking);
+        assert!(!sim.tick_at(1899).probe_due);
+        assert_eq!(sim.core.status(), ClockStatus::Rechecking);
+        sim.probe_at(1900, Ok(0.01));
+        assert_eq!(sim.core.status(), ClockStatus::InSpec);
+
+        // InSpec → step → Rechecking too.
+        sim.jump_ms(5_000);
+        assert!(sim.tick_at(2000).step_diag.is_some());
+        assert_eq!(sim.core.status(), ClockStatus::Rechecking);
+
+        // A step before the first probe, or after an unreachable probe,
+        // leaves the status as it was (there is no verdict to invalidate).
+        let mut sim = Sim::new();
+        sim.jump_ms(5_000);
+        sim.tick_at(10);
+        assert_eq!(sim.core.status(), ClockStatus::Pending);
+        let mut sim = Sim::new();
+        sim.probe_at(30, Err("timed out".to_string()));
+        sim.jump_ms(5_000);
+        sim.tick_at(100);
+        assert_eq!(sim.core.status(), ClockStatus::Unreachable);
+    }
+
+    #[test]
+    fn shared_handle_defaults_to_not_monitored_and_round_trips_every_status() {
+        let shared = ClockSkewShared::new();
+        assert_eq!(shared.status(), ClockStatus::NotMonitored);
+        assert_eq!(
+            ClockSkewShared::default().status(),
+            ClockStatus::NotMonitored
+        );
+        assert_eq!(ClockStatus::default(), ClockStatus::NotMonitored);
+        let relay = shared.clone();
+        for status in [
+            ClockStatus::NotMonitored,
+            ClockStatus::Pending,
+            ClockStatus::InSpec,
+            ClockStatus::Skewed,
+            ClockStatus::Unreachable,
+            ClockStatus::Rechecking,
+        ] {
+            assert_eq!(ClockStatus::from_u8(status.as_u8()), status);
+            shared.set_status(status);
+            assert_eq!(relay.status(), status);
+        }
+        assert_eq!(ClockStatus::from_u8(200), ClockStatus::NotMonitored);
+
+        // `publish` carries both the warning and the status of a core.
+        let mut sim = Sim::new();
+        shared.publish(&sim.core);
+        assert_eq!(relay.status(), ClockStatus::Pending);
+        assert_eq!(relay.warning(), None);
+        sim.probe_at(30, Ok(0.42));
+        shared.publish(&sim.core);
+        assert_eq!(relay.status(), ClockStatus::Skewed);
+        assert_eq!(relay.warning(), Some(0.42));
     }
 
     #[test]

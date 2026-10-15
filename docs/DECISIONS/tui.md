@@ -121,14 +121,14 @@ width; only the highest-priority alarm shows.
 Contract: `PipelineHealth.clock_skew_warning_s: Option<f64>` is `Some` only while the monitor is
 warning, and `None` while the first probe is pending, when pool.ntp.org is unreachable, when the
 clock is in spec, and right after a detected clock step. The threshold and all policy live in the
-coordinator (`pancetta/src/clock_skew.rs`); the TUI only formats (`clock_skew_chip_text`), because
-`pancetta-tui` cannot depend on `pancetta_lib`. The 2 s `tui_relay` health tick copies the value.
+coordinator (`pancetta/src/clock_skew.rs`); the TUI only formats (`clock_skew_chip_text`,
+`readiness::clock_skew_label` since PAN-89), because `pancetta-tui` cannot depend on `pancetta_lib`. The 2 s `tui_relay` health tick copies the value.
 
 No key hint: a `— Shift+D` suffix truncated to `— S` at 120 columns. The Diagnostics overlay carries
 the full `clock.skew` / `clock.step` text and the per-OS NTP fix. At 100 columns every alarm chip is
 clipped to `⚠`; that pre-existing behaviour is unchanged.
-Superseded by PAN-88 (below): the alarm is title-bar admit rank 4 and is shown whole or dropped,
-never clipped.
+Superseded by PAN-88 (below): the alarm became title-bar admit rank 4, shown whole or dropped, never
+clipped. PAN-89 (below) then moved it out of the title bar into the readiness strip.
 
 ## Narrow-terminal layout: reserved clock, priority-fit chips, adaptive columns, scrollable help (PAN-88, 2026-10-12)
 
@@ -145,7 +145,7 @@ arithmetic, guarantees it (a 40-character callsign can't clip it). The other chi
 ordered step list (`title_rank`): each chip has an admit step (compact form if it has one) and,
 with a compact form, an upgrade step; steps apply greedily by rank and a step that overflows is
 reverted without blocking later ones. Callsign and TX policy are pinned. Admit order: live `TX`,
-`⏸` pause prompt (compact `⏸ CQ PAUSED: press a key`), alarm chip, mode, frequency/band (compact
+`⏸` pause prompt (compact `⏸ CQ PAUSED: press a key`), mode, frequency/band (compact
 drops `MHz`), `FOX`, `SPLIT` (compact drops the TX frequency), view chip, held TX offset (compact
 drops `(HOLD)`), `FREQ: HOLD/AUTO`, `QSOs: n`, `DEC: preset`; then restore `MHz`, the full pause
 text, the split frequency, `(HOLD)`, add the grid, restore the decode milliseconds, add
@@ -176,8 +176,8 @@ unchanged (`Press Escape or ? to close`). The scroll keys are modal-only, so per
 are documented by the modal footer, not `KEYBINDINGS`; `docs/KEYBINDINGS.md` is unchanged.
 `App::help_scroll` resets to 0 every time the overlay opens.
 
-PAN-89 rebase note: if PAN-89 moves the health alarm out of the title bar, delete the alarm segment
-(`title_rank::ALARM`) and the alarm entry in the admit order above; the readiness strip doesn't
+PAN-89 moved the health alarm (audio dead, decoder stub, clock skew) out of the title bar into the
+readiness strip, so the alarm segment and `title_rank::ALARM` are gone; the readiness strip doesn't
 touch title-row fitting.
 
 Known gap: `crossterm::Event::Resize` is unhandled and `App::handle_resize` is never called, so
@@ -188,3 +188,61 @@ Tests: `bar_fit::tests`, `ui::view_render_tests::title_bar_*` / `*_headings_are_
 `footer_key_hints_*`, `dx_hunter::tests::visible_columns_*`, `callers::tests`, and
 `tui_runner::key_tests::help_overlay_*`.
 
+
+## Readiness strip — durable blockers vs acknowledgeable warnings vs transient status (PAN-89, 2026-10-12)
+
+`pancetta-tui/src/readiness.rs` (model), `pancetta-tui/src/ui/readiness_strip.rs` (render),
+`pancetta/src/coordinator/readiness.rs` (snapshot + publisher). Supersedes the PAN-114 "title-bar
+alarm slot" placement above.
+
+**Three surfaces.** Row 1 of every view (and zoom) is the readiness strip: a TX verdict chip
+(`… CHECKING`, `✗ TX HELD`, `■ RX ONLY`, `◌ TX WAIT`, `⚠ TX OPEN`, `✓ TX READY`) followed by one chip
+per active condition, rebuilt every frame from typed `App` state. The status line stays the
+transient-activity surface; decodes no longer write it (Band Activity lists them, `Msgs: N` counts
+them, and the echo was what erased errors within a second of busy band). The Shift+D ring stays
+history.
+
+**Severities.** Blockers (red: PTT may still be keyed, rig control restarting, rig CAT link lost, TX
+audio output dead, audio input dead) stay until the condition resolves; `!` cannot hide them.
+Warnings (yellow: clock skewed/unverified, decoder stub, TX → system default, RX fallback, input
+silent, RF-but-no-decodes, supervisor degraded, sticky error alerts) stay until resolved or
+acknowledged with `!`. Notices (cyan: rig control not ready, rig command queued/applying) are
+short-lived waits. Clock skew is now a yellow, acknowledgeable warning: it does not hold TX and a
+non-dismissable red item would be permanent noise for a known-skewed portable station.
+
+**Episode-scoped acks.** `App::prune_acknowledged_readiness` drops an ack as soon as its condition is
+no longer active, so a recurrence shows again. The degraded ack is keyed by the summary text, so a
+changed summary shows again. `TuiMessage::Error` (incl. startup config warnings) becomes a sticky
+alert (dedupe by text while unacknowledged, ×N count, cap 8). Acks are session-only.
+
+**Gate parity.** The verdict reads `StationReadiness.tx_mute_causes`, built by the coordinator's
+display-only `tx::tx_mute_causes`, which lists every active cause in `tx_hard_mute_reason`'s order.
+`tx_mute_causes_first_matches_tx_hard_mute_reason_for_every_input_combination` proves the first cause
+equals the gate's reason for all 288 input combinations. `tx_hard_mute_reason` itself is unchanged.
+
+**`ptt_off_unconfirmed`.** Latched exactly where Hamlib teardown retains the PTT watchdog because
+PTT-off could not be forced; cleared only by a rig-accepted PTT-off (teardown success, the startup
+unkey, the PTT watchdog's forced off, a command-loop `SetPtt{false}`). Orphan release is not a
+confirmed unkey and does not clear it. The falling edge adds `PTT-off confirmed by the rig —
+stuck-PTT warning cleared` to Shift+D. It does not mute TX: that is a TX-safety policy change for its
+own ticket.
+
+**Other findings.** `ui/station_info.rs`'s RIG / TX→default / RX→fallback badges have been unrouted
+since Task 18, so those conditions were invisible in every view; the strip now carries them. The
+Shift+S TX-audio row was inverted (green for the misconfiguration) and is fixed; Shift+S gains a
+readiness section (acknowledged items marked `(ack'd)`), an RX-input row and a clock row. Because
+the readiness section can outgrow the panel (at 80×24 about four items fit before the rig, audio and
+clock rows clip), Shift+S scrolls by rendered line (↑/↓, PgUp/PgDn, Home/End), clamped like the `?`
+overlay and reset on open; the bottom border shows `↑↓ PgUp PgDn scroll · a–b of n` only while it
+overflows. Tests: `ui::view_render_tests::health_panel_scrolls_to_rows_clipped_at_80x24`,
+`tui_runner::key_tests::health_panel_scroll_keys_are_clamped_and_reset_on_reopen`. The strip's row
+also leaves Operate's right column 11 rows at 80×24, where the 20% station card is borders only and
+Callers had no row under its header; below 3 card rows Operate drops the card and splits the column
+50/50 between DX Hunter and Callers, as Hunt hides its card on short terminals. Larger sizes are
+unchanged (`ui::view_render_tests::callers_shows_a_caller_row_at_80x24`). The supervisor's degraded summary is shared state sorted by component name instead of a 5 s overwriting
+`StatusUpdate`.
+
+**Out of scope.** Remote-operator arm/control presence (remote gateway sends stay additive-only and
+the contract lives in dispensa), the SIGTERM/quit shutdown PTT-off path (runs after the TUI exits),
+any change to the TX gate, per-command "saved / sent / confirmed / applied" tracking beyond rig
+frequency/split, and persisting acks.

@@ -122,6 +122,9 @@ pub enum TuiMessage {
     },
     /// Error message
     Error { component: String, message: String },
+    /// PAN-89: station readiness snapshot — coordinator relay, 2 s tick,
+    /// pushed on change. Drives the readiness strip's verdict and items.
+    StationReadiness(crate::readiness::StationReadiness),
     /// Status update
     StatusUpdate { component: String, status: String },
     /// A retained, operator-facing diagnostic event (docs/observability-
@@ -813,6 +816,11 @@ impl TuiRunner {
             }
             TuiMessage::PipelineHealth(health) => {
                 app.pipeline_health = Some(health);
+                app.prune_acknowledged_readiness();
+            }
+            TuiMessage::StationReadiness(readiness) => {
+                app.station_readiness = Some(readiness);
+                app.prune_acknowledged_readiness();
             }
             TuiMessage::ActiveQsosUpdate {
                 qsos,
@@ -932,9 +940,11 @@ impl TuiRunner {
             }
             TuiMessage::AudioOutputDefault { is_default } => {
                 app.tx_output_default = is_default;
+                app.prune_acknowledged_readiness();
             }
             TuiMessage::AudioInputFallback { active } => {
                 app.input_fallback = active;
+                app.prune_acknowledged_readiness();
             }
             TuiMessage::DiagnosticEvent {
                 ts,
@@ -1543,16 +1553,36 @@ impl TuiRunner {
         }
 
         // Station-health panel (docs/observability-diagnostics-plan.md Layer
-        // 3). A read-only snapshot, so — unlike the Diagnostics overlay —
-        // there is no scroll state; just dismiss. Same as the Diagnostics/
-        // Recent-QSOs overlays, it's a read-only informational view rather
-        // than a modal the operator is editing, so `k` falls through to the
-        // global QSO-abort here too (PAN-21 round-1 remediation).
+        // 3). A read-only snapshot. Same as the Diagnostics/Recent-QSOs
+        // overlays, it's a read-only informational view rather than a modal
+        // the operator is editing, so `k` falls through to the global
+        // QSO-abort here too (PAN-21 round-1 remediation).
         if app.show_health {
+            // PAN-89: the readiness section can outgrow the panel, so it
+            // scrolls; clamped against the real terminal size like the `?`
+            // overlay (80×24 in unit tests, which have no terminal).
+            let viewport = self
+                .terminal
+                .as_ref()
+                .and_then(|t| t.size().ok())
+                .map(|s| Rect::new(0, 0, s.width, s.height))
+                .unwrap_or(Rect::new(0, 0, crate::ui::MIN_TERMINAL_WIDTH, 24));
+            let (max_scroll, page) = crate::ui::health_panel_scroll_bounds(viewport, &app);
+            app.health_scroll = app.health_scroll.min(max_scroll);
             match key.code {
                 KeyCode::Esc | KeyCode::Char('S') => {
                     app.show_health = false;
                 }
+                KeyCode::Up => app.health_scroll = app.health_scroll.saturating_sub(1),
+                KeyCode::Down => {
+                    app.health_scroll = app.health_scroll.saturating_add(1).min(max_scroll)
+                }
+                KeyCode::PageUp => app.health_scroll = app.health_scroll.saturating_sub(page),
+                KeyCode::PageDown => {
+                    app.health_scroll = app.health_scroll.saturating_add(page).min(max_scroll)
+                }
+                KeyCode::Home => app.health_scroll = 0,
+                KeyCode::End => app.health_scroll = max_scroll,
                 // Bare `k` only — see the modifier-guard comment on the
                 // global abort handler below for why.
                 KeyCode::Char('k') if key.modifiers.is_empty() => {
@@ -1617,6 +1647,24 @@ impl TuiRunner {
             KeyCode::Esc if app.zoomed => {
                 app.zoomed = false;
                 app.status_message = "Zoom cleared".to_string();
+            }
+
+            // PAN-89: acknowledge every visible yellow readiness warning (and
+            // sticky alert). Red blockers can't be acknowledged — they clear
+            // only when resolved. Not a TX key, so no Ctrl/Alt guard (PAN-112:
+            // crossterm sets SHIFT on `!`, so match the char alone).
+            KeyCode::Char('!') => {
+                let acknowledged = app.acknowledge_readiness();
+                let anything_visible = crate::readiness::readiness_items(&app)
+                    .iter()
+                    .any(|i| i.is_visible());
+                app.status_message = if acknowledged > 0 {
+                    format!("Acknowledged {acknowledged} warning(s) — Shift+S lists them")
+                } else if anything_visible {
+                    "Nothing to acknowledge — red items clear when resolved".to_string()
+                } else {
+                    "Nothing to acknowledge".to_string()
+                };
             }
 
             // Panel navigation
@@ -1842,6 +1890,7 @@ impl TuiRunner {
             // so health uses S.
             KeyCode::Char('S') => {
                 app.show_health = true;
+                app.health_scroll = 0;
             }
             // Shift+R — toggle the Recent-QSOs panel (retained terminal-QSO
             // outcome history: what happened to my last N QSOs). Lowercase
@@ -3123,6 +3172,230 @@ mod key_tests {
 
     fn key_shift(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT)
+    }
+
+    // ---- PAN-89: readiness strip ------------------------------------------
+
+    fn pan89_decode(i: usize) -> crate::app::DecodedMessageView {
+        crate::app::DecodedMessageView {
+            timestamp: chrono::Utc::now(),
+            frequency: 14_074_000.0,
+            mode: "FT8".to_string(),
+            snr: -10,
+            delta_time: 0.0,
+            delta_freq: 1500.0,
+            call_sign: Some(format!("K{i}ABC")),
+            grid_square: None,
+            message: format!("CQ K{i}ABC FN42"),
+            distance: None,
+            bearing: None,
+            slot_parity: None,
+            is_directed_at_us: false,
+            worked_before: false,
+            needed: false,
+            atno: false,
+            band_needed: false,
+            priority_score: None,
+            is_own_tx: false,
+        }
+    }
+
+    async fn pan89_decode_burst(r: &mut TuiRunner, n: usize) {
+        for i in 0..n {
+            r.handle_message(TuiMessage::DecodedMessage(pan89_decode(i)))
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Row 1 (the readiness strip) of a full 120x40 render.
+    async fn pan89_strip_row(app: &Arc<RwLock<App>>) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+        let app = app.read().await;
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &app).unwrap()).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.width)
+            .map(|x| buf[(x, 1)].symbol().chars().next().unwrap_or(' '))
+            .collect()
+    }
+
+    fn pan89_readiness(
+        causes: &[crate::readiness::TxMuteCause],
+        clock: crate::readiness::ClockState,
+        ptt_off_unconfirmed: bool,
+    ) -> TuiMessage {
+        TuiMessage::StationReadiness(crate::readiness::StationReadiness {
+            tx_mute_causes: causes.to_vec(),
+            ptt_off_unconfirmed,
+            clock,
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn station_readiness_message_sets_app_field() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        assert!(app.read().await.station_readiness.is_none());
+        r.handle_message(pan89_readiness(
+            &[crate::readiness::TxMuteCause::RigDisconnected],
+            crate::readiness::ClockState::InSpec,
+            false,
+        ))
+        .await
+        .unwrap();
+        let app = app.read().await;
+        let readiness = app.station_readiness.as_ref().expect("snapshot stored");
+        assert_eq!(
+            readiness.tx_mute_causes,
+            vec![crate::readiness::TxMuteCause::RigDisconnected]
+        );
+    }
+
+    #[tokio::test]
+    async fn bang_acknowledges_visible_warnings_at_main_view() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        r.handle_message(pan89_readiness(
+            &[],
+            crate::readiness::ClockState::Unreachable,
+            false,
+        ))
+        .await
+        .unwrap();
+        r.handle_key_event(key_shift('!')).await.unwrap();
+        let app = app.read().await;
+        assert_eq!(
+            app.status_message,
+            "Acknowledged 1 warning(s) — Shift+S lists them"
+        );
+        assert!(app
+            .acknowledged_readiness
+            .contains(&crate::readiness::ReadinessKey::ClockUnverified));
+    }
+
+    #[tokio::test]
+    async fn bang_with_only_blockers_reports_nothing_to_acknowledge() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        r.handle_message(pan89_readiness(
+            &[crate::readiness::TxMuteCause::RigDisconnected],
+            crate::readiness::ClockState::InSpec,
+            true,
+        ))
+        .await
+        .unwrap();
+        r.handle_key_event(key('!')).await.unwrap();
+        let app = app.read().await;
+        assert_eq!(
+            app.status_message,
+            "Nothing to acknowledge — red items clear when resolved"
+        );
+        assert!(app.acknowledged_readiness.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bang_is_inert_while_help_overlay_is_open() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        r.handle_message(pan89_readiness(
+            &[],
+            crate::readiness::ClockState::Unreachable,
+            false,
+        ))
+        .await
+        .unwrap();
+        app.write().await.help_visible = true;
+        r.handle_key_event(key_shift('!')).await.unwrap();
+        let app = app.read().await;
+        assert!(app.acknowledged_readiness.is_empty());
+        assert!(!app.status_message.contains("cknowledge"));
+    }
+
+    /// Gherkin Scenario 1: a durable blocker survives incoming decode
+    /// traffic until it is resolved (warnings: or acknowledged).
+    #[tokio::test]
+    async fn pan89_scenario1_blocker_survives_decode_burst_until_resolved() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        r.handle_message(pan89_readiness(
+            &[crate::readiness::TxMuteCause::RigDisconnected],
+            crate::readiness::ClockState::Unreachable,
+            false,
+        ))
+        .await
+        .unwrap();
+        pan89_decode_burst(&mut r, 50).await;
+        let row = pan89_strip_row(&app).await;
+        assert!(row.contains("RIG CAT LINK LOST"), "row 1: {row}");
+        assert!(row.contains("CLOCK UNVERIFIED"), "row 1: {row}");
+
+        r.handle_key_event(key_shift('!')).await.unwrap();
+        pan89_decode_burst(&mut r, 10).await;
+        let row = pan89_strip_row(&app).await;
+        assert!(row.contains("RIG CAT LINK LOST"), "row 1: {row}");
+        assert!(!row.contains("CLOCK UNVERIFIED"), "row 1: {row}");
+        assert!(row.contains("1 ack'd"), "row 1: {row}");
+
+        r.handle_message(pan89_readiness(
+            &[],
+            crate::readiness::ClockState::InSpec,
+            false,
+        ))
+        .await
+        .unwrap();
+        let row = pan89_strip_row(&app).await;
+        assert!(row.contains("✓ TX READY"), "row 1: {row}");
+        assert!(!row.contains("RIG CAT LINK LOST"), "row 1: {row}");
+    }
+
+    /// Gherkin Scenario 2: a failed PTT-off is a standing warning `!` can't
+    /// hide, and it clears only when the coordinator reports PTT confirmed off.
+    #[tokio::test]
+    async fn pan89_scenario2_ptt_warning_persists_until_cleared() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        r.handle_message(pan89_readiness(
+            &[crate::readiness::TxMuteCause::RigRestarting],
+            crate::readiness::ClockState::InSpec,
+            true,
+        ))
+        .await
+        .unwrap();
+        pan89_decode_burst(&mut r, 50).await;
+        r.handle_key_event(key_shift('!')).await.unwrap();
+        let row = pan89_strip_row(&app).await;
+        assert!(
+            row.contains("PTT MAY STILL BE KEYED — check radio"),
+            "row 1: {row}"
+        );
+        assert!(row.contains("TX HELD"), "row 1: {row}");
+
+        r.handle_message(TuiMessage::StationReadiness(
+            crate::readiness::StationReadiness {
+                ptt_off_unconfirmed: false,
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap();
+        let row = pan89_strip_row(&app).await;
+        assert!(!row.contains("PTT MAY STILL BE KEYED"), "row 1: {row}");
+    }
+
+    #[tokio::test]
+    async fn pan89_error_alert_survives_decode_burst_until_acknowledged() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        r.handle_message(TuiMessage::Error {
+            component: "Hamlib".to_string(),
+            message: "Rig connect failed (connection refused)".to_string(),
+        })
+        .await
+        .unwrap();
+        pan89_decode_burst(&mut r, 50).await;
+        let row = pan89_strip_row(&app).await;
+        assert!(row.contains("Rig connect failed"), "row 1: {row}");
+        assert!(row.contains("! ack"), "row 1: {row}");
+
+        r.handle_key_event(key_shift('!')).await.unwrap();
+        let row = pan89_strip_row(&app).await;
+        assert!(!row.contains("Rig connect failed"), "row 1: {row}");
+        assert!(row.contains("1 ack'd"), "row 1: {row}");
     }
 
     /// crossterm reports Ctrl+<letter> as the SAME `KeyCode::Char(<letter>)`
@@ -4990,6 +5263,59 @@ mod key_tests {
             Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
         ));
         assert!(app.read().await.show_health, "overlay stays open");
+    }
+
+    /// PAN-89 (Codex P2 on PR #420): Shift+S scrolls when its readiness
+    /// section outgrows the panel; keys clamp like the `?` overlay's and a
+    /// reopen starts from the top.
+    #[tokio::test]
+    async fn health_panel_scroll_keys_are_clamped_and_reset_on_reopen() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        let special = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        {
+            let mut a = app.write().await;
+            a.station_readiness = Some(crate::readiness::StationReadiness {
+                ptt_off_unconfirmed: true,
+                clock: crate::readiness::ClockState::Unreachable,
+                tx_mute_causes: vec![crate::readiness::TxMuteCause::RigDisconnected],
+                ..Default::default()
+            });
+            a.tx_output_default = true;
+            a.input_fallback = true;
+            for i in 0..3 {
+                a.add_error_message(format!("config warning {i}"));
+            }
+        }
+        let (max_scroll, page) =
+            crate::ui::health_panel_scroll_bounds(Rect::new(0, 0, 80, 24), &*app.read().await);
+        assert!(max_scroll > 0, "80x24 can't fit eight items");
+
+        r.handle_key_event(key('S')).await.unwrap();
+        assert!(app.read().await.show_health);
+        assert_eq!(app.read().await.health_scroll, 0);
+
+        r.handle_key_event(special(KeyCode::Down)).await.unwrap();
+        assert_eq!(app.read().await.health_scroll, 1);
+        r.handle_key_event(special(KeyCode::End)).await.unwrap();
+        assert_eq!(app.read().await.health_scroll, max_scroll);
+        r.handle_key_event(special(KeyCode::Down)).await.unwrap();
+        assert_eq!(app.read().await.health_scroll, max_scroll, "stays put");
+        r.handle_key_event(special(KeyCode::Up)).await.unwrap();
+        assert_eq!(app.read().await.health_scroll, max_scroll - 1);
+        r.handle_key_event(special(KeyCode::Home)).await.unwrap();
+        assert_eq!(app.read().await.health_scroll, 0);
+        r.handle_key_event(special(KeyCode::PageDown))
+            .await
+            .unwrap();
+        assert_eq!(app.read().await.health_scroll, page.min(max_scroll));
+        r.handle_key_event(special(KeyCode::PageUp)).await.unwrap();
+        assert_eq!(app.read().await.health_scroll, 0);
+
+        r.handle_key_event(special(KeyCode::End)).await.unwrap();
+        r.handle_key_event(special(KeyCode::Esc)).await.unwrap();
+        assert!(!app.read().await.show_health);
+        r.handle_key_event(key('S')).await.unwrap();
+        assert_eq!(app.read().await.health_scroll, 0, "reopen resets scroll");
     }
 
     /// PAN-24 (Codex round-2 P2 on PR #252): the help overlay (`?`) is the
