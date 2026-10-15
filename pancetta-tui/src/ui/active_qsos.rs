@@ -374,10 +374,11 @@ mod tests {
         term.draw(|f| crate::ui::draw(f, &app).unwrap()).unwrap();
         let buf = term.backend().buffer();
         let row0: String = (0..buf.area.width)
-            .map(|x| buf[(x, 1)].symbol().chars().next().unwrap_or(' '))
+            .map(|x| buf[(x, 2)].symbol().chars().next().unwrap_or(' '))
             .collect();
-        // Row 1 is the active-QSO banner (row 0 is the title bar) in Monitor
-        // view's layout (`compute_monitor_rects`).
+        // Row 2 is the active-QSO banner (row 0 is the title bar, row 1 the
+        // PAN-89 readiness strip) in Monitor view's layout
+        // (`compute_monitor_rects`).
         assert!(
             row0.contains('▶'),
             "Monitor view's banner must mark the selected QSO: {row0}"
