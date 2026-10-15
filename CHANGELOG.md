@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `pancetta import <FILE> [--dry-run]` (PAN-127): bring an existing ADIF
+  log from WSJT-X, N1MM, LoTW, QRZ or another logger into Pancetta. New
+  contacts are appended to `~/.pancetta/qsos.adi` with every field kept as
+  written and indexed into `qso.db`, so `pancetta export` and the next
+  start's worked-station history include them. A contact already in your
+  logbook (same callsign, band and mode, starting within 30 minutes) or
+  repeated in the file is skipped, so re-running an import adds nothing.
+  Records that cannot be read are listed by position and callsign, and the
+  rest still import. The logbook is copied to `qsos.adi.bak` (or the next
+  free `.bak.N`) and the copy checked before anything is written; the output
+  names it and prints the undo steps. `--dry-run` shows the result and
+  changes nothing. Imported contacts are never uploaded.
+
 - Readiness strip (PAN-89): row 1 of every view now answers "can I transmit,
   and what's blocking it?" with a TX verdict chip (`✓ TX READY`, `✗ TX HELD`,
   `■ RX ONLY`, `◌ TX WAIT`, `⚠ TX OPEN`) and one chip per active condition.
@@ -101,6 +114,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Fixed
+
+- Startup no longer wipes a legacy `qso.db` that has no `qsos.adi` beside
+  it: it moves those contacts into `qsos.adi` as intended (PAN-127). A
+  `qso.db` that is missing while `qsos.adi` exists is now rebuilt from it,
+  so deleting `qso.db` really does rebuild the index at the next start.
+
+- The ADIF reader no longer drops or merges records in headerless files or
+  files with several records on one line, accepts `HHMM` times, and no
+  longer loses the field after a non-ASCII value (PAN-127). One malformed
+  record no longer hides the others when importing.
 
 - `max_concurrent_qsos` now also limits QSOs you open by hand (PAN-78). With
   the default of 1, calling a second station while a QSO is waiting for a

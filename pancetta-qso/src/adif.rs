@@ -109,6 +109,21 @@ pub struct AdifFile {
     pub records: Vec<AdifRecord>,
 }
 
+/// One record that could not be read, with its CALL when that field parsed.
+#[derive(Debug)]
+pub struct AdifRecordError {
+    pub error: AdifError,
+    pub call: Option<String>,
+}
+
+/// Every record in an ADIF file, each parsed on its own (PAN-127), so one
+/// malformed record no longer hides the records around it.
+#[derive(Debug)]
+pub struct AdifParse {
+    pub header: AdifHeader,
+    pub records: Vec<Result<AdifRecord, AdifRecordError>>,
+}
+
 /// ADIF file header
 #[derive(Debug, Clone, Default)]
 pub struct AdifHeader {
@@ -326,52 +341,95 @@ impl AdifProcessor {
         self
     }
 
-    /// Parse ADIF data from a string
-    pub fn parse_string(&self, data: &str) -> Result<AdifFile, AdifError> {
-        let lines = data.lines().enumerate();
-        let mut header_fields = HashMap::new();
+    /// Tag tokenizer over the raw bytes (PAN-127): line breaks carry no
+    /// meaning, a file with no `<EOH>` is all records, and `<EOH>` only counts
+    /// before the first record (any free text before it is ignored). Each
+    /// record is parsed on its own, so one malformed record is reported in
+    /// place and the records around it still read. Input that is not UTF-8
+    /// is read as Latin-1.
+    pub fn parse_bytes(&self, data: &[u8]) -> AdifParse {
+        let text = std::str::from_utf8(data).ok(); // None ⇒ decode as Latin-1
+        let mut header_fields: Option<HashMap<String, AdifField>> = None;
         let mut records = Vec::new();
-        let mut in_header = true;
+        let mut fields = HashMap::new();
+        let mut error: Option<AdifError> = None;
+        let mut pos = 0;
 
-        // Parse header
-        let mut header_buffer = String::new();
-        let mut record_buffer = String::new();
+        while let Some((open, close)) = next_tag(data, pos) {
+            let spec = decode(data, text, open + 1, close);
+            pos = close + 1;
 
-        for (line_num, line) in lines {
-            let line = line.trim();
-
-            if line.is_empty() {
+            if spec.eq_ignore_ascii_case("EOH") {
+                // The header holds nothing records need, so its field errors
+                // are dropped rather than reported against a record.
+                if records.is_empty() && header_fields.is_none() {
+                    header_fields = Some(std::mem::take(&mut fields));
+                    error = None;
+                }
+                continue;
+            }
+            if spec.eq_ignore_ascii_case("EOR") {
+                push_record(&mut records, &mut fields, &mut error);
+                continue;
+            }
+            if spec.is_empty() {
                 continue;
             }
 
-            if in_header {
-                header_buffer.push_str(line);
-                header_buffer.push(' ');
-
-                if line.to_uppercase().contains("<EOH>") {
-                    in_header = false;
-                    header_fields = self.parse_header_fields(&header_buffer, line_num + 1)?;
-                    header_buffer.clear();
+            let mut parts = spec.split(':');
+            let name = parts.next().unwrap_or_default().to_uppercase();
+            let length = match parts.next().map(str::parse::<usize>) {
+                None => 0,
+                Some(Ok(length)) => length,
+                Some(Err(_)) => {
+                    // First error wins; the text up to the next tag is skipped.
+                    error.get_or_insert(AdifError::InvalidField {
+                        field: spec.clone(),
+                    });
+                    continue;
                 }
-            } else {
-                record_buffer.push_str(line);
-                record_buffer.push(' ');
+            };
+            let data_type = parts.next().map(str::to_string);
 
-                if line.to_uppercase().contains("<EOR>") {
-                    let record = self.parse_record(&record_buffer, line_num + 1)?;
-                    records.push(record);
-                    record_buffer.clear();
-                }
-            }
+            let (value, end) = read_value(data, text, pos, length);
+            pos = end;
+            fields.insert(
+                name.clone(),
+                AdifField {
+                    name,
+                    value,
+                    length,
+                    data_type,
+                },
+            );
         }
 
-        // Handle any remaining record data
-        if !record_buffer.trim().is_empty() {
-            let record = self.parse_record(&record_buffer, data.lines().count())?;
-            records.push(record);
-        }
+        // A trailing record with no <EOR> still counts.
+        push_record(&mut records, &mut fields, &mut error);
 
-        let header = AdifHeader {
+        AdifParse {
+            header: self.header_from_fields(header_fields.unwrap_or_default()),
+            records,
+        }
+    }
+
+    /// Parse ADIF data from a string. Fails on the first record that cannot
+    /// be read; use [`Self::parse_bytes`] to read every record on its own.
+    pub fn parse_string(&self, data: &str) -> Result<AdifFile, AdifError> {
+        let parsed = self.parse_bytes(data.as_bytes());
+        let records = parsed
+            .records
+            .into_iter()
+            .map(|r| r.map_err(|e| e.error))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(AdifFile {
+            header: parsed.header,
+            records,
+        })
+    }
+
+    fn header_from_fields(&self, header_fields: HashMap<String, AdifField>) -> AdifHeader {
+        AdifHeader {
             version: header_fields
                 .get("ADIF_VER")
                 .map(|f| f.value.clone())
@@ -389,9 +447,7 @@ impl AdifProcessor {
                 .and_then(|f| self.parse_datetime(&f.value).ok())
                 .unwrap_or_else(Utc::now),
             fields: header_fields,
-        };
-
-        Ok(AdifFile { header, records })
+        }
     }
 
     /// Parse ADIF data from a reader
@@ -826,103 +882,6 @@ impl AdifProcessor {
         }
     }
 
-    fn parse_header_fields(
-        &self,
-        header: &str,
-        line_num: usize,
-    ) -> Result<HashMap<String, AdifField>, AdifError> {
-        self.parse_fields(header, line_num)
-    }
-
-    fn parse_record(&self, record: &str, line_num: usize) -> Result<AdifRecord, AdifError> {
-        let fields = self.parse_fields(record, line_num)?;
-        Ok(AdifRecord { fields })
-    }
-
-    fn parse_fields(
-        &self,
-        data: &str,
-        line_num: usize,
-    ) -> Result<HashMap<String, AdifField>, AdifError> {
-        let mut fields = HashMap::new();
-        let mut chars = data.chars().peekable();
-
-        while let Some(ch) = chars.next() {
-            if ch == '<' {
-                // Parse field
-                let mut field_spec = String::new();
-
-                for ch in chars.by_ref() {
-                    if ch == '>' {
-                        break;
-                    }
-                    field_spec.push(ch);
-                }
-
-                if field_spec.is_empty() {
-                    continue;
-                }
-
-                // Skip end-of-header and end-of-record markers
-                if field_spec.to_uppercase() == "EOH" || field_spec.to_uppercase() == "EOR" {
-                    continue;
-                }
-
-                let field = self.parse_field_spec(&field_spec, &mut chars, line_num)?;
-                fields.insert(field.name.to_uppercase(), field);
-            }
-        }
-
-        Ok(fields)
-    }
-
-    fn parse_field_spec(
-        &self,
-        field_spec: &str,
-        chars: &mut std::iter::Peekable<std::str::Chars>,
-        _line_num: usize,
-    ) -> Result<AdifField, AdifError> {
-        let parts: Vec<&str> = field_spec.split(':').collect();
-
-        if parts.is_empty() {
-            return Err(AdifError::InvalidField {
-                field: field_spec.to_string(),
-            });
-        }
-
-        let name = parts[0].to_uppercase();
-        let length: usize = if parts.len() > 1 {
-            parts[1].parse().map_err(|_| AdifError::InvalidField {
-                field: field_spec.to_string(),
-            })?
-        } else {
-            0
-        };
-
-        let data_type = if parts.len() > 2 {
-            Some(parts[2].to_string())
-        } else {
-            None
-        };
-
-        // Read field value
-        let mut value = String::new();
-        for _ in 0..length {
-            if let Some(ch) = chars.next() {
-                value.push(ch);
-            } else {
-                break;
-            }
-        }
-
-        Ok(AdifField {
-            name,
-            value,
-            length,
-            data_type,
-        })
-    }
-
     fn format_field(&self, name: &str, value: &str) -> Result<String, AdifError> {
         if value.is_empty() {
             return Ok(String::new());
@@ -955,6 +914,7 @@ impl AdifProcessor {
         let date = self.get_required_field(record, "QSO_DATE")?;
         let time = self
             .get_field_value(record, "TIME_ON")
+            .map(seconds_if_missing)
             .unwrap_or_else(|| "000000".to_string());
 
         let datetime_str = format!("{} {}", date, time);
@@ -970,6 +930,7 @@ impl AdifProcessor {
         if let Some(date) = self.get_field_value(record, date_field) {
             let time = self
                 .get_field_value(record, time_field)
+                .map(seconds_if_missing)
                 .unwrap_or_else(|| "000000".to_string());
             let datetime_str = format!("{} {}", date, time);
             Ok(Some(self.parse_datetime(&datetime_str)?))
@@ -1092,6 +1053,125 @@ impl AdifProcessor {
         out.push_str("<EOR>\n\n");
         Ok(out)
     }
+
+    /// Render `record` with every field as given: an imported contact keeps its
+    /// own QSL status, comments and APP_ fields, and nothing pancetta-specific is
+    /// added. CALL, QSO_DATE, TIME_ON first, then the rest by name. Empty values
+    /// are left out, as [`Self::generate_record`] does. Ends with `<EOR>\n\n`.
+    pub fn render_record(&self, record: &AdifRecord) -> Result<String, AdifError> {
+        const FIRST: [&str; 3] = ["CALL", "QSO_DATE", "TIME_ON"];
+        let mut rest: Vec<(&String, &AdifField)> = record
+            .fields
+            .iter()
+            .filter(|(name, _)| !FIRST.contains(&name.as_str()))
+            .collect();
+        rest.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut out = String::new();
+        for name in FIRST {
+            if let Some(field) = record.fields.get(name) {
+                out.push_str(&self.format_field(name, &field.value)?);
+            }
+        }
+        for (name, field) in rest {
+            out.push_str(&self.format_field(name, &field.value)?);
+        }
+        out.push_str("<EOR>\n\n");
+        Ok(out)
+    }
+}
+
+/// ADIF allows `HHMM` as well as `HHMMSS`; read `HHMM` as `HHMM00`.
+fn seconds_if_missing(time: String) -> String {
+    if time.len() == 4 && time.bytes().all(|b| b.is_ascii_digit()) {
+        time + "00"
+    } else {
+        time
+    }
+}
+
+/// The next `<…>` tag at or after `from`, as the byte positions of its `<`
+/// and `>`. A `<` inside a tag starts the tag over, so stray text such as
+/// `a<b` never swallows the tag that follows it.
+fn next_tag(data: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut open = from + data.get(from..)?.iter().position(|&b| b == b'<')?;
+    let mut at = open + 1;
+    loop {
+        match data.get(at)? {
+            b'>' => return Some((open, at)),
+            b'<' => open = at,
+            _ => {}
+        }
+        at += 1;
+    }
+}
+
+/// `data[start..end]` as text; both ends sit on ASCII bytes (`<`, `>`), so
+/// they are always char boundaries of `text`.
+fn decode(data: &[u8], text: Option<&str>, start: usize, end: usize) -> String {
+    match text {
+        Some(text) => text[start..end].to_string(),
+        None => data[start..end].iter().map(|&b| b as char).collect(),
+    }
+}
+
+/// Close the record being read: its fields, or its first error together with
+/// its CALL when that field parsed. A record with neither is skipped.
+fn push_record(
+    records: &mut Vec<Result<AdifRecord, AdifRecordError>>,
+    fields: &mut HashMap<String, AdifField>,
+    error: &mut Option<AdifError>,
+) {
+    let fields = std::mem::take(fields);
+    match error.take() {
+        Some(error) => {
+            let call = fields
+                .get("CALL")
+                .map(|f| f.value.trim().to_string())
+                .filter(|call| !call.is_empty());
+            records.push(Err(AdifRecordError { error, call }));
+        }
+        None if fields.is_empty() => {}
+        None => records.push(Ok(AdifRecord { fields })),
+    }
+}
+
+/// ADIF counts a value's length in characters, but pancetta (and most C/Python
+/// writers) count bytes. Cut at the byte count unless only the character count
+/// lands just before the next tag. Non-UTF-8 input is Latin-1: one byte, one char.
+fn read_value(data: &[u8], text: Option<&str>, start: usize, len: usize) -> (String, usize) {
+    let byte_end = start.saturating_add(len).min(data.len());
+    let Some(text) = text else {
+        return (
+            data[start..byte_end].iter().map(|&b| b as char).collect(),
+            byte_end,
+        );
+    };
+    if data[start..byte_end].is_ascii() {
+        return (text[start..byte_end].to_string(), byte_end);
+    }
+    // A byte count can land inside a character: round up to the next boundary.
+    let byte_cut = (byte_end..=text.len())
+        .find(|&i| text.is_char_boundary(i))
+        .unwrap_or(text.len());
+    let char_cut = text[start..]
+        .char_indices()
+        .nth(len)
+        .map_or(text.len(), |(i, _)| start + i);
+    let end = if before_tag(data, byte_cut) || !before_tag(data, char_cut) {
+        byte_cut
+    } else {
+        char_cut
+    };
+    (text[start..end].to_string(), end)
+}
+
+/// True when only whitespace separates `at` from the next `<` (or the end).
+fn before_tag(data: &[u8], at: usize) -> bool {
+    data[at..]
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_none_or(|&b| b == b'<')
 }
 
 impl Default for AdifProcessor {
@@ -1489,8 +1569,6 @@ ADIF Export for Test Program
 
     #[test]
     fn adif_import_carries_state_into_metadata() {
-        // The header terminator matters: `parse_string` yields zero records
-        // without an `<EOH>`.
         let adif_data = "Pancetta state import test\n\
             <ADIF_VER:5>3.1.4 <PROGRAMID:8>pancetta\n\
             <EOH>\n\
@@ -1538,5 +1616,318 @@ ADIF Export for Test Program
 
         let record = processor.qso_to_record(&adif_qso);
         assert!(!record.fields.contains_key("STATE"));
+    }
+
+    // ── PAN-127: reading files other loggers write ──────────────────────────
+
+    fn ok_calls(parsed: &AdifParse) -> Vec<&str> {
+        parsed
+            .records
+            .iter()
+            .map(|r| {
+                r.as_ref().expect("record parses").fields["CALL"]
+                    .value
+                    .as_str()
+            })
+            .collect()
+    }
+
+    fn only_record(parsed: &AdifParse) -> &AdifRecord {
+        assert_eq!(parsed.records.len(), 1, "{:?}", parsed.records);
+        parsed.records[0].as_ref().expect("record parses")
+    }
+
+    #[test]
+    fn parse_bytes_reads_a_headerless_file() {
+        let adif = "<CALL:4>W1AW <QSO_DATE:8>20240101 <TIME_ON:6>120000 <EOR>\n\
+                    <CALL:5>K1ABC <QSO_DATE:8>20240101 <TIME_ON:6>121500 <EOR>\n";
+
+        let parsed = AdifProcessor::new().parse_bytes(adif.as_bytes());
+
+        assert_eq!(ok_calls(&parsed), ["W1AW", "K1ABC"]);
+    }
+
+    #[test]
+    fn parse_bytes_reads_header_and_records_on_one_line() {
+        let adif = "x<ADIF_VER:5>3.1.4<EOH><CALL:4>W1AW<QSO_DATE:8>20240101<EOR>\
+                    <CALL:5>K1ABC<QSO_DATE:8>20240101<EOR>";
+
+        let parsed = AdifProcessor::new().parse_bytes(adif.as_bytes());
+
+        assert_eq!(parsed.header.version, "3.1.4");
+        assert_eq!(ok_calls(&parsed), ["W1AW", "K1ABC"]);
+    }
+
+    #[test]
+    fn parse_bytes_splits_two_records_on_one_line() {
+        let adif = "WSJT-X ADIF Export\n<adif_ver:5>3.1.0\n<eoh>\n\
+                    <call:4>W1AW <qso_date:8>20240101 <time_on:6>120000 <eor> \
+                    <call:5>K1ABC <qso_date:8>20240101 <time_on:6>121500 <eor>\n";
+
+        let parsed = AdifProcessor::new().parse_bytes(adif.as_bytes());
+
+        assert_eq!(ok_calls(&parsed), ["W1AW", "K1ABC"]);
+    }
+
+    #[test]
+    fn parse_bytes_keeps_a_multiline_value_verbatim() {
+        let adif = "<CALL:4>W1AW <NOTES:11>line1\nline2 <EOR>\n";
+
+        let parsed = AdifProcessor::new().parse_bytes(adif.as_bytes());
+
+        assert_eq!(only_record(&parsed).fields["NOTES"].value, "line1\nline2");
+    }
+
+    #[test]
+    fn parse_bytes_isolates_a_malformed_record() {
+        let adif = "<EOH>\n\
+                    <CALL:4>W1AW <QSO_DATE:8>20240101 <EOR>\n\
+                    <CALL:x>K1ABC <QSO_DATE:8>20240101 <EOR>\n\
+                    <CALL:5>N0XYZ <QSO_DATE:8>20240101 <EOR>\n";
+
+        let parsed = AdifProcessor::new().parse_bytes(adif.as_bytes());
+
+        assert_eq!(parsed.records.len(), 3, "{:?}", parsed.records);
+        assert_eq!(
+            parsed.records[0].as_ref().unwrap().fields["CALL"].value,
+            "W1AW"
+        );
+        match &parsed.records[1] {
+            Err(AdifRecordError {
+                error: AdifError::InvalidField { field },
+                call: None,
+            }) => assert_eq!(field, "CALL:x"),
+            other => panic!("expected InvalidField(CALL:x) with no call, got {other:?}"),
+        }
+        assert_eq!(
+            parsed.records[2].as_ref().unwrap().fields["CALL"].value,
+            "N0XYZ"
+        );
+    }
+
+    #[test]
+    fn parse_bytes_reports_the_call_of_a_malformed_record() {
+        let adif = "<CALL:5>K1ABC <TX_PWR:x>5 <QSO_DATE:8>20240101 <EOR>\n";
+
+        let parsed = AdifProcessor::new().parse_bytes(adif.as_bytes());
+
+        assert_eq!(parsed.records.len(), 1);
+        match &parsed.records[0] {
+            Err(AdifRecordError {
+                error: AdifError::InvalidField { field },
+                call,
+            }) => {
+                assert_eq!(field, "TX_PWR:x");
+                assert_eq!(call.as_deref(), Some("K1ABC"));
+            }
+            other => panic!("expected InvalidField(TX_PWR:x), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_string_still_fails_on_a_malformed_record() {
+        let adif = "<EOH>\n\
+                    <CALL:4>W1AW <QSO_DATE:8>20240101 <EOR>\n\
+                    <CALL:x>K1ABC <QSO_DATE:8>20240101 <EOR>\n";
+
+        match AdifProcessor::new().parse_string(adif) {
+            Err(AdifError::InvalidField { field }) => assert_eq!(field, "CALL:x"),
+            other => panic!("expected InvalidField(CALL:x), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_bytes_skips_empty_records() {
+        let adif = "<CALL:4>W1AW <EOR><EOR>\n<EOR> <CALL:5>K1ABC <EOR>\n<eor>";
+
+        let parsed = AdifProcessor::new().parse_bytes(adif.as_bytes());
+
+        assert_eq!(ok_calls(&parsed), ["W1AW", "K1ABC"]);
+    }
+
+    #[test]
+    fn record_to_qso_accepts_four_digit_times() {
+        let adif = "<CALL:4>W1AW <QSO_DATE:8>20240101 <TIME_ON:4>1230 \
+                    <QSO_DATE_OFF:8>20240101 <TIME_OFF:4>1231 <EOR>\n";
+        let processor = AdifProcessor::new();
+        let parsed = processor.parse_bytes(adif.as_bytes());
+
+        let qso = processor.record_to_qso(only_record(&parsed)).unwrap();
+
+        assert_eq!(
+            qso.qso_date,
+            Utc.with_ymd_and_hms(2024, 1, 1, 12, 30, 0).unwrap()
+        );
+        assert_eq!(
+            qso.qso_date_off,
+            Some(Utc.with_ymd_and_hms(2024, 1, 1, 12, 31, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn parse_bytes_reads_byte_counted_utf8_values() {
+        // Byte counts, as pancetta's own `format_field` writes them.
+        let adif = "<CALL:4>W1AW <NAME:7>Müñoz <QTH:7>Zürich <EOR>\n";
+
+        let parsed = AdifProcessor::new().parse_bytes(adif.as_bytes());
+
+        let record = only_record(&parsed);
+        assert_eq!(record.fields["NAME"].value, "Müñoz");
+        assert_eq!(record.fields["QTH"].value, "Zürich");
+    }
+
+    #[test]
+    fn parse_bytes_reads_character_counted_utf8_values() {
+        // Character counts, as the ADIF spec (and WSJT-X-family writers) count.
+        let adif = "<CALL:4>W1AW <NAME:5>Müñoz <QTH:6>Zürich <EOR>\n";
+
+        let parsed = AdifProcessor::new().parse_bytes(adif.as_bytes());
+
+        let record = only_record(&parsed);
+        assert_eq!(record.fields["NAME"].value, "Müñoz");
+        assert_eq!(record.fields["QTH"].value, "Zürich");
+    }
+
+    #[test]
+    fn parse_bytes_decodes_latin1_values() {
+        let adif = b"<CALL:4>W1AW <NAME:4>Jos\xe9 <EOR>\n";
+
+        let parsed = AdifProcessor::new().parse_bytes(adif);
+
+        let record = only_record(&parsed);
+        assert_eq!(record.fields["CALL"].value, "W1AW");
+        assert_eq!(record.fields["NAME"].value, "José");
+    }
+
+    #[test]
+    fn render_record_puts_call_date_time_first_then_sorted() {
+        let processor = AdifProcessor::new();
+        let parsed = processor.parse_bytes(
+            b"<MODE:3>FT8 <time_on:6>120000 <BAND:3>20M <APP_X:1>y \
+              <QSO_DATE:8>20240101 <CALL:4>W1AW <COMMENT:0> <EOR>",
+        );
+
+        let rendered = processor.render_record(only_record(&parsed)).unwrap();
+
+        assert_eq!(
+            rendered,
+            "<CALL:4>W1AW <QSO_DATE:8>20240101 <TIME_ON:6>120000 \
+             <APP_X:1>y <BAND:3>20M <MODE:3>FT8 <EOR>\n\n"
+        );
+    }
+
+    /// The (name, value) pairs of `record`, without empty values.
+    fn field_map(record: &AdifRecord) -> std::collections::BTreeMap<String, String> {
+        record
+            .fields
+            .iter()
+            .filter(|(_, f)| !f.value.is_empty())
+            .map(|(name, f)| (name.clone(), f.value.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn render_record_round_trips_through_parse_string() {
+        let processor = AdifProcessor::new();
+        let original = "<CALL:4>W1AW <QSO_DATE:8>20240101 <TIME_ON:4>1200 <MODE:4>MFSK \
+                        <SUBMODE:3>FT4 <BAND:3>20m <QSL_RCVD:1>Y <QSL_SENT:1>Y \
+                        <APP_LOTW_QSL_RCVD:1>Y <APP_LOTW_RXQSL:19>2024-01-05 10:11:12 \
+                        <NAME:5>Müñoz <QTH:7>Zürich <NOTES:19>line1 <b>\nline2 >x< \
+                        <COMMENT:9>from N1MM <EOR>\n";
+        let parsed = processor.parse_bytes(original.as_bytes());
+        let record = only_record(&parsed);
+
+        let rendered = processor.render_record(record).unwrap();
+        let reread = processor.parse_string(&rendered).unwrap();
+
+        assert_eq!(reread.records.len(), 1);
+        assert_eq!(field_map(&reread.records[0]), field_map(record));
+        assert_eq!(
+            reread.records[0].fields["NOTES"].value,
+            "line1 <b>\nline2 >x<"
+        );
+        assert_eq!(reread.records[0].fields["NAME"].value, "Müñoz");
+        assert_eq!(reread.records[0].fields["COMMENT"].value, "from N1MM");
+        assert_eq!(reread.records[0].fields["QSL_RCVD"].value, "Y");
+        assert!(processor.record_to_qso(&reread.records[0]).is_ok());
+    }
+
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn value() -> impl Strategy<Value = String> {
+            prop_oneof![
+                any::<String>(),
+                "[<>:\n a-zA-Z0-9üñé€]{1,24}",
+                "(?s).{1,24}",
+            ]
+            .prop_filter("non-empty", |v| !v.is_empty())
+        }
+
+        proptest! {
+            /// Any record pancetta renders reads back with the same fields,
+            /// whatever its values hold (`<`, `>`, line breaks, non-ASCII).
+            #[test]
+            fn render_record_round_trips_any_record(
+                fields in proptest::collection::btree_map("[A-Z_]{1,12}", value(), 1..8)
+            ) {
+                let processor = AdifProcessor::new();
+                let record = AdifRecord {
+                    fields: fields
+                        .iter()
+                        .map(|(name, value)| {
+                            (
+                                name.clone(),
+                                AdifField {
+                                    name: name.clone(),
+                                    value: value.clone(),
+                                    length: value.len(),
+                                    data_type: None,
+                                },
+                            )
+                        })
+                        .collect(),
+                };
+
+                let rendered = processor.render_record(&record).unwrap();
+                let reread = processor.parse_string(&rendered).unwrap();
+
+                prop_assert_eq!(reread.records.len(), 1);
+                prop_assert_eq!(field_map(&reread.records[0]), fields);
+            }
+
+            /// No input, however broken, makes the reader panic.
+            #[test]
+            fn parse_bytes_never_panics(
+                data in prop_oneof![
+                    proptest::collection::vec(any::<u8>(), 0..256),
+                    "[<>:0-9A-Za-z éü€\n]{0,128}".prop_map(String::into_bytes),
+                    proptest::collection::vec(
+                        prop_oneof![
+                            Just(b"<".to_vec()),
+                            Just(b">".to_vec()),
+                            Just(b":".to_vec()),
+                            Just(b"<EOR>".to_vec()),
+                            Just(b"<EOH>".to_vec()),
+                            Just(b"<CALL:".to_vec()),
+                            Just("ü".as_bytes().to_vec()),
+                            Just(vec![0xe9]),
+                            Just(vec![0xc3]),
+                            "[0-9]{1,3}".prop_map(String::into_bytes),
+                            "[A-Z ]{1,4}".prop_map(String::into_bytes),
+                        ],
+                        0..48,
+                    )
+                    .prop_map(|parts| parts.concat()),
+                ]
+            ) {
+                let processor = AdifProcessor::new();
+                let _ = processor.parse_bytes(&data);
+                if let Ok(text) = std::str::from_utf8(&data) {
+                    let _ = processor.parse_string(text);
+                }
+            }
+        }
     }
 }

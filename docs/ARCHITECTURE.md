@@ -182,7 +182,8 @@ periodically by the coordinator from cqdx.io and the QSO log.
 Writes completed QSO records to `~/.pancetta/qsos.adi` in ADIF format. The file is
 append-only and vendor-neutral — it can be imported directly into WSJT-X, N1MM+, LoTW,
 eQSL, or any logging application that accepts ADIF. This file is the durable
-source of truth; back it up.
+source of truth; back it up. `pancetta import` also appends other loggers' records
+through it, verbatim (`append_record`).
 
 ### `AsyncQsoLogger` (pancetta)
 
@@ -194,7 +195,8 @@ async-only via sqlx.
 
 **Migration**: on the first startup after upgrade, if `qso.db` exists but `qsos.adi`
 does not, the coordinator auto-exports all rows from the old database into a fresh ADIF
-file before opening the new logging path.
+file before opening the new logging path. This runs before either writer opens a
+file (PAN-127).
 
 ---
 

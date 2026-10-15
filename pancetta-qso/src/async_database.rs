@@ -3,7 +3,7 @@
 //! This module provides async-safe persistent storage for QSO data using SQLite
 //! through the sqlx library, enabling proper Send/Sync support for tokio spawns.
 
-use crate::adif::{AdifProcessor, AdifQso};
+use crate::adif::{AdifProcessor, AdifQso, AdifRecord};
 use crate::states::*;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -994,9 +994,39 @@ impl QsoDatabase {
             .parse_string(&raw)
             .map_err(|e| AsyncDatabaseError::Replay(format!("ADIF parse failed: {e}")))?;
 
+        let (inserted, skipped) = db
+            .insert_adif_records(&processor, &adif_file.records)
+            .await?;
+
+        if skipped > 0 {
+            warn!(
+                "Skipped {} ADIF records with no CALL field during replay",
+                skipped
+            );
+        }
+        info!(
+            "Replayed {} records from {} into {} ({} skipped)",
+            inserted,
+            adif_path.display(),
+            db_path.display(),
+            skipped,
+        );
+        Ok(db)
+    }
+
+    /// Index `records` exactly as [`Self::replay_from_adif`] does: the same
+    /// record→row conversion, the same −15 dB report default, and the same
+    /// skip (with a `warn!`) for a record with no CALL. Returns (inserted,
+    /// skipped for having no CALL). Fails on the first record
+    /// `record_to_qso` rejects.
+    pub async fn insert_adif_records(
+        &self,
+        processor: &AdifProcessor,
+        records: &[AdifRecord],
+    ) -> Result<(u64, u64), AsyncDatabaseError> {
         let mut inserted: u64 = 0;
         let mut skipped: u64 = 0;
-        for adif_record in &adif_file.records {
+        for adif_record in records {
             let adif_qso = processor
                 .record_to_qso(adif_record)
                 .map_err(|e| AsyncDatabaseError::Replay(format!("record→AdifQso failed: {e}")))?;
@@ -1046,24 +1076,16 @@ impl QsoDatabase {
                 metadata,
             };
 
-            db.insert_qso(&progress).await?;
+            self.insert_qso(&progress).await?;
             inserted += 1;
         }
+        Ok((inserted, skipped))
+    }
 
-        if skipped > 0 {
-            warn!(
-                "Skipped {} ADIF records with no CALL field during replay",
-                skipped
-            );
-        }
-        info!(
-            "Replayed {} records from {} into {} ({} skipped)",
-            inserted,
-            adif_path.display(),
-            db_path.display(),
-            skipped,
-        );
-        Ok(db)
+    /// Close the pool, so a short-lived process (e.g. `pancetta import`)
+    /// checkpoints the WAL cleanly before it exits.
+    pub async fn close(&self) {
+        self.pool.close().await
     }
 
     /// Export all QSOs in the index to an ADIF file at `path`.
@@ -1650,6 +1672,75 @@ mod tests {
             "missing K9DEF in {:?}",
             calls
         );
+    }
+
+    /// PAN-127: three records exercising band, grid and state seeding.
+    const INSERT_FIXTURE: &str = "<ADIF_VER:5>3.1.4 <EOH>\n\
+        <CALL:5>W1ABC <QSO_DATE:8>20250101 <TIME_ON:6>120000 <MODE:3>FT8 \
+        <FREQ:9>14.074000 <BAND:3>20m <GRIDSQUARE:4>FN42 <STATE:2>MA <EOR>\n\
+        <CALL:5>K9DEF <QSO_DATE:8>20250102 <TIME_ON:4>1215 <MODE:4>MFSK \
+        <SUBMODE:3>FT4 <FREQ:8>7.047500 <RST_SENT:3>-07 <RST_RCVD:3>+02 <EOR>\n\
+        <CALL:5>N0XYZ <QSO_DATE:8>20250103 <TIME_ON:6>130000 <MODE:3>FT8 \
+        <FREQ:9>21.074000 <GRIDSQUARE:6>EM10ab <STATE:2>TX <EOR>\n";
+
+    fn sorted(mut pairs: Vec<(String, String)>) -> Vec<(String, String)> {
+        pairs.sort();
+        pairs
+    }
+
+    #[tokio::test]
+    async fn insert_adif_records_indexes_like_replay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let adif_path = tmp.path().join("qsos.adi");
+        tokio::fs::write(&adif_path, INSERT_FIXTURE).await.unwrap();
+        let replayed = QsoDatabase::replay_from_adif(":memory:", &adif_path)
+            .await
+            .unwrap();
+
+        let processor = AdifProcessor::new();
+        let file = processor.parse_string(INSERT_FIXTURE).unwrap();
+        let inserted = QsoDatabase::new_in_memory().await.unwrap();
+        let counts = inserted
+            .insert_adif_records(&processor, &file.records)
+            .await
+            .unwrap();
+
+        assert_eq!(counts, (3, 0));
+        assert_eq!(inserted.count_qsos().await.unwrap(), 3);
+        assert_eq!(
+            inserted.count_qsos().await.unwrap(),
+            replayed.count_qsos().await.unwrap()
+        );
+        let bands_and_calls = sorted(inserted.get_worked_bands_and_callsigns().await);
+        assert_eq!(bands_and_calls.len(), 3, "{bands_and_calls:?}");
+        assert_eq!(
+            bands_and_calls,
+            sorted(replayed.get_worked_bands_and_callsigns().await)
+        );
+        assert_eq!(
+            sorted(inserted.get_worked_bands_and_grids().await),
+            sorted(replayed.get_worked_bands_and_grids().await)
+        );
+        let states = inserted.get_worked_callsigns_and_states().await;
+        assert_eq!(states.len(), 2, "{states:?}");
+        assert_eq!(states, replayed.get_worked_callsigns_and_states().await);
+        inserted.close().await;
+        replayed.close().await;
+    }
+
+    #[tokio::test]
+    async fn insert_adif_records_skips_a_record_with_no_call() {
+        let adif = "<CALL:5>W1ABC <QSO_DATE:8>20250101 <TIME_ON:6>120000 <MODE:3>FT8 <EOR>\n\
+                    <CALL:0> <QSO_DATE:8>20250101 <TIME_ON:6>121000 <MODE:3>FT8 <EOR>\n\
+                    <CALL:5>K9DEF <QSO_DATE:8>20250101 <TIME_ON:6>122000 <MODE:3>FT8 <EOR>\n";
+        let processor = AdifProcessor::new();
+        let file = processor.parse_string(adif).unwrap();
+        let db = QsoDatabase::new_in_memory().await.unwrap();
+
+        let counts = db.insert_adif_records(&processor, &file.records).await;
+
+        assert_eq!(counts.unwrap(), (2, 1));
+        assert_eq!(db.count_qsos().await.unwrap(), 2);
     }
 
     /// PAN-85: a replayed ADIF record's `STATE` field must survive the

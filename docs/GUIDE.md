@@ -208,6 +208,39 @@ manually, or don't have `tqsl` installed, point TQSL/WSJT-X's importer at
 `~/.pancetta/qsos.adi` instead. Bulk export with filters:
 `pancetta export --output mylog.adi`.
 
+### …bring in my log from another program?
+
+Export your log as an ADIF (`.adi`) file first. WSJT-X keeps
+`wsjtx_log.adi` in its log directory (File → Open log directory); N1MM,
+LoTW and QRZ each have an ADIF export. Then preview the import, which
+changes nothing:
+
+```bash
+pancetta import ~/wsjtx_log.adi --dry-run
+```
+
+It prints how many contacts would be added, how many are duplicates, and
+each record it could not read (by position and callsign). If that looks
+right, run it for real:
+
+```bash
+pancetta import ~/wsjtx_log.adi
+```
+
+- **Duplicates are skipped.** A contact counts as already logged when the
+  callsign, band and mode match and the start times are at most 30 minutes
+  apart (the tolerance LoTW uses). Re-running the same import adds nothing.
+- **Contacts are kept as written.** Each one is appended to
+  `~/.pancetta/qsos.adi` with every field unchanged, QSL status included.
+- **Your log is backed up first.** Before the first write, `qsos.adi` is
+  copied to `~/.pancetta/qsos.adi.bak` (or the next free `.bak.N`). The
+  output names the backup and ends with the exact steps to undo the import.
+- **Nothing is uploaded.** Imported contacts never go to QRZ, LoTW,
+  ClubLog or cqdx; only QSOs pancetta completes do.
+
+Pancetta loads the imported contacts into its worked-station history the
+next time it starts.
+
 ### …switch bands or modes?
 
 - `=` / `-` step the band up/down (CAT moves the dial; active QSOs are
