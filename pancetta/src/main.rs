@@ -423,6 +423,7 @@ async fn run_application(cli: Cli) -> Result<()> {
     // PAN-103: config reloads watch and read the path as given, so a
     // symlinked config repointed at a new file is picked up.
     let config_watch_path = config_raw_path(&cli);
+    let cli_config_given = cli.config.clone();
 
     // Create application coordinator
     let mut coordinator = ApplicationCoordinator::new(
@@ -443,6 +444,16 @@ async fn run_application(cli: Cli) -> Result<()> {
     )
     .await?;
     coordinator.set_config_watch_path(config_watch_path);
+    if cli_config_given.is_none() {
+        // PAN-103: without `--config`, startup merged every discovered config
+        // source; the watched file is only one of them. Reloads re-load the
+        // merged configuration the same way before applying a consent grant.
+        coordinator.set_config_effective_loader(|| {
+            Config::load_default_unvalidated()
+                .map(|(config, _)| config)
+                .map_err(|e| e.to_string())
+        });
+    }
 
     info!("Application coordinator initialized");
 

@@ -600,10 +600,17 @@ fn sweep_arm_expiry(ctx: &ArmContext, now: ArmTime) -> Vec<PeerSend> {
 /// flag's state, exactly as round 2 established -- the flag is now only
 /// consulted to narrow the *non-panicking* fallback, never to override a
 /// real panic.
+///
+/// PAN-103: `stop_requested` is this component's own "deliberately stopped"
+/// flag, set by the coordinator right before it aborts the session because a
+/// saved config edit disabled the station agent. It narrows the same
+/// non-panicking fallback as `shutdown` does, so that deliberate stop is
+/// audited as `OperatorDisarm`, never `ComponentCrash`.
 struct RemoteTxDisarmGuard {
     arm: Arc<Mutex<ArmState>>,
     audit: AuditLog,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    stop_requested: Arc<std::sync::atomic::AtomicBool>,
     normal_exit: bool,
 }
 
@@ -618,8 +625,9 @@ impl RemoteTxDisarmGuard {
 
 impl Drop for RemoteTxDisarmGuard {
     fn drop(&mut self) {
-        let non_panicking_shutdown_cancellation =
-            !std::thread::panicking() && self.shutdown.load(Ordering::Acquire);
+        let non_panicking_shutdown_cancellation = !std::thread::panicking()
+            && (self.shutdown.load(Ordering::Acquire)
+                || self.stop_requested.load(Ordering::Acquire));
         let reason = if self.normal_exit || non_panicking_shutdown_cancellation {
             DisarmReason::OperatorDisarm
         } else {
@@ -1550,6 +1558,9 @@ pub(crate) struct StationAgentLiveHandles {
     pub(crate) client_keys: Arc<std::sync::RwLock<std::collections::HashMap<String, VerifyingKey>>>,
     pub(crate) revocation_pending: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) authz_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Set right before the coordinator aborts the session for a config
+    /// disable, so the session's disarm guard audits `OperatorDisarm`.
+    pub(crate) stop_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// PAN-103: remove `removed` keyIds from a running session's authorization
@@ -1869,6 +1880,9 @@ impl super::ApplicationCoordinator {
         // changes the admission lists; the session loop reconciles on it (see
         // `ArmContext::authz_generation`).
         let authz_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // PAN-103: set by a config disable just before the abort (see
+        // `RemoteTxDisarmGuard`).
+        let stop_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Task 6: subscribe to the shared display feed (if the localhost
         // gateway or this component's own gating started it — see
@@ -1931,6 +1945,7 @@ impl super::ApplicationCoordinator {
             client_keys: client_keys.clone(),
             revocation_pending: revocation_pending.clone(),
             authz_generation: authz_generation.clone(),
+            stop_requested: stop_requested.clone(),
         });
 
         let handle = tokio::spawn(async move {
@@ -1948,6 +1963,7 @@ impl super::ApplicationCoordinator {
                 revocation_pending,
                 authz_generation,
                 shutdown,
+                stop_requested,
             })
             .await;
             Ok::<(), anyhow::Error>(())
@@ -2212,6 +2228,8 @@ struct RunConfig {
     /// Threaded into `ArmContext::authz_generation` — see there.
     authz_generation: Arc<std::sync::atomic::AtomicU64>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// See [`StationAgentLiveHandles::stop_requested`].
+    stop_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The connect → authenticate → process → (disarm on loss) → reconnect loop.
@@ -2223,6 +2241,7 @@ async fn run_session_loop(mut cfg: RunConfig) {
         arm: cfg.arm.clone(),
         audit: cfg.audit.clone(),
         shutdown: cfg.shutdown.clone(),
+        stop_requested: cfg.stop_requested.clone(),
         normal_exit: false,
     };
     let mut backoff = RECONNECT_BACKOFF_MIN;
@@ -2822,6 +2841,7 @@ mod tests {
                 arm: arm.clone(),
                 audit: audit.clone(),
                 shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 normal_exit: true,
             };
         }
@@ -2857,6 +2877,7 @@ mod tests {
                 arm: arm.clone(),
                 audit: audit.clone(),
                 shutdown: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 normal_exit: false,
             };
             // Guard drops here via ordinary scope exit -- simulating a
@@ -2895,6 +2916,7 @@ mod tests {
                 arm: arm.clone(),
                 audit: audit.clone(),
                 shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 normal_exit: false,
             };
             // Guard drops here via ordinary scope exit -- not a panic, but
@@ -2915,6 +2937,37 @@ mod tests {
         );
     }
 
+    /// PAN-103 (Codex P2 on #436): a saved config edit that disables the
+    /// station agent aborts the session while it may still be armed. That
+    /// abort drops the guard with `normal_exit` unset and the process-wide
+    /// shutdown flag false; the component's own `stop_requested` flag is what
+    /// tells the guard it was a deliberate operator stop, not a crash.
+    #[test]
+    fn drop_after_a_config_stop_request_audits_operator_disarm_not_a_crash() {
+        let arm = Arc::new(Mutex::new(armed_state()));
+        let audit = AuditLog::new(audit_tmp());
+
+        {
+            let _guard = RemoteTxDisarmGuard {
+                arm: arm.clone(),
+                audit: audit.clone(),
+                shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                normal_exit: false,
+            };
+        }
+
+        let log = std::fs::read_to_string(audit.path()).unwrap_or_default();
+        assert!(
+            !log.contains("component-crash"),
+            "a config-driven stop must not be audited as a component crash: {log:?}"
+        );
+        assert!(
+            log.contains("operator-disarm"),
+            "a config-driven stop is an operator disarm: {log:?}"
+        );
+    }
+
     /// The scenario `RemoteTxDisarmGuard` exists for in the first place: a
     /// real panic/unwind, with `normal_exit` never reached. Drives an actual
     /// panic through `catch_unwind` so `std::thread::panicking()` is
@@ -2932,6 +2985,7 @@ mod tests {
                 arm: arm_for_panic,
                 audit: audit_for_panic,
                 shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 normal_exit: false,
             };
             panic!("simulated genuine task panic");
@@ -2974,6 +3028,7 @@ mod tests {
                 arm: arm_for_panic,
                 audit: audit_for_panic,
                 shutdown: shutdown_for_panic,
+                stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 normal_exit: false,
             };
             // A real panic, so the guard drops while genuinely unwinding --
@@ -3019,6 +3074,7 @@ mod tests {
                 arm: arm_for_task,
                 audit: audit_for_task,
                 shutdown: shutdown_for_task,
+                stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 normal_exit: false,
             };
             // Stand-in for `run_one_session` still mid-flight (e.g. awaiting
@@ -3064,6 +3120,7 @@ mod tests {
                 arm: arm_for_task,
                 audit: audit_for_task,
                 shutdown: shutdown_for_task,
+                stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 normal_exit: false,
             };
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -7962,6 +8019,7 @@ mod tests {
             client_keys: ctx.client_keys.clone(),
             revocation_pending: ctx.revocation_pending.clone(),
             authz_generation: ctx.authz_generation.clone(),
+            stop_requested: Default::default(),
         }
     }
 

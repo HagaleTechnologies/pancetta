@@ -632,7 +632,12 @@ other search locations above), nothing is watched and every change
 needs a restart. A save is picked up within a few seconds. Each save is
 compared with the file's previous content, so a value that came from
 another config file or a `PANCETTA_*` environment variable stays as it
-is unless you edit that key in the watched file.
+is unless you edit that key in the watched file. Without `--config`, the
+config files are merged, and turning consent on (`remote_tx_enabled`,
+`allow_tx_initiation`) in the watched file applies only if the merged
+configuration agrees: if a higher-priority file (for example
+`~/.config/pancetta/pancetta.toml`) keeps it off, consent stays off and a
+`Not applied:` line says why. Turning consent off always applies.
 
 **Applied live — remote-access revocations (security):**
 
