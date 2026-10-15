@@ -88,6 +88,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A crash in the transmit worker no longer keeps the station off the air for
+  the rest of the session: the supervisor restarts it after a short backoff,
+  within the same 5-restarts-per-10-minutes budget as the other restartable
+  components. Past that budget TX stays disabled until pancetta is
+  restarted, as before (PAN-119).
+
 - Turning Fox mode off (Shift+X) no longer cuts the Hound contacts already in
   progress down to one transmitted stream; they keep transmitting until they
   finish, while new QSOs wait for the normal `max_concurrent_qsos` limit

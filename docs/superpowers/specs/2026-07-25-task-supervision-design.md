@@ -27,6 +27,14 @@ device-recovery path owns rollback semantics that task restart cannot reproduce.
 drops are surfaced as described in §4.4. See §4.6 for the already-shipped panic-hook groundwork this
 builds on. With Dsp/Ft8Decoder (PAN-4) and Hamlib/StationAgent (PAN-5) now covered, only Audio
 remains intentionally `DegradeOnly`.
+**Status update (2026-10-15):** PAN-119 added `Ft8Transmitter` to the restartable set. It had been
+left `DegradeOnly` by omission — §4.1 below never classified it, so it silently inherited the
+"anything not listed degrades" safety net alongside `Config`/`Coordinator` (neither a real task),
+meaning a single TX-worker panic disabled TX for the rest of the session (review finding L4-25).
+It now restarts as a cheap-restartable component with no teardown: `PttGuard`'s `Drop` already
+clears keyed state and sends PTT-off on every exit path including panics, and its bus-channel
+registration moved to `get_or_create_channel` so a restart's second `start_transmitter_component`
+call succeeds. Same 5-restarts/10-minute budget; past it, TX stays disabled until process restart.
 **Scope crates:** `pancetta` (coordinator), `pancetta-qso` (new `QsoFailureReason` variant)
 **Supersedes:** `docs/task-supervision-plan.md` (2026-07-03) — that doc's research and touch
 points are correct and are folded in here; this spec is now the authoritative source and
@@ -111,7 +119,8 @@ enum RestartPolicy { Restartable { max_retries: u32, backoff: BackoffSpec }, Deg
 Extends the existing `component_criticality` seam (`mod.rs:773`) with a third axis. Confirmed
 split (updated through PAN-5):
 
-- **Restartable (cheap):** Autonomous, DxCluster, PskReporter, RemoteGateway, Qso. Plain restart
+- **Restartable (cheap):** Autonomous, DxCluster, PskReporter, RemoteGateway, Qso, Ft8Transmitter
+  (added by PAN-119; see the status update above). Plain restart
   via the existing `start_*_component` methods, all already `&mut self`.
   Restarting `Qso` drops in-flight QSOs — acceptable for crash recovery, and surfaced per §4.4.
 - **Restartable-with-teardown (shipped via `teardown_component`, not a separate policy
