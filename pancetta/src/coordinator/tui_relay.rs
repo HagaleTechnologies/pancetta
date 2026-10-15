@@ -1538,8 +1538,8 @@ impl super::ApplicationCoordinator {
                             enabled,
                             tx_frequency,
                         } => {
-                            let store = if enabled { tx_frequency } else { 0 };
-                            cmd_split_tx_hz.store(store, Ordering::Relaxed);
+                            let store =
+                                super::record_split_state(&cmd_split_tx_hz, enabled, tx_frequency);
                             info!(target: "rig.split", "TUI SetSplit enabled={} tx={} Hz", enabled, tx_frequency);
                             // Push authoritative split state to the TUI chip.
                             let _ = cmd_tui_msg_tx.send(
