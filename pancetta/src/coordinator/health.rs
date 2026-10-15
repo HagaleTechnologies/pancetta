@@ -876,10 +876,10 @@ impl super::ApplicationCoordinator {
         let _ = self.message_bus.send_message(error_msg).await;
     }
 
-    /// Re-invoke the given component's start method. Only the seven components
-    /// this plan covers are wired; anything else reaching here is a bug
-    /// (Task 2's `component_restart_policy` should have already routed it
-    /// to `DegradeOnly`).
+    /// Re-invoke the given component's start method. Every component that
+    /// `component_restart_policy` classifies `Restartable` must have an
+    /// arm here; anything else reaching here is a bug (the policy match
+    /// should have already routed it to `DegradeOnly`).
     async fn restart_component(&mut self, id: ComponentId) -> Result<()> {
         match id {
             ComponentId::Autonomous => self.start_autonomous_component().await,
@@ -892,6 +892,7 @@ impl super::ApplicationCoordinator {
             #[cfg(feature = "pancetta-hamlib")]
             ComponentId::Hamlib => self.start_hamlib_component().await,
             ComponentId::StationAgent => self.start_station_agent_component().await,
+            ComponentId::Ft8Transmitter => self.start_transmitter_component().await,
             other => anyhow::bail!("restart_component called for non-restartable {other}"),
         }
     }
