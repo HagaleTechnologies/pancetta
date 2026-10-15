@@ -818,12 +818,11 @@ pub struct ApplicationCoordinator {
     /// are measured against it, not against `config` (which may also hold
     /// values from other config files or `PANCETTA_*` environment variables).
     config_file_baseline: Option<Config>,
-    /// PAN-103: loads the effective (merged) configuration the way startup
+    /// PAN-103: loads and validates the merged configuration the way startup
     /// did, when the watched file is only one of several merged sources (no
-    /// `--config`). A consent grant saved in the watched file is applied live
-    /// only if the effective configuration agrees. `None` when the watched
-    /// file is the whole configuration (`--config`).
-    config_effective_loader: Option<config_reload::EffectiveConfigLoader>,
+    /// `--config`); reloads apply that. `None` when the watched file is the
+    /// whole configuration (`--config`): reloads load the file alone.
+    config_reload_loader: Option<config_reload::ConfigReloadLoader>,
 
     /// PAN-43/45 follow-up (Codex round 2 on PR #342): self-CQ attempt IDs
     /// whose dispatch failed but whose `AutonomousCqDispatchFailed`
@@ -2138,7 +2137,7 @@ impl ApplicationCoordinator {
             config_file_warnings: Vec::new(),
             config_reload_rx: None,
             config_file_baseline: None,
-            config_effective_loader: None,
+            config_reload_loader: None,
             pending_autonomous_cq_dispatch_failures: Arc::new(std::sync::Mutex::new(Vec::new())),
             pending_qso_offset_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
             pending_cq_offset_nudge: Arc::new(std::sync::atomic::AtomicBool::new(false)),

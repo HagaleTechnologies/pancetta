@@ -17,16 +17,18 @@
 //!   config snapshot: other code reads that snapshot while running (e.g. the
 //!   shutdown PTT-off safety net reads `rig.interface.enabled`), so writing a
 //!   restart-required key into it would half-apply that key.
-//! - Changes are measured between the previous and the new content of the
-//!   watched file, not against the running config, so a value that came from
-//!   another config file or a `PANCETTA_*` environment variable at startup is
-//!   never overridden unless that very key is edited in the watched file.
-//! - The live security values are still the effective ones. When the watched
-//!   file is only one of several merged sources (no `--config`), a consent
-//!   grant saved in it is applied only if the effective merged configuration
-//!   (re-loaded the way startup loads it) agrees, so a lower-priority file can
-//!   never turn on remote TX that a higher-priority source keeps off. A
-//!   revocation always applies.
+//! - Changes are measured between the previous and the new result of the
+//!   same load startup did, not against the running config (which the TUI
+//!   also changes live). With `--config` that is the watched file alone.
+//!   Without it, startup merges every discovered config source and the
+//!   watched file is only one of them, so a reload re-loads and validates the
+//!   merged configuration (environment included) and diffs merged results: a
+//!   grant saved in a file that a higher-priority source overrides changes
+//!   nothing, and a change in a higher-priority source is applied by the next
+//!   reload.
+//! - An edit saved between the startup load and the watcher's first read is
+//!   reconciled when the watcher starts: its live remote-access changes are
+//!   applied then (see `start_config_reload_watcher`).
 //! - C19: every reload is classified by [`classify_config_reload`]. A
 //!   QSO-latched field (callsign, grid, slot parity) is never written to the
 //!   running state at all — it is restart-required — so no reload can clobber
@@ -50,10 +52,10 @@ use pancetta_agent::arm::ConsentChannel;
 /// or the load/validation error text.
 pub(crate) type ConfigReloadOutcome = Result<(Config, Vec<String>), String>;
 
-/// Loads the effective configuration from every merged source, the way
-/// startup does (see [`ApplicationCoordinator::set_config_effective_loader`]).
-pub(crate) type EffectiveConfigLoader =
-    std::sync::Arc<dyn Fn() -> Result<Config, String> + Send + Sync>;
+/// Loads (and validates) the configuration a reload applies: the watched
+/// file alone with `--config`, otherwise every merged source the way startup
+/// loads them (see [`ApplicationCoordinator::set_config_reload_loader`]).
+pub(crate) type ConfigReloadLoader = std::sync::Arc<dyn Fn() -> ConfigReloadOutcome + Send + Sync>;
 
 /// How long to wait after the first watcher event before re-reading the file.
 /// Editors often truncate and then write, which produces several events; the
@@ -77,9 +79,10 @@ pub(crate) const MSG_STATION_AGENT_DISABLED: &str =
     "station_agent disabled — remote sessions closed and remote TX disarmed";
 pub(crate) const MSG_STATION_AGENT_ENABLED: &str =
     "station_agent enabled — restart required before it takes effect";
-/// Prefix of the line saying a saved consent grant was not applied because a
-/// higher-priority config source keeps it off.
-pub(crate) const MSG_GRANT_OVERRIDDEN_PREFIX: &str = "Not applied:";
+/// First line of a startup reconciliation (see
+/// `start_config_reload_watcher_with_settle`).
+pub(crate) const MSG_CHANGED_DURING_STARTUP: &str =
+    "Config changed while pancetta was starting — applying remote-access changes";
 /// Prefix of the line listing saved keys that need a restart.
 pub(crate) const MSG_RESTART_REQUIRED_PREFIX: &str = "Saved changes take effect after a restart:";
 /// At most this many key names are listed in that line.
@@ -288,46 +291,6 @@ fn flatten_toml(
     }
 }
 
-/// Drop the consent grants in `diff` that the effective configuration does
-/// not hold. `effective` is the merged configuration re-loaded from every
-/// source; `Err` (it failed to load) withholds every grant, since the
-/// effective value is then unknown. Revocations are never touched: turning
-/// remote TX off is always safe. Returns one diagnostic line per withheld
-/// grant.
-pub(crate) fn withhold_overridden_grants(
-    diff: &mut SecurityConfigDiff,
-    effective: Result<&Config, &str>,
-) -> Vec<(DiagnosticLevel, String)> {
-    let mut lines = Vec::new();
-    let mut withhold = |value: &mut Option<bool>, key: &str, effective_on: Result<bool, &str>| {
-        if *value != Some(true) {
-            return;
-        }
-        let why = match effective_on {
-            Ok(true) => return,
-            Ok(false) => "a higher-priority config source keeps it off".to_string(),
-            Err(e) => format!("the merged configuration failed to load ({e})"),
-        };
-        *value = None;
-        warn!("Config reload: {key} grant withheld: {why}");
-        lines.push((
-            DiagnosticLevel::Warn,
-            format!("{MSG_GRANT_OVERRIDDEN_PREFIX} {key} turned on in the saved file, but {why} — remote TX consent stays OFF"),
-        ));
-    };
-    withhold(
-        &mut diff.station_agent_consent,
-        "network.station_agent.remote_tx_enabled",
-        effective.map(|c| c.network.station_agent.remote_tx_enabled),
-    );
-    withhold(
-        &mut diff.wsjtx_consent,
-        "network.wsjtx_udp.allow_tx_initiation",
-        effective.map(wsjtx_consent),
-    );
-    lines
-}
-
 /// Write what [`ApplicationCoordinator::apply_security_config`] applies into
 /// the running config snapshot, and nothing more: consent values, the
 /// allow-list minus removed entries (additions are restart-required), and
@@ -357,7 +320,7 @@ pub(crate) fn patch_live_security_fields(
     }
 }
 
-/// Load and validate `path` the way the watcher does.
+/// Load and validate `path` alone (the `--config` reload loader).
 fn load_config_for_reload(path: &Path) -> ConfigReloadOutcome {
     let (config, warnings) =
         Config::load_from_file_with_warnings(path).map_err(|e| e.to_string())?;
@@ -374,7 +337,7 @@ fn load_config_for_reload(path: &Path) -> ConfigReloadOutcome {
 async fn forward_config_reload_events(
     mut events: broadcast::Receiver<ConfigReloadEvent>,
     tx: mpsc::Sender<ConfigReloadOutcome>,
-    path: PathBuf,
+    load: ConfigReloadLoader,
     settle: Duration,
 ) {
     use tokio::sync::broadcast::error::{RecvError, TryRecvError};
@@ -391,14 +354,18 @@ async fn forward_config_reload_events(
                 Err(TryRecvError::Closed) => return,
             }
         }
-        let p = path.clone();
-        let outcome = tokio::task::spawn_blocking(move || load_config_for_reload(&p))
-            .await
-            .unwrap_or_else(|e| Err(format!("config reload task failed: {e}")));
+        let outcome = run_reload_loader(load.clone()).await;
         if tx.send(outcome).await.is_err() {
             return;
         }
     }
+}
+
+/// Run a reload loader off the async runtime (it reads files).
+async fn run_reload_loader(load: ConfigReloadLoader) -> ConfigReloadOutcome {
+    tokio::task::spawn_blocking(move || load())
+        .await
+        .unwrap_or_else(|e| Err(format!("config reload task failed: {e}")))
 }
 
 /// Receive the next reload outcome, or wait forever when no watcher runs.
@@ -423,15 +390,26 @@ impl super::ApplicationCoordinator {
         self.config_watch_path = path;
     }
 
-    /// Set how a reload re-loads the effective configuration when the
-    /// watched file is only one of several merged sources (no `--config`).
-    /// Consent grants saved in the watched file are then applied only when
-    /// the effective configuration agrees (see [`withhold_overridden_grants`]).
-    pub fn set_config_effective_loader(
+    /// Set how a reload loads the configuration when the watched file is
+    /// only one of several merged sources (no `--config`): the loader must
+    /// load and validate the merged configuration exactly as startup did.
+    /// Without one, a reload loads `config_watch_path` alone.
+    pub fn set_config_reload_loader(
         &mut self,
-        loader: impl Fn() -> Result<Config, String> + Send + Sync + 'static,
+        loader: impl Fn() -> ConfigReloadOutcome + Send + Sync + 'static,
     ) {
-        self.config_effective_loader = Some(std::sync::Arc::new(loader));
+        self.config_reload_loader = Some(std::sync::Arc::new(loader));
+    }
+
+    /// The loader reloads use (see [`Self::set_config_reload_loader`]).
+    fn reload_loader(&self) -> ConfigReloadLoader {
+        match &self.config_reload_loader {
+            Some(load) => load.clone(),
+            None => {
+                let path = self.config_watch_path.clone();
+                std::sync::Arc::new(move || load_config_for_reload(&path))
+            }
+        }
     }
 
     /// Start watching `config_watch_path` for saved edits. Only runs when
@@ -461,14 +439,11 @@ impl super::ApplicationCoordinator {
             );
             return Ok(());
         }
-        // The file's own content is the baseline edits are measured from:
-        // the running config may also hold values from other config files or
-        // `PANCETTA_*` environment variables (see the module doc).
-        let path = watch_path.clone();
-        let baseline = match tokio::task::spawn_blocking(move || load_config_for_reload(&path))
-            .await
-            .unwrap_or_else(|e| Err(e.to_string()))
-        {
+        // What the loader returns now is the baseline edits are measured
+        // from (see the module doc).
+        self.config_watch_path = watch_path.clone();
+        let load = self.reload_loader();
+        let baseline = match run_reload_loader(load.clone()).await {
             Ok(pair) => pair,
             Err(e) => {
                 info!("Config hot reload not started: {e}");
@@ -489,14 +464,10 @@ impl super::ApplicationCoordinator {
             return Ok(());
         }
         let (tx, rx) = mpsc::channel(8);
-        tokio::spawn(forward_config_reload_events(
-            events,
-            tx,
-            watch_path.clone(),
-            settle,
-        ));
+        tokio::spawn(forward_config_reload_events(events, tx, load, settle));
         self.config_reload_watcher = Some(watcher);
         self.config_reload_rx = Some(rx);
+        self.reconcile_startup_window(&baseline).await;
         self.config_file_baseline = Some(baseline);
         self.config_file_warnings = baseline_warnings;
         // `start_watching` already watches the path's own directory; record
@@ -580,10 +551,7 @@ impl super::ApplicationCoordinator {
     pub(crate) async fn handle_config_reload(&mut self, outcome: ConfigReloadOutcome) {
         self.apply_config_reload(outcome).await;
         if self.watch_config_target_dir().await {
-            let path = self.config_watch_path.clone();
-            let outcome = tokio::task::spawn_blocking(move || load_config_for_reload(&path))
-                .await
-                .unwrap_or_else(|e| Err(format!("config reload task failed: {e}")));
+            let outcome = run_reload_loader(self.reload_loader()).await;
             self.apply_config_reload(outcome).await;
         }
     }
@@ -620,7 +588,7 @@ impl super::ApplicationCoordinator {
             .map(|w| (DiagnosticLevel::Warn, format!("Config warning: {w}")))
             .collect();
         self.config_file_warnings = warnings;
-        let mut plan = ReloadApplyPlan::decide(&old, &new, self.config_reload_qso_active());
+        let plan = ReloadApplyPlan::decide(&old, &new, self.config_reload_qso_active());
         if plan.applicability == ConfigReloadApplicability::NoChange
             && plan.apply_security.is_empty()
         {
@@ -643,22 +611,6 @@ impl super::ApplicationCoordinator {
                 .collect()
         };
 
-        // The edit is measured against the file, but a consent grant only
-        // applies if the effective merged configuration agrees: a
-        // higher-priority source that keeps consent off still wins.
-        let mut withheld_lines = Vec::new();
-        let grants = plan.apply_security.station_agent_consent == Some(true)
-            || plan.apply_security.wsjtx_consent == Some(true);
-        if let (true, Some(loader)) = (grants, self.config_effective_loader.clone()) {
-            let effective = tokio::task::spawn_blocking(move || loader())
-                .await
-                .unwrap_or_else(|e| Err(format!("config reload task failed: {e}")));
-            withheld_lines = withhold_overridden_grants(
-                &mut plan.apply_security,
-                effective.as_ref().map_err(String::as_str),
-            );
-        }
-
         // The snapshot is patched before the security actions: disabling the
         // station agent restarts it, and the restart re-reads this snapshot.
         if plan.snapshot == SnapshotAction::PatchSecurity {
@@ -668,7 +620,6 @@ impl super::ApplicationCoordinator {
 
         let mut lines = vec![(DiagnosticLevel::Info, MSG_RELOADED.to_string())];
         lines.extend(warning_lines);
-        lines.extend(withheld_lines);
         lines.extend(self.apply_security_config(&plan.apply_security).await);
         if !restart_keys.is_empty() {
             let mut listed = restart_keys
@@ -689,6 +640,36 @@ impl super::ApplicationCoordinator {
             ));
         }
         self.config_file_baseline = Some(new);
+        self.emit_config_reload_lines(lines).await;
+    }
+
+    /// Apply the live remote-access changes between the configuration the
+    /// station started with (the running snapshot) and `baseline`, the
+    /// watcher's first read. They differ only when the file was saved after
+    /// the startup load and before the watcher existed, an edit no watcher
+    /// event will ever report. Only the live parts (consent, allow-list
+    /// removals, disabling the agent) are applied; everything else stays as
+    /// it would after any reload.
+    async fn reconcile_startup_window(&mut self, baseline: &Config) {
+        let running = self.config.read().await.clone();
+        let full = SecurityConfigDiff::diff(&running, baseline);
+        let live = SecurityConfigDiff {
+            station_agent_consent: full.station_agent_consent,
+            wsjtx_consent: full.wsjtx_consent,
+            allow_list_removed: full.allow_list_removed,
+            station_agent_disabled: full.station_agent_disabled,
+            ..Default::default()
+        };
+        if live.is_empty() {
+            return;
+        }
+        warn!("{MSG_CHANGED_DURING_STARTUP}");
+        patch_live_security_fields(&mut *self.config.write().await, &live, baseline);
+        let mut lines = vec![(
+            DiagnosticLevel::Warn,
+            MSG_CHANGED_DURING_STARTUP.to_string(),
+        )];
+        lines.extend(self.apply_security_config(&live).await);
         self.emit_config_reload_lines(lines).await;
     }
 
@@ -1332,93 +1313,77 @@ mod tests {
         );
     }
 
-    #[test]
-    fn withhold_overridden_grants_keeps_only_grants_the_effective_config_holds() {
-        let grant_both = || SecurityConfigDiff {
-            station_agent_consent: Some(true),
-            wsjtx_consent: Some(true),
-            ..Default::default()
-        };
-        let mut effective_off = base();
-        effective_off.network.station_agent.remote_tx_enabled = false;
-        effective_off.network.wsjtx_udp.enabled = true;
-        effective_off.network.wsjtx_udp.allow_tx_initiation = false;
-
-        let mut diff = grant_both();
-        let lines = withhold_overridden_grants(&mut diff, Ok(&effective_off));
-        assert_eq!(diff.station_agent_consent, None);
-        assert_eq!(diff.wsjtx_consent, None);
-        assert_eq!(lines.len(), 2, "{lines:?}");
-        assert!(lines
-            .iter()
-            .all(|(_, t)| t.starts_with(MSG_GRANT_OVERRIDDEN_PREFIX)));
-
-        let mut effective_on = effective_off.clone();
-        effective_on.network.station_agent.remote_tx_enabled = true;
-        effective_on.network.wsjtx_udp.allow_tx_initiation = true;
-        let mut diff = grant_both();
-        assert!(withhold_overridden_grants(&mut diff, Ok(&effective_on)).is_empty());
-        assert_eq!(
-            diff,
-            grant_both(),
-            "grants the effective config holds apply"
-        );
-
-        let mut diff = grant_both();
-        let lines = withhold_overridden_grants(&mut diff, Err("boom"));
-        assert_eq!(
-            (diff.station_agent_consent, diff.wsjtx_consent),
-            (None, None)
-        );
-        assert!(lines[0].1.contains("boom"), "{lines:?}");
-
-        // Revocations are never withheld, whatever the effective config says.
-        let mut revoke = SecurityConfigDiff {
-            station_agent_consent: Some(false),
-            wsjtx_consent: Some(false),
-            allow_list_removed: vec!["A".to_string()],
-            station_agent_disabled: true,
-            ..Default::default()
-        };
-        let before = revoke.clone();
-        assert!(withhold_overridden_grants(&mut revoke, Ok(&effective_on)).is_empty());
-        assert!(withhold_overridden_grants(&mut revoke, Err("boom")).is_empty());
-        assert_eq!(revoke, before);
+    /// The merged-mode loader `main.rs` installs, over explicit search
+    /// directories (lowest precedence first) instead of the real ones.
+    fn merged_loader(dirs: Vec<std::path::PathBuf>) -> impl Fn() -> ConfigReloadOutcome {
+        move || {
+            let loader = pancetta_config::ConfigLoader::with_search_paths(dirs.clone())
+                .map_err(|e| e.to_string())?;
+            let mut config = loader.load().map_err(|e| e.to_string())?;
+            config.metadata = None;
+            Ok((config, loader.load_warnings()))
+        }
     }
 
-    /// Codex P1 on #436: without `--config`, a higher-priority source (e.g.
-    /// `~/.config/pancetta/pancetta.toml`) that keeps `remote_tx_enabled =
-    /// false` must win over a grant saved in the watched lower-priority file.
-    #[tokio::test]
-    async fn a_grant_in_the_watched_file_does_not_override_a_higher_priority_source() {
-        let mut config = base();
-        config.network.station_agent.remote_tx_enabled = false;
-        let mut coordinator = test_coordinator(config).await;
-        assert!(!coordinator
+    const STATION_TOML: &str = "[station]\ncallsign = \"K1TEST\"\ngrid_square = \"FN42\"\n";
+
+    fn station_agent_toml(remote_tx_enabled: bool) -> String {
+        format!(
+            "{STATION_TOML}[network.station_agent]\nremote_tx_enabled = {remote_tx_enabled}\ntx_allow_list = [\"A\", \"B\"]\n"
+        )
+    }
+
+    /// A merged-mode coordinator: `dirs` each hold a `pancetta.toml` (lowest
+    /// precedence first); the running config and the baseline are the merged
+    /// result, as at startup.
+    async fn merged_coordinator(
+        dirs: Vec<std::path::PathBuf>,
+    ) -> (ApplicationCoordinator, impl Fn() -> ConfigReloadOutcome) {
+        let load = merged_loader(dirs.clone());
+        let (startup, _) = load().expect("merged config loads");
+        let mut coordinator = test_coordinator(startup.clone()).await;
+        let seeded = startup.network.station_agent.remote_tx_enabled;
+        coordinator
             .remote_tx_arm
             .lock()
             .unwrap()
-            .channel_consent(ConsentChannel::StationAgent));
-        let file = coordinator.config.read().await.clone();
-        coordinator.config_file_baseline = Some(file.clone());
-        // The merged configuration: the higher-priority file still says false.
-        let effective = file.clone();
-        coordinator.set_config_effective_loader(move || Ok(effective.clone()));
+            .set_channel_consent(ConsentChannel::StationAgent, seeded, 0);
+        coordinator.set_config_reload_loader(merged_loader(dirs));
+        // The running config also carries test_coordinator's audit-log path;
+        // the baseline is the merged load, like the watcher's first read.
+        coordinator.config_file_baseline = Some(load().unwrap().0);
+        (coordinator, load)
+    }
+
+    fn station_agent_consent(coordinator: &ApplicationCoordinator) -> bool {
+        coordinator
+            .remote_tx_arm
+            .lock()
+            .unwrap()
+            .channel_consent(ConsentChannel::StationAgent)
+    }
+
+    /// Codex P1 on #436: without `--config`, a higher-priority source that
+    /// keeps `remote_tx_enabled = false` wins over a grant saved in the
+    /// watched lower-priority file.
+    #[tokio::test]
+    async fn merged_mode_grant_overridden_by_a_higher_priority_source_changes_nothing() {
+        let root = temp_path("merged-grant");
+        let (watched, high) = (root.join("watched"), root.join("high"));
+        std::fs::create_dir_all(&watched).unwrap();
+        std::fs::create_dir_all(&high).unwrap();
+        std::fs::write(watched.join("pancetta.toml"), STATION_TOML).unwrap();
+        std::fs::write(high.join("pancetta.toml"), station_agent_toml(false)).unwrap();
+        let (mut coordinator, load) = merged_coordinator(vec![watched.clone(), high]).await;
+        assert!(!station_agent_consent(&coordinator), "setup: consent off");
         let rx = tui_rx(&coordinator).await;
 
-        let mut granted = file;
-        granted.network.station_agent.remote_tx_enabled = true;
-        coordinator
-            .handle_config_reload(Ok((granted.clone(), Vec::new())))
-            .await;
+        std::fs::write(watched.join("pancetta.toml"), station_agent_toml(true)).unwrap();
+        coordinator.handle_config_reload(load()).await;
 
         assert!(
-            !coordinator
-                .remote_tx_arm
-                .lock()
-                .unwrap()
-                .channel_consent(ConsentChannel::StationAgent),
-            "consent stays off: the effective config keeps it off"
+            !station_agent_consent(&coordinator),
+            "the higher-priority false wins"
         );
         assert!(
             !coordinator
@@ -1427,49 +1392,128 @@ mod tests {
                 .await
                 .network
                 .station_agent
-                .remote_tx_enabled,
-            "the snapshot is not patched with the withheld grant"
+                .remote_tx_enabled
         );
         let lines = diagnostics(&rx);
-        assert!(
-            lines
-                .iter()
-                .any(|(_, t)| t.starts_with(MSG_GRANT_OVERRIDDEN_PREFIX)
-                    && t.contains("network.station_agent.remote_tx_enabled")),
-            "{lines:?}"
-        );
         assert!(
             !texts(&lines).contains(&MSG_STATION_AGENT_CONSENT_ON),
             "{lines:?}"
         );
-        assert!(
-            coordinator
-                .config_file_baseline
-                .as_ref()
-                .unwrap()
-                .network
-                .station_agent
-                .remote_tx_enabled,
-            "the baseline still follows the file"
-        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
-        // Once the effective config agrees, the same grant applies.
-        let mut effective_on = granted.clone();
-        effective_on.network.station_agent.remote_tx_enabled = true;
-        coordinator.set_config_effective_loader(move || Ok(effective_on.clone()));
-        let mut off = granted.clone();
-        off.network.station_agent.remote_tx_enabled = false;
+    /// Merged mode measures edits on the merged result, not on the watched
+    /// file: a revocation in a higher-priority source (which is not itself
+    /// watched) is applied by the next reload, and a key the watched file
+    /// leaves at its default never hides one (Codex P1 on #436, round 2).
+    #[tokio::test]
+    async fn merged_mode_applies_a_revocation_from_a_higher_priority_source() {
+        let root = temp_path("merged-revoke");
+        let (watched, high) = (root.join("watched"), root.join("high"));
+        std::fs::create_dir_all(&watched).unwrap();
+        std::fs::create_dir_all(&high).unwrap();
+        std::fs::write(watched.join("pancetta.toml"), STATION_TOML).unwrap();
+        std::fs::write(high.join("pancetta.toml"), station_agent_toml(true)).unwrap();
+        let (mut coordinator, load) = merged_coordinator(vec![watched.clone(), high.clone()]).await;
+        assert!(station_agent_consent(&coordinator), "setup: consent on");
+        arm_client(&coordinator, "A");
+        assert!(permitted(&coordinator, "A"), "setup: armed");
+        let rx = tui_rx(&coordinator).await;
+
+        std::fs::write(high.join("pancetta.toml"), station_agent_toml(false)).unwrap();
+        // Any save of the watched file triggers the reload.
+        std::fs::write(
+            watched.join("pancetta.toml"),
+            format!("{STATION_TOML}# touched\n"),
+        )
+        .unwrap();
+        coordinator.handle_config_reload(load()).await;
+
+        assert!(!station_agent_consent(&coordinator), "consent revoked");
+        assert!(!permitted(&coordinator, "A"), "remote TX refused");
+        assert!(
+            texts(&diagnostics(&rx)).contains(&MSG_STATION_AGENT_CONSENT_OFF),
+            "the revocation is reported"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Codex P2 on #436: a revocation saved after the startup load but
+    /// before the watcher's first read is applied when the watcher starts.
+    #[tokio::test]
+    async fn an_edit_saved_before_the_watcher_started_is_reconciled() {
+        let dir = temp_path("startup-window");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pancetta.toml");
+        let mut config = base();
+        config.station.callsign = "K1TEST".to_string();
+        config.station.grid_square = "FN42".to_string();
+        let mut coordinator = test_coordinator(config.clone()).await;
         coordinator
-            .handle_config_reload(Ok((off, Vec::new())))
-            .await;
-        coordinator
-            .handle_config_reload(Ok((granted, Vec::new())))
-            .await;
-        assert!(coordinator
             .remote_tx_arm
             .lock()
             .unwrap()
-            .channel_consent(ConsentChannel::StationAgent));
+            .set_channel_consent(ConsentChannel::StationAgent, true, 0);
+        let rx = tui_rx(&coordinator).await;
+        // Saved during startup: consent off.
+        let mut saved = coordinator.config.read().await.clone();
+        saved.network.station_agent.remote_tx_enabled = false;
+        std::fs::write(&path, toml::to_string(&saved).unwrap()).unwrap();
+
+        coordinator.set_config_watch_path(path.clone());
+        coordinator
+            .start_config_reload_watcher_with_settle(Duration::from_millis(100))
+            .await
+            .unwrap();
+
+        assert!(coordinator.config_reload_rx.is_some(), "watcher started");
+        assert!(
+            !station_agent_consent(&coordinator),
+            "the startup-window edit applied"
+        );
+        assert!(
+            !coordinator
+                .config
+                .read()
+                .await
+                .network
+                .station_agent
+                .remote_tx_enabled
+        );
+        let lines = diagnostics(&rx);
+        assert!(
+            texts(&lines).contains(&MSG_CHANGED_DURING_STARTUP),
+            "{lines:?}"
+        );
+        assert!(
+            texts(&lines).contains(&MSG_STATION_AGENT_CONSENT_OFF),
+            "{lines:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The common case: the file has not changed since startup, so starting
+    /// the watcher applies and reports nothing.
+    #[tokio::test]
+    async fn starting_the_watcher_on_an_unchanged_file_reports_nothing() {
+        let dir = temp_path("startup-unchanged");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pancetta.toml");
+        let mut config = base();
+        config.station.callsign = "K1TEST".to_string();
+        config.station.grid_square = "FN42".to_string();
+        let mut coordinator = test_coordinator(config).await;
+        let rx = tui_rx(&coordinator).await;
+        let running = coordinator.config.read().await.clone();
+        std::fs::write(&path, toml::to_string(&running).unwrap()).unwrap();
+        coordinator.set_config_watch_path(path.clone());
+        coordinator
+            .start_config_reload_watcher_with_settle(Duration::from_millis(100))
+            .await
+            .unwrap();
+        assert!(coordinator.config_reload_rx.is_some());
+        assert!(diagnostics(&rx).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

@@ -446,12 +446,15 @@ async fn run_application(cli: Cli) -> Result<()> {
     coordinator.set_config_watch_path(config_watch_path);
     if cli_config_given.is_none() {
         // PAN-103: without `--config`, startup merged every discovered config
-        // source; the watched file is only one of them. Reloads re-load the
-        // merged configuration the same way before applying a consent grant.
-        coordinator.set_config_effective_loader(|| {
-            Config::load_default_unvalidated()
-                .map(|(config, _)| config)
-                .map_err(|e| e.to_string())
+        // source and the watched file is only one of them. Reloads load and
+        // validate the merged configuration the same way. The merged result
+        // carries fresh load metadata (timestamp, instance id) every time;
+        // it is dropped so it never reads as an edit.
+        coordinator.set_config_reload_loader(|| {
+            let (mut config, warnings) =
+                Config::load_default_with_warnings().map_err(|e| e.to_string())?;
+            config.metadata = None;
+            Ok((config, warnings))
         });
     }
 

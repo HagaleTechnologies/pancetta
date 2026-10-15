@@ -629,15 +629,15 @@ path is a symlink, both edits to the file it points at and repointing
 the symlink itself are picked up. If that
 file does not exist (for example, your config lives only in one of the
 other search locations above), nothing is watched and every change
-needs a restart. A save is picked up within a few seconds. Each save is
-compared with the file's previous content, so a value that came from
-another config file or a `PANCETTA_*` environment variable stays as it
-is unless you edit that key in the watched file. Without `--config`, the
-config files are merged, and turning consent on (`remote_tx_enabled`,
-`allow_tx_initiation`) in the watched file applies only if the merged
-configuration agrees: if a higher-priority file (for example
-`~/.config/pancetta/pancetta.toml`) keeps it off, consent stays off and a
-`Not applied:` line says why. Turning consent off always applies.
+needs a restart. A save is picked up within a few seconds. With
+`--config`, each save is compared with that file's previous content.
+Without `--config`, each save re-loads and validates every config file and
+`PANCETTA_*` environment variable the way startup does, and the merged
+result is compared with the previous one: a setting a higher-priority file
+(for example `~/.config/pancetta/pancetta.toml`) overrides does not change
+when you edit it in `~/.pancetta/pancetta.toml`, and an edit to that other
+file is applied the next time the watched file is saved. A save made while
+pancetta is starting is applied when watching begins.
 
 **Applied live — remote-access revocations (security):**
 
