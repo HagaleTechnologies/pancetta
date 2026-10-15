@@ -58,13 +58,30 @@ impl ConfigHotReload {
         config: Config,
         config_path: impl AsRef<Path>,
     ) -> Result<(Self, broadcast::Receiver<ConfigReloadEvent>)> {
+        // Verify the config file exists
+        if !config_path.as_ref().exists() {
+            return Err(anyhow::anyhow!(
+                "Configuration file does not exist: {}",
+                config_path.as_ref().display()
+            ));
+        }
+        Self::new_allow_missing(config, config_path)
+    }
+
+    /// Like [`new`](Self::new), but the file itself may be absent for now
+    /// (e.g. mid-way through a non-atomic replacement): only its parent
+    /// directory must exist. [`start_watching`](Self::start_watching) then
+    /// watches the parent, so the file's re-creation triggers a reload.
+    pub fn new_allow_missing(
+        config: Config,
+        config_path: impl AsRef<Path>,
+    ) -> Result<(Self, broadcast::Receiver<ConfigReloadEvent>)> {
         let config_path = config_path.as_ref().to_path_buf();
         let (event_tx, event_rx) = broadcast::channel(100);
 
-        // Verify the config file exists
-        if !config_path.exists() {
+        if !config_path.parent().is_some_and(Path::is_dir) {
             return Err(anyhow::anyhow!(
-                "Configuration file does not exist: {}",
+                "Configuration directory does not exist: {}",
                 config_path.display()
             ));
         }
@@ -195,8 +212,11 @@ impl ConfigHotReload {
             notify::Config::default().with_poll_interval(Duration::from_secs(2)),
         )?;
 
-        // Watch the configuration file
-        watcher.watch(&self.config_path, RecursiveMode::NonRecursive)?;
+        // Watch the configuration file (when it exists right now; the
+        // parent watch below sees it being created).
+        if self.config_path.exists() {
+            watcher.watch(&self.config_path, RecursiveMode::NonRecursive)?;
+        }
 
         // Also watch parent directory for file replacements (common with editors)
         if let Some(parent) = self.config_path.parent() {

@@ -387,7 +387,16 @@ impl super::ApplicationCoordinator {
     /// default location), symlinks NOT resolved. Reloads read and watch this
     /// path, so repointing a symlinked config at a new file is picked up.
     pub fn set_config_watch_path(&mut self, path: PathBuf) {
+        self.config_watch_existed_at_startup = path.is_file();
         self.config_watch_path = path;
+    }
+
+    /// Record whether the watched path held a file when startup loaded the
+    /// configuration (see `start_config_reload_watcher`). Defaults to what
+    /// [`Self::set_config_watch_path`] saw; `main.rs` sets it from the
+    /// moment of the startup load.
+    pub fn set_config_watch_existed_at_startup(&mut self, existed: bool) {
+        self.config_watch_existed_at_startup = existed;
     }
 
     /// Set how a reload loads the configuration when the watched file is
@@ -432,7 +441,13 @@ impl super::ApplicationCoordinator {
         // path's parent, which a bare relative file name does not have.
         let watch_path = std::path::absolute(&self.config_watch_path)
             .unwrap_or_else(|_| self.config_watch_path.clone());
-        if !watch_path.is_file() {
+        // A path that is absent now but existed at startup is mid-way
+        // through a replacement (or was removed after startup loaded it):
+        // watch its directory anyway, measured from the running config, so
+        // the re-created file is applied. A path that never existed (config
+        // only in another search location) is not watched.
+        let present = watch_path.is_file();
+        if !present && !self.config_watch_existed_at_startup {
             info!(
                 "Config hot reload not started: {} is not a file",
                 watch_path.display()
@@ -447,22 +462,35 @@ impl super::ApplicationCoordinator {
         // half-written while pancetta starts) must not cost the station its
         // watcher: watch anyway, measured from the running config, and report
         // the error. The next valid save is then applied as usual.
-        let (baseline, baseline_warnings, load_error) = match run_reload_loader(load.clone()).await
-        {
-            Ok((config, warnings)) => (config, warnings, None),
-            Err(e) => {
-                let mut running = self.config.read().await.clone();
-                running.metadata = None;
-                (running, self.config_warnings.clone(), Some(e))
+        let running_baseline = || async {
+            let mut running = self.config.read().await.clone();
+            running.metadata = None;
+            running
+        };
+        let (baseline, baseline_warnings, load_error) = if !present {
+            info!(
+                "{} is missing right now; watching for it to be re-created",
+                watch_path.display()
+            );
+            (running_baseline().await, self.config_warnings.clone(), None)
+        } else {
+            match run_reload_loader(load.clone()).await {
+                Ok((config, warnings)) => (config, warnings, None),
+                Err(e) => (
+                    running_baseline().await,
+                    self.config_warnings.clone(),
+                    Some(e),
+                ),
             }
         };
-        let (mut watcher, events) = match ConfigHotReload::new(baseline.clone(), &watch_path) {
-            Ok(pair) => pair,
-            Err(e) => {
-                info!("Config hot reload not started: {e}");
-                return Ok(());
-            }
-        };
+        let (mut watcher, events) =
+            match ConfigHotReload::new_allow_missing(baseline.clone(), &watch_path) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    info!("Config hot reload not started: {e}");
+                    return Ok(());
+                }
+            };
         if let Err(e) = watcher.start_watching().await {
             info!("Config hot reload not started: {e}");
             return Ok(());
@@ -486,7 +514,7 @@ impl super::ApplicationCoordinator {
             ));
         }
         self.emit_config_reload_lines(lines).await;
-        if load_error.is_none() {
+        if present && load_error.is_none() {
             self.reconcile_startup_window(&baseline).await;
         }
         self.config_file_baseline = Some(baseline);
@@ -1593,6 +1621,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Codex P1 on #436 (round 4): a config file that existed at startup but
+    /// is missing when the watcher starts (a non-atomic replacement in
+    /// progress) is still watched; its re-creation is applied.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_config_missing_at_watcher_start_is_watched_for_re_creation() {
+        let dir = temp_path("startup-missing");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pancetta.toml");
+        let mut config = base();
+        config.station.callsign = "K1TEST".to_string();
+        config.station.grid_square = "FN42".to_string();
+        let mut coordinator = test_coordinator(config).await;
+        coordinator
+            .remote_tx_arm
+            .lock()
+            .unwrap()
+            .set_channel_consent(ConsentChannel::StationAgent, true, 0);
+        coordinator.set_config_watch_path(path.clone());
+        coordinator.set_config_watch_existed_at_startup(true);
+        coordinator
+            .start_config_reload_watcher_with_settle(Duration::from_millis(100))
+            .await
+            .unwrap();
+        let mut rx = coordinator
+            .config_reload_rx
+            .take()
+            .expect("watcher started for the missing file");
+
+        let mut recreated = coordinator.config.read().await.clone();
+        recreated.network.station_agent.remote_tx_enabled = false;
+        let text = toml::to_string(&recreated).unwrap();
+        let outcome = resave_until_consent(&mut rx, false, || {
+            std::fs::write(&path, &text).unwrap();
+        })
+        .await;
+        coordinator.handle_config_reload(outcome).await;
+        assert!(
+            !station_agent_consent(&coordinator),
+            "the re-created file applies"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The common case: the file has not changed since startup, so starting
     /// the watcher applies and reports nothing.
     #[tokio::test]
@@ -2037,13 +2108,31 @@ mod tests {
         // a late event for the initial write, so a single write right after
         // start can be missed under load. Re-save until the edit arrives.
         let text = toml::to_string(&edited).unwrap();
-        let outcome = tokio::time::timeout(Duration::from_secs(30), async {
+        let outcome = resave_until_consent(&mut rx, false, || {
+            std::fs::write(&path, &text).unwrap();
+        })
+        .await;
+        let (reloaded, _) = outcome.expect("the saved file loads and validates");
+        assert!(!reloaded.network.station_agent.remote_tx_enabled);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Repeat `act` (a save) until a reload outcome whose `remote_tx_enabled`
+    /// is `want` arrives. macOS FSEvents registers watches asynchronously and
+    /// can drop or delay an event on a loaded machine, so one save is not
+    /// guaranteed to be seen in a test; `act` must be idempotent.
+    async fn resave_until_consent(
+        rx: &mut mpsc::Receiver<ConfigReloadOutcome>,
+        want: bool,
+        act: impl Fn(),
+    ) -> ConfigReloadOutcome {
+        tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                std::fs::write(&path, &text).unwrap();
+                act();
                 let wait = tokio::time::timeout(Duration::from_secs(3), async {
                     loop {
                         let outcome = rx.recv().await.expect("channel open");
-                        if matches!(&outcome, Ok((c, _)) if !c.network.station_agent.remote_tx_enabled)
+                        if matches!(&outcome, Ok((c, _)) if c.network.station_agent.remote_tx_enabled == want)
                         {
                             return outcome;
                         }
@@ -2055,28 +2144,7 @@ mod tests {
             }
         })
         .await
-        .expect("a reload outcome carrying the edit within 30 s");
-        let (reloaded, _) = outcome.expect("the saved file loads and validates");
-        assert!(!reloaded.network.station_agent.remote_tx_enabled);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Wait for the next reload outcome whose `remote_tx_enabled` is `want`.
-    async fn next_outcome_with_consent(
-        rx: &mut mpsc::Receiver<ConfigReloadOutcome>,
-        want: bool,
-    ) -> ConfigReloadOutcome {
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                let outcome = rx.recv().await.expect("channel open");
-                if matches!(&outcome, Ok((c, _)) if c.network.station_agent.remote_tx_enabled == want)
-                {
-                    return outcome;
-                }
-            }
-        })
-        .await
-        .expect("a matching reload outcome within 15 s")
+        .expect("a matching reload outcome within 30 s")
     }
 
     /// `--config` names a symlink that a dotfile manager repoints at a new
@@ -2122,9 +2190,12 @@ mod tests {
         let new_target = new_dir.join("pancetta.toml");
         std::fs::write(&new_target, toml::to_string(&revoked).unwrap()).unwrap();
         let tmp_link = link_dir.join(".pancetta.toml.tmp");
-        std::os::unix::fs::symlink(&new_target, &tmp_link).unwrap();
-        std::fs::rename(&tmp_link, &link).unwrap();
-        let outcome = next_outcome_with_consent(&mut rx, false).await;
+        let outcome = resave_until_consent(&mut rx, false, || {
+            let _ = std::fs::remove_file(&tmp_link);
+            std::os::unix::fs::symlink(&new_target, &tmp_link).unwrap();
+            std::fs::rename(&tmp_link, &link).unwrap();
+        })
+        .await;
         // Saved before the new directory is watched: no event fires for it.
         let mut pruned = revoked.clone();
         pruned.network.station_agent.tx_allow_list = vec!["B".to_string()];
@@ -2155,8 +2226,12 @@ mod tests {
         // library's 500 ms reload debounce first (this test's settle is
         // shorter than the production 750 ms that covers it).
         tokio::time::sleep(Duration::from_millis(700)).await;
-        std::fs::write(&new_target, toml::to_string(&config).unwrap()).unwrap();
-        assert!(next_outcome_with_consent(&mut rx, true).await.is_ok());
+        let text = toml::to_string(&config).unwrap();
+        let outcome = resave_until_consent(&mut rx, true, || {
+            std::fs::write(&new_target, &text).unwrap();
+        })
+        .await;
+        assert!(outcome.is_ok());
         let _ = std::fs::remove_dir_all(&root);
     }
 

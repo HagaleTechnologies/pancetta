@@ -823,6 +823,10 @@ pub struct ApplicationCoordinator {
     /// `--config`); reloads apply that. `None` when the watched file is the
     /// whole configuration (`--config`): reloads load the file alone.
     config_reload_loader: Option<config_reload::ConfigReloadLoader>,
+    /// PAN-103: whether `config_watch_path` held a file when startup loaded
+    /// the configuration. A path missing at watcher start is still watched
+    /// when it did (it is mid-way through a replacement).
+    config_watch_existed_at_startup: bool,
 
     /// PAN-43/45 follow-up (Codex round 2 on PR #342): self-CQ attempt IDs
     /// whose dispatch failed but whose `AutonomousCqDispatchFailed`
@@ -2138,6 +2142,7 @@ impl ApplicationCoordinator {
             config_reload_rx: None,
             config_file_baseline: None,
             config_reload_loader: None,
+            config_watch_existed_at_startup: false,
             pending_autonomous_cq_dispatch_failures: Arc::new(std::sync::Mutex::new(Vec::new())),
             pending_qso_offset_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
             pending_cq_offset_nudge: Arc::new(std::sync::atomic::AtomicBool::new(false)),
