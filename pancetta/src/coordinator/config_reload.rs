@@ -443,15 +443,19 @@ impl super::ApplicationCoordinator {
         // from (see the module doc).
         self.config_watch_path = watch_path.clone();
         let load = self.reload_loader();
-        let baseline = match run_reload_loader(load.clone()).await {
-            Ok(pair) => pair,
+        // A config that fails to load or validate right now (e.g. saved
+        // half-written while pancetta starts) must not cost the station its
+        // watcher: watch anyway, measured from the running config, and report
+        // the error. The next valid save is then applied as usual.
+        let (baseline, baseline_warnings, load_error) = match run_reload_loader(load.clone()).await
+        {
+            Ok((config, warnings)) => (config, warnings, None),
             Err(e) => {
-                info!("Config hot reload not started: {e}");
-                return Ok(());
+                let mut running = self.config.read().await.clone();
+                running.metadata = None;
+                (running, self.config_warnings.clone(), Some(e))
             }
         };
-        // Startup already showed this file's warnings (`config_warnings`).
-        let (baseline, baseline_warnings) = baseline;
         let (mut watcher, events) = match ConfigHotReload::new(baseline.clone(), &watch_path) {
             Ok(pair) => pair,
             Err(e) => {
@@ -467,7 +471,24 @@ impl super::ApplicationCoordinator {
         tokio::spawn(forward_config_reload_events(events, tx, load, settle));
         self.config_reload_watcher = Some(watcher);
         self.config_reload_rx = Some(rx);
-        self.reconcile_startup_window(&baseline).await;
+        // Startup showed its own load warnings (`config_warnings`); one
+        // introduced by a save since then has not been shown yet.
+        let mut lines: Vec<(DiagnosticLevel, String)> = baseline_warnings
+            .iter()
+            .filter(|w| !self.config_warnings.contains(w))
+            .map(|w| (DiagnosticLevel::Warn, format!("Config warning: {w}")))
+            .collect();
+        if let Some(e) = &load_error {
+            warn!("Config reload failed at watcher start: {e}");
+            lines.push((
+                DiagnosticLevel::Error,
+                format!("Config reload failed: {e} — previous configuration still active"),
+            ));
+        }
+        self.emit_config_reload_lines(lines).await;
+        if load_error.is_none() {
+            self.reconcile_startup_window(&baseline).await;
+        }
         self.config_file_baseline = Some(baseline);
         self.config_file_warnings = baseline_warnings;
         // `start_watching` already watches the path's own directory; record
@@ -1492,6 +1513,86 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Codex P1 on #436 (round 3): a config that fails to load when the
+    /// watcher starts still gets a watcher, and the error is reported; the
+    /// next valid save is applied.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_config_invalid_at_watcher_start_still_gets_a_watcher() {
+        let dir = temp_path("startup-invalid");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pancetta.toml");
+        let mut config = base();
+        config.station.callsign = "K1TEST".to_string();
+        config.station.grid_square = "FN42".to_string();
+        let mut coordinator = test_coordinator(config).await;
+        coordinator
+            .remote_tx_arm
+            .lock()
+            .unwrap()
+            .set_channel_consent(ConsentChannel::StationAgent, true, 0);
+        let rx = tui_rx(&coordinator).await;
+        std::fs::write(&path, "[station\ncallsign = ").unwrap();
+        coordinator.set_config_watch_path(path.clone());
+        coordinator
+            .start_config_reload_watcher_with_settle(Duration::from_millis(100))
+            .await
+            .unwrap();
+        assert!(coordinator.config_reload_rx.is_some(), "watcher started");
+        let lines = diagnostics(&rx);
+        assert!(
+            lines.iter().any(
+                |(l, t)| *l == DiagnosticLevel::Error && t.starts_with("Config reload failed:")
+            ),
+            "{lines:?}"
+        );
+        assert!(
+            station_agent_consent(&coordinator),
+            "nothing applied from the broken file"
+        );
+
+        // The operator fixes the file, revoking consent.
+        let mut fixed = coordinator.config.read().await.clone();
+        fixed.network.station_agent.remote_tx_enabled = false;
+        std::fs::write(&path, toml::to_string(&fixed).unwrap()).unwrap();
+        let outcome = (coordinator.reload_loader())();
+        coordinator.handle_config_reload(outcome).await;
+        assert!(
+            !station_agent_consent(&coordinator),
+            "the fixed save applies"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Codex P2 on #436 (round 3): a load warning introduced by a save during
+    /// startup is shown when the watcher starts.
+    #[tokio::test]
+    async fn a_warning_introduced_during_startup_is_shown_at_watcher_start() {
+        let dir = temp_path("startup-warning");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pancetta.toml");
+        let mut config = base();
+        config.station.callsign = "K1TEST".to_string();
+        config.station.grid_square = "FN42".to_string();
+        let mut coordinator = test_coordinator(config).await;
+        let rx = tui_rx(&coordinator).await;
+        let running = coordinator.config.read().await.clone();
+        let text = toml::to_string(&running).unwrap() + "\n[bogus_section]\nx = 1\n";
+        std::fs::write(&path, text).unwrap();
+        coordinator.set_config_watch_path(path.clone());
+        coordinator
+            .start_config_reload_watcher_with_settle(Duration::from_millis(100))
+            .await
+            .unwrap();
+        let lines = diagnostics(&rx);
+        assert!(
+            lines
+                .iter()
+                .any(|(l, t)| *l == DiagnosticLevel::Warn && t.starts_with("Config warning:")),
+            "{lines:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The common case: the file has not changed since startup, so starting
     /// the watcher applies and reports nothing.
     #[tokio::test]
@@ -1932,14 +2033,29 @@ mod tests {
 
         let mut edited = config.clone();
         edited.network.station_agent.remote_tx_enabled = false;
-        // Give the watcher a moment to register before the write.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        std::fs::write(&path, toml::to_string(&edited).unwrap()).unwrap();
-
-        // A late event for the initial write (macOS FSEvents can deliver it
-        // after the sleep above) forwards the pre-edit content first; wait
-        // for the outcome carrying the edit.
-        let outcome = next_outcome_with_consent(&mut rx, false).await;
+        // macOS FSEvents registers the watch asynchronously and can deliver
+        // a late event for the initial write, so a single write right after
+        // start can be missed under load. Re-save until the edit arrives.
+        let text = toml::to_string(&edited).unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                std::fs::write(&path, &text).unwrap();
+                let wait = tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        let outcome = rx.recv().await.expect("channel open");
+                        if matches!(&outcome, Ok((c, _)) if !c.network.station_agent.remote_tx_enabled)
+                        {
+                            return outcome;
+                        }
+                    }
+                });
+                if let Ok(outcome) = wait.await {
+                    return outcome;
+                }
+            }
+        })
+        .await
+        .expect("a reload outcome carrying the edit within 30 s");
         let (reloaded, _) = outcome.expect("the saved file loads and validates");
         assert!(!reloaded.network.station_agent.remote_tx_enabled);
         let _ = std::fs::remove_dir_all(&dir);
