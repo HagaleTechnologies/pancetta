@@ -21,17 +21,13 @@ name: Wait for Codex
 # project_hag78_coppa_migration_20260922 for the full saga), since a label has no
 # "creating identity" ownership restriction the way a check-run does.
 #
-# HAG-96 (discovered live during THIS PR's own review cycle): issue_comment has never
-# triggered a single workflow run on pancetta specifically, in its entire history (0 of
-# 5000+ runs, vs coppa's 8) -- root cause not yet identified, tracked separately. This means
-# a Codex response delivered as a bare comment (rather than a formal pull_request_review)
-# is never processed here. Unlike HAG-87's already-accepted reaction-gap, credenza's
-# org-wide timeout-scan backstop does NOT cover this: it only recovers checks stuck
-# in_progress past 90/120 minutes, not one that's already reached a COMPLETED-but-stale
-# conclusion from an earlier round (exactly what happens if a bare-comment response is
-# missed). Until HAG-96 is root-caused, a stuck stale conclusion on this repo needs a human
-# to either push a new commit (resets the check-run's history entirely) or wait for Codex to
-# happen to respond via a formal review instead on a re-request.
+# WID-20 / dispensa Q-0068: CODEX_REVIEW_PAT and HAGALE_AGENT_APP_PRIVATE_KEY live in the
+# codex-review environment (deployment branches: main only). Every job that reads either one
+# declares it; merge_group (a PR-derived ref the environment rejects) uses github.token only.
+# pull_request_review is dropped: a Codex findings review now leaves the gate pending (still
+# blocks merge) instead of red; Catalyst remediates on the non-clean review, and the clean
+# verdict arrives on issue_comment (HAG-96's "issue_comment never fires here" no longer holds:
+# it fires routinely as of 2026-10-14). credenza's timeout scan fails an abandoned PR.
 #
 # Top-level workflow `name:` is deliberately UNCHANGED ("Wait for Codex", not renamed) --
 # queue-retry-handler.yml's own `workflows: ['CI', 'Supply Chain', 'Wait for Codex']`
@@ -64,22 +60,19 @@ on:
   # executes the PR's own code -- only `gh api` calls against metadata (PR number, head
   # SHA) from the event payload.
   pull_request_target:
+    # Q-0068: non-main bases get no gate (main-only codex-review environment); main's ruleset is what requires it.
+    branches: [main]
     types: [opened, ready_for_review, synchronize, reopened]
-  # Codex P1, this PR's own round-1 review: codex-review-response's own job-level `if:`
-  # already gates on pull_request_review/issue_comment from the Codex bot actor -- but
-  # without these two event types actually triggering the WORKFLOW at all, that job could
-  # never run in the first place. Every real Codex response would leave the managed check
-  # permanently in_progress until the org-wide timeout-scan backstop eventually failed it.
-  pull_request_review:
-    types: [submitted]
+  # issue_comment: Codex's clean verdict (and its error replies) arrive here and fire
+  # codex-review-response. pull_request_review was dropped (Q-0068, see header).
   issue_comment:
     types: [created]
   # merge_group: pancetta's native merge-queue ruleset re-evaluates every required check
-  # against a temporary merge-group SHA with no associated PR context. Handled by an
-  # event-gated pass-through step in the request job rather than a second job (two
-  # same-named check-runs would rely on undocumented same-name multi-run matching
-  # semantics for a REQUIRED check -- pancetta's own OLD file already made this exact
-  # design choice, carried forward unchanged).
+  # against a temporary merge-group SHA with no associated PR context. Handled by
+  # codex-review-merge-group-passthrough below, which posts the one managed check-run with
+  # github.token and reads no secret (Q-0068: a merge_group ref can't enter the main-only
+  # codex-review environment). Its job name differs from the managed check name, so there
+  # is still exactly one check-run under the required name.
   #
   # IMPORTANT bootstrap note (learned live on coppa PR #113): merge_group evaluates the
   # workflow file as it exists in the PR's OWN INCOMING content, not the base branch's
@@ -99,7 +92,7 @@ permissions:
 
 jobs:
   # ============================================================================================
-  # Producer half: fires on every pull_request_target action (plus merge_group). Creates/
+  # Producer half: fires on every pull_request_target action. Creates/
   # upserts the "Codex review clean (gate before expensive downstream jobs)" check-run and
   # asks Codex to look -- never waits for a response itself. Either an immediate
   # pass-through (applies the codex-clean label directly, no Codex round to wait on) or
@@ -140,8 +133,14 @@ jobs:
     # steps -- App-token mint included -- must never run for either). merge_group is
     # unaffected by this revert: merge_group events are NOT Dependabot-triggered and have
     # normal secret access, so its own explicit-upsert fix from round 8 stays correct.
+    # merge_group is no longer handled here (Q-0068; see codex-review-merge-group-passthrough).
     name: Codex review request (producer)
-    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request_target' && github.event.pull_request.draft == false && github.actor != 'dependabot[bot]')
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.draft == false && github.actor != 'dependabot[bot]'
+    # Q-0068: secrets come from the main-only codex-review environment (pull_request_target
+    # runs at main).
+    environment:
+      name: codex-review
+      deployment: false
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -150,12 +149,11 @@ jobs:
       issues: write
       checks: write
     # A newer push must supersede an older run outright -- cancelling is simpler and
-    # stronger than re-verifying HEAD right before the mutation. merge_group.head_sha keeps
-    # concurrent merge-queue entries in DISTINCT groups; run_attempt == 1 only, so a stale
+    # stronger than re-verifying HEAD right before the mutation. run_attempt == 1 only, so a stale
     # rerun replaying an old event can't cancel a run actively gating a newer head before
     # that run's own head-check step gets a chance to no-op the stale one instead.
     concurrency:
-      group: codex-review-request-${{ github.event.pull_request.number || github.event.merge_group.head_sha }}
+      group: codex-review-request-${{ github.event.pull_request.number }}
       cancel-in-progress: ${{ github.run_attempt == 1 }}
     outputs:
       check_run_id: ${{ steps.create-check.outputs.check_run_id }}
@@ -166,11 +164,8 @@ jobs:
         # github.token can create a check-run within its own run but is rejected for
         # updating one a DIFFERENT run created, and a plain PAT is rejected outright for
         # both create and update. hagale-agent (App ID 4696353) is not subject to either
-        # restriction. Already used fleet-wide (HAG-44/74/75/78). Also minted for
-        # merge_group now (round 8) -- that path explicitly upserts the managed check too,
-        # rather than relying on this job's own native attribution (see the job's header
-        # comment for why).
-        if: github.event_name == 'merge_group' || github.event_name == 'pull_request_target'
+        # restriction. Already used fleet-wide (HAG-44/74/75/78).
+        if: github.event_name == 'pull_request_target'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: 4696353
@@ -265,19 +260,14 @@ jobs:
 
       - name: Create/upsert the codex-clean check-run
         id: create-check
-        # Round 8: also runs for merge_group now, explicitly upserting the managed check
-        # to completed/success there (see the job's own header comment) instead of relying
-        # on the "Pass through for merge-queue evaluation" step's mere existence -- that
-        # standalone step is removed; this one step now covers both paths.
-        if: github.event_name == 'merge_group' || (github.event_name == 'pull_request_target' && steps.head-check.outputs.stale != 'true')
+        if: github.event_name == 'pull_request_target' && steps.head-check.outputs.stale != 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           RUN_ID: ${{ github.run_id }}
           ALREADY_CLEAN: ${{ steps.existing-label.outputs.already_clean || 'false' }}
           BOOTSTRAP_STATUS: ${{ steps.bootstrap-check.outputs.bootstrap_status || 'absent' }}
-          IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
         run: |
           set -o pipefail
 
@@ -340,16 +330,12 @@ jobs:
             fi
           }
 
-          # merge_group (the constituent PR already passed a real Codex review during its
-          # own PR phase -- nothing further to review on this synthetic integration
-          # commit), OR bootstrap not live yet, OR the label already exists: pass through
+          # Bootstrap not live yet, OR the label already exists: pass through
           # immediately with a completed, successful check-run. Dependabot never reaches
           # this step at all -- excluded at the job level (see the job's own header
           # comment), since GitHub withholds secrets from Dependabot-triggered runs and this
           # step needs the minted App token.
-          if [ "$IS_MERGE_GROUP" = "true" ]; then
-            conclusion="success"
-          elif [ "$BOOTSTRAP_STATUS" != "ready" ]; then
+          if [ "$BOOTSTRAP_STATUS" != "ready" ]; then
             conclusion="success"
           elif [ "$ALREADY_CLEAN" = "true" ]; then
             conclusion="success"
@@ -451,13 +437,13 @@ jobs:
   codex-review-request-failsafe:
     name: Codex review request setup failsafe
     needs: codex-review-request
-    # Proactive fix mirroring coppa's HAG-93 round-3 finding on the identical redesign:
-    # round 8 made merge_group depend on the SAME app-token mint + create-check machinery as
-    # pull_request_target to publish the required check (no more native-attribution fallback
-    # for that event either) -- this failsafe needs to cover it too, or a transient App/API
-    # failure on a merge_group run leaves that required check permanently absent with no
-    # automatic recovery.
-    if: always() && needs.codex-review-request.result == 'failure' && (github.event_name == 'pull_request_target' || github.event_name == 'merge_group')
+    # Q-0068: merge_group no longer reaches codex-review-request (see
+    # codex-review-merge-group-passthrough), so this is pull_request_target only.
+    if: always() && needs.codex-review-request.result == 'failure' && github.event_name == 'pull_request_target'
+    # Q-0068: the app key lives in the main-only codex-review environment.
+    environment:
+      name: codex-review
+      deployment: false
     runs-on: ubuntu-latest
     timeout-minutes: 2
     permissions:
@@ -491,7 +477,7 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
           USED_GITHUB_TOKEN: ${{ steps.app-token.outcome == 'failure' && 'true' || 'false' }}
           REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           RUN_ID: ${{ github.run_id }}
         run: |
           # Only proceed when no check-run for this head_sha exists yet at all -- if a
@@ -535,8 +521,39 @@ jobs:
           JSON
 
   # ============================================================================================
-  # Consumer half: fires once per Codex reply (pull_request_review or issue_comment from
-  # Codex's own actor), never on a poll interval. Re-derives everything it needs from live
+  # merge_group pass-through (Q-0068). The constituent PR already passed a real Codex review in
+  # its PR phase; nothing further to review on this synthetic integration commit. Uses
+  # github.token and no secret: a merge_group ref can't enter the main-only codex-review
+  # environment. The merge-group head SHA is fresh, so no other app's check-run exists to
+  # update. Job name deliberately differs from the managed check name (see
+  # codex-review-request).
+  # ============================================================================================
+  codex-review-merge-group-passthrough:
+    name: 'Codex review clean: merge-group pass-through'
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      checks: write
+    steps:
+      - name: Report a completed, successful check-run for the merge-group SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        run: |
+          gh api -X POST "repos/${REPO}/check-runs" \
+            -f name="Codex review clean (gate before expensive downstream jobs)" \
+            -f head_sha="$HEAD_SHA" \
+            -f status="completed" \
+            -f conclusion="success" \
+            -f output[title]="Merge-group pass-through" \
+            -f output[summary]="The constituent PR already passed a real Codex review during its own PR phase; nothing further to review on this synthetic integration commit." \
+            >/dev/null
+
+  # ============================================================================================
+  # Consumer half: fires once per Codex reply (issue_comment from Codex's own actor; Q-0068
+  # dropped pull_request_review), never on a poll interval. Re-derives everything it needs from live
   # GitHub data using timestamp comparison against the request comment's own creation time --
   # no cross-invocation state beyond the marker comments and the check-run's own status.
   # ============================================================================================
@@ -546,8 +563,12 @@ jobs:
     # author.login -- these two APIs disagree on bot-actor login formatting (the webhook
     # payload reports the [bot]-suffixed form).
     if: |
-      (github.event_name == 'pull_request_review' && (github.event.review.user.login == 'chatgpt-codex-connector' || github.event.review.user.login == 'chatgpt-codex-connector[bot]')) ||
-      (github.event_name == 'issue_comment' && (github.event.comment.user.login == 'chatgpt-codex-connector' || github.event.comment.user.login == 'chatgpt-codex-connector[bot]') && github.event.issue.pull_request != null)
+      github.event_name == 'issue_comment' && (github.event.comment.user.login == 'chatgpt-codex-connector' || github.event.comment.user.login == 'chatgpt-codex-connector[bot]') && github.event.issue.pull_request != null
+    # Q-0068: secrets come from the main-only codex-review environment (issue_comment runs
+    # at main).
+    environment:
+      name: codex-review
+      deployment: false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

@@ -568,3 +568,20 @@ beside each client, not config:
 Rule: do not call `.text()`, `.bytes()` or `.json()` on a `reqwest::Response` in these crates, and
 do not dial or accept a WebSocket without a `WebSocketConfig` sized to its protocol. The
 remote-gateway acceptor does not follow this rule yet (PAN-99).
+
+## Release workflow pins and token scope (PAN-106, 2026-10-14)
+
+- **Pins.** `.github/workflows/release.yml` pins every action to a full commit SHA, with the
+  version in a trailing comment. `dtolnay/rust-toolchain` follows its `stable` branch at a pinned
+  SHA (the commit `stable` resolved to when pinned), so a toolchain-action update is an explicit
+  pin bump. `supply-chain.yml` still pins an older `dtolnay/rust-toolchain` commit; aligning the
+  two is a follow-up.
+- **Token.** The workflow-level token is `contents: read`. Only the `release` job, which runs
+  `gh release create`, declares `contents: write`; `build` inherits read-only. Both checkouts set
+  `persist-credentials: false`; the `ft8_lib` submodule is public and fetches anonymously.
+- **Rule.** Add new actions to `release.yml` SHA-pinned, and do not give `build` any write scope.
+  The `Supply Chain` pin check only covers newly added `uses:` lines, so it does not catch an
+  existing ref being left mutable.
+- **Deferred.** Artifact attestation and signing (it needs `id-token: write` and
+  `attestations: write` on `build`, so it gets its own decision), and pinning plus permission
+  scoping for `demo-assets.yml`, `docs.yml`, `dependabot-auto-merge.yml` and `ci.yml`.
