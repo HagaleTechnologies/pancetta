@@ -236,7 +236,10 @@ pub enum RecvOutcome {
 }
 
 /// A synchronous WebSocket seam so the session driver can be tested with a
-/// scripted mock. The production async implementation lands in P3.4.
+/// scripted mock. The production implementation is the station agent's
+/// `RealWsConn` (in the `pancetta` crate). Real implementations must bound
+/// every call with a deadline: the session driver has no other way to regain
+/// control from a relay that stops responding.
 pub trait WsConn {
     /// Send a text frame.
     fn send_text(&mut self, s: String) -> Result<(), RelayError>;
@@ -256,6 +259,13 @@ pub trait WsConn {
             Some(t) => RecvOutcome::Frame(t),
             None => RecvOutcome::Closed,
         })
+    }
+
+    /// Free slots in this connection's outbound queue, if it has one. `None`
+    /// means unknown or unbounded (scripted mocks). The session loop is the
+    /// only producer, so the value can only grow before the loop's next send.
+    fn send_capacity(&self) -> Option<usize> {
+        None
     }
 }
 
@@ -413,6 +423,20 @@ mod tests {
             m.recv_text_within(d).unwrap(),
             RecvOutcome::Closed
         ));
+    }
+
+    #[test]
+    fn send_capacity_default_is_unknown() {
+        struct M;
+        impl WsConn for M {
+            fn send_text(&mut self, _s: String) -> Result<(), RelayError> {
+                Ok(())
+            }
+            fn recv_text(&mut self) -> Result<Option<String>, RelayError> {
+                Ok(None)
+            }
+        }
+        assert_eq!(M.send_capacity(), None, "a scripted mock reports no queue");
     }
 
     #[test]

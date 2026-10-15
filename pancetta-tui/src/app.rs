@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use crossterm::event::MouseEvent;
 use ratatui::layout::Rect;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
@@ -1246,10 +1246,14 @@ pub struct App {
     /// Shift+D overlay visibility for `diagnostic_events`.
     pub show_diagnostics: bool,
     /// Shift+S overlay visibility for the consolidated station-health panel
-    /// (docs/observability-diagnostics-plan.md Layer 3). Unlike
-    /// `show_diagnostics` (a scrollback), this is a snapshot view — no
-    /// scroll-position field needed.
+    /// (docs/observability-diagnostics-plan.md Layer 3). A snapshot view,
+    /// not a scrollback like `show_diagnostics`.
     pub show_health: bool,
+    /// PAN-89: first visible line of the Shift+S panel (rendered lines,
+    /// after wrapping) — its readiness section can outgrow the panel at
+    /// 80×24. Reset to 0 on open; clamped by the key handler and again by
+    /// the renderer.
+    pub health_scroll: u16,
     /// Shift+R overlay visibility for `recent_qsos` (docs/observability-
     /// diagnostics-plan.md Layer 2 — the Recent-QSOs panel). Sibling toggle
     /// to `show_diagnostics`; lowercase `r` is taken (Re-send last TX), so
@@ -1493,6 +1497,18 @@ pub struct App {
     pub tx_output_default: bool,
     /// RX capture fell back to a device other than the configured one.
     pub input_fallback: bool,
+    /// PAN-89: latest coordinator readiness snapshot (`None` until the
+    /// relay's first push, which the strip shows as `… CHECKING`).
+    pub station_readiness: Option<crate::readiness::StationReadiness>,
+    /// PAN-89: sticky error alerts from `TuiMessage::Error`, oldest first,
+    /// capped at `readiness::ALERT_CAP`. They stay on the readiness strip
+    /// until acknowledged with `!`; decodes can't erase them.
+    pub alerts: VecDeque<crate::readiness::Alert>,
+    /// PAN-89: warnings the operator acknowledged with `!`. Pruned to the
+    /// still-active conditions whenever readiness inputs update, so an ack
+    /// covers one episode and a recurrence shows again.
+    pub acknowledged_readiness: HashSet<crate::readiness::ReadinessKey>,
+    next_alert_id: u64,
 
     // Band/frequency tracking
     pub current_band_index: usize,
@@ -1625,6 +1641,7 @@ impl App {
             recent_qsos: VecDeque::with_capacity(50),
             show_diagnostics: false,
             show_health: false,
+            health_scroll: 0,
             show_recent_qsos: false,
             diagnostics_scroll: 0,
             recent_qsos_scroll: 0,
@@ -1689,6 +1706,10 @@ impl App {
             rig_connected: RigConnDisplay::default(),
             tx_output_default: false,
             input_fallback: false,
+            station_readiness: None,
+            alerts: VecDeque::new(),
+            acknowledged_readiness: HashSet::new(),
+            next_alert_id: 0,
             current_band_index: default_band_index,
             radio_frequency: None,
             band_cache: HashMap::new(),
@@ -2205,7 +2226,9 @@ impl App {
         self.clamp_dx_hunter_selection();
         self.clamp_callers_selection();
 
-        self.status_message = format!("Decoded: {}", message.message);
+        // PAN-89: decodes no longer echo on the status line — Band Activity
+        // lists them and `Msgs: N` counts them, and the echo was what erased
+        // errors and other operator messages within a second of busy band.
         Ok(())
     }
 
@@ -3069,6 +3092,66 @@ impl App {
 
     pub fn add_error_message(&mut self, error: String) {
         self.status_message = format!("Error: {}", error);
+        // PAN-89: also a sticky alert on the readiness strip until `!`
+        // acknowledges it. A repeat of an unacknowledged alert counts up
+        // instead of stacking.
+        if let Some(alert) = self
+            .alerts
+            .iter_mut()
+            .find(|a| !a.acknowledged && a.text == error)
+        {
+            alert.count += 1;
+            return;
+        }
+        self.next_alert_id += 1;
+        self.alerts.push_back(crate::readiness::Alert {
+            id: self.next_alert_id,
+            text: error,
+            count: 1,
+            first_at: Utc::now(),
+            acknowledged: false,
+        });
+        while self.alerts.len() > crate::readiness::ALERT_CAP {
+            self.alerts.pop_front();
+        }
+    }
+
+    /// PAN-89 `!`: acknowledge every visible readiness Warning (alerts are
+    /// marked acknowledged). Blockers and Notices are untouched. Returns how
+    /// many items were acknowledged.
+    pub fn acknowledge_readiness(&mut self) -> usize {
+        let mut count = 0;
+        for item in crate::readiness::readiness_items(self) {
+            if !item.is_visible() || !item.is_acknowledgeable() {
+                continue;
+            }
+            match item.key {
+                crate::readiness::ReadinessKey::Alert(id) => {
+                    if let Some(alert) = self.alerts.iter_mut().find(|a| a.id == id) {
+                        alert.acknowledged = true;
+                    }
+                }
+                key => {
+                    self.acknowledged_readiness.insert(key);
+                }
+            }
+            count += 1;
+        }
+        count
+    }
+
+    /// PAN-89: forget acks for conditions that are no longer active, so the
+    /// next episode of a condition shows again.
+    pub fn prune_acknowledged_readiness(&mut self) {
+        if self.acknowledged_readiness.is_empty() {
+            return;
+        }
+        let active: HashSet<crate::readiness::ReadinessKey> =
+            crate::readiness::readiness_items(self)
+                .into_iter()
+                .map(|i| i.key)
+                .collect();
+        self.acknowledged_readiness.retain(|k| active.contains(k));
     }
 
     /// Append a retained diagnostic event, evicting the oldest once the
@@ -4731,6 +4814,36 @@ mod tests {
             priority_score: None,
             is_own_tx: false,
         }
+    }
+
+    #[tokio::test]
+    async fn decoded_message_does_not_overwrite_status_message() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.status_message = "Applying rig config…".to_string();
+        for i in 0..30 {
+            app.add_decoded_message(fixture_view(&format!("K{i}ABC"), -10))
+                .await
+                .unwrap();
+        }
+        assert_eq!(app.status_message, "Applying rig config…");
+    }
+
+    #[tokio::test]
+    async fn error_message_becomes_sticky_alert_that_survives_decodes() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.add_error_message("Rig connect failed (connection refused)".to_string());
+        for i in 0..50 {
+            app.add_decoded_message(fixture_view(&format!("K{i}ABC"), -10))
+                .await
+                .unwrap();
+        }
+        assert_eq!(app.alerts.len(), 1);
+        assert_eq!(
+            app.alerts[0].text,
+            "Rig connect failed (connection refused)"
+        );
+        assert!(!app.alerts[0].acknowledged);
+        assert!(app.status_message.starts_with("Error: "));
     }
 
     fn fixture_view_directed(call: &str, snr: i32) -> DecodedMessageView {

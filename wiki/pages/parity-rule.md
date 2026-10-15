@@ -52,6 +52,11 @@ decode from the partner. Full findings: `docs/qso-tx-deep-review-2026-07-18.md`
   `pancetta/src/coordinator/qso.rs`; as of 2026-07-18, `RespondToCaller` runs
   through the same admission gate too (it used to be the one manual entry
   point that admitted immediately regardless of the committed side).
+- PAN-78: the manual open handlers check capacity (`capacity_snapshot`,
+  `max_concurrent_qsos` or Fox `fox_max_streams`) right after this parity gate
+  and refuse at capacity; a cross-parity pick still queues, and promotion from
+  the queue starts only as many calls as there are free slots. Details in
+  `docs/DECISIONS/tx-scheduling.md` ("Manual admission capacity gate").
 - The TX coalescer and the autonomous multi-TX bundler both **exclude** (never
   coerce) a bundle stream whose `tx_parity` disagrees with the bundle's anchor
   — added 2026-07-18 after finding bundles previously just assumed their

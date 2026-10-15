@@ -144,6 +144,8 @@ impl super::ApplicationCoordinator {
         // PAN-114: clock-skew warning published by the clock-skew monitor
         // (`clock_monitor.rs`), read on the same 2s health tick.
         let clock_skew_relay = self.clock_skew.clone();
+        // PAN-89: readiness-strip inputs, snapshotted on the same 2s tick.
+        let readiness_sources = super::readiness::ReadinessSources::from_coordinator(self);
         // Clone our callsign before the tui-relay thread consumes the original
         // via move. The async command-handler task below needs its own copy.
         let cmd_our_callsign = our_callsign_for_relay.clone();
@@ -170,6 +172,11 @@ impl super::ApplicationCoordinator {
             // C20 — RF-present / zero-decodes detector (mode/clock fault),
             // fed from the cumulative DSP-window + decode telemetry below.
             let mut rf_no_decode = super::health::RfNoDecodeMonitor::new();
+            // PAN-89: current RF/silent-input edge state for the readiness
+            // snapshot, and its push-on-change bookkeeping.
+            let mut rf_no_decode_active = false;
+            let mut input_silent_active = false;
+            let mut readiness_publisher = super::readiness::ReadinessPublisher::default();
             // PAN-85: remember the last US state actually forwarded for each
             // callsign (uppercased key) rather than merely that one was sent,
             // so both a state learned later (QRZ enrichment mid-session) and a
@@ -765,6 +772,12 @@ impl super::ApplicationCoordinator {
                         f32::from_bits(health_last_rms_relay.load(Ordering::Relaxed));
                     let edges =
                         rf_no_decode.observe(rf_dsp_windows, rf_total_decodes, rf_last_rms);
+                    if let Some(active) = edges.rf_no_decode {
+                        rf_no_decode_active = active;
+                    }
+                    if let Some(active) = edges.silent_input {
+                        input_silent_active = active;
+                    }
                     match edges.rf_no_decode {
                         Some(true) => {
                             let _ = tui_msg_tx_relay.send(
@@ -811,6 +824,31 @@ impl super::ApplicationCoordinator {
                             );
                         }
                         None => {}
+                    }
+
+                    // PAN-89: station-readiness strip — push only on change.
+                    let readiness =
+                        readiness_sources.snapshot(rf_no_decode_active, input_silent_active);
+                    let (send_readiness, ptt_cleared) = readiness_publisher.observe(&readiness);
+                    if send_readiness {
+                        let _ = tui_msg_tx_relay.send(
+                            pancetta_tui::tui_runner::TuiMessage::StationReadiness(readiness),
+                        );
+                    }
+                    if ptt_cleared {
+                        const PTT_CLEARED: &str =
+                            "PTT-off confirmed by the rig — stuck-PTT warning cleared";
+                        info!("{PTT_CLEARED}");
+                        let _ = tui_msg_tx_relay.send(
+                            pancetta_tui::tui_runner::TuiMessage::DiagnosticEvent {
+                                ts: chrono::Utc::now(),
+                                target: "supervisor",
+                                level: pancetta_core::DiagnosticLevel::Info,
+                                text: PTT_CLEARED.into(),
+                                qso_id: None,
+                                callsign: None,
+                            },
+                        );
                     }
                 }
             }
