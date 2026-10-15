@@ -143,7 +143,7 @@ operator-supervised.
 
    This is the WSJT-X-style late-start path. If TX lands 30s later
    instead of in the current slot, something's off — check
-   `[station].tx_late_max_ms` (default 8000) and `[station].ptt_lead_ms`
+   `[station].tx_late_max_ms` (default 3000) and `[station].ptt_lead_ms`
    (default 80).
 
 ### Switch to antenna

@@ -34,7 +34,7 @@ The DSP pipeline connects real-time audio input to the FT8 decoder through a mod
 
 ## Slot-Parity-Aware TX Scheduling
 
-FT8 TX honors WSJT-X-style slot parity and supports late-start audio playback up to 8 seconds past the slot boundary (configurable via `[station].tx_late_max_ms`).
+FT8 TX honors WSJT-X-style slot parity and supports late-start audio playback up to 3 seconds past the slot boundary (configurable via `[station].tx_late_max_ms`).
 
 ## Hardware Integration
 

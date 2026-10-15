@@ -163,12 +163,13 @@ within a single 15-second slot.
 `TransmitRequest` carries an `Option<SlotParity>` set from the latched QSO metadata
 (or `None` for unsolicited CQ); the scheduler picks the next opposite-parity slot and
 uses silent-pad / cursor-offset to align audio to the slot boundary. Late-start
-tolerance is governed by `[station].tx_late_max_ms` (default 8 000 ms). See
+tolerance is governed by `[station].tx_late_max_ms` (default 3 000 ms). See
 `docs/superpowers/specs/2026-04-27-dx-slot-aware-tx-design.md`. Audio is emitted
 with silent samples padded in front (early case, `mstr < 500ms`) or with the
 modulated waveform's cursor advanced (late case, `mstr <= tx_late_max_ms`), so the
 operator can press Space several seconds into a slot and still TX in that slot —
-receivers decode via the middle and end Costas sync arrays.
+at the 3s default both the middle and end Costas sync arrays still air, so
+receivers keep two sync references.
 
 ### `CachedStationLookup` (pancetta / priority_evaluator.rs)
 
