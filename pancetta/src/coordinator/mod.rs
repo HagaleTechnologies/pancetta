@@ -1658,14 +1658,15 @@ pub(crate) fn component_restart_policy(id: ComponentId) -> RestartPolicy {
         | ComponentId::Dsp
         | ComponentId::Ft8Decoder
         | ComponentId::Hamlib
-        | ComponentId::StationAgent => RestartPolicy::Restartable,
+        | ComponentId::StationAgent
+        | ComponentId::Ft8Transmitter => RestartPolicy::Restartable,
         // Audio device recovery happens inside AudioManager; restarting the
         // relays would compete for the same device and lose rollback state.
         ComponentId::Audio => RestartPolicy::DegradeOnly,
         // Owns the terminal; restart is awkward — degrade + notify.
         ComponentId::Tui => RestartPolicy::DegradeOnly,
         // Never a real task-handle target for this supervisor.
-        ComponentId::Config | ComponentId::Coordinator | ComponentId::Ft8Transmitter => {
+        ComponentId::Config | ComponentId::Coordinator => {
             RestartPolicy::DegradeOnly
         }
         // Companion protocol integration; not critical for autonomous operation.
@@ -4190,7 +4191,7 @@ mod tests {
         );
         assert_eq!(
             component_restart_policy(ComponentId::Ft8Transmitter),
-            DegradeOnly
+            Restartable
         );
         assert_eq!(component_restart_policy(ComponentId::WsjtxUdp), DegradeOnly);
     }
