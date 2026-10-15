@@ -1666,9 +1666,7 @@ pub(crate) fn component_restart_policy(id: ComponentId) -> RestartPolicy {
         // Owns the terminal; restart is awkward — degrade + notify.
         ComponentId::Tui => RestartPolicy::DegradeOnly,
         // Never a real task-handle target for this supervisor.
-        ComponentId::Config | ComponentId::Coordinator => {
-            RestartPolicy::DegradeOnly
-        }
+        ComponentId::Config | ComponentId::Coordinator => RestartPolicy::DegradeOnly,
         // Companion protocol integration; not critical for autonomous operation.
         ComponentId::WsjtxUdp => RestartPolicy::DegradeOnly,
     }
