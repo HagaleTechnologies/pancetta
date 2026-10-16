@@ -196,7 +196,9 @@ impl WavRecorder {
         std::fs::create_dir_all(&dir)?;
 
         // Sum existing recording sizes
-        let total_bytes = Self::dir_size(&dir).unwrap_or(0);
+        // A partial scan still counts every readable WAV, the best lower
+        // bound available at startup.
+        let total_bytes = Self::dir_size(&dir).map(|(bytes, _)| bytes).unwrap_or(0);
         info!(
             "WAV recorder: dir={}, existing={:.1} MB, cap={:.1} GB",
             dir.display(),
@@ -214,24 +216,30 @@ impl WavRecorder {
     /// [`Self::delete_oldest`] evicts from, so curated fixture subdirectories
     /// (e.g. `noise_1000/`) and non-WAV files never count toward the cap.
     ///
-    /// Any scan error fails the whole measurement, so callers never mistake a
-    /// partial total for the real one. The exception is a file that vanished
-    /// between listing and stat (the offload moved it): it is simply gone.
-    fn dir_size(dir: &std::path::Path) -> std::io::Result<u64> {
+    /// Returns the readable total and whether every entry was read, so a
+    /// partial scan is never mistaken for the real total. A file that vanished
+    /// between listing and stat (the offload moved it) is simply gone and
+    /// doesn't make the scan incomplete.
+    fn dir_size(dir: &std::path::Path) -> std::io::Result<(u64, bool)> {
         let mut total = 0;
+        let mut complete = true;
         for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            if entry.path().extension().is_none_or(|ext| ext != "wav") {
+            let Ok(entry) = entry else {
+                complete = false;
+                continue;
+            };
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "wav") {
                 continue;
             }
-            match entry.metadata() {
+            match std::fs::metadata(&path) {
                 Ok(m) if m.is_file() => total += m.len(),
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
+                Err(_) => complete = false,
             }
         }
-        Ok(total)
+        Ok((total, complete))
     }
 
     /// Write a 12kHz mono f32 window to a timestamped WAV file.
@@ -260,12 +268,16 @@ impl WavRecorder {
 
         // The running total only overestimates (external removals aren't
         // seen), so re-measure before trusting it to evict anything.
-        // A failed scan keeps the old (over)estimate: reading an unreadable
-        // directory as empty would skip eviction and let the buffer grow past
-        // the cap.
+        // Only a complete scan may lower the estimate. A partial one is a
+        // lower bound, and a failed one says nothing; trusting either could
+        // skip eviction and let the buffer grow past the cap.
         if self.total_bytes >= self.max_bytes {
             match Self::dir_size(&self.dir) {
-                Ok(measured) => self.total_bytes = measured,
+                Ok((measured, true)) => self.total_bytes = measured,
+                Ok((measured, false)) => {
+                    warn!("WAV recorder: partial re-measure of {}", self.dir.display());
+                    self.total_bytes = self.total_bytes.max(measured);
+                }
                 Err(e) => warn!(
                     "WAV recorder: cannot re-measure {}: {}",
                     self.dir.display(),
@@ -1592,23 +1604,53 @@ mod wav_recorder_tests {
             &tmp.path().join("noise_1000"),
             &["n1.wav", "n2.wav", "n3.wav"],
         );
-        assert_eq!(WavRecorder::dir_size(tmp.path()).unwrap(), FILE);
+        assert_eq!(WavRecorder::dir_size(tmp.path()).unwrap(), (FILE, true));
     }
 
-    /// A partial scan (listing works, stat fails) is an error, not a smaller
-    /// total. r-- without x lets read_dir list names but denies stat.
+    /// A WAV that can't be stat'd (here a symlink loop: ELOOP for every user,
+    /// root included) marks the scan incomplete but keeps the readable total.
+    #[cfg(unix)]
+    fn seed_with_unstatable(dir: &std::path::Path) {
+        seed(dir, &["ft8_a.wav", "ft8_b.wav"]);
+        std::os::unix::fs::symlink("ft8_loop.wav", dir.join("ft8_loop.wav")).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
-    fn partial_scan_is_an_error_not_a_smaller_total() {
-        use std::os::unix::fs::PermissionsExt;
+    fn partial_scan_reports_incomplete_with_readable_total() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("recordings");
-        std::fs::create_dir(&dir).unwrap();
-        seed(&dir, &["ft8_a.wav", "ft8_b.wav"]);
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o444)).unwrap();
-        let measured = WavRecorder::dir_size(&dir);
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(measured.is_err(), "partial scan returned {measured:?}");
+        seed_with_unstatable(tmp.path());
+        assert_eq!(
+            WavRecorder::dir_size(tmp.path()).unwrap(),
+            (2 * FILE, false)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_partial_scan_keeps_readable_usage() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_with_unstatable(tmp.path());
+        let rec = WavRecorder::open(tmp.path().to_path_buf(), 10 * FILE).unwrap();
+        assert_eq!(rec.total_bytes, 2 * FILE);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_remeasure_never_lowers_the_at_cap_estimate() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_with_unstatable(tmp.path());
+        let mut rec = WavRecorder::open(tmp.path().to_path_buf(), 3 * FILE).unwrap();
+        rec.total_bytes = 5 * FILE; // stale at-cap estimate
+
+        rec.write_window(&tone(), &ts(), 0);
+
+        // Eviction ran from the kept estimate rather than the partial 2 KB total.
+        let names = wav_names(tmp.path());
+        assert!(
+            !names.contains(&"ft8_a.wav".to_string()),
+            "eviction skipped: {names:?}"
+        );
     }
 
     /// An unreadable directory must not be mistaken for an empty one: the
