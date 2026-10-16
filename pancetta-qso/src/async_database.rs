@@ -2010,6 +2010,75 @@ mod tests {
         assert_eq!(db.count_qsos().await.unwrap(), 2);
     }
 
+    /// PR #451 review (Codex P2): an imported LoTW/QRZ record keeps its QSL
+    /// state through the index, so `pancetta export` (which regenerates ADIF
+    /// from the indexed metadata) does not reset a confirmed contact to
+    /// `QSL_RCVD=N`.
+    #[tokio::test]
+    async fn imported_qsl_state_survives_index_and_export() {
+        let adif = "<CALL:5>W1ABC <QSO_DATE:8>20250101 <TIME_ON:6>120000 <MODE:3>FT8 \
+                    <FREQ:9>14.074000 <QSL_SENT:1>Y <QSL_RCVD:1>Y <QSLSDATE:8>20250102 \
+                    <QSLRDATE:8>20250110 <QSL_SENT_VIA:1>E <QSL_RCVD_VIA:1>E \
+                    <QSLMSG:6>TNX 73 <LOTW_QSL_SENT:1>Y <LOTW_QSL_RCVD:1>Y \
+                    <LOTW_QSLSDATE:8>20250102 <LOTW_QSLRDATE:8>20250110 \
+                    <EQSL_QSL_RCVD:1>Y <QRZCOM_QSO_UPLOAD_STATUS:1>Y <EOR>\n\
+                    <CALL:5>K9DEF <QSO_DATE:8>20250101 <TIME_ON:6>121000 <MODE:3>FT8 \
+                    <FREQ:9>14.074000 <QSL_SENT:1>R <QSL_RCVD:1>I <EOR>\n";
+        let processor = AdifProcessor::new();
+        let file = processor.parse_string(adif).unwrap();
+        let db = QsoDatabase::new_in_memory().await.unwrap();
+        db.insert_adif_records(&processor, &file.records)
+            .await
+            .unwrap();
+
+        // The same conversion `pancetta export` applies to each indexed row.
+        let progresses = db
+            .search_qsos(&QsoFilter::default(), &QueryOptions::default())
+            .await
+            .unwrap();
+        let exported: HashMap<String, HashMap<String, String>> = progresses
+            .iter()
+            .map(|progress| {
+                let adif_qso = processor
+                    .qso_to_adif(&progress.metadata, progress.metadata.contest_info.as_ref());
+                let record = processor.qso_to_record(&adif_qso);
+                let fields: HashMap<String, String> = record
+                    .fields
+                    .into_iter()
+                    .map(|(name, field)| (name, field.value))
+                    .collect();
+                (fields["CALL"].clone(), fields)
+            })
+            .collect();
+
+        let confirmed = &exported["W1ABC"];
+        for (name, value) in [
+            ("QSL_SENT", "Y"),
+            ("QSL_RCVD", "Y"),
+            ("QSLSDATE", "20250102"),
+            ("QSLRDATE", "20250110"),
+            ("QSL_SENT_VIA", "E"),
+            ("QSL_RCVD_VIA", "E"),
+            ("QSLMSG", "TNX 73"),
+            ("LOTW_QSL_SENT", "Y"),
+            ("LOTW_QSL_RCVD", "Y"),
+            ("LOTW_QSLSDATE", "20250102"),
+            ("LOTW_QSLRDATE", "20250110"),
+            ("EQSL_QSL_RCVD", "Y"),
+            ("QRZCOM_QSO_UPLOAD_STATUS", "Y"),
+        ] {
+            assert_eq!(
+                confirmed.get(name).map(String::as_str),
+                Some(value),
+                "{name} lost through import → export: {confirmed:?}"
+            );
+        }
+        let requested = &exported["K9DEF"];
+        assert_eq!(requested["QSL_SENT"], "R", "{requested:?}");
+        assert_eq!(requested["QSL_RCVD"], "I", "{requested:?}");
+        db.close().await;
+    }
+
     /// PR #453 review (Codex P2): a newer-but-unreadable `qsos.adi` must not
     /// cost the operator the existing index — the replay may only delete
     /// `qso.db` once the ADIF has been read and converted.

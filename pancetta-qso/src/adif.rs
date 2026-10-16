@@ -237,6 +237,11 @@ pub struct AdifQso {
     pub additional_fields: HashMap<String, String>,
 }
 
+/// ADIF field names under which an imported record's QSL status is kept in
+/// [`QsoMetadata::tags`].
+const QSL_SENT_FIELD: &str = "QSL_SENT";
+const QSL_RCVD_FIELD: &str = "QSL_RCVD";
+
 /// Map an RF frequency (Hz) to its ADIF band string (e.g. "20M").
 ///
 /// Free function so callers don't have to construct an [`AdifProcessor`] just
@@ -549,6 +554,15 @@ impl AdifProcessor {
         // the machine-readable APP_PANCETTA_HOUND marker.  Non-Hound QSOs are
         // unchanged (no extra field → byte-identical output).
         let mut additional_fields = metadata.tags.clone();
+        // An imported record's QSL status rides in the tags (see
+        // `adif_to_qso`); a QSO Pancetta logged itself has none, so it
+        // exports as not yet sent or received.
+        let qsl_sent = additional_fields
+            .remove(QSL_SENT_FIELD)
+            .unwrap_or_else(|| "N".to_string());
+        let qsl_rcvd = additional_fields
+            .remove(QSL_RCVD_FIELD)
+            .unwrap_or_else(|| "N".to_string());
         if metadata.hound {
             additional_fields
                 .entry("APP_PANCETTA_HOUND".to_string())
@@ -583,8 +597,8 @@ impl AdifProcessor {
             stx_string: None,
             srx: contest_info.and_then(|c| c.serials.received),
             srx_string: None,
-            qsl_sent: Some("N".to_string()),
-            qsl_rcvd: Some("N".to_string()),
+            qsl_sent: Some(qsl_sent),
+            qsl_rcvd: Some(qsl_rcvd),
             qslmsg: None,
             comment,
             notes: None,
@@ -647,7 +661,7 @@ impl AdifProcessor {
                     points: 1, // Default
                     multiplier: None,
                 }),
-            tags: adif_qso.additional_fields.clone(),
+            tags: Self::tags_with_qsl_status(adif_qso),
             notes: adif_qso.comment.clone(),
             tx_parity: None,
             initiated_by: Default::default(),
@@ -668,6 +682,25 @@ impl AdifProcessor {
             remote_client_key_id: None,
             tx_parity_provisional: false,
         }
+    }
+
+    /// `additional_fields` plus the record's QSL_SENT/QSL_RCVD, which are
+    /// standard fields (so not in `additional_fields`) but have no
+    /// [`QsoMetadata`] field of their own. Keeping them in the tags carries an
+    /// imported LoTW/QRZ confirmation through the index to `qso_to_adif`
+    /// (PAN-127). The other QSL fields (dates, VIA, QSLMSG, LOTW_*/EQSL_*)
+    /// are not standard here, so they already ride in `additional_fields`.
+    fn tags_with_qsl_status(adif_qso: &AdifQso) -> HashMap<String, String> {
+        let mut tags = adif_qso.additional_fields.clone();
+        for (name, value) in [
+            (QSL_SENT_FIELD, &adif_qso.qsl_sent),
+            (QSL_RCVD_FIELD, &adif_qso.qsl_rcvd),
+        ] {
+            if let Some(value) = value.as_ref().filter(|value| !value.is_empty()) {
+                tags.insert(name.to_string(), value.clone());
+            }
+        }
+        tags
     }
 
     /// Convert AdifRecord to AdifQso
