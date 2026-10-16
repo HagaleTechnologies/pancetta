@@ -2081,15 +2081,17 @@ mod tests {
 
     /// PR #451 review (Codex P2): standard ADIF fields the index has no column
     /// or metadata field for (OPERATOR, TX_PWR, COUNTRY, DXCC, CQZ, ITUZ,
-    /// NOTES, the serial strings, a CW report, the BAND of a record with no
-    /// FREQ, the MODE behind a SUBMODE) survive import → index → export.
+    /// NOTES, the serial strings, serials with no CONTEST_ID, a TIME_OFF
+    /// with no QSO_DATE_OFF, a CW report, the BAND of a record with no FREQ,
+    /// the MODE behind a SUBMODE) survive import → index → export.
     #[tokio::test]
     async fn imported_standard_fields_survive_index_and_export() {
         let adif = "<CALL:5>W1ABC <QSO_DATE:8>20250101 <TIME_ON:6>120000 <MODE:4>MFSK \
                     <SUBMODE:3>FT4 <BAND:3>40M <OPERATOR:4>W5AU <TX_PWR:3>100 \
                     <COUNTRY:13>United States <DXCC:3>291 <CQZ:1>5 <ITUZ:1>8 \
                     <NOTES:13>first contact <STX_STRING:3>001 <SRX_STRING:5>123AB \
-                    <RST_SENT:3>599 <RST_RCVD:3>5NN <EOR>\n";
+                    <RST_SENT:3>599 <RST_RCVD:3>5NN <STX:2>17 <SRX:3>342 \
+                    <TIME_OFF:6>120130 <EOR>\n";
         let processor = AdifProcessor::new();
         let file = processor.parse_string(adif).unwrap();
         let db = QsoDatabase::new_in_memory().await.unwrap();
@@ -2127,6 +2129,9 @@ mod tests {
             ("SRX_STRING", "123AB"),
             ("RST_SENT", "599"),
             ("RST_RCVD", "5NN"),
+            ("STX", "17"),
+            ("SRX", "342"),
+            ("TIME_OFF", "120130"),
         ] {
             assert_eq!(
                 exported.get(name).map(String::as_str),

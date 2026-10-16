@@ -689,7 +689,7 @@ impl AdifProcessor {
     /// `additional_fields` plus the record's standard fields that
     /// [`QsoMetadata`] does not hold as read: OPERATOR, TX_PWR, COUNTRY, DXCC,
     /// CQZ, ITUZ, NOTES, QSL_SENT/QSL_RCVD, the reports as written (a CW
-    /// `599`/`5NN` is not a dB report), BAND (export derives it from FREQ,
+    /// `599`/`5NN` is not a dB report), STX/SRX, BAND (export derives it from FREQ,
     /// which a record may lack), and MODE when a SUBMODE replaced it in
     /// `mode`. Kept in the tags, they ride through the index and come back
     /// out of `qso_to_adif` as fields, so an imported contact exports as it
@@ -707,6 +707,10 @@ impl AdifProcessor {
             ("DXCC", number(adif_qso.dxcc.map(u32::from))),
             ("CQZ", number(adif_qso.cqz.map(u32::from))),
             ("ITUZ", number(adif_qso.ituz.map(u32::from))),
+            // Only a record with a CONTEST_ID gets a `contest_info` to hold
+            // its serials; without one they would be dropped.
+            ("STX", number(adif_qso.stx)),
+            ("SRX", number(adif_qso.srx)),
             ("NOTES", adif_qso.notes.clone()),
             (QSL_SENT_FIELD, adif_qso.qsl_sent.clone()),
             (QSL_RCVD_FIELD, adif_qso.qsl_rcvd.clone()),
@@ -776,8 +780,24 @@ impl AdifProcessor {
             qslmsg: self.get_field_value(record, "QSLMSG"),
             comment: self.get_field_value(record, "COMMENT"),
             notes: self.get_field_value(record, "NOTES"),
-            additional_fields: self.extract_additional_fields(record),
+            additional_fields: self.additional_fields_of(record),
         })
+    }
+
+    /// [`Self::extract_additional_fields`] plus a TIME_OFF that has no
+    /// QSO_DATE_OFF: `qso_date_off` needs both, so without this the end
+    /// time would be dropped (PAN-127).
+    fn additional_fields_of(&self, record: &AdifRecord) -> HashMap<String, String> {
+        let mut additional = self.extract_additional_fields(record);
+        if self.get_field_value(record, "QSO_DATE_OFF").is_none() {
+            if let Some(time_off) = self
+                .get_field_value(record, "TIME_OFF")
+                .filter(|time_off| !time_off.is_empty())
+            {
+                additional.insert("TIME_OFF".to_string(), time_off);
+            }
+        }
+        additional
     }
 
     /// Convert AdifQso to AdifRecord
