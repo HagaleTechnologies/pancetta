@@ -9454,10 +9454,11 @@ async fn prepare_local_qso_index(
 
     if needs_replay {
         let replayed = QsoDatabase::replay_from_adif(&db_path, &adif_path).await;
-        // The marker asks for one rebuild, as a newer ADIF log does: a replay
-        // that fails has already replaced the index, and retrying it at every
-        // start would only wipe what the station indexed since.
-        if marked {
+        // The marker stays until a replay succeeds, so a failed one (bad
+        // record, transient disk error) is retried at the next start instead
+        // of a stale or partial index being trusted from then on. Retrying
+        // loses nothing: `qsos.adi` holds every QSO the station logged.
+        if marked && replayed.is_ok() {
             let _ = tokio::fs::remove_file(&marker).await;
         }
         match replayed {
@@ -10413,11 +10414,12 @@ mod replay_local_log_tests {
         shutdown.store(true, std::sync::atomic::Ordering::Release);
     }
 
-    /// The marker asks for one rebuild. A replay that fails (here, on an
-    /// unreadable record) clears it too, or every later start would wipe
-    /// the index again.
+    /// PR #451 review (Codex P2): a replay that fails (here, on an
+    /// unreadable record) keeps the marker, so the rebuild is retried at the
+    /// next start once the cause is fixed, instead of the stale index being
+    /// trusted from then on. The failed replay leaves the old index in place.
     #[tokio::test]
-    async fn live_start_clears_the_marker_when_the_rebuild_fails() {
+    async fn live_start_keeps_the_marker_when_the_rebuild_fails() {
         let dir = tempfile::tempdir().expect("tempdir");
         let adif_path = dir.path().join("qsos.adi");
         let db_path = dir.path().join("qso.db");
@@ -10429,7 +10431,7 @@ mod replay_local_log_tests {
         let manager = manager();
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        let _ = start_local_qso_log_writers(
+        let (_adif_writer, _async_logger, seed_db) = start_local_qso_log_writers(
             false,
             &adif_path,
             &db_path,
@@ -10440,7 +10442,9 @@ mod replay_local_log_tests {
         )
         .await;
 
-        assert!(!marker.exists(), "a failed rebuild still clears the marker");
+        assert!(marker.exists(), "a failed rebuild keeps the marker");
+        let seed_db = seed_db.expect("falls back to the existing index");
+        assert_eq!(seed_db.count_qsos().await.expect("count"), 2);
         shutdown.store(true, std::sync::atomic::Ordering::Release);
     }
 
