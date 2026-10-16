@@ -616,6 +616,7 @@ watchdog timer before `set_ptt(Off)` returns, so a failed CAT unkey also
 stops that watchdog. Non-remote PTT-off sites (clock-step hold, normal
 Step 9, supersede, tune completion) keep best-effort delivery.
 
+<<<<<<< HEAD
 ## PAN-136: bundle items carry their own authorization
 
 A multi-TX bundle is gated by one bundle-level binding (`origin` plus
@@ -720,3 +721,41 @@ the re-folded binding. The bundle-level scalars on `MultiTransmitRequest` stay
 as the gate binding. No wire, config or dispensa contract changes:
 `MessageType` is never serialized and neither type appears in
 `pancetta-protocol` or `pancetta-agent`.
+=======
+## PAN-139: refuse denied remote close-step opens before mutating the QSO
+
+Round 23 on PR #362 (Codex): round 15's pre-mutation identity-bound permission
+check for a brand-new QSO opened directly at a close step covered
+`ResponseStep::SeventyThree` only. If a client's queued `answerCaller(rr73)`
+was processed after control transferred to another armed client, the TX
+worker's arm gate correctly dropped the `FinalConfirmation` frame at key-time
+(no unauthorized transmission — availability, not security), but
+`respond_to_caller` had already created a `WaitingForConfirmation` QSO and
+recorded the never-aired frame as `Sent`. `rearm_manual_calls_at` has no
+keep-call concept past RR73 by design (the DX's own next frame drives that
+stage), so nothing retried or corrected the phantom — the QSO sat until
+`confirmation_timeout` (30 s default) retired it as `Failed(Timeout)`, a
+quietly lost QSO.
+
+The guard now covers both close steps via `step_ladder_rank(step) >= Some(2)`
+— the identical predicate FIX B uses for "close step", so a future close-step
+addition is covered automatically — and still runs before
+`supersede_active_qsos_for` per round 16 (a denied request must not cancel an
+ongoing autonomous same-call QSO first). The refusal message names the
+requested step instead of hardcoding `SeventyThree`.
+
+Refuse-outright rather than preserve-retryable: the PAN-75 unsent-attempt
+ledger is never populated for an opening call (`record_keep_call_attempt`
+fires only from the rearm loop and `resend_last_tx`), so "retryable" would
+require new unreviewed mechanism; the half-duplex-parity-deferred admission
+queue already re-queues a failing entry at the front and retries it on later
+terminal-QSO events within its 10-minute `QUEUED_CALL_TTL` (an authorization
+denial can legitimately re-arm inside that window), and the immediate path
+logs a warning and emits a status line exactly as `SeventyThree` refusals
+already do. A later authorized call then opens the QSO fresh.
+
+Scope: `Report`/`ReportAck` opens are deliberately not covered — their states
+are rearm-eligible and `frame_reaches_the_air` already refuses to compound a
+denial (no further false `Sent`, no stall accounting), so they self-correct
+under the manual keep-call watchdog.
+>>>>>>> dd6a4c7ab728aec99b575bc71af4529f46533bea

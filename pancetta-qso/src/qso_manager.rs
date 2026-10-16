@@ -2859,13 +2859,30 @@ impl QsoManager {
         // retried once that client becomes authorized, and the false log
         // entry cannot be un-logged. Refuse outright rather than create
         // anything — a later, actually-authorized call creates it fresh.
-        if step == pancetta_core::ResponseStep::SeventyThree
+        //
+        // PAN-139 (Codex round 23 on PR #362): the same refusal now covers
+        // BOTH close steps (`step_ladder_rank >= 2`, the identical predicate
+        // FIX B uses above), not just `SeventyThree`. A denied `Rr73` open
+        // used to mutate unconditionally: the TX arm gate correctly dropped
+        // the unauthorized `FinalConfirmation` frame at key-time, but the
+        // QSO was already stranded in `WaitingForConfirmation` with a
+        // phantom `Sent` record for a frame that never aired — a state the
+        // rearm loop deliberately never retries (`rearm_manual_calls_at`
+        // has no keep-call concept past RR73; the DX's own next frame drives
+        // that stage), so `confirmation_timeout` retired it as a silently
+        // lost QSO. Refusing outright lets a later authorized call open it
+        // fresh, and the deferred admission queue already re-queues and
+        // retries the refusal within its TTL. `Report`/`ReportAck` opens are
+        // NOT covered: their states are rearm-eligible and
+        // `frame_reaches_the_air` already refuses to compound a denial, so
+        // they self-correct.
+        if Self::step_ladder_rank(step) >= Some(2)
             && remote_origin
             && !(self.remote_tx_permitted)(remote_client_key_id.as_deref())
         {
             return Err(QsoManagerError::Internal {
                 message: format!(
-                    "refusing to open-and-complete a new QSO with {target} at SeventyThree: \
+                    "refusing to open a brand-new QSO with {target} at close step {step:?}: \
                      the bound remote client is not currently TX-permitted"
                 ),
             });
@@ -15614,6 +15631,180 @@ mod reply_emitter_tests {
         );
         let progress = manager.get_qso(qso_id).await.unwrap();
         assert!(matches!(progress.state, QsoState::Completed { .. }));
+    }
+
+    /// PAN-139 (Codex round 23 on PR #362): a brand-new QSO opened directly
+    /// at `Rr73` by a remote client the identity-bound TX gate denies must
+    /// be refused BEFORE any mutation — no `WaitingForConfirmation` QSO
+    /// created, no phantom `Sent` `FinalConfirmation` recorded, no
+    /// `MessageToSend` emitted. On current main the open unconditionally
+    /// mutated first: the TX worker correctly dropped the unauthorized frame
+    /// at key-time, but the QSO then sat in `WaitingForConfirmation` — a
+    /// state `rearm_manual_calls_at` deliberately never retries (`_ =>
+    /// continue`) — until `confirmation_timeout` retired it as a silently
+    /// lost QSO.
+    #[tokio::test]
+    async fn denied_remote_rr73_open_is_refused_before_any_mutation() {
+        let mut manager = manager();
+        // Simulate the TX worker's identity-bound arm gate: client-A is NOT
+        // currently TX-permitted (control transferred to another client).
+        manager.set_remote_tx_permitted_source(Arc::new(|client_key_id: Option<&str>| {
+            client_key_id != Some("client-A")
+        }));
+        let mut rx = manager.subscribe();
+
+        let err = manager
+            .respond_to_caller(
+                DX.into(),
+                FREQ,
+                None,
+                ResponseStep::Rr73,
+                Some(-5.0),
+                Some(-7),
+                None, // partner_freq
+                true, // remote_origin
+                Some("client-A".into()),
+            )
+            .await
+            .expect_err("a denied remote Rr73 open must be refused, not mutated");
+        assert!(
+            err.to_string().contains("not currently TX-permitted"),
+            "expected the denial to name the TX-permission failure, got {err:?}"
+        );
+
+        let events = drain(&mut rx);
+        assert!(
+            messages_to_send(&events).is_empty(),
+            "nothing may be emitted for a refused open, got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, QsoEvent::StateChanged { .. })),
+            "no QSO may be created (or superseded) for a refused open, got {events:?}"
+        );
+    }
+
+    /// PAN-139: the same refusal pins round-15's original `SeventyThree`
+    /// guard, which shipped with no test of its own. A brand-new QSO opened
+    /// directly at `SeventyThree` by a denied remote client must be refused
+    /// before any mutation — completing instead would emit an un-retractable
+    /// `QsoCompleted` (ADIF log entry).
+    #[tokio::test]
+    async fn denied_remote_seventythree_open_is_refused_before_any_mutation() {
+        let mut manager = manager();
+        manager.set_remote_tx_permitted_source(Arc::new(|client_key_id: Option<&str>| {
+            client_key_id != Some("client-A")
+        }));
+        let mut rx = manager.subscribe();
+
+        let err = manager
+            .respond_to_caller(
+                DX.into(),
+                FREQ,
+                None,
+                ResponseStep::SeventyThree,
+                Some(-8.0),
+                Some(-4),
+                None, // partner_freq
+                true, // remote_origin
+                Some("client-A".into()),
+            )
+            .await
+            .expect_err("a denied remote SeventyThree open must be refused, not mutated");
+        assert!(
+            err.to_string().contains("not currently TX-permitted"),
+            "expected the denial to name the TX-permission failure, got {err:?}"
+        );
+
+        let events = drain(&mut rx);
+        assert!(
+            messages_to_send(&events).is_empty(),
+            "nothing may be emitted for a refused open, got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, QsoEvent::StateChanged { .. })),
+            "no QSO may be created (or superseded) for a refused open, got {events:?}"
+        );
+    }
+
+    /// PAN-139 control: the guard is identity-bound, not a blanket remote
+    /// block — a remote client the predicate PERMITS must still open at
+    /// `Rr73` exactly as before (`WaitingForConfirmation` + one
+    /// `FinalConfirmation` send).
+    #[tokio::test]
+    async fn permitted_remote_client_can_still_open_at_rr73() {
+        let mut manager = manager();
+        manager.set_remote_tx_permitted_source(Arc::new(|client_key_id: Option<&str>| {
+            client_key_id == Some("client-B")
+        }));
+        let mut rx = manager.subscribe();
+
+        let qso_id = manager
+            .respond_to_caller(
+                DX.into(),
+                FREQ,
+                None,
+                ResponseStep::Rr73,
+                Some(-5.0),
+                Some(-7),
+                None, // partner_freq
+                true, // remote_origin
+                Some("client-B".into()),
+            )
+            .await
+            .expect("a permitted remote client must still open at Rr73");
+
+        let sends = messages_to_send(&drain(&mut rx));
+        assert_eq!(sends.len(), 1);
+        assert!(
+            matches!(sends[0], MessageType::FinalConfirmation { .. }),
+            "expected FinalConfirmation, got {:?}",
+            sends[0]
+        );
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(matches!(
+            progress.state,
+            QsoState::WaitingForConfirmation { .. }
+        ));
+    }
+
+    /// PAN-139 control: the guard is remote-only — a LOCAL-origin `Rr73`
+    /// open must ignore the deny predicate entirely (a disarmed station
+    /// must not freeze local manual QSOs; the arm gate only applies to
+    /// `TxOrigin::Remote` frames). Same control pattern as
+    /// `a_disarmed_arm_gate_does_not_suppress_local_qso_stall_counting`.
+    #[tokio::test]
+    async fn local_origin_rr73_open_ignores_the_remote_deny_predicate() {
+        let mut manager = manager();
+        manager.set_remote_tx_permitted_source(Arc::new(|_| false));
+        let mut rx = manager.subscribe();
+
+        let qso_id = manager
+            .respond_to_caller(
+                DX.into(),
+                FREQ,
+                None,
+                ResponseStep::Rr73,
+                Some(-5.0),
+                Some(-7),
+                None,  // partner_freq
+                false, // remote_origin
+                None,
+            )
+            .await
+            .expect("a local-origin Rr73 open must not consult the remote deny predicate");
+
+        let sends = messages_to_send(&drain(&mut rx));
+        assert_eq!(sends.len(), 1);
+        assert!(matches!(sends[0], MessageType::FinalConfirmation { .. }));
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(matches!(
+            progress.state,
+            QsoState::WaitingForConfirmation { .. }
+        ));
     }
 
     /// FIX B (one-QSO-per-(callsign,band) close idempotency,
