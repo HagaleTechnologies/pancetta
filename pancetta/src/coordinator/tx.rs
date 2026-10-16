@@ -20920,7 +20920,6 @@ mod pan118_worker_band_plan_tests {
     }
 }
 
-<<<<<<< HEAD
 /// PAN-136: a multi-TX bundle whose item is re-bound during the pre-PTT wait
 /// (Step 4b-pivot swaps the item's binding with its payload) is gated under
 /// the RE-FOLDED binding, through the real TX worker over a real `MessageBus`.
@@ -20986,7 +20985,226 @@ mod pan136_bundle_binding_worker_tests {
                     tx_parity: None,
                     origin,
                     remote_client_key_id: key.map(str::to_string),
-=======
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    struct Collected {
+        completions: Vec<Option<bool>>,
+        ptt_on: bool,
+        diagnostics: Vec<String>,
+        frames_not_sent: Vec<QsoMessage>,
+    }
+
+    /// Drain every receiver until a `TransmitComplete` has arrived for each
+    /// of `texts` (or `within` elapses).
+    async fn collect(h: &Harness, texts: &[&str], within: Duration) -> Collected {
+        let mut c = Collected {
+            completions: vec![None; texts.len()],
+            ptt_on: false,
+            diagnostics: Vec::new(),
+            frames_not_sent: Vec::new(),
+        };
+        let deadline = Instant::now() + within;
+        let drain = |c: &mut Collected| {
+            while let Ok(msg) = h.hamlib_rx.try_recv() {
+                c.ptt_on |= matches!(
+                    msg.message_type,
+                    MessageType::RigControl(RigControlMessage::SetPtt { state: true })
+                );
+            }
+            while let Ok(msg) = h.tui_rx.try_recv() {
+                if let MessageType::DiagnosticEvent { text, .. } = msg.message_type {
+                    c.diagnostics.push(text);
+                }
+            }
+            while let Ok(msg) = h.qso_rx.try_recv() {
+                if let MessageType::QsoMessage(q @ QsoMessage::TxFrameNotSent { .. }) =
+                    msg.message_type
+                {
+                    c.frames_not_sent.push(q);
+                }
+            }
+            while let Ok(msg) = h.autonomous_rx.try_recv() {
+                if let MessageType::TransmitComplete {
+                    success,
+                    message_text,
+                    ..
+                } = msg.message_type
+                {
+                    if let Some(slot) = texts.iter().position(|t| *t == message_text) {
+                        if c.completions[slot].is_none() {
+                            c.completions[slot] = Some(success);
+                        }
+                    }
+                }
+            }
+        };
+        while Instant::now() < deadline && c.completions.iter().any(|d| d.is_none()) {
+            drain(&mut c);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Anything the worker emitted alongside the last completion.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drain(&mut c);
+        c
+    }
+
+    /// Arm `client_key` over the station-agent channel, as a verified
+    /// `txArm` would, and keep the dead-man window open with a heartbeat
+    /// every 3 s (`HEARTBEAT_TIMEOUT_MS` is 30 s; a bundle waits up to one
+    /// slot pair). Abort the returned task when the test ends.
+    fn arm_client(h: &Harness, client_key: &str) -> tokio::task::JoinHandle<()> {
+        use pancetta_agent::arm::{ArmTime, ConsentChannel, VerifiedArmGrant};
+        let jti = format!("pan136-{client_key}");
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        {
+            let mut arm = h.coordinator.remote_tx_arm.lock().unwrap();
+            arm.set_channel_consent(ConsentChannel::StationAgent, true, now_ms);
+            arm.arm(
+                VerifiedArmGrant {
+                    operator_callsign: "K5ARH".to_string(),
+                    ttl_ms: 120_000,
+                    armed_until_ms: now_ms + 120_000,
+                    heartbeat_interval_sec: 5,
+                    scope_tx: true,
+                    jti: jti.clone(),
+                    client_key_id: client_key.to_string(),
+                },
+                ArmTime::now(),
+            );
+        }
+        let arm = h.coordinator.remote_tx_arm.clone();
+        tokio::spawn(async move {
+            let mut seq = 0u64;
+            loop {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                seq += 1;
+                arm.lock().unwrap().heartbeat(&jti, seq, ArmTime::now());
+            }
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_bundle_item_rebound_to_unarmed_client_is_denied() {
+        let h = worker_harness().await;
+        setup(&h, Some((QA_TEXT, TxOrigin::Remote, Some("client-B"))));
+        send_bundle(&h, TxOrigin::Local, None).await;
+        let c = collect(&h, &[QA_TEXT, QB_TEXT], Duration::from_secs(50)).await;
+        assert!(
+            !c.ptt_on,
+            "a bundle carrying a frame re-bound to an unarmed client must not key"
+        );
+        assert_eq!(c.completions, vec![Some(false), Some(false)]);
+        assert!(
+            c.diagnostics.iter().any(|d| {
+                d.contains(
+                "Remote TX denied (arm went stale during slot wait: 'SM2LIY K5ARH R-14' at 1000 Hz)"
+            )
+            }),
+            "the re-folded bundle must be denied by the key-time arm gate: {:?}",
+            c.diagnostics
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_bundle_item_pivoting_to_unarmed_remote_text_is_denied() {
+        let h = worker_harness().await;
+        setup(
+            &h,
+            Some(("SM2LIY K5ARH 73", TxOrigin::Remote, Some("client-B"))),
+        );
+        send_bundle(&h, TxOrigin::Local, None).await;
+        let c = collect(&h, &["SM2LIY K5ARH 73", QB_TEXT], Duration::from_secs(50)).await;
+        assert!(
+            !c.ptt_on,
+            "a bundle whose item pivoted to an unarmed client's text must not key"
+        );
+        assert_eq!(c.completions, vec![Some(false), Some(false)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn armed_clients_bundle_holds_item_rebound_to_another_client() {
+        let h = worker_harness().await;
+        let heartbeat = arm_client(&h, "client-A");
+        setup(&h, Some((QA_TEXT, TxOrigin::Remote, Some("client-B"))));
+        send_bundle(&h, TxOrigin::Remote, Some("client-A")).await;
+        let c = collect(&h, &[QA_TEXT, QB_TEXT], Duration::from_secs(50)).await;
+        heartbeat.abort();
+        assert!(c.ptt_on, "client A's own frame must still key");
+        assert_eq!(
+            c.completions,
+            vec![Some(false), Some(true)],
+            "client B's re-bound frame is held; client A's sibling airs"
+        );
+        assert!(
+            c.diagnostics.iter().any(|d| d
+                == "holding multi-TX item: its remote binding changed during the pre-PTT wait and conflicts with the rest of the bundle: 'SM2LIY K5ARH R-14'"),
+            "the held item must be named: {:?}",
+            c.diagnostics
+        );
+        assert!(
+            !c.diagnostics.iter().any(|d| d.contains("for ended QSO")),
+            "a held item must not be mislabelled as an ended QSO: {:?}",
+            c.diagnostics
+        );
+        let replaced = c.frames_not_sent.iter().find_map(|q| match q {
+            QsoMessage::TxFrameNotSent {
+                qso_id,
+                message_text,
+                replaced: Some(p),
+            } if qso_id == "qa" && message_text == QA_TEXT => Some(p.clone()),
+            _ => None,
+        });
+        let replaced = replaced.unwrap_or_else(|| {
+            panic!(
+                "qa's replaced frame must be rolled back: {:?}",
+                c.frames_not_sent
+            )
+        });
+        assert_eq!(replaced.frequency_hz, 1000.0);
+        assert_eq!(
+            replaced.remote_binding,
+            Some((true, Some("client-A".to_string()))),
+            "the replaced frame carries its own pre-pivot binding"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_bundle_item_rebound_to_armed_client_keys_under_it() {
+        let h = worker_harness().await;
+        let heartbeat = arm_client(&h, "client-B");
+        setup(&h, Some((QA_TEXT, TxOrigin::Remote, Some("client-B"))));
+        send_bundle(&h, TxOrigin::Local, None).await;
+        let c = collect(&h, &[QA_TEXT, QB_TEXT], Duration::from_secs(50)).await;
+        heartbeat.abort();
+        assert!(
+            c.ptt_on,
+            "the re-folded bundle passes client B's gate: {:?}",
+            c.diagnostics
+        );
+        assert_eq!(c.completions, vec![Some(true), Some(true)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_bundle_without_pivot_is_still_denied_unarmed() {
+        let h = worker_harness().await;
+        setup(&h, None);
+        send_bundle(&h, TxOrigin::Remote, Some("client-B")).await;
+        let c = collect(&h, &[QA_TEXT, QB_TEXT], Duration::from_secs(50)).await;
+        assert!(!c.ptt_on, "an unarmed Remote bundle must not key");
+        assert!(
+            c.diagnostics.iter().any(|d| d
+                .contains("Remote TX denied (not armed/permitted): multi-TX bundle of 2 items")),
+            "{:?}",
+            c.diagnostics
+        );
+    }
+}
+
 #[cfg(test)]
 mod pan135_ptt_release_tests {
     use super::*;
@@ -21311,226 +21529,11 @@ mod pan135_worker_disarm_tests {
                     tx_parity: None,
                     origin: TxOrigin::Remote,
                     remote_client_key_id: Some("client-a".into()),
->>>>>>> 5320305db5eccaa31e7a751f08e5949b15486341
                 },
                 Instant::now(),
             ))
             .await
             .unwrap();
-<<<<<<< HEAD
-    }
-
-    struct Collected {
-        completions: Vec<Option<bool>>,
-        ptt_on: bool,
-        diagnostics: Vec<String>,
-        frames_not_sent: Vec<QsoMessage>,
-    }
-
-    /// Drain every receiver until a `TransmitComplete` has arrived for each
-    /// of `texts` (or `within` elapses).
-    async fn collect(h: &Harness, texts: &[&str], within: Duration) -> Collected {
-        let mut c = Collected {
-            completions: vec![None; texts.len()],
-            ptt_on: false,
-            diagnostics: Vec::new(),
-            frames_not_sent: Vec::new(),
-        };
-        let deadline = Instant::now() + within;
-        let drain = |c: &mut Collected| {
-            while let Ok(msg) = h.hamlib_rx.try_recv() {
-                c.ptt_on |= matches!(
-                    msg.message_type,
-                    MessageType::RigControl(RigControlMessage::SetPtt { state: true })
-                );
-            }
-            while let Ok(msg) = h.tui_rx.try_recv() {
-                if let MessageType::DiagnosticEvent { text, .. } = msg.message_type {
-                    c.diagnostics.push(text);
-                }
-            }
-            while let Ok(msg) = h.qso_rx.try_recv() {
-                if let MessageType::QsoMessage(q @ QsoMessage::TxFrameNotSent { .. }) =
-                    msg.message_type
-                {
-                    c.frames_not_sent.push(q);
-                }
-            }
-            while let Ok(msg) = h.autonomous_rx.try_recv() {
-                if let MessageType::TransmitComplete {
-                    success,
-                    message_text,
-                    ..
-                } = msg.message_type
-                {
-                    if let Some(slot) = texts.iter().position(|t| *t == message_text) {
-                        if c.completions[slot].is_none() {
-                            c.completions[slot] = Some(success);
-                        }
-                    }
-                }
-            }
-        };
-        while Instant::now() < deadline && c.completions.iter().any(|d| d.is_none()) {
-            drain(&mut c);
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        // Anything the worker emitted alongside the last completion.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        drain(&mut c);
-        c
-    }
-
-    /// Arm `client_key` over the station-agent channel, as a verified
-    /// `txArm` would, and keep the dead-man window open with a heartbeat
-    /// every 3 s (`HEARTBEAT_TIMEOUT_MS` is 30 s; a bundle waits up to one
-    /// slot pair). Abort the returned task when the test ends.
-    fn arm_client(h: &Harness, client_key: &str) -> tokio::task::JoinHandle<()> {
-        use pancetta_agent::arm::{ArmTime, ConsentChannel, VerifiedArmGrant};
-        let jti = format!("pan136-{client_key}");
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        {
-            let mut arm = h.coordinator.remote_tx_arm.lock().unwrap();
-            arm.set_channel_consent(ConsentChannel::StationAgent, true, now_ms);
-            arm.arm(
-                VerifiedArmGrant {
-                    operator_callsign: "K5ARH".to_string(),
-                    ttl_ms: 120_000,
-                    armed_until_ms: now_ms + 120_000,
-                    heartbeat_interval_sec: 5,
-                    scope_tx: true,
-                    jti: jti.clone(),
-                    client_key_id: client_key.to_string(),
-                },
-                ArmTime::now(),
-            );
-        }
-        let arm = h.coordinator.remote_tx_arm.clone();
-        tokio::spawn(async move {
-            let mut seq = 0u64;
-            loop {
-                tokio::time::sleep(Duration::from_secs(3)).await;
-                seq += 1;
-                arm.lock().unwrap().heartbeat(&jti, seq, ArmTime::now());
-            }
-        })
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn local_bundle_item_rebound_to_unarmed_client_is_denied() {
-        let h = worker_harness().await;
-        setup(&h, Some((QA_TEXT, TxOrigin::Remote, Some("client-B"))));
-        send_bundle(&h, TxOrigin::Local, None).await;
-        let c = collect(&h, &[QA_TEXT, QB_TEXT], Duration::from_secs(50)).await;
-        assert!(
-            !c.ptt_on,
-            "a bundle carrying a frame re-bound to an unarmed client must not key"
-        );
-        assert_eq!(c.completions, vec![Some(false), Some(false)]);
-        assert!(
-            c.diagnostics.iter().any(|d| {
-                d.contains(
-                "Remote TX denied (arm went stale during slot wait: 'SM2LIY K5ARH R-14' at 1000 Hz)"
-            )
-            }),
-            "the re-folded bundle must be denied by the key-time arm gate: {:?}",
-            c.diagnostics
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn local_bundle_item_pivoting_to_unarmed_remote_text_is_denied() {
-        let h = worker_harness().await;
-        setup(
-            &h,
-            Some(("SM2LIY K5ARH 73", TxOrigin::Remote, Some("client-B"))),
-        );
-        send_bundle(&h, TxOrigin::Local, None).await;
-        let c = collect(&h, &["SM2LIY K5ARH 73", QB_TEXT], Duration::from_secs(50)).await;
-        assert!(
-            !c.ptt_on,
-            "a bundle whose item pivoted to an unarmed client's text must not key"
-        );
-        assert_eq!(c.completions, vec![Some(false), Some(false)]);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn armed_clients_bundle_holds_item_rebound_to_another_client() {
-        let h = worker_harness().await;
-        let heartbeat = arm_client(&h, "client-A");
-        setup(&h, Some((QA_TEXT, TxOrigin::Remote, Some("client-B"))));
-        send_bundle(&h, TxOrigin::Remote, Some("client-A")).await;
-        let c = collect(&h, &[QA_TEXT, QB_TEXT], Duration::from_secs(50)).await;
-        heartbeat.abort();
-        assert!(c.ptt_on, "client A's own frame must still key");
-        assert_eq!(
-            c.completions,
-            vec![Some(false), Some(true)],
-            "client B's re-bound frame is held; client A's sibling airs"
-        );
-        assert!(
-            c.diagnostics.iter().any(|d| d
-                == "holding multi-TX item: its remote binding changed during the pre-PTT wait and conflicts with the rest of the bundle: 'SM2LIY K5ARH R-14'"),
-            "the held item must be named: {:?}",
-            c.diagnostics
-        );
-        assert!(
-            !c.diagnostics.iter().any(|d| d.contains("for ended QSO")),
-            "a held item must not be mislabelled as an ended QSO: {:?}",
-            c.diagnostics
-        );
-        let replaced = c.frames_not_sent.iter().find_map(|q| match q {
-            QsoMessage::TxFrameNotSent {
-                qso_id,
-                message_text,
-                replaced: Some(p),
-            } if qso_id == "qa" && message_text == QA_TEXT => Some(p.clone()),
-            _ => None,
-        });
-        let replaced = replaced.unwrap_or_else(|| {
-            panic!(
-                "qa's replaced frame must be rolled back: {:?}",
-                c.frames_not_sent
-            )
-        });
-        assert_eq!(replaced.frequency_hz, 1000.0);
-        assert_eq!(
-            replaced.remote_binding,
-            Some((true, Some("client-A".to_string()))),
-            "the replaced frame carries its own pre-pivot binding"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn local_bundle_item_rebound_to_armed_client_keys_under_it() {
-        let h = worker_harness().await;
-        let heartbeat = arm_client(&h, "client-B");
-        setup(&h, Some((QA_TEXT, TxOrigin::Remote, Some("client-B"))));
-        send_bundle(&h, TxOrigin::Local, None).await;
-        let c = collect(&h, &[QA_TEXT, QB_TEXT], Duration::from_secs(50)).await;
-        heartbeat.abort();
-        assert!(
-            c.ptt_on,
-            "the re-folded bundle passes client B's gate: {:?}",
-            c.diagnostics
-        );
-        assert_eq!(c.completions, vec![Some(true), Some(true)]);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn remote_bundle_without_pivot_is_still_denied_unarmed() {
-        let h = worker_harness().await;
-        setup(&h, None);
-        send_bundle(&h, TxOrigin::Remote, Some("client-B")).await;
-        let c = collect(&h, &[QA_TEXT, QB_TEXT], Duration::from_secs(50)).await;
-        assert!(!c.ptt_on, "an unarmed Remote bundle must not key");
-        assert!(
-            c.diagnostics.iter().any(|d| d
-                .contains("Remote TX denied (not armed/permitted): multi-TX bundle of 2 items")),
-            "{:?}",
-            c.diagnostics
-        );
-=======
         assert!(
             await_ptt_on(&h, Duration::from_secs(40)).await,
             "remote frame must key"
@@ -21677,6 +21680,5 @@ mod pan135_worker_disarm_tests {
             "the armed guard retries on Drop once Hamlib catches up"
         );
         assert!(!h.coordinator.ptt_active.load(Ordering::Acquire));
->>>>>>> 5320305db5eccaa31e7a751f08e5949b15486341
     }
 }
