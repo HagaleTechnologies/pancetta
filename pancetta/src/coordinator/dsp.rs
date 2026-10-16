@@ -196,7 +196,7 @@ impl WavRecorder {
         std::fs::create_dir_all(&dir)?;
 
         // Sum existing recording sizes
-        let total_bytes = Self::dir_size(&dir);
+        let total_bytes = Self::dir_size(&dir).unwrap_or(0);
         info!(
             "WAV recorder: dir={}, existing={:.1} MB, cap={:.1} GB",
             dir.display(),
@@ -213,18 +213,14 @@ impl WavRecorder {
     /// Bytes in top-level `*.wav` files: the same flat scope
     /// [`Self::delete_oldest`] evicts from, so curated fixture subdirectories
     /// (e.g. `noise_1000/`) and non-WAV files never count toward the cap.
-    fn dir_size(dir: &std::path::Path) -> u64 {
-        std::fs::read_dir(dir)
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .filter(|e| e.path().extension().is_some_and(|ext| ext == "wav"))
-                    .filter_map(|e| e.metadata().ok())
-                    .filter(|m| m.is_file())
-                    .map(|m| m.len())
-                    .sum()
-            })
-            .unwrap_or(0)
+    fn dir_size(dir: &std::path::Path) -> std::io::Result<u64> {
+        Ok(std::fs::read_dir(dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "wav"))
+            .filter_map(|e| e.metadata().ok())
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+            .sum())
     }
 
     /// Write a 12kHz mono f32 window to a timestamped WAV file.
@@ -253,8 +249,18 @@ impl WavRecorder {
 
         // The running total only overestimates (external removals aren't
         // seen), so re-measure before trusting it to evict anything.
+        // A failed scan keeps the old (over)estimate: reading an unreadable
+        // directory as empty would skip eviction and let the buffer grow past
+        // the cap.
         if self.total_bytes >= self.max_bytes {
-            self.total_bytes = Self::dir_size(&self.dir);
+            match Self::dir_size(&self.dir) {
+                Ok(measured) => self.total_bytes = measured,
+                Err(e) => warn!(
+                    "WAV recorder: cannot re-measure {}: {}",
+                    self.dir.display(),
+                    e
+                ),
+            }
         }
 
         // Enforce cap by deleting oldest files
@@ -1575,6 +1581,26 @@ mod wav_recorder_tests {
             &tmp.path().join("noise_1000"),
             &["n1.wav", "n2.wav", "n3.wav"],
         );
-        assert_eq!(WavRecorder::dir_size(tmp.path()), FILE);
+        assert_eq!(WavRecorder::dir_size(tmp.path()).unwrap(), FILE);
+    }
+
+    /// An unreadable directory must not be mistaken for an empty one: the
+    /// at-cap estimate survives, so eviction isn't bypassed.
+    #[test]
+    fn failed_remeasure_keeps_the_at_cap_estimate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("recordings");
+        let mut rec = WavRecorder::open(dir.clone(), 3 * FILE).unwrap();
+        seed(&dir, &["ft8_a.wav", "ft8_b.wav", "ft8_c.wav"]);
+        rec.total_bytes = 3 * FILE;
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        rec.write_window(&tone(), &ts(), 0);
+
+        assert!(
+            rec.total_bytes >= 3 * FILE,
+            "estimate reset to {}",
+            rec.total_bytes
+        );
     }
 }
