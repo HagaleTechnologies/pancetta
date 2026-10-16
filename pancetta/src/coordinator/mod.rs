@@ -180,11 +180,13 @@ pub const PIVOT_OFFSET_EPSILON_HZ: f64 = 0.5;
 /// frame, and a text/offset-only comparison would leave a request already
 /// sitting in the worker's pre-PTT wait keyed against its STALE
 /// authorization even though `latest_tx_intent` already holds the fresh
-/// one. `None` preserves the original text/offset-only comparison for
-/// callers with no real per-item identity to compare (the multi-TX bundle
-/// path's [`pivot_bundle_items`] — `TransmitRequestItem` carries no
-/// identity at all yet; see PAN-136) rather than manufacturing spurious
-/// pivots there.
+/// one. Both production callers pass `Some`: single-TX Step 4c and, since
+/// PAN-136, [`pivot_bundle_items`] (each `TransmitRequestItem` now carries
+/// its own binding). `None` keeps the original text/offset-only comparison
+/// for callers with no binding to compare (today only the
+/// `coord_robustness` tests); passing a bundle-level binding instead of the
+/// item's own would manufacture spurious pivots (a `Local` item in a
+/// `Remote` bundle would never match its own `Local` intent).
 pub fn tx_pivot_target(
     qso_id: Option<&str>,
     current_text: &str,
@@ -286,6 +288,15 @@ pub fn is_pivot_duplicate(
 /// unchanged and is never reported as a pivot — mirroring `tx_pivot_target`'s
 /// exact "differs → `Some`" semantics.
 ///
+/// PAN-136: each item's own `origin`/`remote_client_key_id` is compared too,
+/// exactly like single-TX Step 4c, so an authorization-ONLY rebind (identical
+/// text and offset, different binding) is a pivot as well (round-5 semantics,
+/// see [`tx_pivot_target`]) and plants the same consume-once tombstone. On a
+/// pivot the binding is replaced ATOMICALLY with the payload (round-4
+/// semantics, see [`LatestTxIntent`]), never left stale. The bundle-level
+/// gate binding is then re-folded by the TX worker's Step 4b-rebind (see
+/// [`bundle_identity_conflict_mask`] and [`fold_bundle_identity`]).
+///
 /// Returns `(all_items_with_pivots_applied, list_of_what_was_pivoted)`.
 pub fn pivot_bundle_items(
     items: Vec<crate::message_bus::TransmitRequestItem>,
@@ -302,9 +313,9 @@ pub fn pivot_bundle_items(
                 item.qso_id.as_deref(),
                 &item.message_text,
                 item.frequency_offset,
-                // `TransmitRequestItem` carries no identity to compare yet
-                // (PAN-136) — preserve the original text/offset-only check.
-                None,
+                // PAN-136: the item's own binding, exactly like single-TX
+                // Step 4c — an authorization-only rebind is a pivot too.
+                Some((item.origin, item.remote_client_key_id.as_deref())),
                 latest,
             ) {
                 // `tx_pivot_target` only returns `Some` when `qso_id` is
@@ -316,12 +327,92 @@ pub fn pivot_bundle_items(
                 );
                 item.message_text = intent.message_text;
                 item.frequency_offset = intent.frequency_offset;
+                // Round-4 semantics (see `LatestTxIntent`): the binding is
+                // replaced ATOMICALLY with the payload, never left stale.
+                item.origin = intent.origin;
+                item.remote_client_key_id = intent.remote_client_key_id;
                 pivots.push((key, item.message_text.clone(), item.frequency_offset));
             }
             item
         })
         .collect();
     (pivoted_items, pivots)
+}
+
+/// PAN-136: the binding a multi-TX bundle is gated under, folded from its
+/// items' own bindings. Any `Remote` item makes the bundle `Remote` (the arm
+/// gate covers the whole summed waveform; fail-safe), and the client key is
+/// the first `Remote` item's that has one. This is the coalescer's original
+/// fold, shared so the coalescer and the TX worker's post-pivot re-fold cannot
+/// drift. It does not detect conflicting bindings; callers remove those first
+/// (the coalescer's arm/channel partitions, or [`bundle_identity_conflict_mask`]).
+pub fn fold_bundle_identity<'a>(
+    items: impl IntoIterator<Item = &'a crate::message_bus::TransmitRequestItem>,
+) -> (crate::message_bus::TxOrigin, Option<String>) {
+    let remote: Vec<&crate::message_bus::TransmitRequestItem> = items
+        .into_iter()
+        .filter(|it| it.origin == crate::message_bus::TxOrigin::Remote)
+        .collect();
+    if remote.is_empty() {
+        return (crate::message_bus::TxOrigin::Local, None);
+    }
+    (
+        crate::message_bus::TxOrigin::Remote,
+        remote.iter().find_map(|it| it.remote_client_key_id.clone()),
+    )
+}
+
+/// PAN-136: whether two bindings may not share one bundle-level gate. Both
+/// `Remote` and bound differently: two station-agent clients, or the WSJT-X
+/// UDP channel (`None`) against a station-agent client (PAN-98, independent
+/// consent). `Local` never conflicts.
+pub fn remote_identities_conflict(
+    a: (crate::message_bus::TxOrigin, Option<&str>),
+    b: (crate::message_bus::TxOrigin, Option<&str>),
+) -> bool {
+    a.0 == crate::message_bus::TxOrigin::Remote
+        && b.0 == crate::message_bus::TxOrigin::Remote
+        && a.1 != b.1
+}
+
+/// PAN-136: after a key-time bundle pivot, which live items must be held out
+/// of this bundle because their (possibly just re-bound) remote binding
+/// conflicts with the bundle's anchor binding. The anchor is `admitted` — the
+/// binding the bundle was dequeued with, which the coalescer checked against
+/// one arm snapshot — when a live item still carries it; otherwise the first
+/// live `Remote` item in bundle order (the coalescer's own "keep the first
+/// remote channel" rule). Preferring the admitted binding means a peer that
+/// re-binds one QSO cannot displace frames the arm already admitted. A held
+/// item's own fresh request is still queued, so it gets full per-entry
+/// admission next cycle. Not-live items are never flagged and never anchor;
+/// `Local` items never conflict.
+pub fn bundle_identity_conflict_mask(
+    items: &[crate::message_bus::TransmitRequestItem],
+    live: &[bool],
+    admitted: (crate::message_bus::TxOrigin, Option<&str>),
+) -> Vec<bool> {
+    let remote = crate::message_bus::TxOrigin::Remote;
+    let live_remote = || {
+        items
+            .iter()
+            .zip(live)
+            .filter(move |(it, &l)| l && it.origin == remote)
+            .map(|(it, _)| (it.origin, it.remote_client_key_id.as_deref()))
+    };
+    let anchor = if admitted.0 == remote && live_remote().any(|b| b == admitted) {
+        Some(admitted)
+    } else {
+        live_remote().next()
+    };
+    items
+        .iter()
+        .zip(live)
+        .map(|(it, &l)| {
+            l && anchor.is_some_and(|a| {
+                remote_identities_conflict(a, (it.origin, it.remote_client_key_id.as_deref()))
+            })
+        })
+        .collect()
 }
 
 /// Threshold (Hz) for treating a same-band (or out-of-band) dial move as a
@@ -2973,7 +3064,15 @@ mod pivot_bundle_tests {
             message_text: text.to_string(),
             frequency_offset: freq,
             qso_id: qso_id.map(|s| s.to_string()),
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         }
+    }
+
+    fn bound(mut it: TransmitRequestItem, key: Option<&str>) -> TransmitRequestItem {
+        it.origin = crate::message_bus::TxOrigin::Remote;
+        it.remote_client_key_id = key.map(str::to_string);
+        it
     }
 
     fn intent(text: &str, freq: f64) -> LatestTxIntent {
@@ -3113,6 +3212,176 @@ mod pivot_bundle_tests {
                 "SM2LIY K5ARH 73".to_string(),
                 693.0
             )]
+        );
+    }
+
+    /// PAN-136: the coordinator-level fold reproduces the coalescer's
+    /// original inline fold exactly, including its `find_map` edge (the key
+    /// is the first `Remote` item that HAS one, not the first `Remote`
+    /// item's).
+    #[test]
+    fn pan136_fold_bundle_identity_matches_the_coalescer_rule() {
+        use super::fold_bundle_identity;
+        use crate::message_bus::TxOrigin::{Local, Remote};
+        let l = item(None, "CQ K5ARH EM10", 900.0);
+        let a = bound(
+            item(Some("qa"), "SM2LIY K5ARH R-14", 1000.0),
+            Some("client-A"),
+        );
+        let b = bound(
+            item(Some("qb"), "C6AVD K5ARH EM10", 1600.0),
+            Some("client-B"),
+        );
+        let w = bound(item(Some("qw"), "K1ABC K5ARH -10", 2000.0), None);
+        assert_eq!(
+            fold_bundle_identity([] as [&TransmitRequestItem; 0]),
+            (Local, None)
+        );
+        assert_eq!(fold_bundle_identity([&l]), (Local, None));
+        // Any Remote item makes the bundle Remote; key = first Remote item that HAS one.
+        assert_eq!(
+            fold_bundle_identity([&l, &b, &a]),
+            (Remote, Some("client-B".into()))
+        );
+        assert_eq!(
+            fold_bundle_identity([&w, &a]),
+            (Remote, Some("client-A".into()))
+        );
+        assert_eq!(fold_bundle_identity([&l, &w]), (Remote, None));
+    }
+
+    /// PAN-136: the shared conflict predicate has supersede's original truth
+    /// table.
+    #[test]
+    fn pan136_remote_identities_conflict_truth_table() {
+        use super::remote_identities_conflict as c;
+        use crate::message_bus::TxOrigin::{Local, Remote};
+        assert!(c((Remote, Some("a")), (Remote, Some("b"))));
+        assert!(c((Remote, None), (Remote, Some("a")))); // WSJT-X UDP vs station agent (PAN-98)
+        assert!(!c((Remote, Some("a")), (Remote, Some("a"))));
+        assert!(!c((Remote, None), (Remote, None)));
+        assert!(!c((Local, None), (Remote, Some("a"))));
+    }
+
+    /// PAN-136: identical text and offset, but the intent is now bound to a
+    /// remote client: that is a pivot (tombstoned like any other), and the
+    /// item takes the intent's binding with it.
+    #[test]
+    fn pan136_authorization_only_rebind_is_a_bundle_pivot() {
+        let mut latest = HashMap::new();
+        let mut i = intent("C6AVD K5ARH EM10", 1728.0);
+        i.origin = crate::message_bus::TxOrigin::Remote;
+        i.remote_client_key_id = Some("client-B".to_string());
+        latest.insert(active_tx_qso_key("qso-a"), i);
+        let items = vec![item(Some("qso-a"), "C6AVD K5ARH EM10", 1728.0)]; // Local item
+        let (pivoted, pivots) = pivot_bundle_items(items, &latest);
+        assert_eq!(
+            pivots,
+            vec![(
+                active_tx_qso_key("qso-a"),
+                "C6AVD K5ARH EM10".to_string(),
+                1728.0
+            )]
+        );
+        assert_eq!(pivoted[0].origin, crate::message_bus::TxOrigin::Remote);
+        assert_eq!(pivoted[0].remote_client_key_id.as_deref(), Some("client-B"));
+    }
+
+    /// PAN-136: a text pivot replaces the binding atomically with the payload.
+    #[test]
+    fn pan136_text_pivot_carries_the_intents_binding() {
+        let mut latest = HashMap::new();
+        let mut i = intent("SM2LIY K5ARH 73", 693.0);
+        i.origin = crate::message_bus::TxOrigin::Remote;
+        i.remote_client_key_id = Some("client-B".to_string());
+        latest.insert(active_tx_qso_key("qso-a"), i);
+        let items = vec![bound(
+            item(Some("qso-a"), "SM2LIY K5ARH R-14", 693.0),
+            Some("client-A"),
+        )];
+        let (pivoted, pivots) = pivot_bundle_items(items, &latest);
+        assert_eq!(
+            pivots,
+            vec![(
+                active_tx_qso_key("qso-a"),
+                "SM2LIY K5ARH 73".to_string(),
+                693.0
+            )]
+        );
+        assert_eq!(pivoted[0].message_text, "SM2LIY K5ARH 73");
+        assert_eq!(pivoted[0].origin, crate::message_bus::TxOrigin::Remote);
+        assert_eq!(pivoted[0].remote_client_key_id.as_deref(), Some("client-B"));
+    }
+
+    /// PAN-136: an item whose own binding matches its intent's is still not a
+    /// pivot, and a manual (`qso_id: None`) item in the same bundle is never
+    /// pivoted: comparing each item's OWN binding manufactures no spurious
+    /// pivots.
+    #[test]
+    fn pan136_same_binding_is_still_not_a_pivot() {
+        let mut latest = HashMap::new();
+        let mut i = intent("SM2LIY K5ARH R-14", 1000.0);
+        i.origin = crate::message_bus::TxOrigin::Remote;
+        i.remote_client_key_id = Some("client-A".to_string());
+        latest.insert(active_tx_qso_key("qa"), i);
+        latest.insert(active_tx_qso_key("ql"), intent("C6AVD K5ARH EM10", 1600.0));
+        let items = vec![
+            bound(
+                item(Some("qa"), "SM2LIY K5ARH R-14", 1000.0),
+                Some("client-A"),
+            ),
+            item(Some("ql"), "C6AVD K5ARH EM10", 1600.0),
+            item(None, "CQ K5ARH EM10", 900.0),
+        ];
+        let (pivoted, pivots) = pivot_bundle_items(items, &latest);
+        assert!(pivots.is_empty(), "no spurious pivots: {pivots:?}");
+        assert_eq!(pivoted[0].origin, crate::message_bus::TxOrigin::Remote);
+        assert_eq!(pivoted[0].remote_client_key_id.as_deref(), Some("client-A"));
+        assert_eq!(pivoted[1].origin, crate::message_bus::TxOrigin::Local);
+        assert_eq!(pivoted[2].origin, crate::message_bus::TxOrigin::Local);
+    }
+
+    /// PAN-136: the post-pivot conflict hold anchors on the admitted binding
+    /// while a live item still carries it, otherwise on the first live
+    /// `Remote` item; not-live and `Local` items are never flagged.
+    #[test]
+    fn pan136_conflict_mask_prefers_the_admitted_binding() {
+        use super::bundle_identity_conflict_mask as mask;
+        use crate::message_bus::TxOrigin::{Local, Remote};
+        let l = item(None, "CQ K5ARH EM10", 900.0);
+        let a = bound(
+            item(Some("qa"), "SM2LIY K5ARH R-14", 1000.0),
+            Some("client-A"),
+        );
+        let b = bound(
+            item(Some("qb"), "C6AVD K5ARH EM10", 1600.0),
+            Some("client-B"),
+        );
+        let w = bound(item(Some("qw"), "K1ABC K5ARH -10", 2000.0), None);
+        let items = vec![l, b, a, w];
+        // Admitted binding A is still carried by a live item: it anchors, even though B comes first.
+        assert_eq!(
+            mask(&items, &[true; 4], (Remote, Some("client-A"))),
+            vec![false, true, false, true]
+        );
+        // Local bundle (no admitted Remote binding): the first live Remote item anchors.
+        assert_eq!(
+            mask(&items, &[true; 4], (Local, None)),
+            vec![false, false, true, true]
+        );
+        // Not-live items are never flagged and never anchor.
+        assert_eq!(
+            mask(&items, &[true, false, true, true], (Local, None)),
+            vec![false, false, false, true]
+        );
+        // Admitted binding no longer carried by any live item: fall back to first live Remote.
+        assert_eq!(
+            mask(
+                &items,
+                &[true, true, false, true],
+                (Remote, Some("client-A"))
+            ),
+            vec![false, false, false, true]
         );
     }
 }

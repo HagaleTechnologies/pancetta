@@ -2514,6 +2514,8 @@ impl super::ApplicationCoordinator {
                                                 message_text: message_text.clone(),
                                                 frequency_offset,
                                                 qso_id: qso_id.clone(),
+                                                origin: crate::message_bus::TxOrigin::Local,
+                                                remote_client_key_id: None,
                                             },
                                             tx_parity,
                                         ));
@@ -3884,6 +3886,8 @@ mod plan_slot_transmissions_tests {
                 message_text: text.to_string(),
                 frequency_offset: offset,
                 qso_id: None,
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             },
             Some(SlotParity::Even),
         )
@@ -3895,6 +3899,8 @@ mod plan_slot_transmissions_tests {
                 message_text: text.to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some(qso_id.to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             },
             Some(SlotParity::Odd),
         )

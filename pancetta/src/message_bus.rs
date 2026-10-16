@@ -399,10 +399,16 @@ pub enum MessageType {
         /// Where this bundle came from. `Local` (default) skips the remote-TX
         /// arm gate; `Remote` is gated by `ArmState::tx_permitted()`. The whole
         /// bundle shares one origin (a bundle is one operator's slot).
+        ///
+        /// PAN-136: together with `remote_client_key_id` this is the bundle's
+        /// gate binding: the fold of its items' bindings
+        /// (`coordinator::fold_bundle_identity`), re-folded by the TX worker
+        /// after a key-time pivot.
         #[allow(dead_code)]
         origin: TxOrigin,
         /// See `MessageType::TransmitRequest::remote_client_key_id`. The whole
-        /// bundle shares one client binding, matching `origin` above.
+        /// bundle shares one client binding, matching `origin` above: the fold
+        /// of its items' bindings, re-folded after a key-time pivot (PAN-136).
         remote_client_key_id: Option<String>,
     },
 
@@ -486,11 +492,23 @@ pub enum MessageType {
 }
 
 /// A single transmit request item for multi-TX bundles.
+///
+/// PAN-136: each item carries the authorization of the request it came from,
+/// so a key-time pivot can swap it atomically with the payload (see
+/// `coordinator::pivot_bundle_items`). There is deliberately no `Default`:
+/// every construction site must name the binding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransmitRequestItem {
     pub message_text: String,
     pub frequency_offset: f64,
     pub qso_id: Option<String>,
+    /// See `MessageType::TransmitRequest::origin`.
+    #[serde(default)]
+    pub origin: TxOrigin,
+    /// See `MessageType::TransmitRequest::remote_client_key_id`; `None` for
+    /// every `Local` item.
+    #[serde(default)]
+    pub remote_client_key_id: Option<String>,
 }
 
 /// One row in a `MessageType::TxQueueStatus` payload — a compact,
