@@ -384,9 +384,11 @@ impl AdifProcessor {
             let mut parts = spec.split(':');
             let name = parts.next().unwrap_or_default().to_uppercase();
             let length = match parts.next().map(str::parse::<usize>) {
-                None => 0,
                 Some(Ok(length)) => length,
-                Some(Err(_)) => {
+                // No length (`<COMMENT>secret`) is as unreadable as a
+                // non-numeric one: reading it as zero would import the
+                // contact with the value silently dropped (PR #451 review).
+                None | Some(Err(_)) => {
                     // First error wins; the text up to the next tag is skipped.
                     error.get_or_insert(AdifError::InvalidField {
                         field: spec.clone(),
@@ -661,7 +663,7 @@ impl AdifProcessor {
                     points: 1, // Default
                     multiplier: None,
                 }),
-            tags: Self::tags_with_qsl_status(adif_qso),
+            tags: Self::tags_with_unmodeled_fields(adif_qso),
             notes: adif_qso.comment.clone(),
             tx_parity: None,
             initiated_by: Default::default(),
@@ -684,20 +686,38 @@ impl AdifProcessor {
         }
     }
 
-    /// `additional_fields` plus the record's QSL_SENT/QSL_RCVD, which are
-    /// standard fields (so not in `additional_fields`) but have no
-    /// [`QsoMetadata`] field of their own. Keeping them in the tags carries an
-    /// imported LoTW/QRZ confirmation through the index to `qso_to_adif`
-    /// (PAN-127). The other QSL fields (dates, VIA, QSLMSG, LOTW_*/EQSL_*)
-    /// are not standard here, so they already ride in `additional_fields`.
-    fn tags_with_qsl_status(adif_qso: &AdifQso) -> HashMap<String, String> {
+    /// `additional_fields` plus the record's standard fields that
+    /// [`QsoMetadata`] does not hold as read: OPERATOR, TX_PWR, COUNTRY, DXCC,
+    /// CQZ, ITUZ, NOTES, QSL_SENT/QSL_RCVD, the reports as written (a CW
+    /// `599`/`5NN` is not a dB report), BAND (export derives it from FREQ,
+    /// which a record may lack), and MODE when a SUBMODE replaced it in
+    /// `mode`. Kept in the tags, they ride through the index and come back
+    /// out of `qso_to_adif` as fields, so an imported contact exports as it
+    /// was read (PAN-127). Non-standard fields (QSL dates, VIA, QSLMSG,
+    /// LOTW_*/EQSL_*, serial strings) are already in `additional_fields`.
+    fn tags_with_unmodeled_fields(adif_qso: &AdifQso) -> HashMap<String, String> {
         let mut tags = adif_qso.additional_fields.clone();
+        let number = |value: Option<u32>| value.map(|n| n.to_string());
+        let mode = adif_qso.submode.as_ref().map(|_| adif_qso.mode.clone());
+        let band = Some(adif_qso.band.clone());
         for (name, value) in [
-            (QSL_SENT_FIELD, &adif_qso.qsl_sent),
-            (QSL_RCVD_FIELD, &adif_qso.qsl_rcvd),
+            ("OPERATOR", adif_qso.operator.clone()),
+            ("TX_PWR", adif_qso.tx_pwr.map(|watts| watts.to_string())),
+            ("COUNTRY", adif_qso.country.clone()),
+            ("DXCC", number(adif_qso.dxcc.map(u32::from))),
+            ("CQZ", number(adif_qso.cqz.map(u32::from))),
+            ("ITUZ", number(adif_qso.ituz.map(u32::from))),
+            ("NOTES", adif_qso.notes.clone()),
+            (QSL_SENT_FIELD, adif_qso.qsl_sent.clone()),
+            (QSL_RCVD_FIELD, adif_qso.qsl_rcvd.clone()),
+            ("RST_SENT", adif_qso.rst_sent.clone()),
+            ("RST_RCVD", adif_qso.rst_rcvd.clone()),
+            ("BAND", band),
+            ("MODE", mode),
+            ("SUBMODE", adif_qso.submode.clone()),
         ] {
-            if let Some(value) = value.as_ref().filter(|value| !value.is_empty()) {
-                tags.insert(name.to_string(), value.clone());
+            if let Some(value) = value.filter(|value| !value.is_empty()) {
+                tags.insert(name.to_string(), value);
             }
         }
         tags
@@ -1807,6 +1827,30 @@ ADIF Export for Test Program
             }
             other => panic!("expected InvalidField(TX_PWR:x), got {other:?}"),
         }
+    }
+
+    /// PR #451 review (Codex P2): a tag with no length (`<COMMENT>secret`)
+    /// must make its record unreadable, as a non-numeric length does, rather
+    /// than import the contact with the value silently dropped.
+    #[test]
+    fn parse_bytes_rejects_a_field_tag_with_no_length() {
+        let adif = "<CALL:4>W1AW <QSO_DATE:8>20240101 <TIME_ON:4>1200 <COMMENT>secret <EOR>\n\
+                    <CALL:5>K1ABC <QSO_DATE:8>20240101 <TIME_ON:4>1300 <EOR>\n";
+
+        let parsed = AdifProcessor::new().parse_bytes(adif.as_bytes());
+
+        assert_eq!(parsed.records.len(), 2);
+        match &parsed.records[0] {
+            Err(AdifRecordError {
+                error: AdifError::InvalidField { field },
+                call,
+            }) => {
+                assert_eq!(field, "COMMENT");
+                assert_eq!(call.as_deref(), Some("W1AW"));
+            }
+            other => panic!("expected InvalidField(COMMENT), got {other:?}"),
+        }
+        assert!(parsed.records[1].is_ok(), "{:?}", parsed.records[1]);
     }
 
     #[test]
