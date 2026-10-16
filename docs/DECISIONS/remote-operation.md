@@ -560,7 +560,58 @@ mid-TX poll remains the backstop.
 
 Following round 9's log-ordering requirement, `TxFrameLogged` is emitted only
 on `Enqueued`. Denied or dropped audio no longer appears as an aired frame in
-Band Activity. Concurrent bundle items retain a shared timestamp. Delivery
-confirmation for PTT-off and audio flush remains PAN-135; those safe-direction
-sends keep the existing best-effort contract. Tune, config, and wire formats
-are unchanged.
+Band Activity. Concurrent bundle items retain a shared timestamp. PAN-135
+confirms the PTT-off and audio-flush sends at these unwinds; see below. Tune,
+config, and wire formats are unchanged.
+
+## PAN-135: confirm PTT-off and the disarm audio flush before proceeding
+
+`MessageBus` has three delivery tiers. `send_message` stays best-effort
+(PAN-38): a dropped delivery still returns `Ok(())`. `send_message_checked`
+and `send_message_retrying` confirm enqueue; a `DeliveryAck` carried inside
+the message confirms the consumer applied it.
+
+A safety send is handed off once it is enqueued on the same FIFO as
+everything it must precede. PTT-off qualifies: Hamlib applies its channel in
+order, so a later PTT-on from the TX worker always lands after it. The disarm
+audio flush does not: it travels the Audio channel and relay while the next
+key travels Hamlib's channel, so it needs the audio thread's acknowledgement.
+
+At every remote-revocation unkey (the four `AbortedByDisarm` arms and the two
+Step 7 `SendIfOutcome::Denied` pre-audio rechecks), `PttGuard::release`
+retries PTT-off at 5, 20 and
+50 ms and stands the guard down and clears `ptt_active` only after an attempt
+is enqueued. If every attempt drops, the guard stays armed and its `Drop`
+retries on scope exit with the same schedule; Hamlib's 14 s PTT watchdog is
+the backstop. A late fallback PTT-off can only cut a later transmission
+short, never extend one.
+
+The mid-playback arms send `MessageType::AudioFlush { ack }` in band. The
+relay forwards it in order, and the audio thread settles the ack `Applied`
+only when the output callback completed the flush within `queue_output`'s
+20 ms handshake (the callback discards the ring buffer before it reads
+another sample). A handshake that times out, because the callback is
+stalled, settles `NotApplied`: that flush is still pending and would clear
+whatever is buffered when the callback resumes, including a later frame. The TX
+worker waits for the ack before draining or re-enqueuing pending work.
+Without one (dropped, not applied, or no reply) it waits until the revoked
+waveform's playback end plus 250 ms, never less than 250 ms; shutdown ends
+the wait. In `--no-audio`, stub-audio and replay modes nothing acks, so a
+mid-playback remote disarm waits out the frame. An output callback that has
+not run within the 20 ms handshake counts as stalled, so on a device whose
+callback period exceeds 20 ms every mid-playback disarm also waits out the
+frame. A callback still stalled when that wait ends leaves the flush
+pending, and it can then clear a later frame's audio; PAN-115's TX hard mute
+refuses keying only once the output callback has been silent for 2 s.
+
+Rejected: a priority lane (a PTT-off overtaking a still-queued PTT-on of the
+same frame would leave the rig keyed); a CAT-level ack for PTT-off (FIFO
+hand-off already orders it, and the worker cannot repair a failed CAT call);
+changing `send_message` for its other callers; an out-of-band flush channel
+(it could clear the buffer before the revoked samples reached it).
+
+Not covered: manual PTT (TUI and remote) does not pass through the TX worker
+and is not gated on the flush wait. Hamlib's command loop clears its PTT
+watchdog timer before `set_ptt(Off)` returns, so a failed CAT unkey also
+stops that watchdog. Non-remote PTT-off sites (clock-step hold, normal
+Step 9, supersede, tune completion) keep best-effort delivery.
