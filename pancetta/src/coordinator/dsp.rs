@@ -268,21 +268,29 @@ impl WavRecorder {
 
         // The running total only overestimates (external removals aren't
         // seen), so re-measure before trusting it to evict anything.
-        // Only a complete scan may lower the estimate. A partial one is a
-        // lower bound, and a failed one says nothing; trusting either could
-        // skip eviction and let the buffer grow past the cap.
+        // At the cap, re-measure before deleting anything: external removals
+        // (the NAS offload) aren't tracked, so the running total only
+        // overestimates. If the scan is partial or fails, the real size is
+        // unknown. Skip this window rather than evict from a stale estimate,
+        // and retry on the next one.
         if self.total_bytes >= self.max_bytes {
             match Self::dir_size(&self.dir) {
                 Ok((measured, true)) => self.total_bytes = measured,
-                Ok((measured, false)) => {
-                    warn!("WAV recorder: partial re-measure of {}", self.dir.display());
-                    self.total_bytes = self.total_bytes.max(measured);
+                Ok((_, false)) => {
+                    warn!(
+                        "WAV recorder: partial re-measure of {}, skipping write",
+                        self.dir.display()
+                    );
+                    return;
                 }
-                Err(e) => warn!(
-                    "WAV recorder: cannot re-measure {}: {}",
-                    self.dir.display(),
-                    e
-                ),
+                Err(e) => {
+                    warn!(
+                        "WAV recorder: cannot re-measure {}: {}, skipping write",
+                        self.dir.display(),
+                        e
+                    );
+                    return;
+                }
             }
         }
 
@@ -1635,21 +1643,24 @@ mod wav_recorder_tests {
         assert_eq!(rec.total_bytes, 2 * FILE);
     }
 
+    /// A partial re-measure at the cap must neither evict from the stale
+    /// estimate (which could delete every readable recording) nor write past
+    /// an unknown size: skip the window and keep everything.
     #[cfg(unix)]
     #[test]
-    fn partial_remeasure_never_lowers_the_at_cap_estimate() {
+    fn partial_remeasure_skips_the_write_and_evicts_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         seed_with_unstatable(tmp.path());
         let mut rec = WavRecorder::open(tmp.path().to_path_buf(), 3 * FILE).unwrap();
-        rec.total_bytes = 5 * FILE; // stale at-cap estimate
+        rec.total_bytes = 50 * FILE; // stale at-cap estimate, far above what's on disk
+        let before = wav_names(tmp.path());
 
         rec.write_window(&tone(), &ts(), 0);
 
-        // Eviction ran from the kept estimate rather than the partial 2 KB total.
-        let names = wav_names(tmp.path());
-        assert!(
-            !names.contains(&"ft8_a.wav".to_string()),
-            "eviction skipped: {names:?}"
+        assert_eq!(
+            wav_names(tmp.path()),
+            before,
+            "partial re-measure changed the buffer"
         );
     }
 
