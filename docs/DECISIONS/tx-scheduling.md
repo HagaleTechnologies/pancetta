@@ -288,6 +288,18 @@ in a restart pending slot). Closing this needs a confirmed-RF source (the rig's 
 back) or in-flight marking from the requested-value store through CAT application. That producer
 ordering predates PAN-118 and is follow-up scope.
 
+**PAN-208: the occupied interval must fit inside one allowed range.** The gate first checked the
+low and high edges as two independent point queries. Point membership is OR across a
+`custom_bands` entry's `ranges`, so a frame whose base tone sat in one range and top tone in the
+next keyed across the excluded gap between them. Deferred from PR #446's Codex P1 thread
+`PRRT_kwDORcJovs6s7i1s`; fixed by `pancetta_tui::app::tx_interval_out_of_band_plan`, which
+requires `[floor(low), ceil(low + span)]` to sit inside ONE candidate range resolved from the low
+edge (custom ranges are clipped to the band's global range, matching the point check). Every
+caller of `tx_band_plan_mute_reason` gets it with no call-site change; the two refusal messages
+are unchanged. Built-in region/global tables are unaffected: they give each band one contiguous
+range, and inter-band gaps are far wider than the 175 Hz maximum span. Overlapping custom ranges
+are not unioned: one range must contain the whole signal.
+
 The QSO stall-evidence closure (`qso.rs`) is deliberately untouched; whether band-plan refusals
 should suppress stall-escape counting is follow-up scope. The `coord_sim` fixture mirrors the gate
 in its `drive_slot` chain using the re-exported real gate functions, exactly as it does for the

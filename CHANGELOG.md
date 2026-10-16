@@ -114,6 +114,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The TX band-plan gate now refuses a frame that straddles the gap between
+  two ranges of a `custom_bands` entry (PAN-208). The whole occupied signal
+  must fit inside ONE allowed range; before, the low and high edges were
+  checked separately, each landed in some range, and the frame keyed across
+  the excluded gap. Built-in band plans behave as before.
+
 - QSO log index and backups: when startup rebuilt `~/.pancetta/qso.db` from
   a newer `qsos.adi`, the SQLite logger had already opened the old file, so
   QSOs it logged that session never reached the live index and its startup
