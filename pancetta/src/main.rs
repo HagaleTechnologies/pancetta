@@ -904,8 +904,8 @@ async fn import_command(args: ImportArgs) -> Result<()> {
     };
 
     // Marked before the first write and cleared only once every new row is
-    // indexed, so an import stopped part-way still gets its index rebuilt at
-    // the next start. A marker left by an earlier interrupted import is not
+    // indexed (and the index was current to begin with), so an import
+    // stopped part-way still gets its index rebuilt at the next start. A marker left by an earlier interrupted import is not
     // ours to clear: its missing rows are not among the ones added here.
     let marker = QsoDatabase::rebuild_marker(&db);
     let marked_here = mark_index_incomplete(&marker)
@@ -930,7 +930,10 @@ async fn import_command(args: ImportArgs) -> Result<()> {
     if index_was_behind || indexed.is_err() {
         mark_newer_than(&adif, &db);
     }
-    if marked_here && indexed.is_ok() {
+    // An index that was already behind is still missing rows after the new
+    // ones are added: keep it marked, since a later live write can make
+    // qso.db look newer than qsos.adi again (PAN-127).
+    if marked_here && indexed.is_ok() && !index_was_behind {
         let _ = std::fs::remove_file(&marker);
     }
     print!(

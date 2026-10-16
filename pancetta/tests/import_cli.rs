@@ -396,6 +396,12 @@ fn import_keeps_a_stale_index_looking_stale() {
         modified(s.adif()) > modified(s.db()),
         "qso.db must stay older than qsos.adi so the next start rebuilds it"
     );
+    // A later live write can make qso.db newer again, so the mtime alone
+    // cannot carry the stale index to the next start (PR #451 review).
+    assert!(
+        QsoDatabase::rebuild_marker(&s.db()).exists(),
+        "an index that was already behind stays marked for rebuild"
+    );
 }
 
 /// When indexing fails, the logbook must be left looking newer than any
