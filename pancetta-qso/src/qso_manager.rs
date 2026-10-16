@@ -1069,10 +1069,12 @@ pub struct UnsentAttemptPayload {
 
 /// Per-QSO relocation counters shared with the TX worker (PAN-145).
 ///
-/// A relocation bumps its raw QsoId key under `ptt_sync_gate`, before
-/// committing the offset. The worker snapshots before reading intent and
-/// compares after acquiring that gate. This detects the PAN-143 round-4
+/// `apply_tx_offset_switch` bumps its raw QsoId key under `ptt_sync_gate`,
+/// before committing the offset. The worker snapshots before reading intent
+/// and compares after acquiring that gate. This detects the PAN-143 round-4
 /// race even while the coordinator's asynchronous intent mirror lags.
+/// Other paths that move a QSO's TX offset without the gate (for example the
+/// drift relatch and the Hound QSY) do not bump it.
 /// The map lock is never held across an await.
 #[derive(Default)]
 pub struct TxRelocationEpochs {

@@ -7,11 +7,17 @@
 
 A successful QSO offset switch bumps a per-QSO epoch under `ptt_sync_gate`,
 before committing the frequency. The TX worker snapshots epochs before its
-intent read and compares them after acquiring the gate. A relocation across
+intent read and compares them after acquiring the gate. An offset switch across
 that interval drops the single frame or the whole summed bundle before PTT,
 with unaired accounting and pivot-tombstone cleanup. Counters are keyed by raw
 QSO ids, shared through coordinator injection, and retained across manager
 clones. Unrelated QSOs and frames without a QSO id do not trigger this check.
+
+Only `apply_tx_offset_switch` bumps the counter. Other `QsoManager` paths that
+move a QSO's TX offset, for example the drift relatch on a Tx=Rx QSO and the
+Hound QSY, take neither the gate nor the counter, as before PAN-143. A newer
+request they produce reaches the worker as a `MessageToSend`; if it lands after
+the intent read, the old frame keys and the existing supersede handling applies.
 
 A second read of `latest_tx_intent` cannot establish freshness: the coordinator
 updates it asynchronously after the relocation publishes its events. Holding
@@ -19,7 +25,7 @@ the gate through modulation would add DSP latency without closing that mirror
 gap. Rebuilding after the wait would duplicate the same vulnerable read and the
 encoding path. The epoch comparison therefore uses PAN-148's drop-only final
 gate; a fresh request can key a later eligible slot. The PTT gate still prevents
-any later relocation while the worker is preparing to key. See the PAN-145
+any later offset switch while the worker is preparing to key. See the PAN-145
 amendment in `docs/superpowers/specs/2026-09-12-pan-143-ptt-shared-synchronization-design.md`.
 
 ## DX-slot-aware TX scheduling

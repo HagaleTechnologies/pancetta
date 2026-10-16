@@ -266,12 +266,24 @@ without a QSO id and tune requests keep their existing paths. Other QSOs'
 relocations do not invalidate the frame.
 
 The shared gate remains essential. Once the worker sets `ptt_active` under it,
-a later relocation refuses before its bump. The counter detects relocations
-between the snapshot and that store, including ones whose event has not reached
-the mirror. It complements the PAN-143 mutual exclusion; it does not replace it
-with the ungated generation/CAS approach rejected above. Lock order is
+a later offset switch refuses before its bump. The counter detects offset
+switches between the snapshot and that store, including ones whose event has
+not reached the mirror. It complements the PAN-143 mutual exclusion; it does not
+replace it with the ungated generation/CAS approach rejected above. Lock order is
 `qsos` then `ptt_sync_gate` then the epoch map; epoch readers release the map
 before awaiting anything.
+
+Bound: only `apply_tx_offset_switch` bumps the counter. Other `QsoManager` paths
+also move a QSO's TX offset, for example the confirmed drift relatch on a Tx=Rx
+QSO (`maybe_confirm_frequency_drift_at`) and the one-shot Hound QSY
+(`process_message_for_qso`). They take neither `ptt_sync_gate` nor the counter
+and do not check `ptt_active` (none did before PAN-143). A newer request they
+produce reaches the worker as a `MessageToSend`. When that lands after the
+worker's intent read, the old frame keys and the existing supersede handling
+applies to the newer request, exactly as at the PAN-145 base. An offset switch
+holds the `qsos` write lock for its whole gate-held span except the final event
+sends, so these paths can overlap a gate wait the switch causes only in that
+tail. Gating them is a separate design change.
 
 The refusal follows PAN-148's drop-only final gate. No re-encoding or modulation
 runs under the gate, and the slot-lateness check stays last. The fresh request

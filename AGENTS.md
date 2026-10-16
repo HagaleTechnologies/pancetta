@@ -69,7 +69,7 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 - Drop-stale-TX: the worker re-checks QSO liveness and slot-timing headroom (`tx_late_max_ms`
   elapsed in the target slot) at the last instant before PTT; an over-cap frame is dropped,
   never keyed (PAN-117).
-- The TX worker revalidates its snapshotted TX-intent epoch after acquiring `ptt_sync_gate` and refuses, never keys, a frame whose QSO relocated during the gate wait (PAN-145).
+- The TX worker revalidates its snapshotted relocation epoch after acquiring `ptt_sync_gate` and refuses, never keys, a frame whose QSO `apply_tx_offset_switch` moved between that snapshot and the gate (PAN-145).
 - The TX hard mute (`tx_hard_mute_reason`) also refuses while the rig CAT link is `PollingFailed` or the audio output has stopped calling back (PAN-115). Both clear on their own when the link/device recovers, and the Hamlib poll loop must keep redialling rigctld while disconnected.
 - Band-plan gate (PAN-118): every PTT-on path — single TX, bundle item, tune, manual PTT, any origin — also refuses, before PTT, when the absolute TX RF (effective split-aware dial + audio offset) falls outside the configured band plan (`edge_warnings` is the master switch; skipped while the dial is the unknown-0 sentinel); bundles drop only the offending items wherever items are still separable, and hold the whole bundle once the waveform is summed.
 - `mode=FT8` paths must remain byte-identical when FT4/FT2 features are untouched.

@@ -4393,7 +4393,7 @@ fn final_single_tx_gate_denial(
 }
 
 /// PAN-145: compare raw QsoId epochs after `PttGuard::new` has set
-/// `ptt_active` under the shared gate. Later relocations now refuse, so
+/// `ptt_active` under the shared gate. Later offset switches now refuse, so
 /// these reads need no async lock or repeated DSP. None is manual/test TX.
 fn relocation_epoch_stale(
     epochs: &pancetta_qso::qso_manager::TxRelocationEpochs,
@@ -8263,7 +8263,7 @@ impl super::ApplicationCoordinator {
                                         // schedule (pad/cursor) stays valid, and every FT8
                                         // frame is the same 79-symbol length so audio_out's
                                         // length (and audio_duration_ms) are unchanged.
-                                        // Snapshot BEFORE the async mirror read. A relocation
+                                        // Snapshot BEFORE the async mirror read. An offset switch
                                         // during the pivot or gate wait invalidates this frame,
                                         // even if its MessageToSend has not reached the mirror.
                                         let relocation_snapshot = [(
