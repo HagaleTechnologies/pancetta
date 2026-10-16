@@ -402,6 +402,19 @@ impl QsoDatabase {
 
     /// Insert a new QSO record
     pub async fn insert_qso(&self, progress: &QsoProgress) -> Result<i64, AsyncDatabaseError> {
+        self.insert_qso_with(&self.pool, progress).await
+    }
+
+    /// [`Self::insert_qso`] on any executor, so a batch can share one
+    /// transaction.
+    async fn insert_qso_with<'e, E>(
+        &self,
+        executor: E,
+        progress: &QsoProgress,
+    ) -> Result<i64, AsyncDatabaseError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
         let qso_id = progress.metadata.qso_id.to_string();
         let metadata_json = serde_json::to_string(&progress.metadata)?;
         let state_json = serde_json::to_string(&progress.state)?;
@@ -428,7 +441,7 @@ impl QsoDatabase {
         .bind(&now)
         .bind(&now)
         .bind(&checksum)
-        .execute(&self.pool)
+        .execute(executor)
         .await?;
 
         let id = result.last_insert_rowid();
@@ -1062,7 +1075,8 @@ impl QsoDatabase {
     /// record→row conversion, the same −15 dB report default, and the same
     /// skip (with a `warn!`) for a record with no CALL. Returns (inserted,
     /// skipped for having no CALL). Fails, inserting nothing, if
-    /// `record_to_qso` rejects any record.
+    /// `record_to_qso` rejects any record or any insert fails: the rows
+    /// commit in one transaction.
     pub async fn insert_adif_records(
         &self,
         processor: &AdifProcessor,
@@ -1089,7 +1103,7 @@ impl QsoDatabase {
             .collect()
     }
 
-    /// Insert converted records as completed QSOs.
+    /// Insert converted records as completed QSOs, all in one transaction.
     /// Records with no CALL are skipped. Returns (inserted, skipped).
     async fn insert_converted(
         &self,
@@ -1097,6 +1111,10 @@ impl QsoDatabase {
     ) -> Result<(u64, u64), AsyncDatabaseError> {
         let mut inserted: u64 = 0;
         let mut skipped: u64 = 0;
+        // One transaction: an import stopped part-way (error, kill, power
+        // loss) leaves none of its rows, never a partial index that looks
+        // current (PAN-127).
+        let mut tx = self.pool.begin().await?;
         for metadata in converted {
             // ADIF records with no <CALL:N> field are semantically broken — skip
             // them rather than inserting a record with no callsign.
@@ -1142,18 +1160,20 @@ impl QsoDatabase {
                 metadata,
             };
 
-            self.insert_qso(&progress).await?;
+            self.insert_qso_with(&mut *tx, &progress).await?;
             inserted += 1;
         }
+        tx.commit().await?;
         Ok((inserted, skipped))
     }
 
     /// The file beside the index at `db_path` that marks it as missing rows
     /// the ADIF log holds. `pancetta import` creates it before writing and
     /// removes it once the new rows are indexed; startup rebuilds an index it
-    /// finds marked. Each row commits on its own, so an import stopped part-way
-    /// (Ctrl-C, power loss) can leave a partial index newer than the ADIF log,
-    /// which the mtime check alone would trust (PAN-127).
+    /// finds marked. The new rows commit together, but an import stopped
+    /// between appending to the ADIF log and committing them (Ctrl-C, power
+    /// loss) leaves an index missing rows the log holds, which the mtime
+    /// check alone may trust (PAN-127).
     pub fn rebuild_marker(db_path: &Path) -> std::path::PathBuf {
         let mut name = db_path.as_os_str().to_owned();
         name.push(".rebuild");
@@ -1943,6 +1963,36 @@ mod tests {
         assert_eq!(states, replayed.get_worked_callsigns_and_states().await);
         inserted.close().await;
         replayed.close().await;
+    }
+
+    /// PR #451 review (Codex P2): an import's rows must commit together. A
+    /// failure part-way (here a trigger rejecting the second row; in the
+    /// field, a kill or power loss) must leave none of them behind, or the
+    /// partial index can look current and never be rebuilt.
+    #[tokio::test]
+    async fn insert_adif_records_commits_all_rows_or_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = QsoDatabase::open(tmp.path().join("qso.db")).await.unwrap();
+        sqlx::query(
+            "CREATE TRIGGER reject_k9def BEFORE INSERT ON qsos \
+             WHEN json_extract(NEW.metadata, '$.their_callsign') = 'K9DEF' \
+             BEGIN SELECT RAISE(ABORT, 'rejected'); END",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let processor = AdifProcessor::new();
+        let file = processor.parse_string(INSERT_FIXTURE).unwrap();
+
+        let result = db.insert_adif_records(&processor, &file.records).await;
+
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(
+            db.count_qsos().await.unwrap(),
+            0,
+            "a failed import must not leave part of its rows indexed"
+        );
+        db.close().await;
     }
 
     #[tokio::test]
