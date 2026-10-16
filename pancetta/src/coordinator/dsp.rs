@@ -213,14 +213,25 @@ impl WavRecorder {
     /// Bytes in top-level `*.wav` files: the same flat scope
     /// [`Self::delete_oldest`] evicts from, so curated fixture subdirectories
     /// (e.g. `noise_1000/`) and non-WAV files never count toward the cap.
+    ///
+    /// Any scan error fails the whole measurement, so callers never mistake a
+    /// partial total for the real one. The exception is a file that vanished
+    /// between listing and stat (the offload moved it): it is simply gone.
     fn dir_size(dir: &std::path::Path) -> std::io::Result<u64> {
-        Ok(std::fs::read_dir(dir)?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "wav"))
-            .filter_map(|e| e.metadata().ok())
-            .filter(|m| m.is_file())
-            .map(|m| m.len())
-            .sum())
+        let mut total = 0;
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.path().extension().is_none_or(|ext| ext != "wav") {
+                continue;
+            }
+            match entry.metadata() {
+                Ok(m) if m.is_file() => total += m.len(),
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(total)
     }
 
     /// Write a 12kHz mono f32 window to a timestamped WAV file.
@@ -1582,6 +1593,22 @@ mod wav_recorder_tests {
             &["n1.wav", "n2.wav", "n3.wav"],
         );
         assert_eq!(WavRecorder::dir_size(tmp.path()).unwrap(), FILE);
+    }
+
+    /// A partial scan (listing works, stat fails) is an error, not a smaller
+    /// total. r-- without x lets read_dir list names but denies stat.
+    #[cfg(unix)]
+    #[test]
+    fn partial_scan_is_an_error_not_a_smaller_total() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("recordings");
+        std::fs::create_dir(&dir).unwrap();
+        seed(&dir, &["ft8_a.wav", "ft8_b.wav"]);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let measured = WavRecorder::dir_size(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(measured.is_err(), "partial scan returned {measured:?}");
     }
 
     /// An unreadable directory must not be mistaken for an empty one: the
