@@ -616,7 +616,6 @@ watchdog timer before `set_ptt(Off)` returns, so a failed CAT unkey also
 stops that watchdog. Non-remote PTT-off sites (clock-step hold, normal
 Step 9, supersede, tune completion) keep best-effort delivery.
 
-<<<<<<< HEAD
 ## PAN-136: bundle items carry their own authorization
 
 A multi-TX bundle is gated by one bundle-level binding (`origin` plus
@@ -721,7 +720,7 @@ the re-folded binding. The bundle-level scalars on `MultiTransmitRequest` stay
 as the gate binding. No wire, config or dispensa contract changes:
 `MessageType` is never serialized and neither type appears in
 `pancetta-protocol` or `pancetta-agent`.
-=======
+
 ## PAN-139: refuse denied remote close-step opens before mutating the QSO
 
 Round 23 on PR #362 (Codex): round 15's pre-mutation identity-bound permission
@@ -758,4 +757,3 @@ Scope: `Report`/`ReportAck` opens are deliberately not covered — their states
 are rearm-eligible and `frame_reaches_the_air` already refuses to compound a
 denial (no further false `Sent`, no stall accounting), so they self-correct
 under the manual keep-call watchdog.
->>>>>>> dd6a4c7ab728aec99b575bc71af4529f46533bea
