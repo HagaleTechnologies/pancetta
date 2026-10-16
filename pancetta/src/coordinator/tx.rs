@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::{debug, error, info, span, warn, Level};
 
-use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType};
+use crate::message_bus::{
+    AckState, ComponentId, ComponentMessage, DeliveryAck, MessageBus, MessageType,
+};
 
 /// FT8 nominal pre-roll: audio starts 500ms past the slot boundary.
 const DELAY_MS: u64 = 500;
@@ -1146,13 +1148,14 @@ async fn reenqueue_pending(message_bus: &MessageBus, pending: Vec<ComponentMessa
 /// it after — never re-ordering — keeps `coalesce_backlog_into` and the
 /// bundle arms seeing requests in the order they actually arrived.
 ///
-/// The CALLER invokes this only AFTER sending PTT off on a detected disarm
+/// The CALLER invokes this only AFTER attempting confirmed PTT-off on a detected disarm
+/// and, during playback, after the confirmed flush or playback wait-out (PAN-135)
 /// (round-9 review, Codex P1): draining *before* returning from
 /// `interruptible_sleep_or_supersede` reintroduced round-2's original
 /// problem — with concurrent producers continually refilling the channel,
 /// an unbounded `try_recv()` loop there could delay the caller's first
 /// (safety-critical) PTT-off send indefinitely. Calling it here instead,
-/// after PTT is already off, keeps the drain's unboundedness from ever
+/// after attempting PTT release, keeps the drain's unboundedness from ever
 /// touching PTT-release latency — it can only delay the lower-priority
 /// reenqueue/audit/completion bookkeeping that follows.
 fn drain_and_merge_pending(
@@ -2232,6 +2235,113 @@ mod interruptible_sleep_tests {
     }
 }
 
+/// PAN-135: bounded retry for a safety send that must not be silently
+/// dropped. Uses the PAN-43/45 schedule: 4 attempts over about 75 ms.
+const SAFETY_SEND_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(5),
+    Duration::from_millis(20),
+    Duration::from_millis(50),
+];
+
+fn ptt_off_message() -> ComponentMessage {
+    ComponentMessage::new(
+        ComponentId::Ft8Transmitter,
+        ComponentId::Hamlib,
+        MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt { state: false }),
+        Instant::now(),
+    )
+}
+
+/// What [`PttGuard::release`] achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PttRelease {
+    /// PTT-off is enqueued on Hamlib's channel: handed off.
+    Delivered,
+    /// Every attempt dropped; the guard stays armed.
+    Undelivered,
+}
+
+/// PAN-135: the shortest a disarm flush waits for its ack, and how far
+/// past the revoked waveform's scheduled end an unconfirmed flush waits
+/// (relay poll + audio-thread latency between Step 7's enqueue and the
+/// samples reaching the output ring).
+const FLUSH_ACK_MIN_WAIT: Duration = Duration::from_millis(250);
+const FLUSH_PLAYBACK_SLACK: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisarmFlush {
+    /// The audio thread confirmed the flush reached the output ring.
+    Applied,
+    /// No confirmation: waited until the revoked audio had played out.
+    WaitedOutPlayback,
+    /// Shutdown ended the wait.
+    Shutdown,
+}
+
+/// PAN-135 (PR #362 rounds 4/6, Codex P1): flush the revoked remote
+/// waveform before the caller drains or re-enqueues work that may key
+/// again. Wait for the audio thread to confirm the flush, the revoked
+/// playback window to elapse, or shutdown. The playback bound applies
+/// when confirmation cannot arrive, including `--no-audio` and a stalled
+/// audio thread. The flush rides the same Audio FIFO as the frame's samples,
+/// so it can never clear the buffer ahead of them.
+async fn flush_disarmed_audio_confirmed(
+    message_bus: &MessageBus,
+    sample_rate: u32,
+    playback_end: tokio::time::Instant,
+    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> DisarmFlush {
+    let deadline = std::cmp::max(
+        playback_end + FLUSH_PLAYBACK_SLACK,
+        tokio::time::Instant::now() + FLUSH_ACK_MIN_WAIT,
+    );
+    'attempts: for attempt in 0..=SAFETY_SEND_RETRY_DELAYS.len() {
+        let (ack, mut waiter) = DeliveryAck::new();
+        let flush = ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Audio,
+            MessageType::AudioFlush { sample_rate, ack },
+            Instant::now(),
+        );
+        if matches!(message_bus.send_message_checked(flush).await, Ok(true)) {
+            loop {
+                if shutdown.load(Ordering::Acquire) {
+                    return DisarmFlush::Shutdown;
+                }
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    break 'attempts;
+                }
+                match waiter
+                    .wait_for((deadline - now).min(Duration::from_millis(50)))
+                    .await
+                {
+                    AckState::Applied => return DisarmFlush::Applied,
+                    AckState::Pending => {}
+                    AckState::NotApplied => break 'attempts,
+                    AckState::Dropped => break, // lost in transit: send a fresh one
+                }
+            }
+        }
+        if let Some(delay) = SAFETY_SEND_RETRY_DELAYS.get(attempt) {
+            sleep(*delay).await;
+        }
+    }
+    error!(
+        target: "pancetta::tx.ptt",
+        "Remote disarm: audio flush not confirmed by the audio thread; holding re-enqueue for {:?} until the revoked waveform has played out",
+        deadline.saturating_duration_since(tokio::time::Instant::now())
+    );
+    while tokio::time::Instant::now() < deadline {
+        if shutdown.load(Ordering::Acquire) {
+            return DisarmFlush::Shutdown;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        sleep(remaining.min(Duration::from_millis(50))).await;
+    }
+    DisarmFlush::WaitedOutPlayback
+}
+
 /// Guard that sends PTT-off when dropped, ensuring PTT is released
 /// even if the transmitter task is cancelled mid-transmission.
 struct PttGuard {
@@ -2271,6 +2381,36 @@ impl PttGuard {
             message_bus,
             armed: true,
             ptt_active,
+        }
+    }
+
+    /// PAN-135: unkey with checked, bounded-retry delivery, and stand the
+    /// RAII fallback down only once PTT-off is enqueued on Hamlib's channel.
+    /// Hamlib applies that channel in order, so any later PTT-on from this
+    /// worker lands after this unkey. An enqueued PTT-off is handed off.
+    /// If every attempt drops, the guard stays armed (its `Drop` retries on
+    /// scope exit) and `ptt_active` stays true until then; Hamlib's 14 s
+    /// PTT watchdog is the remaining backstop.
+    async fn release(&mut self, context: &str) -> PttRelease {
+        match self
+            .message_bus
+            .send_message_retrying(ptt_off_message, &SAFETY_SEND_RETRY_DELAYS)
+            .await
+        {
+            Ok(true) => {
+                self.ptt_active
+                    .store(false, std::sync::atomic::Ordering::Release);
+                self.armed = false;
+                PttRelease::Delivered
+            }
+            Ok(false) | Err(_) => {
+                error!(
+                    target: "pancetta::tx.ptt",
+                    "{context}: PTT OFF not delivered to Hamlib after {} attempts; PTT guard stays armed and retries on drop; Hamlib's PTT watchdog is the backstop",
+                    SAFETY_SEND_RETRY_DELAYS.len() + 1
+                );
+                PttRelease::Undelivered
+            }
         }
     }
 
@@ -5958,18 +6098,19 @@ impl Drop for PttGuard {
             // the dropped JoinHandle is the canonical fire-and-forget idiom.
             #[allow(clippy::let_underscore_future)]
             let _ = tokio::task::spawn(async move {
-                let ptt_off_msg = ComponentMessage::new(
-                    ComponentId::Ft8Transmitter,
-                    ComponentId::Hamlib,
-                    MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt {
-                        state: false,
-                    }),
-                    Instant::now(),
-                );
-                if let Err(e) = bus.send_message(ptt_off_msg).await {
-                    tracing::error!("PTT GUARD: failed to force PTT off on drop: {}", e);
-                } else {
-                    tracing::warn!("PTT GUARD: forced PTT off due to task cancellation");
+                match bus
+                    .send_message_retrying(ptt_off_message, &SAFETY_SEND_RETRY_DELAYS)
+                    .await
+                {
+                    Ok(true) => {
+                        tracing::warn!("PTT GUARD: forced PTT off due to task cancellation")
+                    }
+                    Ok(false) => tracing::error!(
+                        target: "pancetta::tx.ptt",
+                        "PTT GUARD: PTT OFF not delivered to Hamlib after {} attempts on drop; Hamlib's PTT watchdog is the remaining backstop",
+                        SAFETY_SEND_RETRY_DELAYS.len() + 1
+                    ),
+                    Err(e) => tracing::error!("PTT GUARD: failed to force PTT off on drop: {}", e),
                 }
             });
         }
@@ -8684,26 +8825,8 @@ impl super::ApplicationCoordinator {
                                                 // of this helper's awaits (diagnostic, audit-log
                                                 // I/O, relay) — a disarmed transmission must not
                                                 // stay keyed a moment longer than necessary.
-                                                let ptt_off_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Hamlib,
-                                                    MessageType::RigControl(
-                                                        crate::message_bus::RigControlMessage::SetPtt {
-                                                            state: false,
-                                                        },
-                                                    ),
-                                                    Instant::now(),
-                                                );
-                                                if let Err(e) =
-                                                    message_bus.send_message(ptt_off_msg).await
-                                                {
-                                                    warn!(
-                                                        "Remote disarm mid-TX: PTT OFF failed: {}",
-                                                        e
-                                                    );
-                                                }
-                                                ptt_active.store(false, Ordering::Release);
-                                                ptt_guard.disarm();
+                                                // PAN-135: stand the guard down only after Hamlib accepts PTT-off.
+                                                ptt_guard.release("Remote disarm mid-TX").await;
                                                 // Round-7 review (Codex P2): this is a
                                                 // PRE-SLOT abort — PTT was keyed but Step 7
                                                 // never routed any audio, so nothing actually
@@ -9044,26 +9167,10 @@ impl super::ApplicationCoordinator {
                                                 remote_client_key_id.as_deref(),
                                             )
                                         {
-                                            let ptt_off_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Hamlib,
-                                                MessageType::RigControl(
-                                                    crate::message_bus::RigControlMessage::SetPtt {
-                                                        state: false,
-                                                    },
-                                                ),
-                                                Instant::now(),
-                                            );
-                                            if let Err(e) =
-                                                message_bus.send_message(ptt_off_msg).await
-                                            {
-                                                warn!(
-                                                    "Remote disarm before audio delivery: PTT OFF failed: {}",
-                                                    e
-                                                );
-                                            }
-                                            ptt_active.store(false, Ordering::Release);
-                                            ptt_guard.disarm();
+                                            // PAN-135: stand the guard down only after Hamlib accepts PTT-off.
+                                            ptt_guard
+                                                .release("Remote disarm before audio delivery")
+                                                .await;
                                             let pivot_replaced =
                                                 pivoted_this_key.take().and_then(|key| {
                                                     pivoted_once.remove(&key);
@@ -9135,6 +9242,9 @@ impl super::ApplicationCoordinator {
                                         // Playback is now on the air; a qualifying request here
                                         // supersedes it (aborts + re-keys), flushing the still-
                                         // playing samples on the retry's Step 7.
+                                        // PAN-135: expected playback end bounds an unconfirmed disarm flush.
+                                        let playback_end = tokio::time::Instant::now()
+                                            + Duration::from_millis(audio_duration_ms);
                                         match interruptible_sleep_or_supersede(
                                             Duration::from_millis(audio_duration_ms),
                                             &shutdown,
@@ -9193,26 +9303,8 @@ impl super::ApplicationCoordinator {
                                                 // of this helper's awaits (diagnostic, audit-log
                                                 // I/O, relay) — a disarmed transmission must not
                                                 // stay keyed a moment longer than necessary.
-                                                let ptt_off_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Hamlib,
-                                                    MessageType::RigControl(
-                                                        crate::message_bus::RigControlMessage::SetPtt {
-                                                            state: false,
-                                                        },
-                                                    ),
-                                                    Instant::now(),
-                                                );
-                                                if let Err(e) =
-                                                    message_bus.send_message(ptt_off_msg).await
-                                                {
-                                                    warn!(
-                                                        "Remote disarm mid-TX: PTT OFF failed: {}",
-                                                        e
-                                                    );
-                                                }
-                                                ptt_active.store(false, Ordering::Release);
-                                                ptt_guard.disarm();
+                                                // PAN-135: stand the guard down only after Hamlib accepts PTT-off.
+                                                ptt_guard.release("Remote disarm mid-TX").await;
                                                 // Round-4 review (Codex P1): flush the
                                                 // already-queued remote waveform BEFORE
                                                 // reenqueuing pending work — a pending local
@@ -9220,28 +9312,15 @@ impl super::ApplicationCoordinator {
                                                 // `flush_first: false`, so without this the
                                                 // disarmed client's remaining audio could
                                                 // still reach the air riding behind the next
-                                                // request's samples. Reuses the same
-                                                // `AudioOutput{flush_first: true}` mechanism
-                                                // the re-key/supersede path already relies on
-                                                // to clear a superseded transmission's buffer.
-                                                let flush_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Audio,
-                                                    MessageType::AudioOutput {
-                                                        samples: Vec::new(),
-                                                        sample_rate,
-                                                        flush_first: true,
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                if let Err(e) =
-                                                    message_bus.send_message(flush_msg).await
-                                                {
-                                                    debug!(
-                                                        "Flushing aborted remote audio after disarm: {}",
-                                                        e
-                                                    );
-                                                }
+                                                // request's samples. PAN-135 waits for the audio
+                                                // thread to confirm the flush before proceeding.
+                                                flush_disarmed_audio_confirmed(
+                                                    &message_bus,
+                                                    sample_rate,
+                                                    playback_end,
+                                                    &shutdown,
+                                                )
+                                                .await;
                                                 // Round-9 review (Codex P1): drain HERE,
                                                 // after PTT is already off — see
                                                 // `drain_and_merge_pending`'s doc for why.
@@ -11565,26 +11644,8 @@ impl super::ApplicationCoordinator {
                                             );
                                             // PAN-91 review: release PTT FIRST — see the
                                             // single-TX arm's identical fix for why.
-                                            let ptt_off_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Hamlib,
-                                                MessageType::RigControl(
-                                                    crate::message_bus::RigControlMessage::SetPtt {
-                                                        state: false,
-                                                    },
-                                                ),
-                                                Instant::now(),
-                                            );
-                                            if let Err(e) =
-                                                message_bus.send_message(ptt_off_msg).await
-                                            {
-                                                warn!(
-                                                    "Remote disarm mid-TX: PTT OFF failed: {}",
-                                                    e
-                                                );
-                                            }
-                                            ptt_active.store(false, Ordering::Release);
-                                            ptt_guard.disarm();
+                                            // PAN-135: stand the guard down only after Hamlib accepts PTT-off.
+                                            ptt_guard.release("Remote disarm mid-TX").await;
                                             // Round-7 review (Codex P2): pre-slot abort —
                                             // nothing reached the air yet (Step 7 never ran)
                                             // — see the single-TX arm's identical fix.
@@ -11692,25 +11753,10 @@ impl super::ApplicationCoordinator {
                                             remote_client_key_id.as_deref(),
                                         )
                                     {
-                                        let ptt_off_msg = ComponentMessage::new(
-                                            ComponentId::Ft8Transmitter,
-                                            ComponentId::Hamlib,
-                                            MessageType::RigControl(
-                                                crate::message_bus::RigControlMessage::SetPtt {
-                                                    state: false,
-                                                },
-                                            ),
-                                            Instant::now(),
-                                        );
-                                        if let Err(e) = message_bus.send_message(ptt_off_msg).await
-                                        {
-                                            warn!(
-                                                "Remote disarm before audio delivery: PTT OFF failed: {}",
-                                                e
-                                            );
-                                        }
-                                        ptt_active.store(false, Ordering::Release);
-                                        ptt_guard.disarm();
+                                        // PAN-135: stand the guard down only after Hamlib accepts PTT-off.
+                                        ptt_guard
+                                            .release("Remote disarm before audio delivery")
+                                            .await;
                                         let mut bundle_replaced = unwind_bundle_pivots(
                                             &pivoted_this_bundle_keys,
                                             &mut pivoted_once,
@@ -11788,6 +11834,9 @@ impl super::ApplicationCoordinator {
                                     // Playback is now on the air; a qualifying request here
                                     // supersedes the bundle (same bundle-add-or-replace decision
                                     // as Step 6 via `supersede_multi_reenqueue`).
+                                    // PAN-135: expected playback end bounds an unconfirmed disarm flush.
+                                    let playback_end = tokio::time::Instant::now()
+                                        + Duration::from_millis(audio_duration_ms);
                                     match interruptible_sleep_or_supersede(
                                         Duration::from_millis(audio_duration_ms),
                                         &shutdown,
@@ -11841,48 +11890,20 @@ impl super::ApplicationCoordinator {
                                             );
                                             // PAN-91 review: release PTT FIRST — see the
                                             // single-TX arm's identical fix for why.
-                                            let ptt_off_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Hamlib,
-                                                MessageType::RigControl(
-                                                    crate::message_bus::RigControlMessage::SetPtt {
-                                                        state: false,
-                                                    },
-                                                ),
-                                                Instant::now(),
-                                            );
-                                            if let Err(e) =
-                                                message_bus.send_message(ptt_off_msg).await
-                                            {
-                                                warn!(
-                                                    "Remote disarm mid-TX: PTT OFF failed: {}",
-                                                    e
-                                                );
-                                            }
-                                            ptt_active.store(false, Ordering::Release);
-                                            ptt_guard.disarm();
+                                            // PAN-135: stand the guard down only after Hamlib accepts PTT-off.
+                                            ptt_guard.release("Remote disarm mid-TX").await;
                                             // Round-4 review (Codex P1): flush the
                                             // already-queued remote bundle waveform BEFORE
                                             // reenqueuing pending work — see the single-TX
-                                            // arm's identical fix for why.
-                                            let flush_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Audio,
-                                                MessageType::AudioOutput {
-                                                    samples: Vec::new(),
-                                                    sample_rate,
-                                                    flush_first: true,
-                                                },
-                                                Instant::now(),
-                                            );
-                                            if let Err(e) =
-                                                message_bus.send_message(flush_msg).await
-                                            {
-                                                debug!(
-                                                    "Flushing aborted remote audio after disarm: {}",
-                                                    e
-                                                );
-                                            }
+                                            // arm's identical fix for why. PAN-135 confirms
+                                            // the flush in the audio thread.
+                                            flush_disarmed_audio_confirmed(
+                                                &message_bus,
+                                                sample_rate,
+                                                playback_end,
+                                                &shutdown,
+                                            )
+                                            .await;
                                             // Round-9 review (Codex P1): drain HERE, after
                                             // PTT is already off — see
                                             // `drain_and_merge_pending`'s doc for why.
@@ -20277,5 +20298,483 @@ mod pan118_worker_band_plan_tests {
         assert_eq!(done[0], Some(false), "item A must complete as failed");
         assert_eq!(done[1], Some(false), "item B must complete as failed");
         assert!(!ptt_on, "no SetPtt(true) for a fully out-of-band bundle");
+    }
+}
+
+#[cfg(test)]
+mod pan135_ptt_release_tests {
+    use super::*;
+    use crate::message_bus::{MessageBus, RigControlMessage};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    async fn guard(bus: &MessageBus, ptt_active: &Arc<AtomicBool>) -> PttGuard {
+        PttGuard::new(
+            bus.clone(),
+            ptt_active.clone(),
+            &Arc::new(tokio::sync::Mutex::new(())),
+            &Arc::new(AtomicU64::new(0)),
+        )
+        .await
+    }
+    async fn backlog(bus: &MessageBus) -> bool {
+        bus.send_message_checked(ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::AudioData(Vec::new()),
+            Instant::now(),
+        ))
+        .await
+        .unwrap()
+    }
+    fn ptt_offs(rx: &crossbeam_channel::Receiver<ComponentMessage>) -> usize {
+        rx.try_iter()
+            .filter(|m| {
+                matches!(
+                    m.message_type,
+                    MessageType::RigControl(RigControlMessage::SetPtt { state: false })
+                )
+            })
+            .count()
+    }
+    async fn let_drop_task_run() {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_on_a_healthy_channel_unkeys_once_and_stands_the_guard_down() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let ptt_active = Arc::new(AtomicBool::new(false));
+        let mut g = guard(&bus, &ptt_active).await;
+        assert_eq!(g.release("test").await, PttRelease::Delivered);
+        assert!(!ptt_active.load(Ordering::Acquire));
+        drop(g);
+        let_drop_task_run().await;
+        assert_eq!(
+            ptt_offs(&rx),
+            1,
+            "no duplicate unkey from a stood-down guard"
+        );
+    }
+
+    /// THE regression (reproduced this session against the old sequence:
+    /// 0 PTT-offs ever reached Hamlib).
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_into_a_full_hamlib_channel_keeps_the_fallback_armed() {
+        let bus = MessageBus::new(1).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        assert!(backlog(&bus).await);
+        let ptt_active = Arc::new(AtomicBool::new(false));
+        let mut g = guard(&bus, &ptt_active).await;
+        assert_eq!(g.release("test").await, PttRelease::Undelivered);
+        assert!(
+            ptt_active.load(Ordering::Acquire),
+            "unkey not delivered: still keyed"
+        );
+        let _ = rx.try_iter().count(); // Hamlib catches up
+        drop(g);
+        let_drop_task_run().await;
+        assert_eq!(
+            ptt_offs(&rx),
+            1,
+            "the armed guard's Drop delivers the unkey"
+        );
+        assert!(!ptt_active.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn release_retries_until_hamlib_frees_room() {
+        let bus = MessageBus::new(1).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        assert!(backlog(&bus).await);
+        let rx2 = rx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = rx2.try_recv();
+        });
+        let ptt_active = Arc::new(AtomicBool::new(false));
+        let mut g = guard(&bus, &ptt_active).await;
+        assert_eq!(g.release("test").await, PttRelease::Delivered);
+        assert_eq!(ptt_offs(&rx), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn armed_guard_drop_retries_until_hamlib_frees_room() {
+        let bus = MessageBus::new(1).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        assert!(backlog(&bus).await);
+        let ptt_active = Arc::new(AtomicBool::new(false));
+        drop(guard(&bus, &ptt_active).await); // armed
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let _ = rx.try_recv(); // room frees inside the Drop's retry window
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(ptt_offs(&rx), 1, "Drop retries, not one best-effort shot");
+    }
+}
+#[cfg(test)]
+mod pan135_disarm_flush_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    async fn take_flush_ack(rx: &crossbeam_channel::Receiver<ComponentMessage>) -> DeliveryAck {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(message) = rx.try_recv() {
+                    if let MessageType::AudioFlush { ack, .. } = message.message_type {
+                        return ack;
+                    }
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("audio flush must arrive")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flush_returns_only_after_the_audio_thread_acks() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Audio).await.unwrap();
+        let acked_at = Arc::new(std::sync::Mutex::new(None));
+        let a2 = acked_at.clone();
+        let consumer = tokio::spawn(async move {
+            let ack = take_flush_ack(&rx).await;
+            sleep(Duration::from_millis(30)).await;
+            *a2.lock().unwrap() = Some(Instant::now());
+            ack.complete(true);
+        });
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let playback_end = tokio::time::Instant::now() + Duration::from_secs(5);
+        let out = flush_disarmed_audio_confirmed(&bus, 12_000, playback_end, &shutdown).await;
+        let returned = Instant::now();
+        consumer.await.unwrap();
+        assert_eq!(out, DisarmFlush::Applied);
+        assert!(
+            returned >= acked_at.lock().unwrap().expect("acked"),
+            "never ahead of the ack"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flush_resends_when_the_ack_is_dropped_in_transit() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Audio).await.unwrap();
+        let consumer = tokio::spawn(async move {
+            drop(take_flush_ack(&rx).await);
+            take_flush_ack(&rx).await.complete(true);
+            sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                rx.try_iter().count(),
+                0,
+                "exactly two flushes, no further retry"
+            );
+        });
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let playback_end = tokio::time::Instant::now() + Duration::from_secs(5);
+        assert_eq!(
+            flush_disarmed_audio_confirmed(&bus, 12_000, playback_end, &shutdown).await,
+            DisarmFlush::Applied
+        );
+        consumer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unacknowledged_flush_waits_out_the_revoked_playback() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_s, _rx) = bus.create_channel(ComponentId::Audio).await.unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let start = tokio::time::Instant::now();
+        let outcome = flush_disarmed_audio_confirmed(
+            &bus,
+            12_000,
+            start + Duration::from_millis(200),
+            &shutdown,
+        )
+        .await;
+        assert_eq!(outcome, DisarmFlush::WaitedOutPlayback);
+        assert!(start.elapsed() >= Duration::from_millis(450));
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn not_applied_flush_waits_out_the_revoked_playback() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Audio).await.unwrap();
+        let consumer = tokio::spawn(async move {
+            take_flush_ack(&rx).await.complete(false);
+        });
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            flush_disarmed_audio_confirmed(
+                &bus,
+                12_000,
+                start + Duration::from_millis(100),
+                &shutdown,
+            )
+            .await,
+            DisarmFlush::WaitedOutPlayback
+        );
+        assert!(start.elapsed() >= Duration::from_millis(350));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        consumer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn flush_into_a_full_audio_channel_waits_out_the_revoked_playback() {
+        let bus = MessageBus::new(1).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Audio).await.unwrap();
+        assert!(bus
+            .send_message_checked(ComponentMessage::new(
+                ComponentId::Audio,
+                ComponentId::Audio,
+                MessageType::AudioData(Vec::new()),
+                Instant::now(),
+            ))
+            .await
+            .unwrap());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            flush_disarmed_audio_confirmed(&bus, 12_000, start, &shutdown).await,
+            DisarmFlush::WaitedOutPlayback
+        );
+        assert!(start.elapsed() >= Duration::from_millis(250));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            rx.len(),
+            1,
+            "all flush attempts dropped; original filler remains"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_interrupts_the_flush_wait() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_s, _rx) = bus.create_channel(ComponentId::Audio).await.unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s2 = shutdown.clone();
+        let stopper = tokio::spawn(async move {
+            sleep(Duration::from_millis(100)).await;
+            s2.store(true, Ordering::Release);
+        });
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            flush_disarmed_audio_confirmed(
+                &bus,
+                12_000,
+                start + Duration::from_secs(10),
+                &shutdown,
+            )
+            .await,
+            DisarmFlush::Shutdown
+        );
+        assert!(start.elapsed() < Duration::from_millis(300));
+        stopper.await.unwrap();
+    }
+}
+#[cfg(test)]
+mod pan135_worker_disarm_tests {
+    use super::pan115_worker_gate_tests::{await_ptt_on, worker_harness, Harness};
+    use super::*;
+    use crate::message_bus::{RigControlMessage, TxOrigin};
+    use crossbeam_channel::Receiver;
+    use pancetta_agent::arm::{ArmTime, ConsentChannel, VerifiedArmGrant};
+
+    const TEXT: &str = "CQ N0CALL FN20";
+
+    async fn remote_playback() -> (Harness, Receiver<ComponentMessage>) {
+        let h = worker_harness().await;
+        let (_, audio_rx) = h
+            .coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Audio)
+            .await
+            .unwrap();
+        {
+            let mut arm = h.coordinator.remote_tx_arm.lock().unwrap();
+            let now_ms = super::super::now_epoch_ms() as i64;
+            arm.set_channel_consent(ConsentChannel::StationAgent, true, now_ms);
+            arm.arm(
+                VerifiedArmGrant {
+                    operator_callsign: "N0CALL".into(),
+                    ttl_ms: 120_000,
+                    armed_until_ms: now_ms + 120_000,
+                    heartbeat_interval_sec: 10,
+                    scope_tx: true,
+                    jti: "pan135-worker".into(),
+                    client_key_id: "client-a".into(),
+                },
+                ArmTime::now(),
+            );
+        }
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::StationAgent,
+                ComponentId::Ft8Transmitter,
+                MessageType::TransmitRequest {
+                    message_text: TEXT.into(),
+                    frequency_offset: 1500.0,
+                    qso_id: None,
+                    tx_parity: None,
+                    origin: TxOrigin::Remote,
+                    remote_client_key_id: Some("client-a".into()),
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            await_ptt_on(&h, Duration::from_secs(40)).await,
+            "remote frame must key"
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if audio_rx.try_iter().any(|m| {
+                    matches!(m.message_type,
+                    MessageType::AudioOutput { samples, .. } if !samples.is_empty())
+                }) {
+                    break;
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("frame must enter playback");
+        (h, audio_rx)
+    }
+
+    fn disarm(h: &Harness) {
+        h.coordinator
+            .remote_tx_arm
+            .lock()
+            .unwrap()
+            .disarm(super::super::now_epoch_ms() as i64);
+    }
+
+    async fn flush_ack(rx: &Receiver<ComponentMessage>) -> DeliveryAck {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(m) = rx.try_recv() {
+                    if let MessageType::AudioFlush { ack, .. } = m.message_type {
+                        return ack;
+                    }
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("mid-playback disarm must send a flush")
+    }
+
+    fn completed(h: &Harness) -> Option<bool> {
+        h.autonomous_rx
+            .try_iter()
+            .find_map(|m| match m.message_type {
+                MessageType::TransmitComplete {
+                    message_text,
+                    success,
+                    ..
+                } if message_text == TEXT => Some(success),
+                _ => None,
+            })
+    }
+
+    // Unlike the shared await_completion helper, preserve the Hamlib messages
+    // so the tests can count every unkey, including one sent by Drop.
+    async fn await_failed_completion(h: &Harness) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(success) = completed(h) {
+                    assert!(!success, "revoked frame must be reported unsuccessful");
+                    break;
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("completion must follow the flush ack");
+    }
+
+    fn ptt_offs(h: &Harness) -> usize {
+        h.hamlib_rx
+            .try_iter()
+            .filter(|m| {
+                matches!(
+                    m.message_type,
+                    MessageType::RigControl(RigControlMessage::SetPtt { state: false })
+                )
+            })
+            .count()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_mid_playback_disarm_unkeys_once_then_waits_for_the_flush_ack() {
+        let (h, audio_rx) = remote_playback().await;
+        disarm(&h);
+        let ack = flush_ack(&audio_rx).await;
+        assert_eq!(ptt_offs(&h), 1, "PTT-off precedes the flush");
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            completed(&h),
+            None,
+            "no completion while the flush ack is held"
+        );
+        ack.complete(true);
+        await_failed_completion(&h).await;
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            ptt_offs(&h),
+            0,
+            "the stood-down guard must not duplicate the unkey"
+        );
+        assert!(!h.coordinator.ptt_active.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_mid_playback_disarm_with_hamlib_backlogged_still_unkeys() {
+        let (h, audio_rx) = remote_playback().await;
+        let bus = &h.coordinator.message_bus;
+        let mut filled = 0;
+        while bus
+            .send_message_checked(ComponentMessage::new(
+                ComponentId::Hamlib,
+                ComponentId::Hamlib,
+                MessageType::AudioData(Vec::new()),
+                Instant::now(),
+            ))
+            .await
+            .unwrap()
+        {
+            filled += 1;
+        }
+        assert_eq!(filled, 10_000, "exercise a completely full Hamlib channel");
+        disarm(&h);
+        let ack = flush_ack(&audio_rx).await;
+        assert!(
+            h.coordinator.ptt_active.load(Ordering::Acquire),
+            "unkey not delivered: still keyed"
+        );
+        assert_eq!(completed(&h), None);
+        assert_eq!(
+            ptt_offs(&h),
+            0,
+            "only backlog existed; no unkey was delivered yet"
+        );
+        ack.complete(true);
+        await_failed_completion(&h).await;
+        sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            ptt_offs(&h),
+            1,
+            "the armed guard retries on Drop once Hamlib catches up"
+        );
+        assert!(!h.coordinator.ptt_active.load(Ordering::Acquire));
     }
 }

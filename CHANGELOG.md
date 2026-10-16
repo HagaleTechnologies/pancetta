@@ -114,6 +114,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A remote client's transmission stopped by a disarm (explicit, dead-man,
+  heartbeat loss, TTL expiry or local kill) no longer depends on one
+  best-effort message to unkey (PAN-135). PTT-off is retried, and the
+  transmitter keeps its PTT fallback armed until the unkey is queued to the
+  rig controller. Before the TX worker resumes pending work, it waits for the
+  audio thread to confirm it discarded the revoked client's remaining audio,
+  or, if no confirmation can come, until that audio would have finished
+  playing.
+
 - `max_concurrent_qsos` now also limits QSOs you open by hand (PAN-78). With
   the default of 1, calling a second station while a QSO is waiting for a
   reply used to open it anyway and transmit it alongside the first. Now the

@@ -1,3 +1,4 @@
+use super::audio::TxAudioCommand;
 use anyhow::Result;
 use geographiclib_rs::InverseGeodesic;
 use pancetta_audio::{AudioManager, AudioManagerConfig};
@@ -172,7 +173,7 @@ impl super::ApplicationCoordinator {
         let health_last_rms = handles.health_last_rms.clone();
 
         // TX audio channel: Ft8Transmitter -> Audio thread for playback
-        let (tx_audio_tx, tx_audio_rx) = crossbeam_channel::bounded::<(Vec<f32>, u32, bool)>(4);
+        let (tx_audio_tx, tx_audio_rx) = crossbeam_channel::bounded::<TxAudioCommand>(4);
 
         // Pipeline health tracking (atomics shared across threads)
         let health_audio_alive = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -233,22 +234,26 @@ impl super::ApplicationCoordinator {
                 while !shutdown.load(Ordering::Acquire) {
                     match audio_bus_rx.try_recv() {
                         Ok(message) => {
-                            if let MessageType::AudioOutput {
-                                samples,
-                                sample_rate,
-                                flush_first,
-                            } = message.message_type
-                            {
-                                info!(
-                                    "Audio TX relay: {} samples at {} Hz from {:?}",
-                                    samples.len(),
-                                    sample_rate,
-                                    message.source
-                                );
-                                if tx_audio_tx
-                                    .send((samples, sample_rate, flush_first))
-                                    .is_err()
-                                {
+                            let source = message.source;
+                            if let Some(command) = TxAudioCommand::from_bus(message.message_type) {
+                                match &command {
+                                    TxAudioCommand::Play {
+                                        samples,
+                                        sample_rate,
+                                        ..
+                                    } => info!(
+                                        "Audio TX relay: {} samples at {} Hz from {:?}",
+                                        samples.len(),
+                                        sample_rate,
+                                        source
+                                    ),
+                                    TxAudioCommand::Flush { .. } => {
+                                        info!("Audio TX relay: disarm flush from {:?}", source)
+                                    }
+                                }
+                                // A failed send drops the command and any flush ack in it,
+                                // so a waiting TX worker sees `AckState::Dropped` at once.
+                                if tx_audio_tx.send(command).is_err() {
                                     warn!("Audio TX relay: audio thread channel closed");
                                     break;
                                 }
