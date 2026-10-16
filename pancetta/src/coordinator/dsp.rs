@@ -176,7 +176,11 @@ fn reanchor_decode_window(
 /// the oldest files are deleted to make room.
 struct WavRecorder {
     dir: std::path::PathBuf,
+    /// Running estimate of the top-level `*.wav` bytes in `dir`. Files moved
+    /// out externally (the NAS offload job) are not subtracted, so it can
+    /// only overestimate; it is re-measured from disk before any eviction.
     total_bytes: u64,
+    max_bytes: u64,
 }
 
 impl WavRecorder {
@@ -185,6 +189,10 @@ impl WavRecorder {
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join(".pancetta")
             .join("recordings");
+        Self::open(dir, WAV_RECORDING_MAX_BYTES)
+    }
+
+    fn open(dir: std::path::PathBuf, max_bytes: u64) -> Result<Self> {
         std::fs::create_dir_all(&dir)?;
 
         // Sum existing recording sizes
@@ -193,17 +201,26 @@ impl WavRecorder {
             "WAV recorder: dir={}, existing={:.1} MB, cap={:.1} GB",
             dir.display(),
             total_bytes as f64 / 1_048_576.0,
-            WAV_RECORDING_MAX_BYTES as f64 / 1_073_741_824.0,
+            max_bytes as f64 / 1_073_741_824.0,
         );
-        Ok(Self { dir, total_bytes })
+        Ok(Self {
+            dir,
+            total_bytes,
+            max_bytes,
+        })
     }
 
+    /// Bytes in top-level `*.wav` files: the same flat scope
+    /// [`Self::delete_oldest`] evicts from, so curated fixture subdirectories
+    /// (e.g. `noise_1000/`) and non-WAV files never count toward the cap.
     fn dir_size(dir: &std::path::Path) -> u64 {
         std::fs::read_dir(dir)
             .map(|entries| {
                 entries
                     .filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().is_some_and(|ext| ext == "wav"))
                     .filter_map(|e| e.metadata().ok())
+                    .filter(|m| m.is_file())
                     .map(|m| m.len())
                     .sum()
             })
@@ -234,8 +251,14 @@ impl WavRecorder {
             return;
         }
 
+        // The running total only overestimates (external removals aren't
+        // seen), so re-measure before trusting it to evict anything.
+        if self.total_bytes >= self.max_bytes {
+            self.total_bytes = Self::dir_size(&self.dir);
+        }
+
         // Enforce cap by deleting oldest files
-        while self.total_bytes >= WAV_RECORDING_MAX_BYTES {
+        while self.total_bytes >= self.max_bytes {
             if !self.delete_oldest() {
                 warn!("WAV recorder: cannot free space, skipping write");
                 return;
@@ -1465,5 +1488,93 @@ mod reanchor_decode_window_tests {
             reanchor_decode_window(now, next_window_time, decode_phase(), FT8_SLOT_NS),
             (next_window_time, None)
         );
+    }
+}
+
+#[cfg(test)]
+mod wav_recorder_tests {
+    use super::*;
+
+    const FILE: u64 = 1000;
+
+    fn seed(dir: &std::path::Path, names: &[&str]) {
+        for n in names {
+            std::fs::write(dir.join(n), vec![0u8; FILE as usize]).unwrap();
+        }
+    }
+
+    fn wav_names(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".wav"))
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn tone() -> Vec<f32> {
+        (0..1200).map(|i| (i as f32 * 0.3).sin() * 0.5).collect()
+    }
+
+    fn ts() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(1_790_000_000, 0).unwrap()
+    }
+
+    /// sophon 2026-10-15: the NAS offload moved files out from under the
+    /// recorder, which still believed it was at the cap and deleted the
+    /// oldest remaining recording on every window (1,462 deletions while the
+    /// dir shrank 10 GB → 3.1 GB).
+    #[test]
+    fn external_removal_is_not_mistaken_for_a_full_buffer() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), &["ft8_a.wav", "ft8_b.wav", "ft8_c.wav"]);
+        let mut rec = WavRecorder::open(tmp.path().to_path_buf(), 3 * FILE).unwrap();
+
+        // Offload job moves two files away.
+        std::fs::remove_file(tmp.path().join("ft8_a.wav")).unwrap();
+        std::fs::remove_file(tmp.path().join("ft8_b.wav")).unwrap();
+
+        rec.write_window(&tone(), &ts(), 0);
+
+        let names = wav_names(tmp.path());
+        assert!(
+            names.contains(&"ft8_c.wav".to_string()),
+            "evicted despite free space: {names:?}"
+        );
+        assert_eq!(names.len(), 2, "{names:?}");
+    }
+
+    #[test]
+    fn real_overflow_still_evicts_oldest() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), &["ft8_a.wav", "ft8_b.wav", "ft8_c.wav"]);
+        let mut rec = WavRecorder::open(tmp.path().to_path_buf(), 3 * FILE).unwrap();
+
+        rec.write_window(&tone(), &ts(), 0);
+
+        let names = wav_names(tmp.path());
+        assert!(
+            !names.contains(&"ft8_a.wav".to_string()),
+            "oldest not evicted: {names:?}"
+        );
+        assert!(names.contains(&"ft8_b.wav".to_string()));
+        assert!(names.contains(&"ft8_c.wav".to_string()));
+    }
+
+    /// Curated fixture subdirectories (noise_1000/) and non-WAV files are
+    /// outside the recorder's flat eviction scope, so they must not count
+    /// toward the cap either.
+    #[test]
+    fn size_counts_only_top_level_wavs() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), &["ft8_a.wav", "notes.txt"]);
+        std::fs::create_dir(tmp.path().join("noise_1000")).unwrap();
+        seed(
+            &tmp.path().join("noise_1000"),
+            &["n1.wav", "n2.wav", "n3.wav"],
+        );
+        assert_eq!(WavRecorder::dir_size(tmp.path()), FILE);
     }
 }
