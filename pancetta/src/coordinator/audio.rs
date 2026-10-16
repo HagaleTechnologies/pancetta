@@ -119,23 +119,26 @@ impl TxAudioCommand {
 
     /// Run `queue_output` for this command. A flush makes the same call
     /// today's empty `AudioOutput{flush_first: true}` made. That call
-    /// issues `request_flush`, after which the output callback discards
-    /// the buffer before playing another sample. Then settle the ack
-    /// with whether the call succeeded.
+    /// issues `request_flush` and waits (bounded) for the output callback
+    /// to discard the buffer. `queue_output` returns whether that flush
+    /// completed (`AudioManager::queue_output_confirming_flush`). The ack
+    /// settles `Applied` only when it did: a flush still pending after the
+    /// wait would clear whatever is buffered once a stalled callback
+    /// resumes, including a later frame's audio.
     pub(crate) fn apply<E>(
         self,
-        queue_output: impl FnOnce(&[f32], u32, bool) -> Result<(), E>,
+        queue_output: impl FnOnce(&[f32], u32, bool) -> Result<bool, E>,
     ) -> Result<(), E> {
         match self {
             Self::Play {
                 samples,
                 sample_rate,
                 flush_first,
-            } => queue_output(&samples, sample_rate, flush_first),
+            } => queue_output(&samples, sample_rate, flush_first).map(|_| ()),
             Self::Flush { sample_rate, ack } => {
                 let result = queue_output(&[], sample_rate, true);
-                ack.complete(result.is_ok());
-                result
+                ack.complete(matches!(result, Ok(true)));
+                result.map(|_| ())
             }
         }
     }
@@ -490,7 +493,11 @@ impl super::ApplicationCoordinator {
                                     sample_rate,
                                     flush_first
                                 );
-                                audio_manager.queue_output(samples, sample_rate, flush_first)
+                                audio_manager.queue_output_confirming_flush(
+                                    samples,
+                                    sample_rate,
+                                    flush_first,
+                                )
                             }) {
                                 let s = e.to_string();
                                 error!("Audio TX output error: {}", s);
@@ -810,7 +817,7 @@ mod pan135_tx_audio_command_tests {
         }
         .apply(|s, rate, flush_first| {
             seen = Some((s.len(), rate, flush_first));
-            Ok(())
+            Ok(true)
         });
         assert!(r.is_ok());
         assert_eq!(
@@ -821,6 +828,24 @@ mod pan135_tx_audio_command_tests {
         assert_eq!(
             waiter.wait_for(Duration::from_millis(10)).await,
             AckState::Applied
+        );
+    }
+
+    /// PAN-135 review: `queue_output` succeeded but its 20 ms flush
+    /// handshake timed out (stalled output callback). The flush is still
+    /// pending, so the ack must not report `Applied`.
+    #[tokio::test]
+    async fn flush_settles_not_applied_when_the_flush_handshake_times_out() {
+        let (ack, mut waiter) = DeliveryAck::new();
+        let r: Result<(), String> = TxAudioCommand::Flush {
+            sample_rate: 12_000,
+            ack,
+        }
+        .apply(|_, _, _| Ok(false));
+        assert!(r.is_ok());
+        assert_eq!(
+            waiter.wait_for(Duration::from_millis(10)).await,
+            AckState::NotApplied
         );
     }
 

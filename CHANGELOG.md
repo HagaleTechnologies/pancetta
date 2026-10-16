@@ -114,16 +114,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-<<<<<<< HEAD
-- A remote client's transmission stopped by a disarm (explicit, dead-man,
-  heartbeat loss, TTL expiry or local kill) no longer depends on one
-  best-effort message to unkey (PAN-135). PTT-off is retried, and the
-  transmitter keeps its PTT fallback armed until the unkey is queued to the
-  rig controller. Before the TX worker resumes pending work, it waits for the
-  audio thread to confirm it discarded the revoked client's remaining audio,
-  or, if no confirmation can come, until that audio would have finished
-  playing.
-=======
 - QSO log index and backups: when startup rebuilt `~/.pancetta/qso.db` from
   a newer `qsos.adi`, the SQLite logger had already opened the old file, so
   QSOs it logged that session never reached the live index and its startup
@@ -138,7 +128,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interferer (`Collision detected with: ["W5AU"]`) when our own transmission
   is decoded back at our TX offset; portable/compound forms of our call are
   excluded too.
->>>>>>> e90233a7630f5f5c7f3889782824b310ae692edf
+
+- A remote client's transmission stopped by a disarm (explicit, dead-man,
+  heartbeat loss, TTL expiry or local kill) no longer depends on one
+  best-effort message to unkey (PAN-135). PTT-off is retried, and the
+  transmitter keeps its PTT fallback armed until the unkey is queued to the
+  rig controller. Before the TX worker resumes pending work, it waits for the
+  audio thread to confirm it discarded the revoked client's remaining audio,
+  or, if no confirmation can come, until that audio would have finished
+  playing.
 
 - `max_concurrent_qsos` now also limits QSOs you open by hand (PAN-78). With
   the default of 1, calling a second station while a QSO is waiting for a

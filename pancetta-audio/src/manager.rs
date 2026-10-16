@@ -384,6 +384,21 @@ impl AudioManager {
         input_rate: u32,
         flush_first: bool,
     ) -> Result<(), AudioError> {
+        self.queue_output_confirming_flush(samples, input_rate, flush_first)
+            .map(|_| ())
+    }
+
+    /// [`Self::queue_output`], also reporting whether the output callback
+    /// completed the `flush_first` flush within the bounded wait (PAN-135).
+    /// `Ok(false)` means the flush is still pending: a stalled callback will
+    /// apply it late, to whatever is buffered by then. `Ok(true)` when no
+    /// flush was requested.
+    pub fn queue_output_confirming_flush(
+        &mut self,
+        samples: &[f32],
+        input_rate: u32,
+        flush_first: bool,
+    ) -> Result<bool, AudioError> {
         let producer = self
             .output_producer
             .as_mut()
@@ -391,6 +406,7 @@ impl AudioManager {
                 message: "Output stream not initialized".to_string(),
             })?;
 
+        let mut flush_completed = true;
         if flush_first {
             let token = producer.shared.request_flush();
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
@@ -398,7 +414,8 @@ impl AudioManager {
             {
                 std::thread::sleep(std::time::Duration::from_micros(500));
             }
-            if !producer.shared.is_flush_completed(token) {
+            flush_completed = producer.shared.is_flush_completed(token);
+            if !flush_completed {
                 warn!("queue_output: flush did not complete within 20ms — proceeding anyway");
             }
         }
@@ -434,7 +451,7 @@ impl AudioManager {
             "Queued {} TX audio samples for output (rate {}->{}Hz, flush_first={})",
             written, input_rate, self.config.sample_rate, flush_first
         );
-        Ok(())
+        Ok(flush_completed)
     }
 
     /// Get list of available input devices
@@ -809,6 +826,25 @@ mod tests {
             // when flush_first is set, so by the time this call returns the
             // buffer holds only the new 2 samples, not 4+2.
             assert_eq!(manager.output_producer_occupied_len(), 2);
+        }
+    }
+
+    /// PAN-135 review: with no output callback servicing the flush (a
+    /// stalled callback), the bounded wait times out and the flush must be
+    /// reported as not completed, even though `queue_output` still succeeds.
+    #[test]
+    fn queue_output_confirming_flush_reports_an_unserviced_flush() {
+        if let Ok(mut manager) = AudioManager::new() {
+            let completed = manager
+                .queue_output_confirming_flush(&[], 48_000, true)
+                .expect("producer present");
+            assert!(
+                !completed,
+                "no callback ran, yet the flush was reported complete"
+            );
+            assert!(manager
+                .queue_output_confirming_flush(&[], 48_000, false)
+                .expect("producer present"));
         }
     }
 
