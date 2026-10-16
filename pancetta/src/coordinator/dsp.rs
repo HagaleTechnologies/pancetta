@@ -176,7 +176,11 @@ fn reanchor_decode_window(
 /// the oldest files are deleted to make room.
 struct WavRecorder {
     dir: std::path::PathBuf,
+    /// Running estimate of the top-level `*.wav` bytes in `dir`. Files moved
+    /// out externally (the NAS offload job) are not subtracted, so it can
+    /// only overestimate; it is re-measured from disk before any eviction.
     total_bytes: u64,
+    max_bytes: u64,
 }
 
 impl WavRecorder {
@@ -185,29 +189,57 @@ impl WavRecorder {
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join(".pancetta")
             .join("recordings");
+        Self::open(dir, WAV_RECORDING_MAX_BYTES)
+    }
+
+    fn open(dir: std::path::PathBuf, max_bytes: u64) -> Result<Self> {
         std::fs::create_dir_all(&dir)?;
 
         // Sum existing recording sizes
-        let total_bytes = Self::dir_size(&dir);
+        // A partial scan still counts every readable WAV, the best lower
+        // bound available at startup.
+        let total_bytes = Self::dir_size(&dir).map(|(bytes, _)| bytes).unwrap_or(0);
         info!(
             "WAV recorder: dir={}, existing={:.1} MB, cap={:.1} GB",
             dir.display(),
             total_bytes as f64 / 1_048_576.0,
-            WAV_RECORDING_MAX_BYTES as f64 / 1_073_741_824.0,
+            max_bytes as f64 / 1_073_741_824.0,
         );
-        Ok(Self { dir, total_bytes })
+        Ok(Self {
+            dir,
+            total_bytes,
+            max_bytes,
+        })
     }
 
-    fn dir_size(dir: &std::path::Path) -> u64 {
-        std::fs::read_dir(dir)
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .filter_map(|e| e.metadata().ok())
-                    .map(|m| m.len())
-                    .sum()
-            })
-            .unwrap_or(0)
+    /// Bytes in top-level `*.wav` files: the same flat scope
+    /// [`Self::delete_oldest`] evicts from, so curated fixture subdirectories
+    /// (e.g. `noise_1000/`) and non-WAV files never count toward the cap.
+    ///
+    /// Returns the readable total and whether every entry was read, so a
+    /// partial scan is never mistaken for the real total. A file that vanished
+    /// between listing and stat (the offload moved it) is simply gone and
+    /// doesn't make the scan incomplete.
+    fn dir_size(dir: &std::path::Path) -> std::io::Result<(u64, bool)> {
+        let mut total = 0;
+        let mut complete = true;
+        for entry in std::fs::read_dir(dir)? {
+            let Ok(entry) = entry else {
+                complete = false;
+                continue;
+            };
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "wav") {
+                continue;
+            }
+            match std::fs::metadata(&path) {
+                Ok(m) if m.is_file() => total += m.len(),
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => complete = false,
+            }
+        }
+        Ok((total, complete))
     }
 
     /// Write a 12kHz mono f32 window to a timestamped WAV file.
@@ -234,8 +266,36 @@ impl WavRecorder {
             return;
         }
 
+        // The running total only overestimates (external removals aren't
+        // seen), so re-measure before trusting it to evict anything.
+        // At the cap, re-measure before deleting anything: external removals
+        // (the NAS offload) aren't tracked, so the running total only
+        // overestimates. If the scan is partial or fails, the real size is
+        // unknown. Skip this window rather than evict from a stale estimate,
+        // and retry on the next one.
+        if self.total_bytes >= self.max_bytes {
+            match Self::dir_size(&self.dir) {
+                Ok((measured, true)) => self.total_bytes = measured,
+                Ok((_, false)) => {
+                    warn!(
+                        "WAV recorder: partial re-measure of {}, skipping write",
+                        self.dir.display()
+                    );
+                    return;
+                }
+                Err(e) => {
+                    warn!(
+                        "WAV recorder: cannot re-measure {}: {}, skipping write",
+                        self.dir.display(),
+                        e
+                    );
+                    return;
+                }
+            }
+        }
+
         // Enforce cap by deleting oldest files
-        while self.total_bytes >= WAV_RECORDING_MAX_BYTES {
+        while self.total_bytes >= self.max_bytes {
             if !self.delete_oldest() {
                 warn!("WAV recorder: cannot free space, skipping write");
                 return;
@@ -1464,6 +1524,163 @@ mod reanchor_decode_window_tests {
         assert_eq!(
             reanchor_decode_window(now, next_window_time, decode_phase(), FT8_SLOT_NS),
             (next_window_time, None)
+        );
+    }
+}
+
+#[cfg(test)]
+mod wav_recorder_tests {
+    use super::*;
+
+    const FILE: u64 = 1000;
+
+    fn seed(dir: &std::path::Path, names: &[&str]) {
+        for n in names {
+            std::fs::write(dir.join(n), vec![0u8; FILE as usize]).unwrap();
+        }
+    }
+
+    fn wav_names(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".wav"))
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn tone() -> Vec<f32> {
+        (0..1200).map(|i| (i as f32 * 0.3).sin() * 0.5).collect()
+    }
+
+    fn ts() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(1_790_000_000, 0).unwrap()
+    }
+
+    /// sophon 2026-10-15: the NAS offload moved files out from under the
+    /// recorder, which still believed it was at the cap and deleted the
+    /// oldest remaining recording on every window (1,462 deletions while the
+    /// dir shrank 10 GB → 3.1 GB).
+    #[test]
+    fn external_removal_is_not_mistaken_for_a_full_buffer() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), &["ft8_a.wav", "ft8_b.wav", "ft8_c.wav"]);
+        let mut rec = WavRecorder::open(tmp.path().to_path_buf(), 3 * FILE).unwrap();
+
+        // Offload job moves two files away.
+        std::fs::remove_file(tmp.path().join("ft8_a.wav")).unwrap();
+        std::fs::remove_file(tmp.path().join("ft8_b.wav")).unwrap();
+
+        rec.write_window(&tone(), &ts(), 0);
+
+        let names = wav_names(tmp.path());
+        assert!(
+            names.contains(&"ft8_c.wav".to_string()),
+            "evicted despite free space: {names:?}"
+        );
+        assert_eq!(names.len(), 2, "{names:?}");
+    }
+
+    #[test]
+    fn real_overflow_still_evicts_oldest() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), &["ft8_a.wav", "ft8_b.wav", "ft8_c.wav"]);
+        let mut rec = WavRecorder::open(tmp.path().to_path_buf(), 3 * FILE).unwrap();
+
+        rec.write_window(&tone(), &ts(), 0);
+
+        let names = wav_names(tmp.path());
+        assert!(
+            !names.contains(&"ft8_a.wav".to_string()),
+            "oldest not evicted: {names:?}"
+        );
+        assert!(names.contains(&"ft8_b.wav".to_string()));
+        assert!(names.contains(&"ft8_c.wav".to_string()));
+    }
+
+    /// Curated fixture subdirectories (noise_1000/) and non-WAV files are
+    /// outside the recorder's flat eviction scope, so they must not count
+    /// toward the cap either.
+    #[test]
+    fn size_counts_only_top_level_wavs() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path(), &["ft8_a.wav", "notes.txt"]);
+        std::fs::create_dir(tmp.path().join("noise_1000")).unwrap();
+        seed(
+            &tmp.path().join("noise_1000"),
+            &["n1.wav", "n2.wav", "n3.wav"],
+        );
+        assert_eq!(WavRecorder::dir_size(tmp.path()).unwrap(), (FILE, true));
+    }
+
+    /// A WAV that can't be stat'd (here a symlink loop: ELOOP for every user,
+    /// root included) marks the scan incomplete but keeps the readable total.
+    #[cfg(unix)]
+    fn seed_with_unstatable(dir: &std::path::Path) {
+        seed(dir, &["ft8_a.wav", "ft8_b.wav"]);
+        std::os::unix::fs::symlink("ft8_loop.wav", dir.join("ft8_loop.wav")).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_scan_reports_incomplete_with_readable_total() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_with_unstatable(tmp.path());
+        assert_eq!(
+            WavRecorder::dir_size(tmp.path()).unwrap(),
+            (2 * FILE, false)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_partial_scan_keeps_readable_usage() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_with_unstatable(tmp.path());
+        let rec = WavRecorder::open(tmp.path().to_path_buf(), 10 * FILE).unwrap();
+        assert_eq!(rec.total_bytes, 2 * FILE);
+    }
+
+    /// A partial re-measure at the cap must neither evict from the stale
+    /// estimate (which could delete every readable recording) nor write past
+    /// an unknown size: skip the window and keep everything.
+    #[cfg(unix)]
+    #[test]
+    fn partial_remeasure_skips_the_write_and_evicts_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_with_unstatable(tmp.path());
+        let mut rec = WavRecorder::open(tmp.path().to_path_buf(), 3 * FILE).unwrap();
+        rec.total_bytes = 50 * FILE; // stale at-cap estimate, far above what's on disk
+        let before = wav_names(tmp.path());
+
+        rec.write_window(&tone(), &ts(), 0);
+
+        assert_eq!(
+            wav_names(tmp.path()),
+            before,
+            "partial re-measure changed the buffer"
+        );
+    }
+
+    /// An unreadable directory must not be mistaken for an empty one: the
+    /// at-cap estimate survives, so eviction isn't bypassed.
+    #[test]
+    fn failed_remeasure_keeps_the_at_cap_estimate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("recordings");
+        let mut rec = WavRecorder::open(dir.clone(), 3 * FILE).unwrap();
+        seed(&dir, &["ft8_a.wav", "ft8_b.wav", "ft8_c.wav"]);
+        rec.total_bytes = 3 * FILE;
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        rec.write_window(&tone(), &ts(), 0);
+
+        assert!(
+            rec.total_bytes >= 3 * FILE,
+            "estimate reset to {}",
+            rec.total_bytes
         );
     }
 }

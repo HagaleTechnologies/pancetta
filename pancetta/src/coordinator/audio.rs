@@ -85,11 +85,70 @@ pub struct AudioReopenRequest {
     pub respond: tokio::sync::oneshot::Sender<Result<(), String>>,
 }
 
+/// PAN-135: one item on the relay → audio-thread channel. Both variants
+/// share that FIFO, so a flush applies after every sample queued before it.
+pub(crate) enum TxAudioCommand {
+    Play {
+        samples: Vec<f32>,
+        sample_rate: u32,
+        flush_first: bool,
+    },
+    Flush {
+        sample_rate: u32,
+        ack: crate::message_bus::DeliveryAck,
+    },
+}
+
+impl TxAudioCommand {
+    /// The relay's mapping from a bus message (`None`: not TX audio).
+    pub(crate) fn from_bus(message_type: MessageType) -> Option<Self> {
+        match message_type {
+            MessageType::AudioOutput {
+                samples,
+                sample_rate,
+                flush_first,
+            } => Some(Self::Play {
+                samples,
+                sample_rate,
+                flush_first,
+            }),
+            MessageType::AudioFlush { sample_rate, ack } => Some(Self::Flush { sample_rate, ack }),
+            _ => None,
+        }
+    }
+
+    /// Run `queue_output` for this command. A flush makes the same call
+    /// today's empty `AudioOutput{flush_first: true}` made. That call
+    /// issues `request_flush` and waits (bounded) for the output callback
+    /// to discard the buffer. `queue_output` returns whether that flush
+    /// completed (`AudioManager::queue_output_confirming_flush`). The ack
+    /// settles `Applied` only when it did: a flush still pending after the
+    /// wait would clear whatever is buffered once a stalled callback
+    /// resumes, including a later frame's audio.
+    pub(crate) fn apply<E>(
+        self,
+        queue_output: impl FnOnce(&[f32], u32, bool) -> Result<bool, E>,
+    ) -> Result<(), E> {
+        match self {
+            Self::Play {
+                samples,
+                sample_rate,
+                flush_first,
+            } => queue_output(&samples, sample_rate, flush_first).map(|_| ()),
+            Self::Flush { sample_rate, ack } => {
+                let result = queue_output(&[], sample_rate, true);
+                ack.complete(matches!(result, Ok(true)));
+                result.map(|_| ())
+            }
+        }
+    }
+}
+
 impl super::ApplicationCoordinator {
     pub(crate) async fn start_audio_pipeline(
         &mut self,
         audio_to_dsp_tx: crossbeam_channel::Sender<Vec<f32>>,
-        tx_audio_rx: crossbeam_channel::Receiver<(Vec<f32>, u32, bool)>,
+        tx_audio_rx: crossbeam_channel::Receiver<TxAudioCommand>,
         health_audio_alive: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<()> {
         if self.no_audio {
@@ -426,16 +485,20 @@ impl super::ApplicationCoordinator {
 
                     // Check for TX audio to play out
                     match tx_audio_rx.try_recv() {
-                        Ok((samples, sample_rate, flush_first)) => {
-                            info!(
-                                "Audio TX: queueing {} samples at {} Hz (flush_first={})",
-                                samples.len(),
-                                sample_rate,
-                                flush_first
-                            );
-                            if let Err(e) =
-                                audio_manager.queue_output(&samples, sample_rate, flush_first)
-                            {
+                        Ok(command) => {
+                            if let Err(e) = command.apply(|samples, sample_rate, flush_first| {
+                                info!(
+                                    "Audio TX: queueing {} samples at {} Hz (flush_first={})",
+                                    samples.len(),
+                                    sample_rate,
+                                    flush_first
+                                );
+                                audio_manager.queue_output_confirming_flush(
+                                    samples,
+                                    sample_rate,
+                                    flush_first,
+                                )
+                            }) {
                                 let s = e.to_string();
                                 error!("Audio TX output error: {}", s);
                                 maybe_report_runtime("TX output error", s);
@@ -711,5 +774,110 @@ impl super::ApplicationCoordinator {
 
         info!("Audio component started");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod pan135_tx_audio_command_tests {
+    use super::TxAudioCommand;
+    use crate::message_bus::{AckState, DeliveryAck, MessageType};
+    use std::time::Duration;
+
+    #[test]
+    fn from_bus_maps_audio_output_and_flush_and_ignores_the_rest() {
+        let play = TxAudioCommand::from_bus(MessageType::AudioOutput {
+            samples: vec![0.5; 3],
+            sample_rate: 12_000,
+            flush_first: false,
+        });
+        assert!(
+            matches!(play, Some(TxAudioCommand::Play { ref samples, sample_rate: 12_000, flush_first: false }) if samples.len() == 3)
+        );
+        let (ack, _w) = DeliveryAck::new();
+        assert!(matches!(
+            TxAudioCommand::from_bus(MessageType::AudioFlush {
+                sample_rate: 12_000,
+                ack
+            }),
+            Some(TxAudioCommand::Flush {
+                sample_rate: 12_000,
+                ..
+            })
+        ));
+        assert!(TxAudioCommand::from_bus(MessageType::AudioData(vec![])).is_none());
+    }
+
+    #[tokio::test]
+    async fn flush_settles_applied_after_queue_output_ok() {
+        let (ack, mut waiter) = DeliveryAck::new();
+        let mut seen = None;
+        let r: Result<(), String> = TxAudioCommand::Flush {
+            sample_rate: 12_000,
+            ack,
+        }
+        .apply(|s, rate, flush_first| {
+            seen = Some((s.len(), rate, flush_first));
+            Ok(true)
+        });
+        assert!(r.is_ok());
+        assert_eq!(
+            seen,
+            Some((0, 12_000, true)),
+            "same queue_output call as today's flush"
+        );
+        assert_eq!(
+            waiter.wait_for(Duration::from_millis(10)).await,
+            AckState::Applied
+        );
+    }
+
+    /// PAN-135 review: `queue_output` succeeded but its 20 ms flush
+    /// handshake timed out (stalled output callback). The flush is still
+    /// pending, so the ack must not report `Applied`.
+    #[tokio::test]
+    async fn flush_settles_not_applied_when_the_flush_handshake_times_out() {
+        let (ack, mut waiter) = DeliveryAck::new();
+        let r: Result<(), String> = TxAudioCommand::Flush {
+            sample_rate: 12_000,
+            ack,
+        }
+        .apply(|_, _, _| Ok(false));
+        assert!(r.is_ok());
+        assert_eq!(
+            waiter.wait_for(Duration::from_millis(10)).await,
+            AckState::NotApplied
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_settles_not_applied_when_queue_output_errs() {
+        let (ack, mut waiter) = DeliveryAck::new();
+        let r: Result<(), String> = TxAudioCommand::Flush {
+            sample_rate: 12_000,
+            ack,
+        }
+        .apply(|_, _, _| Err("Output stream not initialized".into()));
+        assert!(r.is_err());
+        assert_eq!(
+            waiter.wait_for(Duration::from_millis(10)).await,
+            AckState::NotApplied
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flush_lost_on_a_closed_audio_channel_reports_dropped() {
+        let (tx, rx) = crossbeam_channel::bounded::<TxAudioCommand>(1);
+        drop(rx); // audio thread gone (--no-audio / stub / replay)
+        let (ack, mut waiter) = DeliveryAck::new();
+        assert!(tx
+            .send(TxAudioCommand::Flush {
+                sample_rate: 12_000,
+                ack
+            })
+            .is_err());
+        assert_eq!(
+            waiter.wait_for(Duration::from_millis(100)).await,
+            AckState::Dropped
+        );
     }
 }

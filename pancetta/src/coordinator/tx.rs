@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::{debug, error, info, span, warn, Level};
 
-use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType};
+use crate::message_bus::{
+    AckState, ComponentId, ComponentMessage, DeliveryAck, MessageBus, MessageType, SendIfOutcome,
+};
 
 /// FT8 nominal pre-roll: audio starts 500ms past the slot boundary.
 const DELAY_MS: u64 = 500;
@@ -117,13 +119,14 @@ fn tx_late_max_ms_effective(protocol: pancetta_ft8::Protocol, tx_late_max_ms: u6
 const COALESCE_MAX_EXTENSION_MS: u64 = 3000;
 
 /// Safety margin subtracted from remaining `tx_late_max_ms` headroom before
-/// it's used as the adaptive window's extension cap. Covers Step 1's
-/// encode/modulate time and other fixed per-message overhead between
-/// `request_received_at` and the actual coalesce point, none of which is
-/// otherwise accounted for in the headroom math — without this margin, a
-/// request that arrives with headroom just barely covering the extension
-/// alone could still get pushed past the `tx_late_max_ms` cliff by that
-/// extra overhead.
+/// it's used as the adaptive window's extension cap. Covers ONLY Step 1's
+/// encode/modulate time and other fixed per-message overhead AFTER the
+/// coalesce point — the mandatory base collection window
+/// (`coalesce_collect_window_ms`, always elapsed before any extension) is
+/// subtracted from the headroom explicitly in `adaptive_coalesce_cap_ms`
+/// (PAN-117). Without both, a request that arrives with headroom just barely
+/// covering the extension alone could still get pushed past the
+/// `tx_late_max_ms` cliff the key-time final gate enforces.
 const COALESCE_CAP_SAFETY_MARGIN_MS: u64 = 500;
 
 /// Protocol-scaled `COALESCE_MAX_EXTENSION_MS` — see that constant's doc.
@@ -133,12 +136,61 @@ fn coalesce_max_extension_ms(protocol: pancetta_ft8::Protocol) -> u64 {
     ((COALESCE_MAX_EXTENSION_MS as f64) * (cycle / FT8_CYCLE_SECS)).round() as u64
 }
 
+/// PAN-117 (PR #450 review): the cap the QUEUE-TIME current-slot
+/// acceptance decision (`schedule_tx`'s `use_current`) is decided
+/// against. Between the frozen `request_received_at` timestamp and the
+/// key-time final gate, the unconditional base coalesce window
+/// (`coalesce_collect_window_ms`, 800ms FT8) ALWAYS elapses first, and
+/// the encode/modulate + gate-await overhead the safety margin covers
+/// follows it. Deciding `use_current` against the raw effective cap
+/// therefore accepted a request arriving 2.2-3.0s into its FT8 slot
+/// (1.1-1.5s FT4) into the CURRENT slot while the same fresh-clock gate
+/// was guaranteed to drop it — scheduled, dropped, never deferred.
+/// Reserving both quantities below the cap makes such a request DEFER
+/// to the next slot (30s) instead; the key-time gate keeps the raw
+/// effective cap as its unconditional backstop, and
+/// `adaptive_coalesce_cap_ms`'s probe passes this same value so its
+/// deferred branch matches the decision the worker actually makes.
+fn current_slot_acceptance_cap_ms(protocol: pancetta_ft8::Protocol, tx_late_max_ms: u64) -> u64 {
+    tx_late_max_ms_effective(protocol, tx_late_max_ms)
+        .saturating_sub(coalesce_collect_window_ms(protocol))
+        .saturating_sub(COALESCE_CAP_SAFETY_MARGIN_MS)
+}
+
+/// PAN-117 (PR #450 review round 2): the multi-TX arm's queue-time
+/// acceptance cap. Only a bundle COALESCED from a `TransmitRequest` head
+/// sat through the unconditional base coalesce window after its frozen
+/// `request_received_at`; a `MultiTransmitRequest` dequeued directly (an
+/// autonomous bundle, or a mid-TX supersede re-enqueue) skips that wait.
+/// Reserving the base window for it too would defer a bundle that can
+/// still key before the raw cap, so it reserves only the safety margin.
+fn multi_tx_acceptance_cap_ms(
+    protocol: pancetta_ft8::Protocol,
+    tx_late_max_ms: u64,
+    waited_base_window: bool,
+) -> u64 {
+    if waited_base_window {
+        current_slot_acceptance_cap_ms(protocol, tx_late_max_ms)
+    } else {
+        tx_late_max_ms_effective(protocol, tx_late_max_ms)
+            .saturating_sub(COALESCE_CAP_SAFETY_MARGIN_MS)
+    }
+}
+
 /// Remaining `tx_late_max_ms` headroom, in ms, available to extend the
 /// Symptom-C adaptive coalesce window for the given head request — bounds
 /// the window so it can never push a request past the late-skip cliff.
-/// Returns the full (protocol-scaled) `COALESCE_MAX_EXTENSION_MS` when the
-/// head has already resolved to a DEFERRED (next-slot) target, since
-/// there's no current-slot cliff to protect in that case, and `0` if `head`
+/// The headroom subtracts the mandatory base collection window
+/// (`coalesce_collect_window_ms`) explicitly: the base wait always runs in
+/// full before any extension, so extension headroom that ignored it would
+/// deliberately stretch a request past the very cap the key-time final
+/// gate enforces (PAN-117). The headroom is measured against whichever
+/// slot the head resolves to, current or DEFERRED: a deferred target that
+/// begins a whole slot later leaves headroom far above the protocol-scaled
+/// `COALESCE_MAX_EXTENSION_MS` ceiling (so the ceiling applies), but one
+/// that begins moments away (a head arriving at :14.5 for the :15 slot)
+/// is bounded by its own cliff too (PAN-117, PR #450 Codex review), or the
+/// stretch would carry it past the key-time cap. Returns `0` if `head`
 /// isn't a `TransmitRequest` (defensive — the only caller checks this
 /// first).
 fn adaptive_coalesce_cap_ms(
@@ -156,23 +208,29 @@ fn adaptive_coalesce_cap_ms(
     let required_parity =
         resolve_required_parity(*tx_parity, tx_self_parity, request_received_at, slot_ns);
     let tx_late_max_ms_eff = tx_late_max_ms_effective(protocol, tx_late_max_ms);
+    // PAN-117 (PR #450 review): probe with the SAME acceptance cap the
+    // worker's queue-time decision uses, so `probe.target_slot` is the
+    // slot the real decision will pick — a head in the reserved band
+    // below the raw cap defers at the decision, so the headroom must be
+    // measured against that deferred slot, not a current-slot target it
+    // will never get.
     let probe = schedule_tx(
         request_received_at,
         required_parity,
-        tx_late_max_ms_eff,
+        current_slot_acceptance_cap_ms(protocol, tx_late_max_ms),
         sample_rate,
         slot_ns,
     );
     let protocol_ceiling = coalesce_max_extension_ms(protocol);
-    if probe.deferred {
-        return protocol_ceiling;
-    }
-    let elapsed_in_slot_ms = (request_received_at - probe.target_slot)
-        .num_milliseconds()
-        .max(0) as u64;
-    let headroom = tx_late_max_ms_eff
+    // Signed: negative when the target slot (a deferred one) has not begun
+    // yet, which ADDS the time until it starts to the headroom. A current
+    // slot target is never ahead of `request_received_at`.
+    let elapsed_in_slot_ms = (request_received_at - probe.target_slot).num_milliseconds();
+    let headroom = (tx_late_max_ms_eff as i64)
         .saturating_sub(elapsed_in_slot_ms)
-        .saturating_sub(COALESCE_CAP_SAFETY_MARGIN_MS);
+        .saturating_sub(coalesce_collect_window_ms(protocol) as i64)
+        .saturating_sub(COALESCE_CAP_SAFETY_MARGIN_MS as i64)
+        .max(0) as u64;
     headroom.min(protocol_ceiling)
 }
 
@@ -457,6 +515,14 @@ pub fn classify_incoming_during_tx(
 /// `slot_ns` is the active slot period (FT8 = 15e9, FT4 = 7.5e9). All
 /// slot-grid math is computed against it; passing
 /// `pancetta_core::slot::SLOT_NS` is byte-identical to the FT8 behavior.
+///
+/// PAN-117 (PR #450 review): the worker arms pass an acceptance cap here —
+/// not the raw effective cap — so the current slot is only accepted when
+/// the request can absorb the coalesce/encode overhead that runs before
+/// the key: `current_slot_acceptance_cap_ms` for a request that took the
+/// base coalesce wait, `multi_tx_acceptance_cap_ms` (margin only) for a
+/// directly dequeued bundle that did not. The key-time final gate keeps
+/// enforcing the raw effective cap.
 pub fn schedule_tx(
     now: chrono::DateTime<chrono::Utc>,
     required_parity: pancetta_core::slot::SlotParity,
@@ -605,6 +671,26 @@ fn ptt_wait_step(
         return PttWaitStep::ClockJumped(WallClockJump::Forward(now - ptt_target));
     }
     PttWaitStep::Reached
+}
+
+/// PAN-117 (six-lane review L5 H-7): `true` when `now` falls more than
+/// `late_max_ms` past `target_slot` — keying then would put so little of
+/// the waveform on the air that no receiver could decode it. Applied at
+/// the last instant before PTT in both worker arms (the Step 4d final
+/// gate), because everything after the queue-time `schedule_tx` decision
+/// (coalesce waits, encode/modulate, gate awaits) adds real delay the
+/// queue-time check never sees. The boundary is inclusive on the key side
+/// (`elapsed == cap` keys), mirroring `schedule_tx`'s
+/// `mstr <= tx_late_max_ms`; a deferred target (target_slot in the
+/// future) makes `now - target_slot` negative, so this only bites
+/// current-slot late starts. Mid-wait clock jumps stay covered by
+/// PAN-114's `ptt_wait_step` above.
+fn key_time_too_late(
+    now: chrono::DateTime<chrono::Utc>,
+    target_slot: chrono::DateTime<chrono::Utc>,
+    late_max_ms: u64,
+) -> bool {
+    now - target_slot > chrono::Duration::milliseconds(late_max_ms as i64)
 }
 
 /// Outcome of [`wait_for_ptt_instant`].
@@ -1062,13 +1148,14 @@ async fn reenqueue_pending(message_bus: &MessageBus, pending: Vec<ComponentMessa
 /// it after — never re-ordering — keeps `coalesce_backlog_into` and the
 /// bundle arms seeing requests in the order they actually arrived.
 ///
-/// The CALLER invokes this only AFTER sending PTT off on a detected disarm
+/// The CALLER invokes this only AFTER attempting confirmed PTT-off on a detected disarm
+/// and, during playback, after the confirmed flush or playback wait-out (PAN-135)
 /// (round-9 review, Codex P1): draining *before* returning from
 /// `interruptible_sleep_or_supersede` reintroduced round-2's original
 /// problem — with concurrent producers continually refilling the channel,
 /// an unbounded `try_recv()` loop there could delay the caller's first
 /// (safety-critical) PTT-off send indefinitely. Calling it here instead,
-/// after PTT is already off, keeps the drain's unboundedness from ever
+/// after attempting PTT release, keeps the drain's unboundedness from ever
 /// touching PTT-release latency — it can only delay the lower-priority
 /// reenqueue/audit/completion bookkeeping that follows.
 fn drain_and_merge_pending(
@@ -2148,6 +2235,113 @@ mod interruptible_sleep_tests {
     }
 }
 
+/// PAN-135: bounded retry for a safety send that must not be silently
+/// dropped. Uses the PAN-43/45 schedule: 4 attempts over about 75 ms.
+const SAFETY_SEND_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(5),
+    Duration::from_millis(20),
+    Duration::from_millis(50),
+];
+
+fn ptt_off_message() -> ComponentMessage {
+    ComponentMessage::new(
+        ComponentId::Ft8Transmitter,
+        ComponentId::Hamlib,
+        MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt { state: false }),
+        Instant::now(),
+    )
+}
+
+/// What [`PttGuard::release`] achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PttRelease {
+    /// PTT-off is enqueued on Hamlib's channel: handed off.
+    Delivered,
+    /// Every attempt dropped; the guard stays armed.
+    Undelivered,
+}
+
+/// PAN-135: the shortest a disarm flush waits for its ack, and how far
+/// past the revoked waveform's scheduled end an unconfirmed flush waits
+/// (relay poll + audio-thread latency between Step 7's enqueue and the
+/// samples reaching the output ring).
+const FLUSH_ACK_MIN_WAIT: Duration = Duration::from_millis(250);
+const FLUSH_PLAYBACK_SLACK: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisarmFlush {
+    /// The audio thread confirmed the flush reached the output ring.
+    Applied,
+    /// No confirmation: waited until the revoked audio had played out.
+    WaitedOutPlayback,
+    /// Shutdown ended the wait.
+    Shutdown,
+}
+
+/// PAN-135 (PR #362 rounds 4/6, Codex P1): flush the revoked remote
+/// waveform before the caller drains or re-enqueues work that may key
+/// again. Wait for the audio thread to confirm the flush, the revoked
+/// playback window to elapse, or shutdown. The playback bound applies
+/// when confirmation cannot arrive, including `--no-audio` and a stalled
+/// audio thread. The flush rides the same Audio FIFO as the frame's samples,
+/// so it can never clear the buffer ahead of them.
+async fn flush_disarmed_audio_confirmed(
+    message_bus: &MessageBus,
+    sample_rate: u32,
+    playback_end: tokio::time::Instant,
+    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> DisarmFlush {
+    let deadline = std::cmp::max(
+        playback_end + FLUSH_PLAYBACK_SLACK,
+        tokio::time::Instant::now() + FLUSH_ACK_MIN_WAIT,
+    );
+    'attempts: for attempt in 0..=SAFETY_SEND_RETRY_DELAYS.len() {
+        let (ack, mut waiter) = DeliveryAck::new();
+        let flush = ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Audio,
+            MessageType::AudioFlush { sample_rate, ack },
+            Instant::now(),
+        );
+        if matches!(message_bus.send_message_checked(flush).await, Ok(true)) {
+            loop {
+                if shutdown.load(Ordering::Acquire) {
+                    return DisarmFlush::Shutdown;
+                }
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    break 'attempts;
+                }
+                match waiter
+                    .wait_for((deadline - now).min(Duration::from_millis(50)))
+                    .await
+                {
+                    AckState::Applied => return DisarmFlush::Applied,
+                    AckState::Pending => {}
+                    AckState::NotApplied => break 'attempts,
+                    AckState::Dropped => break, // lost in transit: send a fresh one
+                }
+            }
+        }
+        if let Some(delay) = SAFETY_SEND_RETRY_DELAYS.get(attempt) {
+            sleep(*delay).await;
+        }
+    }
+    error!(
+        target: "pancetta::tx.ptt",
+        "Remote disarm: audio flush not confirmed by the audio thread; holding re-enqueue for {:?} until the revoked waveform has played out",
+        deadline.saturating_duration_since(tokio::time::Instant::now())
+    );
+    while tokio::time::Instant::now() < deadline {
+        if shutdown.load(Ordering::Acquire) {
+            return DisarmFlush::Shutdown;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        sleep(remaining.min(Duration::from_millis(50))).await;
+    }
+    DisarmFlush::WaitedOutPlayback
+}
+
 /// Guard that sends PTT-off when dropped, ensuring PTT is released
 /// even if the transmitter task is cancelled mid-transmission.
 struct PttGuard {
@@ -2187,6 +2381,36 @@ impl PttGuard {
             message_bus,
             armed: true,
             ptt_active,
+        }
+    }
+
+    /// PAN-135: unkey with checked, bounded-retry delivery, and stand the
+    /// RAII fallback down only once PTT-off is enqueued on Hamlib's channel.
+    /// Hamlib applies that channel in order, so any later PTT-on from this
+    /// worker lands after this unkey. An enqueued PTT-off is handed off.
+    /// If every attempt drops, the guard stays armed (its `Drop` retries on
+    /// scope exit) and `ptt_active` stays true until then; Hamlib's 14 s
+    /// PTT watchdog is the remaining backstop.
+    async fn release(&mut self, context: &str) -> PttRelease {
+        match self
+            .message_bus
+            .send_message_retrying(ptt_off_message, &SAFETY_SEND_RETRY_DELAYS)
+            .await
+        {
+            Ok(true) => {
+                self.ptt_active
+                    .store(false, std::sync::atomic::Ordering::Release);
+                self.armed = false;
+                PttRelease::Delivered
+            }
+            Ok(false) | Err(_) => {
+                error!(
+                    target: "pancetta::tx.ptt",
+                    "{context}: PTT OFF not delivered to Hamlib after {} attempts; PTT guard stays armed and retries on drop; Hamlib's PTT watchdog is the backstop",
+                    SAFETY_SEND_RETRY_DELAYS.len() + 1
+                );
+                PttRelease::Undelivered
+            }
         }
     }
 
@@ -2734,6 +2958,376 @@ fn has_undelivered_pending_hamlib_state(
             .lock()
             .map(|slot| slot.is_some())
             .unwrap_or(true)
+}
+
+/// PAN-118: frequency-aware sibling of [`tx_hard_mute_reason`]. That
+/// function answers "may the station key at all right now" from global,
+/// frequency-independent state; this one answers "may THIS transmission
+/// key on THIS absolute RF frequency" from the configured band plan
+/// (`rig.frequency.band_plan`; `edge_warnings` is the single master
+/// switch for both the TUI edge warning and this hard refusal, so
+/// `edge_warnings = false` remains the operator's documented escape
+/// hatch). Per-request by construction (two bundle items can differ),
+/// so it is NOT folded into `tx_hard_mute_reason` — whose one
+/// frequency-less consumer (the QSO stall-evidence closure) must not
+/// grow a frequency parameter. The boolean itself is
+/// `pancetta_tui::app::tx_rf_out_of_band_plan`, the single source of
+/// truth (region tables + `custom_bands` override) shared with the
+/// TUI's entry-time warning. Refusals are rare; allocation cost is
+/// fine. `pub` + re-exported from `coordinator` so the `coord_sim`
+/// rig-simulation fixture mirrors the worker's gate with the REAL gate
+/// functions, exactly as it already does for the coalescer, the arm
+/// gate, and the liveness predicate.
+///
+/// `tx_rf_hz` is the LOWEST emitted tone (dial + audio offset, from
+/// [`tx_rf_for_gate`]); `signal_span_hz` is how far above it the highest
+/// emitted tone sits ([`tx_signal_span_hz`] for a protocol frame, `0.0`
+/// for a single-tone tune or a raw manual-PTT carrier). Both the low and
+/// the high edge must be inside the band plan (PR #446 Codex review: an
+/// FT8 frame whose base tone is in-band can still put its top tone up to
+/// 43.75 Hz past an upper band edge).
+pub fn tx_band_plan_mute_reason(
+    tx_rf_hz: f64,
+    signal_span_hz: f64,
+    band_plan: &pancetta_config::BandPlanConfig,
+) -> Option<String> {
+    // Conservative integer edges computed from the exact f64 RF (PR #446
+    // Codex review): the low edge rounds DOWN and the high edge rounds UP,
+    // each from the unrounded base, so a fractional offset or span (FT4's
+    // 62.4999 Hz) can never be checked inside the band while the real tone
+    // sits a fraction of a Hz outside it. A non-finite RF fails closed; a
+    // non-finite / negative span degrades to the base-tone-only check.
+    if !tx_rf_hz.is_finite() {
+        return Some(format!(
+            "TX frequency {tx_rf_hz} Hz is not a valid RF frequency"
+        ));
+    }
+    let span_hz = if signal_span_hz.is_finite() && signal_span_hz > 0.0 {
+        signal_span_hz
+    } else {
+        0.0
+    };
+    let low_hz = tx_rf_hz.max(0.0).floor() as u64;
+    let high_hz = (tx_rf_hz.max(0.0) + span_hz).ceil() as u64;
+    let low_out = pancetta_tui::app::tx_rf_out_of_band_plan(low_hz, band_plan);
+    let high_out =
+        high_hz != low_hz && pancetta_tui::app::tx_rf_out_of_band_plan(high_hz, band_plan);
+    if low_out {
+        Some(format!(
+            "TX frequency {low_hz} Hz is outside the configured amateur band plan"
+        ))
+    } else if high_out {
+        Some(format!(
+            "TX signal {low_hz}-{high_hz} Hz extends outside the configured \
+             amateur band plan"
+        ))
+    } else {
+        None
+    }
+}
+
+/// PAN-118: distance in Hz from the lowest to the highest tone the
+/// modulator emits for one `protocol` frame — `(num_tones - 1) *
+/// tone_spacing`, exactly the upper bound `Ft8Modulator::
+/// modulate_symbols_protocol` emits above its base frequency (FT8 43.75,
+/// FT4 62.5, FT2 175). The band-plan gate adds it to the low edge to get
+/// the occupied high edge.
+pub fn tx_signal_span_hz(protocol: pancetta_ft8::Protocol) -> f64 {
+    let params = pancetta_ft8::ProtocolParams::from_protocol(protocol);
+    (params.num_tones as f64 - 1.0) * params.tone_spacing
+}
+
+/// PAN-118: absolute TX RF for gating: effective TX dial (split when
+/// active, else RX dial — `pancetta_qso::qso_manager::effective_tx_dial`)
+/// plus the request's absolute audio offset. `None` while the effective
+/// TX dial reads 0 (no split set and RX dial 0) — the codebase's
+/// "frequency not yet known" sentinel (TUI
+/// 14.074 fallback, `--replay` seed, mock-rig dev modes) — in which case
+/// the caller skips the band-plan check; every frequency-independent
+/// hard-mute input still applies. Also the dial resolver for the TUI
+/// relay's manual-PTT sibling gate (`tui_relay::ptt_band_plan_refusal`),
+/// so the split-vs-RX-dial rule has exactly one implementation. `pub` +
+/// re-exported for the same `coord_sim` reason as
+/// `tx_band_plan_mute_reason` above.
+pub fn tx_rf_for_gate(
+    operating_frequency_hz: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    split_tx_frequency_hz: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    audio_offset_hz: f64,
+) -> Option<f64> {
+    let rx_dial = operating_frequency_hz.load(Ordering::Relaxed);
+    let split = split_tx_frequency_hz.load(Ordering::Relaxed);
+    // Resolve the effective TX dial FIRST (PR #446 Codex review): a known
+    // split dial with the RX dial still 0 is a real TX frequency and must
+    // be gated; only an effective dial of 0 means "not yet known".
+    let tx_dial = pancetta_qso::qso_manager::effective_tx_dial(rx_dial, split);
+    if tx_dial == 0 {
+        return None;
+    }
+    // Exact f64 RF — NOT rounded here; `tx_band_plan_mute_reason` derives
+    // conservative integer edges from it (PR #446 Codex review).
+    Some(tx_dial as f64 + audio_offset_hz)
+}
+
+#[cfg(test)]
+mod pan118_band_plan_gate_tests {
+    use super::*;
+
+    #[test]
+    fn in_band_frequency_is_permitted() {
+        assert_eq!(
+            tx_band_plan_mute_reason(
+                (14_074_000 + 1_500) as f64,
+                0.0,
+                &pancetta_config::BandPlanConfig::default()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn between_bands_frequency_is_refused_with_the_rf_in_the_reason() {
+        let reason = tx_band_plan_mute_reason(
+            15_001_500.0,
+            0.0,
+            &pancetta_config::BandPlanConfig::default(),
+        )
+        .expect("15.0015 MHz sits between 20m and 17m — must refuse");
+        assert!(
+            reason.contains("TX frequency 15001500 Hz is outside the configured amateur band plan"),
+            "reason names the absolute RF: {reason}"
+        );
+    }
+
+    #[test]
+    fn edge_warnings_false_permits_everything() {
+        let mut band_plan = pancetta_config::BandPlanConfig::default();
+        band_plan.edge_warnings = false;
+        assert_eq!(
+            tx_band_plan_mute_reason(15_001_500.0, 0.0, &band_plan),
+            None
+        );
+    }
+
+    #[test]
+    fn custom_bands_override_is_respected() {
+        use pancetta_config::{BandDefinition, BandType, FrequencyRange};
+        let default_plan = pancetta_config::BandPlanConfig::default();
+        // 14.340 MHz is inside 20m's region-2 range (14.000–14.350 MHz).
+        assert_eq!(
+            tx_band_plan_mute_reason(14_340_000.0, 0.0, &default_plan),
+            None
+        );
+        // A custom "20m" entry narrows the allocation to 14.000–14.100 MHz —
+        // the same override semantics as the TUI's own override test
+        // (`tx_rf_out_of_band_plan_custom_bands_override_wins`): the entry
+        // replaces the region table for frequencies the global band table
+        // still resolves to that band. 14.340 MHz now falls outside it.
+        let mut custom = default_plan.clone();
+        custom.custom_bands.insert(
+            "20m".to_string(),
+            BandDefinition {
+                name: "20m".to_string(),
+                ranges: vec![FrequencyRange {
+                    start: 14_000_000,
+                    end: 14_100_000,
+                    modes: Vec::new(),
+                }],
+                default_mode: "FT8".to_string(),
+                band_type: BandType::Hf,
+            },
+        );
+        let reason = tx_band_plan_mute_reason(14_340_000.0, 0.0, &custom)
+            .expect("custom 20m narrowed to 14.000-14.100 MHz must refuse 14.340 MHz");
+        assert!(reason.contains("TX frequency 14340000 Hz"));
+        assert_eq!(tx_band_plan_mute_reason(14_080_000.0, 0.0, &custom), None);
+    }
+
+    // PR #446 Codex review: the gate must check the OCCUPIED signal — the
+    // lowest tone (dial + audio offset) AND the highest tone (+ the
+    // protocol's (num_tones - 1) * tone_spacing) — not just the base tone.
+    // 20m's upper edge is 14.350 MHz in every IARU region.
+    const TWENTY_M_TOP: u64 = 14_350_000;
+
+    fn assert_upper_edge_gate(protocol: pancetta_ft8::Protocol, refused_low: u64, ok_low: u64) {
+        let plan = pancetta_config::BandPlanConfig::default();
+        let span = tx_signal_span_hz(protocol);
+        // The base tone alone is in-band in both cases...
+        assert_eq!(
+            tx_band_plan_mute_reason(refused_low as f64, 0.0, &plan),
+            None
+        );
+        // ...but here the top tone crosses the band edge: refuse.
+        assert!(
+            refused_low as f64 + span > TWENTY_M_TOP as f64,
+            "fixture: {protocol} top tone must cross the edge"
+        );
+        let reason =
+            tx_band_plan_mute_reason(refused_low as f64, span, &plan).unwrap_or_else(|| {
+                panic!(
+                    "{protocol}: top tone at {} Hz is past 14.350 MHz — must refuse",
+                    refused_low as f64 + span
+                )
+            });
+        assert!(
+            reason.contains(&format!(
+                "TX signal {refused_low}-{} Hz extends outside the configured amateur band plan",
+                refused_low + span.ceil() as u64
+            )),
+            "{protocol}: reason names the occupied range: {reason}"
+        );
+        // Whole signal below the edge: permit.
+        assert!(ok_low as f64 + span <= TWENTY_M_TOP as f64);
+        assert_eq!(
+            tx_band_plan_mute_reason(ok_low as f64, span, &plan),
+            None,
+            "{protocol}"
+        );
+    }
+
+    #[test]
+    fn signal_span_matches_modulator_tone_geometry() {
+        assert_eq!(tx_signal_span_hz(pancetta_ft8::Protocol::Ft8), 7.0 * 6.25);
+        assert!((tx_signal_span_hz(pancetta_ft8::Protocol::Ft4) - 3.0 * 20.8333).abs() < 1e-9);
+        #[cfg(feature = "ft2")]
+        assert_eq!(tx_signal_span_hz(pancetta_ft8::Protocol::Ft2), 7.0 * 25.0);
+    }
+
+    #[test]
+    fn ft8_top_tone_past_upper_band_edge_is_refused() {
+        // 14_349_970 + 43.75 = 14_350_013.75 > edge; 14_349_950 + 43.75 < edge.
+        assert_upper_edge_gate(pancetta_ft8::Protocol::Ft8, 14_349_970, 14_349_950);
+    }
+
+    #[test]
+    fn ft4_top_tone_past_upper_band_edge_is_refused() {
+        // 14_349_950 + 62.5 = 14_350_012.5 > edge; 14_349_930 + 62.5 < edge.
+        assert_upper_edge_gate(pancetta_ft8::Protocol::Ft4, 14_349_950, 14_349_930);
+    }
+
+    #[cfg(feature = "ft2")]
+    #[test]
+    fn ft2_top_tone_past_upper_band_edge_is_refused() {
+        // 14_349_850 + 175 = 14_350_025 > edge; 14_349_800 + 175 < edge.
+        assert_upper_edge_gate(pancetta_ft8::Protocol::Ft2, 14_349_850, 14_349_800);
+    }
+
+    #[test]
+    fn low_edge_still_refused_with_a_signal_span() {
+        // Base tone below 20m's lower edge (14.000 MHz), top tone inside it.
+        let plan = pancetta_config::BandPlanConfig::default();
+        let span = tx_signal_span_hz(pancetta_ft8::Protocol::Ft8);
+        assert!(tx_band_plan_mute_reason(13_999_980.0, span, &plan).is_some());
+        assert_eq!(tx_band_plan_mute_reason(14_000_000.0, span, &plan), None);
+    }
+
+    #[test]
+    fn edge_warnings_false_permits_a_spanning_signal() {
+        let plan = pancetta_config::BandPlanConfig {
+            edge_warnings: false,
+            ..Default::default()
+        };
+        let span = tx_signal_span_hz(pancetta_ft8::Protocol::Ft8);
+        assert_eq!(tx_band_plan_mute_reason(14_349_990.0, span, &plan), None);
+    }
+
+    // PR #446 Codex review: the gate must not round a fractional audio
+    // offset before comparing — a sub-Hz overshoot past a band edge is
+    // still out of band. Composite (resolver + gate), as every caller uses it.
+    fn gate(dial: u64, audio_offset_hz: f64, span_hz: f64) -> Option<String> {
+        tx_rf_for_gate(
+            &std::sync::Arc::new(std::sync::atomic::AtomicU64::new(dial)),
+            &std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            audio_offset_hz,
+        )
+        .and_then(|rf| {
+            tx_band_plan_mute_reason(rf, span_hz, &pancetta_config::BandPlanConfig::default())
+        })
+    }
+
+    #[test]
+    fn fractional_top_tone_past_upper_edge_is_refused() {
+        // 14_348_000 + 1_956.4 + 43.75 = 14_350_000.15 Hz > 14.350 MHz.
+        let ft8 = tx_signal_span_hz(pancetta_ft8::Protocol::Ft8);
+        assert!(
+            gate(14_348_000, 1_956.4, ft8).is_some(),
+            "top tone 0.15 Hz past the 20m upper edge must refuse"
+        );
+        // 14_348_000 + 1_956.25 + 43.75 = 14_350_000.0 exactly: in band.
+        assert_eq!(gate(14_348_000, 1_956.25, ft8), None);
+    }
+
+    #[test]
+    fn fractional_base_tone_below_lower_edge_is_refused() {
+        // 13_998_000 + 1_999.6 = 13_999_999.6 Hz < 14.000 MHz.
+        let ft8 = tx_signal_span_hz(pancetta_ft8::Protocol::Ft8);
+        assert!(
+            gate(13_998_000, 1_999.6, ft8).is_some(),
+            "base tone 0.4 Hz below the 20m lower edge must refuse"
+        );
+        // Single tone (tune / carrier) too.
+        assert!(gate(13_998_000, 1_999.6, 0.0).is_some());
+        assert_eq!(gate(13_998_000, 2_000.0, ft8), None);
+    }
+
+    #[test]
+    fn rf_gate_skips_when_dial_unknown() {
+        assert_eq!(
+            tx_rf_for_gate(
+                &std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                &std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                1_500.0,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rf_gate_resolves_split_when_rx_dial_unknown() {
+        // PR #446 Codex review: RX dial still 0 (initial CAT read failed)
+        // but a split TX dial is known — the effective TX dial is the
+        // split, so the gate must check it, not skip.
+        assert_eq!(
+            tx_rf_for_gate(
+                &std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                &std::sync::Arc::new(std::sync::atomic::AtomicU64::new(15_000_000)),
+                1_500.0,
+            ),
+            Some(15_001_500.0)
+        );
+    }
+
+    #[test]
+    fn rf_gate_uses_rx_dial_plus_offset_on_simplex() {
+        assert_eq!(
+            tx_rf_for_gate(
+                &std::sync::Arc::new(std::sync::atomic::AtomicU64::new(14_074_000)),
+                &std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                1_500.0,
+            ),
+            Some(14_075_500.0)
+        );
+        assert_eq!(
+            tx_rf_for_gate(
+                &std::sync::Arc::new(std::sync::atomic::AtomicU64::new(14_074_000)),
+                &std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                1_499.6,
+            ),
+            // Exact, unrounded (PR #446 Codex review) — the gate floors/ceils.
+            Some(14_075_499.6)
+        );
+    }
+
+    #[test]
+    fn rf_gate_prefers_split_dial_when_active() {
+        assert_eq!(
+            tx_rf_for_gate(
+                &std::sync::Arc::new(std::sync::atomic::AtomicU64::new(14_074_000)),
+                &std::sync::Arc::new(std::sync::atomic::AtomicU64::new(15_000_000)),
+                1_500.0,
+            ),
+            Some(15_001_500.0)
+        );
+    }
 }
 
 /// PAN-89: one TX hard-mute cause, display-only. Declared in
@@ -3716,10 +4310,14 @@ async fn dx_parity_conflict_for_qso(
 /// Distinct variants only so the denial's log/diagnostic text can name the
 /// actual reason, mirroring Step 4b/4b-parity's separate messages for the
 /// same two conditions re-evaluated here at the true last instant.
+/// PAN-117 adds the third: the frame's elapsed time in its target slot
+/// exceeded `tx_late_max_ms` by the time the gate ran — keying it would
+/// put an undecodable fragment on the air.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FinalGateDenial {
     StaleQso,
     DxParityConflict,
+    TooLateToDecode { elapsed_ms: u64, late_max_ms: u64 },
 }
 
 /// PAN-141 (Step 4b) / PAN-148 (Step 4d): resolves every id's DX callsign —
@@ -3761,6 +4359,13 @@ async fn resolve_callsigns(
 /// actual freshness read (`dx_parity_conflict`) are the true last reads
 /// before `SetPtt`, and nothing async can suspend between Step 3's trim and
 /// the key.
+///
+/// PAN-117's slot-timing re-check is deliberately NOT here: it reads the
+/// clock, so it runs as its own [`key_time_gate_denial`] call after every
+/// other synchronous pre-PTT gate (this one, the hard mute, the remote arm
+/// recheck), immediately before the `SetPtt{true}` send — PR #450 Codex
+/// review: a clock read taken here could go stale while this function's
+/// `RwLock` reads and the later gates ran.
 fn final_single_tx_gate_denial(
     qso_id: Option<&str>,
     required_parity: pancetta_core::slot::SlotParity,
@@ -3785,6 +4390,64 @@ fn final_single_tx_gate_denial(
         return Some(FinalGateDenial::DxParityConflict);
     }
     None
+}
+
+/// PAN-117: the slot-timing half of the Step 4d final gate, shared by both
+/// worker arms. `now` must be the caller's TRUE last clock read — taken
+/// after every other synchronous pre-PTT gate, immediately before the
+/// `SetPtt{true}` send — and if more than `late_max_ms` of `target_slot`
+/// has elapsed by then the frame is denied with `TooLateToDecode`: keyed
+/// that late it is mathematically undecodable for any receiver, so it is
+/// dropped rather than keyed (the QSO engine's existing retry timers own
+/// the re-send).
+fn key_time_gate_denial(
+    now: chrono::DateTime<chrono::Utc>,
+    target_slot: chrono::DateTime<chrono::Utc>,
+    late_max_ms: u64,
+) -> Option<FinalGateDenial> {
+    key_time_too_late(now, target_slot, late_max_ms).then(|| FinalGateDenial::TooLateToDecode {
+        elapsed_ms: (now - target_slot).num_milliseconds().max(0) as u64,
+        late_max_ms,
+    })
+}
+
+/// Log + diagnostic text for a single-TX Step 4d denial, `(log, diagnostic)`.
+fn final_gate_denial_text(
+    denial: FinalGateDenial,
+    qso_id: Option<&str>,
+    required_parity: pancetta_core::slot::SlotParity,
+    message_text: &str,
+) -> (String, String) {
+    match denial {
+        FinalGateDenial::StaleQso => (
+            format!(
+                "dropping stale TX at final pre-PTT check for ended QSO {}: '{message_text}'",
+                qso_id.unwrap_or("?")
+            ),
+            format!("dropping stale TX at final pre-PTT check for ended QSO: '{message_text}'"),
+        ),
+        FinalGateDenial::DxParityConflict => (
+            format!(
+                "holding TX at final pre-PTT check for QSO {}: DX observed transmitting on the colliding parity {required_parity:?}: '{message_text}'",
+                qso_id.unwrap_or("?")
+            ),
+            format!(
+                "holding TX at final pre-PTT check: DX observed transmitting on the colliding parity {required_parity:?}: '{message_text}'"
+            ),
+        ),
+        FinalGateDenial::TooLateToDecode {
+            elapsed_ms,
+            late_max_ms,
+        } => (
+            format!(
+                "dropping stale TX at final pre-PTT check for QSO {}: {elapsed_ms}ms into the slot exceeds tx_late_max_ms={late_max_ms}ms — no receiver could decode it: '{message_text}'",
+                qso_id.unwrap_or("?")
+            ),
+            format!(
+                "dropping stale TX at final pre-PTT check: {elapsed_ms}ms into the slot exceeds tx_late_max_ms={late_max_ms}ms — no receiver could decode it: '{message_text}'"
+            ),
+        ),
+    }
 }
 
 /// PAN-141 (Step 4b) / PAN-148 (Step 4d): per-item liveness+DX-parity mask
@@ -4084,6 +4747,18 @@ pub fn remote_tx_permitted_for(
         }
         Err(_) => false,
     }
+}
+
+/// PAN-134: authorization for all four safety-critical sends. Evaluated
+/// inside MessageBus's read lock by `send_message_if`, after the lock wait.
+/// Never check this and then use plain `send_message`: that restores the gap.
+fn tx_send_authorized(
+    origin: crate::message_bus::TxOrigin,
+    arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
+    remote_client_key_id: Option<&str>,
+) -> bool {
+    origin != crate::message_bus::TxOrigin::Remote
+        || remote_tx_permitted_for(arm, pancetta_agent::arm::ArmTime::now, remote_client_key_id)
 }
 
 /// One-time snapshot of the remote-TX arm's permission state, taken under a
@@ -5435,18 +6110,19 @@ impl Drop for PttGuard {
             // the dropped JoinHandle is the canonical fire-and-forget idiom.
             #[allow(clippy::let_underscore_future)]
             let _ = tokio::task::spawn(async move {
-                let ptt_off_msg = ComponentMessage::new(
-                    ComponentId::Ft8Transmitter,
-                    ComponentId::Hamlib,
-                    MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt {
-                        state: false,
-                    }),
-                    Instant::now(),
-                );
-                if let Err(e) = bus.send_message(ptt_off_msg).await {
-                    tracing::error!("PTT GUARD: failed to force PTT off on drop: {}", e);
-                } else {
-                    tracing::warn!("PTT GUARD: forced PTT off due to task cancellation");
+                match bus
+                    .send_message_retrying(ptt_off_message, &SAFETY_SEND_RETRY_DELAYS)
+                    .await
+                {
+                    Ok(true) => {
+                        tracing::warn!("PTT GUARD: forced PTT off due to task cancellation")
+                    }
+                    Ok(false) => tracing::error!(
+                        target: "pancetta::tx.ptt",
+                        "PTT GUARD: PTT OFF not delivered to Hamlib after {} attempts on drop; Hamlib's PTT watchdog is the remaining backstop",
+                        SAFETY_SEND_RETRY_DELAYS.len() + 1
+                    ),
+                    Err(e) => tracing::error!("PTT GUARD: failed to force PTT off on drop: {}", e),
                 }
             });
         }
@@ -6235,7 +6911,14 @@ impl super::ApplicationCoordinator {
         let message_bus = self.message_bus.clone();
 
         // Capture config snapshot for TX timing parameters.
-        let (tx_late_max_ms, tx_self_parity, ptt_lead_ms, sample_rate, max_concurrent_qsos) = {
+        let (
+            tx_late_max_ms,
+            tx_self_parity,
+            ptt_lead_ms,
+            sample_rate,
+            max_concurrent_qsos,
+            band_plan,
+        ) = {
             let cfg = self.config.read().await;
             (
                 cfg.station.tx_late_max_ms,
@@ -6248,6 +6931,13 @@ impl super::ApplicationCoordinator {
                 // content instead of fully replacing it. `1` (the default)
                 // keeps the single-item replace path byte-identical to Task 6.
                 cfg.autonomous.max_concurrent_qsos,
+                // PAN-118: band-plan snapshot for the frequency-aware TX
+                // gate (`tx_band_plan_mute_reason`). Config is loaded once
+                // at startup (the hot-reload apply task is a documented
+                // no-op), so a startup snapshot is always the live value,
+                // and it keeps the last-instant re-check synchronous (no
+                // lock acquisition on the hot path).
+                cfg.rig.frequency.band_plan.clone(),
             )
         };
 
@@ -6276,6 +6966,12 @@ impl super::ApplicationCoordinator {
             // PAN-115 -- see `tx_hard_mute_reason`'s doc comment.
             let rig_conn_state = self.rig_conn_state.clone();
             let audio_output_alive = self.audio_output_alive.clone();
+            // PAN-118 -- see `tx_band_plan_mute_reason`'s doc comment. The
+            // shared dial atomics (updated by the Hamlib poll loop / split
+            // writers) give the frequency-aware gate the live effective TX
+            // dial at every check, including the last-instant re-check.
+            let operating_frequency_hz = self.operating_frequency_hz.clone();
+            let split_tx_frequency_hz = self.split_tx_frequency_hz();
             // Drop-stale-TX gate: the QSO component keeps this set in sync;
             // the worker refuses to key PTT for a request whose `qso_id` is no
             // longer present (superseded / cancelled / completed-past-grace).
@@ -6488,6 +7184,14 @@ impl super::ApplicationCoordinator {
                             // scheduling decision being made ~800ms later than the
                             // request actually arrived — an unforced ~30s defer.
                             let request_received_at = chrono::Utc::now();
+                            // PAN-117 (PR #450 review round 2): only a
+                            // `TransmitRequest` head takes the base coalesce wait
+                            // below. Captured before coalescing can fold it into a
+                            // `MultiTransmitRequest`, so the multi-TX arm can tell
+                            // a coalesced bundle (waited) from a directly dequeued
+                            // one (did not) when it picks its acceptance cap.
+                            let head_takes_base_wait =
+                                matches!(message.message_type, MessageType::TransmitRequest { .. });
 
                             // --- Backpressure / staleness coalescing ---
                             // The worker processes one request at a time and a
@@ -6506,7 +7210,7 @@ impl super::ApplicationCoordinator {
                             // dropped. Single-request (no-backlog) case rewrites
                             // back to exactly that one request — normal path
                             // unchanged.
-                            if matches!(message.message_type, MessageType::TransmitRequest { .. }) {
+                            if head_takes_base_wait {
                                 // Adaptive collection window (Symptom C fix): take
                                 // the base wait once, unconditionally (same as
                                 // before — this is the byte-identical baseline for
@@ -6774,6 +7478,56 @@ impl super::ApplicationCoordinator {
                                         continue;
                                     }
 
+                                    // --- Step 0-band: PAN-118 band-plan gate ---
+                                    // Frequency-aware sibling of the hard mute
+                                    // above: refuses THIS transmission when its
+                                    // absolute TX RF (effective split-aware dial
+                                    // + this request's absolute audio offset)
+                                    // falls outside the configured amateur band
+                                    // plan — before PTT is ever asserted. Same
+                                    // unwind as the hard-mute branch above. The
+                                    // check is skipped while the dial is the
+                                    // unknown-0 sentinel (dev/mock modes);
+                                    // `tx_band_plan_mute_reason` has the detail.
+                                    if let Some(reason) = tx_rf_for_gate(
+                                        &operating_frequency_hz,
+                                        &split_tx_frequency_hz,
+                                        frequency_offset,
+                                    )
+                                    .and_then(|rf| {
+                                        tx_band_plan_mute_reason(
+                                            rf,
+                                            tx_signal_span_hz(active_protocol),
+                                            &band_plan,
+                                        )
+                                    }) {
+                                        info!(
+                                            target: "pancetta::tx.policy",
+                                            "TX blocked ({reason}): '{}' at {:.0} Hz (qso: {:?})",
+                                            message_text, frequency_offset, qso_id
+                                        );
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "tx.policy",
+                                            pancetta_core::DiagnosticLevel::Info,
+                                            format!(
+                                                "TX blocked ({reason}): '{message_text}' at {frequency_offset:.0} Hz"
+                                            ),
+                                            qso_id.as_deref(),
+                                        )
+                                        .await;
+                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                        let _ = report_transmit_complete(
+                                            &message_bus,
+                                            false,
+                                            message_text,
+                                            0,
+                                            qso_id.clone(),
+                                        )
+                                        .await;
+                                        continue;
+                                    }
+
                                     // --- Step 0a: Remote-TX arm gate ---
                                     // Remote-originated requests must pass the
                                     // station-agent arm gate (armed ∧ tx-scope ∧
@@ -6978,10 +7732,22 @@ impl super::ApplicationCoordinator {
                                             slot_ns,
                                         );
 
+                                        // PAN-117 (PR #450 review): decide
+                                        // `use_current` against the acceptance
+                                        // cap, not the raw effective cap — the
+                                        // base coalesce window plus the safety
+                                        // margin's overhead always elapse
+                                        // between the frozen
+                                        // `request_received_at` and the
+                                        // key-time gate, so a head accepted on
+                                        // the raw cap in the 2.2-3.0s band
+                                        // (FT8, 3000ms default) could only
+                                        // ever be dropped there. Reserving the
+                                        // overhead makes it defer 30s instead.
                                         let mut schedule = schedule_tx(
                                             request_received_at,
                                             required_parity,
-                                            tx_late_max_ms_effective(
+                                            current_slot_acceptance_cap_ms(
                                                 active_protocol,
                                                 tx_late_max_ms,
                                             ),
@@ -7337,6 +8103,46 @@ impl super::ApplicationCoordinator {
                                             continue 'worker;
                                         }
 
+                                        // PAN-118: the band-plan sibling of the
+                                        // re-key mute above — the dial may have
+                                        // moved (CAT / split change) during the
+                                        // pre-PTT wait. Same unwind as that
+                                        // branch.
+                                        if let Some(reason) = tx_rf_for_gate(
+                                            &operating_frequency_hz,
+                                            &split_tx_frequency_hz,
+                                            frequency_offset,
+                                        )
+                                        .and_then(|rf| {
+                                            tx_band_plan_mute_reason(
+                                                rf,
+                                                tx_signal_span_hz(active_protocol),
+                                                &band_plan,
+                                            )
+                                        }) {
+                                            emit_diagnostic(
+                                                &message_bus,
+                                                "tx.policy",
+                                                pancetta_core::DiagnosticLevel::Info,
+                                                format!(
+                                                    "TX re-key blocked ({reason}): '{message_text}'"
+                                                ),
+                                                qso_id.as_deref(),
+                                            )
+                                            .await;
+                                            send_tx_queue_status(&message_bus, None, Vec::new())
+                                                .await;
+                                            let _ = report_transmit_complete(
+                                                &message_bus,
+                                                false,
+                                                message_text,
+                                                0,
+                                                qso_id.clone(),
+                                            )
+                                            .await;
+                                            continue 'worker;
+                                        }
+
                                         // PAN-148: resolve the DX callsign for the Step 4d
                                         // final gate's parity re-check NOW, BEFORE Step 3's
                                         // timing-sensitive trim below — round-2 review (Codex
@@ -7618,6 +8424,10 @@ impl super::ApplicationCoordinator {
                                         // between this call and the key. SYNCHRONOUS (uses
                                         // `final_gate_callsign`, resolved before Step 3's
                                         // trim above — see that call site's comment).
+                                        // PAN-117: the slot-timing re-check is NOT part of
+                                        // this gate — it reads the clock, so it runs last,
+                                        // just before the PTT-on send below (see
+                                        // `key_time_gate_denial`).
                                         if let Some(denial) = final_single_tx_gate_denial(
                                             qso_id.as_deref(),
                                             required_parity,
@@ -7635,26 +8445,12 @@ impl super::ApplicationCoordinator {
                                                     pivoted_once.remove(&key);
                                                     pivoted_from.remove(&key)
                                                 });
-                                            let (log_msg, diag_msg) = match denial {
-                                                FinalGateDenial::StaleQso => (
-                                                    format!(
-                                                        "dropping stale TX at final pre-PTT check for ended QSO {}: '{message_text}'",
-                                                        qso_id.as_deref().unwrap_or("?")
-                                                    ),
-                                                    format!(
-                                                        "dropping stale TX at final pre-PTT check for ended QSO: '{message_text}'"
-                                                    ),
-                                                ),
-                                                FinalGateDenial::DxParityConflict => (
-                                                    format!(
-                                                        "holding TX at final pre-PTT check for QSO {}: DX observed transmitting on the colliding parity {required_parity:?}: '{message_text}'",
-                                                        qso_id.as_deref().unwrap_or("?")
-                                                    ),
-                                                    format!(
-                                                        "holding TX at final pre-PTT check: DX observed transmitting on the colliding parity {required_parity:?}: '{message_text}'"
-                                                    ),
-                                                ),
-                                            };
+                                            let (log_msg, diag_msg) = final_gate_denial_text(
+                                                denial,
+                                                qso_id.as_deref(),
+                                                required_parity,
+                                                &message_text,
+                                            );
                                             info!(target: "pancetta::tx.policy", "{log_msg}");
                                             emit_diagnostic(
                                                 &message_bus,
@@ -7728,56 +8524,44 @@ impl super::ApplicationCoordinator {
                                             continue 'worker;
                                         }
 
-                                        // --- Step 4d-arm: last-instant pre-PTT arm recheck
-                                        // (round-3 review, Codex P1) — round-2's placement
-                                        // here (before the two awaits above) still left the
-                                        // `send_tx_status`/`send_tx_queue_status` awaits
-                                        // between the check and the actual PTT-on send below,
-                                        // which is exactly the gap this check exists to close.
-                                        // This is the genuine last instant: nothing but the
-                                        // PTT-on send itself follows (PAN-148 extended this
-                                        // final gate above to also cover liveness/DX-parity).
-                                        // PTT hardware was never asserted on this path —
-                                        // `ptt_guard` only flipped the in-process `ptt_active`
-                                        // flag on construction — so denying here needs no
-                                        // PTT-off send, just unwinding that flag and the
-                                        // TX-badge/queue status the two awaits above just
-                                        // (prematurely) announced.
-                                        if origin == crate::message_bus::TxOrigin::Remote
-                                            && !remote_tx_permitted_for(
-                                                &remote_tx_arm,
-                                                pancetta_agent::arm::ArmTime::now,
-                                                remote_client_key_id.as_deref(),
+                                        // PAN-118: the band-plan sibling of the
+                                        // final pre-PTT mute above — nothing else
+                                        // runs between this synchronous check
+                                        // (atomics + a local struct snapshot) and
+                                        // the key. Same unwind: nothing reached
+                                        // the air, so the frame is reported
+                                        // unaired, not failed-complete.
+                                        if let Some(reason) = tx_rf_for_gate(
+                                            &operating_frequency_hz,
+                                            &split_tx_frequency_hz,
+                                            frequency_offset,
+                                        )
+                                        .and_then(|rf| {
+                                            tx_band_plan_mute_reason(
+                                                rf,
+                                                tx_signal_span_hz(active_protocol),
+                                                &band_plan,
                                             )
-                                        {
+                                        }) {
                                             ptt_active.store(false, Ordering::Release);
                                             ptt_guard.disarm();
-                                            // Round-6 review (Codex P2): if Step 4c pivoted
-                                            // this cycle, remove the tombstone it inserted —
-                                            // nothing actually reached the air, so the
-                                            // genuinely fresh request still queued behind
-                                            // this one must NOT be discarded by Step 0-dup as
-                                            // an already-sent duplicate of a pivot that never
-                                            // transmitted.
                                             let pivot_replaced =
                                                 pivoted_this_key.take().and_then(|key| {
                                                     pivoted_once.remove(&key);
                                                     pivoted_from.remove(&key)
                                                 });
-                                            let denial_reason = format!(
-                                                "arm went stale in the pre-PTT gap: '{message_text}' at {frequency_offset:.0} Hz"
+                                            info!(
+                                                target: "pancetta::tx.policy",
+                                                "TX blocked at final pre-PTT check ({reason}): '{message_text}' (qso: {:?})",
+                                                qso_id
                                             );
-                                            let operator_callsign = tx_denied_operator_attribution(
-                                                &remote_tx_arm,
-                                                remote_client_key_id.as_deref(),
-                                            );
-                                            emit_disarm_interrupt_signals(
+                                            emit_diagnostic(
                                                 &message_bus,
-                                                &audit_log,
-                                                &display_feed_enabled,
-                                                operator_callsign,
-                                                "denied",
-                                                denial_reason,
+                                                "tx.policy",
+                                                pancetta_core::DiagnosticLevel::Info,
+                                                format!(
+                                                    "TX blocked at final pre-PTT check ({reason}): '{message_text}'"
+                                                ),
                                                 qso_id.as_deref(),
                                             )
                                             .await;
@@ -7793,6 +8577,64 @@ impl super::ApplicationCoordinator {
                                             continue 'worker;
                                         }
 
+                                        // PAN-117 (PR #450 Codex review): the slot-timing
+                                        // half of Step 4d, run LAST among the pre-send
+                                        // gates — after the liveness/DX-parity gate, the
+                                        // hard mute and the band-plan gate above — so
+                                        // `chrono::Utc::now()` here is the last clock read
+                                        // before the PTT-on send. A frame more than
+                                        // `tx_late_max_ms` into its target slot is dropped
+                                        // here instead of keyed (no receiver could decode
+                                        // the surviving fragment). SYNCHRONOUS up to
+                                        // `send_message_if` below, whose table-lock wait
+                                        // precedes its PAN-134 arm recheck and the enqueue.
+                                        if let Some(denial) = key_time_gate_denial(
+                                            chrono::Utc::now(),
+                                            schedule.target_slot,
+                                            tx_late_max_ms_effective(
+                                                active_protocol,
+                                                tx_late_max_ms,
+                                            ),
+                                        ) {
+                                            ptt_active.store(false, Ordering::Release);
+                                            ptt_guard.disarm();
+                                            let pivot_replaced =
+                                                pivoted_this_key.take().and_then(|key| {
+                                                    pivoted_once.remove(&key);
+                                                    pivoted_from.remove(&key)
+                                                });
+                                            let (log_msg, diag_msg) = final_gate_denial_text(
+                                                denial,
+                                                qso_id.as_deref(),
+                                                required_parity,
+                                                &message_text,
+                                            );
+                                            info!(target: "pancetta::tx.policy", "{log_msg}");
+                                            emit_diagnostic(
+                                                &message_bus,
+                                                "tx.policy",
+                                                pancetta_core::DiagnosticLevel::Info,
+                                                diag_msg,
+                                                qso_id.as_deref(),
+                                            )
+                                            .await;
+                                            send_tx_queue_status(&message_bus, None, Vec::new())
+                                                .await;
+                                            let _ = report_unaired_frame(
+                                                &message_bus,
+                                                message_text,
+                                                qso_id.clone(),
+                                                pivot_replaced,
+                                            )
+                                            .await;
+                                            continue 'worker;
+                                        }
+
+                                        // --- Step 4d-arm: last-instant pre-PTT arm recheck (PAN-134)
+                                        // Authorization runs inside the bus read lock after its wait, with
+                                        // no suspension before enqueue. The mid-TX poll remains a backstop.
+                                        // PTT hardware is not asserted yet. Denial only unwinds the local
+                                        // PTT flag, pivot tombstones, and the announced TX/queue status.
                                         let ptt_msg = ComponentMessage::new(
                                             ComponentId::Ft8Transmitter,
                                             ComponentId::Hamlib,
@@ -7803,16 +8645,79 @@ impl super::ApplicationCoordinator {
                                             ),
                                             Instant::now(),
                                         );
-                                        if let Err(e) = message_bus.send_message(ptt_msg).await {
-                                            warn!("PTT ON failed (rig not keyed): {} — if you are transmitting, TX audio may be going to the wrong device", e);
-                                        } else {
-                                            info!(
-                                                target: "pancetta::tx.ptt",
-                                                "PTT ON (scheduled TX) sent to rig: '{}' @{:.0}Hz qso={}",
-                                                message_text,
-                                                frequency_offset,
-                                                qso_id.as_deref().unwrap_or("-")
-                                            );
+                                        let outcome = message_bus
+                                            .send_message_if(ptt_msg, || {
+                                                tx_send_authorized(
+                                                    origin,
+                                                    &remote_tx_arm,
+                                                    remote_client_key_id.as_deref(),
+                                                )
+                                            })
+                                            .await;
+                                        match outcome {
+                                            Ok(SendIfOutcome::Enqueued) => {
+                                                info!(
+                                                    target: "pancetta::tx.ptt",
+                                                    "PTT ON (scheduled TX) sent to rig: '{}' @{:.0}Hz qso={}",
+                                                    message_text,
+                                                    frequency_offset,
+                                                    qso_id.as_deref().unwrap_or("-")
+                                                );
+                                            }
+                                            Ok(SendIfOutcome::Denied) => {
+                                                ptt_active.store(false, Ordering::Release);
+                                                ptt_guard.disarm();
+                                                // Round-6 review (Codex P2): if Step 4c pivoted
+                                                // this cycle, remove the tombstone it inserted —
+                                                // nothing actually reached the air, so the
+                                                // genuinely fresh request still queued behind
+                                                // this one must NOT be discarded by Step 0-dup as
+                                                // an already-sent duplicate of a pivot that never
+                                                // transmitted.
+                                                let pivot_replaced =
+                                                    pivoted_this_key.take().and_then(|key| {
+                                                        pivoted_once.remove(&key);
+                                                        pivoted_from.remove(&key)
+                                                    });
+                                                let denial_reason = format!(
+                                                    "arm went stale in the pre-PTT gap: '{message_text}' at {frequency_offset:.0} Hz"
+                                                );
+                                                let operator_callsign =
+                                                    tx_denied_operator_attribution(
+                                                        &remote_tx_arm,
+                                                        remote_client_key_id.as_deref(),
+                                                    );
+                                                emit_disarm_interrupt_signals(
+                                                    &message_bus,
+                                                    &audit_log,
+                                                    &display_feed_enabled,
+                                                    operator_callsign,
+                                                    "denied",
+                                                    denial_reason,
+                                                    qso_id.as_deref(),
+                                                )
+                                                .await;
+                                                send_tx_queue_status(
+                                                    &message_bus,
+                                                    None,
+                                                    Vec::new(),
+                                                )
+                                                .await;
+                                                let _ = report_unaired_frame(
+                                                    &message_bus,
+                                                    message_text,
+                                                    qso_id.clone(),
+                                                    pivot_replaced,
+                                                )
+                                                .await;
+                                                continue 'worker;
+                                            }
+                                            Ok(SendIfOutcome::Dropped) => {
+                                                warn!("PTT ON failed (rig not keyed): message dropped — if you are transmitting, TX audio may be going to the wrong device");
+                                            }
+                                            Err(e) => {
+                                                warn!("PTT ON failed (rig not keyed): {} — if you are transmitting, TX audio may be going to the wrong device", e);
+                                            }
                                         }
 
                                         // --- Step 6: Sleep precisely until target slot start ---
@@ -7937,26 +8842,8 @@ impl super::ApplicationCoordinator {
                                                 // of this helper's awaits (diagnostic, audit-log
                                                 // I/O, relay) — a disarmed transmission must not
                                                 // stay keyed a moment longer than necessary.
-                                                let ptt_off_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Hamlib,
-                                                    MessageType::RigControl(
-                                                        crate::message_bus::RigControlMessage::SetPtt {
-                                                            state: false,
-                                                        },
-                                                    ),
-                                                    Instant::now(),
-                                                );
-                                                if let Err(e) =
-                                                    message_bus.send_message(ptt_off_msg).await
-                                                {
-                                                    warn!(
-                                                        "Remote disarm mid-TX: PTT OFF failed: {}",
-                                                        e
-                                                    );
-                                                }
-                                                ptt_active.store(false, Ordering::Release);
-                                                ptt_guard.disarm();
+                                                // PAN-135: stand the guard down only after Hamlib accepts PTT-off.
+                                                ptt_guard.release("Remote disarm mid-TX").await;
                                                 // Round-7 review (Codex P2): this is a
                                                 // PRE-SLOT abort — PTT was keyed but Step 7
                                                 // never routed any audio, so nothing actually
@@ -8276,96 +9163,12 @@ impl super::ApplicationCoordinator {
                                         }
 
                                         // --- Step 7: Route audio to output ---
-                                        // Round-7 review (Codex P1): Step 6's sleep can
-                                        // return `Completed` (nothing to interrupt it) even
-                                        // though the bound client disarmed during an
-                                        // intervening await elsewhere in this iteration
-                                        // that this function's own poll never covers. PTT
-                                        // is already asserted (Step 5) but no audio has
-                                        // gone out yet, so this is the last chance to catch
-                                        // a stale authorization before the waveform
-                                        // actually reaches the air. Round-9 review (Codex
-                                        // P2): this check must run BEFORE `log_tx_frame`
-                                        // below, not after — logging first recorded a
-                                        // denied frame as a genuine own-transmission in the
-                                        // TUI's Band Activity panel even though no waveform
-                                        // ever reached the air.
-                                        if origin == crate::message_bus::TxOrigin::Remote
-                                            && !remote_tx_permitted_for(
-                                                &remote_tx_arm,
-                                                pancetta_agent::arm::ArmTime::now,
-                                                remote_client_key_id.as_deref(),
-                                            )
-                                        {
-                                            let ptt_off_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Hamlib,
-                                                MessageType::RigControl(
-                                                    crate::message_bus::RigControlMessage::SetPtt {
-                                                        state: false,
-                                                    },
-                                                ),
-                                                Instant::now(),
-                                            );
-                                            if let Err(e) =
-                                                message_bus.send_message(ptt_off_msg).await
-                                            {
-                                                warn!(
-                                                    "Remote disarm before audio delivery: PTT OFF failed: {}",
-                                                    e
-                                                );
-                                            }
-                                            ptt_active.store(false, Ordering::Release);
-                                            ptt_guard.disarm();
-                                            let pivot_replaced =
-                                                pivoted_this_key.take().and_then(|key| {
-                                                    pivoted_once.remove(&key);
-                                                    pivoted_from.remove(&key)
-                                                });
-                                            let denial_reason = format!(
-                                                "arm went stale before audio delivery: '{message_text}' at {frequency_offset:.0} Hz"
-                                            );
-                                            let operator_callsign = tx_denied_operator_attribution(
-                                                &remote_tx_arm,
-                                                remote_client_key_id.as_deref(),
-                                            );
-                                            emit_disarm_interrupt_signals(
-                                                &message_bus,
-                                                &audit_log,
-                                                &display_feed_enabled,
-                                                operator_callsign,
-                                                "denied",
-                                                denial_reason,
-                                                qso_id.as_deref(),
-                                            )
-                                            .await;
-                                            send_tx_queue_status(&message_bus, None, Vec::new())
-                                                .await;
-                                            let _ = report_unaired_frame(
-                                                &message_bus,
-                                                message_text,
-                                                qso_id.clone(),
-                                                pivot_replaced,
-                                            )
-                                            .await;
-                                            continue 'worker;
-                                        }
-
-                                        // Band Activity's own-TX history logs the actual
-                                        // audio-start instant here, not Step 5's PTT-key
-                                        // time — see `log_tx_frame`'s doc comment. Runs
-                                        // AFTER the arm recheck above (round-9 review): a
-                                        // denied frame must never appear in Band Activity
-                                        // as a genuine own-transmission.
-                                        log_tx_frame(
-                                            &message_bus,
-                                            message_text.clone(),
-                                            frequency_offset,
-                                            qso_id.clone(),
-                                            chrono::Utc::now(),
-                                        )
-                                        .await;
-
+                                        // PAN-134: recheck authorization after the bus lock wait, with no
+                                        // suspension before audio enqueue. PTT is already asserted, so
+                                        // denial releases it first. The mid-TX poll remains a backstop.
+                                        // Round-9 review: denied frames must never appear in Band Activity
+                                        // as genuine own-transmissions. Log only on Enqueued, so dropped
+                                        // audio cannot appear as an aired frame either.
                                         let audio_msg = ComponentMessage::new(
                                             ComponentId::Ft8Transmitter,
                                             ComponentId::Audio,
@@ -8380,14 +9183,92 @@ impl super::ApplicationCoordinator {
                                             },
                                             Instant::now(),
                                         );
-                                        if let Err(e) = message_bus.send_message(audio_msg).await {
-                                            debug!("Audio output routing: {}", e);
+                                        let outcome = message_bus
+                                            .send_message_if(audio_msg, || {
+                                                tx_send_authorized(
+                                                    origin,
+                                                    &remote_tx_arm,
+                                                    remote_client_key_id.as_deref(),
+                                                )
+                                            })
+                                            .await;
+                                        match outcome {
+                                            Ok(SendIfOutcome::Enqueued) => {
+                                                // Band Activity's own-TX history logs the actual
+                                                // audio-start instant here, not Step 5's PTT-key
+                                                // time — see `log_tx_frame`'s doc comment. Runs
+                                                // AFTER authorized enqueue (PAN-134 / round-9 review): a
+                                                // denied frame must never appear in Band Activity
+                                                // as a genuine own-transmission.
+                                                log_tx_frame(
+                                                    &message_bus,
+                                                    message_text.clone(),
+                                                    frequency_offset,
+                                                    qso_id.clone(),
+                                                    chrono::Utc::now(),
+                                                )
+                                                .await;
+                                            }
+                                            Ok(SendIfOutcome::Denied) => {
+                                                // PAN-135: stand the guard down only after
+                                                // Hamlib accepts PTT-off (checked, bounded
+                                                // retry — see `PttGuard::release`).
+                                                ptt_guard
+                                                    .release("Remote disarm before audio delivery")
+                                                    .await;
+                                                let pivot_replaced =
+                                                    pivoted_this_key.take().and_then(|key| {
+                                                        pivoted_once.remove(&key);
+                                                        pivoted_from.remove(&key)
+                                                    });
+                                                let denial_reason = format!(
+                                                    "arm went stale before audio delivery: '{message_text}' at {frequency_offset:.0} Hz"
+                                                );
+                                                let operator_callsign =
+                                                    tx_denied_operator_attribution(
+                                                        &remote_tx_arm,
+                                                        remote_client_key_id.as_deref(),
+                                                    );
+                                                emit_disarm_interrupt_signals(
+                                                    &message_bus,
+                                                    &audit_log,
+                                                    &display_feed_enabled,
+                                                    operator_callsign,
+                                                    "denied",
+                                                    denial_reason,
+                                                    qso_id.as_deref(),
+                                                )
+                                                .await;
+                                                send_tx_queue_status(
+                                                    &message_bus,
+                                                    None,
+                                                    Vec::new(),
+                                                )
+                                                .await;
+                                                let _ = report_unaired_frame(
+                                                    &message_bus,
+                                                    message_text,
+                                                    qso_id.clone(),
+                                                    pivot_replaced,
+                                                )
+                                                .await;
+                                                continue 'worker;
+                                            }
+                                            Ok(SendIfOutcome::Dropped) => {
+                                                debug!("Audio output routing: message dropped");
+                                            }
+                                            Err(e) => {
+                                                debug!("Audio output routing: {}", e);
+                                            }
                                         }
 
                                         // --- Step 8: Wait for audio playback to complete ---
                                         // Playback is now on the air; a qualifying request here
                                         // supersedes it (aborts + re-keys), flushing the still-
                                         // playing samples on the retry's Step 7.
+                                        // PAN-135: expected playback end bounds an unconfirmed disarm flush.
+                                        let playback_end = tokio::time::Instant::now()
+                                            + Duration::from_millis(audio_duration_ms);
                                         match interruptible_sleep_or_supersede(
                                             Duration::from_millis(audio_duration_ms),
                                             &shutdown,
@@ -8446,26 +9327,8 @@ impl super::ApplicationCoordinator {
                                                 // of this helper's awaits (diagnostic, audit-log
                                                 // I/O, relay) — a disarmed transmission must not
                                                 // stay keyed a moment longer than necessary.
-                                                let ptt_off_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Hamlib,
-                                                    MessageType::RigControl(
-                                                        crate::message_bus::RigControlMessage::SetPtt {
-                                                            state: false,
-                                                        },
-                                                    ),
-                                                    Instant::now(),
-                                                );
-                                                if let Err(e) =
-                                                    message_bus.send_message(ptt_off_msg).await
-                                                {
-                                                    warn!(
-                                                        "Remote disarm mid-TX: PTT OFF failed: {}",
-                                                        e
-                                                    );
-                                                }
-                                                ptt_active.store(false, Ordering::Release);
-                                                ptt_guard.disarm();
+                                                // PAN-135: stand the guard down only after Hamlib accepts PTT-off.
+                                                ptt_guard.release("Remote disarm mid-TX").await;
                                                 // Round-4 review (Codex P1): flush the
                                                 // already-queued remote waveform BEFORE
                                                 // reenqueuing pending work — a pending local
@@ -8473,28 +9336,15 @@ impl super::ApplicationCoordinator {
                                                 // `flush_first: false`, so without this the
                                                 // disarmed client's remaining audio could
                                                 // still reach the air riding behind the next
-                                                // request's samples. Reuses the same
-                                                // `AudioOutput{flush_first: true}` mechanism
-                                                // the re-key/supersede path already relies on
-                                                // to clear a superseded transmission's buffer.
-                                                let flush_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Audio,
-                                                    MessageType::AudioOutput {
-                                                        samples: Vec::new(),
-                                                        sample_rate,
-                                                        flush_first: true,
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                if let Err(e) =
-                                                    message_bus.send_message(flush_msg).await
-                                                {
-                                                    debug!(
-                                                        "Flushing aborted remote audio after disarm: {}",
-                                                        e
-                                                    );
-                                                }
+                                                // request's samples. PAN-135 waits for the audio
+                                                // thread to confirm the flush before proceeding.
+                                                flush_disarmed_audio_confirmed(
+                                                    &message_bus,
+                                                    sample_rate,
+                                                    playback_end,
+                                                    &shutdown,
+                                                )
+                                                .await;
                                                 // Round-9 review (Codex P1): drain HERE,
                                                 // after PTT is already off — see
                                                 // `drain_and_merge_pending`'s doc for why.
@@ -8976,6 +9826,86 @@ impl super::ApplicationCoordinator {
                                         continue;
                                     }
 
+                                    // --- Step 0-band: PAN-118 band-plan gate
+                                    // (bundle, per item) ---
+                                    // Bundled items sit at independent audio
+                                    // offsets, so band-plan compliance is
+                                    // evaluated PER ITEM: an out-of-privilege
+                                    // item is dropped and reported here
+                                    // (mirroring the per-item failure loop of
+                                    // the whole-bundle refusal above and the
+                                    // Step 0b stale-drop below) while
+                                    // in-privilege siblings proceed. The
+                                    // whole bundle is refused only when every
+                                    // item is out of privilege. Skipped while
+                                    // the dial is the unknown-0 sentinel.
+                                    {
+                                        let mut kept = Vec::with_capacity(items.len());
+                                        let mut dropped_any = false;
+                                        for item in items.into_iter() {
+                                            match tx_rf_for_gate(
+                                                &operating_frequency_hz,
+                                                &split_tx_frequency_hz,
+                                                item.frequency_offset,
+                                            )
+                                            .and_then(|rf| {
+                                                tx_band_plan_mute_reason(
+                                                    rf,
+                                                    tx_signal_span_hz(active_protocol),
+                                                    &band_plan,
+                                                )
+                                            }) {
+                                                Some(reason) => {
+                                                    dropped_any = true;
+                                                    info!(
+                                                        target: "pancetta::tx.policy",
+                                                        "dropping out-of-band multi-TX item: '{}' ({reason})",
+                                                        item.message_text
+                                                    );
+                                                    emit_diagnostic(
+                                                        &message_bus,
+                                                        "tx.policy",
+                                                        pancetta_core::DiagnosticLevel::Info,
+                                                        format!(
+                                                            "dropping out-of-band multi-TX item: '{}' ({reason})",
+                                                            item.message_text
+                                                        ),
+                                                        item.qso_id.as_deref(),
+                                                    )
+                                                    .await;
+                                                    let _ = report_transmit_complete(
+                                                        &message_bus,
+                                                        false,
+                                                        item.message_text.clone(),
+                                                        0,
+                                                        item.qso_id.clone(),
+                                                    )
+                                                    .await;
+                                                }
+                                                None => kept.push(item),
+                                            }
+                                        }
+                                        items = kept;
+                                        if dropped_any && items.is_empty() {
+                                            info!(
+                                                target: "pancetta::tx.policy",
+                                                "multi-TX bundle empty after dropping out-of-band items — skipping"
+                                            );
+                                            emit_diagnostic(
+                                                &message_bus,
+                                                "tx.policy",
+                                                pancetta_core::DiagnosticLevel::Info,
+                                                "multi-TX bundle empty after dropping out-of-band items — skipping"
+                                                    .to_string(),
+                                                None,
+                                            )
+                                            .await;
+                                            send_tx_queue_status(&message_bus, None, Vec::new())
+                                                .await;
+                                            continue;
+                                        }
+                                    }
+
                                     // --- Step 0a: Remote-TX arm gate (bundle) ---
                                     // A Remote-origin bundle must pass the station-agent
                                     // arm gate before ANY item keys PTT. Local bundles
@@ -9240,10 +10170,23 @@ impl super::ApplicationCoordinator {
                                         slot_ns,
                                     );
 
+                                    // PAN-117 (PR #450 review): a bundle frozen
+                                    // at `request_received_at` must not be
+                                    // accepted into a slot the key-time gate is
+                                    // guaranteed to drop. A bundle coalesced
+                                    // from a single request already waited the
+                                    // base window, so it reserves that plus the
+                                    // margin like the single-TX arm's Step 2; a
+                                    // directly dequeued bundle never waited, so
+                                    // it reserves only the margin (round 2).
                                     let mut schedule = schedule_tx(
                                         request_received_at,
                                         required_parity,
-                                        tx_late_max_ms_effective(active_protocol, tx_late_max_ms),
+                                        multi_tx_acceptance_cap_ms(
+                                            active_protocol,
+                                            tx_late_max_ms,
+                                            head_takes_base_wait,
+                                        ),
                                         sample_rate,
                                         slot_ns,
                                     );
@@ -9612,6 +10555,61 @@ impl super::ApplicationCoordinator {
                                         dx_parity_freshness_window(slot_ns),
                                     );
 
+                                    // PAN-118: re-evaluate the band plan per item
+                                    // against the CURRENT dial/split (it may have
+                                    // moved via CAT or a split change since Step
+                                    // 0's partition). An item now out of privilege
+                                    // is folded into `live_mask` as not-live, so
+                                    // the existing per-item drop + re-encode
+                                    // machinery below excludes exactly those items
+                                    // and still keys the in-privilege siblings —
+                                    // the same partial-liveness semantics a stale
+                                    // item gets at this site. `band_drop_mask`
+                                    // only steers the per-item reason text below.
+                                    let mut live_mask = live_mask;
+                                    let mut band_drop_mask = vec![false; live_mask.len()];
+                                    for (item, (live, band_dropped)) in items
+                                        .iter()
+                                        .zip(live_mask.iter_mut().zip(band_drop_mask.iter_mut()))
+                                    {
+                                        if !*live {
+                                            continue;
+                                        }
+                                        if tx_rf_for_gate(
+                                            &operating_frequency_hz,
+                                            &split_tx_frequency_hz,
+                                            item.frequency_offset,
+                                        )
+                                        .and_then(|rf| {
+                                            tx_band_plan_mute_reason(
+                                                rf,
+                                                tx_signal_span_hz(active_protocol),
+                                                &band_plan,
+                                            )
+                                        })
+                                        .is_some()
+                                        {
+                                            *live = false;
+                                            *band_dropped = true;
+                                            info!(
+                                                target: "pancetta::tx.policy",
+                                                "dropping out-of-band multi-TX item at key-time: '{}' (TX frequency outside the configured amateur band plan)",
+                                                item.message_text
+                                            );
+                                            emit_diagnostic(
+                                                &message_bus,
+                                                "tx.policy",
+                                                pancetta_core::DiagnosticLevel::Info,
+                                                format!(
+                                                    "dropping out-of-band multi-TX item at key-time: '{}'",
+                                                    item.message_text
+                                                ),
+                                                item.qso_id.as_deref(),
+                                            )
+                                            .await;
+                                        }
+                                    }
+
                                     if !live_mask.iter().any(|&live| live) {
                                         info!(
                                             target: "pancetta::tx.policy",
@@ -9750,10 +10748,12 @@ impl super::ApplicationCoordinator {
                                         } else {
                                             // Partial staleness: report the dropped item(s), then
                                             // re-encode just the still-live subset.
-                                            for ((item, &live), &parity_held) in items
-                                                .iter()
-                                                .zip(live_mask.iter())
-                                                .zip(parity_hold_mask.iter())
+                                            for ((item, &live), (&parity_held, &band_dropped)) in
+                                                items.iter().zip(live_mask.iter()).zip(
+                                                    parity_hold_mask
+                                                        .iter()
+                                                        .zip(band_drop_mask.iter()),
+                                                )
                                             {
                                                 if !live {
                                                     // PAN-141: distinguish a genuine
@@ -9761,7 +10761,20 @@ impl super::ApplicationCoordinator {
                                                     // this cycle for a fresh DX-parity
                                                     // conflict — same drop mechanics
                                                     // either way, different reason.
-                                                    if parity_held {
+                                                    // PAN-118: a band-plan drop is a
+                                                    // third reason with the same
+                                                    // mechanics; its diagnostic was
+                                                    // already emitted when the mask
+                                                    // was folded, so this branch only
+                                                    // logs.
+                                                    if band_dropped {
+                                                        info!(
+                                                            target: "pancetta::tx.policy",
+                                                            "dropping out-of-band multi-TX item at key-time for QSO {}: '{}'",
+                                                            item.qso_id.as_deref().unwrap_or("?"),
+                                                            item.message_text
+                                                        );
+                                                    } else if parity_held {
                                                         info!(
                                                             target: "pancetta::tx.policy",
                                                             "holding multi-TX item at key-time for QSO {}: DX observed transmitting on the colliding parity {:?} within the freshness window: '{}'",
@@ -10009,6 +11022,59 @@ impl super::ApplicationCoordinator {
                                         continue;
                                     }
 
+                                    // PAN-118: the band-plan sibling of the re-key
+                                    // mute above. By this point the bundle waveform
+                                    // is SUMMED, so an item that is now out of
+                                    // privilege cannot be individually extracted —
+                                    // its audio energy shares the one waveform with
+                                    // its siblings. Mirroring the adjacent hard-mute
+                                    // refusal, the WHOLE bundle is held: nothing
+                                    // keys, every item is reported as an unaired
+                                    // frame. (Per-item drops with siblings still
+                                    // keying happened at Step 0's partition and the
+                                    // Step 4b key-time mask, where the items were
+                                    // still separable.)
+                                    if let Some(reason) = items.iter().find_map(|item| {
+                                        tx_rf_for_gate(
+                                            &operating_frequency_hz,
+                                            &split_tx_frequency_hz,
+                                            item.frequency_offset,
+                                        )
+                                        .and_then(|rf| {
+                                            tx_band_plan_mute_reason(
+                                                rf,
+                                                tx_signal_span_hz(active_protocol),
+                                                &band_plan,
+                                            )
+                                        })
+                                    }) {
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "tx.policy",
+                                            pancetta_core::DiagnosticLevel::Info,
+                                            format!(
+                                                "TX bundle re-key blocked ({reason}): {} items",
+                                                items.len()
+                                            ),
+                                            None,
+                                        )
+                                        .await;
+                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                        for item in &items {
+                                            let _ = report_unaired_frame(
+                                                &message_bus,
+                                                item.message_text.clone(),
+                                                item.qso_id.clone(),
+                                                take_bundle_replaced(
+                                                    &mut early_replaced,
+                                                    item.qso_id.as_deref(),
+                                                ),
+                                            )
+                                            .await;
+                                        }
+                                        continue;
+                                    }
+
                                     // Double-PTT fix: record every pivot from Step
                                     // 4b-pivot now that we're actually about to key this
                                     // bundle, so the newer request that PRODUCED each
@@ -10170,6 +11236,9 @@ impl super::ApplicationCoordinator {
                                     // path through this file's highest-review-churn region.
                                     // SYNCHRONOUS (uses `final_gate_callsigns`, resolved
                                     // before Step 3's trim above).
+                                    //
+                                    // PAN-117: the slot-timing re-check runs LAST, just
+                                    // before the PTT-on send below, not here.
                                     let (final_live_mask, final_parity_hold_mask) =
                                         bundle_live_mask(
                                             &encoded_qso_ids_final,
@@ -10282,58 +11351,50 @@ impl super::ApplicationCoordinator {
                                         continue;
                                     }
 
-                                    // --- Step 4d-arm: last-instant pre-PTT arm recheck
-                                    // (round-3 review, Codex P1) — mirrors the single-TX
-                                    // Step 4d-arm; round-2's placement here (before the
-                                    // status-send awaits above) left exactly the gap this
-                                    // check exists to close. This is the genuine last
-                                    // instant: nothing but the PTT-on send itself follows
-                                    // (PAN-148 extended this final gate above to also cover
-                                    // liveness/DX-parity). PTT hardware was never asserted
-                                    // on this path — `ptt_guard` only flipped the
-                                    // in-process `ptt_active` flag on construction — so
-                                    // denying here needs no PTT-off send, just unwinding
-                                    // that flag and the TX-badge/queue status the awaits
-                                    // above just (prematurely) announced.
-                                    if origin == crate::message_bus::TxOrigin::Remote
-                                        && !remote_tx_permitted_for(
-                                            &remote_tx_arm,
-                                            pancetta_agent::arm::ArmTime::now,
-                                            remote_client_key_id.as_deref(),
+                                    // PAN-118: the band-plan sibling of the final
+                                    // pre-PTT mute above — synchronous (atomics +
+                                    // the startup band-plan snapshot), so "nothing
+                                    // else runs between this call and the key"
+                                    // still holds. Same physics and same unwind as
+                                    // the post-wait site: the waveform is summed,
+                                    // so ANY out-of-privilege item holds the whole
+                                    // bundle (nothing keys; all items unaired).
+                                    if let Some(reason) = items.iter().find_map(|item| {
+                                        tx_rf_for_gate(
+                                            &operating_frequency_hz,
+                                            &split_tx_frequency_hz,
+                                            item.frequency_offset,
                                         )
-                                    {
+                                        .and_then(|rf| {
+                                            tx_band_plan_mute_reason(
+                                                rf,
+                                                tx_signal_span_hz(active_protocol),
+                                                &band_plan,
+                                            )
+                                        })
+                                    }) {
                                         ptt_active.store(false, Ordering::Release);
                                         ptt_guard.disarm();
-                                        // Round-6 review (Codex P2): nothing reached the
-                                        // air — remove any tombstone this bundle's Step
-                                        // 4b-pivot just inserted, so the genuinely fresh
-                                        // request still queued behind it isn't discarded by
-                                        // Step 0-dup as an already-sent duplicate.
                                         let mut bundle_replaced = unwind_bundle_pivots(
                                             &pivoted_this_bundle_keys,
                                             &mut pivoted_once,
                                             &mut pivoted_from,
                                         );
-                                        let operator_callsign = tx_denied_operator_attribution(
-                                            &remote_tx_arm,
-                                            remote_client_key_id.as_deref(),
+                                        let n = items.len();
+                                        info!(
+                                            target: "pancetta::tx.policy",
+                                            "TX bundle blocked at final pre-PTT check ({reason}): {n} items"
                                         );
-                                        for item in &items {
-                                            let denial_reason = format!(
-                                                "arm went stale in the pre-PTT gap: '{}' at {:.0} Hz",
-                                                item.message_text, item.frequency_offset
-                                            );
-                                            emit_disarm_interrupt_signals(
-                                                &message_bus,
-                                                &audit_log,
-                                                &display_feed_enabled,
-                                                operator_callsign.clone(),
-                                                "denied",
-                                                denial_reason,
-                                                item.qso_id.as_deref(),
-                                            )
-                                            .await;
-                                        }
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "tx.policy",
+                                            pancetta_core::DiagnosticLevel::Info,
+                                            format!(
+                                                "TX bundle blocked at final pre-PTT check ({reason}): {n} items"
+                                            ),
+                                            None,
+                                        )
+                                        .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
                                             let _ = report_unaired_frame(
@@ -10350,6 +11411,77 @@ impl super::ApplicationCoordinator {
                                         continue;
                                     }
 
+                                    // PAN-117 (six-lane review L5 H-7; PR #450 Codex
+                                    // review): re-check slot-timing headroom LAST among the
+                                    // pre-send gates — after the liveness mask, the hard
+                                    // mute and the band-plan gate above — so this clock
+                                    // read is the last one before the PTT-on send. The
+                                    // whole bundle shares one slot (per
+                                    // `multi_tx_status_items`' doc), so this is a
+                                    // bundle-level check. A frame keyed more than
+                                    // `tx_late_max_ms` past the slot boundary is
+                                    // mathematically undecodable for any receiver; the
+                                    // queue-time `schedule_tx` decision never sees the
+                                    // coalesce/encode/gate delays, so it is dropped HERE
+                                    // through the same whole-bundle unwind as the liveness
+                                    // branch above. SYNCHRONOUS up to `send_message_if`
+                                    // below, whose table-lock wait precedes its PAN-134
+                                    // arm recheck and the enqueue.
+                                    let key_time_now = chrono::Utc::now();
+                                    let key_time_late_max_ms =
+                                        tx_late_max_ms_effective(active_protocol, tx_late_max_ms);
+                                    if key_time_too_late(
+                                        key_time_now,
+                                        schedule.target_slot,
+                                        key_time_late_max_ms,
+                                    ) {
+                                        ptt_active.store(false, Ordering::Release);
+                                        ptt_guard.disarm();
+                                        let mut bundle_replaced = unwind_bundle_pivots(
+                                            &pivoted_this_bundle_keys,
+                                            &mut pivoted_once,
+                                            &mut pivoted_from,
+                                        );
+                                        let elapsed_ms = (key_time_now - schedule.target_slot)
+                                            .num_milliseconds()
+                                            .max(0)
+                                            as u64;
+                                        let n = items.len();
+                                        info!(
+                                            target: "pancetta::tx.policy",
+                                            "dropping multi-TX bundle at final pre-PTT check: {elapsed_ms}ms into the slot exceeds tx_late_max_ms={key_time_late_max_ms}ms — no receiver could decode it ({n} frame(s))"
+                                        );
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "tx.policy",
+                                            pancetta_core::DiagnosticLevel::Info,
+                                            format!(
+                                                "dropping multi-TX bundle at final pre-PTT check: {elapsed_ms}ms into the slot exceeds tx_late_max_ms={key_time_late_max_ms}ms — no receiver could decode it ({n} frame(s))"
+                                            ),
+                                            None,
+                                        )
+                                        .await;
+                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                        for item in &items {
+                                            let _ = report_unaired_frame(
+                                                &message_bus,
+                                                item.message_text.clone(),
+                                                item.qso_id.clone(),
+                                                take_bundle_replaced(
+                                                    &mut bundle_replaced,
+                                                    item.qso_id.as_deref(),
+                                                ),
+                                            )
+                                            .await;
+                                        }
+                                        continue;
+                                    }
+
+                                    // --- Step 4d-arm: last-instant pre-PTT arm recheck (PAN-134)
+                                    // Authorization runs inside the bus read lock after its wait, with
+                                    // no suspension before enqueue. The mid-TX poll remains a backstop.
+                                    // PTT hardware is not asserted yet. Denial only unwinds the local
+                                    // PTT flag, pivot tombstones, and the announced TX/queue status.
                                     let ptt_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Hamlib,
@@ -10360,13 +11492,77 @@ impl super::ApplicationCoordinator {
                                         ),
                                         Instant::now(),
                                     );
-                                    if let Err(e) = message_bus.send_message(ptt_msg).await {
-                                        warn!("PTT ON failed (rig not keyed): {} — if you are transmitting, TX audio may be going to the wrong device", e);
-                                    } else {
-                                        info!(
-                                            target: "pancetta::tx.ptt",
-                                            "PTT ON (scheduled multi-TX) sent to rig"
-                                        );
+                                    let outcome = message_bus
+                                        .send_message_if(ptt_msg, || {
+                                            tx_send_authorized(
+                                                origin,
+                                                &remote_tx_arm,
+                                                remote_client_key_id.as_deref(),
+                                            )
+                                        })
+                                        .await;
+                                    match outcome {
+                                        Ok(SendIfOutcome::Enqueued) => {
+                                            info!(
+                                                target: "pancetta::tx.ptt",
+                                                "PTT ON (scheduled multi-TX) sent to rig"
+                                            );
+                                        }
+                                        Ok(SendIfOutcome::Denied) => {
+                                            ptt_active.store(false, Ordering::Release);
+                                            ptt_guard.disarm();
+                                            // Round-6 review (Codex P2): nothing reached the
+                                            // air — remove any tombstone this bundle's Step
+                                            // 4b-pivot just inserted, so the genuinely fresh
+                                            // request still queued behind it isn't discarded by
+                                            // Step 0-dup as an already-sent duplicate.
+                                            let mut bundle_replaced = unwind_bundle_pivots(
+                                                &pivoted_this_bundle_keys,
+                                                &mut pivoted_once,
+                                                &mut pivoted_from,
+                                            );
+                                            let operator_callsign = tx_denied_operator_attribution(
+                                                &remote_tx_arm,
+                                                remote_client_key_id.as_deref(),
+                                            );
+                                            for item in &items {
+                                                let denial_reason = format!(
+                                                    "arm went stale in the pre-PTT gap: '{}' at {:.0} Hz",
+                                                    item.message_text, item.frequency_offset
+                                                );
+                                                emit_disarm_interrupt_signals(
+                                                    &message_bus,
+                                                    &audit_log,
+                                                    &display_feed_enabled,
+                                                    operator_callsign.clone(),
+                                                    "denied",
+                                                    denial_reason,
+                                                    item.qso_id.as_deref(),
+                                                )
+                                                .await;
+                                            }
+                                            send_tx_queue_status(&message_bus, None, Vec::new())
+                                                .await;
+                                            for item in &items {
+                                                let _ = report_unaired_frame(
+                                                    &message_bus,
+                                                    item.message_text.clone(),
+                                                    item.qso_id.clone(),
+                                                    take_bundle_replaced(
+                                                        &mut bundle_replaced,
+                                                        item.qso_id.as_deref(),
+                                                    ),
+                                                )
+                                                .await;
+                                            }
+                                            continue;
+                                        }
+                                        Ok(SendIfOutcome::Dropped) => {
+                                            warn!("PTT ON failed (rig not keyed): message dropped — if you are transmitting, TX audio may be going to the wrong device");
+                                        }
+                                        Err(e) => {
+                                            warn!("PTT ON failed (rig not keyed): {} — if you are transmitting, TX audio may be going to the wrong device", e);
+                                        }
                                     }
 
                                     // --- Step 6: Sleep precisely until target slot ---
@@ -10477,26 +11673,8 @@ impl super::ApplicationCoordinator {
                                             );
                                             // PAN-91 review: release PTT FIRST — see the
                                             // single-TX arm's identical fix for why.
-                                            let ptt_off_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Hamlib,
-                                                MessageType::RigControl(
-                                                    crate::message_bus::RigControlMessage::SetPtt {
-                                                        state: false,
-                                                    },
-                                                ),
-                                                Instant::now(),
-                                            );
-                                            if let Err(e) =
-                                                message_bus.send_message(ptt_off_msg).await
-                                            {
-                                                warn!(
-                                                    "Remote disarm mid-TX: PTT OFF failed: {}",
-                                                    e
-                                                );
-                                            }
-                                            ptt_active.store(false, Ordering::Release);
-                                            ptt_guard.disarm();
+                                            // PAN-135: stand the guard down only after Hamlib accepts PTT-off.
+                                            ptt_guard.release("Remote disarm mid-TX").await;
                                             // Round-7 review (Codex P2): pre-slot abort —
                                             // nothing reached the air yet (Step 7 never ran)
                                             // — see the single-TX arm's identical fix.
@@ -10585,103 +11763,12 @@ impl super::ApplicationCoordinator {
                                     }
 
                                     // --- Step 7: Route audio to output ---
-                                    // Round-7 review (Codex P1): mirrors the single-TX
-                                    // arm's identical fix — Step 6's sleep can return
-                                    // `Completed` even though the bound client disarmed
-                                    // during an intervening await elsewhere in this
-                                    // iteration that this function's own poll never
-                                    // covers. PTT is already asserted but no audio has
-                                    // gone out yet. Round-9 review (Codex P2): this check
-                                    // must run BEFORE the `log_tx_frame` loop below, not
-                                    // after — logging first recorded denied frames as
-                                    // genuine own-transmissions in the TUI's Band
-                                    // Activity panel even though no waveform ever reached
-                                    // the air.
-                                    if origin == crate::message_bus::TxOrigin::Remote
-                                        && !remote_tx_permitted_for(
-                                            &remote_tx_arm,
-                                            pancetta_agent::arm::ArmTime::now,
-                                            remote_client_key_id.as_deref(),
-                                        )
-                                    {
-                                        let ptt_off_msg = ComponentMessage::new(
-                                            ComponentId::Ft8Transmitter,
-                                            ComponentId::Hamlib,
-                                            MessageType::RigControl(
-                                                crate::message_bus::RigControlMessage::SetPtt {
-                                                    state: false,
-                                                },
-                                            ),
-                                            Instant::now(),
-                                        );
-                                        if let Err(e) = message_bus.send_message(ptt_off_msg).await
-                                        {
-                                            warn!(
-                                                "Remote disarm before audio delivery: PTT OFF failed: {}",
-                                                e
-                                            );
-                                        }
-                                        ptt_active.store(false, Ordering::Release);
-                                        ptt_guard.disarm();
-                                        let mut bundle_replaced = unwind_bundle_pivots(
-                                            &pivoted_this_bundle_keys,
-                                            &mut pivoted_once,
-                                            &mut pivoted_from,
-                                        );
-                                        let operator_callsign = tx_denied_operator_attribution(
-                                            &remote_tx_arm,
-                                            remote_client_key_id.as_deref(),
-                                        );
-                                        for item in &items {
-                                            let denial_reason = format!(
-                                                "arm went stale before audio delivery: '{}' at {:.0} Hz",
-                                                item.message_text, item.frequency_offset
-                                            );
-                                            emit_disarm_interrupt_signals(
-                                                &message_bus,
-                                                &audit_log,
-                                                &display_feed_enabled,
-                                                operator_callsign.clone(),
-                                                "denied",
-                                                denial_reason,
-                                                item.qso_id.as_deref(),
-                                            )
-                                            .await;
-                                        }
-                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
-                                        for item in &items {
-                                            let _ = report_unaired_frame(
-                                                &message_bus,
-                                                item.message_text.clone(),
-                                                item.qso_id.clone(),
-                                                take_bundle_replaced(
-                                                    &mut bundle_replaced,
-                                                    item.qso_id.as_deref(),
-                                                ),
-                                            )
-                                            .await;
-                                        }
-                                        continue;
-                                    }
-
-                                    // Band Activity's own-TX history logs the actual
-                                    // audio-start instant here, not Step 5's PTT-key
-                                    // time — see `log_tx_frame`'s doc comment. Every
-                                    // bundle item is keyed concurrently in this same
-                                    // slot, so all of them share this one timestamp.
-                                    // Runs AFTER the arm recheck above (round-9 review).
-                                    let tx_logged_at = chrono::Utc::now();
-                                    for item in &items {
-                                        log_tx_frame(
-                                            &message_bus,
-                                            item.message_text.clone(),
-                                            item.frequency_offset,
-                                            item.qso_id.clone(),
-                                            tx_logged_at,
-                                        )
-                                        .await;
-                                    }
-
+                                    // PAN-134: recheck authorization after the bus lock wait, with no
+                                    // suspension before audio enqueue. PTT is already asserted, so
+                                    // denial releases it first. The mid-TX poll remains a backstop.
+                                    // Round-9 review: denied frames must never appear in Band Activity
+                                    // as genuine own-transmissions. Log only on Enqueued, so dropped
+                                    // audio cannot appear as an aired frame either.
                                     let audio_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Audio,
@@ -10692,14 +11779,98 @@ impl super::ApplicationCoordinator {
                                         },
                                         Instant::now(),
                                     );
-                                    if let Err(e) = message_bus.send_message(audio_msg).await {
-                                        debug!("Audio output routing: {}", e);
+                                    let outcome = message_bus
+                                        .send_message_if(audio_msg, || {
+                                            tx_send_authorized(
+                                                origin,
+                                                &remote_tx_arm,
+                                                remote_client_key_id.as_deref(),
+                                            )
+                                        })
+                                        .await;
+                                    match outcome {
+                                        Ok(SendIfOutcome::Enqueued) => {
+                                            // Band Activity's own-TX history logs the actual
+                                            // audio-start instant here, not Step 5's PTT-key
+                                            // time — see `log_tx_frame`'s doc comment. Every
+                                            // bundle item is keyed concurrently in this same
+                                            // slot, so all of them share this one timestamp.
+                                            // Runs only AFTER authorized enqueue (PAN-134 / round-9 review).
+                                            let tx_logged_at = chrono::Utc::now();
+                                            for item in &items {
+                                                log_tx_frame(
+                                                    &message_bus,
+                                                    item.message_text.clone(),
+                                                    item.frequency_offset,
+                                                    item.qso_id.clone(),
+                                                    tx_logged_at,
+                                                )
+                                                .await;
+                                            }
+                                        }
+                                        Ok(SendIfOutcome::Denied) => {
+                                            // PAN-135: stand the guard down only after
+                                            // Hamlib accepts PTT-off (checked, bounded
+                                            // retry — see `PttGuard::release`).
+                                            ptt_guard
+                                                .release("Remote disarm before audio delivery")
+                                                .await;
+                                            let mut bundle_replaced = unwind_bundle_pivots(
+                                                &pivoted_this_bundle_keys,
+                                                &mut pivoted_once,
+                                                &mut pivoted_from,
+                                            );
+                                            let operator_callsign = tx_denied_operator_attribution(
+                                                &remote_tx_arm,
+                                                remote_client_key_id.as_deref(),
+                                            );
+                                            for item in &items {
+                                                let denial_reason = format!(
+                                                    "arm went stale before audio delivery: '{}' at {:.0} Hz",
+                                                    item.message_text, item.frequency_offset
+                                                );
+                                                emit_disarm_interrupt_signals(
+                                                    &message_bus,
+                                                    &audit_log,
+                                                    &display_feed_enabled,
+                                                    operator_callsign.clone(),
+                                                    "denied",
+                                                    denial_reason,
+                                                    item.qso_id.as_deref(),
+                                                )
+                                                .await;
+                                            }
+                                            send_tx_queue_status(&message_bus, None, Vec::new())
+                                                .await;
+                                            for item in &items {
+                                                let _ = report_unaired_frame(
+                                                    &message_bus,
+                                                    item.message_text.clone(),
+                                                    item.qso_id.clone(),
+                                                    take_bundle_replaced(
+                                                        &mut bundle_replaced,
+                                                        item.qso_id.as_deref(),
+                                                    ),
+                                                )
+                                                .await;
+                                            }
+                                            continue;
+                                        }
+                                        Ok(SendIfOutcome::Dropped) => {
+                                            debug!("Audio output routing: message dropped");
+                                        }
+                                        Err(e) => {
+                                            debug!("Audio output routing: {}", e);
+                                        }
                                     }
 
                                     // --- Step 8: Wait for playback to complete ---
                                     // Playback is now on the air; a qualifying request here
                                     // supersedes the bundle (same bundle-add-or-replace decision
                                     // as Step 6 via `supersede_multi_reenqueue`).
+                                    // PAN-135: expected playback end bounds an unconfirmed disarm flush.
+                                    let playback_end = tokio::time::Instant::now()
+                                        + Duration::from_millis(audio_duration_ms);
                                     match interruptible_sleep_or_supersede(
                                         Duration::from_millis(audio_duration_ms),
                                         &shutdown,
@@ -10753,48 +11924,20 @@ impl super::ApplicationCoordinator {
                                             );
                                             // PAN-91 review: release PTT FIRST — see the
                                             // single-TX arm's identical fix for why.
-                                            let ptt_off_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Hamlib,
-                                                MessageType::RigControl(
-                                                    crate::message_bus::RigControlMessage::SetPtt {
-                                                        state: false,
-                                                    },
-                                                ),
-                                                Instant::now(),
-                                            );
-                                            if let Err(e) =
-                                                message_bus.send_message(ptt_off_msg).await
-                                            {
-                                                warn!(
-                                                    "Remote disarm mid-TX: PTT OFF failed: {}",
-                                                    e
-                                                );
-                                            }
-                                            ptt_active.store(false, Ordering::Release);
-                                            ptt_guard.disarm();
+                                            // PAN-135: stand the guard down only after Hamlib accepts PTT-off.
+                                            ptt_guard.release("Remote disarm mid-TX").await;
                                             // Round-4 review (Codex P1): flush the
                                             // already-queued remote bundle waveform BEFORE
                                             // reenqueuing pending work — see the single-TX
-                                            // arm's identical fix for why.
-                                            let flush_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Audio,
-                                                MessageType::AudioOutput {
-                                                    samples: Vec::new(),
-                                                    sample_rate,
-                                                    flush_first: true,
-                                                },
-                                                Instant::now(),
-                                            );
-                                            if let Err(e) =
-                                                message_bus.send_message(flush_msg).await
-                                            {
-                                                debug!(
-                                                    "Flushing aborted remote audio after disarm: {}",
-                                                    e
-                                                );
-                                            }
+                                            // arm's identical fix for why. PAN-135 confirms
+                                            // the flush in the audio thread.
+                                            flush_disarmed_audio_confirmed(
+                                                &message_bus,
+                                                sample_rate,
+                                                playback_end,
+                                                &shutdown,
+                                            )
+                                            .await;
                                             // Round-9 review (Codex P1): drain HERE, after
                                             // PTT is already off — see
                                             // `drain_and_merge_pending`'s doc for why.
@@ -10987,6 +12130,38 @@ impl super::ApplicationCoordinator {
                                         continue;
                                     }
 
+                                    // PAN-118: a tune carrier is a transmission
+                                    // too — refuse it on the effective dial +
+                                    // tone offset before PTT, mirroring the
+                                    // band-plan sibling gate at the other
+                                    // sites. Same unwind as the hard-mute
+                                    // branch above (no TransmitComplete exists
+                                    // for a tune).
+                                    if let Some(reason) = tx_rf_for_gate(
+                                        &operating_frequency_hz,
+                                        &split_tx_frequency_hz,
+                                        tone_offset_hz,
+                                    )
+                                    .and_then(|rf| tx_band_plan_mute_reason(rf, 0.0, &band_plan))
+                                    {
+                                        info!(
+                                            target: "pancetta::tx.policy",
+                                            "TX blocked ({}): tune ({}s @ {} Hz)",
+                                            reason, duration_secs, tone_offset_hz
+                                        );
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "tx.policy",
+                                            pancetta_core::DiagnosticLevel::Info,
+                                            format!(
+                                                "TX blocked ({reason}): tune ({duration_secs}s @ {tone_offset_hz} Hz)"
+                                            ),
+                                            None,
+                                        )
+                                        .await;
+                                        continue;
+                                    }
+
                                     // Generate a continuous sine wave
                                     // (single tone, zero-bandwidth on air).
                                     // Amplitude 0.5 — operator manages rig
@@ -11016,6 +12191,45 @@ impl super::ApplicationCoordinator {
                                     // exit path (complete / abort / shutdown).
                                     let _tx_status_guard = TxStatusGuard::new(message_bus.clone());
                                     send_tx_status(&message_bus, true).await;
+
+                                    // PAN-118: last-instant band-plan re-check.
+                                    // The tone-buffer build, `PttGuard::new`'s
+                                    // sync-gate wait and the TX-status send
+                                    // above all ran since the admission check,
+                                    // and the effective TX dial may have moved
+                                    // meanwhile. Nothing but the PTT-on send
+                                    // follows. PTT hardware was never asserted
+                                    // (`ptt_guard` only flipped the in-process
+                                    // flag), so unwind that flag and disarm
+                                    // rather than send PTT-off; the TX-badge
+                                    // guard's drop clears the badge.
+                                    if let Some(reason) = tx_rf_for_gate(
+                                        &operating_frequency_hz,
+                                        &split_tx_frequency_hz,
+                                        tone_offset_hz,
+                                    )
+                                    .and_then(|rf| tx_band_plan_mute_reason(rf, 0.0, &band_plan))
+                                    {
+                                        ptt_active.store(false, Ordering::Release);
+                                        ptt_guard.disarm();
+                                        info!(
+                                            target: "pancetta::tx.policy",
+                                            "TX blocked at final pre-PTT check ({}): tune ({}s @ {} Hz)",
+                                            reason, duration_secs, tone_offset_hz
+                                        );
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "tx.policy",
+                                            pancetta_core::DiagnosticLevel::Info,
+                                            format!(
+                                                "TX blocked at final pre-PTT check ({reason}): tune ({duration_secs}s @ {tone_offset_hz} Hz)"
+                                            ),
+                                            None,
+                                        )
+                                        .await;
+                                        continue;
+                                    }
+
                                     let ptt_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Hamlib,
@@ -12006,6 +13220,86 @@ mod schedule_tx_tests {
         );
     }
 
+    /// PAN-117: the key-time slot-timing gate must deny a frame that is
+    /// only ready to key several seconds past its slot boundary — the
+    /// ticket's gherkin scenario — carrying the elapsed time and cap for
+    /// the denial's log/diagnostic. An on-time key, a key exactly at the
+    /// cap, and a deferred (future) target deny nothing.
+    #[test]
+    fn key_time_gate_denial_flags_key_time_late_frame() {
+        let target_slot = at(30.0);
+        assert_eq!(
+            super::key_time_gate_denial(
+                target_slot + chrono::Duration::seconds(9),
+                target_slot,
+                3000
+            ),
+            Some(super::FinalGateDenial::TooLateToDecode {
+                elapsed_ms: 9000,
+                late_max_ms: 3000,
+            }),
+            "a frame only ready to key 9s into its slot must be refused, not keyed"
+        );
+        assert_eq!(
+            super::key_time_gate_denial(
+                target_slot + chrono::Duration::milliseconds(3001),
+                target_slot,
+                3000
+            ),
+            Some(super::FinalGateDenial::TooLateToDecode {
+                elapsed_ms: 3001,
+                late_max_ms: 3000,
+            }),
+        );
+        assert!(super::key_time_gate_denial(target_slot, target_slot, 3000).is_none());
+        assert!(super::key_time_gate_denial(
+            target_slot + chrono::Duration::milliseconds(3000),
+            target_slot,
+            3000
+        )
+        .is_none());
+        assert!(super::key_time_gate_denial(at(29.92), target_slot, 3000).is_none());
+    }
+
+    /// PAN-117 (PR #450 Codex review): the liveness/DX-parity gate no
+    /// longer carries the slot-timing check — that reads the clock, so it
+    /// runs separately as the last check before `SetPtt`. A live QSO with
+    /// no conflict clears this gate however late the frame is; only
+    /// `key_time_gate_denial` refuses it.
+    #[test]
+    fn final_single_tx_gate_denial_has_no_clock_dependency() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, RwLock};
+        let active: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+        active
+            .write()
+            .unwrap()
+            .insert(super::super::active_tx_qso_key("qso-peru"));
+        let cts = pancetta_qso::CrossTimeState::empty();
+        assert!(super::final_single_tx_gate_denial(
+            Some("qso-peru"),
+            SlotParity::Odd,
+            &active,
+            None,
+            &cts,
+            std::time::Duration::from_secs(30),
+        )
+        .is_none());
+        assert_eq!(
+            super::final_gate_denial_text(
+                super::FinalGateDenial::TooLateToDecode {
+                    elapsed_ms: 9000,
+                    late_max_ms: 3000,
+                },
+                Some("qso-peru"),
+                SlotParity::Odd,
+                "K1ABC W5AU R-05",
+            )
+            .1,
+            "dropping stale TX at final pre-PTT check: 9000ms into the slot exceeds tx_late_max_ms=3000ms — no receiver could decode it: 'K1ABC W5AU R-05'"
+        );
+    }
+
     /// `bundle_live_mask` must reproduce the pre-refactor inline
     /// computation's semantics exactly (this refactor's only job): all
     /// live, all held, and mixed cases. `callsigns` is empty (no
@@ -12190,27 +13484,32 @@ mod schedule_tx_tests {
 
     #[test]
     fn adaptive_cap_shrinks_for_a_late_arriving_head() {
-        // Arrives 7.5s into an 8000ms tx_late_max_ms budget: only 500ms of
-        // headroom remains before the safety margin (500ms) eats the rest —
-        // cap should be at or near zero. at(7.5) falls inside slot 0, which
-        // is Even (base timestamp 1767225600 / 15 % 2 == 0, per `at()`'s own
-        // doc comment) — so the request must target Even parity for this to
-        // be a same-slot late arrival (`use_current = true`) rather than a
-        // parity-mismatch defer to the next Odd slot, which would exercise
-        // the unrelated `probe.deferred` branch instead of the headroom math
+        // Arrives 6.0s into an 8000ms tx_late_max_ms budget: the base
+        // window (800ms) + safety margin (500ms) eat 1300ms of it, leaving
+        // 700ms of extension headroom. (PAN-117 PR review: arrivals later
+        // than cap − 1300ms — e.g. 7.5s here — now resolve DEFERRED at the
+        // queue-time acceptance check, so their headroom is measured against
+        // that deferred slot's own start instead; see
+        // current_slot_acceptance_reserves_the_base_coalesce_wait.)
+        // at(6.0) falls inside slot 0, which is Even (base timestamp
+        // 1767225600 / 15 % 2 == 0, per `at()`'s own doc comment) — so the
+        // request must target Even parity for this to be a same-slot late
+        // arrival (`use_current = true`) rather than a parity-mismatch
+        // defer to the next Odd slot, whose headroom would be measured
+        // against that later slot instead of the late same-slot arrival
         // this test is for.
         use pancetta_config::station::TxSelfParity;
         let head = tx_request(Some(SlotParity::Even));
         let cap = adaptive_coalesce_cap_ms(
             &head,
-            at(7.5),
+            at(6.0),
             TxSelfParity::Auto,
             8000,
             12_000,
             SLOT_NS,
             pancetta_ft8::Protocol::Ft8,
         );
-        assert_eq!(cap, 0);
+        assert_eq!(cap, 700);
     }
 
     #[test]
@@ -12221,9 +13520,9 @@ mod schedule_tx_tests {
         // Even (base timestamp 1767225600 / 15 % 2 == 0, per `at()`'s own doc
         // comment) — so the request must target Even parity for this to be a
         // same-slot early arrival (`use_current = true`, `deferred = false`)
-        // and actually exercise `headroom.min(protocol_ceiling)`, rather than
-        // parity-mismatch deferring to the next Odd slot and short-circuiting
-        // at `if probe.deferred { return protocol_ceiling; }` before that line.
+        // whose `headroom.min(protocol_ceiling)` is measured against the
+        // current slot, rather than parity-mismatch deferring to the next Odd
+        // slot and measuring the headroom from that slot's later start.
         use pancetta_config::station::TxSelfParity;
         let head = tx_request(Some(SlotParity::Even));
         let cap = adaptive_coalesce_cap_ms(
@@ -12245,9 +13544,8 @@ mod schedule_tx_tests {
         // at(0.5) on FT4's 7.5s slot grid is also slot 0 = Even, so — same
         // reasoning as adaptive_cap_has_room_for_an_early_arriving_head above
         // — the request must target Even parity to hit `use_current = true`
-        // / `deferred = false` and actually exercise
-        // `headroom.min(protocol_ceiling)`, instead of deferring to the next
-        // Odd slot and short-circuiting before that line.
+        // / `deferred = false`, so `headroom.min(protocol_ceiling)` is
+        // measured against the current slot instead of the next Odd slot.
         use pancetta_config::station::TxSelfParity;
         let head = tx_request(Some(SlotParity::Even));
         let cap = adaptive_coalesce_cap_ms(
@@ -12265,8 +13563,11 @@ mod schedule_tx_tests {
     #[test]
     fn adaptive_cap_full_ceiling_when_already_deferred() {
         // A head that's already past tx_late_max_ms for the current slot
-        // (deferred to the next one) has no current-slot cliff to protect —
-        // cap is the full protocol ceiling.
+        // defers to the next Odd slot, which begins 16s later at :45. Its
+        // headroom against that slot's own cap is far above the protocol
+        // ceiling, so the cap is the ceiling. Deferral alone does not grant
+        // it: a deferred slot that begins moments away is still bounded
+        // (adaptive_cap_bounds_a_deferred_head_by_the_imminent_target_slot).
         use pancetta_config::station::TxSelfParity;
         let head = tx_request(Some(SlotParity::Odd));
         let cap = adaptive_coalesce_cap_ms(
@@ -12279,6 +13580,96 @@ mod schedule_tx_tests {
             pancetta_ft8::Protocol::Ft8,
         );
         assert_eq!(cap, 3000);
+    }
+
+    #[test]
+    fn adaptive_cap_subtracts_the_base_window() {
+        // PAN-117: slot-start head under the new 3000ms default — the
+        // extension must leave room for the 800ms base window + 500ms
+        // margin → 1700ms, not 2500ms. (Queue-time stretch must never end
+        // past the cap the key-time gate enforces.) at(0.0) is slot 0,
+        // which is Even (per `at()`'s doc comment), so an Even-targeting
+        // head is a same-slot arrival exercising the headroom math.
+        use pancetta_config::station::TxSelfParity;
+        let head = tx_request(Some(SlotParity::Even));
+        let cap = adaptive_coalesce_cap_ms(
+            &head,
+            at(0.0),
+            TxSelfParity::Auto,
+            3000,
+            12_000,
+            SLOT_NS,
+            pancetta_ft8::Protocol::Ft8,
+        );
+        assert_eq!(cap, 1700);
+        // FT4: effective cap 1500, base window 400, margin 500 → 600.
+        let cap = adaptive_coalesce_cap_ms(
+            &head,
+            at(0.0),
+            TxSelfParity::Auto,
+            3000,
+            12_000,
+            FT4_SLOT_NS,
+            pancetta_ft8::Protocol::Ft4,
+        );
+        assert_eq!(cap, 600);
+    }
+
+    #[test]
+    fn adaptive_cap_bounds_a_deferred_head_by_the_imminent_target_slot() {
+        // PAN-117 (PR #450 Codex review): a head arriving at :14.5 in the
+        // Even slot 0 but requiring Odd parity defers to slot 1, which
+        // begins only 500ms later at :15.0. The full 3000ms ceiling would
+        // let base (800) + extension (3000) run to :18.3 before encode,
+        // past the 3000ms key-time cap, so the final gate would drop it.
+        // Headroom must be measured against the deferred target too:
+        // 3000 + 500 (time until :15.0) - 800 - 500 = 2200ms.
+        use pancetta_config::station::TxSelfParity;
+        let head = tx_request(Some(SlotParity::Odd));
+        let cap = adaptive_coalesce_cap_ms(
+            &head,
+            at(14.5),
+            TxSelfParity::Auto,
+            3000,
+            12_000,
+            SLOT_NS,
+            pancetta_ft8::Protocol::Ft8,
+        );
+        assert_eq!(cap, 2200);
+        // 100ms before the boundary: 3000 + 100 - 1300 = 1800.
+        let cap = adaptive_coalesce_cap_ms(
+            &head,
+            at(14.9),
+            TxSelfParity::Auto,
+            3000,
+            12_000,
+            SLOT_NS,
+            pancetta_ft8::Protocol::Ft8,
+        );
+        assert_eq!(cap, 1800);
+        // A deferred target a whole slot or more away keeps the ceiling.
+        let cap = adaptive_coalesce_cap_ms(
+            &head,
+            at(1.0),
+            TxSelfParity::Auto,
+            3000,
+            12_000,
+            SLOT_NS,
+            pancetta_ft8::Protocol::Ft8,
+        );
+        assert_eq!(cap, 3000);
+        // FT4 (7.5s slots, Odd slot 1 at 7.5s): effective cap 1500,
+        // base 400, margin 500, 300ms until the boundary → 900.
+        let cap = adaptive_coalesce_cap_ms(
+            &head,
+            at(7.2),
+            TxSelfParity::Auto,
+            3000,
+            12_000,
+            FT4_SLOT_NS,
+            pancetta_ft8::Protocol::Ft4,
+        );
+        assert_eq!(cap, 900);
     }
 
     #[test]
@@ -12350,6 +13741,160 @@ mod schedule_tx_tests {
             ptt_wait_step(now, ptt_target, target_slot, false, 8000, SLOT_NS),
             PttWaitStep::Reached
         );
+    }
+
+    // --- PAN-117: key-time late-cap enforcement ---
+
+    #[test]
+    fn key_time_too_late_boundary_is_inclusive() {
+        // Exactly at cap: keys (matches schedule_tx's `mstr <= tx_late_max_ms`).
+        let (_, target_slot) = ptt_and_slot(30.0);
+        assert!(!key_time_too_late(
+            target_slot + chrono::Duration::milliseconds(3000),
+            target_slot,
+            3000
+        ));
+        // 1ms past cap: drops.
+        assert!(key_time_too_late(
+            target_slot + chrono::Duration::milliseconds(3001),
+            target_slot,
+            3000
+        ));
+        // Deferred target (slot in the future): never late.
+        assert!(!key_time_too_late(
+            target_slot - chrono::Duration::seconds(5),
+            target_slot,
+            3000
+        ));
+    }
+
+    #[test]
+    fn key_time_too_late_covers_the_ticket_scenario() {
+        // The PAN-117 gherkin: several seconds of slot elapsed, default-ish cap.
+        let (_, target_slot) = ptt_and_slot(30.0);
+        assert!(key_time_too_late(
+            target_slot + chrono::Duration::seconds(9),
+            target_slot,
+            3000
+        ));
+    }
+
+    #[test]
+    fn current_slot_acceptance_reserves_the_base_coalesce_wait() {
+        // PAN-117 PR #450 review finding: the queue-time `use_current`
+        // decision is made from `request_received_at`, frozen BEFORE the
+        // unconditional base coalesce wait (800ms FT8) and the overhead the
+        // safety margin (500ms) covers — while the key-time gate compares a
+        // FRESH clock against the raw effective cap. A request arriving in
+        // the band between the reserved overhead and the cap (2.2-3.0s at
+        // the 3000ms FT8 default; 1.1-1.5s FT4) was therefore accepted into
+        // the current slot and then ALWAYS dropped at the gate — never
+        // deferred. The worker now decides against the acceptance cap, so
+        // such a request defers 30s instead.
+        use pancetta_config::station::TxSelfParity;
+        assert_eq!(
+            current_slot_acceptance_cap_ms(pancetta_ft8::Protocol::Ft8, 3000),
+            1700,
+            "FT8 default: 3000 − 800 base window − 500 margin"
+        );
+        assert_eq!(
+            current_slot_acceptance_cap_ms(pancetta_ft8::Protocol::Ft4, 3000),
+            600,
+            "FT4: 1500 effective − 400 base window − 500 margin"
+        );
+        // Band edge: 2.3s into an Even slot (slot 0 is Even per at()'s
+        // doc) is inside the raw 3000ms cap but past the acceptance cap —
+        // scheduling with what the worker arms pass must DEFER, not accept
+        // the current slot the key-time gate would drop.
+        let s = schedule_tx(
+            at(2.3),
+            SlotParity::Even,
+            current_slot_acceptance_cap_ms(pancetta_ft8::Protocol::Ft8, 3000),
+            12_000,
+            SLOT_NS,
+        );
+        assert!(s.deferred, "2.3s arrival must defer at the 3000ms default");
+        assert_eq!(
+            (s.target_slot - at(0.0)).num_milliseconds(),
+            30_000,
+            "deferral targets the next Even slot, 30s out"
+        );
+        // An early-enough arrival still makes the current slot.
+        let s = schedule_tx(
+            at(1.0),
+            SlotParity::Even,
+            current_slot_acceptance_cap_ms(pancetta_ft8::Protocol::Ft8, 3000),
+            12_000,
+            SLOT_NS,
+        );
+        assert!(!s.deferred, "a 1.0s arrival still makes the current slot");
+        assert_eq!(
+            (s.target_slot - at(0.0)).num_milliseconds(),
+            0,
+            "same-slot acceptance targets the current Even slot"
+        );
+        // Coherence: the adaptive-coalesce probe answers with the SAME
+        // decision the worker makes, so a band head resolves DEFERRED and
+        // grants the full protocol ceiling (not a saturated-zero headroom
+        // against a current-slot target it will never get).
+        let head = tx_request(Some(SlotParity::Even));
+        let cap = adaptive_coalesce_cap_ms(
+            &head,
+            at(2.3),
+            TxSelfParity::Auto,
+            3000,
+            12_000,
+            SLOT_NS,
+            pancetta_ft8::Protocol::Ft8,
+        );
+        assert_eq!(
+            cap, 3000,
+            "a 2.3s head resolves deferred, so extension gets the full ceiling"
+        );
+    }
+
+    #[test]
+    fn multi_tx_acceptance_reserves_the_base_wait_only_for_coalesced_bundles() {
+        // PAN-117 PR #450 review round 2: a `MultiTransmitRequest` dequeued
+        // directly (mid-TX supersede re-enqueue, autonomous bundle) never
+        // takes the base coalesce wait, so the multi-TX arm must not
+        // reserve it — only the 500ms margin.
+        assert_eq!(
+            multi_tx_acceptance_cap_ms(pancetta_ft8::Protocol::Ft8, 3000, true),
+            1700,
+            "coalesced FT8 bundle: 3000 − 800 base window − 500 margin"
+        );
+        assert_eq!(
+            multi_tx_acceptance_cap_ms(pancetta_ft8::Protocol::Ft8, 3000, false),
+            2500,
+            "direct FT8 bundle: 3000 − 500 margin"
+        );
+        assert_eq!(
+            multi_tx_acceptance_cap_ms(pancetta_ft8::Protocol::Ft4, 3000, false),
+            1000,
+            "direct FT4 bundle: 1500 effective − 500 margin"
+        );
+        // A direct bundle re-key 2.0s into its Even slot keys in the
+        // current slot instead of deferring 30s.
+        let s = schedule_tx(
+            at(2.0),
+            SlotParity::Even,
+            multi_tx_acceptance_cap_ms(pancetta_ft8::Protocol::Ft8, 3000, false),
+            12_000,
+            SLOT_NS,
+        );
+        assert!(!s.deferred, "a direct 2.0s bundle makes the current slot");
+        assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 0);
+        // A coalesced bundle frozen at the same instant already lost 800ms
+        // to the base wait, so it still defers.
+        let s = schedule_tx(
+            at(2.0),
+            SlotParity::Even,
+            multi_tx_acceptance_cap_ms(pancetta_ft8::Protocol::Ft8, 3000, true),
+            12_000,
+            SLOT_NS,
+        );
+        assert!(s.deferred, "a coalesced 2.0s bundle defers");
     }
 
     #[test]
@@ -12833,6 +14378,163 @@ mod disarm_interrupt_signal_tests {
             .lines()
             .map(|l| serde_json::from_str(l).expect("audit line must be valid JSON"))
             .collect()
+    }
+
+    mod tx_send_authorized_tests {
+        use super::*;
+        use crate::message_bus::TxOrigin;
+        use pancetta_agent::arm::{ArmState, ArmTime, ConsentChannel, VerifiedArmGrant};
+
+        fn armed_client_a() -> Arc<std::sync::Mutex<ArmState>> {
+            let mut state = ArmState::new();
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            state.set_channel_consent(ConsentChannel::StationAgent, true, now_ms);
+            state.arm(
+                VerifiedArmGrant {
+                    operator_callsign: "K5ARH".to_string(),
+                    ttl_ms: 120_000,
+                    armed_until_ms: now_ms + 120_000,
+                    heartbeat_interval_sec: 10,
+                    scope_tx: true,
+                    jti: "pan134-predicate".to_string(),
+                    client_key_id: "client-a".to_string(),
+                },
+                ArmTime::now(),
+            );
+            Arc::new(std::sync::Mutex::new(state))
+        }
+
+        #[test]
+        fn local_origin_is_always_authorized() {
+            let arm = Arc::new(std::sync::Mutex::new(ArmState::new()));
+            assert!(tx_send_authorized(TxOrigin::Local, &arm, None));
+        }
+
+        #[test]
+        fn remote_origin_authorized_when_armed_as_same_client() {
+            assert!(tx_send_authorized(
+                TxOrigin::Remote,
+                &armed_client_a(),
+                Some("client-a")
+            ));
+        }
+
+        #[test]
+        fn remote_origin_denied_on_identity_mismatch() {
+            assert!(!tx_send_authorized(
+                TxOrigin::Remote,
+                &armed_client_a(),
+                Some("client-b")
+            ));
+        }
+
+        #[test]
+        fn remote_origin_denied_when_disarmed() {
+            let arm = armed_client_a();
+            arm.lock().unwrap().set_channel_consent(
+                ConsentChannel::StationAgent,
+                false,
+                chrono::Utc::now().timestamp_millis(),
+            );
+            assert!(!tx_send_authorized(
+                TxOrigin::Remote,
+                &arm,
+                Some("client-a")
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn pan134_bundle_denial_reports_each_unaired_item() {
+        // The monolithic worker is not driven here. Exercise the same denial
+        // helper composition; message_bus tests cover the lock-wait race.
+        let bus = MessageBus::new(16).unwrap();
+        let (_tui_tx, tui_rx) = bus.create_channel(ComponentId::Tui).await.unwrap();
+        let (_gw_tx, gw_rx) = bus
+            .create_channel(ComponentId::RemoteGateway)
+            .await
+            .unwrap();
+        let (_rig_tx, rig_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp());
+        let display_feed_enabled = Arc::new(AtomicBool::new(true));
+        let arm = Arc::new(std::sync::Mutex::new(pancetta_agent::arm::ArmState::new()));
+        let items = [
+            crate::message_bus::TransmitRequestItem {
+                message_text: "W1ABC K5ARH -10".into(),
+                frequency_offset: 1000.0,
+                qso_id: Some("qso-a".into()),
+            },
+            crate::message_bus::TransmitRequestItem {
+                message_text: "K2DEF K5ARH -15".into(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-b".into()),
+            },
+        ];
+        let outcome = bus
+            .send_message_if(
+                ComponentMessage::new(
+                    ComponentId::Ft8Transmitter,
+                    ComponentId::Hamlib,
+                    MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt {
+                        state: true,
+                    }),
+                    Instant::now(),
+                ),
+                || tx_send_authorized(crate::message_bus::TxOrigin::Remote, &arm, Some("client-a")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, SendIfOutcome::Denied);
+        if outcome == SendIfOutcome::Denied {
+            let operator_callsign = tx_denied_operator_attribution(&arm, Some("client-a"));
+            for item in &items {
+                let denial_reason = format!(
+                    "arm went stale in the pre-PTT gap: '{}' at {:.0} Hz",
+                    item.message_text, item.frequency_offset
+                );
+                emit_disarm_interrupt_signals(
+                    &bus,
+                    &audit_log,
+                    &display_feed_enabled,
+                    operator_callsign.clone(),
+                    "denied",
+                    denial_reason,
+                    item.qso_id.as_deref(),
+                )
+                .await;
+            }
+        }
+        assert!(rig_rx.try_recv().is_err(), "denied bundle must not key PTT");
+        let events = read_audit_lines(audit_log.path());
+        assert_eq!(events.len(), items.len());
+        for (item, event) in items.iter().zip(events) {
+            let expected = format!(
+                "arm went stale in the pre-PTT gap: '{}' at {:.0} Hz",
+                item.message_text, item.frequency_offset
+            );
+            match gw_rx.try_recv().unwrap().message_type {
+                MessageType::TxDenied { reason, qso_id } => {
+                    assert_eq!(reason, expected);
+                    assert_eq!(qso_id, item.qso_id);
+                }
+                other => panic!("expected TxDenied, got {other:?}"),
+            }
+            match tui_rx.try_recv().unwrap().message_type {
+                MessageType::DiagnosticEvent { text, qso_id, .. } => {
+                    assert!(text.starts_with("Remote TX denied ("));
+                    assert!(!text.contains("disarmed mid-transmission"));
+                    assert!(text.contains(&expected));
+                    assert_eq!(qso_id, item.qso_id);
+                }
+                other => panic!("expected DiagnosticEvent, got {other:?}"),
+            }
+            assert_eq!(event.kind, pancetta_agent::audit::AuditKind::TxDenied);
+            assert_eq!(event.detail, expected);
+            assert_eq!(event.operator_callsign, None);
+        }
+        assert!(gw_rx.try_recv().is_err());
+        assert!(tui_rx.try_recv().is_err());
+        let _ = std::fs::remove_file(audit_log.path());
     }
 
     #[tokio::test]
@@ -17645,12 +19347,15 @@ mod pan115_worker_gate_tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    struct Harness {
-        coordinator: ApplicationCoordinator,
+    // `pub(crate)` fields/helpers: shared with the sibling PAN-118 worker-gate
+    // test module (`pan118_worker_band_plan_tests`), which reuses this harness
+    // exactly as the PAN-115 plan's shape intends.
+    pub(crate) struct Harness {
+        pub(crate) coordinator: ApplicationCoordinator,
         shutdown: Arc<AtomicBool>,
-        hamlib_rx: Receiver<ComponentMessage>,
-        autonomous_rx: Receiver<ComponentMessage>,
-        tui_rx: Receiver<ComponentMessage>,
+        pub(crate) hamlib_rx: Receiver<ComponentMessage>,
+        pub(crate) autonomous_rx: Receiver<ComponentMessage>,
+        pub(crate) tui_rx: Receiver<ComponentMessage>,
         qso_rx: Receiver<ComponentMessage>,
     }
 
@@ -17660,7 +19365,7 @@ mod pan115_worker_gate_tests {
         }
     }
 
-    async fn worker_harness() -> Harness {
+    pub(crate) async fn worker_harness() -> Harness {
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut coordinator = ApplicationCoordinator::new(
             Config::default(),
@@ -17703,6 +19408,9 @@ mod pan115_worker_gate_tests {
             .unwrap();
         let (_, qso_rx) = bus.get_or_create_channel(ComponentId::Qso).await.unwrap();
         let (_, tui_rx) = bus.get_or_create_channel(ComponentId::Tui).await.unwrap();
+        // PAN-134 logs audio start only after an actual enqueue. The worker
+        // fixture needs an Audio destination even though it uses no device.
+        bus.get_or_create_channel(ComponentId::Audio).await.unwrap();
         coordinator
             .start_transmitter_component()
             .await
@@ -17717,7 +19425,7 @@ mod pan115_worker_gate_tests {
         }
     }
 
-    async fn request(h: &Harness, text: &str) {
+    pub(crate) async fn request(h: &Harness, text: &str) {
         let msg = ComponentMessage::new(
             ComponentId::Autonomous,
             ComponentId::Ft8Transmitter,
@@ -17745,7 +19453,7 @@ mod pan115_worker_gate_tests {
     /// on Autonomous (or `within` elapses). Returns that completion's
     /// `success`, every TUI diagnostic text seen, and whether any
     /// `SetPtt{true}` reached Hamlib.
-    async fn await_completion(
+    pub(crate) async fn await_completion(
         h: &Harness,
         text: &str,
         within: Duration,
@@ -17789,7 +19497,7 @@ mod pan115_worker_gate_tests {
         (completed, diagnostics, ptt_on)
     }
 
-    async fn await_ptt_on(h: &Harness, within: Duration) -> bool {
+    pub(crate) async fn await_ptt_on(h: &Harness, within: Duration) -> bool {
         let deadline = Instant::now() + within;
         while Instant::now() < deadline {
             while let Ok(msg) = h.hamlib_rx.try_recv() {
@@ -18299,5 +20007,968 @@ mod report_transmit_complete_tests {
             MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { ref message_text, replaced: None, .. })
                 if message_text == "K1ABC N0CALL R-07"
         ));
+    }
+}
+
+/// PAN-118: the band-plan Gherkin end to end, through the real TX worker
+/// (`start_transmitter_component`) over a real `MessageBus`, reusing the
+/// PAN-115 harness: a transmission whose absolute TX RF (effective
+/// split-aware dial + absolute audio offset) falls outside the configured
+/// amateur band plan is refused before `SetPtt{true}` ever reaches Hamlib.
+/// The dial-0 "not yet known" sentinel (mock/rig-disabled dev modes,
+/// `--test-tx`, replay seed) skips the check, keeping those modes
+/// byte-identical.
+#[cfg(test)]
+mod pan118_worker_band_plan_tests {
+    use super::pan115_worker_gate_tests::{
+        await_completion, await_ptt_on, request, worker_harness, Harness,
+    };
+    use crate::message_bus::{ComponentId, ComponentMessage, MessageType, TxOrigin};
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    /// 20m: in-band under the default region-2 plan.
+    const IN_BAND_DIAL_HZ: u64 = 14_074_000;
+    /// 15.000 MHz: between 20m and 17m — inside no amateur allocation.
+    const OUT_OF_BAND_DIAL_HZ: u64 = 15_000_000;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn out_of_band_single_tx_is_refused_before_ptt() {
+        let h = worker_harness().await;
+        // The shared RX-dial atomic, as the Hamlib poll loop would set it.
+        h.coordinator
+            .operating_frequency_hz
+            .store(OUT_OF_BAND_DIAL_HZ, Ordering::Relaxed);
+
+        request(&h, "CQ N0CALL FN20").await;
+        let (completed, diagnostics, ptt_on) =
+            await_completion(&h, "CQ N0CALL FN20", Duration::from_secs(5)).await;
+        assert_eq!(
+            completed,
+            Some(false),
+            "an out-of-band TX must complete as failed"
+        );
+        assert!(
+            !ptt_on,
+            "no SetPtt{{true}} may reach Hamlib for an out-of-band TX"
+        );
+        assert!(
+            diagnostics.iter().any(|d| d.contains(
+                "TX blocked (TX frequency 15001500 Hz is outside the configured amateur band plan)"
+            )),
+            "the admission gate must name the absolute RF, got {diagnostics:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_band_single_tx_still_keys() {
+        let h = worker_harness().await;
+        h.coordinator
+            .operating_frequency_hz
+            .store(IN_BAND_DIAL_HZ, Ordering::Relaxed);
+
+        request(&h, "CQ N0CALL FN20").await;
+        assert!(
+            await_ptt_on(&h, Duration::from_secs(40)).await,
+            "an in-band TX must still key (guard against over-blocking)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_dial_zero_still_keys() {
+        let h = worker_harness().await;
+        // Dial never set: the unknown-0 sentinel must skip the band-plan
+        // check (mock/rig-disabled dev modes, --test-tx, replay seed).
+        request(&h, "CQ N0CALL FN20").await;
+        assert!(
+            await_ptt_on(&h, Duration::from_secs(40)).await,
+            "a TX with an unknown (0) dial must still key"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn split_out_of_band_is_refused_even_with_in_band_rx_dial() {
+        let h = worker_harness().await;
+        h.coordinator
+            .operating_frequency_hz
+            .store(IN_BAND_DIAL_HZ, Ordering::Relaxed);
+        // Split active: the station transmits on the split dial, which is
+        // out of band — the gate must resolve the effective TX dial, not
+        // the in-band RX dial.
+        h.coordinator
+            .split_tx_frequency_hz
+            .store(OUT_OF_BAND_DIAL_HZ, Ordering::Relaxed);
+
+        request(&h, "CQ N0CALL FN20").await;
+        let (completed, diagnostics, ptt_on) =
+            await_completion(&h, "CQ N0CALL FN20", Duration::from_secs(5)).await;
+        assert_eq!(
+            completed,
+            Some(false),
+            "a split TX landing out of band must complete as failed"
+        );
+        assert!(!ptt_on, "no SetPtt(true) for an out-of-band split TX");
+        assert!(
+            diagnostics.iter().any(|d| d.contains(
+                "TX blocked (TX frequency 15001500 Hz is outside the configured amateur band plan)"
+            )),
+            "the gate must name the split-resolved absolute RF, got {diagnostics:?}"
+        );
+    }
+
+    /// The dial moving out of band between admission and key time (CAT
+    /// retune / split change during the pre-PTT wait) must still refuse
+    /// before PTT. The exact refusing site (post-wait re-key check or the
+    /// final pre-PTT check) depends on where in the slot the move lands,
+    /// so the assertion accepts either label — both are refusals before
+    /// PTT through the same unwind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dial_moved_out_of_band_before_key_is_refused() {
+        let h = worker_harness().await;
+        h.coordinator
+            .operating_frequency_hz
+            .store(IN_BAND_DIAL_HZ, Ordering::Relaxed);
+
+        request(&h, "CQ N0CALL FN20").await;
+        // Wait until the worker has admitted the frame (it appears in a
+        // TxQueueStatus push), then move the dial out of band — the frame
+        // is now queued against a dial that would key out of privilege.
+        let text = "CQ N0CALL FN20";
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if h.tui_rx
+                .try_iter()
+                .any(|msg| matches!(msg.message_type, MessageType::TxQueueStatus { queued, .. } if queued.iter().any(|item| item.text == text)))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "worker did not queue the frame");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        h.coordinator
+            .operating_frequency_hz
+            .store(OUT_OF_BAND_DIAL_HZ, Ordering::Relaxed);
+
+        let (completed, diagnostics, ptt_on) =
+            await_completion(&h, text, Duration::from_secs(45)).await;
+        assert_eq!(
+            completed,
+            Some(false),
+            "a frame whose dial moved out of band before key must complete as failed"
+        );
+        assert!(!ptt_on, "no SetPtt(true) after the dial moved out of band");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.contains("outside the configured amateur band plan")),
+            "a key-time gate must report the band-plan refusal, got {diagnostics:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tune_request_out_of_band_is_refused() {
+        let h = worker_harness().await;
+        h.coordinator
+            .operating_frequency_hz
+            .store(OUT_OF_BAND_DIAL_HZ, Ordering::Relaxed);
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Tui,
+                ComponentId::Ft8Transmitter,
+                MessageType::TuneRequest {
+                    duration_secs: 5,
+                    tone_offset_hz: 1500.0,
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_refusal = false;
+        let mut ptt_on = false;
+        while Instant::now() < deadline && !saw_refusal {
+            while let Ok(msg) = h.hamlib_rx.try_recv() {
+                ptt_on |= matches!(
+                    msg.message_type,
+                    MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt {
+                        state: true
+                    })
+                );
+            }
+            while let Ok(msg) = h.tui_rx.try_recv() {
+                if let MessageType::DiagnosticEvent { text, .. } = msg.message_type {
+                    if text.contains("outside the configured amateur band plan")
+                        && text.contains("tune")
+                    {
+                        saw_refusal = true;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            saw_refusal,
+            "an out-of-band tune must be refused with a diagnostic"
+        );
+        assert!(!ptt_on, "no SetPtt(true) for an out-of-band tune");
+
+        // Control: the same tune on an in-band dial still keys.
+        h.coordinator
+            .operating_frequency_hz
+            .store(IN_BAND_DIAL_HZ, Ordering::Relaxed);
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Tui,
+                ComponentId::Ft8Transmitter,
+                MessageType::TuneRequest {
+                    duration_secs: 2,
+                    tone_offset_hz: 1500.0,
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            await_ptt_on(&h, Duration::from_secs(10)).await,
+            "an in-band tune must still key"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tune_dial_moved_out_of_band_before_ptt_is_refused_at_last_instant() {
+        let h = worker_harness().await;
+        h.coordinator
+            .operating_frequency_hz
+            .store(IN_BAND_DIAL_HZ, Ordering::Relaxed);
+        // Hold the PAN-143 PTT sync gate so the worker parks inside
+        // `PttGuard::new` — after the tune's admission band-plan check
+        // passed on the in-band dial, before the PTT-on send.
+        let ptt_sync_gate = h.coordinator.ptt_sync_gate.clone();
+        let held = ptt_sync_gate.lock().await;
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Tui,
+                ComponentId::Ft8Transmitter,
+                MessageType::TuneRequest {
+                    duration_secs: 1,
+                    tone_offset_hz: 1500.0,
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+        // Wait for the worker to dequeue the request. From there the tune's
+        // admission checks and tone build run without yielding until the
+        // held gate, so a short settle covers them.
+        let (worker_inbox, _) = h
+            .coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !worker_inbox.is_empty() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            worker_inbox.is_empty(),
+            "the TX worker must dequeue the tune request"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut diagnostics = Vec::new();
+        while let Ok(msg) = h.tui_rx.try_recv() {
+            if let MessageType::DiagnosticEvent { text, .. } = msg.message_type {
+                diagnostics.push(text);
+            }
+        }
+        assert!(
+            diagnostics.iter().all(|d| !d.contains("TX blocked")),
+            "the in-band tune must pass admission before the dial moves: {diagnostics:?}"
+        );
+
+        // The effective TX dial leaves the band plan while the worker waits.
+        h.coordinator
+            .operating_frequency_hz
+            .store(OUT_OF_BAND_DIAL_HZ, Ordering::Relaxed);
+        drop(held);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_refusal = false;
+        let mut ptt_on = false;
+        while Instant::now() < deadline && !saw_refusal && !ptt_on {
+            while let Ok(msg) = h.hamlib_rx.try_recv() {
+                ptt_on |= matches!(
+                    msg.message_type,
+                    MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt {
+                        state: true
+                    })
+                );
+            }
+            while let Ok(msg) = h.tui_rx.try_recv() {
+                if let MessageType::DiagnosticEvent { text, .. } = msg.message_type {
+                    saw_refusal |= text.contains("final pre-PTT check")
+                        && text.contains("outside the configured amateur band plan")
+                        && text.contains("tune");
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !ptt_on,
+            "no SetPtt(true) for a tune whose dial left the band plan before PTT"
+        );
+        assert!(
+            saw_refusal,
+            "the tune must be refused at the final pre-PTT check with a band-plan diagnostic"
+        );
+    }
+
+    /// Send one two-item local bundle through the real worker.
+    async fn send_bundle(h: &Harness, a_offset: f64, b_offset: f64) {
+        use crate::message_bus::TransmitRequestItem;
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Autonomous,
+                ComponentId::Ft8Transmitter,
+                MessageType::MultiTransmitRequest {
+                    items: vec![
+                        TransmitRequestItem {
+                            message_text: "CQ N0CALL FN20".to_string(),
+                            frequency_offset: a_offset,
+                            qso_id: None,
+                        },
+                        TransmitRequestItem {
+                            message_text: "CQ N0CALL EN27".to_string(),
+                            frequency_offset: b_offset,
+                            qso_id: None,
+                        },
+                    ],
+                    tx_parity: None,
+                    origin: TxOrigin::Local,
+                    remote_client_key_id: None,
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    /// Drain until the TransmitComplete for EVERY text in `texts` has
+    /// arrived on Autonomous (bundles complete per item, back-to-back — a
+    /// single-text waiter would discard its siblings' completions while
+    /// polling), returning each text's `success` in order plus whether any
+    /// `SetPtt{true}` reached Hamlib.
+    async fn await_bundle_completions(
+        h: &Harness,
+        texts: &[&str],
+        within: Duration,
+    ) -> (Vec<Option<bool>>, bool) {
+        let deadline = Instant::now() + within;
+        let mut ptt_on = false;
+        let mut done: Vec<Option<bool>> = vec![None; texts.len()];
+        while Instant::now() < deadline && done.iter().any(|d| d.is_none()) {
+            while let Ok(msg) = h.hamlib_rx.try_recv() {
+                ptt_on |= matches!(
+                    msg.message_type,
+                    MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt {
+                        state: true
+                    })
+                );
+            }
+            while let Ok(msg) = h.autonomous_rx.try_recv() {
+                if let MessageType::TransmitComplete {
+                    success,
+                    message_text,
+                    ..
+                } = msg.message_type
+                {
+                    if let Some(slot) = texts.iter().position(|t| *t == message_text) {
+                        if done[slot].is_none() {
+                            done[slot] = Some(success);
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        while let Ok(msg) = h.hamlib_rx.try_recv() {
+            ptt_on |= matches!(
+                msg.message_type,
+                MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt {
+                    state: true
+                })
+            );
+        }
+        (done, ptt_on)
+    }
+
+    /// PAN-118 Gherkin, bundle discrimination: at the 20m upper edge
+    /// (14.348 MHz dial), a +500 Hz item lands in-band while a +2,500 Hz
+    /// sibling lands past the edge (14.3505 MHz) — only the offending
+    /// item is dropped; the in-privilege sibling still keys.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bundle_drops_only_the_out_of_band_item() {
+        let h = worker_harness().await;
+        // 20m region-2 upper edge is 14.350 MHz.
+        h.coordinator
+            .operating_frequency_hz
+            .store(14_348_000, Ordering::Relaxed);
+
+        send_bundle(&h, 500.0, 2_500.0).await;
+        // The out-of-band item is dropped at admission with a failed
+        // completion naming its absolute RF.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_drop_diag = false;
+        while Instant::now() < deadline && !saw_drop_diag {
+            saw_drop_diag |= h
+                .tui_rx
+                .try_iter()
+                .any(|msg| matches!(msg.message_type, MessageType::DiagnosticEvent { text, .. } if text.contains("dropping out-of-band multi-TX item") && text.contains("14350500")));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            saw_drop_diag,
+            "the dropped item's diagnostic must name 14350500 Hz"
+        );
+        let (done, ptt_on) = await_bundle_completions(
+            &h,
+            &["CQ N0CALL FN20", "CQ N0CALL EN27"],
+            Duration::from_secs(50),
+        )
+        .await;
+        assert_eq!(
+            done[1],
+            Some(false),
+            "the out-of-band item must complete as failed"
+        );
+        assert_eq!(
+            done[0],
+            Some(true),
+            "the in-band sibling must complete successfully"
+        );
+        assert!(ptt_on, "the in-band sibling must key PTT");
+    }
+
+    /// Control: both offsets in-band on a normal 20m dial — both items key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bundle_fully_in_band_keys_all_items() {
+        let h = worker_harness().await;
+        h.coordinator
+            .operating_frequency_hz
+            .store(14_074_000, Ordering::Relaxed);
+
+        send_bundle(&h, 500.0, 2_500.0).await;
+        let (done, ptt_on) = await_bundle_completions(
+            &h,
+            &["CQ N0CALL FN20", "CQ N0CALL EN27"],
+            Duration::from_secs(50),
+        )
+        .await;
+        assert_eq!(done[0], Some(true), "item A must complete successfully");
+        assert_eq!(done[1], Some(true), "item B must complete successfully");
+        assert!(ptt_on, "the bundle must key");
+    }
+
+    /// Every item out of privilege (dial between bands): the whole bundle
+    /// is refused — nothing keys, both items fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bundle_fully_out_of_band_keys_nothing() {
+        let h = worker_harness().await;
+        h.coordinator
+            .operating_frequency_hz
+            .store(OUT_OF_BAND_DIAL_HZ, Ordering::Relaxed);
+
+        send_bundle(&h, 500.0, 2_500.0).await;
+        let (done, ptt_on) = await_bundle_completions(
+            &h,
+            &["CQ N0CALL FN20", "CQ N0CALL EN27"],
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(done[0], Some(false), "item A must complete as failed");
+        assert_eq!(done[1], Some(false), "item B must complete as failed");
+        assert!(!ptt_on, "no SetPtt(true) for a fully out-of-band bundle");
+    }
+}
+
+#[cfg(test)]
+mod pan135_ptt_release_tests {
+    use super::*;
+    use crate::message_bus::{MessageBus, RigControlMessage};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    async fn guard(bus: &MessageBus, ptt_active: &Arc<AtomicBool>) -> PttGuard {
+        PttGuard::new(
+            bus.clone(),
+            ptt_active.clone(),
+            &Arc::new(tokio::sync::Mutex::new(())),
+            &Arc::new(AtomicU64::new(0)),
+        )
+        .await
+    }
+    async fn backlog(bus: &MessageBus) -> bool {
+        bus.send_message_checked(ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::AudioData(Vec::new()),
+            Instant::now(),
+        ))
+        .await
+        .unwrap()
+    }
+    fn ptt_offs(rx: &crossbeam_channel::Receiver<ComponentMessage>) -> usize {
+        rx.try_iter()
+            .filter(|m| {
+                matches!(
+                    m.message_type,
+                    MessageType::RigControl(RigControlMessage::SetPtt { state: false })
+                )
+            })
+            .count()
+    }
+    async fn let_drop_task_run() {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_on_a_healthy_channel_unkeys_once_and_stands_the_guard_down() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let ptt_active = Arc::new(AtomicBool::new(false));
+        let mut g = guard(&bus, &ptt_active).await;
+        assert_eq!(g.release("test").await, PttRelease::Delivered);
+        assert!(!ptt_active.load(Ordering::Acquire));
+        drop(g);
+        let_drop_task_run().await;
+        assert_eq!(
+            ptt_offs(&rx),
+            1,
+            "no duplicate unkey from a stood-down guard"
+        );
+    }
+
+    /// THE regression (reproduced this session against the old sequence:
+    /// 0 PTT-offs ever reached Hamlib).
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_into_a_full_hamlib_channel_keeps_the_fallback_armed() {
+        let bus = MessageBus::new(1).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        assert!(backlog(&bus).await);
+        let ptt_active = Arc::new(AtomicBool::new(false));
+        let mut g = guard(&bus, &ptt_active).await;
+        assert_eq!(g.release("test").await, PttRelease::Undelivered);
+        assert!(
+            ptt_active.load(Ordering::Acquire),
+            "unkey not delivered: still keyed"
+        );
+        let _ = rx.try_iter().count(); // Hamlib catches up
+        drop(g);
+        let_drop_task_run().await;
+        assert_eq!(
+            ptt_offs(&rx),
+            1,
+            "the armed guard's Drop delivers the unkey"
+        );
+        assert!(!ptt_active.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn release_retries_until_hamlib_frees_room() {
+        let bus = MessageBus::new(1).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        assert!(backlog(&bus).await);
+        let rx2 = rx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = rx2.try_recv();
+        });
+        let ptt_active = Arc::new(AtomicBool::new(false));
+        let mut g = guard(&bus, &ptt_active).await;
+        assert_eq!(g.release("test").await, PttRelease::Delivered);
+        assert_eq!(ptt_offs(&rx), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn armed_guard_drop_retries_until_hamlib_frees_room() {
+        let bus = MessageBus::new(1).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        assert!(backlog(&bus).await);
+        let ptt_active = Arc::new(AtomicBool::new(false));
+        drop(guard(&bus, &ptt_active).await); // armed
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let _ = rx.try_recv(); // room frees inside the Drop's retry window
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(ptt_offs(&rx), 1, "Drop retries, not one best-effort shot");
+    }
+}
+#[cfg(test)]
+mod pan135_disarm_flush_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    async fn take_flush_ack(rx: &crossbeam_channel::Receiver<ComponentMessage>) -> DeliveryAck {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(message) = rx.try_recv() {
+                    if let MessageType::AudioFlush { ack, .. } = message.message_type {
+                        return ack;
+                    }
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("audio flush must arrive")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flush_returns_only_after_the_audio_thread_acks() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Audio).await.unwrap();
+        let acked_at = Arc::new(std::sync::Mutex::new(None));
+        let a2 = acked_at.clone();
+        let consumer = tokio::spawn(async move {
+            let ack = take_flush_ack(&rx).await;
+            sleep(Duration::from_millis(30)).await;
+            *a2.lock().unwrap() = Some(Instant::now());
+            ack.complete(true);
+        });
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let playback_end = tokio::time::Instant::now() + Duration::from_secs(5);
+        let out = flush_disarmed_audio_confirmed(&bus, 12_000, playback_end, &shutdown).await;
+        let returned = Instant::now();
+        consumer.await.unwrap();
+        assert_eq!(out, DisarmFlush::Applied);
+        assert!(
+            returned >= acked_at.lock().unwrap().expect("acked"),
+            "never ahead of the ack"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flush_resends_when_the_ack_is_dropped_in_transit() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Audio).await.unwrap();
+        let consumer = tokio::spawn(async move {
+            drop(take_flush_ack(&rx).await);
+            take_flush_ack(&rx).await.complete(true);
+            sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                rx.try_iter().count(),
+                0,
+                "exactly two flushes, no further retry"
+            );
+        });
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let playback_end = tokio::time::Instant::now() + Duration::from_secs(5);
+        assert_eq!(
+            flush_disarmed_audio_confirmed(&bus, 12_000, playback_end, &shutdown).await,
+            DisarmFlush::Applied
+        );
+        consumer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unacknowledged_flush_waits_out_the_revoked_playback() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_s, _rx) = bus.create_channel(ComponentId::Audio).await.unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let start = tokio::time::Instant::now();
+        let outcome = flush_disarmed_audio_confirmed(
+            &bus,
+            12_000,
+            start + Duration::from_millis(200),
+            &shutdown,
+        )
+        .await;
+        assert_eq!(outcome, DisarmFlush::WaitedOutPlayback);
+        assert!(start.elapsed() >= Duration::from_millis(450));
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn not_applied_flush_waits_out_the_revoked_playback() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Audio).await.unwrap();
+        let consumer = tokio::spawn(async move {
+            take_flush_ack(&rx).await.complete(false);
+        });
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            flush_disarmed_audio_confirmed(
+                &bus,
+                12_000,
+                start + Duration::from_millis(100),
+                &shutdown,
+            )
+            .await,
+            DisarmFlush::WaitedOutPlayback
+        );
+        assert!(start.elapsed() >= Duration::from_millis(350));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        consumer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn flush_into_a_full_audio_channel_waits_out_the_revoked_playback() {
+        let bus = MessageBus::new(1).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Audio).await.unwrap();
+        assert!(bus
+            .send_message_checked(ComponentMessage::new(
+                ComponentId::Audio,
+                ComponentId::Audio,
+                MessageType::AudioData(Vec::new()),
+                Instant::now(),
+            ))
+            .await
+            .unwrap());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            flush_disarmed_audio_confirmed(&bus, 12_000, start, &shutdown).await,
+            DisarmFlush::WaitedOutPlayback
+        );
+        assert!(start.elapsed() >= Duration::from_millis(250));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            rx.len(),
+            1,
+            "all flush attempts dropped; original filler remains"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_interrupts_the_flush_wait() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_s, _rx) = bus.create_channel(ComponentId::Audio).await.unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s2 = shutdown.clone();
+        let stopper = tokio::spawn(async move {
+            sleep(Duration::from_millis(100)).await;
+            s2.store(true, Ordering::Release);
+        });
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            flush_disarmed_audio_confirmed(
+                &bus,
+                12_000,
+                start + Duration::from_secs(10),
+                &shutdown,
+            )
+            .await,
+            DisarmFlush::Shutdown
+        );
+        assert!(start.elapsed() < Duration::from_millis(300));
+        stopper.await.unwrap();
+    }
+}
+#[cfg(test)]
+mod pan135_worker_disarm_tests {
+    use super::pan115_worker_gate_tests::{await_ptt_on, worker_harness, Harness};
+    use super::*;
+    use crate::message_bus::{RigControlMessage, TxOrigin};
+    use crossbeam_channel::Receiver;
+    use pancetta_agent::arm::{ArmTime, ConsentChannel, VerifiedArmGrant};
+
+    const TEXT: &str = "CQ N0CALL FN20";
+
+    async fn remote_playback() -> (Harness, Receiver<ComponentMessage>) {
+        let h = worker_harness().await;
+        let (_, audio_rx) = h
+            .coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Audio)
+            .await
+            .unwrap();
+        {
+            let mut arm = h.coordinator.remote_tx_arm.lock().unwrap();
+            let now_ms = super::super::now_epoch_ms() as i64;
+            arm.set_channel_consent(ConsentChannel::StationAgent, true, now_ms);
+            arm.arm(
+                VerifiedArmGrant {
+                    operator_callsign: "N0CALL".into(),
+                    ttl_ms: 120_000,
+                    armed_until_ms: now_ms + 120_000,
+                    heartbeat_interval_sec: 10,
+                    scope_tx: true,
+                    jti: "pan135-worker".into(),
+                    client_key_id: "client-a".into(),
+                },
+                ArmTime::now(),
+            );
+        }
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::StationAgent,
+                ComponentId::Ft8Transmitter,
+                MessageType::TransmitRequest {
+                    message_text: TEXT.into(),
+                    frequency_offset: 1500.0,
+                    qso_id: None,
+                    tx_parity: None,
+                    origin: TxOrigin::Remote,
+                    remote_client_key_id: Some("client-a".into()),
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            await_ptt_on(&h, Duration::from_secs(40)).await,
+            "remote frame must key"
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if audio_rx.try_iter().any(|m| {
+                    matches!(m.message_type,
+                    MessageType::AudioOutput { samples, .. } if !samples.is_empty())
+                }) {
+                    break;
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("frame must enter playback");
+        (h, audio_rx)
+    }
+
+    fn disarm(h: &Harness) {
+        h.coordinator
+            .remote_tx_arm
+            .lock()
+            .unwrap()
+            .disarm(super::super::now_epoch_ms() as i64);
+    }
+
+    async fn flush_ack(rx: &Receiver<ComponentMessage>) -> DeliveryAck {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(m) = rx.try_recv() {
+                    if let MessageType::AudioFlush { ack, .. } = m.message_type {
+                        return ack;
+                    }
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("mid-playback disarm must send a flush")
+    }
+
+    fn completed(h: &Harness) -> Option<bool> {
+        h.autonomous_rx
+            .try_iter()
+            .find_map(|m| match m.message_type {
+                MessageType::TransmitComplete {
+                    message_text,
+                    success,
+                    ..
+                } if message_text == TEXT => Some(success),
+                _ => None,
+            })
+    }
+
+    // Unlike the shared await_completion helper, preserve the Hamlib messages
+    // so the tests can count every unkey, including one sent by Drop.
+    async fn await_failed_completion(h: &Harness) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(success) = completed(h) {
+                    assert!(!success, "revoked frame must be reported unsuccessful");
+                    break;
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("completion must follow the flush ack");
+    }
+
+    fn ptt_offs(h: &Harness) -> usize {
+        h.hamlib_rx
+            .try_iter()
+            .filter(|m| {
+                matches!(
+                    m.message_type,
+                    MessageType::RigControl(RigControlMessage::SetPtt { state: false })
+                )
+            })
+            .count()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_mid_playback_disarm_unkeys_once_then_waits_for_the_flush_ack() {
+        let (h, audio_rx) = remote_playback().await;
+        disarm(&h);
+        let ack = flush_ack(&audio_rx).await;
+        assert_eq!(ptt_offs(&h), 1, "PTT-off precedes the flush");
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            completed(&h),
+            None,
+            "no completion while the flush ack is held"
+        );
+        ack.complete(true);
+        await_failed_completion(&h).await;
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            ptt_offs(&h),
+            0,
+            "the stood-down guard must not duplicate the unkey"
+        );
+        assert!(!h.coordinator.ptt_active.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_mid_playback_disarm_with_hamlib_backlogged_still_unkeys() {
+        let (h, audio_rx) = remote_playback().await;
+        let bus = &h.coordinator.message_bus;
+        let mut filled = 0;
+        while bus
+            .send_message_checked(ComponentMessage::new(
+                ComponentId::Hamlib,
+                ComponentId::Hamlib,
+                MessageType::AudioData(Vec::new()),
+                Instant::now(),
+            ))
+            .await
+            .unwrap()
+        {
+            filled += 1;
+        }
+        assert_eq!(filled, 10_000, "exercise a completely full Hamlib channel");
+        disarm(&h);
+        let ack = flush_ack(&audio_rx).await;
+        assert!(
+            h.coordinator.ptt_active.load(Ordering::Acquire),
+            "unkey not delivered: still keyed"
+        );
+        assert_eq!(completed(&h), None);
+        assert_eq!(
+            ptt_offs(&h),
+            0,
+            "only backlog existed; no unkey was delivered yet"
+        );
+        ack.complete(true);
+        await_failed_completion(&h).await;
+        sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            ptt_offs(&h),
+            1,
+            "the armed guard retries on Drop once Hamlib catches up"
+        );
+        assert!(!h.coordinator.ptt_active.load(Ordering::Acquire));
     }
 }

@@ -602,17 +602,56 @@ impl QsoDatabase {
             });
         }
 
+        // VACUUM INTO writes a uniquely named sibling first; the backup only
+        // appears under its real name via a no-clobber hard link once it is
+        // complete. A failure (or a same-named backup made concurrently by
+        // another logger/process) therefore never leaves a partial file
+        // under the real name and never deletes anyone else's backup.
+        let target = backup_path.as_ref();
+        static PARTIAL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let file_name = target
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "backup".to_string());
+        let partial = target.with_file_name(format!(
+            ".{file_name}.partial-{}-{}",
+            std::process::id(),
+            PARTIAL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let remove_partial = || async {
+            match tokio::fs::remove_file(&partial).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!(
+                    "Could not remove partial backup {}: {}",
+                    partial.display(),
+                    e
+                ),
+            }
+        };
+
         // VACUUM INTO has no bind-parameter form for its target, so the path is
         // interpolated into a single-quoted SQL string literal. Escape embedded
         // single quotes (`'` → `''`) so a path containing `'` cannot break out
         // of the literal and inject SQL.
-        let escaped_path = escape_sqlite_string_literal(&backup_path_str);
+        let escaped_path = escape_sqlite_string_literal(&partial.to_string_lossy());
 
         // Use VACUUM INTO which atomically creates a complete copy of the database.
-        sqlx::query(&format!("VACUUM INTO '{}'", escaped_path))
+        if let Err(e) = sqlx::query(&format!("VACUUM INTO '{}'", escaped_path))
             .execute(&self.pool)
             .await
-            .map_err(AsyncDatabaseError::Sqlx)?;
+        {
+            remove_partial().await;
+            return Err(AsyncDatabaseError::Sqlx(e));
+        }
+
+        // Fails with AlreadyExists rather than replacing an existing file.
+        let linked = tokio::fs::hard_link(&partial, target).await;
+        remove_partial().await;
+        linked.map_err(|source| AsyncDatabaseError::Io {
+            path: target.to_path_buf(),
+            source,
+        })?;
 
         info!("Database backup completed (VACUUM INTO)");
         Ok(())
@@ -951,8 +990,9 @@ impl QsoDatabase {
 
     /// Build a fresh index at `db_path` by replaying every record in `adif_path`.
     ///
-    /// If `db_path` exists, it is deleted first — caller should only invoke this
-    /// when the DB is known to be stale or missing. `db_path` may also be the
+    /// If `db_path` exists, it is deleted once the ADIF has been read and
+    /// converted (an unreadable/malformed ADIF leaves it untouched) — caller
+    /// should only invoke this when the DB is known to be stale or missing. `db_path` may also be the
     /// literal `":memory:"` sentinel (see [`Self::open`]) for a throwaway,
     /// on-disk-file-free rebuild; that case is never `try_exists`/`remove_file`d.
     /// Returns the new database handle, ready for queries.
@@ -970,18 +1010,9 @@ impl QsoDatabase {
         // (`open` below only recognizes the sentinel AFTER this check).
         let is_in_memory = db_path == std::path::Path::new(":memory:");
 
-        // Drop any existing index so the rebuild is from scratch.
-        if !is_in_memory && tokio::fs::try_exists(db_path).await.unwrap_or(false) {
-            tokio::fs::remove_file(db_path)
-                .await
-                .map_err(|source| AsyncDatabaseError::Io {
-                    path: db_path.to_path_buf(),
-                    source,
-                })?;
-        }
-
-        let db = Self::open(db_path).await?;
-
+        // Read and convert the whole ADIF BEFORE touching the existing index:
+        // an unreadable or malformed ADIF must leave the old `qso.db` (and
+        // the history it carries) in place for the caller's fallback.
         let raw = tokio::fs::read_to_string(adif_path)
             .await
             .map_err(|source| AsyncDatabaseError::Io {
@@ -994,9 +1025,22 @@ impl QsoDatabase {
             .parse_string(&raw)
             .map_err(|e| AsyncDatabaseError::Replay(format!("ADIF parse failed: {e}")))?;
 
-        let (inserted, skipped) = db
-            .insert_adif_records(&processor, &adif_file.records)
-            .await?;
+        // Convert every record before touching the existing index: a record
+        // `record_to_qso` rejects must leave the old `qso.db` in place.
+        let converted = Self::convert_adif_records(&processor, &adif_file.records)?;
+
+        // Drop any existing index so the rebuild is from scratch.
+        if !is_in_memory && tokio::fs::try_exists(db_path).await.unwrap_or(false) {
+            tokio::fs::remove_file(db_path)
+                .await
+                .map_err(|source| AsyncDatabaseError::Io {
+                    path: db_path.to_path_buf(),
+                    source,
+                })?;
+        }
+
+        let db = Self::open(db_path).await?;
+        let (inserted, skipped) = db.insert_converted(converted).await?;
 
         if skipped > 0 {
             warn!(
@@ -1017,21 +1061,43 @@ impl QsoDatabase {
     /// Index `records` exactly as [`Self::replay_from_adif`] does: the same
     /// record→row conversion, the same −15 dB report default, and the same
     /// skip (with a `warn!`) for a record with no CALL. Returns (inserted,
-    /// skipped for having no CALL). Fails on the first record
-    /// `record_to_qso` rejects.
+    /// skipped for having no CALL). Fails, inserting nothing, if
+    /// `record_to_qso` rejects any record.
     pub async fn insert_adif_records(
         &self,
         processor: &AdifProcessor,
         records: &[AdifRecord],
     ) -> Result<(u64, u64), AsyncDatabaseError> {
+        let converted = Self::convert_adif_records(processor, records)?;
+        self.insert_converted(converted).await
+    }
+
+    /// `record_to_qso` + `adif_to_qso` for every record, failing on the first
+    /// record that cannot be converted.
+    fn convert_adif_records(
+        processor: &AdifProcessor,
+        records: &[AdifRecord],
+    ) -> Result<Vec<QsoMetadata>, AsyncDatabaseError> {
+        records
+            .iter()
+            .map(|adif_record| {
+                processor
+                    .record_to_qso(adif_record)
+                    .map(|adif_qso| processor.adif_to_qso(&adif_qso))
+                    .map_err(|e| AsyncDatabaseError::Replay(format!("record→AdifQso failed: {e}")))
+            })
+            .collect()
+    }
+
+    /// Insert converted records as completed QSOs.
+    /// Records with no CALL are skipped. Returns (inserted, skipped).
+    async fn insert_converted(
+        &self,
+        converted: Vec<QsoMetadata>,
+    ) -> Result<(u64, u64), AsyncDatabaseError> {
         let mut inserted: u64 = 0;
         let mut skipped: u64 = 0;
-        for adif_record in records {
-            let adif_qso = processor
-                .record_to_qso(adif_record)
-                .map_err(|e| AsyncDatabaseError::Replay(format!("record→AdifQso failed: {e}")))?;
-            let metadata = processor.adif_to_qso(&adif_qso);
-
+        for metadata in converted {
             // ADIF records with no <CALL:N> field are semantically broken — skip
             // them rather than inserting a record with no callsign.
             let their_callsign = match metadata.their_callsign.clone() {
@@ -1334,6 +1400,89 @@ mod tests {
             db.backup("/tmp/ev\nil.db").await,
             Err(AsyncDatabaseError::InvalidQuery { .. })
         ));
+    }
+
+    /// A real on-disk database whose non-header pages are overwritten, so
+    /// opening it still works (page 1 / `sqlite_master` is intact) but a full
+    /// read such as `VACUUM INTO` fails with "database disk image is malformed".
+    async fn open_corrupted_db(dir: &std::path::Path) -> QsoDatabase {
+        let db_path = dir.join("corrupt.db");
+        let db = QsoDatabase::open(&db_path).await.unwrap();
+        // Fold the WAL into the main file so every page is on disk to corrupt.
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        // Corrupt the `qsos` table's root page: schema init on reopen never
+        // reads it, but VACUUM copies every table row and must.
+        let root: i64 =
+            sqlx::query_scalar("SELECT rootpage FROM sqlite_master WHERE name = 'qsos'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        db.pool.close().await;
+        let mut bytes = std::fs::read(&db_path).unwrap();
+        let start = (root as usize - 1) * 4096;
+        for b in &mut bytes[start..start + 4096] {
+            *b = 0xFF;
+        }
+        std::fs::write(&db_path, &bytes).unwrap();
+        QsoDatabase::open(&db_path).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_failed_backup_removes_the_partial_target() {
+        // sophon 2026-10-07 / 2026-10-15: each failed VACUUM INTO left a
+        // 0-byte `qso_backup_*.db` behind, which then counted towards
+        // `retain_count` and pushed real backups out.
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_corrupted_db(dir.path()).await;
+        let target = dir.path().join("backup.db");
+
+        assert!(db.backup(&target).await.is_err());
+        assert!(
+            !target.exists(),
+            "a failed backup must not leave a partial file behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_same_name_backups_keep_one_valid_backup() {
+        // PR #453 review (Codex P2): two loggers backing up in the same
+        // second derive the same file name; the loser must not delete the
+        // winner's backup.
+        let dir = tempfile::tempdir().unwrap();
+        let db = QsoDatabase::open(dir.path().join("ok.db")).await.unwrap();
+        for i in 0..20 {
+            let target = dir.path().join(format!("same-{i}.db"));
+            let (a, b) = tokio::join!(db.backup(&target), db.backup(&target));
+            assert!(
+                a.is_ok() ^ b.is_ok(),
+                "exactly one backup wins: {a:?} / {b:?}"
+            );
+            let copy = QsoDatabase::open(&target)
+                .await
+                .expect("winner is a valid db");
+            assert_eq!(copy.count_qsos().await.unwrap(), 0);
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".partial-"))
+            .collect();
+        assert!(leftovers.is_empty(), "no partial files left behind");
+    }
+
+    #[tokio::test]
+    async fn test_failed_backup_never_removes_a_preexisting_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = QsoDatabase::open(dir.path().join("ok.db")).await.unwrap();
+        let target = dir.path().join("existing.db");
+        std::fs::write(&target, b"not ours").unwrap();
+
+        // VACUUM INTO refuses a non-empty existing target.
+        assert!(db.backup(&target).await.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"not ours");
     }
 
     // --- Security: I-9 (LIMIT clamping) -----------------------------------
@@ -1809,6 +1958,42 @@ mod tests {
 
         assert_eq!(counts.unwrap(), (2, 1));
         assert_eq!(db.count_qsos().await.unwrap(), 2);
+    }
+
+    /// PR #453 review (Codex P2): a newer-but-unreadable `qsos.adi` must not
+    /// cost the operator the existing index — the replay may only delete
+    /// `qso.db` once the ADIF has been read and converted.
+    #[tokio::test]
+    async fn replay_from_unreadable_adif_keeps_the_existing_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let adif_path = tmp.path().join("qsos.adi");
+        let db_path = tmp.path().join("qsos.db");
+        tokio::fs::write(
+            &adif_path,
+            "keep-index test\n<ADIF_VER:5>3.1.4 <PROGRAMID:8>pancetta\n<EOH>\n\n\
+             <CALL:5>W1ABC <QSO_DATE:8>20250101 <TIME_ON:6>120000 \
+             <MODE:3>FT8 <FREQ:9>14.074000 <BAND:3>20m\n<EOR>\n",
+        )
+        .await
+        .unwrap();
+        let db = QsoDatabase::replay_from_adif(&db_path, &adif_path)
+            .await
+            .unwrap();
+        db.pool.close().await;
+
+        tokio::fs::write(&adif_path, [0xFFu8, 0xFE, 0x00, 0x01])
+            .await
+            .unwrap();
+        assert!(QsoDatabase::replay_from_adif(&db_path, &adif_path)
+            .await
+            .is_err());
+
+        let db = QsoDatabase::open(&db_path).await.unwrap();
+        assert_eq!(
+            db.count_qsos().await.unwrap(),
+            1,
+            "existing index must survive"
+        );
     }
 
     /// PAN-85: a replayed ADIF record's `STATE` field must survive the

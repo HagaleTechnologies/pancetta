@@ -88,7 +88,7 @@ additionally needs `[autonomous] enabled = true` (see below).
 | `itu_zone` | integer | `8` | Used by some contest exchanges. |
 | `cq_zone` | integer | `5` | Same. |
 | `operator_name` | string | `""` | Your name (optional, for log export). |
-| `tx_late_max_ms` | integer | `8000` | Maximum latency past the slot boundary at which the TX scheduler will still attempt a late-start TX via audio cursor skip-ahead. Beyond this, defers to the next opposite-parity slot (30s later). 8s leaves ~5s of audio on the air, which is enough for the receiver to lock onto the middle and end Costas sync arrays. |
+| `tx_late_max_ms` | integer | `3000` | Hard cap on elapsed slot time at keying: a frame that would key past it is dropped at the final pre-PTT gate, never keyed undecodably. The queue-time same-slot acceptance reserves the unconditional coalesce window + safety margin below the cap — at the default, a request within roughly the first 1.7s of the slot still keys the current slot; later arrivals defer 30s to the next opposite-parity slot. A multi-TX bundle the worker receives already assembled skips that coalesce wait, so it reserves only the 0.5s margin and still keys the current slot if it arrives within roughly the first 2.5s at the default. 3s keeps both the middle and end Costas sync arrays and 49 of 58 data symbols (147 coded bits vs the 91 information bits LDPC needs) on the air. |
 | `tx_self_parity` | string | `"auto"` | When calling CQ (no DX heard), pick TX slot parity by this rule. `"auto"` picks whichever next slot is closer; `"even"` / `"odd"` lock to the named parity. |
 | `ptt_lead_ms` | integer | `80` | PTT engage lead time before the slot boundary. Drop to 50ms for fast solid-state keying; bump up to 150–200ms for slow mechanical relays. |
 
@@ -153,6 +153,39 @@ baud_rate = 38400
 > non-loopback address tells Pancetta to talk to a remote `rigctld`.
 > The TCP port is unauthenticated; if you do this on anything other
 > than a trusted LAN, anyone who can reach the port can drive your rig.
+
+### `[rig.frequency.band_plan]` — amateur band privileges (TX gate + edge warning)
+
+```toml
+[rig.frequency.band_plan]
+region = 2            # ITU/IARU region 1, 2 or 3 (2 = Americas; default 2)
+edge_warnings = true  # master switch: the band-plan TX gate AND the TUI edge
+                      # warning. false disables BOTH — the operator's opt-out
+                      # (e.g. a CW/SSB station parked outside the FT8 tables).
+                      # Default true.
+
+[rig.frequency.band_plan.custom_bands]   # optional per-band override, keyed by Band::Display
+"40m" = { name = "40m", ranges = [{ start = 7_000_000, end = 7_200_000, modes = [] }], default_mode = "FT8", band_type = "HF" }
+# e.g. a national allocation narrower than the IARU region table
+```
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `region` | integer | `2` | Selects the IARU region tables (1, 2 or 3; they diverge on 40/60/80 m, 2 m, 70 cm). An invalid number falls back to the global table — never panics. |
+| `edge_warnings` | bool | `true` | Master switch for both the hard TX refusal and the TUI's manual-frequency-entry warning. `false` disables both: nothing is refused, nothing warns. |
+| `custom_bands."<band>"` | table | — | Overrides the region table for that band (in-band iff the RF falls within ANY of the entry's `ranges`, OR across ranges). Applies to frequencies the band table resolves to that band — the escape hatch for a national allocation narrower than your region's default. |
+
+Since PAN-118 the band plan is enforced, not just displayed: every path that
+asserts PTT (scheduled FT8 transmissions and multi-TX bundle items, F4 tune,
+manual Shift+T PTT, remote-originated frames) is **refused before keying**
+whenever the absolute TX RF it would transmit on — the effective dial (split
+TX dial when split is active, else the RX dial) plus the frame's audio
+offset — falls outside the plan, with a `TX blocked (TX frequency … Hz is
+outside the configured amateur band plan)` diagnostic. A multi-TX bundle
+drops only its out-of-privilege items; in-privilege siblings still key. The
+check is skipped while the dial is not yet known (mock rig / CAT-disabled
+modes). Edits take effect on restart — config is loaded once at startup, and
+the runtime hot-reload apply task is a documented no-op.
 
 ---
 

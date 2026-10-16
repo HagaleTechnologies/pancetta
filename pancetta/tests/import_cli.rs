@@ -398,12 +398,11 @@ fn import_keeps_a_stale_index_looking_stale() {
     );
 }
 
-/// When indexing fails part-way, the partial `qso.db` is newer than the
-/// finished `qsos.adi` (some rows were committed after the logbook was
-/// written), so the logbook must be left looking newer: otherwise the next
-/// start treats the partial index as current and never repairs it. Here the
-/// logbook's second record cannot be converted, so the index build commits
-/// the first record and then errors.
+/// When indexing fails, the logbook must be left looking newer than any
+/// `qso.db` the attempt left behind: otherwise the next start treats it as
+/// current and never repairs it. Here the logbook's second record cannot be
+/// converted, so the index build fails — before creating `qso.db` at all,
+/// since the replay converts every record before it touches the index.
 #[test]
 fn a_failed_index_update_leaves_the_logbook_newer() {
     let s = Scratch::new();
@@ -426,10 +425,10 @@ fn a_failed_index_update_leaves_the_logbook_newer() {
         stderr(&out)
     );
 
-    let modified = |p: PathBuf| std::fs::metadata(p).unwrap().modified().unwrap();
+    let modified = |p: PathBuf| std::fs::metadata(p).ok().map(|m| m.modified().unwrap());
     assert!(
         modified(s.adif()) > modified(s.db()),
-        "qso.db must stay older than qsos.adi so the next start rebuilds it"
+        "qso.db must be missing or older than qsos.adi so the next start rebuilds it"
     );
 }
 

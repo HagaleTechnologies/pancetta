@@ -46,8 +46,8 @@ pub(crate) mod wsjtx_udp;
 
 pub use tx::{
     coalesce_transmit_requests, coalesce_transmit_requests_with_fox_priority, remote_tx_permitted,
-    remote_tx_permitted_for, resolve_required_parity, schedule_tx, CoalesceEntry, CoalesceOutcome,
-    TxSchedule,
+    remote_tx_permitted_for, resolve_required_parity, schedule_tx, tx_band_plan_mute_reason,
+    tx_rf_for_gate, tx_signal_span_hz, CoalesceEntry, CoalesceOutcome, TxSchedule,
 };
 
 pub use qso::compute_manual_tx_offset;
@@ -465,11 +465,31 @@ pub(crate) fn resolve_window_lead_secs(decoder_cfg: &pancetta_config::DecoderCon
 /// derived sample counts (`DspTiming`) are expressed at this rate.
 pub(crate) const FT8_SAMPLE_RATE: usize = 12000;
 
+/// Record an operator-requested split change in the coordinator's shared
+/// split-TX dial atomic (0 = simplex) and return the stored value. The single
+/// writer rule for `SetSplit` requests: the local TUI relay and a verified
+/// station-agent peer both call this BEFORE forwarding the
+/// `RigControlMessage::SetSplit` to Hamlib, so the TX band-plan gate
+/// (`tx::tx_rf_for_gate`, which resolves split-vs-RX-dial from this atomic)
+/// never checks a stale dial after a split change (PR #446 Codex review:
+/// the remote path used to bypass it). Clearing split (`enabled = false`)
+/// stores 0 regardless of `tx_frequency`.
+pub(crate) fn record_split_state(
+    split_tx_frequency_hz: &std::sync::atomic::AtomicU64,
+    enabled: bool,
+    tx_frequency: u64,
+) -> u64 {
+    let store = if enabled { tx_frequency } else { 0 };
+    split_tx_frequency_hz.store(store, std::sync::atomic::Ordering::Relaxed);
+    store
+}
+
 /// Map the config-local [`pancetta_config::OperatingMode`] to a concrete
 /// [`pancetta_ft8::Protocol`]. The config crate intentionally does not depend
 /// on `pancetta-ft8`, so the coordinator owns this mapping. Derived once at
-/// startup from `rig_config.operating_mode()`.
-pub(crate) fn protocol_from_mode(mode: pancetta_config::OperatingMode) -> pancetta_ft8::Protocol {
+/// startup from `rig_config.operating_mode()`. `pub` so the `coord_sim`
+/// fixture resolves its band-plan gate's signal span the same way.
+pub fn protocol_from_mode(mode: pancetta_config::OperatingMode) -> pancetta_ft8::Protocol {
     match mode {
         pancetta_config::OperatingMode::Ft8 => pancetta_ft8::Protocol::Ft8,
         pancetta_config::OperatingMode::Ft4 => pancetta_ft8::Protocol::Ft4,

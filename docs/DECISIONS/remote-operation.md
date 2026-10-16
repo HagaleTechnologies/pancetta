@@ -528,3 +528,127 @@ unaffected. Token and bind changes require restart. There is no data migration.
 Merge prerequisite: file the dispensa question in the design spec's
 `Proposed dispensa question` section before merging. Panino's `?gateway=` mode
 cannot connect until it sends `hello.gatewayToken`.
+
+## PAN-134: authorize PTT and audio after the bus lock wait
+
+`MessageBus::send_message_if` waits for the channel table's read lock, calls a
+synchronous authorization predicate, then enqueues with `try_send`. No await
+separates the predicate from enqueue. Both single-TX and multi-TX use it for
+PTT-on and audio output. A disarm or control transfer during the table-lock wait
+is therefore observed before either message can reach its consumer.
+
+The predicate must be a leaf with no bus calls, awaits, or blocking work beyond
+a short arm-state probe. Lock order is `channels` then `ArmState`; callers must
+never acquire the bus while holding a lock the predicate takes. The shared
+private enqueue helper preserves plain-send delivery semantics, counters, and
+logging. `Denied` runs the existing cleanup: clear the local PTT flag, unwind
+pivot tombstones, report each unaired frame, and emit denial signals. Audio
+rejection also sends PTT-off first because PTT is already asserted at that stage.
+
+The planning phase refuted converting the table to `std::sync::RwLock` alone.
+Its probe C held a writer for 80 ms and disarmed at 20 ms; the pre-lock check
+still authorized the later enqueue. The recorded result was
+`probe_c_std_conversion_still_leaves_gap ... ok`, with the assertion
+`std conversion leaves the gap open under contention`. Blocking a worker thread
+instead of suspending a task leaves the same stale check before the wait.
+
+This change closes the await gap. Another core can still change `ArmState`
+after the predicate releases its guard and before `try_send` commits. There is
+no wall-clock bound on that instruction-level interval; full cross-thread
+atomicity would require holding the arm guard across enqueue. The existing
+mid-TX poll remains the backstop.
+
+Following round 9's log-ordering requirement, `TxFrameLogged` is emitted only
+on `Enqueued`. Denied or dropped audio no longer appears as an aired frame in
+Band Activity. Concurrent bundle items retain a shared timestamp. PAN-135
+confirms the PTT-off and audio-flush sends at these unwinds; see below. Tune,
+config, and wire formats are unchanged.
+
+## PAN-135: confirm PTT-off and the disarm audio flush before proceeding
+
+`MessageBus` has three delivery tiers. `send_message` stays best-effort
+(PAN-38): a dropped delivery still returns `Ok(())`. `send_message_checked`
+and `send_message_retrying` confirm enqueue; a `DeliveryAck` carried inside
+the message confirms the consumer applied it.
+
+A safety send is handed off once it is enqueued on the same FIFO as
+everything it must precede. PTT-off qualifies: Hamlib applies its channel in
+order, so a later PTT-on from the TX worker always lands after it. The disarm
+audio flush does not: it travels the Audio channel and relay while the next
+key travels Hamlib's channel, so it needs the audio thread's acknowledgement.
+
+At every remote-revocation unkey (the four `AbortedByDisarm` arms and the two
+Step 7 `SendIfOutcome::Denied` pre-audio rechecks), `PttGuard::release`
+retries PTT-off at 5, 20 and
+50 ms and stands the guard down and clears `ptt_active` only after an attempt
+is enqueued. If every attempt drops, the guard stays armed and its `Drop`
+retries on scope exit with the same schedule; Hamlib's 14 s PTT watchdog is
+the backstop. A late fallback PTT-off can only cut a later transmission
+short, never extend one.
+
+The mid-playback arms send `MessageType::AudioFlush { ack }` in band. The
+relay forwards it in order, and the audio thread settles the ack `Applied`
+only when the output callback completed the flush within `queue_output`'s
+20 ms handshake (the callback discards the ring buffer before it reads
+another sample). A handshake that times out, because the callback is
+stalled, settles `NotApplied`: that flush is still pending and would clear
+whatever is buffered when the callback resumes, including a later frame. The TX
+worker waits for the ack before draining or re-enqueuing pending work.
+Without one (dropped, not applied, or no reply) it waits until the revoked
+waveform's playback end plus 250 ms, never less than 250 ms; shutdown ends
+the wait. In `--no-audio`, stub-audio and replay modes nothing acks, so a
+mid-playback remote disarm waits out the frame. An output callback that has
+not run within the 20 ms handshake counts as stalled, so on a device whose
+callback period exceeds 20 ms every mid-playback disarm also waits out the
+frame. A callback still stalled when that wait ends leaves the flush
+pending, and it can then clear a later frame's audio; PAN-115's TX hard mute
+refuses keying only once the output callback has been silent for 2 s.
+
+Rejected: a priority lane (a PTT-off overtaking a still-queued PTT-on of the
+same frame would leave the rig keyed); a CAT-level ack for PTT-off (FIFO
+hand-off already orders it, and the worker cannot repair a failed CAT call);
+changing `send_message` for its other callers; an out-of-band flush channel
+(it could clear the buffer before the revoked samples reached it).
+
+Not covered: manual PTT (TUI and remote) does not pass through the TX worker
+and is not gated on the flush wait. Hamlib's command loop clears its PTT
+watchdog timer before `set_ptt(Off)` returns, so a failed CAT unkey also
+stops that watchdog. Non-remote PTT-off sites (clock-step hold, normal
+Step 9, supersede, tune completion) keep best-effort delivery.
+
+## PAN-139: refuse denied remote close-step opens before mutating the QSO
+
+Round 23 on PR #362 (Codex): round 15's pre-mutation identity-bound permission
+check for a brand-new QSO opened directly at a close step covered
+`ResponseStep::SeventyThree` only. If a client's queued `answerCaller(rr73)`
+was processed after control transferred to another armed client, the TX
+worker's arm gate correctly dropped the `FinalConfirmation` frame at key-time
+(no unauthorized transmission — availability, not security), but
+`respond_to_caller` had already created a `WaitingForConfirmation` QSO and
+recorded the never-aired frame as `Sent`. `rearm_manual_calls_at` has no
+keep-call concept past RR73 by design (the DX's own next frame drives that
+stage), so nothing retried or corrected the phantom — the QSO sat until
+`confirmation_timeout` (30 s default) retired it as `Failed(Timeout)`, a
+quietly lost QSO.
+
+The guard now covers both close steps via `step_ladder_rank(step) >= Some(2)`
+— the identical predicate FIX B uses for "close step", so a future close-step
+addition is covered automatically — and still runs before
+`supersede_active_qsos_for` per round 16 (a denied request must not cancel an
+ongoing autonomous same-call QSO first). The refusal message names the
+requested step instead of hardcoding `SeventyThree`.
+
+Refuse-outright rather than preserve-retryable: the PAN-75 unsent-attempt
+ledger is never populated for an opening call (`record_keep_call_attempt`
+fires only from the rearm loop and `resend_last_tx`), so "retryable" would
+require new unreviewed mechanism; the half-duplex-parity-deferred admission
+queue already re-queues a failing entry at the front and retries it on later
+terminal-QSO events within its 10-minute `QUEUED_CALL_TTL` (an authorization
+denial can legitimately re-arm inside that window), and the immediate path
+logs a warning and emits a status line exactly as `SeventyThree` refusals
+already do. A later authorized call then opens the QSO fresh.
+
+Scope: `Report`/`ReportAck` opens are deliberately not covered — their states
+are rearm-eligible and `frame_reaches_the_air` already refuses to compound a
+denial (no further false `Sent`, no stall accounting), so they self-correct
+under the manual keep-call watchdog.

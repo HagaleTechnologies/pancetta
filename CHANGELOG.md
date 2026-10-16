@@ -137,6 +137,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer loses the field after a non-ASCII value (PAN-127). One malformed
   record no longer hides the others when importing.
 
+- QSO log index and backups: when startup rebuilt `~/.pancetta/qso.db` from
+  a newer `qsos.adi`, the SQLite logger had already opened the old file, so
+  QSOs it logged that session never reached the live index and its startup
+  backup failed (`database disk image is malformed` / `file is not a
+  database`). The logger now opens the index after the rebuild, the first
+  automatic backup waits 5 minutes after start, a failed backup no longer
+  leaves a 0-byte `qso_backup_*.db` behind, and backups go to
+  `~/.pancetta/backups` instead of `backups/` under whatever directory
+  pancetta was started from.
+
+- Autonomous collision listening no longer reports our own callsign as an
+  interferer (`Collision detected with: ["W5AU"]`) when our own transmission
+  is decoded back at our TX offset; portable/compound forms of our call are
+  excluded too.
+
+- A remote client's transmission stopped by a disarm (explicit, dead-man,
+  heartbeat loss, TTL expiry or local kill) no longer depends on one
+  best-effort message to unkey (PAN-135). PTT-off is retried, and the
+  transmitter keeps its PTT fallback armed until the unkey is queued to the
+  rig controller. Before the TX worker resumes pending work, it waits for the
+  audio thread to confirm it discarded the revoked client's remaining audio,
+  or, if no confirmation can come, until that audio would have finished
+  playing.
+
 - `max_concurrent_qsos` now also limits QSOs you open by hand (PAN-78). With
   the default of 1, calling a second station while a QSO is waiting for a
   reply used to open it anyway and transmit it alongside the first. Now the
@@ -206,6 +230,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recovers. The rig poll loop now redials rigctld itself (2 s backing off to
   30 s), so the RIG badge also recovers without a transmission. New `rig.cat`
   and `audio.health` diagnostics mark each loss and recovery.
+
+- The station now refuses to transmit outside the configured amateur band
+  plan instead of only displaying it (PAN-118). Every path that asserts PTT —
+  single `TransmitRequest`, multi-TX bundles (per item), `TuneRequest` (F4),
+  and manual PTT (Shift+T), any origin — is refused before PTT whenever the
+  absolute TX RF it would key on (effective split-aware dial + the request's
+  audio offset) falls outside the plan (region table or `custom_bands`
+  override), with a `TX blocked (TX frequency … Hz is outside the configured
+  amateur band plan)` diagnostic and the same failed-completion reporting
+  every other hard-mute refusal uses. A multi-TX bundle drops only its
+  out-of-privilege items; in-privilege siblings still key (a whole bundle is
+  refused only once the summed waveform makes per-item extraction impossible,
+  mirroring the existing stale-item semantics). The check is skipped while the
+  dial is not yet known (the 0 sentinel — mock-rig and `--no-audio --test-tx`
+  dev modes), and `[rig.frequency.band_plan] edge_warnings = false` disables
+  both the hard refusal and the TUI edge warning (the operator's escape
+  hatch), documented for the first time in `docs/CONFIG.md`. Band-plan edits
+  apply on restart, as all config does.
 
 - Every documented minimal config block now parses on its own (PAN-90): the
   README's `[autonomous] enabled = true`, both GUIDE.md GridTracker

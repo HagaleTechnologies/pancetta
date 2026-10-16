@@ -3217,7 +3217,12 @@ impl super::ApplicationCoordinator {
                 // is a single gate, testable without a whole coordinator. On a
                 // live run it also brings the index in line with the ADIF log
                 // before either writer opens a file, and hands back that index
-                // for the worked-station seed below (PAN-127).
+                // for the worked-station seed below (PAN-127). Because the
+                // rebuild runs inside this call before the logger opens
+                // `qso.db`, the logger never holds a pooled connection on a
+                // file the rebuild deleted (#453). Nothing can complete a QSO
+                // before this point: the decode/command loops below have not
+                // started yet.
                 let (_adif_writer, _async_logger, live_seed_db) = start_local_qso_log_writers(
                     replay_mode,
                     &adif_path,
@@ -9311,11 +9316,15 @@ async fn start_local_qso_log_writers(
 
     // Async QSO logger — subscribes independently to QsoEvent::QsoCompleted
     // and inserts into the rebuildable SQLite index.
-    let logger_config = pancetta_qso::LoggerConfig {
+    let mut logger_config = pancetta_qso::LoggerConfig {
         database_path: db_path.to_path_buf(),
         persist_qso_timeline,
         ..Default::default()
     };
+    // `~/.pancetta/backups`, never relative to the process cwd.
+    if let Some(dir) = db_path.parent() {
+        logger_config.backup.backup_directory = dir.join("backups");
+    }
 
     let async_logger = match pancetta_qso::async_logger::QsoLogger::new(
         logger_config,
@@ -10148,7 +10157,7 @@ mod replay_local_log_tests {
     /// Drive one full CQ→grid→report→73 exchange, which is what makes the
     /// manager emit `QsoEvent::QsoCompleted` — the single event both local
     /// writers subscribe to.
-    async fn complete_one_qso(manager: &pancetta_qso::QsoManager) {
+    pub(super) async fn complete_one_qso(manager: &pancetta_qso::QsoManager) {
         let freq = 14_074_000.0;
         manager
             .start_cq(freq, None, false, None)
@@ -10482,6 +10491,35 @@ mod replay_local_log_tests {
         shutdown.store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// Automatic backups land in `backups/` next to `qso.db`
+    /// (`~/.pancetta/backups`), never under the process cwd.
+    #[tokio::test]
+    async fn live_logger_backs_up_next_to_the_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("qso.db");
+        let manager = manager();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let (_adif_writer, async_logger, _seed_db) = start_local_qso_log_writers(
+            false,
+            &dir.path().join("qsos.adi"),
+            &db_path,
+            100,
+            false,
+            &manager,
+            shutdown.clone(),
+        )
+        .await;
+        let backup = async_logger
+            .expect("live run constructs the logger")
+            .create_backup()
+            .await
+            .expect("backup succeeds");
+        assert_eq!(backup.parent().unwrap(), dir.path().join("backups"));
+
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+    }
+
     /// The gate itself: under `--replay` a QSO the engine "completes" off
     /// replayed (historical) traffic must leave ZERO trace in the operator's
     /// local log. Not a tagged record — no record, and no file at all, because
@@ -10649,6 +10687,99 @@ mod replay_history_seed_tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         lookup.is_duplicate(callsign, freq_hz)
+    }
+
+    /// A LIVE (non-replay) coordinator rooted at `home`, station call W1ABC
+    /// (the call `replay_local_log_tests::complete_one_qso` works as).
+    async fn live_coordinator_with_home(home: &std::path::Path) -> ApplicationCoordinator {
+        let mut config = Config::default();
+        config.station.callsign = "W1ABC".to_string();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut coordinator = ApplicationCoordinator::new(
+            config,
+            None,
+            true,  // no_audio
+            true,  // headless
+            false, // metrics
+            9090,
+            None, // no WAV
+            None, // live, not --replay
+            None, // no test-tx
+            1500.0,
+            shutdown,
+            Vec::new(),
+            std::env::temp_dir().join("pancetta-test-config.toml"),
+            true,
+        )
+        .await
+        .expect("coordinator creation should succeed");
+        coordinator.pancetta_home_override = Some(home.to_path_buf());
+        coordinator
+    }
+
+    /// sophon 2026-10-07 / 2026-10-15: the SQLite logger opened `qso.db`
+    /// BEFORE the startup "index older than ADIF" rebuild deleted and
+    /// recreated that file, so its pooled connection kept pointing at the
+    /// deleted file (its immediate startup backup failed "malformed" / "not
+    /// a database", and QSOs it logged landed in the unlinked inode). The
+    /// logger must open the index only after the rebuild.
+    #[tokio::test]
+    async fn live_startup_rebuild_happens_before_the_logger_opens_the_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pancetta_dir = tmp.path().join(".pancetta");
+        tokio::fs::create_dir_all(&pancetta_dir).await.unwrap();
+        let db_path = pancetta_dir.join("qso.db");
+        {
+            let db = QsoDatabase::open(&db_path).await.unwrap();
+            db.insert_qso(&sample_progress("W9STALE")).await.unwrap();
+        }
+        // ADIF strictly newer than the index -> the rebuild path.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        tokio::fs::write(
+            pancetta_dir.join("qsos.adi"),
+            "rebuild-order test\n\
+             <ADIF_VER:5>3.1.4 <PROGRAMID:8>pancetta\n\
+             <EOH>\n\
+             \n\
+             <CALL:5>K2DEF <QSO_DATE:8>20250101 <TIME_ON:6>120000 \
+             <MODE:3>FT8 <FREQ:9>14.074000 <BAND:3>20m\n\
+             <EOR>\n",
+        )
+        .await
+        .unwrap();
+
+        let mut coordinator = live_coordinator_with_home(tmp.path()).await;
+        coordinator.start_qso_component().await.unwrap();
+        assert!(
+            wait_for_duplicate(&coordinator.cached_lookup, "K2DEF", FREQ_20M_HZ).await,
+            "precondition: startup must rebuild/seed from the ADIF"
+        );
+        // Let the local writers subscribe after the seed.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let manager = coordinator
+            .qso_manager_watch
+            .borrow()
+            .clone()
+            .expect("QSO manager published");
+        super::replay_local_log_tests::complete_one_qso(&manager).await;
+
+        let mut found = Vec::new();
+        for _ in 0..100 {
+            let db = QsoDatabase::open(&db_path).await.unwrap();
+            found = db.get_worked_callsigns("20M").await;
+            if found.contains(&"K1DEF".to_string()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            found.contains(&"K1DEF".to_string()),
+            "a QSO logged after a startup rebuild must land in the live qso.db: {found:?}"
+        );
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// The primary path: a real ADIF in the override dir seeds duplicate
