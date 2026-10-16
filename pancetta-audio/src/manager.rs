@@ -384,24 +384,24 @@ impl AudioManager {
         input_rate: u32,
         flush_first: bool,
     ) -> Result<(), AudioError> {
+        if flush_first {
+            // The completion bit is deliberately discarded here: this path
+            // proceeds after the bounded wait either way (pre-existing
+            // behavior). PAN-135's disarm flush learns the truth via
+            // `flush_output` instead.
+            if self.request_output_flush_bounded().is_none() {
+                return Err(AudioError::Stream {
+                    message: "Output stream not initialized".to_string(),
+                });
+            }
+        }
+
         let producer = self
             .output_producer
             .as_mut()
             .ok_or_else(|| AudioError::Stream {
                 message: "Output stream not initialized".to_string(),
             })?;
-
-        if flush_first {
-            let token = producer.shared.request_flush();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
-            while !producer.shared.is_flush_completed(token) && std::time::Instant::now() < deadline
-            {
-                std::thread::sleep(std::time::Duration::from_micros(500));
-            }
-            if !producer.shared.is_flush_completed(token) {
-                warn!("queue_output: flush did not complete within 20ms — proceeding anyway");
-            }
-        }
 
         // Resample if input rate differs from output rate
         let output_samples = if input_rate != self.config.sample_rate {
@@ -435,6 +435,42 @@ impl AudioManager {
             written, input_rate, self.config.sample_rate, flush_first
         );
         Ok(())
+    }
+
+    /// Request an output-ring flush and wait (bounded, 20 ms) for the output
+    /// callback to service it. Returns whether the callback completed the
+    /// flush, or `None` when no output stream exists. Shared by
+    /// [`Self::queue_output`]'s `flush_first` path and [`Self::flush_output`].
+    fn request_output_flush_bounded(&mut self) -> Option<bool> {
+        let producer = self.output_producer.as_mut()?;
+        let token = producer.shared.request_flush();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+        while !producer.shared.is_flush_completed(token) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_micros(500));
+        }
+        let completed = producer.shared.is_flush_completed(token);
+        if !completed {
+            warn!("queue_output: flush did not complete within 20ms — proceeding anyway");
+        }
+        Some(completed)
+    }
+
+    /// PAN-135: discard every sample still buffered for output. Issues the
+    /// same bounded flush handshake as `queue_output(.., flush_first: true)`
+    /// but reports whether the output callback actually completed the flush,
+    /// so the caller does not mistake "requested" for "applied" when the
+    /// callback is stalled.
+    pub fn flush_output(&mut self, input_rate: u32) -> Result<bool, AudioError> {
+        info!(
+            "Flushing TX audio output ring (rate {}->{}Hz, flush_first=true)",
+            input_rate, self.config.sample_rate
+        );
+        match self.request_output_flush_bounded() {
+            Some(completed) => Ok(completed),
+            None => Err(AudioError::Stream {
+                message: "Output stream not initialized".to_string(),
+            }),
+        }
     }
 
     /// Get list of available input devices
@@ -809,6 +845,56 @@ mod tests {
             // when flush_first is set, so by the time this call returns the
             // buffer holds only the new 2 samples, not 4+2.
             assert_eq!(manager.output_producer_occupied_len(), 2);
+        }
+    }
+
+    /// PAN-135 review: with no output callback running (the stalled-callback
+    /// shape), `flush_output` must report the handshake as NOT completed
+    /// after the bounded wait, so the coordinator's disarm flush ack settles
+    /// `NotApplied` instead of `Applied`.
+    #[test]
+    fn flush_output_reports_incomplete_when_no_callback_services_it() {
+        let manager = AudioManager::new();
+        if let Ok(mut manager) = manager {
+            let completed = manager.flush_output(48_000).expect("producer present");
+            assert!(
+                !completed,
+                "no callback drained the flush, yet it was reported complete"
+            );
+        }
+    }
+
+    /// PAN-135: with the output consumer servicing flush requests (standing
+    /// in for the cpal callback, as in
+    /// `queue_output_flush_first_clears_buffered_samples_before_pushing`),
+    /// `flush_output` reports the handshake completed.
+    #[test]
+    fn flush_output_reports_complete_when_the_callback_services_it() {
+        let manager = AudioManager::new();
+        if let Ok(mut manager) = manager {
+            let mut output_consumer = manager
+                .stream
+                .as_mut()
+                .expect("stream present")
+                .take_output_consumer()
+                .expect("output consumer present");
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_bg = stop.clone();
+            let bg = std::thread::spawn(move || {
+                while !stop_bg.load(Ordering::Relaxed) {
+                    output_consumer.drain_pending_flush();
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+            });
+
+            let completed = manager.flush_output(48_000).expect("producer present");
+
+            stop.store(true, Ordering::Relaxed);
+            bg.join().expect("drain thread should not panic");
+            assert!(
+                completed,
+                "the callback serviced the flush, yet it was reported incomplete"
+            );
         }
     }
 

@@ -117,27 +117,73 @@ impl TxAudioCommand {
         }
     }
 
-    /// Run `queue_output` for this command. A flush makes the same call
-    /// today's empty `AudioOutput{flush_first: true}` made. That call
-    /// issues `request_flush`, after which the output callback discards
-    /// the buffer before playing another sample. Then settle the ack
-    /// with whether the call succeeded.
-    pub(crate) fn apply<E>(
-        self,
-        queue_output: impl FnOnce(&[f32], u32, bool) -> Result<(), E>,
-    ) -> Result<(), E> {
+    /// Run this command against `executor`. A flush settles its ack only
+    /// when the audio side confirms the output callback completed the
+    /// flush (PAN-135 review): a 20 ms handshake timeout settles
+    /// `NotApplied`, so the TX worker waits out the revoked playback
+    /// instead of proceeding past a flush a stalled callback will apply
+    /// late — to whatever is queued by then.
+    pub(crate) fn apply<E: TxAudioExecutor>(self, executor: &mut E) -> Result<(), E::Error> {
         match self {
             Self::Play {
                 samples,
                 sample_rate,
                 flush_first,
-            } => queue_output(&samples, sample_rate, flush_first),
-            Self::Flush { sample_rate, ack } => {
-                let result = queue_output(&[], sample_rate, true);
-                ack.complete(result.is_ok());
-                result
-            }
+            } => executor.queue_tx_output(&samples, sample_rate, flush_first),
+            Self::Flush { sample_rate, ack } => match executor.flush_tx_output(sample_rate) {
+                Ok(completed) => {
+                    ack.complete(completed);
+                    Ok(())
+                }
+                Err(e) => {
+                    ack.complete(false);
+                    Err(e)
+                }
+            },
         }
+    }
+}
+
+/// PAN-135: what the audio thread can do with TX audio — the two halves of
+/// [`TxAudioCommand::apply`], split so a single `&mut` executor serves both
+/// variants. Implemented by [`AudioManager`] and by test fakes.
+pub(crate) trait TxAudioExecutor {
+    type Error;
+
+    /// Queue samples for output (the `queue_output` call today's TX path
+    /// makes, including the re-key `flush_first` handshake).
+    fn queue_tx_output(
+        &mut self,
+        samples: &[f32],
+        sample_rate: u32,
+        flush_first: bool,
+    ) -> Result<(), Self::Error>;
+
+    /// Flush the output ring and report whether the output callback
+    /// completed the flush within the bounded wait.
+    fn flush_tx_output(&mut self, sample_rate: u32) -> Result<bool, Self::Error>;
+}
+
+impl TxAudioExecutor for AudioManager {
+    type Error = pancetta_audio::AudioError;
+
+    fn queue_tx_output(
+        &mut self,
+        samples: &[f32],
+        sample_rate: u32,
+        flush_first: bool,
+    ) -> Result<(), Self::Error> {
+        info!(
+            "Audio TX: queueing {} samples at {} Hz (flush_first={})",
+            samples.len(),
+            sample_rate,
+            flush_first
+        );
+        self.queue_output(samples, sample_rate, flush_first)
+    }
+
+    fn flush_tx_output(&mut self, sample_rate: u32) -> Result<bool, Self::Error> {
+        self.flush_output(sample_rate)
     }
 }
 
@@ -483,15 +529,7 @@ impl super::ApplicationCoordinator {
                     // Check for TX audio to play out
                     match tx_audio_rx.try_recv() {
                         Ok(command) => {
-                            if let Err(e) = command.apply(|samples, sample_rate, flush_first| {
-                                info!(
-                                    "Audio TX: queueing {} samples at {} Hz (flush_first={})",
-                                    samples.len(),
-                                    sample_rate,
-                                    flush_first
-                                );
-                                audio_manager.queue_output(samples, sample_rate, flush_first)
-                            }) {
+                            if let Err(e) = command.apply(&mut audio_manager) {
                                 let s = e.to_string();
                                 error!("Audio TX output error: {}", s);
                                 maybe_report_runtime("TX output error", s);
@@ -772,9 +810,34 @@ impl super::ApplicationCoordinator {
 
 #[cfg(test)]
 mod pan135_tx_audio_command_tests {
-    use super::TxAudioCommand;
+    use super::{TxAudioCommand, TxAudioExecutor};
     use crate::message_bus::{AckState, DeliveryAck, MessageType};
     use std::time::Duration;
+
+    /// Test fake for [`TxAudioExecutor`]: records `queue_tx_output` calls and
+    /// answers `flush_tx_output` from a scripted result.
+    struct FakeExecutor {
+        queued: Option<(usize, u32, bool)>,
+        flush_result: Result<bool, String>,
+    }
+
+    impl TxAudioExecutor for FakeExecutor {
+        type Error = String;
+
+        fn queue_tx_output(
+            &mut self,
+            samples: &[f32],
+            sample_rate: u32,
+            flush_first: bool,
+        ) -> Result<(), String> {
+            self.queued = Some((samples.len(), sample_rate, flush_first));
+            Ok(())
+        }
+
+        fn flush_tx_output(&mut self, _sample_rate: u32) -> Result<bool, String> {
+            self.flush_result.clone()
+        }
+    }
 
     #[test]
     fn from_bus_maps_audio_output_and_flush_and_ignores_the_rest() {
@@ -801,22 +864,41 @@ mod pan135_tx_audio_command_tests {
     }
 
     #[tokio::test]
-    async fn flush_settles_applied_after_queue_output_ok() {
+    async fn play_routes_through_queue_tx_output() {
+        let mut executor = FakeExecutor {
+            queued: None,
+            flush_result: Ok(true),
+        };
+        TxAudioCommand::Play {
+            samples: vec![0.5; 3],
+            sample_rate: 12_000,
+            flush_first: true,
+        }
+        .apply(&mut executor)
+        .expect("play should succeed");
+        assert_eq!(
+            executor.queued,
+            Some((3, 12_000, true)),
+            "same queue_output call as today's TX path"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_settles_applied_after_a_completed_handshake() {
         let (ack, mut waiter) = DeliveryAck::new();
-        let mut seen = None;
-        let r: Result<(), String> = TxAudioCommand::Flush {
+        let mut executor = FakeExecutor {
+            queued: None,
+            flush_result: Ok(true),
+        };
+        TxAudioCommand::Flush {
             sample_rate: 12_000,
             ack,
         }
-        .apply(|s, rate, flush_first| {
-            seen = Some((s.len(), rate, flush_first));
-            Ok(())
-        });
-        assert!(r.is_ok());
+        .apply(&mut executor)
+        .expect("flush should succeed");
         assert_eq!(
-            seen,
-            Some((0, 12_000, true)),
-            "same queue_output call as today's flush"
+            executor.queued, None,
+            "a flush must not push any samples through the play path"
         );
         assert_eq!(
             waiter.wait_for(Duration::from_millis(10)).await,
@@ -824,14 +906,41 @@ mod pan135_tx_audio_command_tests {
         );
     }
 
+    /// PAN-135 review: a flush whose 20 ms output-callback handshake timed
+    /// out must settle `NotApplied` — the TX worker then waits out the
+    /// revoked playback instead of proceeding past an unfinished flush that
+    /// a late callback run would apply to whatever is queued by then.
     #[tokio::test]
-    async fn flush_settles_not_applied_when_queue_output_errs() {
+    async fn flush_settles_not_applied_when_the_flush_handshake_times_out() {
         let (ack, mut waiter) = DeliveryAck::new();
-        let r: Result<(), String> = TxAudioCommand::Flush {
+        let mut executor = FakeExecutor {
+            queued: None,
+            flush_result: Ok(false),
+        };
+        TxAudioCommand::Flush {
             sample_rate: 12_000,
             ack,
         }
-        .apply(|_, _, _| Err("Output stream not initialized".into()));
+        .apply(&mut executor)
+        .expect("flush request itself succeeded");
+        assert_eq!(
+            waiter.wait_for(Duration::from_millis(10)).await,
+            AckState::NotApplied
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_settles_not_applied_when_queue_output_errs() {
+        let (ack, mut waiter) = DeliveryAck::new();
+        let mut executor = FakeExecutor {
+            queued: None,
+            flush_result: Err("Output stream not initialized".into()),
+        };
+        let r = TxAudioCommand::Flush {
+            sample_rate: 12_000,
+            ack,
+        }
+        .apply(&mut executor);
         assert!(r.is_err());
         assert_eq!(
             waiter.wait_for(Duration::from_millis(10)).await,

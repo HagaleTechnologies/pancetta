@@ -1127,7 +1127,6 @@ struct ComponentChannel {
     last_heartbeat: Arc<RwLock<Option<Instant>>>,
 }
 
-<<<<<<< HEAD
 /// What a [`DeliveryAckWaiter`] observed (PAN-135).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AckState {
@@ -1207,7 +1206,8 @@ impl DeliveryAckWaiter {
         }
         state
     }
-=======
+}
+
 /// Outcome of [`MessageBus::send_message_if`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendIfOutcome {
@@ -1217,7 +1217,6 @@ pub enum SendIfOutcome {
     Denied,
     /// Delivery failed: expired, full, disconnected, or no destination.
     Dropped,
->>>>>>> e90233a7630f5f5c7f3889782824b310ae692edf
 }
 
 /// High-performance message bus for inter-component communication
