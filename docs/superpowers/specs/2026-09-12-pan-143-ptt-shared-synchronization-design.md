@@ -253,7 +253,11 @@ wait would still permit stale content when the event consumer lags.
 shares one instance with the QSO manager and TX worker. A successful
 `apply_tx_offset_switch` bumps its QSO's counter after the Hold/PTT refusals and
 before the frequency commit, under `ptt_sync_gate`. Refused switches bump
-nothing. Manager clones share the counters; an uninjected manager uses a private
+nothing. The two inline TX-frequency relocations — the simplex drift relatch in
+`maybe_confirm_frequency_drift_at` and the mandatory Hound QSY in
+`process_message_for_qso` — bump at their frequency commits as well (PR #458
+review); they mutate under the QSO write lock without the gate and are never
+refused. Manager clones share the counters; an uninjected manager uses a private
 instance. The counter map uses a synchronous mutex that never spans an await.
 
 Both worker arms snapshot the relevant counters before reading the intent
@@ -266,7 +270,11 @@ without a QSO id and tune requests keep their existing paths. Other QSOs'
 relocations do not invalidate the frame.
 
 The shared gate remains essential. Once the worker sets `ptt_active` under it,
-a later relocation refuses before its bump. The counter detects relocations
+a later offset switch refuses before its bump. The two ungated inline
+relocations can still commit (and bump) after that store, but a bump landing
+after the worker's post-gate check cannot retroactively stale the frame being
+keyed — that ordering keeps the pre-existing supersede path, and the next
+snapshot reads the bumped counter. The counter detects relocations
 between the snapshot and that store, including ones whose event has not reached
 the mirror. It complements the PAN-143 mutual exclusion; it does not replace it
 with the ungated generation/CAS approach rejected above. Lock order is

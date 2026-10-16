@@ -3318,6 +3318,16 @@ impl QsoManager {
                 } else {
                     let old_state = progress.state.clone();
                     progress.metadata.frequency = frequency;
+                    // PAN-145 (PR #458 review): on a simplex (Tx=Rx) QSO this
+                    // relatch IS a TX-frequency relocation — the same class as
+                    // `apply_tx_offset_switch`. Bump the relocation epoch at
+                    // the commit so a TX worker that snapshotted its intent
+                    // before this point and is waiting on `ptt_sync_gate`
+                    // refuses the stale frame instead of keying it at the
+                    // abandoned offset. The split arm above relatches only
+                    // `partner_freq` (RX side; "our TX offset is unchanged")
+                    // and must NOT bump.
+                    self.relocation_epochs.bump(&qso_id.to_string());
                     match &mut progress.state {
                         QsoState::RespondingToCq {
                             frequency: state_freq,
@@ -5010,6 +5020,14 @@ impl QsoManager {
                 let qsy = hound_offset_for(fox_call, resp_min, resp_max);
                 let old_off = progress.metadata.frequency;
                 progress.metadata.frequency = qsy;
+                // PAN-145 (PR #458 review): the mandatory Hound QSY relocates
+                // this QSO's TX offset inline — the same class as
+                // `apply_tx_offset_switch`, minus the gate (procedure-mandated:
+                // fires exactly once, never refused). Bump the relocation
+                // epoch at the commit so a TX worker parked on `ptt_sync_gate`
+                // with the Hound's calling frame at `old_off` refuses it
+                // instead of keying at the abandoned calling offset.
+                self.relocation_epochs.bump(&qso_id.to_string());
                 progress.metadata.pending_freq_drift = None;
                 progress.metadata.hound_qsyed = true;
                 // PAN-72 (Codex round 1 on PR #350, finding 5): re-anchor the
@@ -11204,6 +11222,113 @@ mod tests {
             Err(QsoManagerError::OffsetActionPttInFlight { .. })
         ));
         assert_eq!(manager.relocation_epochs.epoch(&qso_id.to_string()), 0);
+    }
+
+    /// PAN-145 (PR #458 review): the simplex drift relatch relocates the
+    /// QSO's TX frequency directly, without `apply_tx_offset_switch`. It must
+    /// bump the relocation epoch at the commit, or the TX worker's post-gate
+    /// staleness check accepts a frame encoded at the abandoned offset.
+    /// Calls `maybe_confirm_frequency_drift_at` directly (like the drift tests
+    /// above) so the two-strike >=5s confirmation gap is driven by explicit
+    /// timestamps instead of a real sleep.
+    #[tokio::test]
+    async fn simplex_drift_relatch_bumps_the_relocation_epoch() {
+        let manager = QsoManager::new(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual("LU7LRP".into(), 1500.0, None)
+            .await
+            .unwrap();
+        let report = MessageType::SignalReport {
+            to_station: "W1ABC".into(),
+            from_station: "LU7LRP".into(),
+            report: -11,
+        };
+        let first_sighting = Utc::now();
+        manager
+            .maybe_confirm_frequency_drift_at(&report, 937.5, first_sighting)
+            .await;
+        assert_eq!(
+            manager.relocation_epochs.epoch(&qso_id.to_string()),
+            0,
+            "premise: a mere drift candidate must not invalidate in-flight frames"
+        );
+        manager
+            .maybe_confirm_frequency_drift_at(
+                &report,
+                937.5,
+                first_sighting + chrono::Duration::seconds(6),
+            )
+            .await;
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            progress.metadata.frequency, 937.5,
+            "premise: the simplex relatch must have committed"
+        );
+        assert!(
+            manager.relocation_epochs.epoch(&qso_id.to_string()) >= 1,
+            "the confirmed simplex relatch must bump the relocation epoch"
+        );
+    }
+
+    /// PAN-145 (PR #458 review): the mandatory Hound QSY relocates the QSO's
+    /// TX frequency inline in `process_message_for_qso`. It must bump the
+    /// relocation epoch at the commit, or the TX worker's post-gate staleness
+    /// check accepts the Hound's calling frame at the abandoned calling
+    /// offset.
+    #[tokio::test]
+    async fn hound_qsy_bumps_the_relocation_epoch() {
+        let manager = QsoManager::new(test_config());
+        let qso_id = manager
+            .engage_hound(
+                "D2UY",
+                1800.0,
+                Some("JI64"),
+                Some(pancetta_core::slot::SlotParity::Even),
+            )
+            .await
+            .unwrap();
+        // Two off-Fox sightings: no QSY (premise), no epoch movement.
+        for snr in [-19.0, -17.0] {
+            manager
+                .process_message(
+                    MessageType::SignalReport {
+                        to_station: "W1ABC".into(),
+                        from_station: "D2UY".into(),
+                        report: -12,
+                    },
+                    "W1ABC D2UY -12".into(),
+                    900.0,
+                    Some(snr),
+                )
+                .await
+                .unwrap();
+        }
+        assert!(!manager.get_qso(qso_id).await.unwrap().metadata.hound_qsyed);
+        assert_eq!(manager.relocation_epochs.epoch(&qso_id.to_string()), 0);
+        // The Fox answers on its own frequency: RespondingToCq ->
+        // SendingReport, the mandatory QSY fires.
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "W1ABC".into(),
+                    from_station: "D2UY".into(),
+                    report: -12,
+                },
+                "W1ABC D2UY -12".into(),
+                1800.0,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            progress.metadata.hound_qsyed,
+            "premise: the Fox's report must fire the mandatory QSY"
+        );
+        assert!(
+            manager.relocation_epochs.epoch(&qso_id.to_string()) >= 1,
+            "the mandatory Hound QSY must bump the relocation epoch"
+        );
     }
 
     #[tokio::test]

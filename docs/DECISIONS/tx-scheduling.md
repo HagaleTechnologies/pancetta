@@ -6,7 +6,10 @@
 ## Post-gate relocation revalidation (PAN-145, 2026-10-16)
 
 A successful QSO offset switch bumps a per-QSO epoch under `ptt_sync_gate`,
-before committing the frequency. The TX worker snapshots epochs before its
+before committing the frequency. The simplex drift relatch and the mandatory
+Hound QSY — the two inline TX-frequency relocations — bump at their commits
+too (PR #458 review), so every stored TX-offset mutation invalidates in-flight
+snapshots. The TX worker snapshots epochs before its
 intent read and compares them after acquiring the gate. A relocation across
 that interval drops the single frame or the whole summed bundle before PTT,
 with unaired accounting and pivot-tombstone cleanup. Counters are keyed by raw
