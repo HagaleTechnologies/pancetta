@@ -271,13 +271,18 @@ pub struct CollisionResult {
 pub struct CollisionDetector {
     pub our_tx_offset_hz: f64,
     pub tolerance_hz: f64,
+    /// Our own callsign. A decode attributed to us (our own TX heard back
+    /// through RX-path leakage) is never an interferer — counting it would
+    /// start a collision cooldown against ourselves.
+    pub our_callsign: String,
 }
 
 impl CollisionDetector {
-    pub fn new(our_tx_offset_hz: f64, tolerance_hz: f64) -> Self {
+    pub fn new(our_tx_offset_hz: f64, tolerance_hz: f64, our_callsign: String) -> Self {
         Self {
             our_tx_offset_hz,
             tolerance_hz,
+            our_callsign,
         }
     }
 
@@ -288,6 +293,10 @@ impl CollisionDetector {
             let delta = (msg.frequency_hz - self.our_tx_offset_hz).abs();
             if delta <= self.tolerance_hz {
                 if let Some(ref call) = msg.callsign {
+                    // Portable/compound-aware (`W5AU/P`, `EA8/W5AU` match `W5AU`).
+                    if callsigns_match(call, &self.our_callsign) {
+                        continue;
+                    }
                     interfering_calls.push(call.clone());
                 }
             }
@@ -1087,7 +1096,8 @@ pub struct AutonomousOperator {
 impl AutonomousOperator {
     pub fn new(config: AutonomousConfig, our_callsign: String, our_grid: Option<String>) -> Self {
         let slot_manager = SlotManager::new(config.slot_parity, &config.listen_cycle);
-        let collision_detector = CollisionDetector::new(config.tx_offset_hz, 50.0);
+        let collision_detector =
+            CollisionDetector::new(config.tx_offset_hz, 50.0, our_callsign.clone());
         let band_strategy = BandStrategy::new(config.band_hopping.clone());
         // FT8 bandwidth: 8 tones * 6.25 Hz = 50 Hz, plus 25 Hz guard = 75 Hz min separation
         let frequency_allocator = FrequencyAllocator::new(75.0, (200.0, 2800.0));
@@ -3164,7 +3174,7 @@ mod tests {
 
     #[test]
     fn test_collision_detector_no_collision() {
-        let detector = CollisionDetector::new(1500.0, 50.0);
+        let detector = CollisionDetector::new(1500.0, 50.0, "W5AU".into());
         let messages = vec![DecodedMessageInfo {
             callsign: Some("K1DEF".into()),
             frequency_hz: 800.0,
@@ -3182,7 +3192,7 @@ mod tests {
 
     #[test]
     fn test_collision_detector_collision() {
-        let detector = CollisionDetector::new(1500.0, 50.0);
+        let detector = CollisionDetector::new(1500.0, 50.0, "W5AU".into());
         let messages = vec![DecodedMessageInfo {
             callsign: Some("K1DEF".into()),
             frequency_hz: 1520.0,
@@ -3197,6 +3207,59 @@ mod tests {
         let result = detector.check_for_collision(&messages);
         assert!(result.detected);
         assert_eq!(result.interfering_calls, vec!["K1DEF".to_string()]);
+    }
+
+    fn decoded_at(callsign: &str, frequency_hz: f64, text: &str) -> DecodedMessageInfo {
+        DecodedMessageInfo {
+            callsign: Some(callsign.into()),
+            frequency_hz,
+            snr: -10,
+            message_text: text.into(),
+            slot_parity: None,
+            confidence: None,
+            time_offset_s: None,
+            decode_origin: None,
+        }
+    }
+
+    #[test]
+    fn collision_detector_ignores_our_own_callsign() {
+        // Regression (sophon 2026-10-15): our own `C5R W5AU R-11` decoded
+        // back at our TX offset logged `Collision detected with: ["W5AU"]`.
+        let detector = CollisionDetector::new(1531.0, 50.0, "W5AU".into());
+        let result = detector.check_for_collision(&[decoded_at("W5AU", 1531.2, "C5R W5AU R-11")]);
+        assert!(!result.detected);
+        assert!(result.interfering_calls.is_empty());
+    }
+
+    #[test]
+    fn collision_detector_own_call_match_is_case_and_portable_insensitive() {
+        let detector = CollisionDetector::new(1500.0, 50.0, "W5AU".into());
+        for own in ["w5au", "W5AU/P", "EA8/W5AU", " W5AU "] {
+            let result = detector.check_for_collision(&[decoded_at(own, 1510.0, "CQ W5AU EM10")]);
+            assert!(!result.detected, "{own:?} must be treated as our own call");
+        }
+        let portable = CollisionDetector::new(1500.0, 50.0, "W5AU/P".into());
+        assert!(
+            !portable
+                .check_for_collision(&[decoded_at("W5AU", 1510.0, "CQ W5AU EM10")])
+                .detected
+        );
+    }
+
+    #[test]
+    fn collision_detector_still_reports_others_alongside_our_own_call() {
+        let detector = CollisionDetector::new(1500.0, 50.0, "W5AU".into());
+        let result = detector.check_for_collision(&[
+            decoded_at("W5AU", 1500.0, "C5R W5AU EM10"),
+            decoded_at("W5AUX", 1505.0, "CQ W5AUX EM10"),
+            decoded_at("K1DEF", 1520.0, "CQ K1DEF FN31"),
+        ]);
+        assert!(result.detected);
+        assert_eq!(
+            result.interfering_calls,
+            vec!["W5AUX".to_string(), "K1DEF".to_string()]
+        );
     }
 
     #[test]
