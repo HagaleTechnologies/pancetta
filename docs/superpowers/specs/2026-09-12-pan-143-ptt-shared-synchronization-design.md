@@ -239,3 +239,51 @@ This spec does not address PAN-134's other named site (the arm-authorization
 check-then-enqueue gap in `MessageBus::send_message`, PAN-138) — that is a different
 subsystem (arm/authorization vs. frequency/PTT scheduling) and a different parent-ticket
 follow-up, tracked separately.
+
+
+## PAN-145 amendment, 2026-10-16: revalidate after the gate wait
+
+PAN-143 round 4 found that the worker can read `latest_tx_intent`, build a
+waveform, and then wait for a relocation to release `ptt_sync_gate`. The
+relocation publishes its events before releasing the gate, but the coordinator
+updates the intent mirror asynchronously. Reading that mirror again after the
+wait would still permit stale content when the event consumer lags.
+
+`TxRelocationEpochs` now records a counter per raw `QsoId` string. The coordinator
+shares one instance with the QSO manager and TX worker. A successful
+`apply_tx_offset_switch` bumps its QSO's counter after the Hold/PTT refusals and
+before the frequency commit, under `ptt_sync_gate`. Refused switches bump
+nothing. Manager clones share the counters; an uninjected manager uses a private
+instance. The counter map uses a synchronous mutex that never spans an await.
+
+Both worker arms snapshot the relevant counters before reading the intent
+mirror. After `PttGuard::new` sets `ptt_active` under the gate, the first final
+pre-PTT check compares those snapshots. A changed counter refuses the single
+frame, or the whole already-summed bundle, before any PTT-on send. The refusal
+clears the PTT flag, disarms the guard, unwinds this attempt's pivot tombstones,
+clears the queue display, and reports each frame unaired. Manual/test frames
+without a QSO id and tune requests keep their existing paths. Other QSOs'
+relocations do not invalidate the frame.
+
+The shared gate remains essential. Once the worker sets `ptt_active` under it,
+a later relocation refuses before its bump. The counter detects relocations
+between the snapshot and that store, including ones whose event has not reached
+the mirror. It complements the PAN-143 mutual exclusion; it does not replace it
+with the ungated generation/CAS approach rejected above. Lock order is
+`qsos` then `ptt_sync_gate` then the epoch map; epoch readers release the map
+before awaiting anything.
+
+The refusal follows PAN-148's drop-only final gate. No re-encoding or modulation
+runs under the gate, and the slot-lateness check stays last. The fresh request
+from relocation or rearm can transmit in a later eligible slot. Acquiring the
+gate before modulation would extend contention across DSP work while still
+reading an asynchronous mirror. Repeating the pivot after acquisition would
+also depend on that mirror and duplicate the rebuild path. Neither is needed
+for detecting a relocation across this wait.
+
+Regression tests queue a real relocation ahead of the real worker on the FIFO
+gate. A test-only notification marks waveform completion, so the tests need no
+sleep-based assumption about reaching the wait. They leave the mirror stale,
+assert no hardware PTT-on and unaired reports, and check that fresh requests
+remain eligible after pivot cleanup. No-race controls still key. Hardware
+verification is outside this container run.

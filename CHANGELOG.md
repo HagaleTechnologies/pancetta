@@ -114,6 +114,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- TX now refuses a stale frame when its QSO relocates while the worker waits
+  for the PTT synchronization gate (PAN-145). A per-QSO relocation counter
+  detects the change even before the coordinator updates its intent mirror.
+  Single frames and summed bundles are dropped before PTT, with unaired-frame
+  accounting and duplicate-suppression cleanup so a fresh request can retry.
+
 - QSO log index and backups: when startup rebuilt `~/.pancetta/qso.db` from
   a newer `qsos.adi`, the SQLite logger had already opened the old file, so
   QSOs it logged that session never reached the live index and its startup

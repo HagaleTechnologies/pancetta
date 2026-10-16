@@ -3,6 +3,25 @@
 
 # TX scheduling
 
+## Post-gate relocation revalidation (PAN-145, 2026-10-16)
+
+A successful QSO offset switch bumps a per-QSO epoch under `ptt_sync_gate`,
+before committing the frequency. The TX worker snapshots epochs before its
+intent read and compares them after acquiring the gate. A relocation across
+that interval drops the single frame or the whole summed bundle before PTT,
+with unaired accounting and pivot-tombstone cleanup. Counters are keyed by raw
+QSO ids, shared through coordinator injection, and retained across manager
+clones. Unrelated QSOs and frames without a QSO id do not trigger this check.
+
+A second read of `latest_tx_intent` cannot establish freshness: the coordinator
+updates it asynchronously after the relocation publishes its events. Holding
+the gate through modulation would add DSP latency without closing that mirror
+gap. Rebuilding after the wait would duplicate the same vulnerable read and the
+encoding path. The epoch comparison therefore uses PAN-148's drop-only final
+gate; a fresh request can key a later eligible slot. The PTT gate still prevents
+any later relocation while the worker is preparing to key. See the PAN-145
+amendment in `docs/superpowers/specs/2026-09-12-pan-143-ptt-shared-synchronization-design.md`.
+
 ## DX-slot-aware TX scheduling
 
 `pancetta/src/coordinator/tx.rs`: WSJT-X-style. Every `DecodedMessage` carries `slot_parity`; the QSO state machine latches `tx_parity = opposite_of(dx_parity)` at QSO start; the TX scheduler picks the next slot of that parity, padding silent samples if early or skip-ahead-cursoring into the modulated waveform if late (up to `tx_late_max_ms`, default 3s, minus the unconditional coalesce window + safety margin reserved at the queue-time acceptance check). Past that, defers 30s. Never collides with the DX's parity. See `docs/superpowers/specs/2026-04-27-dx-slot-aware-tx-design.md` — its "the first received decode will refine the parity for any subsequent QSO responses" promise is now implemented (2026-07-18 review, Batch 2): a QSO opened with no observed `dx_parity` (a cluster/DX-Hunter spot pick) latches a provisional parity and refines it to the true opposite-of-DX value on the first genuine decode from the latched partner.

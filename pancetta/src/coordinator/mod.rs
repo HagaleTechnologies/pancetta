@@ -1364,6 +1364,13 @@ pub struct ApplicationCoordinator {
     /// 2026-09-12-pan-143-ptt-shared-synchronization-design.md`.
     pub(crate) ptt_sync_gate: Arc<tokio::sync::Mutex<()>>,
 
+    /// PAN-145: synchronous relocation evidence for post-gate TX revalidation.
+    pub(crate) relocation_epochs: Arc<pancetta_qso::qso_manager::TxRelocationEpochs>,
+
+    /// Test handshake after waveform construction, immediately before the gate wait.
+    #[cfg(test)]
+    tx_before_ptt_gate: Arc<tokio::sync::Notify>,
+
     /// Epoch-ms timestamp of the most recent PTT-on (updated alongside
     /// `ptt_active` going true). Unlike the boolean, this survives past
     /// unkey, so the FT8 decode loop can flag a "TX-adjacent" window —
@@ -2164,6 +2171,9 @@ impl ApplicationCoordinator {
             fox_max_streams: Arc::new(AtomicUsize::new(fox_max_streams_init)),
             ptt_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ptt_sync_gate: Arc::new(tokio::sync::Mutex::new(())),
+            relocation_epochs: Arc::new(pancetta_qso::qso_manager::TxRelocationEpochs::default()),
+            #[cfg(test)]
+            tx_before_ptt_gate: Arc::new(tokio::sync::Notify::new()),
             last_ptt_on_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             // C9 dedup anchor — no pancetta-initiated frequency command yet.
             last_freq_command: Arc::new(std::sync::Mutex::new(None)),
