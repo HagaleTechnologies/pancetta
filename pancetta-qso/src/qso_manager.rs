@@ -1063,7 +1063,8 @@ pub enum UnsentAttemptRollback {
 pub struct UnsentAttemptPayload {
     pub frequency_hz: f64,
     /// `(remote_origin, remote_client_key_id)`, or `None` when the reporter
-    /// cannot see the frame's binding (multi-TX bundle items).
+    /// does not supply the frame's binding (a multi-TX supersede that kept
+    /// the bundle's authorization).
     pub remote_binding: Option<(bool, Option<String>)>,
 }
 

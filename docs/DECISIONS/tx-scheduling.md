@@ -322,8 +322,9 @@ Autonomous still gets a failed completion for the pivoted payload, as on Step
 0-dup; correlating it with the queued request's eventual outcome is PAN-185. An F8 abort keeps the
 tombstone, so Step 0-dup later reports the replaced frame. Backlog coalescing
 consumes pivot duplicates before it picks the newest request per QSO, so a
-duplicate superseded in the backlog still reports its replaced frame. Multi-TX bundle items
-carry no binding, which matches bundle pivots comparing only text and offset.
+duplicate superseded in the backlog still reports its replaced frame. Since PAN-136,
+multi-TX bundle items carry their own binding: a bundle pivot compares it alongside text
+and offset, and reports the replaced frame's binding like a single-frame pivot.
 If a rollback takes `stall_cycles` from the switch threshold back below it
 before the coordinator's drain commits a stall offset action that attempt
 raised, the commit is refused (`OffsetActionStallRolledBack`) until the streak
