@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{broadcast, RwLock};
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, interval_at, Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 // ---------------------------------------------------------------------------
@@ -399,6 +399,33 @@ pub enum AsyncLoggerError {
     Configuration { message: String },
 }
 
+/// How long after `start()` the first automatic backup waits. Startup is
+/// when the coordinator may rebuild `qso.db` from ADIF; backing up in that
+/// window raced the rebuild ("file is not a database" / "malformed").
+/// Short enough that a station restarted more often than
+/// `backup_interval` still gets backups.
+const STARTUP_BACKUP_DELAY: Duration = Duration::from_secs(300);
+
+/// Delay before the first automatic backup: [`STARTUP_BACKUP_DELAY`], or the
+/// configured period if that is shorter.
+fn first_backup_delay(period: Duration) -> Duration {
+    STARTUP_BACKUP_DELAY.min(period)
+}
+
+/// A relative `backup_directory` is anchored next to the database file
+/// (`~/.pancetta/backups` for `~/.pancetta/qso.db`), not the process cwd.
+/// An absolute directory, or a database with no parent directory
+/// (`:memory:`), is used as-is.
+fn resolve_backup_directory(dir: &Path, database_path: &Path) -> PathBuf {
+    if dir.is_absolute() {
+        return dir.to_path_buf();
+    }
+    match database_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(dir),
+        _ => dir.to_path_buf(),
+    }
+}
+
 /// Async QSO logger with Send/Sync support
 #[derive(Clone)]
 pub struct QsoLogger {
@@ -664,10 +691,11 @@ impl QsoLogger {
     pub async fn create_backup(&self) -> Result<PathBuf, AsyncLoggerError> {
         let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
         let backup_filename = format!("qso_backup_{}.db", timestamp);
-        let backup_path = self.config.backup.backup_directory.join(backup_filename);
+        let backup_directory = self.backup_directory();
+        let backup_path = backup_directory.join(backup_filename);
 
         // Ensure backup directory exists
-        tokio::fs::create_dir_all(&self.config.backup.backup_directory).await?;
+        tokio::fs::create_dir_all(&backup_directory).await?;
 
         // Perform backup
         self.database.backup(&backup_path).await?;
@@ -749,9 +777,20 @@ impl QsoLogger {
         }
     }
 
+    fn backup_directory(&self) -> PathBuf {
+        resolve_backup_directory(
+            &self.config.backup.backup_directory,
+            &self.config.database_path,
+        )
+    }
+
     async fn backup_loop(&self) {
         let backup_interval = Duration::from_secs(self.config.backup.backup_interval as u64 * 3600);
-        let mut interval_timer = interval(backup_interval);
+        // Not `interval()`: its first tick completes immediately.
+        let mut interval_timer = interval_at(
+            Instant::now() + first_backup_delay(backup_interval),
+            backup_interval,
+        );
 
         loop {
             interval_timer.tick().await;
@@ -869,7 +908,7 @@ impl QsoLogger {
     }
 
     async fn cleanup_old_backups(&self) -> Result<(), AsyncLoggerError> {
-        let mut entries = tokio::fs::read_dir(&self.config.backup.backup_directory).await?;
+        let mut entries = tokio::fs::read_dir(self.backup_directory()).await?;
         let mut backups = Vec::new();
 
         while let Some(entry) = entries.next_entry().await? {
@@ -1010,6 +1049,76 @@ mod tests {
 
         let logger = QsoLogger::new(config, qso_manager).await;
         assert!(logger.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_relative_backup_directory_resolves_next_to_the_database() {
+        // The default `backups` used to resolve against the process cwd, so a
+        // `cargo run` from a checkout wrote backups into the repo.
+        let config = test_logger_config();
+        let db_dir = config.database_path.parent().unwrap().to_path_buf();
+        assert!(config.backup.backup_directory.is_relative());
+        let logger = QsoLogger::new(config, QsoManager::new(QsoManagerConfig::default()))
+            .await
+            .unwrap();
+
+        let backup = logger.create_backup().await.unwrap();
+        assert_eq!(backup.parent().unwrap(), db_dir.join("backups"));
+        assert!(backup.exists());
+    }
+
+    #[test]
+    fn test_resolve_backup_directory() {
+        let db = Path::new("/home/op/.pancetta/qso.db");
+        assert_eq!(
+            resolve_backup_directory(Path::new("backups"), db),
+            PathBuf::from("/home/op/.pancetta/backups")
+        );
+        assert_eq!(
+            resolve_backup_directory(Path::new("/srv/bk"), db),
+            PathBuf::from("/srv/bk")
+        );
+        // `:memory:` has no directory to anchor to.
+        assert_eq!(
+            resolve_backup_directory(Path::new("backups"), Path::new(":memory:")),
+            PathBuf::from("backups")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backup_loop_does_not_back_up_at_startup() {
+        // sophon 2026-10-07 / 2026-10-15: the first `interval()` tick fired
+        // immediately and raced the startup ADIF->index rebuild of the same
+        // qso.db, failing with "file is not a database" / "malformed".
+        let mut config = test_logger_config();
+        let backup_dir = config.database_path.parent().unwrap().join("bk");
+        config.backup.backup_directory = backup_dir.clone();
+        let logger = QsoLogger::new(config, QsoManager::new(QsoManagerConfig::default()))
+            .await
+            .unwrap();
+        logger.start().await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let count = std::fs::read_dir(&backup_dir)
+            .map(|d| d.count())
+            .unwrap_or(0);
+        assert_eq!(
+            count, 0,
+            "no backup may run in the first moments after start"
+        );
+    }
+
+    #[test]
+    fn test_first_backup_delay_is_bounded_by_the_interval() {
+        assert_eq!(
+            first_backup_delay(Duration::from_secs(24 * 3600)),
+            STARTUP_BACKUP_DELAY
+        );
+        assert_eq!(
+            first_backup_delay(Duration::from_secs(60)),
+            Duration::from_secs(60)
+        );
+        assert!(STARTUP_BACKUP_DELAY >= Duration::from_secs(60));
     }
 
     #[tokio::test]

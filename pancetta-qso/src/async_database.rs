@@ -608,11 +608,33 @@ impl QsoDatabase {
         // of the literal and inject SQL.
         let escaped_path = escape_sqlite_string_literal(&backup_path_str);
 
+        // Only a target this call created may be cleaned up on failure; an
+        // existing file (or one whose existence can't be determined) is left
+        // alone. VACUUM INTO itself refuses a non-empty existing target.
+        let target_preexisted = tokio::fs::try_exists(backup_path.as_ref())
+            .await
+            .unwrap_or(true);
+
         // Use VACUUM INTO which atomically creates a complete copy of the database.
-        sqlx::query(&format!("VACUUM INTO '{}'", escaped_path))
+        if let Err(e) = sqlx::query(&format!("VACUUM INTO '{}'", escaped_path))
             .execute(&self.pool)
             .await
-            .map_err(AsyncDatabaseError::Sqlx)?;
+        {
+            // A failed VACUUM INTO can leave a partial (often 0-byte) target
+            // behind, which would then count as a backup for retention.
+            if !target_preexisted {
+                match tokio::fs::remove_file(backup_path.as_ref()).await {
+                    Ok(()) => {}
+                    Err(rm) if rm.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(rm) => warn!(
+                        "Could not remove partial backup {}: {}",
+                        backup_path.as_ref().display(),
+                        rm
+                    ),
+                }
+            }
+            return Err(AsyncDatabaseError::Sqlx(e));
+        }
 
         info!("Database backup completed (VACUUM INTO)");
         Ok(())
@@ -1279,6 +1301,62 @@ mod tests {
             db.backup("/tmp/ev\nil.db").await,
             Err(AsyncDatabaseError::InvalidQuery { .. })
         ));
+    }
+
+    /// A real on-disk database whose non-header pages are overwritten, so
+    /// opening it still works (page 1 / `sqlite_master` is intact) but a full
+    /// read such as `VACUUM INTO` fails with "database disk image is malformed".
+    async fn open_corrupted_db(dir: &std::path::Path) -> QsoDatabase {
+        let db_path = dir.join("corrupt.db");
+        let db = QsoDatabase::open(&db_path).await.unwrap();
+        // Fold the WAL into the main file so every page is on disk to corrupt.
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        // Corrupt the `qsos` table's root page: schema init on reopen never
+        // reads it, but VACUUM copies every table row and must.
+        let root: i64 =
+            sqlx::query_scalar("SELECT rootpage FROM sqlite_master WHERE name = 'qsos'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        db.pool.close().await;
+        let mut bytes = std::fs::read(&db_path).unwrap();
+        let start = (root as usize - 1) * 4096;
+        for b in &mut bytes[start..start + 4096] {
+            *b = 0xFF;
+        }
+        std::fs::write(&db_path, &bytes).unwrap();
+        QsoDatabase::open(&db_path).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_failed_backup_removes_the_partial_target() {
+        // sophon 2026-10-07 / 2026-10-15: each failed VACUUM INTO left a
+        // 0-byte `qso_backup_*.db` behind, which then counted towards
+        // `retain_count` and pushed real backups out.
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_corrupted_db(dir.path()).await;
+        let target = dir.path().join("backup.db");
+
+        assert!(db.backup(&target).await.is_err());
+        assert!(
+            !target.exists(),
+            "a failed backup must not leave a partial file behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_failed_backup_never_removes_a_preexisting_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = QsoDatabase::open(dir.path().join("ok.db")).await.unwrap();
+        let target = dir.path().join("existing.db");
+        std::fs::write(&target, b"not ours").unwrap();
+
+        // VACUUM INTO refuses a non-empty existing target.
+        assert!(db.backup(&target).await.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"not ours");
     }
 
     // --- Security: I-9 (LIMIT clamping) -----------------------------------
