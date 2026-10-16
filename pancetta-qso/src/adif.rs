@@ -1195,16 +1195,35 @@ fn read_value(data: &[u8], text: Option<&str>, start: usize, len: usize) -> (Str
 }
 
 /// True when only whitespace separates `at` from the end, or from a `<` that
-/// [`next_tag`] does not start over: no other `<` comes before its `>` (or
-/// the end, for a file cut off inside its last tag). A stray `<` in a value,
-/// such as the one in `üñabc<x<MODE:3>`, is not a tag.
+/// opens a real tag: one [`next_tag`] does not start over (no other `<`
+/// comes before its `>`) and whose spec is `<EOR>`, `<EOH>` or carries a
+/// length (`<NAME:LEN…>`), or a tag the file ends inside of. A stray `<` in a
+/// value, such as the one in `üñabc<x<MODE:3>`, is not a tag, and neither is
+/// a closed lookalike with no length, such as the `<x>` in `€ñab<x>`.
 fn before_tag(data: &[u8], at: usize) -> bool {
-    match data[at..].iter().position(|b| !b.is_ascii_whitespace()) {
-        None => true,
-        Some(i) => {
-            data[at + i] == b'<' && next_tag(data, at + i).is_none_or(|(open, _)| open == at + i)
-        }
+    let Some(i) = data[at..].iter().position(|b| !b.is_ascii_whitespace()) else {
+        return true;
+    };
+    let open = at + i;
+    if data[open] != b'<' {
+        return false;
     }
+    match next_tag(data, open) {
+        None => true,
+        Some((start, close)) => start == open && is_tag_spec(&data[open + 1..close]),
+    }
+}
+
+/// A tag spec that ends a value: `EOR`, `EOH`, or `NAME:LEN[:TYPE]` with a
+/// decimal length.
+fn is_tag_spec(spec: &[u8]) -> bool {
+    if spec.eq_ignore_ascii_case(b"EOR") || spec.eq_ignore_ascii_case(b"EOH") {
+        return true;
+    }
+    let mut parts = spec.split(|&b| b == b':');
+    let name = parts.next().unwrap_or_default();
+    let length = parts.next().unwrap_or_default();
+    !name.is_empty() && !length.is_empty() && length.iter().all(u8::is_ascii_digit)
 }
 
 impl Default for AdifProcessor {
@@ -1832,6 +1851,21 @@ ADIF Export for Test Program
         let record = only_record(&parsed);
         assert_eq!(record.fields["NOTES"].value, "üñabc<x");
         assert_eq!(record.fields["MODE"].value, "FT8");
+    }
+
+    #[test]
+    fn parse_bytes_keeps_a_closed_lookalike_tag_in_a_character_counted_value() {
+        // Seven characters, ten bytes: the byte count lands before `<x>`,
+        // which is part of the value. `<x>` carries no length, so it is not
+        // a field tag and must not end the value (PR #451 review).
+        let adif = "<CALL:4>W1AW <NOTES:7>€ñab<x><MODE:3>FT8 <EOR>\n";
+
+        let parsed = AdifProcessor::new().parse_bytes(adif.as_bytes());
+
+        let record = only_record(&parsed);
+        assert_eq!(record.fields["NOTES"].value, "€ñab<x>");
+        assert_eq!(record.fields["MODE"].value, "FT8");
+        assert!(!record.fields.contains_key("X"), "{:?}", record.fields);
     }
 
     #[test]
