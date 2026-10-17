@@ -146,9 +146,10 @@ struct ArmContext {
     arm: Arc<Mutex<ArmState>>,
     /// The coordinator's shared split-TX dial (0 = simplex) — the source the
     /// TX band-plan gate (`tx::tx_rf_for_gate`) and the QSO RF stamp read. A
-    /// remote `SetSplit` writes it (via [`super::record_split_state`], the
-    /// same helper the local TUI path uses) before forwarding to Hamlib, so a
-    /// remote split is gated exactly like a local one (PR #446 Codex review).
+    /// remote `SetSplit` writes it via [`super::forward_split_change`] (the
+    /// same helper the local TUI path uses) once Hamlib's channel accepts the
+    /// change, so a remote split is gated exactly like a local one (PR #446
+    /// Codex review) and a dropped one never loosens the gate (PAN-209).
     split_tx_frequency_hz: Arc<std::sync::atomic::AtomicU64>,
     verifier: CapabilityVerifier,
     /// Verifying keys for allow-listed clients, keyed by client keyId. Shared
@@ -977,17 +978,15 @@ async fn dispatch_action(
                 return DispatchOutcome::cont_with(grab);
             }
             let tx_frequency = tx_frequency_hz.max(0.0) as u64;
-            // Update the shared split source BEFORE the rig command, exactly
-            // like the local TUI path, so the TX band-plan gate checks the
-            // remote split dial, never the stale RX dial (PR #446 Codex
-            // review). Split is never polled back from the rig, so this is
-            // the only place a remote split reaches the gate.
-            let store = crate::coordinator::record_split_state(
+            info!(target: "rig.split", peer = %peer, "remote SetSplit enabled={enabled} tx={tx_frequency} Hz");
+            let store = crate::coordinator::forward_split_change(
+                bus,
+                ComponentId::StationAgent,
                 &ctx.split_tx_frequency_hz,
                 enabled,
                 tx_frequency,
-            );
-            info!(target: "rig.split", peer = %peer, "remote SetSplit enabled={enabled} tx={tx_frequency} Hz");
+            )
+            .await;
             // Echo the authoritative split state to the local TUI chip.
             let status = ComponentMessage::new(
                 ComponentId::StationAgent,
@@ -998,11 +997,6 @@ async fn dispatch_action(
             if let Err(e) = bus.send_message(status).await {
                 debug!(target: "agent.control", "split status echo failed: {e}");
             }
-            let msg = RigControlMessage::SetSplit {
-                enabled,
-                tx_frequency,
-            };
-            send_rig(bus, msg).await;
             DispatchOutcome::cont_with(grab)
         }
         ControlAction::TxRequest(kind) => {
@@ -3682,6 +3676,70 @@ mod tests {
         assert_eq!(ctx.split_tx_frequency_hz.load(Ordering::Relaxed), 0);
         assert!(!band_gate_refuses(&ctx, 14_074_000, 1_500.0, ft8_span));
         assert!(!band_gate_refuses(&ctx, 14_074_000, 0.0, 0.0));
+    }
+
+    /// PAN-209 (the ticket's Gherkin): the rig is split with TX on an
+    /// out-of-band 15.000 MHz and the gate has recorded it. A verified
+    /// peer's split clear that never reaches Hamlib (its channel stays full
+    /// through every retry) must leave the gate on that split, so the next
+    /// PTT is still refused.
+    #[tokio::test]
+    async fn remote_set_split_dropped_before_hamlib_keeps_the_band_gate_refusing() {
+        let mut ctx = ctx_with(true, true);
+        ctx.split_tx_frequency_hz
+            .store(15_000_000, Ordering::Relaxed);
+        ctx.peers.insert(
+            CLIENT_KEY_ID.to_string(),
+            PeerCtx::authorized_until(vec!["qsy".to_string()], NOW + 600_000),
+        );
+        let bus = MessageBus::new(1).unwrap();
+        let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        // Fill Hamlib's only slot so every SetSplit attempt is dropped.
+        assert!(bus
+            .send_message_checked(ComponentMessage::new(
+                ComponentId::Hamlib,
+                ComponentId::Hamlib,
+                MessageType::AudioData(Vec::new()),
+                std::time::Instant::now(),
+            ))
+            .await
+            .unwrap());
+        let ft8_span = crate::coordinator::tx_signal_span_hz(pancetta_ft8::Protocol::Ft8);
+        assert!(band_gate_refuses(&ctx, 14_074_000, 1_500.0, ft8_span));
+
+        dispatch_action(
+            ControlAction::SetSplit {
+                enabled: false,
+                tx_frequency_hz: 0.0,
+            },
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+
+        assert!(
+            !hamlib_rx.try_iter().any(|m| matches!(
+                m.message_type,
+                MessageType::RigControl(RigControlMessage::SetSplit { .. })
+            )),
+            "the split clear never reached Hamlib"
+        );
+        assert_eq!(
+            ctx.split_tx_frequency_hz.load(Ordering::Relaxed),
+            15_000_000,
+            "a dropped split clear must not loosen the gate's split source"
+        );
+        assert!(
+            band_gate_refuses(&ctx, 14_074_000, 1_500.0, ft8_span),
+            "QSO TX must still be refused on the rig's out-of-band split"
+        );
+        assert!(
+            band_gate_refuses(&ctx, 14_074_000, 0.0, 0.0),
+            "manual PTT must still be refused on the rig's out-of-band split"
+        );
     }
 
     #[tokio::test]

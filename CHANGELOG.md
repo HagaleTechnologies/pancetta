@@ -127,6 +127,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A split change that never reaches the rig no longer changes the TX
+  band-plan check (PAN-209). Remote and local split changes, and the split
+  clear on a band change, are recorded only once Hamlib's queue accepts them.
+  If the queue rejects every attempt, the check keeps the split the rig is
+  still on, the SPLIT chip shows that split, and the Diagnostics overlay says
+  the change was not delivered.
+
 - Startup no longer wipes a legacy `qso.db` that has no `qsos.adi` beside
   it: it moves those contacts into `qsos.adi` as intended (PAN-127). A
   `qso.db` that is missing while `qsos.adi` exists is now rebuilt from it,

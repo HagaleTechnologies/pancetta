@@ -2237,7 +2237,7 @@ mod interruptible_sleep_tests {
 
 /// PAN-135: bounded retry for a safety send that must not be silently
 /// dropped. Uses the PAN-43/45 schedule: 4 attempts over about 75 ms.
-const SAFETY_SEND_RETRY_DELAYS: [Duration; 3] = [
+pub(super) const SAFETY_SEND_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(5),
     Duration::from_millis(20),
     Duration::from_millis(50),
