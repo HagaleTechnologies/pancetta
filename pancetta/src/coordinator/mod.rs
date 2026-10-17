@@ -485,7 +485,13 @@ fn record_split_state(
 /// PAN-209: forward a split change to Hamlib with checked, bounded-retry
 /// delivery and record it in the shared split atomic only once enqueued.
 /// Hamlib applies its channel in order, so a PTT-on that passes the band
-/// gate after the record lands behind this SetSplit. A change dropped on
+/// gate after the record lands behind this SetSplit. No await separates
+/// the enqueue from the record, but they are not atomic to the gate: a
+/// gate check in between reads the split the rig is about to leave. That
+/// check's PTT-on then queues behind this SetSplit (the TX worker's own
+/// check-to-enqueue window). If this thread stalls until Hamlib has
+/// applied the change and released its in-flight mute, the PTT-on keys
+/// right after the switch. Both are accepted (PAN-216). A change dropped on
 /// every attempt never reached the rig: the atomic keeps the split the rig
 /// still transmits on. Returns the value the atomic now holds, for the
 /// caller's split-chip echo.

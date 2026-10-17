@@ -631,8 +631,8 @@ on the PAN-135 schedule (retries at 5, 20 and 50 ms) and stores the new
 value only once an attempt is enqueued on Hamlib's channel. Enqueue is
 enough for the same reason as PAN-135's PTT-off: Hamlib applies its channel
 in order, so a PTT-on that passes the gate after the store lands behind the
-`SetSplit`, and from dequeue through the CAT call Hamlib's own in-flight
-count mutes TX.
+`SetSplit`, and from its supersession check through the CAT call Hamlib's
+own in-flight count mutes TX.
 
 If every attempt drops, the atomic keeps the split the rig is still on. The
 caller echoes that value to the TUI split chip (and, for the band hop, to
@@ -647,6 +647,27 @@ transient form), and PAN-19's producer-side in-flight pre-mark (it would
 couple the station agent and TUI relay to Hamlib-private bookkeeping, to
 close a gap with no await point between the successful enqueue and the
 store, no wider than the TX worker's own gate-check-to-PTT-on window).
+
+Accepted (PAN-216): having no await point does not make the enqueue and
+the store atomic to the PTT gate. A gate check on another thread that lands
+between the successful `try_send` and the store reads the split the rig is
+about to leave. A change that moves the TX dial out of band (enabling or
+retuning an out-of-band split, or clearing split onto an out-of-band RX
+dial) can then pass the gate in two ways:
+
+- The check's PTT-on queues behind the `SetSplit`. This is the TX worker's
+  own window, from its band-plan check to the PTT-on enqueue in
+  `send_message_if`. That window reaches the same outcome when the check
+  lands before the enqueue too, and it is wider: it includes the bus
+  table-lock wait, which this gap does not.
+- The writer's thread is preempted or otherwise stalled after the enqueue
+  for as long as Hamlib takes to dequeue the `SetSplit`, apply it over CAT
+  and drop its in-flight count. A check in that interval keys right after
+  the rig has switched.
+
+Both are accepted, with no producer-side inhibit. The first widens the TX
+worker's existing window only by this gap. The second needs a stall at
+least as long as Hamlib's dequeue and CAT round trip.
 
 Not covered: a split changed at the radio itself is still never polled back
 (PAN-206), and a TUI and a remote `SetSplit` interleaving between enqueue
