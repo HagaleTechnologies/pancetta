@@ -817,6 +817,11 @@ pub struct RigSelectionState {
     pub naming_bookmark: bool,
     /// Text typed into the bookmark-name input.
     pub bookmark_name_input: String,
+    /// How many `SelectRig` commands Enter has sent (PAN-60 review). A
+    /// `RigConfigUpdate` whose `select_seq` is lower was read before the
+    /// coordinator handled the latest one, so it only refreshes the port
+    /// and bookmark lists.
+    pub submits_sent: u64,
 }
 
 impl Default for RigSelectionState {
@@ -840,6 +845,7 @@ impl Default for RigSelectionState {
             selected_bookmark_idx: 0,
             naming_bookmark: false,
             bookmark_name_input: String::new(),
+            submits_sent: 0,
         }
     }
 }
@@ -4052,8 +4058,10 @@ impl App {
     /// Pre-populates the modal with live values so it opens editable, not
     /// blank — mirrors `set_audio_devices`'s seeding of `device_selection`.
     /// Called at startup and again each time the `i` picker opens (PAN-60);
-    /// when the open picker already has operator edits it merges only the
-    /// refreshed port and bookmark lists instead of overwriting the form.
+    /// when the open picker already has operator edits, or `select_seq` shows
+    /// the reply was read before the coordinator handled the operator's latest
+    /// `SelectRig`, it merges only the refreshed port and bookmark lists
+    /// instead of overwriting the form.
     pub fn apply_rig_config_update(
         &mut self,
         mut available_ports: Vec<String>,
@@ -4062,12 +4070,17 @@ impl App {
         current_baud_rate: u32,
         current_ptt_method: pancetta_config::rig::PttMethod,
         bookmarks: Vec<pancetta_config::rig::RigBookmark>,
+        select_seq: u64,
     ) {
         // PAN-60: this arrives a frame or two after `i` opens the picker.
         // If the operator already started editing, only take the new port
         // and bookmark lists -- overwriting the form here would wipe an
-        // edit in progress.
-        if self.rig_selection.visible && self.rig_selection.has_operator_edits() {
+        // edit in progress. The same goes for a reply read before the
+        // coordinator handled the latest SelectRig, however late it is
+        // drained (PAN-60 review): it would put the old rig back.
+        if select_seq < self.rig_selection.submits_sent
+            || (self.rig_selection.visible && self.rig_selection.has_operator_edits())
+        {
             self.rig_selection
                 .merge_refreshed_ports(available_ports, bookmarks);
             return;
@@ -7195,6 +7208,7 @@ mod tests {
                 baud_rate: 38400,
                 ptt_method: pancetta_config::rig::PttMethod::None,
             }],
+            0,
         );
         assert_eq!(app.rig_selection.bookmarks.len(), 1);
         assert_eq!(app.rig_selection.bookmarks[0].name, "Shack");
@@ -7210,6 +7224,7 @@ mod tests {
             38400,
             pancetta_config::rig::PttMethod::Serial,
             vec![],
+            0,
         );
         assert_eq!(app.rig_selection.model, "FTdx10");
         assert_eq!(app.rig_selection.selected_port_idx, 1);
@@ -7238,6 +7253,7 @@ mod tests {
             38400,
             pancetta_config::rig::PttMethod::Cat,
             vec![],
+            0,
         );
         assert_eq!(
             app.rig_selection.selected_port(),
@@ -7271,6 +7287,7 @@ mod tests {
             230_400, // not in RIG_BAUD_RATES
             pancetta_config::rig::PttMethod::None,
             vec![],
+            0,
         );
         assert_eq!(
             app.rig_selection.selected_baud(),
@@ -7293,6 +7310,7 @@ mod tests {
             9600,
             pancetta_config::rig::PttMethod::Parallel,
             vec![],
+            0,
         );
         assert!(
             matches!(
@@ -7317,6 +7335,7 @@ mod tests {
             230_400,
             pancetta_config::rig::PttMethod::None,
             vec![],
+            0,
         );
         app.rig_selection.active_field = RigField::Baud;
         app.rig_selection.move_down();
@@ -7352,6 +7371,7 @@ mod tests {
             38400,
             pancetta_config::rig::PttMethod::Cat,
             bookmarks,
+            0,
         );
         app.rig_selection.visible = true;
         app.rig_selection.snapshot_committed();
@@ -7384,6 +7404,7 @@ mod tests {
             38400,
             pancetta_config::rig::PttMethod::Cat,
             vec![],
+            0,
         );
 
         let rs = &app.rig_selection;
@@ -7420,6 +7441,7 @@ mod tests {
             38400,
             pancetta_config::rig::PttMethod::Cat,
             vec![],
+            0,
         );
         app.rig_selection.restore_committed(); // Esc
 
@@ -7449,6 +7471,7 @@ mod tests {
             38400,
             pancetta_config::rig::PttMethod::Cat,
             vec![],
+            0,
         );
 
         assert_eq!(
@@ -7486,6 +7509,7 @@ mod tests {
             38400,
             pancetta_config::rig::PttMethod::Cat,
             vec![rig_bookmark("A")],
+            0,
         );
 
         assert_eq!(
@@ -7512,6 +7536,7 @@ mod tests {
             38400,
             pancetta_config::rig::PttMethod::Cat,
             vec![],
+            0,
         );
 
         let rs = &app.rig_selection;
@@ -7538,6 +7563,7 @@ mod tests {
             19200,
             pancetta_config::rig::PttMethod::Serial,
             vec![rig_bookmark("A")],
+            0,
         );
 
         let rs = &app.rig_selection;

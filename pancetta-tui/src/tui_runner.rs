@@ -276,8 +276,9 @@ pub enum TuiMessage {
     /// rig-picker modal can pre-populate with live values. Pushed at
     /// startup and again in answer to every `TuiCommand::RequestRigConfig`
     /// (PAN-60), so the `i` picker lists ports that appeared after startup;
-    /// while the open picker has edits, the TUI merges only the port and
-    /// bookmark lists (`App::apply_rig_config_update`). The TUI is a
+    /// while the open picker has edits, or when `select_seq` shows the reply
+    /// predates the operator's latest submit, the TUI merges only the port
+    /// and bookmark lists (`App::apply_rig_config_update`). The TUI is a
     /// passive renderer — it never enumerates serial ports itself,
     /// mirroring `DeviceListUpdate` above.
     RigConfigUpdate {
@@ -291,6 +292,11 @@ pub enum TuiMessage {
         /// alongside the live values so the `b` load overlay has data from
         /// frame 1.
         bookmarks: Vec<pancetta_config::rig::RigBookmark>,
+        /// How many `TuiCommand::SelectRig` the coordinator had handled when
+        /// it read these values (PAN-60 review). Fewer than the TUI has sent
+        /// means the reply predates the operator's latest submit, so the TUI
+        /// takes only its port and bookmark lists.
+        select_seq: u64,
     },
     /// Saved rig-config bookmarks changed (PAN-61: after a `SaveRigBookmark`
     /// or `DeleteRigBookmark` command). Full resync, mirroring
@@ -931,6 +937,7 @@ impl TuiRunner {
                 current_baud_rate,
                 current_ptt_method,
                 bookmarks,
+                select_seq,
             } => {
                 app.apply_rig_config_update(
                     available_ports,
@@ -939,6 +946,7 @@ impl TuiRunner {
                     current_baud_rate,
                     current_ptt_method,
                     bookmarks,
+                    select_seq,
                 );
             }
             TuiMessage::RigBookmarksUpdate { bookmarks } => {
@@ -1355,6 +1363,9 @@ impl TuiRunner {
                         // snapshot to the just-applied values so a later
                         // open/cancel cycle doesn't revert past them.
                         app.rig_selection.snapshot_committed();
+                        // PAN-60 review: replies read before the coordinator
+                        // handles this SelectRig must not revert the form.
+                        app.rig_selection.submits_sent += 1;
                         app.status_message = "Applying rig config…".to_string();
                     }
                 }
@@ -6643,8 +6654,19 @@ mod key_tests {
     }
 
     /// A `RigConfigUpdate` as the coordinator's refresh sends it (PAN-60):
-    /// 38400 baud, CAT PTT, no bookmarks.
+    /// 38400 baud, CAT PTT, no bookmarks, read before any `SelectRig`.
     fn rig_config_update(ports: &[&str], model: &str, current_port: &str) -> TuiMessage {
+        rig_config_update_after(0, ports, model, current_port)
+    }
+
+    /// `rig_config_update`, read after the coordinator handled
+    /// `select_seq` `SelectRig` commands.
+    fn rig_config_update_after(
+        select_seq: u64,
+        ports: &[&str],
+        model: &str,
+        current_port: &str,
+    ) -> TuiMessage {
         TuiMessage::RigConfigUpdate {
             available_ports: ports.iter().map(|p| p.to_string()).collect(),
             current_model: model.to_string(),
@@ -6652,6 +6674,7 @@ mod key_tests {
             current_baud_rate: 38400,
             current_ptt_method: pancetta_config::rig::PttMethod::Cat,
             bookmarks: vec![],
+            select_seq,
         }
     }
 
@@ -6818,6 +6841,106 @@ mod key_tests {
         );
     }
 
+    /// PAN-60 review: the refresh `i` asked for can be read before Enter's
+    /// `SelectRig` reaches the coordinator, and drained after the picker has
+    /// closed or, behind a backlog of decodes, after it has reopened. It must
+    /// not overwrite the just-submitted rig, or Enter on the reopened picker
+    /// would re-apply the old one.
+    async fn stale_refresh_keeps_the_submitted_rig(land_after_reopen: bool) {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        r.handle_message(rig_config_update(
+            &["/dev/ttyUSB0", "/dev/ttyUSB1"],
+            "FTdx10",
+            "/dev/ttyUSB0",
+        ))
+        .await
+        .unwrap();
+
+        r.handle_key_event(key('i')).await.unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        r.handle_key_event(key('X')).await.unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        if land_after_reopen {
+            r.handle_key_event(key('i')).await.unwrap();
+        }
+
+        // Read before the coordinator handled the SelectRig.
+        r.handle_message(rig_config_update(
+            &["/dev/ttyACM0", "/dev/ttyUSB0", "/dev/ttyUSB1"],
+            "FTdx10",
+            "/dev/ttyUSB0",
+        ))
+        .await
+        .unwrap();
+        {
+            let app = app.read().await;
+            assert_eq!(
+                app.rig_selection.model, "FTdx1X",
+                "a refresh read before the submit must not revert the submitted model"
+            );
+            assert_eq!(
+                app.rig_selection.selected_port(),
+                "/dev/ttyUSB1",
+                "a refresh read before the submit must not revert the submitted port"
+            );
+            assert_eq!(
+                app.rig_selection.available_ports,
+                vec!["/dev/ttyACM0", "/dev/ttyUSB0", "/dev/ttyUSB1"],
+                "the refreshed port list is still taken"
+            );
+        }
+
+        if !land_after_reopen {
+            r.handle_key_event(key('i')).await.unwrap();
+        }
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let cmds: Vec<TuiCommand> = cmd_rx.try_iter().collect();
+        match cmds.as_slice() {
+            [TuiCommand::RequestRigConfig, TuiCommand::SelectRig {
+                model: m1,
+                port: p1,
+                ..
+            }, TuiCommand::RequestRigConfig, TuiCommand::SelectRig {
+                model: m2,
+                port: p2,
+                ..
+            }] => {
+                assert_eq!((m1.as_str(), p1.as_str()), ("FTdx1X", "/dev/ttyUSB1"));
+                assert_eq!(
+                    (m2.as_str(), p2.as_str()),
+                    ("FTdx1X", "/dev/ttyUSB1"),
+                    "Enter on the reopened picker must re-apply the submitted rig, not the stale one"
+                );
+            }
+            other => panic!(
+                "expected RequestRigConfig, SelectRig, RequestRigConfig, SelectRig; got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn rig_config_refresh_landing_after_enter_keeps_the_submitted_rig() {
+        stale_refresh_keeps_the_submitted_rig(false).await;
+    }
+
+    #[tokio::test]
+    async fn rig_config_refresh_landing_after_reopen_keeps_the_submitted_rig() {
+        stale_refresh_keeps_the_submitted_rig(true).await;
+    }
+
     /// PAN-60 (folds in the PAN-59 "no re-push after a switch" finding):
     /// Enter commits the form locally whether or not the coordinator
     /// accepts it, so after a refused switch the reopened picker must take
@@ -6842,8 +6965,9 @@ mod key_tests {
         assert_eq!(app.read().await.rig_selection.model, "FTdx10X");
 
         // The coordinator refused the unknown model, so config still holds
-        // FTdx10 and the refresh says so.
-        r.handle_message(rig_config_update(
+        // FTdx10 and the refresh, read after it handled that SelectRig, says so.
+        r.handle_message(rig_config_update_after(
+            1,
             &["/dev/ttyUSB0"],
             "FTdx10",
             "/dev/ttyUSB0",
@@ -7093,6 +7217,7 @@ mod pan_59_command_tests {
             current_baud_rate: 38400,
             current_ptt_method: pancetta_config::rig::PttMethod::Serial,
             bookmarks: vec![],
+            select_seq: 0,
         };
         match msg {
             TuiMessage::RigConfigUpdate {
@@ -7122,6 +7247,7 @@ mod pan_59_command_tests {
                 baud_rate: 38400,
                 ptt_method: pancetta_config::rig::PttMethod::None,
             }],
+            select_seq: 0,
         };
         match msg {
             TuiMessage::RigConfigUpdate { bookmarks, .. } => {

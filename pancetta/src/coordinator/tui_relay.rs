@@ -1053,6 +1053,10 @@ impl super::ApplicationCoordinator {
         let cmd_config_warnings = self.config_warnings.clone();
         // PAN-60: single-flight flag for `spawn_rig_config_refresh` (startup + every `i` open).
         let cmd_rig_refresh_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // PAN-60 review: `SelectRig` commands handled so far, stamped on every
+        // `RigConfigUpdate` so the TUI can tell a reply that predates its
+        // latest submit.
+        let cmd_rig_select_seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
         const TUNE_DURATION_SECS: u32 = 12;
         const TUNE_TONE_HZ: f64 = 1500.0;
         let cmd_handle = tokio::spawn(async move {
@@ -1092,6 +1096,7 @@ impl super::ApplicationCoordinator {
                 cmd_config.clone(),
                 cmd_tui_msg_tx.clone(),
                 cmd_rig_refresh_in_flight.clone(),
+                cmd_rig_select_seq.clone(),
                 enumerate_serial_ports,
             );
 
@@ -2651,6 +2656,9 @@ impl super::ApplicationCoordinator {
                                     "TUI SelectRig: unknown rig model '{}' -- not applied",
                                     model
                                 );
+                                // Config is unchanged, so no lock is needed
+                                // to order this against a refresh's read.
+                                cmd_rig_select_seq.fetch_add(1, Ordering::AcqRel);
                                 let _ = cmd_tui_msg_tx.send(
                                     pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                         component: "rig".to_string(),
@@ -2672,6 +2680,10 @@ impl super::ApplicationCoordinator {
                                     cfg.rig.interface.port = port.clone();
                                     cfg.rig.interface.baud_rate = baud_rate;
                                     cfg.rig.ptt.method = ptt_method.clone();
+                                    // Under the write lock: a refresh reads
+                                    // the count and the rig under its read
+                                    // lock, so it sees both or neither.
+                                    cmd_rig_select_seq.fetch_add(1, Ordering::AcqRel);
                                 }
                                 // PAN-62: the actually-loaded config path
                                 // (`--config <path>`, or the default), not
@@ -2898,6 +2910,7 @@ impl super::ApplicationCoordinator {
                                 cmd_config.clone(),
                                 cmd_tui_msg_tx.clone(),
                                 cmd_rig_refresh_in_flight.clone(),
+                                cmd_rig_select_seq.clone(),
                                 enumerate_serial_ports,
                             )
                             .is_none()
@@ -3948,10 +3961,16 @@ impl Drop for RigConfigRefreshInFlight {
 /// its `RigBookmarksUpdate` -- a stale bookmark list can never land last.
 /// The send is `try_send`: a full TUI channel drops this reply (the next
 /// open asks again) rather than parking a runtime thread under that lock.
+///
+/// The reply carries `select_seq`, the number of `SelectRig` commands
+/// handled so far, read under the same guard; `SelectRig` bumps it under
+/// its config write lock, so the count always matches the rig values read
+/// (PAN-60 review).
 fn spawn_rig_config_refresh<E>(
     config: Arc<tokio::sync::RwLock<pancetta_config::Config>>,
     tui_msg_tx: crossbeam_channel::Sender<pancetta_tui::tui_runner::TuiMessage>,
     in_flight: Arc<std::sync::atomic::AtomicBool>,
+    select_seq: Arc<std::sync::atomic::AtomicU64>,
     enumerate: E,
 ) -> Option<tokio::task::JoinHandle<()>>
 where
@@ -3978,6 +3997,7 @@ where
             current_baud_rate: cfg.rig.interface.baud_rate,
             current_ptt_method: cfg.rig.ptt.method.clone(),
             bookmarks: cfg.rig.effective_bookmarks().to_vec(),
+            select_seq: select_seq.load(Ordering::Acquire),
         }) {
             debug!("Failed to send rig config refresh to TUI: {}", e);
         }
@@ -3987,7 +4007,7 @@ where
 #[cfg(test)]
 mod tui_relay_tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8};
 
     /// Shared fixture for the `resolve_nudge_tx_offset` cases: an empty
     /// mailbox and an unset CQ flag.
@@ -4826,6 +4846,11 @@ mod tui_relay_tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
+    /// A `SelectRig` count no command has bumped yet.
+    fn no_selects() -> Arc<AtomicU64> {
+        Arc::new(AtomicU64::new(0))
+    }
+
     /// PAN-60: the ticket's scenario at the coordinator boundary -- a port
     /// that appears between two refreshes (a rig plugged in after startup)
     /// is in the second reply, alongside the configured model and port.
@@ -4839,6 +4864,7 @@ mod tui_relay_tests {
             config.clone(),
             tui_msg_tx.clone(),
             in_flight.clone(),
+            no_selects(),
             || ports(&["/dev/ttyUSB0"]),
         )
         .expect("nothing is in flight, so the first refresh must spawn");
@@ -4850,6 +4876,7 @@ mod tui_relay_tests {
             config.clone(),
             tui_msg_tx.clone(),
             in_flight.clone(),
+            no_selects(),
             || ports(&["/dev/ttyUSB0", "/dev/ttyUSB1"]),
         )
         .expect("the first refresh finished, so the second must spawn");
@@ -4875,10 +4902,11 @@ mod tui_relay_tests {
         let in_flight = Arc::new(AtomicBool::new(false));
         let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
 
-        let handle = spawn_rig_config_refresh(config, tui_msg_tx, in_flight, move || {
-            gate_rx.recv().unwrap();
-            ports(&["/dev/ttyUSB0"])
-        });
+        let handle =
+            spawn_rig_config_refresh(config, tui_msg_tx, in_flight, no_selects(), move || {
+                gate_rx.recv().unwrap();
+                ports(&["/dev/ttyUSB0"])
+            });
         assert!(
             handle.is_some(),
             "the helper must return its handle while the enumeration is still gated"
@@ -4911,6 +4939,7 @@ mod tui_relay_tests {
             config.clone(),
             tui_msg_tx.clone(),
             in_flight.clone(),
+            no_selects(),
             move || {
                 gate_rx.recv().unwrap();
                 ports(&["/dev/ttyUSB0"])
@@ -4922,6 +4951,7 @@ mod tui_relay_tests {
             config.clone(),
             tui_msg_tx.clone(),
             in_flight.clone(),
+            no_selects(),
             || -> Vec<String> { panic!("a coalesced request must never enumerate") },
         );
         assert!(
@@ -4937,8 +4967,9 @@ mod tui_relay_tests {
             "the finished refresh must clear the single-flight flag"
         );
 
-        let third =
-            spawn_rig_config_refresh(config, tui_msg_tx, in_flight, || ports(&["/dev/ttyUSB0"]));
+        let third = spawn_rig_config_refresh(config, tui_msg_tx, in_flight, no_selects(), || {
+            ports(&["/dev/ttyUSB0"])
+        });
         assert!(
             third.is_some(),
             "once the in-flight refresh finished, a new request must spawn"
@@ -4957,10 +4988,16 @@ mod tui_relay_tests {
         let in_flight = Arc::new(AtomicBool::new(false));
         let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
 
-        let handle = spawn_rig_config_refresh(config.clone(), tui_msg_tx, in_flight, move || {
-            gate_rx.recv().unwrap();
-            ports(&["/dev/ttyUSB0", "/dev/ttyUSB1"])
-        })
+        let handle = spawn_rig_config_refresh(
+            config.clone(),
+            tui_msg_tx,
+            in_flight,
+            no_selects(),
+            move || {
+                gate_rx.recv().unwrap();
+                ports(&["/dev/ttyUSB0", "/dev/ttyUSB1"])
+            },
+        )
         .expect("nothing is in flight, so the refresh must spawn");
 
         {
@@ -4990,6 +5027,60 @@ mod tui_relay_tests {
         assert_eq!(bookmarks[0].name, "Portable");
     }
 
+    /// PAN-60 review: the reply's `select_seq` is read with the rig values,
+    /// so a `SelectRig` committed while the enumeration ran shows up in
+    /// both, and the TUI never takes pre-switch values as post-switch ones.
+    #[tokio::test]
+    async fn rig_config_refresh_stamps_the_select_count_read_with_the_config() {
+        let config = rig_refresh_config("FTdx10", "/dev/ttyUSB0");
+        let (tui_msg_tx, tui_msg_rx) = crossbeam_channel::unbounded();
+        let in_flight = Arc::new(AtomicBool::new(false));
+        let select_seq = no_selects();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+
+        let handle = spawn_rig_config_refresh(
+            config.clone(),
+            tui_msg_tx,
+            in_flight,
+            select_seq.clone(),
+            move || {
+                gate_rx.recv().unwrap();
+                ports(&["/dev/ttyUSB0"])
+            },
+        )
+        .expect("nothing is in flight, so the refresh must spawn");
+
+        {
+            // What the relay's `SelectRig` arm does under its write lock.
+            let mut cfg = config.write().await;
+            cfg.rig.model = "IC-7300".to_string();
+            select_seq.fetch_add(1, Ordering::AcqRel);
+        }
+        gate_tx.send(()).unwrap();
+
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(pancetta_tui::tui_runner::TuiMessage::RigConfigUpdate {
+                    current_model,
+                    select_seq,
+                    ..
+                }) = tui_msg_rx.try_recv()
+                {
+                    return (current_model, select_seq);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a rig config refresh must reply within 5s");
+        handle.await.unwrap();
+        assert_eq!(
+            reply,
+            ("IC-7300".to_string(), 1),
+            "the reply must carry the SelectRig count that matches its rig values"
+        );
+    }
+
     /// PAN-60: an enumerator panic still produces a reply (empty port list,
     /// so the TUI falls back to the configured port) and still clears the
     /// single-flight flag -- otherwise every later `i` would be coalesced
@@ -5000,11 +5091,14 @@ mod tui_relay_tests {
         let (tui_msg_tx, tui_msg_rx) = crossbeam_channel::unbounded();
         let in_flight = Arc::new(AtomicBool::new(false));
 
-        let handle =
-            spawn_rig_config_refresh(config, tui_msg_tx, in_flight.clone(), || -> Vec<String> {
-                panic!("simulated enumeration failure")
-            })
-            .expect("nothing is in flight, so the refresh must spawn");
+        let handle = spawn_rig_config_refresh(
+            config,
+            tui_msg_tx,
+            in_flight.clone(),
+            no_selects(),
+            || -> Vec<String> { panic!("simulated enumeration failure") },
+        )
+        .expect("nothing is in flight, so the refresh must spawn");
 
         let (available_ports, current_model, current_port, _) =
             next_rig_config_update(&tui_msg_rx).await;
@@ -5039,10 +5133,11 @@ mod tui_relay_tests {
             .unwrap();
         let in_flight = Arc::new(AtomicBool::new(false));
 
-        let handle = spawn_rig_config_refresh(config, tui_msg_tx, in_flight.clone(), || {
-            ports(&["/dev/ttyUSB0"])
-        })
-        .expect("nothing is in flight, so the refresh must spawn");
+        let handle =
+            spawn_rig_config_refresh(config, tui_msg_tx, in_flight.clone(), no_selects(), || {
+                ports(&["/dev/ttyUSB0"])
+            })
+            .expect("nothing is in flight, so the refresh must spawn");
 
         tokio::time::timeout(std::time::Duration::from_secs(5), handle)
             .await

@@ -137,9 +137,11 @@ list-select, since rig fields aren't one enumerable list the way audio devices a
    after enumerating, so a reopen after a rig switch shows what the coordinator actually holds, and
    sends with a non-blocking `try_send` while holding the config read lock, which orders the reply
    against the bookmark worker's `RigBookmarksUpdate`. When the reply lands on an open picker the
-   operator has already edited (or with a bookmark sub-overlay open), the TUI merges only the port
-   and bookmark lists (`RigSelectionState::merge_refreshed_ports`) and keeps every field the operator
-   chose; otherwise it applies the reply in full.
+   operator has already edited (or with a bookmark sub-overlay open), or when the reply's
+   `select_seq` (the `SelectRig` count the relay had handled when it read the config) is below the
+   number the TUI has sent, the TUI merges only the port and bookmark lists
+   (`RigSelectionState::merge_refreshed_ports`) and keeps every field the operator chose; otherwise it
+   applies the reply in full.
 2. **Operator presses `i`** (new binding — `d`/`r`/`R` are all taken; see key-choice note below):
    opens the modal, already pre-populated with current values.
 3. **Operator edits fields, presses Enter**: TUI sends

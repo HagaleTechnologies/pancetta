@@ -283,7 +283,13 @@ overwrites every field. `App::apply_rig_config_update` therefore merges when the
 and `RigSelectionState::has_operator_edits()` (any field differs from the snapshot taken on open, or
 a bookmark sub-overlay is open): `merge_refreshed_ports` replaces the port list, re-finds the
 selected and committed ports by name (prepending either if it vanished, as I-2a and PAN-61's I-4
-do), replaces bookmarks with the overlay selection clamped, and touches nothing else. An untouched
+do), replaces bookmarks with the overlay selection clamped, and touches nothing else. It also merges,
+open or closed, a reply read before the coordinator handled the operator's latest `SelectRig`: the
+relay counts handled `SelectRig`s (bumped under the config write lock when it applies one), the
+refresh stamps that count on the reply as `select_seq` under its read lock, and the TUI merges any
+reply whose `select_seq` is below `RigSelectionState::submits_sent`. Without it, a refresh read just
+before Enter and drained afterwards (after the picker closed, or behind a decode backlog after it
+reopened) put the old rig back in the form, and the next Enter re-applied it. Otherwise an untouched
 open picker, or a closed one, takes the full apply, so a reopen after a switch the coordinator
 refused shows the configured values. `active_field` is never touched.
 
@@ -295,4 +301,5 @@ refresh and the port shows on the next open. A hung `available_ports()` cannot b
 flag stays set and the picker keeps the last-known list, which is the pre-PAN-60 behaviour. Tests:
 the six `tui_relay_tests::rig_config_refresh_*` tests, the `app::tests::apply_rig_config_update_*`
 merge tests, and `tui_runner::key_tests::rig_picker_reaches_a_port_plugged_in_after_startup` /
-`rig_config_refresh_landing_mid_edit_keeps_the_edit`.
+`rig_config_refresh_landing_mid_edit_keeps_the_edit` /
+`rig_config_refresh_landing_after_{enter,reopen}_keeps_the_submitted_rig`.
