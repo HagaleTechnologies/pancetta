@@ -3983,16 +3983,14 @@ where
             }
         };
         let cfg = config.read().await;
-        if let Err(e) =
-            tui_msg_tx.try_send(pancetta_tui::tui_runner::TuiMessage::RigConfigUpdate {
-                available_ports,
-                current_model: cfg.rig.model.clone(),
-                current_port: cfg.rig.interface.port.clone(),
-                current_baud_rate: cfg.rig.interface.baud_rate,
-                current_ptt_method: cfg.rig.ptt.method.clone(),
-                bookmarks: cfg.rig.effective_bookmarks().to_vec(),
-            })
-        {
+        if let Err(e) = tui_msg_tx.try_send(pancetta_tui::tui_runner::TuiMessage::RigConfigUpdate {
+            available_ports,
+            current_model: cfg.rig.model.clone(),
+            current_port: cfg.rig.interface.port.clone(),
+            current_baud_rate: cfg.rig.interface.baud_rate,
+            current_ptt_method: cfg.rig.ptt.method.clone(),
+            bookmarks: cfg.rig.effective_bookmarks().to_vec(),
+        }) {
             debug!("Failed to send rig config refresh to TUI: {}", e);
         }
     }))
@@ -4951,9 +4949,8 @@ mod tui_relay_tests {
             "the finished refresh must clear the single-flight flag"
         );
 
-        let third = spawn_rig_config_refresh(config, tui_msg_tx, in_flight, || {
-            ports(&["/dev/ttyUSB0"])
-        });
+        let third =
+            spawn_rig_config_refresh(config, tui_msg_tx, in_flight, || ports(&["/dev/ttyUSB0"]));
         assert!(
             third.is_some(),
             "once the in-flight refresh finished, a new request must spawn"
@@ -5015,13 +5012,11 @@ mod tui_relay_tests {
         let (tui_msg_tx, tui_msg_rx) = crossbeam_channel::unbounded();
         let in_flight = Arc::new(AtomicBool::new(false));
 
-        let handle = spawn_rig_config_refresh(
-            config,
-            tui_msg_tx,
-            in_flight.clone(),
-            || -> Vec<String> { panic!("simulated enumeration failure") },
-        )
-        .expect("nothing is in flight, so the refresh must spawn");
+        let handle =
+            spawn_rig_config_refresh(config, tui_msg_tx, in_flight.clone(), || -> Vec<String> {
+                panic!("simulated enumeration failure")
+            })
+            .expect("nothing is in flight, so the refresh must spawn");
 
         let (available_ports, current_model, current_port, _) =
             next_rig_config_update(&tui_msg_rx).await;
