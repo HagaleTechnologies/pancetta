@@ -1187,23 +1187,26 @@ pub struct ReliabilityConfig {
     pub health_check: HealthCheckConfig,
 }
 
-/// Retry configuration
+/// Quick-retry schedule for per-QSO logbook uploads (ClubLog, QRZ Logbook,
+/// eQSL, cqdx.io — PAN-57). After `max_attempts` tries a failing destination
+/// moves to a slow lane that retries every 5 minutes; queued uploads survive a
+/// restart in `~/.pancetta/upload_outbox.json`. Restart-required.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RetryConfig {
-    /// Maximum retry attempts
+    /// Tries in the quick burst, counting the first (>= 1).
     pub max_attempts: u32,
 
-    /// Base delay in milliseconds
+    /// Wait after the first failure, in milliseconds.
     pub base_delay_ms: u64,
 
-    /// Maximum delay in milliseconds
+    /// Cap on any quick-retry wait, in milliseconds (>= `base_delay_ms`).
     pub max_delay_ms: u64,
 
-    /// Exponential backoff multiplier
+    /// Each wait is the previous one times this (finite, >= 1.0).
     pub backoff_multiplier: f32,
 
-    /// Jitter factor
+    /// Each wait varies by ± this fraction (finite, 0.0–1.0).
     pub jitter_factor: f32,
 }
 
@@ -1611,6 +1614,34 @@ impl Default for HealthCheckConfig {
 
 impl ConfigSection for NetworkConfig {
     fn validate_section(&self) -> ConfigResult<()> {
+        // PAN-57: the upload retry schedule is live, so nonsense is refused
+        // whether or not an upload target is enabled.
+        let r = &self.reliability.retry;
+        if r.max_attempts == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "reliability.retry.max_attempts".to_string(),
+                value: r.max_attempts.to_string(),
+            });
+        }
+        if !r.backoff_multiplier.is_finite() || r.backoff_multiplier < 1.0 {
+            return Err(ConfigError::InvalidValue {
+                field: "reliability.retry.backoff_multiplier".to_string(),
+                value: r.backoff_multiplier.to_string(),
+            });
+        }
+        if !r.jitter_factor.is_finite() || !(0.0..=1.0).contains(&r.jitter_factor) {
+            return Err(ConfigError::InvalidValue {
+                field: "reliability.retry.jitter_factor".to_string(),
+                value: r.jitter_factor.to_string(),
+            });
+        }
+        if r.base_delay_ms > r.max_delay_ms {
+            return Err(ConfigError::Validation(format!(
+                "reliability.retry.base_delay_ms ({}) must not exceed max_delay_ms ({})",
+                r.base_delay_ms, r.max_delay_ms
+            )));
+        }
+
         // Validate PSKReporter settings
         if self.psk_reporter.enabled {
             if self.psk_reporter.upload_interval_seconds == 0 {
@@ -1942,6 +1973,82 @@ impl std::fmt::Debug for JwtConfig {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+
+    // ----- PAN-57: upload retry schedule validation. ------------------------
+
+    fn with_retry(f: impl FnOnce(&mut RetryConfig)) -> ConfigResult<()> {
+        let mut cfg = NetworkConfig::default();
+        f(&mut cfg.reliability.retry);
+        cfg.validate_section()
+    }
+
+    #[test]
+    fn default_retry_config_validates() {
+        assert!(with_retry(|_| {}).is_ok());
+        let r = RetryConfig::default();
+        assert_eq!(
+            (
+                r.max_attempts,
+                r.base_delay_ms,
+                r.max_delay_ms,
+                r.backoff_multiplier,
+                r.jitter_factor
+            ),
+            (3, 1000, 10_000, 2.0, 0.1)
+        );
+    }
+
+    #[test]
+    fn retry_max_attempts_zero_is_rejected() {
+        match with_retry(|r| r.max_attempts = 0) {
+            Err(ConfigError::InvalidValue { field, value }) => {
+                assert_eq!(field, "reliability.retry.max_attempts");
+                assert_eq!(value, "0");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retry_multiplier_below_one_is_rejected() {
+        for bad in [0.5, f32::NAN, f32::INFINITY] {
+            match with_retry(|r| r.backoff_multiplier = bad) {
+                Err(ConfigError::InvalidValue { field, .. }) => {
+                    assert_eq!(field, "reliability.retry.backoff_multiplier")
+                }
+                other => panic!("{bad}: expected InvalidValue, got {other:?}"),
+            }
+        }
+        assert!(with_retry(|r| r.backoff_multiplier = 1.0).is_ok());
+    }
+
+    #[test]
+    fn retry_jitter_outside_unit_interval_is_rejected() {
+        for bad in [3.0, -0.1, f32::NAN] {
+            match with_retry(|r| r.jitter_factor = bad) {
+                Err(ConfigError::InvalidValue { field, .. }) => {
+                    assert_eq!(field, "reliability.retry.jitter_factor")
+                }
+                other => panic!("{bad}: expected InvalidValue, got {other:?}"),
+            }
+        }
+        assert!(with_retry(|r| r.jitter_factor = 0.0).is_ok());
+        assert!(with_retry(|r| r.jitter_factor = 1.0).is_ok());
+    }
+
+    #[test]
+    fn retry_base_above_max_is_rejected() {
+        match with_retry(|r| {
+            r.base_delay_ms = 20_000;
+            r.max_delay_ms = 10;
+        }) {
+            Err(ConfigError::Validation(msg)) => assert_eq!(
+                msg,
+                "reliability.retry.base_delay_ms (20000) must not exceed max_delay_ms (10)"
+            ),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
 
     const GOOD_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 

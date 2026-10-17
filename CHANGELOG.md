@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Pending-upload queue for ClubLog, QRZ Logbook, eQSL and cqdx.io uploads
+  (PAN-57). Each completed QSO's uploads are saved to
+  `~/.pancetta/upload_outbox.json` before the first attempt and leave it only
+  when the service accepts them, so an outage, a rate limit or a restart no
+  longer loses an upload. Transient failures (5xx, 429, timeouts, refused
+  connections) are retried with capped exponential backoff and then every 5
+  minutes, and the queue is sent again at every start. A rejected login or
+  record now shows as an acknowledgeable readiness-strip warning
+  (`⚠ QRZ LOGBOOK LOGIN REJECTED`, `⚠ CLUBLOG REJECTED 1 QSO`,
+  `⚠ EQSL UPLOAD RETRYING · 4 QUEUED`, `⚠ UPLOAD QUEUE FULL`) with details in
+  Shift+S and one Shift+D row per change; upload warnings never hold TX.
+  LoTW keeps its single tqsl attempt.
+
 - `pancetta import <FILE> [--dry-run]` (PAN-127): bring an existing ADIF
   log from WSJT-X, N1MM, LoTW, QRZ or another logger into Pancetta. New
   contacts are appended to `~/.pancetta/qsos.adi` with every field kept as
@@ -287,6 +300,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Q in the composer.
 
 ### Changed
+
+- `[network.reliability.retry]` now controls per-QSO upload retries
+  (PAN-57) and is validated: `max_attempts` must be at least 1,
+  `backoff_multiplier` finite and at least 1.0, `jitter_factor` finite and
+  between 0.0 and 1.0, and `base_delay_ms` not above `max_delay_ms`. The
+  defaults are unchanged.
 
 - TUI status surfaces (PAN-89): the `AUDIO DEAD` / `DECODER STUB` / `CLOCK`
   alarm chips move from the title bar to the readiness strip, where several can
