@@ -479,7 +479,10 @@ impl RetrySchedule {
         } else {
             0.0
         };
-        let jittered = (capped * (1.0 + self.jitter * unit)).max(0.0);
+        // Cap again after the jitter: `max_delay_ms` bounds the actual wait.
+        let jittered = (capped * (1.0 + self.jitter * unit))
+            .max(0.0)
+            .min(self.max_ms);
         let ms = if jittered.is_finite() {
             jittered.round() as u64
         } else {
@@ -632,6 +635,20 @@ mod tests {
         assert_eq!(
             s.delay_after(1, 0.5),
             RetryDelay::Burst(Duration::from_millis(1050))
+        );
+    }
+
+    #[test]
+    fn jitter_never_pushes_a_wait_past_the_cap() {
+        let s = RetrySchedule::new(6, 1000, 10_000, 2.0, 0.1, Duration::from_secs(300));
+        // 1000 × 2^4 = 16000 → capped at 10000; +10% jitter must not exceed it.
+        assert_eq!(
+            s.delay_after(5, 1.0),
+            RetryDelay::Burst(Duration::from_millis(10_000))
+        );
+        assert_eq!(
+            s.delay_after(5, -1.0),
+            RetryDelay::Burst(Duration::from_millis(9000))
         );
     }
 

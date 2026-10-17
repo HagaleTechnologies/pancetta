@@ -384,14 +384,22 @@ impl UploadOutboxHandle {
         &self.destinations
     }
 
-    /// Queue a batch. Waits for room in the channel; a closed channel only
-    /// happens at shutdown, so the batch is dropped with a debug line.
+    /// Queue a batch. Waits for room in the channel. Once the worker sees
+    /// shutdown it closes the channel, then saves what is already in it; a
+    /// batch sent after the close (or after the worker is gone) is not queued
+    /// and is logged at warn.
     pub(crate) async fn enqueue(&self, batch: Vec<NewUpload>) {
         if batch.is_empty() {
             return;
         }
-        if self.tx.send(batch).await.is_err() {
-            debug!(target: "qso.upload", "upload queue closed (shutting down); batch not queued");
+        if let Err(mpsc::error::SendError(batch)) = self.tx.send(batch).await {
+            let call = batch.first().map_or("?", |u| u.call.as_str());
+            warn!(
+                target: "qso.upload",
+                "upload queue is closed — {} upload(s) for {} not queued",
+                batch.len(),
+                call
+            );
         }
     }
 
@@ -581,6 +589,13 @@ impl<T: OutboxTransport> Worker<T> {
                 Some(result) = results.recv() => self.on_result(&mut store, result).await,
                 _ = tokio::time::sleep(self.timing.tick) => {}
             }
+        }
+        // Shutdown: start no new attempts, but save every batch the channel
+        // already took. Closing first makes a later `enqueue` fail at once
+        // instead of leaving its batch unread in the channel.
+        inbox.close();
+        while let Some(batch) = inbox.recv().await {
+            self.on_batch(&mut store, batch).await;
         }
         debug!(target: "qso.upload", "upload queue worker stopped; {} uploads stay queued", store.len());
     }
@@ -1271,6 +1286,23 @@ mod tests {
             .unwrap();
         let (store, _) = OutboxStore::open(rig.path.clone());
         assert_eq!(store.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_saves_a_batch_already_in_the_channel() {
+        // Current-thread runtime: the worker has not run yet, so the batch is
+        // still in the channel when it first sees the shutdown flag.
+        let rig = start(FakeTransport::new(&[ClubLog]));
+        rig.shutdown.store(true, Ordering::Release);
+        rig.handle.enqueue(vec![upload(ClubLog, "K1ABC")]).await;
+        tokio::time::timeout(Duration::from_secs(1), rig.task)
+            .await
+            .expect("worker stops within 1s")
+            .unwrap();
+        let (store, _) = OutboxStore::open(rig.path.clone());
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.entries()[0].call, "K1ABC");
+        assert_eq!(rig.transport.calls_to(ClubLog), 0);
     }
 
     #[tokio::test]
