@@ -2587,13 +2587,21 @@ impl super::ApplicationCoordinator {
                                                 );
                                             }
                                             // A band change invalidates any split TX freq.
-                                            if split_tx_hz.swap(0, Ordering::Relaxed) != 0 {
-                                                // Push authoritative split clear to the TUI chip
+                                            if split_tx_hz.load(Ordering::Relaxed) != 0 {
+                                                let store = super::forward_split_change(
+                                                    &message_bus,
+                                                    ComponentId::Autonomous,
+                                                    &split_tx_hz,
+                                                    false,
+                                                    0,
+                                                )
+                                                .await;
+                                                // Push authoritative split state to the TUI chip
                                                 // via the message bus (Autonomous → Tui relay).
                                                 let split_clr_tui = ComponentMessage::new(
                                                     ComponentId::Autonomous,
                                                     ComponentId::Tui,
-                                                    MessageType::SplitStatus { tx_hz: 0 },
+                                                    MessageType::SplitStatus { tx_hz: store },
                                                     Instant::now(),
                                                 );
                                                 let _ = message_bus.send_message(split_clr_tui).await;
@@ -2601,21 +2609,9 @@ impl super::ApplicationCoordinator {
                                                     &message_bus,
                                                     &display_feed_enabled,
                                                     ComponentId::Autonomous,
-                                                    MessageType::SplitStatus { tx_hz: 0 },
+                                                    MessageType::SplitStatus { tx_hz: store },
                                                 )
                                                 .await;
-                                                let clr = ComponentMessage::new(
-                                                    ComponentId::Autonomous,
-                                                    ComponentId::Hamlib,
-                                                    MessageType::RigControl(
-                                                        crate::message_bus::RigControlMessage::SetSplit {
-                                                            enabled: false,
-                                                            tx_frequency: 0,
-                                                        },
-                                                    ),
-                                                    Instant::now(),
-                                                );
-                                                let _ = message_bus.send_message(clr).await;
                                             }
                                         }
                                         let msg = ComponentMessage::new(

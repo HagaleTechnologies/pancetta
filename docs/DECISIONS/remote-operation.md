@@ -616,6 +616,63 @@ watchdog timer before `set_ptt(Off)` returns, so a failed CAT unkey also
 stops that watchdog. Non-remote PTT-off sites (clock-step hold, normal
 Step 9, supersede, tune completion) keep best-effort delivery.
 
+## PAN-209: record a split change only once Hamlib has it
+
+The TX band-plan gate resolves the TX dial from the coordinator's shared
+split atomic, and split is never polled back from the rig. Every write to
+that atomic now goes through `coordinator::forward_split_change`: the remote
+`SetSplit` from a verified peer, the TUI `SetSplit`, the split clear on a
+manual band change, and the split clear on an autonomous band hop.
+`record_split_state` is private to `coordinator/mod.rs` and is called only
+from that helper.
+
+The helper sends `RigControlMessage::SetSplit` with `send_message_retrying`
+on the PAN-135 schedule (retries at 5, 20 and 50 ms) and stores the new
+value only once an attempt is enqueued on Hamlib's channel. Enqueue is
+enough for the same reason as PAN-135's PTT-off: Hamlib applies its channel
+in order, so a PTT-on that passes the gate after the store lands behind the
+`SetSplit`, and from its supersession check through the CAT call Hamlib's
+own in-flight count mutes TX.
+
+If every attempt drops, the atomic keeps the split the rig is still on. The
+caller echoes that value to the TUI split chip (and, for the band hop, to
+the gateway), so an optimistic chip snaps back, and the helper emits an
+`Error` diagnostic under `rig.split` saying the change was not delivered and
+which TX dial the band check still uses. The retry wait (about 75 ms) is
+paid only when the send fails; a healthy change makes one attempt.
+
+Rejected: storing first and rolling back on a drop (during the retry window
+the gate would read a split the rig was never sent, the same bug in
+transient form), and PAN-19's producer-side in-flight pre-mark (it would
+couple the station agent and TUI relay to Hamlib-private bookkeeping, to
+close a gap with no await point between the successful enqueue and the
+store, no wider than the TX worker's own gate-check-to-PTT-on window).
+
+Accepted (PAN-216): having no await point does not make the enqueue and
+the store atomic to the PTT gate. A gate check on another thread that lands
+between the successful `try_send` and the store reads the split the rig is
+about to leave. A change that moves the TX dial out of band (enabling or
+retuning an out-of-band split, or clearing split onto an out-of-band RX
+dial) can then pass the gate in two ways:
+
+- The check's PTT-on queues behind the `SetSplit`. This is the TX worker's
+  own window, from its band-plan check to the PTT-on enqueue in
+  `send_message_if`. That window reaches the same outcome when the check
+  lands before the enqueue too, and it is wider: it includes the bus
+  table-lock wait, which this gap does not.
+- The writer's thread is preempted or otherwise stalled after the enqueue
+  for as long as Hamlib takes to dequeue the `SetSplit`, apply it over CAT
+  and drop its in-flight count. A check in that interval keys right after
+  the rig has switched.
+
+Both are accepted, with no producer-side inhibit. The first widens the TX
+worker's existing window only by this gap. The second needs a stall at
+least as long as Hamlib's dequeue and CAT round trip.
+
+Not covered: a split changed at the radio itself is still never polled back
+(PAN-206), and a TUI and a remote `SetSplit` interleaving between enqueue
+and store can still leave the atomic on the earlier of the two.
+
 ## PAN-139: refuse denied remote close-step opens before mutating the QSO
 
 Round 23 on PR #362 (Codex): round 15's pre-mutation identity-bound permission
