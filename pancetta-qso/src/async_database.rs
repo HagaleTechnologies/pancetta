@@ -2099,7 +2099,7 @@ mod tests {
                     <COUNTRY:13>United States <DXCC:3>291 <CQZ:1>5 <ITUZ:1>8 \
                     <NOTES:13>first contact <STX_STRING:3>001 <SRX_STRING:5>123AB \
                     <RST_SENT:3>599 <RST_RCVD:3>5NN <STX:2>17 <SRX:3>342 \
-                    <TIME_OFF:6>120130 <EOR>\n";
+                    <TIME_OFF:6>120130 <COMMENT:15>Worked portable <EOR>\n";
         let processor = AdifProcessor::new();
         let file = processor.parse_string(adif).unwrap();
         let db = QsoDatabase::new_in_memory().await.unwrap();
@@ -2140,6 +2140,9 @@ mod tests {
             ("STX", "17"),
             ("SRX", "342"),
             ("TIME_OFF", "120130"),
+            // A third-party comment exports as read, with no Pancetta
+            // attribution appended.
+            ("COMMENT", "Worked portable"),
         ] {
             assert_eq!(
                 exported.get(name).map(String::as_str),

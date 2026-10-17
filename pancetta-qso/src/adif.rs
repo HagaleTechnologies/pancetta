@@ -701,7 +701,7 @@ impl AdifProcessor {
 
     /// `additional_fields` plus the record's standard fields that
     /// [`QsoMetadata`] does not hold as read: OPERATOR, TX_PWR, COUNTRY, DXCC,
-    /// CQZ, ITUZ, NOTES, QSL_SENT/QSL_RCVD, the reports as written (a CW
+    /// CQZ, ITUZ, NOTES, COMMENT as written, QSL_SENT/QSL_RCVD, the reports as written (a CW
     /// `599`/`5NN` is not a dB report), STX/SRX, BAND (export derives it from FREQ,
     /// which a record may lack), and MODE when a SUBMODE replaced it in
     /// `mode`. Kept in the tags, they ride through the index and come back
@@ -725,6 +725,9 @@ impl AdifProcessor {
             ("STX", number(adif_qso.stx)),
             ("SRX", number(adif_qso.srx)),
             ("NOTES", adif_qso.notes.clone()),
+            // `notes` holds it too, but export appends Pancetta's attribution
+            // to `notes`; the tag writes a third-party comment back as read.
+            ("COMMENT", adif_qso.comment.clone()),
             (QSL_SENT_FIELD, adif_qso.qsl_sent.clone()),
             (QSL_RCVD_FIELD, adif_qso.qsl_rcvd.clone()),
             ("RST_SENT", adif_qso.rst_sent.clone()),
