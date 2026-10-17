@@ -1084,6 +1084,49 @@ impl RigSelectionState {
         self.selected_baud_idx = self.committed_baud_idx;
         self.selected_ptt_idx = self.committed_ptt_idx;
     }
+
+    /// Whether the operator has done anything in the open picker that a
+    /// refresh must not undo (PAN-60): any field differs from the snapshot
+    /// taken when the picker opened, or a bookmark sub-overlay is open.
+    pub fn has_operator_edits(&self) -> bool {
+        self.naming_bookmark
+            || self.bookmark_overlay_visible
+            || self.model != self.committed_model
+            || self.selected_port_idx != self.committed_port_idx
+            || self.selected_baud_idx != self.committed_baud_idx
+            || self.selected_ptt_idx != self.committed_ptt_idx
+    }
+
+    /// Take a refreshed port list and bookmark list without touching what
+    /// the operator chose (PAN-60). The selected and committed ports are
+    /// re-found by name; one that vanished from the new enumeration is
+    /// prepended so it stays selectable, as `apply_rig_config_update`'s
+    /// I-2a prepend and `load_bookmark`'s I-4 shift do. Model, baud, PTT and
+    /// their committed values are left alone.
+    pub fn merge_refreshed_ports(
+        &mut self,
+        mut ports: Vec<String>,
+        bookmarks: Vec<pancetta_config::rig::RigBookmark>,
+    ) {
+        let selected = self.selected_port();
+        let committed = self
+            .available_ports
+            .get(self.committed_port_idx)
+            .cloned()
+            .unwrap_or_default();
+        for name in [&committed, &selected] {
+            if !name.is_empty() && !ports.contains(name) {
+                ports.insert(0, name.clone());
+            }
+        }
+        self.selected_port_idx = ports.iter().position(|p| *p == selected).unwrap_or(0);
+        self.committed_port_idx = ports.iter().position(|p| *p == committed).unwrap_or(0);
+        self.available_ports = ports;
+        if self.selected_bookmark_idx >= bookmarks.len() {
+            self.selected_bookmark_idx = bookmarks.len().saturating_sub(1);
+        }
+        self.bookmarks = bookmarks;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -4008,6 +4051,9 @@ impl App {
     /// Seed `rig_selection` from a `TuiMessage::RigConfigUpdate` (PAN-59).
     /// Pre-populates the modal with live values so it opens editable, not
     /// blank — mirrors `set_audio_devices`'s seeding of `device_selection`.
+    /// Called at startup and again each time the `i` picker opens (PAN-60);
+    /// when the open picker already has operator edits it merges only the
+    /// refreshed port and bookmark lists instead of overwriting the form.
     pub fn apply_rig_config_update(
         &mut self,
         mut available_ports: Vec<String>,
@@ -4017,6 +4063,15 @@ impl App {
         current_ptt_method: pancetta_config::rig::PttMethod,
         bookmarks: Vec<pancetta_config::rig::RigBookmark>,
     ) {
+        // PAN-60: this arrives a frame or two after `i` opens the picker.
+        // If the operator already started editing, only take the new port
+        // and bookmark lists -- overwriting the form here would wipe an
+        // edit in progress.
+        if self.rig_selection.visible && self.rig_selection.has_operator_edits() {
+            self.rig_selection
+                .merge_refreshed_ports(available_ports, bookmarks);
+            return;
+        }
         // I-2a fix (PAN-59 final review): if the configured port isn't
         // among the enumerated ones (the rig is unplugged, or it's a
         // `host:port` network-rig spec -- `serialport::available_ports()`

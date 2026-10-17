@@ -272,17 +272,22 @@ pub enum TuiMessage {
         output: Vec<(String, bool)>,
         current_output: Option<String>,
     },
-    /// Current rig config + enumerated serial ports, pushed once at startup
-    /// (PAN-59) so the `i` rig-picker modal can pre-populate with live
-    /// values. The TUI is a passive renderer — it never enumerates serial
-    /// ports itself, mirroring `DeviceListUpdate` above.
+    /// Current rig config + enumerated serial ports (PAN-59) so the `i`
+    /// rig-picker modal can pre-populate with live values. Pushed at
+    /// startup and again in answer to every `TuiCommand::RequestRigConfig`
+    /// (PAN-60), so the `i` picker lists ports that appeared after startup;
+    /// while the open picker has edits, the TUI merges only the port and
+    /// bookmark lists (`App::apply_rig_config_update`). The TUI is a
+    /// passive renderer — it never enumerates serial ports itself,
+    /// mirroring `DeviceListUpdate` above.
     RigConfigUpdate {
         available_ports: Vec<String>,
         current_model: String,
         current_port: String,
         current_baud_rate: u32,
         current_ptt_method: pancetta_config::rig::PttMethod,
-        /// Saved rig-config bookmarks (PAN-61), pushed once at startup
+        /// Saved rig-config bookmarks (PAN-61), pushed at startup and in
+        /// answer to every `TuiCommand::RequestRigConfig` (PAN-60)
         /// alongside the live values so the `b` load overlay has data from
         /// frame 1.
         bookmarks: Vec<pancetta_config::rig::RigBookmark>,
@@ -1864,6 +1869,11 @@ impl TuiRunner {
                 app.status_message =
                     "Edit rig config (Tab: next, Up/Down: change, F2: load bookmark, F3: save bookmark, Enter: apply, Esc: cancel)"
                         .to_string();
+                // PAN-60: ask the coordinator to re-enumerate serial ports
+                // so a rig plugged in after startup is listed. The reply
+                // lands a frame or two later; `apply_rig_config_update`
+                // keeps any edit the operator has already made.
+                self.message_tx.send(TuiCommand::RequestRigConfig)?;
             }
             KeyCode::Char('?') => {
                 app.toggle_help();

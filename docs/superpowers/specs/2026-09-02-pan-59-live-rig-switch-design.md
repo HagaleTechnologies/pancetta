@@ -127,6 +127,19 @@ list-select, since rig fields aren't one enumerable list the way audio devices a
    `TuiMessage::RigConfigUpdate { available_ports: Vec<String>, current_model: String, current_port:
    String, current_baud_rate: u32, current_ptt_method: pancetta_config::rig::PttMethod }` once. The
    TUI seeds `App::rig_selection` from it (`App::apply_rig_config_update`).
+
+   **PAN-60 amendment:** the startup push is no longer the only one. Opening the picker (`i`) sends
+   `TuiCommand::RequestRigConfig`, and the coordinator answers with a fresh `RigConfigUpdate`, so a
+   rig plugged in after startup is listed without a restart. Both the startup push and every request
+   go through `spawn_rig_config_refresh` (`tui_relay.rs`): it runs `serialport::available_ports()` on
+   tokio's blocking pool inside a detached, single-flight task (a request made while one is running
+   is answered by that one's reply), so the relay loop never waits on enumeration. It reads `cfg.rig`
+   after enumerating, so a reopen after a rig switch shows what the coordinator actually holds, and
+   sends with a non-blocking `try_send` while holding the config read lock, which orders the reply
+   against the bookmark worker's `RigBookmarksUpdate`. When the reply lands on an open picker the
+   operator has already edited (or with a bookmark sub-overlay open), the TUI merges only the port
+   and bookmark lists (`RigSelectionState::merge_refreshed_ports`) and keeps every field the operator
+   chose; otherwise it applies the reply in full.
 2. **Operator presses `i`** (new binding — `d`/`r`/`R` are all taken; see key-choice note below):
    opens the modal, already pre-populated with current values.
 3. **Operator edits fields, presses Enter**: TUI sends
