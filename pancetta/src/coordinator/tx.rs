@@ -2982,10 +2982,13 @@ fn has_undelivered_pending_hamlib_state(
 /// `tx_rf_hz` is the LOWEST emitted tone (dial + audio offset, from
 /// [`tx_rf_for_gate`]); `signal_span_hz` is how far above it the highest
 /// emitted tone sits ([`tx_signal_span_hz`] for a protocol frame, `0.0`
-/// for a single-tone tune or a raw manual-PTT carrier). Both the low and
-/// the high edge must be inside the band plan (PR #446 Codex review: an
-/// FT8 frame whose base tone is in-band can still put its top tone up to
-/// 43.75 Hz past an upper band edge).
+/// for a single-tone tune or a raw manual-PTT carrier). The whole occupied
+/// interval, low edge to high edge, must fit inside ONE allowed range of
+/// the band plan (PR #446 Codex review: an FT8 frame whose base tone is
+/// in-band can still put its top tone up to 43.75 Hz past an upper band
+/// edge; PAN-208: a multi-range `custom_bands` entry must not be straddled
+/// across the gap between two ranges —
+/// `pancetta_tui::app::tx_interval_out_of_band_plan`).
 pub fn tx_band_plan_mute_reason(
     tx_rf_hz: f64,
     signal_span_hz: f64,
@@ -3010,13 +3013,15 @@ pub fn tx_band_plan_mute_reason(
     let low_hz = tx_rf_hz.max(0.0).floor() as u64;
     let high_hz = (tx_rf_hz.max(0.0) + span_hz).ceil() as u64;
     let low_out = pancetta_tui::app::tx_rf_out_of_band_plan(low_hz, band_plan);
-    let high_out =
-        high_hz != low_hz && pancetta_tui::app::tx_rf_out_of_band_plan(high_hz, band_plan);
+    // PAN-208: the whole occupied interval must fit inside ONE allowed range,
+    // not just have each edge in some range.
+    let interval_out = high_hz != low_hz
+        && pancetta_tui::app::tx_interval_out_of_band_plan(low_hz, high_hz, band_plan);
     if low_out {
         Some(format!(
             "TX frequency {low_hz} Hz is outside the configured amateur band plan"
         ))
-    } else if high_out {
+    } else if interval_out {
         Some(format!(
             "TX signal {low_hz}-{high_hz} Hz extends outside the configured \
              amateur band plan"
@@ -3326,6 +3331,124 @@ mod pan118_band_plan_gate_tests {
                 1_500.0,
             ),
             Some(15_001_500.0)
+        );
+    }
+}
+
+/// PAN-208: a `custom_bands` entry with two or more `ranges` leaves gaps
+/// inside the band. The occupied signal `[floor(low), ceil(low + span)]`
+/// must fit inside ONE allowed range; checking the low and high edges
+/// independently let a frame whose base tone sat in one range and top
+/// tone in the next key across the excluded gap (PR #446 Codex review).
+#[cfg(test)]
+pub(crate) mod pan208_band_plan_gap_tests {
+    use super::*;
+
+    const FT8_SPAN_HZ: f64 = 43.75;
+
+    /// The ticket's plan: 20m carved into 14,070,000–14,071,000 Hz and
+    /// 14,071,020–14,072,000 Hz, with 14,071,000–14,071,020 excluded.
+    pub(crate) fn gapped_plan() -> pancetta_config::BandPlanConfig {
+        use pancetta_config::{BandDefinition, BandType, FrequencyRange};
+        let mut plan = pancetta_config::BandPlanConfig::default();
+        plan.custom_bands.insert(
+            "20m".to_string(),
+            BandDefinition {
+                name: "20m".to_string(),
+                ranges: vec![
+                    FrequencyRange {
+                        start: 14_070_000,
+                        end: 14_071_000,
+                        modes: Vec::new(),
+                    },
+                    FrequencyRange {
+                        start: 14_071_020,
+                        end: 14_072_000,
+                        modes: Vec::new(),
+                    },
+                ],
+                default_mode: "FT8".to_string(),
+                band_type: BandType::Hf,
+            },
+        );
+        plan
+    }
+
+    #[test]
+    fn gap_straddling_signal_is_refused_and_names_the_occupied_range() {
+        // Base tone 14,070,990 Hz is in the first range; the top tone
+        // 14,071,033.75 Hz is in the second. Each edge alone is allowed.
+        let reason = tx_band_plan_mute_reason(14_070_990.0, FT8_SPAN_HZ, &gapped_plan())
+            .expect("a frame straddling the 14,071,000-14,071,020 Hz gap must refuse");
+        assert!(
+            reason.contains(
+                "TX signal 14070990-14071034 Hz extends outside the configured amateur band plan"
+            ),
+            "reason names the occupied range: {reason}"
+        );
+    }
+
+    #[test]
+    fn fully_inside_one_range_signal_still_keys() {
+        // 14,071,100 + 43.75 = 14,071,143.75 Hz: wholly inside the second range.
+        assert_eq!(
+            tx_band_plan_mute_reason(14_071_100.0, FT8_SPAN_HZ, &gapped_plan()),
+            None
+        );
+    }
+
+    #[test]
+    fn zero_span_base_tone_in_first_range_still_keys() {
+        // A tune tone or raw manual-PTT carrier occupies one frequency.
+        assert_eq!(
+            tx_band_plan_mute_reason(14_070_990.0, 0.0, &gapped_plan()),
+            None
+        );
+    }
+
+    #[test]
+    fn gap_plan_edge_warnings_false_permits_the_gap_straddling_signal() {
+        let mut plan = gapped_plan();
+        plan.edge_warnings = false;
+        assert_eq!(
+            tx_band_plan_mute_reason(14_070_990.0, FT8_SPAN_HZ, &plan),
+            None
+        );
+    }
+
+    #[test]
+    fn gap_plan_low_edge_in_no_range_keeps_low_frequency_message() {
+        // 14,069,900 Hz is in global 20m but below the first custom range.
+        let reason = tx_band_plan_mute_reason(14_069_900.0, FT8_SPAN_HZ, &gapped_plan())
+            .expect("a base tone below every custom range must refuse");
+        assert!(
+            reason.contains("TX frequency 14069900 Hz is outside the configured amateur band plan"),
+            "reason names the base tone: {reason}"
+        );
+    }
+
+    #[test]
+    fn gap_plan_top_past_last_range_uses_extends_message() {
+        // 14,071,990 + 43.75 = 14,072,033.75 Hz: past the second range's top.
+        let reason = tx_band_plan_mute_reason(14_071_990.0, FT8_SPAN_HZ, &gapped_plan())
+            .expect("a top tone past the last custom range must refuse");
+        assert!(
+            reason.contains("TX signal 14071990-14072034 Hz extends outside"),
+            "reason names the occupied range: {reason}"
+        );
+    }
+
+    #[test]
+    fn gap_plan_inclusive_edges_are_contained() {
+        // Top tone exactly on the first range's upper edge.
+        assert_eq!(
+            tx_band_plan_mute_reason(14_070_990.0, 10.0, &gapped_plan()),
+            None
+        );
+        // Base tone exactly on the second range's lower edge.
+        assert_eq!(
+            tx_band_plan_mute_reason(14_071_020.0, FT8_SPAN_HZ, &gapped_plan()),
+            None
         );
     }
 }
@@ -19491,9 +19614,16 @@ mod pan115_worker_gate_tests {
     }
 
     pub(crate) async fn worker_harness() -> Harness {
+        worker_harness_with_config(Config::default()).await
+    }
+
+    /// [`worker_harness`] over a caller-built `Config` — the worker snapshots
+    /// `rig.frequency.band_plan` at spawn, so a custom plan must be in the
+    /// config the coordinator is built from (PAN-208).
+    pub(crate) async fn worker_harness_with_config(cfg: Config) -> Harness {
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut coordinator = ApplicationCoordinator::new(
-            Config::default(),
+            cfg,
             None,
             true,  // no_audio
             true,  // headless
@@ -20974,6 +21104,73 @@ mod pan118_worker_band_plan_tests {
         assert_eq!(done[0], Some(false), "item A must complete as failed");
         assert_eq!(done[1], Some(false), "item B must complete as failed");
         assert!(!ptt_on, "no SetPtt(true) for a fully out-of-band bundle");
+    }
+}
+
+/// PAN-208: the gap-straddling Gherkin end to end, through the real TX
+/// worker with a two-range `custom_bands` entry for 20m in its config. A
+/// frame whose base tone sits in the first range and top tone in the second
+/// is refused before `SetPtt{true}` reaches Hamlib; a frame wholly inside
+/// one range still keys.
+#[cfg(test)]
+mod pan208_worker_band_plan_tests {
+    use super::pan115_worker_gate_tests::{
+        await_completion, await_ptt_on, request, worker_harness_with_config, Harness,
+    };
+    use super::pan208_band_plan_gap_tests::gapped_plan;
+    use pancetta_config::Config;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    /// The worker snapshots the band plan at spawn, so it goes in the config.
+    async fn gapped_plan_harness() -> Harness {
+        let mut cfg = Config::default();
+        cfg.rig.frequency.band_plan = gapped_plan();
+        worker_harness_with_config(cfg).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gap_straddling_custom_plan_tx_is_refused_before_ptt() {
+        let h = gapped_plan_harness().await;
+        // Dial + 1,500 Hz audio offset = base tone 14,070,990 Hz; the FT8
+        // top tone lands at 14,071,033.75 Hz, across the excluded gap.
+        h.coordinator
+            .operating_frequency_hz
+            .store(14_069_490, Ordering::Relaxed);
+
+        request(&h, "CQ N0CALL FN20").await;
+        let (completed, diagnostics, ptt_on) =
+            await_completion(&h, "CQ N0CALL FN20", Duration::from_secs(5)).await;
+        assert_eq!(
+            completed,
+            Some(false),
+            "a gap-straddling TX must complete as failed"
+        );
+        assert!(
+            !ptt_on,
+            "no SetPtt{{true}} may reach Hamlib for a gap-straddling TX"
+        );
+        assert!(
+            diagnostics.iter().any(|d| d.contains(
+                "TX blocked (TX signal 14070990-14071034 Hz extends outside the configured amateur band plan)"
+            )),
+            "the admission gate must name the occupied range, got {diagnostics:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fully_inside_custom_plan_tx_still_keys() {
+        let h = gapped_plan_harness().await;
+        // Base tone 14,071,100 Hz; top tone 14,071,143.75 Hz — one range.
+        h.coordinator
+            .operating_frequency_hz
+            .store(14_069_600, Ordering::Relaxed);
+
+        request(&h, "CQ N0CALL FN20").await;
+        assert!(
+            await_ptt_on(&h, Duration::from_secs(40)).await,
+            "a TX wholly inside one custom range must still key"
+        );
     }
 }
 

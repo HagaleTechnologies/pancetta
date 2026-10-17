@@ -4633,21 +4633,64 @@ pub fn tx_rf_out_of_band_plan(tx_rf_hz: u64, band_plan: &pancetta_config::BandPl
     if !band_plan.edge_warnings {
         return false;
     }
+    !band_plan_candidate_ranges(tx_rf_hz, band_plan)
+        .iter()
+        .any(|&(start, end)| tx_rf_hz >= start && tx_rf_hz <= end)
+}
 
-    if let Some(band) = pancetta_core::Band::from_frequency(tx_rf_hz) {
+/// PAN-208: interval sibling of [`tx_rf_out_of_band_plan`] for the
+/// coordinator's TX gate. `true` unless ONE allowed range holds the whole
+/// occupied signal `[low_hz, high_hz]` (inclusive edges, as in the point
+/// check). Point membership is OR across a `custom_bands` entry's `ranges`,
+/// so checking the two edges separately would let a signal straddle the gap
+/// between two ranges. `edge_warnings == false` suppresses it like the point
+/// check.
+pub fn tx_interval_out_of_band_plan(
+    low_hz: u64,
+    high_hz: u64,
+    band_plan: &pancetta_config::BandPlanConfig,
+) -> bool {
+    if !band_plan.edge_warnings {
+        return false;
+    }
+    !band_plan_candidate_ranges(low_hz, band_plan)
+        .iter()
+        .any(|&(start, end)| low_hz >= start && high_hz <= end)
+}
+
+/// The allowed `(start, end)` ranges (Hz, inclusive) that govern `freq_hz`
+/// under `band_plan`, shared by [`tx_rf_out_of_band_plan`] and
+/// [`tx_interval_out_of_band_plan`] so band/region/`custom_bands`
+/// resolution has one implementation:
+///
+/// - the `custom_bands` entry for the global-table band of `freq_hz`, each
+///   range clipped to that band's global range (the override only applies
+///   to frequencies the global table resolves to the band);
+/// - else the region-aware range (global table for an invalid region) that
+///   contains `freq_hz`;
+/// - else none.
+fn band_plan_candidate_ranges(
+    freq_hz: u64,
+    band_plan: &pancetta_config::BandPlanConfig,
+) -> Vec<(u64, u64)> {
+    if let Some(band) = pancetta_core::Band::from_frequency(freq_hz) {
         if let Some(custom) = band_plan.custom_bands.get(&band.to_string()) {
-            let in_band = custom
+            let (band_low, band_high) = band.frequency_range();
+            return custom
                 .ranges
                 .iter()
-                .any(|r| tx_rf_hz >= r.start && tx_rf_hz <= r.end);
-            return !in_band;
+                .map(|r| (r.start.max(band_low), r.end.min(band_high)))
+                .filter(|&(start, end)| start <= end)
+                .collect();
         }
     }
 
-    match pancetta_core::IaruRegion::from_u8(band_plan.region) {
-        Some(region) => pancetta_core::Band::from_frequency_for_region(tx_rf_hz, region).is_none(),
-        None => pancetta_core::Band::from_frequency(tx_rf_hz).is_none(),
-    }
+    let range = match pancetta_core::IaruRegion::from_u8(band_plan.region) {
+        Some(region) => pancetta_core::Band::from_frequency_for_region(freq_hz, region)
+            .map(|band| band.frequency_range_for_region(region)),
+        None => pancetta_core::Band::from_frequency(freq_hz).map(|band| band.frequency_range()),
+    };
+    range.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -7991,6 +8034,91 @@ mod tests {
         };
         assert!(super::tx_rf_out_of_band_plan(7_250_000, &with_override));
         assert!(!super::tx_rf_out_of_band_plan(7_050_000, &with_override));
+    }
+
+    /// PAN-208: 20m carved into two custom ranges with a 20 Hz gap.
+    fn gapped_20m_plan(ranges: &[(u64, u64)]) -> pancetta_config::BandPlanConfig {
+        use pancetta_config::{BandDefinition, BandType, FrequencyRange};
+        let mut custom_bands = std::collections::HashMap::new();
+        custom_bands.insert(
+            "20m".to_string(),
+            BandDefinition {
+                name: "20m".to_string(),
+                ranges: ranges
+                    .iter()
+                    .map(|&(start, end)| FrequencyRange {
+                        start,
+                        end,
+                        modes: vec![],
+                    })
+                    .collect(),
+                default_mode: "FT8".to_string(),
+                band_type: BandType::Hf,
+            },
+        );
+        pancetta_config::BandPlanConfig {
+            region: 2,
+            custom_bands,
+            edge_warnings: true,
+        }
+    }
+
+    #[test]
+    fn tx_interval_out_of_band_plan_requires_one_custom_range() {
+        let plan = gapped_20m_plan(&[(14_070_000, 14_071_000), (14_071_020, 14_072_000)]);
+        // Each edge is in some range, but no single range holds both.
+        assert!(!super::tx_rf_out_of_band_plan(14_070_990, &plan));
+        assert!(!super::tx_rf_out_of_band_plan(14_071_034, &plan));
+        assert!(super::tx_interval_out_of_band_plan(
+            14_070_990, 14_071_034, &plan
+        ));
+        // Wholly inside the second range.
+        assert!(!super::tx_interval_out_of_band_plan(
+            14_071_100, 14_071_144, &plan
+        ));
+        // Range edges are inclusive, as in the point check.
+        assert!(!super::tx_interval_out_of_band_plan(
+            14_070_990, 14_071_000, &plan
+        ));
+    }
+
+    #[test]
+    fn tx_interval_out_of_band_plan_respects_edge_warnings_toggle() {
+        let mut plan = gapped_20m_plan(&[(14_070_000, 14_071_000), (14_071_020, 14_072_000)]);
+        plan.edge_warnings = false;
+        assert!(!super::tx_interval_out_of_band_plan(
+            14_070_990, 14_071_034, &plan
+        ));
+    }
+
+    #[test]
+    fn tx_interval_out_of_band_plan_region_fallback_checks_the_top_edge() {
+        let plan = pancetta_config::BandPlanConfig {
+            region: 2,
+            custom_bands: Default::default(),
+            edge_warnings: true,
+        };
+        assert!(!super::tx_interval_out_of_band_plan(
+            14_075_500, 14_075_544, &plan
+        ));
+        // Top tone past 20m's 14.350 MHz upper edge.
+        assert!(super::tx_interval_out_of_band_plan(
+            14_349_990, 14_350_034, &plan
+        ));
+    }
+
+    #[test]
+    fn tx_interval_out_of_band_plan_custom_range_stops_at_the_global_band_edge() {
+        // A custom range past the global 20m top (14.350 MHz) is honoured by
+        // the point check only inside 20m, so the interval check must agree.
+        let plan = gapped_20m_plan(&[(14_300_000, 14_400_000)]);
+        assert!(super::tx_rf_out_of_band_plan(14_350_034, &plan));
+        assert!(super::tx_interval_out_of_band_plan(
+            14_349_990, 14_350_034, &plan
+        ));
+        assert!(!super::tx_interval_out_of_band_plan(
+            14_349_900, 14_349_944, &plan
+        ));
     }
 
     #[test]
