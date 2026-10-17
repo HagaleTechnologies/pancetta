@@ -204,7 +204,10 @@ pub struct SpotReportRequest {
 
 // --- QSO Reporting ---
 
-#[derive(Debug, Clone, Serialize)]
+/// One QSO for `POST /api/v1/qsos`. `Deserialize` lets pancetta's
+/// pending-upload queue (PAN-57) store the record built at completion and
+/// send it again unchanged, so a retry hits the same idempotency key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QsoRecord {
     pub callsign: String,
     #[serde(rename = "remoteGrid")]
@@ -285,6 +288,41 @@ pub fn rank_to_rarity(rank: Option<u32>) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qso_record_json_round_trips() {
+        let start = DateTime::parse_from_rfc3339("2026-10-17T14:02:11Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for rec in [
+            QsoRecord {
+                callsign: "K1ABC".to_string(),
+                remote_grid: Some("FN42".to_string()),
+                local_grid: Some("EM10".to_string()),
+                frequency: 14_074_500,
+                mode: "FT8".to_string(),
+                rst_sent: Some("-10".to_string()),
+                rst_received: Some("+02".to_string()),
+                start_time: start,
+                end_time: start + chrono::Duration::seconds(60),
+            },
+            QsoRecord {
+                callsign: "JA1XYZ".to_string(),
+                remote_grid: None,
+                local_grid: None,
+                frequency: 7_074_000,
+                mode: "FT4".to_string(),
+                rst_sent: None,
+                rst_received: None,
+                start_time: start,
+                end_time: start,
+            },
+        ] {
+            let json = serde_json::to_string(&rec).unwrap();
+            let back: QsoRecord = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, rec, "{json}");
+        }
+    }
 
     #[test]
     fn test_rank_to_rarity_boundaries() {

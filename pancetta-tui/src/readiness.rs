@@ -75,6 +75,34 @@ pub enum ClockState {
     Rechecking,
 }
 
+/// What is wrong with one logbook-upload destination (PAN-57).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UploadIssueKind {
+    /// The service refused the account; uploads are held until a restart.
+    LoginRejected,
+    /// The service refused some records; they are held until the next start.
+    Rejected,
+    /// Still failing after the quick retries; retried on the slow interval.
+    Retrying { every_mins: u64 },
+}
+
+/// One upload warning for the readiness strip (PAN-57). Never a Blocker:
+/// upload trouble never holds TX.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadIssue {
+    /// Service name, e.g. "QRZ Logbook".
+    pub service: String,
+    /// Where its credentials live, e.g. "[network.qrz_logbook]".
+    pub config_section: String,
+    pub kind: UploadIssueKind,
+    /// Uploads affected (held, or queued).
+    pub count: usize,
+    /// The latest failure text (≤ 160 chars, never a credential).
+    pub last_error: String,
+    /// The contacted station of the latest affected upload, when known.
+    pub last_call: Option<String>,
+}
+
 /// Coordinator → TUI readiness snapshot (relay, 2 s tick, pushed on change).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StationReadiness {
@@ -88,6 +116,10 @@ pub struct StationReadiness {
     pub degraded: Option<String>,
     pub rf_no_decode: bool,
     pub input_silent: bool,
+    /// Per-destination logbook-upload warnings (PAN-57).
+    pub upload_issues: Vec<UploadIssue>,
+    /// New uploads refused this session because the queue was full.
+    pub upload_queue_refused: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +150,10 @@ pub enum ReadinessKey {
     RigNotReady,
     RigCmdQueued,
     RigCmdApplying,
+    /// A logbook-upload warning, keyed by service and kind (not count), so
+    /// an ack survives a count change (PAN-57).
+    Upload(String, UploadIssueKind),
+    UploadQueueFull,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,6 +239,71 @@ pub fn clock_skew_detail(offset_s: f64) -> String {
     };
     let dir = if offset_s > 0.0 { "SLOW" } else { "FAST" };
     format!("{mag} {dir}")
+}
+
+/// `""` for one, `"s"` otherwise.
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+/// The strip item for one upload issue.
+fn upload_item(i: &UploadIssue) -> ReadinessItem {
+    let service_upper = i.service.to_uppercase();
+    let n = i.count;
+    let (label, detail) = match i.kind {
+        UploadIssueKind::LoginRejected => (
+            format!("⚠ {service_upper} LOGIN REJECTED"),
+            format!(
+                "{} login rejected — {n} upload{} held: {}. Fix {} and restart pancetta; held uploads retry at startup.",
+                i.service,
+                plural(n),
+                i.last_error,
+                i.config_section
+            ),
+        ),
+        UploadIssueKind::Rejected => {
+            let last = i
+                .last_call
+                .as_ref()
+                .map(|c| format!("last {c}: "))
+                .unwrap_or_default();
+            let stays = if n == 1 {
+                "the QSO stays"
+            } else {
+                "the QSOs stay"
+            };
+            (
+                format!(
+                    "⚠ {service_upper} REJECTED {n} QSO{}",
+                    plural(n).to_uppercase()
+                ),
+                format!(
+                    "{} rejected {n} QSO{} — {last}{}. Held until the next start; {stays} in qsos.adi.",
+                    i.service,
+                    plural(n),
+                    i.last_error
+                ),
+            )
+        }
+        UploadIssueKind::Retrying { every_mins } => (
+            format!("⚠ {service_upper} UPLOAD RETRYING · {n} QUEUED"),
+            format!(
+                "{} upload retrying — {n} queued, trying every {every_mins} min: {}. Queued uploads survive a restart.",
+                i.service, i.last_error
+            ),
+        ),
+    };
+    ReadinessItem {
+        key: ReadinessKey::Upload(i.service.clone(), i.kind),
+        severity: Severity::Warning,
+        label,
+        detail,
+        acknowledged: false,
+    }
 }
 
 fn item(key: ReadinessKey, severity: Severity, label: &str, detail: &str) -> ReadinessItem {
@@ -362,6 +463,22 @@ fn condition_items(
                 severity: Severity::Warning,
                 label: format!("⚠ DEGRADED: {summary}"),
                 detail: format!("Degraded — {summary}"),
+                acknowledged: false,
+            });
+        }
+        // PAN-57: upload warnings. Always Warnings, never Blockers, so they
+        // can never change the TX verdict.
+        warnings.extend(r.upload_issues.iter().map(upload_item));
+        if r.upload_queue_refused > 0 {
+            let n = r.upload_queue_refused;
+            warnings.push(ReadinessItem {
+                key: ReadinessKey::UploadQueueFull,
+                severity: Severity::Warning,
+                label: "⚠ UPLOAD QUEUE FULL".to_string(),
+                detail: format!(
+                    "Upload queue full — {n} new upload{} not queued this session; those QSOs are in qsos.adi. Resolve the failing service to drain the queue.",
+                    plural(n)
+                ),
                 acknowledged: false,
             });
         }
@@ -704,5 +821,164 @@ mod tests {
         // The same text after an ack is a new alert, not a repeat.
         app.add_error_message("Rig connect failed".to_string());
         assert_eq!(visible_labels(&app), vec!["⚠ Rig connect failed"]);
+    }
+
+    // ----- PAN-57: upload warnings. -----------------------------------------
+
+    fn issue(service: &str, section: &str, kind: UploadIssueKind, count: usize) -> UploadIssue {
+        UploadIssue {
+            service: service.to_string(),
+            config_section: section.to_string(),
+            kind,
+            count,
+            last_error: "HTTP 503 Service Unavailable".to_string(),
+            last_call: Some("K1ABC".to_string()),
+        }
+    }
+
+    fn qrz_login(count: usize) -> UploadIssue {
+        issue(
+            "QRZ Logbook",
+            "[network.qrz_logbook]",
+            UploadIssueKind::LoginRejected,
+            count,
+        )
+    }
+
+    fn with_uploads(issues: Vec<UploadIssue>, refused: usize) -> StationReadiness {
+        StationReadiness {
+            upload_issues: issues,
+            upload_queue_refused: refused,
+            ..StationReadiness::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_login_rejected_is_an_acknowledgeable_warning() {
+        let mut app = app().await;
+        app.station_readiness = Some(with_uploads(vec![qrz_login(3)], 0));
+        let items = readiness_items(&app);
+        assert_eq!(items.len(), 1);
+        let i = &items[0];
+        assert_eq!(i.label, "⚠ QRZ LOGBOOK LOGIN REJECTED");
+        assert_eq!(i.severity, Severity::Warning);
+        assert!(i.is_acknowledgeable());
+        assert!(
+            i.detail
+                .starts_with("QRZ Logbook login rejected — 3 uploads held: "),
+            "{}",
+            i.detail
+        );
+        assert!(i.detail.contains("Fix [network.qrz_logbook] and restart"));
+    }
+
+    #[tokio::test]
+    async fn upload_rejected_label_counts_qsos() {
+        let mut app = app().await;
+        let clublog = |n| issue("ClubLog", "[network.clublog]", UploadIssueKind::Rejected, n);
+        app.station_readiness = Some(with_uploads(vec![clublog(1)], 0));
+        assert_eq!(labels(&app), vec!["⚠ CLUBLOG REJECTED 1 QSO"]);
+        let detail = readiness_items(&app)[0].detail.clone();
+        assert!(detail.contains("last K1ABC: "), "{detail}");
+        assert!(detail.contains("the QSO stays in qsos.adi"), "{detail}");
+        app.station_readiness = Some(with_uploads(vec![clublog(2)], 0));
+        assert_eq!(labels(&app), vec!["⚠ CLUBLOG REJECTED 2 QSOS"]);
+    }
+
+    #[tokio::test]
+    async fn upload_retrying_label_shows_the_queue() {
+        let mut app = app().await;
+        app.station_readiness = Some(with_uploads(
+            vec![issue(
+                "eQSL",
+                "[network.eqsl]",
+                UploadIssueKind::Retrying { every_mins: 5 },
+                4,
+            )],
+            0,
+        ));
+        assert_eq!(labels(&app), vec!["⚠ EQSL UPLOAD RETRYING · 4 QUEUED"]);
+        assert!(readiness_items(&app)[0]
+            .detail
+            .contains("trying every 5 min"));
+    }
+
+    #[tokio::test]
+    async fn upload_queue_full_is_a_warning() {
+        let mut app = app().await;
+        app.station_readiness = Some(with_uploads(vec![], 2));
+        let items = readiness_items(&app);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "⚠ UPLOAD QUEUE FULL");
+        assert_eq!(items[0].severity, Severity::Warning);
+    }
+
+    #[tokio::test]
+    async fn upload_warnings_never_change_the_tx_verdict() {
+        let mut app = app().await;
+        let all = vec![
+            qrz_login(3),
+            issue("ClubLog", "[network.clublog]", UploadIssueKind::Rejected, 1),
+            issue(
+                "eQSL",
+                "[network.eqsl]",
+                UploadIssueKind::Retrying { every_mins: 5 },
+                4,
+            ),
+        ];
+        app.station_readiness = Some(with_uploads(all.clone(), 1));
+        assert_eq!(verdict(&app), Verdict::Ready);
+        app.station_readiness = Some(StationReadiness {
+            tx_mute_causes: vec![TxMuteCause::RigDisconnected],
+            ..with_uploads(all, 1)
+        });
+        assert_eq!(verdict(&app), Verdict::Held);
+        app.station_readiness = Some(snapshot(&[TxMuteCause::RigDisconnected]));
+        assert_eq!(verdict(&app), Verdict::Held);
+    }
+
+    #[tokio::test]
+    async fn upload_ack_survives_a_count_change_and_clears_when_resolved() {
+        let mut app = app().await;
+        app.station_readiness = Some(with_uploads(vec![qrz_login(3)], 0));
+        assert_eq!(app.acknowledge_readiness(), 1);
+        assert!(visible_labels(&app).is_empty());
+
+        app.station_readiness = Some(with_uploads(vec![qrz_login(4)], 0));
+        app.prune_acknowledged_readiness();
+        assert!(visible_labels(&app).is_empty());
+
+        app.station_readiness = Some(with_uploads(vec![], 0));
+        app.prune_acknowledged_readiness();
+        assert!(app.acknowledged_readiness.is_empty());
+
+        app.station_readiness = Some(with_uploads(vec![qrz_login(1)], 0));
+        app.prune_acknowledged_readiness();
+        let items = readiness_items(&app);
+        assert!(!items[0].acknowledged);
+        assert_eq!(visible_labels(&app), vec!["⚠ QRZ LOGBOOK LOGIN REJECTED"]);
+    }
+
+    #[tokio::test]
+    async fn upload_detail_lead_splits_for_the_ackd_marker() {
+        let mut app = app().await;
+        app.station_readiness = Some(with_uploads(
+            vec![
+                qrz_login(1),
+                issue("ClubLog", "[network.clublog]", UploadIssueKind::Rejected, 1),
+                issue(
+                    "eQSL",
+                    "[network.eqsl]",
+                    UploadIssueKind::Retrying { every_mins: 5 },
+                    1,
+                ),
+            ],
+            1,
+        ));
+        let items = readiness_items(&app);
+        assert_eq!(items.len(), 4);
+        for i in items {
+            assert!(i.detail.split_once(" — ").is_some(), "{}", i.detail);
+        }
     }
 }
