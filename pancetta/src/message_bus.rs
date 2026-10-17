@@ -321,7 +321,9 @@ pub enum MessageType {
     /// Split-TX state echo for the TUI title-bar chip. Sent by the
     /// coordinator relay after every write to the split atomic: on
     /// `TuiCommand::SetSplit` (operator modal), on manual band-change
-    /// (clears split), and on autonomous band-hop (clears split).
+    /// (clears split), and on autonomous band-hop (clears split). When a
+    /// split change was not delivered to Hamlib, it carries the unchanged
+    /// value the band-plan gate still enforces (PAN-209).
     /// `tx_hz == 0` means simplex (chip hidden). Observation only.
     SplitStatus {
         /// Current split TX frequency in Hz, or 0 for simplex.

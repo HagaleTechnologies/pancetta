@@ -1497,25 +1497,21 @@ impl super::ApplicationCoordinator {
                                     warn!("Band change: failed to send teardown: {}", e);
                                 }
                                 // A band change invalidates any split TX freq.
-                                if cmd_split_tx_hz.swap(0, Ordering::Relaxed) != 0 {
-                                    // Push authoritative split clear to the TUI chip.
+                                if cmd_split_tx_hz.load(Ordering::Relaxed) != 0 {
+                                    let store = super::forward_split_change(
+                                        &cmd_message_bus,
+                                        ComponentId::Tui,
+                                        &cmd_split_tx_hz,
+                                        false,
+                                        0,
+                                    )
+                                    .await;
+                                    // Push authoritative split state to the TUI chip.
                                     let _ = cmd_tui_msg_tx.send(
                                         pancetta_tui::tui_runner::TuiMessage::SplitUpdate {
-                                            tx_hz: 0,
+                                            tx_hz: store,
                                         },
                                     );
-                                    let clr = ComponentMessage::new(
-                                        ComponentId::Tui,
-                                        ComponentId::Hamlib,
-                                        MessageType::RigControl(
-                                            crate::message_bus::RigControlMessage::SetSplit {
-                                                enabled: false,
-                                                tx_frequency: 0,
-                                            },
-                                        ),
-                                        Instant::now(),
-                                    );
-                                    let _ = cmd_message_bus.send_message(clr).await;
                                 }
                             }
                             // Forward to hamlib if available
@@ -1538,27 +1534,19 @@ impl super::ApplicationCoordinator {
                             enabled,
                             tx_frequency,
                         } => {
-                            let store =
-                                super::record_split_state(&cmd_split_tx_hz, enabled, tx_frequency);
                             info!(target: "rig.split", "TUI SetSplit enabled={} tx={} Hz", enabled, tx_frequency);
+                            let store = super::forward_split_change(
+                                &cmd_message_bus,
+                                ComponentId::Tui,
+                                &cmd_split_tx_hz,
+                                enabled,
+                                tx_frequency,
+                            )
+                            .await;
                             // Push authoritative split state to the TUI chip.
                             let _ = cmd_tui_msg_tx.send(
                                 pancetta_tui::tui_runner::TuiMessage::SplitUpdate { tx_hz: store },
                             );
-                            let msg = ComponentMessage::new(
-                                ComponentId::Tui,
-                                ComponentId::Hamlib,
-                                MessageType::RigControl(
-                                    crate::message_bus::RigControlMessage::SetSplit {
-                                        enabled,
-                                        tx_frequency,
-                                    },
-                                ),
-                                Instant::now(),
-                            );
-                            if let Err(e) = cmd_message_bus.send_message(msg).await {
-                                warn!("Failed to forward SetSplit to hamlib: {}", e);
-                            }
                         }
                         pancetta_tui::tui_runner::TuiCommand::Quit => {
                             info!("TUI requested application quit");

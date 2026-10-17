@@ -114,6 +114,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A split change that never reaches the rig no longer changes the TX
+  band-plan check (PAN-209). Remote and local split changes, and the split
+  clear on a band change, are recorded only once Hamlib's queue accepts them.
+  If the queue rejects every attempt, the check keeps the split the rig is
+  still on, the SPLIT chip shows that split, and the Diagnostics overlay says
+  the change was not delivered.
+
 - The TX band-plan gate now refuses a frame that straddles the gap between
   two ranges of a `custom_bands` entry (PAN-208). The whole occupied signal
   must fit inside ONE allowed range; before, the low and high edges were
