@@ -272,20 +272,31 @@ pub enum TuiMessage {
         output: Vec<(String, bool)>,
         current_output: Option<String>,
     },
-    /// Current rig config + enumerated serial ports, pushed once at startup
-    /// (PAN-59) so the `i` rig-picker modal can pre-populate with live
-    /// values. The TUI is a passive renderer — it never enumerates serial
-    /// ports itself, mirroring `DeviceListUpdate` above.
+    /// Current rig config + enumerated serial ports (PAN-59) so the `i`
+    /// rig-picker modal can pre-populate with live values. Pushed at
+    /// startup and again in answer to every `TuiCommand::RequestRigConfig`
+    /// (PAN-60), so the `i` picker lists ports that appeared after startup;
+    /// while the open picker has edits, or when `select_seq` shows the reply
+    /// predates the operator's latest submit, the TUI merges only the port
+    /// and bookmark lists (`App::apply_rig_config_update`). The TUI is a
+    /// passive renderer — it never enumerates serial ports itself,
+    /// mirroring `DeviceListUpdate` above.
     RigConfigUpdate {
         available_ports: Vec<String>,
         current_model: String,
         current_port: String,
         current_baud_rate: u32,
         current_ptt_method: pancetta_config::rig::PttMethod,
-        /// Saved rig-config bookmarks (PAN-61), pushed once at startup
+        /// Saved rig-config bookmarks (PAN-61), pushed at startup and in
+        /// answer to every `TuiCommand::RequestRigConfig` (PAN-60)
         /// alongside the live values so the `b` load overlay has data from
         /// frame 1.
         bookmarks: Vec<pancetta_config::rig::RigBookmark>,
+        /// How many `TuiCommand::SelectRig` the coordinator had handled when
+        /// it read these values (PAN-60 review). Fewer than the TUI has sent
+        /// means the reply predates the operator's latest submit, so the TUI
+        /// takes only its port and bookmark lists.
+        select_seq: u64,
     },
     /// Saved rig-config bookmarks changed (PAN-61: after a `SaveRigBookmark`
     /// or `DeleteRigBookmark` command). Full resync, mirroring
@@ -432,6 +443,13 @@ pub enum TuiCommand {
     /// Delete a saved rig-config bookmark by name (PAN-61). No-op if the
     /// name doesn't match any saved bookmark.
     DeleteRigBookmark { name: String },
+    /// Ask the coordinator for a fresh `RigConfigUpdate` (PAN-60), sent
+    /// each time the `i` rig picker opens so a serial port that appeared
+    /// after startup (a newly plugged-in rig) is listed without a restart.
+    /// The coordinator enumerates off its relay loop and replies
+    /// asynchronously; until the reply lands the picker shows the
+    /// last-known list.
+    RequestRigConfig,
     /// User requested quit
     Quit,
     /// Operator pressed the emergency-stop key (`Q` / `q` with Shift).
@@ -919,6 +937,7 @@ impl TuiRunner {
                 current_baud_rate,
                 current_ptt_method,
                 bookmarks,
+                select_seq,
             } => {
                 app.apply_rig_config_update(
                     available_ports,
@@ -927,6 +946,7 @@ impl TuiRunner {
                     current_baud_rate,
                     current_ptt_method,
                     bookmarks,
+                    select_seq,
                 );
             }
             TuiMessage::RigBookmarksUpdate { bookmarks } => {
@@ -1343,6 +1363,9 @@ impl TuiRunner {
                         // snapshot to the just-applied values so a later
                         // open/cancel cycle doesn't revert past them.
                         app.rig_selection.snapshot_committed();
+                        // PAN-60 review: replies read before the coordinator
+                        // handles this SelectRig must not revert the form.
+                        app.rig_selection.submits_sent += 1;
                         app.status_message = "Applying rig config…".to_string();
                     }
                 }
@@ -1857,6 +1880,11 @@ impl TuiRunner {
                 app.status_message =
                     "Edit rig config (Tab: next, Up/Down: change, F2: load bookmark, F3: save bookmark, Enter: apply, Esc: cancel)"
                         .to_string();
+                // PAN-60: ask the coordinator to re-enumerate serial ports
+                // so a rig plugged in after startup is listed. The reply
+                // lands a frame or two later; `apply_rig_config_update`
+                // keeps any edit the operator has already made.
+                self.message_tx.send(TuiCommand::RequestRigConfig)?;
             }
             KeyCode::Char('?') => {
                 app.toggle_help();
@@ -6608,16 +6636,349 @@ mod key_tests {
         r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .await
             .unwrap();
-        match cmd_rx.try_recv() {
-            Ok(TuiCommand::SelectRig { model, .. }) => {
+        let cmds: Vec<TuiCommand> = cmd_rx.try_iter().collect();
+        match cmds.as_slice() {
+            [TuiCommand::RequestRigConfig, TuiCommand::RequestRigConfig, TuiCommand::SelectRig { model, .. }] =>
+            {
                 assert_eq!(
                     model, "FTdx10",
                     "a later, unrelated Enter must never apply an abandoned edit from a \
                      prior cancelled session"
                 );
             }
-            other => panic!("expected SelectRig, got {:?}", other),
+            other => panic!(
+                "expected two RequestRigConfig then SelectRig, got {:?}",
+                other
+            ),
         }
+    }
+
+    /// A `RigConfigUpdate` as the coordinator's refresh sends it (PAN-60):
+    /// 38400 baud, CAT PTT, no bookmarks, read before any `SelectRig`.
+    fn rig_config_update(ports: &[&str], model: &str, current_port: &str) -> TuiMessage {
+        rig_config_update_after(0, ports, model, current_port)
+    }
+
+    /// `rig_config_update`, read after the coordinator handled
+    /// `select_seq` `SelectRig` commands.
+    fn rig_config_update_after(
+        select_seq: u64,
+        ports: &[&str],
+        model: &str,
+        current_port: &str,
+    ) -> TuiMessage {
+        TuiMessage::RigConfigUpdate {
+            available_ports: ports.iter().map(|p| p.to_string()).collect(),
+            current_model: model.to_string(),
+            current_port: current_port.to_string(),
+            current_baud_rate: 38400,
+            current_ptt_method: pancetta_config::rig::PttMethod::Cat,
+            bookmarks: vec![],
+            select_seq,
+        }
+    }
+
+    /// PAN-60: opening the rig picker asks the coordinator to re-enumerate
+    /// serial ports, exactly once per open.
+    #[tokio::test]
+    async fn i_opens_rig_picker_and_requests_a_fresh_rig_config() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        r.handle_key_event(key('i')).await.unwrap();
+
+        assert!(app.read().await.rig_selection.visible);
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(TuiCommand::RequestRigConfig)),
+            "opening the rig picker must request a fresh rig config"
+        );
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "one open must send exactly one RequestRigConfig"
+        );
+    }
+
+    /// PAN-60: inside the open picker `i` is a Model character, not an
+    /// open, so it must not request again.
+    #[tokio::test]
+    async fn typing_i_into_the_open_rig_picker_does_not_request_again() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        app.write().await.rig_selection.model = "FTdx10".to_string();
+        r.handle_key_event(key('i')).await.unwrap();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::RequestRigConfig)
+        ));
+
+        r.handle_key_event(key('i')).await.unwrap();
+
+        assert_eq!(app.read().await.rig_selection.model, "FTdx10i");
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "typing `i` into the open picker must not request another refresh"
+        );
+    }
+
+    /// PAN-60, the ticket's scenario: a rig plugged in after startup is
+    /// unreachable until the refresh sent on open lands, then Down reaches
+    /// its port and Enter applies it.
+    #[tokio::test]
+    async fn rig_picker_reaches_a_port_plugged_in_after_startup() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        // Startup push: only the original rig's port exists.
+        r.handle_message(rig_config_update(
+            &["/dev/ttyUSB0"],
+            "FTdx10",
+            "/dev/ttyUSB0",
+        ))
+        .await
+        .unwrap();
+
+        r.handle_key_event(key('i')).await.unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.read().await.rig_selection.selected_port(),
+            "/dev/ttyUSB0",
+            "before the refresh lands, the new rig's port is not in the list"
+        );
+
+        // The refresh `i` asked for lands, listing the newly plugged-in rig.
+        r.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        r.handle_message(rig_config_update(
+            &["/dev/ttyUSB0", "/dev/ttyUSB1"],
+            "FTdx10",
+            "/dev/ttyUSB0",
+        ))
+        .await
+        .unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.read().await.rig_selection.selected_port(),
+            "/dev/ttyUSB1",
+            "after the refresh, Down must reach the newly plugged-in rig's port"
+        );
+
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let cmds: Vec<TuiCommand> = cmd_rx.try_iter().collect();
+        match cmds.as_slice() {
+            [TuiCommand::RequestRigConfig, TuiCommand::SelectRig { port, .. }] => {
+                assert_eq!(port, "/dev/ttyUSB1");
+            }
+            other => panic!("expected RequestRigConfig then SelectRig, got {:?}", other),
+        }
+    }
+
+    /// PAN-60: the refresh lands asynchronously, so an operator who starts
+    /// typing the moment the picker opens must not have the edit wiped by
+    /// it -- and Esc must still restore the values the picker opened with.
+    #[tokio::test]
+    async fn rig_config_refresh_landing_mid_edit_keeps_the_edit() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        r.handle_message(rig_config_update(
+            &["/dev/ttyUSB0", "/dev/ttyUSB1"],
+            "FTdx10",
+            "/dev/ttyUSB0",
+        ))
+        .await
+        .unwrap();
+
+        r.handle_key_event(key('i')).await.unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        r.handle_key_event(key('X')).await.unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        {
+            let app = app.read().await;
+            assert_eq!(app.rig_selection.model, "FTdx1X");
+            assert_eq!(app.rig_selection.selected_port(), "/dev/ttyUSB1");
+        }
+
+        r.handle_message(rig_config_update(
+            &["/dev/ttyACM0", "/dev/ttyUSB0", "/dev/ttyUSB1"],
+            "FTdx10",
+            "/dev/ttyUSB0",
+        ))
+        .await
+        .unwrap();
+        {
+            let app = app.read().await;
+            assert_eq!(
+                app.rig_selection.model, "FTdx1X",
+                "a refresh landing mid-edit must not wipe the typed model"
+            );
+            assert_eq!(
+                app.rig_selection.selected_port(),
+                "/dev/ttyUSB1",
+                "a refresh landing mid-edit must not move the chosen port"
+            );
+        }
+
+        r.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let app = app.read().await;
+        assert_eq!(app.rig_selection.model, "FTdx10");
+        assert_eq!(
+            app.rig_selection.selected_port(),
+            "/dev/ttyUSB0",
+            "Esc must restore the port the picker opened with, even after the refresh \
+             moved it to a new index"
+        );
+    }
+
+    /// PAN-60 review: the refresh `i` asked for can be read before Enter's
+    /// `SelectRig` reaches the coordinator, and drained after the picker has
+    /// closed or, behind a backlog of decodes, after it has reopened. It must
+    /// not overwrite the just-submitted rig, or Enter on the reopened picker
+    /// would re-apply the old one.
+    async fn stale_refresh_keeps_the_submitted_rig(land_after_reopen: bool) {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        r.handle_message(rig_config_update(
+            &["/dev/ttyUSB0", "/dev/ttyUSB1"],
+            "FTdx10",
+            "/dev/ttyUSB0",
+        ))
+        .await
+        .unwrap();
+
+        r.handle_key_event(key('i')).await.unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        r.handle_key_event(key('X')).await.unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        if land_after_reopen {
+            r.handle_key_event(key('i')).await.unwrap();
+        }
+
+        // Read before the coordinator handled the SelectRig.
+        r.handle_message(rig_config_update(
+            &["/dev/ttyACM0", "/dev/ttyUSB0", "/dev/ttyUSB1"],
+            "FTdx10",
+            "/dev/ttyUSB0",
+        ))
+        .await
+        .unwrap();
+        {
+            let app = app.read().await;
+            assert_eq!(
+                app.rig_selection.model, "FTdx1X",
+                "a refresh read before the submit must not revert the submitted model"
+            );
+            assert_eq!(
+                app.rig_selection.selected_port(),
+                "/dev/ttyUSB1",
+                "a refresh read before the submit must not revert the submitted port"
+            );
+            assert_eq!(
+                app.rig_selection.available_ports,
+                vec!["/dev/ttyACM0", "/dev/ttyUSB0", "/dev/ttyUSB1"],
+                "the refreshed port list is still taken"
+            );
+        }
+
+        if !land_after_reopen {
+            r.handle_key_event(key('i')).await.unwrap();
+        }
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let cmds: Vec<TuiCommand> = cmd_rx.try_iter().collect();
+        match cmds.as_slice() {
+            [TuiCommand::RequestRigConfig, TuiCommand::SelectRig {
+                model: m1,
+                port: p1,
+                ..
+            }, TuiCommand::RequestRigConfig, TuiCommand::SelectRig {
+                model: m2,
+                port: p2,
+                ..
+            }] => {
+                assert_eq!((m1.as_str(), p1.as_str()), ("FTdx1X", "/dev/ttyUSB1"));
+                assert_eq!(
+                    (m2.as_str(), p2.as_str()),
+                    ("FTdx1X", "/dev/ttyUSB1"),
+                    "Enter on the reopened picker must re-apply the submitted rig, not the stale one"
+                );
+            }
+            other => panic!(
+                "expected RequestRigConfig, SelectRig, RequestRigConfig, SelectRig; got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn rig_config_refresh_landing_after_enter_keeps_the_submitted_rig() {
+        stale_refresh_keeps_the_submitted_rig(false).await;
+    }
+
+    #[tokio::test]
+    async fn rig_config_refresh_landing_after_reopen_keeps_the_submitted_rig() {
+        stale_refresh_keeps_the_submitted_rig(true).await;
+    }
+
+    /// PAN-60 (folds in the PAN-59 "no re-push after a switch" finding):
+    /// Enter commits the form locally whether or not the coordinator
+    /// accepts it, so after a refused switch the reopened picker must take
+    /// the refresh's configured model rather than keep the refused one.
+    #[tokio::test]
+    async fn rig_picker_reopen_adopts_the_configured_model_after_a_refused_switch() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        r.handle_message(rig_config_update(
+            &["/dev/ttyUSB0"],
+            "FTdx10",
+            "/dev/ttyUSB0",
+        ))
+        .await
+        .unwrap();
+
+        r.handle_key_event(key('i')).await.unwrap();
+        r.handle_key_event(key('X')).await.unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        r.handle_key_event(key('i')).await.unwrap();
+        assert_eq!(app.read().await.rig_selection.model, "FTdx10X");
+
+        // The coordinator refused the unknown model, so config still holds
+        // FTdx10 and the refresh, read after it handled that SelectRig, says so.
+        r.handle_message(rig_config_update_after(
+            1,
+            &["/dev/ttyUSB0"],
+            "FTdx10",
+            "/dev/ttyUSB0",
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            app.read().await.rig_selection.model,
+            "FTdx10",
+            "an untouched reopened picker must show the model the coordinator holds"
+        );
     }
 
     #[tokio::test]
@@ -6856,6 +7217,7 @@ mod pan_59_command_tests {
             current_baud_rate: 38400,
             current_ptt_method: pancetta_config::rig::PttMethod::Serial,
             bookmarks: vec![],
+            select_seq: 0,
         };
         match msg {
             TuiMessage::RigConfigUpdate {
@@ -6885,6 +7247,7 @@ mod pan_59_command_tests {
                 baud_rate: 38400,
                 ptt_method: pancetta_config::rig::PttMethod::None,
             }],
+            select_seq: 0,
         };
         match msg {
             TuiMessage::RigConfigUpdate { bookmarks, .. } => {

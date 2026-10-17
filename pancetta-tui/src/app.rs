@@ -817,6 +817,11 @@ pub struct RigSelectionState {
     pub naming_bookmark: bool,
     /// Text typed into the bookmark-name input.
     pub bookmark_name_input: String,
+    /// How many `SelectRig` commands Enter has sent (PAN-60 review). A
+    /// `RigConfigUpdate` whose `select_seq` is lower was read before the
+    /// coordinator handled the latest one, so it only refreshes the port
+    /// and bookmark lists.
+    pub submits_sent: u64,
 }
 
 impl Default for RigSelectionState {
@@ -840,6 +845,7 @@ impl Default for RigSelectionState {
             selected_bookmark_idx: 0,
             naming_bookmark: false,
             bookmark_name_input: String::new(),
+            submits_sent: 0,
         }
     }
 }
@@ -1083,6 +1089,49 @@ impl RigSelectionState {
         self.selected_port_idx = self.committed_port_idx;
         self.selected_baud_idx = self.committed_baud_idx;
         self.selected_ptt_idx = self.committed_ptt_idx;
+    }
+
+    /// Whether the operator has done anything in the open picker that a
+    /// refresh must not undo (PAN-60): any field differs from the snapshot
+    /// taken when the picker opened, or a bookmark sub-overlay is open.
+    pub fn has_operator_edits(&self) -> bool {
+        self.naming_bookmark
+            || self.bookmark_overlay_visible
+            || self.model != self.committed_model
+            || self.selected_port_idx != self.committed_port_idx
+            || self.selected_baud_idx != self.committed_baud_idx
+            || self.selected_ptt_idx != self.committed_ptt_idx
+    }
+
+    /// Take a refreshed port list and bookmark list without touching what
+    /// the operator chose (PAN-60). The selected and committed ports are
+    /// re-found by name; one that vanished from the new enumeration is
+    /// prepended so it stays selectable, as `apply_rig_config_update`'s
+    /// I-2a prepend and `load_bookmark`'s I-4 shift do. Model, baud, PTT and
+    /// their committed values are left alone.
+    pub fn merge_refreshed_ports(
+        &mut self,
+        mut ports: Vec<String>,
+        bookmarks: Vec<pancetta_config::rig::RigBookmark>,
+    ) {
+        let selected = self.selected_port();
+        let committed = self
+            .available_ports
+            .get(self.committed_port_idx)
+            .cloned()
+            .unwrap_or_default();
+        for name in [&committed, &selected] {
+            if !name.is_empty() && !ports.contains(name) {
+                ports.insert(0, name.clone());
+            }
+        }
+        self.selected_port_idx = ports.iter().position(|p| *p == selected).unwrap_or(0);
+        self.committed_port_idx = ports.iter().position(|p| *p == committed).unwrap_or(0);
+        self.available_ports = ports;
+        if self.selected_bookmark_idx >= bookmarks.len() {
+            self.selected_bookmark_idx = bookmarks.len().saturating_sub(1);
+        }
+        self.bookmarks = bookmarks;
     }
 }
 
@@ -4008,6 +4057,11 @@ impl App {
     /// Seed `rig_selection` from a `TuiMessage::RigConfigUpdate` (PAN-59).
     /// Pre-populates the modal with live values so it opens editable, not
     /// blank — mirrors `set_audio_devices`'s seeding of `device_selection`.
+    /// Called at startup and again each time the `i` picker opens (PAN-60);
+    /// when the open picker already has operator edits, or `select_seq` shows
+    /// the reply was read before the coordinator handled the operator's latest
+    /// `SelectRig`, it merges only the refreshed port and bookmark lists
+    /// instead of overwriting the form.
     pub fn apply_rig_config_update(
         &mut self,
         mut available_ports: Vec<String>,
@@ -4016,7 +4070,21 @@ impl App {
         current_baud_rate: u32,
         current_ptt_method: pancetta_config::rig::PttMethod,
         bookmarks: Vec<pancetta_config::rig::RigBookmark>,
+        select_seq: u64,
     ) {
+        // PAN-60: this arrives a frame or two after `i` opens the picker.
+        // If the operator already started editing, only take the new port
+        // and bookmark lists -- overwriting the form here would wipe an
+        // edit in progress. The same goes for a reply read before the
+        // coordinator handled the latest SelectRig, however late it is
+        // drained (PAN-60 review): it would put the old rig back.
+        if select_seq < self.rig_selection.submits_sent
+            || (self.rig_selection.visible && self.rig_selection.has_operator_edits())
+        {
+            self.rig_selection
+                .merge_refreshed_ports(available_ports, bookmarks);
+            return;
+        }
         // I-2a fix (PAN-59 final review): if the configured port isn't
         // among the enumerated ones (the rig is unplugged, or it's a
         // `host:port` network-rig spec -- `serialport::available_ports()`
@@ -7140,6 +7208,7 @@ mod tests {
                 baud_rate: 38400,
                 ptt_method: pancetta_config::rig::PttMethod::None,
             }],
+            0,
         );
         assert_eq!(app.rig_selection.bookmarks.len(), 1);
         assert_eq!(app.rig_selection.bookmarks[0].name, "Shack");
@@ -7155,6 +7224,7 @@ mod tests {
             38400,
             pancetta_config::rig::PttMethod::Serial,
             vec![],
+            0,
         );
         assert_eq!(app.rig_selection.model, "FTdx10");
         assert_eq!(app.rig_selection.selected_port_idx, 1);
@@ -7183,6 +7253,7 @@ mod tests {
             38400,
             pancetta_config::rig::PttMethod::Cat,
             vec![],
+            0,
         );
         assert_eq!(
             app.rig_selection.selected_port(),
@@ -7216,6 +7287,7 @@ mod tests {
             230_400, // not in RIG_BAUD_RATES
             pancetta_config::rig::PttMethod::None,
             vec![],
+            0,
         );
         assert_eq!(
             app.rig_selection.selected_baud(),
@@ -7238,6 +7310,7 @@ mod tests {
             9600,
             pancetta_config::rig::PttMethod::Parallel,
             vec![],
+            0,
         );
         assert!(
             matches!(
@@ -7262,10 +7335,247 @@ mod tests {
             230_400,
             pancetta_config::rig::PttMethod::None,
             vec![],
+            0,
         );
         app.rig_selection.active_field = RigField::Baud;
         app.rig_selection.move_down();
         assert_eq!(app.rig_selection.selected_baud(), RIG_BAUD_RATES[0]);
+    }
+
+    fn rig_ports(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn rig_bookmark(name: &str) -> pancetta_config::rig::RigBookmark {
+        pancetta_config::rig::RigBookmark {
+            name: name.to_string(),
+            model: "FTdx10".to_string(),
+            port: "/dev/ttyUSB0".to_string(),
+            baud_rate: 38400,
+            ptt_method: pancetta_config::rig::PttMethod::Cat,
+        }
+    }
+
+    /// Seed the picker as the startup push does, then open it as the `i`
+    /// arm does (visible + committed snapshot), ready for a PAN-60 refresh.
+    async fn opened_rig_picker(
+        ports: &[&str],
+        current_port: &str,
+        bookmarks: Vec<pancetta_config::rig::RigBookmark>,
+    ) -> App {
+        let mut app = fixture_app().await;
+        app.apply_rig_config_update(
+            rig_ports(ports),
+            "FTdx10".to_string(),
+            current_port.to_string(),
+            38400,
+            pancetta_config::rig::PttMethod::Cat,
+            bookmarks,
+            0,
+        );
+        app.rig_selection.visible = true;
+        app.rig_selection.snapshot_committed();
+        app
+    }
+
+    /// The operator's PAN-60 mid-edit edit: Model typed to `FTdx1X`, Port
+    /// moved to index 1, baud moved down by one.
+    fn edit_rig_picker(app: &mut App) {
+        app.rig_selection.model = "FTdx1X".to_string();
+        app.rig_selection.selected_port_idx = 1;
+        app.rig_selection.active_field = RigField::Baud;
+        app.rig_selection.move_down();
+    }
+
+    /// PAN-60: the refresh sent on `i` lands a frame or two later. If the
+    /// operator already started editing, it must take the new port list
+    /// without overwriting a single field they chose.
+    #[tokio::test]
+    async fn apply_rig_config_update_while_editing_keeps_the_form_and_adds_new_ports() {
+        let mut app =
+            opened_rig_picker(&["/dev/ttyUSB0", "/dev/ttyUSB1"], "/dev/ttyUSB0", vec![]).await;
+        edit_rig_picker(&mut app);
+        let before = app.rig_selection.clone();
+
+        app.apply_rig_config_update(
+            rig_ports(&["/dev/ttyACM0", "/dev/ttyUSB0", "/dev/ttyUSB1"]),
+            "FTdx10".to_string(),
+            "/dev/ttyUSB0".to_string(),
+            38400,
+            pancetta_config::rig::PttMethod::Cat,
+            vec![],
+            0,
+        );
+
+        let rs = &app.rig_selection;
+        assert_eq!(rs.model, "FTdx1X", "the typed model must survive a refresh");
+        assert_eq!(rs.selected_port(), "/dev/ttyUSB1");
+        assert_eq!(rs.selected_baud_idx, before.selected_baud_idx);
+        assert_eq!(rs.selected_ptt_idx, before.selected_ptt_idx);
+        assert_eq!(rs.live_baud_rate, before.live_baud_rate);
+        assert_eq!(
+            format!("{:?}", rs.live_ptt_method),
+            format!("{:?}", before.live_ptt_method)
+        );
+        assert_eq!(rs.active_field, RigField::Baud);
+        assert_eq!(
+            rs.available_ports,
+            rig_ports(&["/dev/ttyACM0", "/dev/ttyUSB0", "/dev/ttyUSB1"]),
+            "the refreshed port list must replace the old one"
+        );
+    }
+
+    /// PAN-60: the refresh can reorder ports, so the Esc baseline must be
+    /// re-found by name -- not left pointing at whatever now sits at the
+    /// old index.
+    #[tokio::test]
+    async fn apply_rig_config_update_while_editing_tracks_the_committed_port_by_name() {
+        let mut app =
+            opened_rig_picker(&["/dev/ttyUSB0", "/dev/ttyUSB1"], "/dev/ttyUSB0", vec![]).await;
+        edit_rig_picker(&mut app);
+
+        app.apply_rig_config_update(
+            rig_ports(&["/dev/ttyACM0", "/dev/ttyUSB0", "/dev/ttyUSB1"]),
+            "FTdx10".to_string(),
+            "/dev/ttyUSB0".to_string(),
+            38400,
+            pancetta_config::rig::PttMethod::Cat,
+            vec![],
+            0,
+        );
+        app.rig_selection.restore_committed(); // Esc
+
+        assert_eq!(
+            app.rig_selection.selected_port(),
+            "/dev/ttyUSB0",
+            "Esc must restore the port the picker opened with, now at a new index"
+        );
+        assert_eq!(app.rig_selection.selected_port_idx, 1);
+        assert_eq!(app.rig_selection.model, "FTdx10");
+    }
+
+    /// PAN-60: an operator who picked a port that then vanished from the
+    /// refresh (unplugged mid-edit) keeps it selected -- prepended, the way
+    /// the I-2a fix keeps an unenumerated configured port -- and the Esc
+    /// baseline still resolves by name.
+    #[tokio::test]
+    async fn apply_rig_config_update_while_editing_keeps_a_vanished_selected_port_selectable() {
+        let mut app =
+            opened_rig_picker(&["/dev/ttyUSB0", "/dev/ttyUSB1"], "/dev/ttyUSB0", vec![]).await;
+        edit_rig_picker(&mut app);
+
+        app.apply_rig_config_update(
+            rig_ports(&["/dev/ttyUSB0"]),
+            "FTdx10".to_string(),
+            "/dev/ttyUSB0".to_string(),
+            38400,
+            pancetta_config::rig::PttMethod::Cat,
+            vec![],
+            0,
+        );
+
+        assert_eq!(
+            app.rig_selection.selected_port(),
+            "/dev/ttyUSB1",
+            "a port that vanished mid-edit must stay selected, not silently become another"
+        );
+        assert!(app
+            .rig_selection
+            .available_ports
+            .contains(&"/dev/ttyUSB1".to_string()));
+        app.rig_selection.restore_committed();
+        assert_eq!(app.rig_selection.selected_port(), "/dev/ttyUSB0");
+    }
+
+    /// PAN-60: an open F2/F3 sub-overlay counts as editing even with no
+    /// field changed. The refresh replaces bookmarks (clamping the overlay
+    /// selection, as `RigBookmarksUpdate` does) and leaves the form alone.
+    #[tokio::test]
+    async fn apply_rig_config_update_with_bookmark_overlay_open_keeps_the_form_and_clamps_the_selection(
+    ) {
+        let mut app = opened_rig_picker(
+            &["/dev/ttyUSB0"],
+            "/dev/ttyUSB0",
+            vec![rig_bookmark("A"), rig_bookmark("B"), rig_bookmark("C")],
+        )
+        .await;
+        app.rig_selection.bookmark_overlay_visible = true;
+        app.rig_selection.selected_bookmark_idx = 2;
+
+        app.apply_rig_config_update(
+            rig_ports(&["/dev/ttyUSB0"]),
+            "IC-7300".to_string(),
+            "/dev/ttyUSB0".to_string(),
+            38400,
+            pancetta_config::rig::PttMethod::Cat,
+            vec![rig_bookmark("A")],
+            0,
+        );
+
+        assert_eq!(
+            app.rig_selection.model, "FTdx10",
+            "a refresh landing while a bookmark overlay is open must not touch the form"
+        );
+        assert_eq!(app.rig_selection.bookmarks.len(), 1);
+        assert_eq!(app.rig_selection.selected_bookmark_idx, 0);
+        assert!(app.rig_selection.bookmark_overlay_visible);
+    }
+
+    /// PAN-60: an open but untouched picker takes the refresh in full, so a
+    /// reopen shows what the coordinator really holds (e.g. after a switch
+    /// it refused, or one applied while the picker was closed).
+    #[tokio::test]
+    async fn apply_rig_config_update_on_an_untouched_open_form_adopts_fresh_values() {
+        let mut app =
+            opened_rig_picker(&["/dev/ttyUSB0", "/dev/ttyUSB1"], "/dev/ttyUSB0", vec![]).await;
+
+        app.apply_rig_config_update(
+            rig_ports(&["/dev/ttyUSB0", "/dev/ttyUSB1"]),
+            "IC-7300".to_string(),
+            "/dev/ttyUSB1".to_string(),
+            38400,
+            pancetta_config::rig::PttMethod::Cat,
+            vec![],
+            0,
+        );
+
+        let rs = &app.rig_selection;
+        assert_eq!(rs.model, "IC-7300");
+        assert_eq!(rs.selected_port(), "/dev/ttyUSB1");
+        assert_eq!(rs.committed_model, "IC-7300");
+        assert_eq!(rs.committed_port_idx, 1);
+    }
+
+    /// PAN-60: with the picker closed nothing is in progress, so the
+    /// update is applied in full exactly as before -- even if the fields
+    /// differ from the committed snapshot.
+    #[tokio::test]
+    async fn apply_rig_config_update_while_closed_replaces_everything() {
+        let mut app =
+            opened_rig_picker(&["/dev/ttyUSB0", "/dev/ttyUSB1"], "/dev/ttyUSB0", vec![]).await;
+        edit_rig_picker(&mut app);
+        app.rig_selection.visible = false;
+
+        app.apply_rig_config_update(
+            rig_ports(&["/dev/ttyUSB0", "/dev/ttyUSB1"]),
+            "IC-7300".to_string(),
+            "/dev/ttyUSB0".to_string(),
+            19200,
+            pancetta_config::rig::PttMethod::Serial,
+            vec![rig_bookmark("A")],
+            0,
+        );
+
+        let rs = &app.rig_selection;
+        assert_eq!(rs.model, "IC-7300");
+        assert_eq!(rs.selected_port(), "/dev/ttyUSB0");
+        assert_eq!(rs.selected_baud(), 19200);
+        assert!(matches!(
+            rs.selected_ptt(),
+            pancetta_config::rig::PttMethod::Serial
+        ));
+        assert_eq!(rs.committed_model, "IC-7300");
+        assert_eq!(rs.bookmarks.len(), 1);
     }
 
     /// I-3 fix (PAN-59 final review): pressing Esc after an abandoned edit
