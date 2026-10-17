@@ -9,9 +9,10 @@
 //! Each record is followed by `f.flush().await` (OS buffer → kernel), which is
 //! sufficient for the FT8 hot path: at most one QSO completes per 15-second
 //! window. `sync_data` (fsync) would be roughly 10 000× more expensive and is
-//! deliberately omitted here.
+//! deliberately omitted here. A bulk import ([`AdifLogWriter::append_record`]
+//! per record) calls [`AdifLogWriter::sync_all`] once after its last record.
 
-use crate::adif::{AdifError, AdifProcessor, AdifQso};
+use crate::adif::{AdifError, AdifProcessor, AdifQso, AdifRecord};
 use crate::QsoMetadata;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -107,8 +108,13 @@ impl AdifLogWriter {
     /// Write the ADIF file header (called once when the file is first created).
     async fn write_header(&self) -> AdifLogResult<()> {
         let header = self.processor.generate_header();
+        self.write_flushed(header.as_bytes()).await
+    }
+
+    /// One `write_all` on the `O_APPEND` handle, then flush to the OS buffer.
+    async fn write_flushed(&self, bytes: &[u8]) -> AdifLogResult<()> {
         let mut f = self.file.lock().await;
-        f.write_all(header.as_bytes())
+        f.write_all(bytes)
             .await
             .map_err(|source| AdifLogError::Io {
                 path: self.path.clone(),
@@ -130,19 +136,25 @@ impl AdifLogWriter {
             .processor
             .generate_record(&adif_qso)
             .map_err(|e| AdifLogError::Format(e.to_string()))?;
+        self.write_flushed(record.as_bytes()).await
+    }
 
-        let mut f = self.file.lock().await;
-        f.write_all(record.as_bytes())
-            .await
-            .map_err(|source| AdifLogError::Io {
-                path: self.path.clone(),
-                source,
-            })?;
-        f.flush().await.map_err(|source| AdifLogError::Io {
+    /// Append `record` with its fields exactly as given (an imported contact,
+    /// not a QSO pancetta completed), flushing to the OS buffer. One write per
+    /// record, like `append`, so a running station's own appends never interleave
+    /// inside it.
+    pub async fn append_record(&self, record: &AdifRecord) -> AdifLogResult<()> {
+        let rendered = self.processor.render_record(record)?;
+        self.write_flushed(rendered.as_bytes()).await
+    }
+
+    /// fsync the log. A bulk import calls this once after its last record.
+    pub async fn sync_all(&self) -> AdifLogResult<()> {
+        let f = self.file.lock().await;
+        f.sync_all().await.map_err(|source| AdifLogError::Io {
             path: self.path.clone(),
             source,
-        })?;
-        Ok(())
+        })
     }
 
     /// Return the path this writer is managing.
@@ -270,5 +282,93 @@ mod tests {
             "missing <EOH> tag\n--- file ---\n{}",
             contents
         );
+    }
+
+    /// PAN-127: pancetta's own log reads back record for record, including a
+    /// non-ASCII COMMENT (byte-counted) that used to swallow the next field.
+    #[tokio::test]
+    async fn parse_string_reads_a_log_written_by_adif_log_writer() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("qsos.adi");
+        let writer = AdifLogWriter::open(&path).await.unwrap();
+        let mut with_notes = fixture_metadata();
+        with_notes.notes = Some("Müñoz".to_string());
+
+        writer.append(&fixture_metadata()).await.unwrap();
+        writer.append(&with_notes).await.unwrap();
+        writer.append(&fixture_metadata()).await.unwrap();
+
+        let contents = tokio::fs::read_to_string(&path).await.unwrap();
+        let processor = AdifProcessor::new();
+        let file = processor.parse_string(&contents).unwrap();
+        assert_eq!(file.records.len(), 3, "--- file ---\n{contents}");
+        for record in &file.records {
+            let qso = processor.record_to_qso(record).unwrap();
+            assert_eq!(qso.call, "W1AW");
+        }
+        let comment = &file.records[1].fields["COMMENT"].value;
+        assert!(comment.starts_with("Müñoz"), "COMMENT was {comment:?}");
+        assert_eq!(file.records[1].fields["CALL"].value, "W1AW");
+    }
+
+    /// An imported contact as another logger wrote it.
+    fn imported_record() -> AdifRecord {
+        let adif = "<CALL:5>K1ABC <QSO_DATE:8>20240102 <TIME_ON:4>0815 <MODE:3>FT8 \
+                    <BAND:3>40M <QSL_RCVD:1>Y <APP_N1MM_ID:4>1234 \
+                    <COMMENT:9>from N1MM <EOR>\n";
+        let mut file = AdifProcessor::new().parse_string(adif).unwrap();
+        file.records.remove(0)
+    }
+
+    fn field_map(record: &AdifRecord) -> HashMap<String, String> {
+        record
+            .fields
+            .iter()
+            .map(|(name, f)| (name.clone(), f.value.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn append_record_writes_the_fields_verbatim() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("qsos.adi");
+        let writer = AdifLogWriter::open(&path).await.unwrap();
+        let record = imported_record();
+
+        writer.append_record(&record).await.unwrap();
+        writer.sync_all().await.unwrap();
+
+        let contents = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(contents.matches("<EOH>").count(), 1, "{contents}");
+        assert!(!contents.contains("Using cqdx.io & Pancetta"), "{contents}");
+        let file = AdifProcessor::new().parse_string(&contents).unwrap();
+        assert_eq!(file.records.len(), 1, "{contents}");
+        assert_eq!(field_map(&file.records[0]), field_map(&record));
+        assert_eq!(file.records[0].fields["QSL_RCVD"].value, "Y");
+        assert_eq!(file.records[0].fields["COMMENT"].value, "from N1MM");
+    }
+
+    #[tokio::test]
+    async fn append_record_after_live_appends_keeps_one_header() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("qsos.adi");
+        {
+            let live = AdifLogWriter::open(&path).await.unwrap();
+            live.append(&fixture_metadata()).await.unwrap();
+            live.append(&fixture_metadata()).await.unwrap();
+        }
+        let import = AdifLogWriter::open(&path).await.unwrap();
+        import.append_record(&imported_record()).await.unwrap();
+        import.sync_all().await.unwrap();
+
+        let contents = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(contents.matches("<EOH>").count(), 1, "{contents}");
+        let file = AdifProcessor::new().parse_string(&contents).unwrap();
+        let calls: Vec<&str> = file
+            .records
+            .iter()
+            .map(|r| r.fields["CALL"].value.as_str())
+            .collect();
+        assert_eq!(calls, ["W1AW", "W1AW", "K1ABC"]);
     }
 }

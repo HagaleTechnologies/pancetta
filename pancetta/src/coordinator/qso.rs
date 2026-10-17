@@ -3214,6 +3214,28 @@ impl super::ApplicationCoordinator {
                 // ADIF source of truth at ~/.pancetta/qsos.adi.
                 let adif_path = pancetta_home.join(".pancetta").join("qsos.adi");
 
+                // Both LOCAL source-of-truth writers (ADIF appender + SQLite
+                // index) live behind one helper so the `--replay` suppression
+                // is a single gate, testable without a whole coordinator. On a
+                // live run it also brings the index in line with the ADIF log
+                // before either writer opens a file, and hands back that index
+                // for the worked-station seed below (PAN-127). Because the
+                // rebuild runs inside this call before the logger opens
+                // `qso.db`, the logger never holds a pooled connection on a
+                // file the rebuild deleted (#453). Nothing can complete a QSO
+                // before this point: the decode/command loops below have not
+                // started yet.
+                let (_adif_writer, _async_logger, live_seed_db) = start_local_qso_log_writers(
+                    replay_mode,
+                    &adif_path,
+                    &db_path,
+                    station_power_watts,
+                    persist_qso_timeline,
+                    &qso_manager,
+                    shutdown.clone(),
+                )
+                .await;
+
                 // Per-QSO log-upload subscriber (ClubLog + QRZ Logbook + cqdx.io
                 // + eQSL + LoTW), with optional QRZ-XML grid enrichment applied
                 // first. Opt-in: only spawned when at least one upload target OR
@@ -3240,18 +3262,10 @@ impl super::ApplicationCoordinator {
                 // Seed worked-station history from the QSO database so that
                 // previously-worked stations are recognised as duplicates across restarts.
                 //
-                // Three-case startup decision (non-replay only):
-                //   1. Migration: ADIF missing but legacy DB exists → dump DB to ADIF first
-                //      so contacts are not lost; future runs use ADIF as source of truth.
-                //   2. Replay-rebuild: index missing or older than ADIF → drop + rebuild the
-                //      index so duplicate detection sees every prior contact.
-                //   3. Open as-is: normal startup; index is current.
-                //
-                // Every path above is a write against the *real* `~/.pancetta/qsos.adi` /
-                // `qso.db` (`QsoDatabase::open` itself runs `PRAGMA`s and `CREATE TABLE IF
-                // NOT EXISTS`, a write-mode connection even on an already-current DB) — not
-                // anything derived from `--replay`'s capture-dir argument, so it's gated on
-                // `!replay_mode` (PAN-41).
+                // Live runs seed from the index `start_local_qso_log_writers`
+                // brought in line with the ADIF log (migrate / rebuild / open
+                // as-is, see `prepare_local_qso_index`) before either writer
+                // opened a file.
                 //
                 // PAN-41 round 2: `--replay`'s own contract (coordinator/mod.rs,
                 // CHANGELOG.md) is "no writes to the real log, but still read history so
@@ -3260,12 +3274,12 @@ impl super::ApplicationCoordinator {
                 //
                 // PAN-41 round 3: a plain `mode=ro` connection against the real `db_path`
                 // (round 2's fix) still had two gaps -- it read stale/missing history
-                // instead of rebuilding like case 2 above, and SQLite's `mode=ro` can
-                // itself create `-wal`/`-shm` sidecar files against a WAL-mode db if
-                // they're missing, still a write under the real directory. The `else`
-                // branch below instead rebuilds fresh straight from the real ADIF (only
-                // ever read, never written) into a `:memory:` database — always current,
-                // and creates no file of any kind.
+                // instead of rebuilding like case 2 of `prepare_local_qso_index`, and
+                // SQLite's `mode=ro` can itself create `-wal`/`-shm` sidecar files against
+                // a WAL-mode db if they're missing, still a write under the real directory.
+                // The `else` branch below instead rebuilds fresh straight from the real ADIF
+                // (only ever read, never written) into a `:memory:` database — always
+                // current, and creates no file of any kind.
                 use pancetta_qso::async_database::QsoDatabase;
 
                 if !replay_mode {
@@ -3278,80 +3292,7 @@ impl super::ApplicationCoordinator {
                         .unwrap_or_else(|| "20m".to_string())
                         .to_uppercase();
 
-                    // Case 1: migration — ADIF missing but legacy DB exists.
-                    let adif_exists = tokio::fs::try_exists(&adif_path).await.unwrap_or(false);
-                    let db_exists = tokio::fs::try_exists(&db_path).await.unwrap_or(false);
-
-                    if !adif_exists && db_exists {
-                        info!(
-                            "ADIF missing but legacy DB present — migrating QSOs from {} to {}",
-                            db_path.display(),
-                            adif_path.display(),
-                        );
-                        match QsoDatabase::open(&db_path).await {
-                            Ok(db) => {
-                                if let Err(e) = db.export_to_adif(&adif_path).await {
-                                    warn!(
-                                        "DB→ADIF migration failed: {} — index continues to work, \
-                                         but ADIF source-of-truth will only contain QSOs logged \
-                                         from now on",
-                                        e,
-                                    );
-                                } else {
-                                    info!("DB→ADIF migration succeeded");
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Could not open legacy DB for migration: {} — skipping", e);
-                            }
-                        }
-                    }
-
-                    // Case 2: replay — index missing or older than ADIF.
-                    let needs_replay = match (
-                        tokio::fs::metadata(&db_path).await.ok(),
-                        tokio::fs::metadata(&adif_path).await.ok(),
-                    ) {
-                        (None, Some(_)) => {
-                            info!(
-                                "Index missing at {} — replaying from ADIF",
-                                db_path.display()
-                            );
-                            true
-                        }
-                        (Some(db_meta), Some(adif_meta)) => {
-                            match (db_meta.modified().ok(), adif_meta.modified().ok()) {
-                                (Some(d), Some(a)) if a > d => {
-                                    info!(
-                                        "Index at {} is older than ADIF at {} — replaying",
-                                        db_path.display(),
-                                        adif_path.display(),
-                                    );
-                                    true
-                                }
-                                _ => false,
-                            }
-                        }
-                        // No ADIF and no DB: fresh install; coordinator creates both later.
-                        _ => false,
-                    };
-
-                    let db_for_seed = if needs_replay {
-                        match QsoDatabase::replay_from_adif(&db_path, &adif_path).await {
-                            Ok(db) => Some(db),
-                            Err(e) => {
-                                warn!(
-                                    "ADIF replay failed: {} — falling back to existing index \
-                                     (may be stale)",
-                                    e,
-                                );
-                                QsoDatabase::open(&db_path).await.ok()
-                            }
-                        }
-                    } else {
-                        // Case 3: open as-is.
-                        QsoDatabase::open(&db_path).await.ok()
-                    };
+                    let db_for_seed = live_seed_db;
 
                     if let Some(db) = db_for_seed {
                         let callsigns = db.get_worked_callsigns(&band).await;
@@ -3455,29 +3396,6 @@ impl super::ApplicationCoordinator {
                         }
                     }
                 }
-
-                // Both LOCAL source-of-truth writers (ADIF appender + SQLite
-                // index) live behind one helper so the `--replay` suppression
-                // is a single gate, testable without a whole coordinator.
-                //
-                // Started only AFTER the startup seed above: its
-                // "index older than ADIF" case deletes and recreates
-                // `qso.db`, and a logger opened earlier kept its pooled
-                // connection on the deleted file — its first backup failed
-                // ("malformed" / "not a database") and the QSOs it logged
-                // never reached the live index. Nothing can complete a QSO
-                // before this point: the decode/command loops below have not
-                // started yet.
-                let (_adif_writer, _async_logger) = start_local_qso_log_writers(
-                    replay_mode,
-                    &adif_path,
-                    &db_path,
-                    station_power_watts,
-                    persist_qso_timeline,
-                    &qso_manager,
-                    shutdown.clone(),
-                )
-                .await;
 
                 info!(
                     "QSO component ready (callsign={}, grid={:?})",
@@ -9353,6 +9271,7 @@ async fn start_local_qso_log_writers(
 ) -> (
     Option<std::sync::Arc<pancetta_qso::AdifLogWriter>>,
     Option<std::sync::Arc<pancetta_qso::async_logger::QsoLogger>>,
+    Option<pancetta_qso::async_database::QsoDatabase>,
 ) {
     if replay {
         info!(
@@ -9361,8 +9280,18 @@ async fn start_local_qso_log_writers(
             adif_path.display(),
             db_path.display(),
         );
-        return (None, None);
+        return (None, None, None);
     }
+
+    // Subscribe before the index work below: a QSO that completes while a
+    // large log replays waits in this receiver and is appended once the
+    // writer opens, instead of missing the logbook of record.
+    let adif_events = qso_manager.subscribe();
+
+    // Before either writer below creates a file: opening the writers first
+    // made a legacy-only `qso.db` look stale (wiped by the rebuild) and a
+    // missing index look current (never rebuilt) — PAN-127.
+    let seed_db = prepare_local_qso_index(adif_path, db_path).await;
 
     // ADIF source-of-truth writer. Subscribes to QsoEvent::QsoCompleted and
     // appends one ADIF record per completed QSO. Fail-soft: if open fails, we
@@ -9373,7 +9302,7 @@ async fn start_local_qso_log_writers(
             info!("ADIF log open at {}", adif_path.display());
             w.set_station_power_watts(station_power_watts);
             let w = std::sync::Arc::new(w);
-            start_adif_subscriber(w.clone(), qso_manager.subscribe(), shutdown);
+            start_adif_subscriber(w.clone(), adif_events, shutdown);
             Some(w)
         }
         Err(e) => {
@@ -9425,7 +9354,130 @@ async fn start_local_qso_log_writers(
         }
     };
 
-    (adif_writer, async_logger)
+    (adif_writer, async_logger, seed_db)
+}
+
+/// Bring the rebuildable SQLite index in line with the ADIF source of truth
+/// BEFORE either local log writer opens a file (PAN-127), and return it for
+/// the worked-station seed (`None` when it cannot be opened).
+///
+/// Three-case startup decision (non-replay only):
+///   1. Migration: ADIF missing but legacy DB exists → dump DB to ADIF first
+///      so contacts are not lost; future runs use ADIF as source of truth.
+///   2. Replay-rebuild: index missing or older than ADIF → drop + rebuild the
+///      index so duplicate detection sees every prior contact.
+///   3. Open as-is: normal startup; index is current.
+///
+/// The order matters: `AdifLogWriter::open` creates an empty `qsos.adi` and
+/// `QsoLogger::new` an empty `qso.db`. When the writers opened first, the new
+/// empty ADIF made a legacy-only `qso.db` look stale, so the rebuild wiped
+/// every legacy contact, and a freshly created `qso.db` made a missing index
+/// look current, so it was never rebuilt.
+///
+/// Every path here is a write against the *real* `~/.pancetta/qsos.adi` /
+/// `qso.db` (`QsoDatabase::open` itself runs `PRAGMA`s and `CREATE TABLE IF
+/// NOT EXISTS`, a write-mode connection even on an already-current DB) — not
+/// anything derived from `--replay`'s capture-dir argument, so it only runs
+/// from the live branch of [`start_local_qso_log_writers`] (PAN-41).
+async fn prepare_local_qso_index(
+    adif_path: &std::path::Path,
+    db_path: &std::path::Path,
+) -> Option<pancetta_qso::async_database::QsoDatabase> {
+    use pancetta_qso::async_database::QsoDatabase;
+
+    // Case 1: migration — ADIF missing but legacy DB exists.
+    let adif_exists = tokio::fs::try_exists(&adif_path).await.unwrap_or(false);
+    let db_exists = tokio::fs::try_exists(&db_path).await.unwrap_or(false);
+
+    if !adif_exists && db_exists {
+        info!(
+            "ADIF missing but legacy DB present — migrating QSOs from {} to {}",
+            db_path.display(),
+            adif_path.display(),
+        );
+        match QsoDatabase::open(&db_path).await {
+            Ok(db) => {
+                if let Err(e) = db.export_to_adif(&adif_path).await {
+                    warn!(
+                        "DB→ADIF migration failed: {} — index continues to work, \
+                         but ADIF source-of-truth will only contain QSOs logged \
+                         from now on",
+                        e,
+                    );
+                } else {
+                    info!("DB→ADIF migration succeeded");
+                }
+            }
+            Err(e) => {
+                warn!("Could not open legacy DB for migration: {} — skipping", e);
+            }
+        }
+    }
+
+    // Case 2: replay — index missing or older than ADIF, or marked by a
+    // `pancetta import` that stopped before it finished indexing (PAN-127).
+    let marker = QsoDatabase::rebuild_marker(db_path);
+    let marked = tokio::fs::try_exists(&marker).await.unwrap_or(false);
+    let needs_replay = match (
+        tokio::fs::metadata(&db_path).await.ok(),
+        tokio::fs::metadata(&adif_path).await.ok(),
+    ) {
+        (None, Some(_)) => {
+            info!(
+                "Index missing at {} — replaying from ADIF",
+                db_path.display()
+            );
+            true
+        }
+        (Some(_), Some(_)) if marked => {
+            info!(
+                "Index at {} is missing contacts an interrupted import added to {} — replaying",
+                db_path.display(),
+                adif_path.display(),
+            );
+            true
+        }
+        (Some(db_meta), Some(adif_meta)) => {
+            match (db_meta.modified().ok(), adif_meta.modified().ok()) {
+                (Some(d), Some(a)) if a > d => {
+                    info!(
+                        "Index at {} is older than ADIF at {} — replaying",
+                        db_path.display(),
+                        adif_path.display(),
+                    );
+                    true
+                }
+                _ => false,
+            }
+        }
+        // No ADIF and no DB: fresh install; coordinator creates both later.
+        _ => false,
+    };
+
+    if needs_replay {
+        let replayed = QsoDatabase::replay_from_adif(&db_path, &adif_path).await;
+        // The marker stays until a replay succeeds, so a failed one (bad
+        // record, transient disk error) is retried at the next start instead
+        // of a stale or partial index being trusted from then on. Retrying
+        // loses nothing: `qsos.adi` holds every QSO the station logged.
+        if marked && replayed.is_ok() {
+            let _ = tokio::fs::remove_file(&marker).await;
+        }
+        match replayed {
+            Ok(db) => Some(db),
+            Err(e) => {
+                warn!(
+                    "ADIF replay failed: {} — falling back to existing index \
+                     (may be stale)",
+                    e,
+                );
+                QsoDatabase::open(&db_path).await.ok()
+            }
+        }
+    } else {
+        // Case 3: open as-is.
+        QsoDatabase::open(&db_path).await.ok()
+    }
 }
 
 fn start_adif_subscriber(
@@ -10179,6 +10231,225 @@ mod replay_local_log_tests {
         adif_record_count(path)
     }
 
+    /// Two pancetta-style 20 m records; FREQ is what history seeding bands by.
+    const TWO_RECORDS: &str = "pancetta test log <ADIF_VER:5>3.1.0 <EOH>\n\
+        <CALL:4>W1AW <QSO_DATE:8>20240101 <TIME_ON:6>120000 <MODE:3>FT8 \
+        <FREQ:9>14.074000 <BAND:3>20M <EOR>\n\
+        <CALL:5>K1ABC <QSO_DATE:8>20240101 <TIME_ON:6>121500 <MODE:3>FT8 \
+        <FREQ:9>14.074000 <BAND:3>20M <EOR>\n";
+
+    /// Build a 2-row `qso.db` at `db_path` from an ADIF kept somewhere else,
+    /// so the directory under test holds the index alone.
+    async fn index_with_two_rows(db_path: &std::path::Path) {
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let source = elsewhere.path().join("source.adi");
+        std::fs::write(&source, TWO_RECORDS).expect("write source ADIF");
+        let db = pancetta_qso::async_database::QsoDatabase::replay_from_adif(db_path, &source)
+            .await
+            .expect("build legacy index");
+        assert_eq!(db.count_qsos().await.expect("count"), 2, "precondition");
+        db.close().await;
+    }
+
+    /// PAN-127: a legacy install (`qso.db`, no `qsos.adi`) used to be wiped,
+    /// because the ADIF writer created an empty `qsos.adi` first, which made
+    /// the index look stale and replayed it from zero records.
+    #[tokio::test]
+    async fn live_start_migrates_a_legacy_index_instead_of_wiping_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let adif_path = dir.path().join("qsos.adi");
+        let db_path = dir.path().join("qso.db");
+        index_with_two_rows(&db_path).await;
+        assert!(!adif_path.exists(), "precondition: no ADIF log yet");
+        let manager = manager();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let (_adif_writer, _async_logger, seed_db) = start_local_qso_log_writers(
+            false,
+            &adif_path,
+            &db_path,
+            100,
+            false,
+            &manager,
+            shutdown.clone(),
+        )
+        .await;
+
+        let seed_db = seed_db.expect("a live start returns the seed index");
+        assert_eq!(
+            seed_db.count_qsos().await.expect("count"),
+            2,
+            "the legacy contacts must survive startup"
+        );
+        let adif = std::fs::read_to_string(&adif_path).expect("qsos.adi was written");
+        let parsed = pancetta_qso::AdifProcessor::new()
+            .parse_string(&adif)
+            .expect("migrated ADIF parses");
+        assert_eq!(parsed.records.len(), 2, "both contacts migrated to ADIF");
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// PAN-127: a `qsos.adi` with no `qso.db` (dropped in, or the index
+    /// deleted to force a rebuild) used to be left unindexed, because the
+    /// SQLite logger created an empty `qso.db` that then looked current.
+    #[tokio::test]
+    async fn live_start_rebuilds_a_missing_index_from_the_adif_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let adif_path = dir.path().join("qsos.adi");
+        let db_path = dir.path().join("qso.db");
+        std::fs::write(&adif_path, TWO_RECORDS).expect("write qsos.adi");
+        let manager = manager();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let (_adif_writer, _async_logger, seed_db) = start_local_qso_log_writers(
+            false,
+            &adif_path,
+            &db_path,
+            100,
+            false,
+            &manager,
+            shutdown.clone(),
+        )
+        .await;
+
+        let seed_db = seed_db.expect("a live start returns the seed index");
+        let mut calls = seed_db.get_worked_callsigns("20M").await;
+        calls.sort();
+        assert_eq!(calls, vec!["K1ABC".to_string(), "W1AW".to_string()]);
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// An index newer than the ADIF log is opened as it is, not rebuilt.
+    #[tokio::test]
+    async fn live_start_opens_a_current_index_as_is() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let adif_path = dir.path().join("qsos.adi");
+        let db_path = dir.path().join("qso.db");
+        // The ADIF holds one contact; the (newer) index holds two, so a
+        // rebuild would be visible as a count of 1.
+        let one_record = TWO_RECORDS
+            .split_once("<CALL:5>K1ABC")
+            .map(|(head, _)| head)
+            .expect("fixture has two records");
+        std::fs::write(&adif_path, one_record).expect("write qsos.adi");
+        let an_hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&adif_path)
+            .and_then(|f| f.set_modified(an_hour_ago))
+            .expect("backdate qsos.adi");
+        index_with_two_rows(&db_path).await;
+        let manager = manager();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let (_adif_writer, _async_logger, seed_db) = start_local_qso_log_writers(
+            false,
+            &adif_path,
+            &db_path,
+            100,
+            false,
+            &manager,
+            shutdown.clone(),
+        )
+        .await;
+
+        let seed_db = seed_db.expect("a live start returns the seed index");
+        assert_eq!(
+            seed_db.count_qsos().await.expect("count"),
+            2,
+            "a current index must not be rebuilt"
+        );
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// PAN-127: an import stopped part-way leaves a partial index that is
+    /// newer than the ADIF log, plus the rebuild marker. The marker, not the
+    /// mtimes, decides: the index is rebuilt and the marker cleared.
+    #[tokio::test]
+    async fn live_start_rebuilds_an_index_an_interrupted_import_marked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let adif_path = dir.path().join("qsos.adi");
+        let db_path = dir.path().join("qso.db");
+        std::fs::write(&adif_path, TWO_RECORDS).expect("write qsos.adi");
+        let an_hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&adif_path)
+            .and_then(|f| f.set_modified(an_hour_ago))
+            .expect("backdate qsos.adi");
+        // The partial index: the first contact only.
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let first = elsewhere.path().join("first.adi");
+        let one_record = TWO_RECORDS
+            .split_once("<CALL:5>K1ABC")
+            .map(|(head, _)| head)
+            .expect("fixture has two records");
+        std::fs::write(&first, one_record).expect("write first.adi");
+        pancetta_qso::async_database::QsoDatabase::replay_from_adif(&db_path, &first)
+            .await
+            .expect("build partial index")
+            .close()
+            .await;
+        let marker = pancetta_qso::async_database::QsoDatabase::rebuild_marker(&db_path);
+        std::fs::write(&marker, b"").expect("write marker");
+        let manager = manager();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let (_adif_writer, _async_logger, seed_db) = start_local_qso_log_writers(
+            false,
+            &adif_path,
+            &db_path,
+            100,
+            false,
+            &manager,
+            shutdown.clone(),
+        )
+        .await;
+
+        let seed_db = seed_db.expect("a live start returns the seed index");
+        assert_eq!(
+            seed_db.count_qsos().await.expect("count"),
+            2,
+            "a marked index must be rebuilt from the ADIF log"
+        );
+        assert!(!marker.exists(), "the rebuild clears the marker");
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// PR #451 review (Codex P2): a replay that fails (here, on an
+    /// unreadable record) keeps the marker, so the rebuild is retried at the
+    /// next start once the cause is fixed, instead of the stale index being
+    /// trusted from then on. The failed replay leaves the old index in place.
+    #[tokio::test]
+    async fn live_start_keeps_the_marker_when_the_rebuild_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let adif_path = dir.path().join("qsos.adi");
+        let db_path = dir.path().join("qso.db");
+        index_with_two_rows(&db_path).await;
+        std::fs::write(&adif_path, "<CALL:4>W1AW <TIME_ON:x>120000 <EOR>\n")
+            .expect("write qsos.adi");
+        let marker = pancetta_qso::async_database::QsoDatabase::rebuild_marker(&db_path);
+        std::fs::write(&marker, b"").expect("write marker");
+        let manager = manager();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let (_adif_writer, _async_logger, seed_db) = start_local_qso_log_writers(
+            false,
+            &adif_path,
+            &db_path,
+            100,
+            false,
+            &manager,
+            shutdown.clone(),
+        )
+        .await;
+
+        assert!(marker.exists(), "a failed rebuild keeps the marker");
+        let seed_db = seed_db.expect("falls back to the existing index");
+        assert_eq!(seed_db.count_qsos().await.expect("count"), 2);
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+    }
+
     /// CONTROL (makes the replay assertion below non-vacuous): on a live run
     /// the very same exchange DOES reach both local writers — the ADIF file
     /// gains a record and the SQLite index is created.
@@ -10190,7 +10461,7 @@ mod replay_local_log_tests {
         let manager = manager();
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        let (adif_writer, async_logger) = start_local_qso_log_writers(
+        let (adif_writer, async_logger, _seed_db) = start_local_qso_log_writers(
             false, // NOT replay
             &adif_path,
             &db_path,
@@ -10235,7 +10506,7 @@ mod replay_local_log_tests {
         let manager = manager();
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        let (_adif_writer, async_logger) = start_local_qso_log_writers(
+        let (_adif_writer, async_logger, _seed_db) = start_local_qso_log_writers(
             false,
             &dir.path().join("qsos.adi"),
             &db_path,
@@ -10267,7 +10538,7 @@ mod replay_local_log_tests {
         let manager = manager();
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        let (adif_writer, async_logger) = start_local_qso_log_writers(
+        let (adif_writer, async_logger, seed_db) = start_local_qso_log_writers(
             true, // --replay
             &adif_path,
             &db_path,
@@ -10284,6 +10555,10 @@ mod replay_local_log_tests {
         assert!(
             async_logger.is_none(),
             "the SQLite QSO logger must not be constructed under --replay"
+        );
+        assert!(
+            seed_db.is_none(),
+            "the real index must not be opened (or rebuilt) under --replay"
         );
 
         complete_one_qso(&manager).await;

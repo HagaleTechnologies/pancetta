@@ -101,8 +101,8 @@
 //!
 //! ### ADIF Import/Export
 //!
-//! Use [`QsoLogger`] to export logged QSOs to ADIF or import from an existing log file.
-//! See [`async_logger`] for the full API, including `export_adif` and `import_adif`.
+//! Use [`QsoLogger`] to export logged QSOs to ADIF.
+//! See [`async_logger`] for the full API, including `export_adif`; ADIF import is planned in [`adif_import`].
 //!
 //! ### Statistics and Analytics
 //!
@@ -121,7 +121,7 @@ pub use crate::async_database::{
     QueryOptions, SortField, SortOrder,
 };
 pub use crate::async_logger::{
-    AutoLoggingConfig, BackupConfig, ExportFormat, ExportImportConfig, ExportResult, ImportResult,
+    AutoLoggingConfig, BackupConfig, ExportFormat, ExportImportConfig, ExportResult,
     IntegrationConfig, LoggerConfig, QsoLogger, ValidationConfig,
 };
 pub use crate::autonomous::*;
@@ -135,6 +135,7 @@ pub use crate::watchlist::*;
 
 // Module declarations
 pub mod adif;
+pub mod adif_import;
 pub mod adif_log_writer;
 pub mod async_database;
 pub mod async_logger;
@@ -454,18 +455,6 @@ impl QsoSystem {
     ) -> QsoResult<Option<ExportResult>> {
         if let Some(ref logger) = self.logger {
             Ok(Some(logger.export_adif(path, filter).await?))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Import QSOs from ADIF (requires logger)
-    pub async fn import_adif<P: AsRef<std::path::Path>>(
-        &self,
-        path: P,
-    ) -> QsoResult<Option<ImportResult>> {
-        if let Some(ref logger) = self.logger {
-            Ok(Some(logger.import_adif(path).await?))
         } else {
             Ok(None)
         }

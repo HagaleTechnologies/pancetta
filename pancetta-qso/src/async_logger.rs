@@ -275,31 +275,6 @@ pub struct ExportResult {
     pub duration_ms: u64,
 }
 
-/// Import result
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ImportResult {
-    /// Input file path
-    pub file_path: PathBuf,
-
-    /// Number of QSOs imported
-    pub imported_count: usize,
-
-    /// Number of QSOs skipped (duplicates)
-    pub skipped_count: usize,
-
-    /// Number of QSOs with errors
-    pub error_count: usize,
-
-    /// Import timestamp
-    pub timestamp: DateTime<Utc>,
-
-    /// Import duration in milliseconds
-    pub duration_ms: u64,
-
-    /// Validation errors
-    pub errors: Vec<String>,
-}
-
 // ---------------------------------------------------------------------------
 // Default impls for config types
 // ---------------------------------------------------------------------------
@@ -446,9 +421,6 @@ pub struct QsoLogger {
 
     /// Export history
     export_history: Arc<RwLock<Vec<ExportResult>>>,
-
-    /// Import history
-    import_history: Arc<RwLock<Vec<ImportResult>>>,
 }
 
 impl QsoLogger {
@@ -466,7 +438,6 @@ impl QsoLogger {
             qso_manager: Arc::new(qso_manager),
             event_receiver: Arc::new(RwLock::new(None)),
             export_history: Arc::new(RwLock::new(Vec::new())),
-            import_history: Arc::new(RwLock::new(Vec::new())),
         })
     }
 
@@ -575,72 +546,6 @@ impl QsoLogger {
         );
 
         Ok(export_result)
-    }
-
-    /// Import QSOs from ADIF format
-    pub async fn import_adif<P: AsRef<Path>>(
-        &self,
-        input_path: P,
-    ) -> Result<ImportResult, AsyncLoggerError> {
-        let start_time = Utc::now();
-
-        // Read ADIF file
-        let adif_content = tokio::fs::read_to_string(&input_path).await?;
-        let adif_file = self.adif_processor.parse_string(&adif_content)?;
-
-        let _total_count = adif_file.records.len();
-        let mut imported_count = 0;
-        let mut duplicate_count = 0;
-        let mut error_count = 0;
-
-        // Import each QSO
-        for record in &adif_file.records {
-            match self.adif_processor.record_to_qso(record) {
-                Ok(adif_qso) => {
-                    // Convert to QsoProgress
-                    let progress = self.adif_qso_to_progress(&adif_qso);
-
-                    // Try to insert
-                    match self.database.insert_qso(&progress).await {
-                        Ok(_) => imported_count += 1,
-                        Err(AsyncDatabaseError::DuplicateQso { .. }) => duplicate_count += 1,
-                        Err(e) => {
-                            error!("Error importing QSO: {}", e);
-                            error_count += 1;
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Error parsing ADIF record: {}", e);
-                    error_count += 1;
-                }
-            }
-        }
-
-        let duration_ms = (Utc::now() - start_time).num_milliseconds() as u64;
-
-        let import_result = ImportResult {
-            file_path: input_path.as_ref().to_path_buf(),
-            imported_count,
-            skipped_count: duplicate_count,
-            error_count,
-            timestamp: start_time,
-            duration_ms,
-            errors: Vec::new(), // TODO: Collect actual error messages
-        };
-
-        // Record import history
-        self.import_history
-            .write()
-            .await
-            .push(import_result.clone());
-
-        info!(
-            "Imported {} QSOs from ADIF ({} duplicates, {} errors) in {}ms",
-            imported_count, duplicate_count, error_count, duration_ms
-        );
-
-        Ok(import_result)
     }
 
     /// Get database statistics
@@ -937,92 +842,6 @@ impl QsoLogger {
         }
 
         Ok(())
-    }
-
-    fn adif_qso_to_progress(&self, adif_qso: &crate::adif::AdifQso) -> QsoProgress {
-        QsoProgress {
-            state: QsoState::Completed {
-                their_callsign: adif_qso.call.clone(),
-                their_report: adif_qso
-                    .rst_rcvd
-                    .as_ref()
-                    .and_then(|r| r.parse().ok())
-                    .unwrap_or(0),
-                our_report: adif_qso
-                    .rst_sent
-                    .as_ref()
-                    .and_then(|r| r.parse().ok())
-                    .unwrap_or(0),
-                frequency: adif_qso.freq * 1_000_000.0,
-                grid_square: adif_qso.gridsquare.clone(),
-                completed_at: adif_qso.qso_date_off.unwrap_or(adif_qso.qso_date),
-                duration_seconds: 0,
-            },
-            state_history: vec![],
-            messages: vec![],
-            metadata: QsoMetadata {
-                qso_id: uuid::Uuid::new_v4(),
-                our_callsign: if adif_qso.station_callsign.is_empty() {
-                    "UNKNOWN".to_string()
-                } else {
-                    adif_qso.station_callsign.clone()
-                },
-                their_callsign: Some(adif_qso.call.clone()),
-                frequency: adif_qso.freq * 1_000_000.0,
-                // Already the true RF frequency read back from ADIF (a
-                // historical, already-completed record) — the
-                // `completed_rf_frequency_hz.unwrap_or(frequency)` fallback
-                // resolves correctly without this set; see the matching
-                // comment in `adif.rs`'s `adif_to_qso`.
-                completed_rf_frequency_hz: None,
-                mode: adif_qso.mode.clone(),
-                start_time: adif_qso.qso_date,
-                end_time: adif_qso.qso_date_off,
-                reports: SignalReports {
-                    sent: adif_qso.rst_sent.as_ref().and_then(|r| r.parse().ok()),
-                    received: adif_qso.rst_rcvd.as_ref().and_then(|r| r.parse().ok()),
-                },
-                grids: GridSquares {
-                    ours: adif_qso.my_gridsquare.clone(),
-                    theirs: adif_qso.gridsquare.clone(),
-                },
-                their_state: adif_qso.state.clone(),
-                contest_info: if adif_qso.contest_id.is_some() {
-                    Some(ContestInfo {
-                        contest_name: adif_qso.contest_id.clone().unwrap_or_default(),
-                        category: String::new(),
-                        serials: ContestSerials {
-                            sent: adif_qso.stx,
-                            received: adif_qso.srx,
-                        },
-                        points: 0,
-                        multiplier: None,
-                    })
-                } else {
-                    None
-                },
-                tags: std::collections::HashMap::new(),
-                notes: adif_qso.notes.clone(),
-                tx_parity: None,
-                initiated_by: Default::default(),
-                role: Default::default(),
-                call_count: 0,
-                first_call_at: None,
-                last_call_at: None,
-                progressed_this_cycle: false,
-                stall_cycles: 0,
-                last_known_good_offset_hz: None,
-                advance_generation: 0,
-                pre_switch_offset: None,
-                hound: false,
-                partner_freq: None,
-                pending_freq_drift: None,
-                hound_qsyed: false,
-                remote_origin: false,
-                remote_client_key_id: None,
-                tx_parity_provisional: false,
-            },
-        }
     }
 }
 
