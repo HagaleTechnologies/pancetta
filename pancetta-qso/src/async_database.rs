@@ -402,15 +402,18 @@ impl QsoDatabase {
 
     /// Insert a new QSO record
     pub async fn insert_qso(&self, progress: &QsoProgress) -> Result<i64, AsyncDatabaseError> {
-        self.insert_qso_with(&self.pool, progress).await
+        self.insert_qso_with(&self.pool, progress, Utc::now()).await
     }
 
     /// [`Self::insert_qso`] on any executor, so a batch can share one
-    /// transaction.
+    /// transaction. `created_at` is the row's searchable timestamp (the
+    /// date-range filters and ordering use it): the moment of logging for a
+    /// live QSO, the QSO's own start time for one read from ADIF.
     async fn insert_qso_with<'e, E>(
         &self,
         executor: E,
         progress: &QsoProgress,
+        created_at: DateTime<Utc>,
     ) -> Result<i64, AsyncDatabaseError>
     where
         E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
@@ -426,6 +429,7 @@ impl QsoDatabase {
         let adif_json = serde_json::to_string(&adif_qso)?;
 
         let now = Utc::now().to_rfc3339();
+        let created_at = created_at.to_rfc3339();
         let checksum = Self::calculate_checksum(&metadata_json, &state_json, &adif_json);
 
         let result = sqlx::query(
@@ -438,7 +442,7 @@ impl QsoDatabase {
         .bind(&state_json)
         .bind(&progress_json)
         .bind(&adif_json)
-        .bind(&now)
+        .bind(&created_at)
         .bind(&now)
         .bind(&checksum)
         .execute(executor)
@@ -1160,7 +1164,11 @@ impl QsoDatabase {
                 metadata,
             };
 
-            self.insert_qso_with(&mut *tx, &progress).await?;
+            // A historical record lands in its own date range, not the day
+            // it was imported or replayed (PR #451 review).
+            let created_at = progress.metadata.start_time;
+            self.insert_qso_with(&mut *tx, &progress, created_at)
+                .await?;
             inserted += 1;
         }
         tx.commit().await?;
@@ -2139,6 +2147,58 @@ mod tests {
                 "{name} lost through import → export: {exported:?}"
             );
         }
+        db.close().await;
+    }
+
+    /// PR #451 review (Codex P2): an imported (or replayed) row lands in its
+    /// QSO's date range, not the day it was imported; a live-logged row still
+    /// lands at the moment it was logged.
+    #[tokio::test]
+    async fn imported_rows_are_searchable_by_their_qso_date() {
+        use chrono::TimeZone;
+        let adif = "<CALL:5>W1ABC <QSO_DATE:8>20200315 <TIME_ON:6>120000 <MODE:3>FT8 \
+                    <FREQ:9>14.074000 <EOR>\n";
+        let processor = AdifProcessor::new();
+        let file = processor.parse_string(adif).unwrap();
+        let db = QsoDatabase::new_in_memory().await.unwrap();
+        db.insert_adif_records(&processor, &file.records)
+            .await
+            .unwrap();
+        let live = duplicate_check_test_progress("K9DEF", 14_074_000.0);
+        db.insert_qso(&live).await.unwrap();
+
+        let in_range = |start: DateTime<Utc>, end: DateTime<Utc>| QsoFilter {
+            date_range: Some(DateRange { start, end }),
+            ..Default::default()
+        };
+        let calls = |progresses: Vec<QsoProgress>| -> Vec<String> {
+            let mut calls: Vec<String> = progresses
+                .into_iter()
+                .filter_map(|p| p.metadata.their_callsign)
+                .collect();
+            calls.sort();
+            calls
+        };
+        let year_2020 = in_range(
+            Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2020, 12, 31, 23, 59, 59).unwrap(),
+        );
+        let today = in_range(
+            Utc::now() - chrono::Duration::hours(1),
+            Utc::now() + chrono::Duration::hours(1),
+        );
+        let options = QueryOptions::default();
+
+        assert_eq!(
+            calls(db.search_qsos(&year_2020, &options).await.unwrap()),
+            vec!["W1ABC".to_string()]
+        );
+        assert_eq!(
+            calls(db.search_qsos(&today, &options).await.unwrap()),
+            vec!["K9DEF".to_string()]
+        );
+        let records = db.search_qsos_records(&year_2020, &options).await.unwrap();
+        assert_eq!(records.len(), 1, "{records:?}");
         db.close().await;
     }
 

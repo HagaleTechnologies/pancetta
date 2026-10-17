@@ -360,7 +360,20 @@ impl AdifProcessor {
         let mut error: Option<AdifError> = None;
         let mut pos = 0;
 
-        while let Some((open, close)) = next_tag(data, pos) {
+        loop {
+            let tag = next_tag(data, pos);
+            // A field tag abandoned before its `>` (`<COMMENT:5abc<EOR>`)
+            // would otherwise be skipped and its value silently lost: it
+            // makes the record unreadable instead (PR #451 review).
+            let scanned_to = tag.map_or(data.len(), |(open, _)| open);
+            if let Some((start, end)) = abandoned_field_tag(data, pos, scanned_to) {
+                error.get_or_insert(AdifError::InvalidField {
+                    field: decode(data, text, start, end).trim_end().to_string(),
+                });
+            }
+            let Some((open, close)) = tag else {
+                break;
+            };
             let spec = decode(data, text, open + 1, close);
             pos = close + 1;
 
@@ -1207,6 +1220,31 @@ fn next_tag(data: &[u8], from: usize) -> Option<(usize, usize)> {
     }
 }
 
+/// The first field-like tag (`NAME:…`) between `from` and `to` that a later
+/// `<` abandoned before its `>`, as the byte range of its spec. Every `<` in
+/// that range is one [`next_tag`] started over from, so each runs to the
+/// next `<` (or to `to`). A stray `<` in free text, such as `a < b`, is not
+/// field-like.
+fn abandoned_field_tag(data: &[u8], from: usize, to: usize) -> Option<(usize, usize)> {
+    let mut at = from;
+    while let Some(i) = data.get(at..to)?.iter().position(|&b| b == b'<') {
+        let start = at + i + 1;
+        let end = data[start..to]
+            .iter()
+            .position(|&b| b == b'<')
+            .map_or(to, |j| start + j);
+        let spec = &data[start..end];
+        if let Some(colon) = spec.iter().position(|&b| b == b':') {
+            let name = &spec[..colon];
+            if !name.is_empty() && name.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_') {
+                return Some((start, end));
+            }
+        }
+        at = end;
+    }
+    None
+}
+
 /// `data[start..end]` as text; both ends sit on ASCII bytes (`<`, `>`), so
 /// they are always char boundaries of `text`.
 fn decode(data: &[u8], text: Option<&str>, start: usize, end: usize) -> String {
@@ -1869,6 +1907,30 @@ ADIF Export for Test Program
                 assert_eq!(call.as_deref(), Some("W1AW"));
             }
             other => panic!("expected InvalidField(COMMENT), got {other:?}"),
+        }
+        assert!(parsed.records[1].is_ok(), "{:?}", parsed.records[1]);
+    }
+
+    /// PR #451 review (Codex P2): a field tag abandoned before its `>`
+    /// (`<COMMENT:5abc<EOR>`) must make its record unreadable, not be
+    /// skipped so the contact imports without the value.
+    #[test]
+    fn parse_bytes_rejects_an_unterminated_field_tag() {
+        let adif = "<CALL:4>W1AW <QSO_DATE:8>20240101 <TIME_ON:4>1200 <COMMENT:5abc<EOR>\n\
+                    <CALL:5>K1ABC <QSO_DATE:8>20240101 <TIME_ON:4>1300 <EOR>\n";
+
+        let parsed = AdifProcessor::new().parse_bytes(adif.as_bytes());
+
+        assert_eq!(parsed.records.len(), 2, "{:?}", parsed.records);
+        match &parsed.records[0] {
+            Err(AdifRecordError {
+                error: AdifError::InvalidField { field },
+                call,
+            }) => {
+                assert_eq!(field, "COMMENT:5abc");
+                assert_eq!(call.as_deref(), Some("W1AW"));
+            }
+            other => panic!("expected InvalidField(COMMENT:5abc), got {other:?}"),
         }
         assert!(parsed.records[1].is_ok(), "{:?}", parsed.records[1]);
     }
