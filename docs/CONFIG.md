@@ -173,7 +173,7 @@ edge_warnings = true  # master switch: the band-plan TX gate AND the TUI edge
 |---|---|---|---|
 | `region` | integer | `2` | Selects the IARU region tables (1, 2 or 3; they diverge on 40/60/80 m, 2 m, 70 cm). An invalid number falls back to the global table — never panics. |
 | `edge_warnings` | bool | `true` | Master switch for both the hard TX refusal and the TUI's manual-frequency-entry warning. `false` disables both: nothing is refused, nothing warns. |
-| `custom_bands."<band>"` | table | — | Overrides the region table for that band (in-band iff the RF falls within ANY of the entry's `ranges`, OR across ranges). Applies to frequencies the band table resolves to that band — the escape hatch for a national allocation narrower than your region's default. |
+| `custom_bands."<band>"` | table | — | Overrides the region table for that band (in-band iff the RF falls within ANY of the entry's `ranges`, OR across ranges). Applies to frequencies the band table resolves to that band — the escape hatch for a national allocation narrower than your region's default. The TUI's entry warning checks one frequency (OR across ranges); a transmission must fit entirely inside ONE of the entry's `ranges` (PAN-208), so a frame straddling the gap between two ranges is refused before PTT. |
 
 Since PAN-118 the band plan is enforced, not just displayed: every path that
 asserts PTT (scheduled FT8 transmissions and multi-TX bundle items, F4 tune,

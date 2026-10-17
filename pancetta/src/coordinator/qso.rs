@@ -2956,6 +2956,7 @@ impl super::ApplicationCoordinator {
         // worker's/TUI-relay task's writes, not just narrowly raced against
         // them.
         let ptt_sync_gate = self.ptt_sync_gate.clone();
+        let relocation_epochs = self.relocation_epochs.clone();
         // T3 will read this to apply the operator's held TX audio offset when
         // starting a manual QSO (Hold mode). Captured here so both atomics
         // are in scope in the StartQso/RespondToCaller handlers below.
@@ -3060,6 +3061,7 @@ impl super::ApplicationCoordinator {
         // PAN-143: share the synchronization gate too — see the field's doc
         // comment in qso_manager.rs.
         qso_manager.set_ptt_sync_gate_source(ptt_sync_gate.clone());
+        qso_manager.set_relocation_epoch_source(relocation_epochs);
         // PAN-72 (Codex round 2 on PR #350, finding 5): share the global TX
         // policy too, so the same stall detector does not count a rearm cycle
         // whose re-send the `TxPolicy::Disabled` hard mute blocked outright —

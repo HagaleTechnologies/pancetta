@@ -2982,10 +2982,13 @@ fn has_undelivered_pending_hamlib_state(
 /// `tx_rf_hz` is the LOWEST emitted tone (dial + audio offset, from
 /// [`tx_rf_for_gate`]); `signal_span_hz` is how far above it the highest
 /// emitted tone sits ([`tx_signal_span_hz`] for a protocol frame, `0.0`
-/// for a single-tone tune or a raw manual-PTT carrier). Both the low and
-/// the high edge must be inside the band plan (PR #446 Codex review: an
-/// FT8 frame whose base tone is in-band can still put its top tone up to
-/// 43.75 Hz past an upper band edge).
+/// for a single-tone tune or a raw manual-PTT carrier). The whole occupied
+/// interval, low edge to high edge, must fit inside ONE allowed range of
+/// the band plan (PR #446 Codex review: an FT8 frame whose base tone is
+/// in-band can still put its top tone up to 43.75 Hz past an upper band
+/// edge; PAN-208: a multi-range `custom_bands` entry must not be straddled
+/// across the gap between two ranges —
+/// `pancetta_tui::app::tx_interval_out_of_band_plan`).
 pub fn tx_band_plan_mute_reason(
     tx_rf_hz: f64,
     signal_span_hz: f64,
@@ -3010,13 +3013,15 @@ pub fn tx_band_plan_mute_reason(
     let low_hz = tx_rf_hz.max(0.0).floor() as u64;
     let high_hz = (tx_rf_hz.max(0.0) + span_hz).ceil() as u64;
     let low_out = pancetta_tui::app::tx_rf_out_of_band_plan(low_hz, band_plan);
-    let high_out =
-        high_hz != low_hz && pancetta_tui::app::tx_rf_out_of_band_plan(high_hz, band_plan);
+    // PAN-208: the whole occupied interval must fit inside ONE allowed range,
+    // not just have each edge in some range.
+    let interval_out = high_hz != low_hz
+        && pancetta_tui::app::tx_interval_out_of_band_plan(low_hz, high_hz, band_plan);
     if low_out {
         Some(format!(
             "TX frequency {low_hz} Hz is outside the configured amateur band plan"
         ))
-    } else if high_out {
+    } else if interval_out {
         Some(format!(
             "TX signal {low_hz}-{high_hz} Hz extends outside the configured \
              amateur band plan"
@@ -3326,6 +3331,124 @@ mod pan118_band_plan_gate_tests {
                 1_500.0,
             ),
             Some(15_001_500.0)
+        );
+    }
+}
+
+/// PAN-208: a `custom_bands` entry with two or more `ranges` leaves gaps
+/// inside the band. The occupied signal `[floor(low), ceil(low + span)]`
+/// must fit inside ONE allowed range; checking the low and high edges
+/// independently let a frame whose base tone sat in one range and top
+/// tone in the next key across the excluded gap (PR #446 Codex review).
+#[cfg(test)]
+pub(crate) mod pan208_band_plan_gap_tests {
+    use super::*;
+
+    const FT8_SPAN_HZ: f64 = 43.75;
+
+    /// The ticket's plan: 20m carved into 14,070,000–14,071,000 Hz and
+    /// 14,071,020–14,072,000 Hz, with 14,071,000–14,071,020 excluded.
+    pub(crate) fn gapped_plan() -> pancetta_config::BandPlanConfig {
+        use pancetta_config::{BandDefinition, BandType, FrequencyRange};
+        let mut plan = pancetta_config::BandPlanConfig::default();
+        plan.custom_bands.insert(
+            "20m".to_string(),
+            BandDefinition {
+                name: "20m".to_string(),
+                ranges: vec![
+                    FrequencyRange {
+                        start: 14_070_000,
+                        end: 14_071_000,
+                        modes: Vec::new(),
+                    },
+                    FrequencyRange {
+                        start: 14_071_020,
+                        end: 14_072_000,
+                        modes: Vec::new(),
+                    },
+                ],
+                default_mode: "FT8".to_string(),
+                band_type: BandType::Hf,
+            },
+        );
+        plan
+    }
+
+    #[test]
+    fn gap_straddling_signal_is_refused_and_names_the_occupied_range() {
+        // Base tone 14,070,990 Hz is in the first range; the top tone
+        // 14,071,033.75 Hz is in the second. Each edge alone is allowed.
+        let reason = tx_band_plan_mute_reason(14_070_990.0, FT8_SPAN_HZ, &gapped_plan())
+            .expect("a frame straddling the 14,071,000-14,071,020 Hz gap must refuse");
+        assert!(
+            reason.contains(
+                "TX signal 14070990-14071034 Hz extends outside the configured amateur band plan"
+            ),
+            "reason names the occupied range: {reason}"
+        );
+    }
+
+    #[test]
+    fn fully_inside_one_range_signal_still_keys() {
+        // 14,071,100 + 43.75 = 14,071,143.75 Hz: wholly inside the second range.
+        assert_eq!(
+            tx_band_plan_mute_reason(14_071_100.0, FT8_SPAN_HZ, &gapped_plan()),
+            None
+        );
+    }
+
+    #[test]
+    fn zero_span_base_tone_in_first_range_still_keys() {
+        // A tune tone or raw manual-PTT carrier occupies one frequency.
+        assert_eq!(
+            tx_band_plan_mute_reason(14_070_990.0, 0.0, &gapped_plan()),
+            None
+        );
+    }
+
+    #[test]
+    fn gap_plan_edge_warnings_false_permits_the_gap_straddling_signal() {
+        let mut plan = gapped_plan();
+        plan.edge_warnings = false;
+        assert_eq!(
+            tx_band_plan_mute_reason(14_070_990.0, FT8_SPAN_HZ, &plan),
+            None
+        );
+    }
+
+    #[test]
+    fn gap_plan_low_edge_in_no_range_keeps_low_frequency_message() {
+        // 14,069,900 Hz is in global 20m but below the first custom range.
+        let reason = tx_band_plan_mute_reason(14_069_900.0, FT8_SPAN_HZ, &gapped_plan())
+            .expect("a base tone below every custom range must refuse");
+        assert!(
+            reason.contains("TX frequency 14069900 Hz is outside the configured amateur band plan"),
+            "reason names the base tone: {reason}"
+        );
+    }
+
+    #[test]
+    fn gap_plan_top_past_last_range_uses_extends_message() {
+        // 14,071,990 + 43.75 = 14,072,033.75 Hz: past the second range's top.
+        let reason = tx_band_plan_mute_reason(14_071_990.0, FT8_SPAN_HZ, &gapped_plan())
+            .expect("a top tone past the last custom range must refuse");
+        assert!(
+            reason.contains("TX signal 14071990-14072034 Hz extends outside"),
+            "reason names the occupied range: {reason}"
+        );
+    }
+
+    #[test]
+    fn gap_plan_inclusive_edges_are_contained() {
+        // Top tone exactly on the first range's upper edge.
+        assert_eq!(
+            tx_band_plan_mute_reason(14_070_990.0, 10.0, &gapped_plan()),
+            None
+        );
+        // Base tone exactly on the second range's lower edge.
+        assert_eq!(
+            tx_band_plan_mute_reason(14_071_020.0, FT8_SPAN_HZ, &gapped_plan()),
+            None
         );
     }
 }
@@ -4390,6 +4513,18 @@ fn final_single_tx_gate_denial(
         return Some(FinalGateDenial::DxParityConflict);
     }
     None
+}
+
+/// PAN-145: compare raw QsoId epochs after `PttGuard::new` has set
+/// `ptt_active` under the shared gate. Later offset switches now refuse, so
+/// these reads need no async lock or repeated DSP. None is manual/test TX.
+fn relocation_epoch_stale(
+    epochs: &pancetta_qso::qso_manager::TxRelocationEpochs,
+    snapshots: &[(Option<String>, u64)],
+) -> bool {
+    snapshots
+        .iter()
+        .any(|(id, before)| id.as_deref().is_some_and(|id| epochs.epoch(id) != *before))
 }
 
 /// PAN-117: the slot-timing half of the Step 4d final gate, shared by both
@@ -7003,6 +7138,9 @@ impl super::ApplicationCoordinator {
             // recheck/store, not just narrowly raced against them. See
             // PttGuard::new's doc comment.
             let ptt_sync_gate = self.ptt_sync_gate.clone();
+            let relocation_epochs = self.relocation_epochs.clone();
+            #[cfg(test)]
+            let tx_before_ptt_gate = self.tx_before_ptt_gate.clone();
             // Timestamp of the most recent PTT-on, read by the FT8 decode
             // loop's TX-adjacent-desense diagnostic (see `ft8.rs`).
             let last_ptt_on_ms = self.last_ptt_on_ms.clone();
@@ -8248,6 +8386,16 @@ impl super::ApplicationCoordinator {
                                         // schedule (pad/cursor) stays valid, and every FT8
                                         // frame is the same 79-symbol length so audio_out's
                                         // length (and audio_duration_ms) are unchanged.
+                                        // Snapshot BEFORE the async mirror read. An offset switch
+                                        // during the pivot or gate wait invalidates this frame,
+                                        // even if its MessageToSend has not reached the mirror.
+                                        let relocation_snapshot = [(
+                                            qso_id.clone(),
+                                            qso_id
+                                                .as_deref()
+                                                .map(|id| relocation_epochs.epoch(id))
+                                                .unwrap_or(0),
+                                        )];
                                         if let Some(intent) =
                                             latest_tx_intent.read().ok().and_then(|m| {
                                                 super::tx_pivot_target(
@@ -8387,6 +8535,8 @@ impl super::ApplicationCoordinator {
                                         }
 
                                         // --- Step 5: Assert PTT ---
+                                        #[cfg(test)]
+                                        tx_before_ptt_gate.notify_one();
                                         let mut ptt_guard = PttGuard::new(
                                             message_bus.clone(),
                                             ptt_active.clone(),
@@ -8428,6 +8578,44 @@ impl super::ApplicationCoordinator {
                                         // this gate — it reads the clock, so it runs last,
                                         // just before the PTT-on send below (see
                                         // `key_time_gate_denial`).
+                                        // PAN-145: the gate can have yielded to a relocation
+                                        // after Step 4c read the intent. Refuse its old waveform
+                                        // before any PTT-on send; do not rebuild under the gate.
+                                        if relocation_epoch_stale(
+                                            &relocation_epochs,
+                                            &relocation_snapshot,
+                                        ) {
+                                            ptt_active.store(false, Ordering::Release);
+                                            ptt_guard.disarm();
+                                            let pivot_replaced =
+                                                pivoted_this_key.take().and_then(|key| {
+                                                    pivoted_once.remove(&key);
+                                                    pivoted_from.remove(&key)
+                                                });
+                                            let diagnostic = format!(
+                                                "TX blocked at final pre-PTT check (QSO relocated during gate wait): '{message_text}'"
+                                            );
+                                            info!(target: "pancetta::tx.policy", "{diagnostic}");
+                                            emit_diagnostic(
+                                                &message_bus,
+                                                "tx.policy",
+                                                pancetta_core::DiagnosticLevel::Info,
+                                                diagnostic,
+                                                qso_id.as_deref(),
+                                            )
+                                            .await;
+                                            send_tx_queue_status(&message_bus, None, Vec::new())
+                                                .await;
+                                            let _ = report_unaired_frame(
+                                                &message_bus,
+                                                message_text,
+                                                qso_id.clone(),
+                                                pivot_replaced,
+                                            )
+                                            .await;
+                                            continue 'worker;
+                                        }
+
                                         if let Some(denial) = final_single_tx_gate_denial(
                                             qso_id.as_deref(),
                                             required_parity,
@@ -10656,6 +10844,23 @@ impl super::ApplicationCoordinator {
                                     // (even with every item otherwise still live) must
                                     // force the rebuild path below, since the item list
                                     // now holds different text than what Step 1 encoded.
+                                    // PAN-145: capture each live QSO before the intent
+                                    // mirror. The authoritative bump can precede its event's
+                                    // delivery to that map while we build or wait for PTT.
+                                    let mut relocation_snapshot: Vec<(Option<String>, u64)> = items
+                                        .iter()
+                                        .zip(live_mask.iter())
+                                        .filter(|(_, live)| **live)
+                                        .map(|(item, _)| {
+                                            (
+                                                item.qso_id.clone(),
+                                                item.qso_id
+                                                    .as_deref()
+                                                    .map(|id| relocation_epochs.epoch(id))
+                                                    .unwrap_or(0),
+                                            )
+                                        })
+                                        .collect();
                                     let latest_snapshot: std::collections::HashMap<
                                         String,
                                         super::LatestTxIntent,
@@ -11176,6 +11381,8 @@ impl super::ApplicationCoordinator {
                                             as u64;
 
                                     // --- Step 5: Assert PTT ---
+                                    #[cfg(test)]
+                                    tx_before_ptt_gate.notify_one();
                                     let mut ptt_guard = PttGuard::new(
                                         message_bus.clone(),
                                         ptt_active.clone(),
@@ -11239,6 +11446,47 @@ impl super::ApplicationCoordinator {
                                     //
                                     // PAN-117: the slot-timing re-check runs LAST, just
                                     // before the PTT-on send below, not here.
+                                    // Rebuilds can reject an item after the snapshot. Only
+                                    // QSOs actually present in the summed waveform matter.
+                                    relocation_snapshot
+                                        .retain(|(id, _)| encoded_qso_ids_final.contains(id));
+                                    if relocation_epoch_stale(
+                                        &relocation_epochs,
+                                        &relocation_snapshot,
+                                    ) {
+                                        ptt_active.store(false, Ordering::Release);
+                                        ptt_guard.disarm();
+                                        let mut bundle_replaced = unwind_bundle_pivots(
+                                            &pivoted_this_bundle_keys,
+                                            &mut pivoted_once,
+                                            &mut pivoted_from,
+                                        );
+                                        let diagnostic = "dropping multi-TX bundle at final pre-PTT check: QSO relocated during gate wait";
+                                        info!(target: "pancetta::tx.policy", "{diagnostic}");
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "tx.policy",
+                                            pancetta_core::DiagnosticLevel::Info,
+                                            diagnostic.to_string(),
+                                            None,
+                                        )
+                                        .await;
+                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                        for item in &items {
+                                            let _ = report_unaired_frame(
+                                                &message_bus,
+                                                item.message_text.clone(),
+                                                item.qso_id.clone(),
+                                                take_bundle_replaced(
+                                                    &mut bundle_replaced,
+                                                    item.qso_id.as_deref(),
+                                                ),
+                                            )
+                                            .await;
+                                        }
+                                        continue;
+                                    }
+
                                     let (final_live_mask, final_parity_hold_mask) =
                                         bundle_live_mask(
                                             &encoded_qso_ids_final,
@@ -19366,9 +19614,16 @@ mod pan115_worker_gate_tests {
     }
 
     pub(crate) async fn worker_harness() -> Harness {
+        worker_harness_with_config(Config::default()).await
+    }
+
+    /// [`worker_harness`] over a caller-built `Config` — the worker snapshots
+    /// `rig.frequency.band_plan` at spawn, so a custom plan must be in the
+    /// config the coordinator is built from (PAN-208).
+    pub(crate) async fn worker_harness_with_config(cfg: Config) -> Harness {
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut coordinator = ApplicationCoordinator::new(
-            Config::default(),
+            cfg,
             None,
             true,  // no_audio
             true,  // headless
@@ -19510,6 +19765,363 @@ mod pan115_worker_gate_tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         false
+    }
+
+    #[test]
+    fn relocation_epoch_stale_is_per_qso_and_skips_none_ids() {
+        let epochs = pancetta_qso::qso_manager::TxRelocationEpochs::default();
+        let snapshot = vec![(Some("qa".to_string()), 0), (None, 0)];
+        assert!(!super::relocation_epoch_stale(&epochs, &snapshot));
+        epochs.bump("qb");
+        epochs.bump("");
+        assert!(!super::relocation_epoch_stale(&epochs, &snapshot));
+        epochs.bump("qa");
+        assert!(super::relocation_epoch_stale(&epochs, &snapshot));
+        let current = vec![(Some("qa".to_string()), epochs.epoch("qa"))];
+        assert!(!super::relocation_epoch_stale(&epochs, &current));
+        epochs.bump("qa");
+        assert!(super::relocation_epoch_stale(&epochs, &current));
+    }
+
+    async fn relocation_manager(h: &Harness) -> (pancetta_qso::QsoManager, pancetta_qso::QsoId) {
+        let mut manager = pancetta_qso::QsoManager::new(pancetta_qso::QsoManagerConfig {
+            our_callsign: "W5AU".into(),
+            our_grid: Some("FN20".into()),
+            ..Default::default()
+        });
+        manager.set_ptt_sync_gate_source(h.coordinator.ptt_sync_gate.clone());
+        manager.set_ptt_active_source(h.coordinator.ptt_active.clone());
+        manager.set_relocation_epoch_source(h.coordinator.relocation_epochs.clone());
+        manager.set_tx_freq_mode_source(Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        let id = manager.start_cq(1500.0, None, false, None).await.unwrap();
+        h.coordinator
+            .active_tx_qsos
+            .write()
+            .unwrap()
+            .insert(super::super::active_tx_qso_key(&id.to_string()));
+        (manager, id)
+    }
+
+    fn mirror_intent(h: &Harness, id: &str, text: &str, frequency_offset: f64) {
+        h.coordinator.latest_tx_intent.write().unwrap().insert(
+            super::super::active_tx_qso_key(id),
+            super::super::LatestTxIntent {
+                message_text: text.into(),
+                frequency_offset,
+                tx_parity: None,
+                origin: TxOrigin::Local,
+                remote_client_key_id: None,
+            },
+        );
+    }
+
+    async fn request_qso(h: &Harness, id: &str, frequency_offset: f64) {
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Autonomous,
+                ComponentId::Ft8Transmitter,
+                MessageType::TransmitRequest {
+                    message_text: "CQ W5AU FN20".into(),
+                    frequency_offset,
+                    qso_id: Some(id.into()),
+                    tx_parity: None,
+                    origin: TxOrigin::Local,
+                    remote_client_key_id: None,
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    async fn wait_for_ptt_gate(h: &Harness) {
+        tokio::time::timeout(
+            Duration::from_secs(40),
+            h.coordinator.tx_before_ptt_gate.notified(),
+        )
+        .await
+        .expect("worker must reach its PTT gate after building the waveform");
+        // These tests use the current-thread runtime. notify_one does not
+        // yield, so the worker has polled the held gate before this resumes.
+        assert!(!h.coordinator.ptt_active.load(Ordering::Acquire));
+    }
+
+    async fn assert_relocation_refusal(h: &Harness, expected: &[(&str, f64)], diagnostic: &str) {
+        let expected_ids: std::collections::HashSet<_> =
+            expected.iter().map(|(id, _)| (*id).to_string()).collect();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut completed = std::collections::HashSet::new();
+        let mut unaired = std::collections::HashSet::new();
+        let mut queue_cleared = false;
+        let mut saw_diagnostic = false;
+        while Instant::now() < deadline
+            && (completed != expected_ids
+                || unaired != expected_ids
+                || !queue_cleared
+                || !saw_diagnostic)
+        {
+            assert!(
+                !h.hamlib_rx.try_iter().any(|msg| is_ptt_on(&msg)),
+                "relocated content must never reach hardware PTT"
+            );
+            for msg in h.autonomous_rx.try_iter() {
+                if let MessageType::TransmitComplete {
+                    success,
+                    qso_id: Some(qso_id),
+                    ..
+                } = msg.message_type
+                {
+                    assert!(!success);
+                    assert!(completed.insert(qso_id), "one completion per unaired frame");
+                }
+            }
+            for msg in h.qso_rx.try_iter() {
+                if let MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent {
+                    qso_id,
+                    replaced,
+                    ..
+                }) = msg.message_type
+                {
+                    let (_, expected_offset) = expected
+                        .iter()
+                        .find(|(id, _)| *id == qso_id)
+                        .expect("report must identify an item in this request");
+                    assert_eq!(
+                        replaced.expect("pivot must be unwound").frequency_hz,
+                        *expected_offset
+                    );
+                    assert!(unaired.insert(qso_id), "one rollback per unaired frame");
+                }
+            }
+            for msg in h.tui_rx.try_iter() {
+                match msg.message_type {
+                    MessageType::DiagnosticEvent {
+                        target,
+                        level,
+                        text,
+                        ..
+                    } if text == diagnostic => {
+                        assert_eq!(target, "tx.policy");
+                        assert_eq!(level, pancetta_core::DiagnosticLevel::Info);
+                        saw_diagnostic = true;
+                    }
+                    MessageType::TxQueueStatus {
+                        sending: None,
+                        queued,
+                    } if queued.is_empty() => {
+                        queue_cleared = true;
+                    }
+                    _ => {}
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(completed, expected_ids);
+        assert_eq!(unaired, expected_ids);
+        assert!(queue_cleared, "refusal must clear the queue display");
+        assert!(
+            saw_diagnostic,
+            "missing expected Info diagnostic: {diagnostic}"
+        );
+        assert!(!h.coordinator.ptt_active.load(Ordering::Acquire));
+        assert!(!h.hamlib_rx.try_iter().any(|msg| is_ptt_on(&msg)));
+    }
+
+    #[tokio::test]
+    async fn single_tx_drops_without_keying_when_qso_relocates_during_gate_wait() {
+        let h = worker_harness().await;
+        let (manager, id) = relocation_manager(&h).await;
+        let id_text = id.to_string();
+        // Force a pivot so this also exercises tombstone rollback.
+        mirror_intent(&h, &id_text, "CQ W5AU FN20", 1550.0);
+        let held = h.coordinator.ptt_sync_gate.lock().await;
+        let mut switching = Box::pin(manager.apply_tx_offset_switch(
+            id,
+            1800.0,
+            pancetta_qso::qso_manager::OffsetRelocationOrigin::OperatorForced,
+        ));
+        // Queue the real relocation FIRST on tokio's FIFO mutex. Do not run
+        // the event consumer: the intent mirror deliberately stays stale.
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                switching.as_mut(),
+                cx
+            )))
+            .await
+            .is_pending()
+        );
+        request_qso(&h, &id_text, 1500.0).await;
+        wait_for_ptt_gate(&h).await;
+        assert_eq!(h.coordinator.relocation_epochs.epoch(&id_text), 0);
+        drop(held);
+        switching.await.unwrap();
+        assert_relocation_refusal(
+            &h,
+            &[(&id_text, 1500.0)],
+            "TX blocked at final pre-PTT check (QSO relocated during gate wait): 'CQ W5AU FN20'",
+        )
+        .await;
+
+        // The request that produced the first pivot must remain eligible.
+        // A leaked tombstone would suppress it before it can pivot to 1800.
+        mirror_intent(&h, &id_text, "CQ W5AU FN20", 1800.0);
+        request_qso(&h, &id_text, 1550.0).await;
+        assert!(
+            await_ptt_on(&h, Duration::from_secs(40)).await,
+            "refusal must unwind the pivot tombstone so the fresh request can key"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_tx_keys_normally_when_no_relocation_races() {
+        let h = worker_harness().await;
+        let (_manager, id) = relocation_manager(&h).await;
+        let held = h.coordinator.ptt_sync_gate.lock().await;
+        request_qso(&h, &id.to_string(), 1500.0).await;
+        wait_for_ptt_gate(&h).await;
+        drop(held);
+        assert!(await_ptt_on(&h, Duration::from_secs(5)).await);
+    }
+
+    #[test]
+    fn bundle_epoch_check_ignores_items_with_no_qso_id() {
+        let epochs = pancetta_qso::qso_manager::TxRelocationEpochs::default();
+        let snapshots = vec![
+            (None, 0),
+            (Some("qa".to_string()), 0),
+            (Some("qb".to_string()), 0),
+        ];
+        epochs.bump("");
+        epochs.bump("not-in-the-bundle");
+        assert!(!super::relocation_epoch_stale(&epochs, &snapshots));
+        epochs.bump("qb");
+        assert!(super::relocation_epoch_stale(&epochs, &snapshots));
+        assert!(!super::relocation_epoch_stale(&epochs, &[(None, 123)]));
+        assert!(!super::relocation_epoch_stale(&epochs, &[]));
+    }
+
+    async fn second_relocation_qso(h: &Harness, manager: &pancetta_qso::QsoManager) -> String {
+        let id = manager
+            .respond_to_cq_manual("K1ABC".into(), 2200.0, None)
+            .await
+            .unwrap()
+            .to_string();
+        h.coordinator
+            .active_tx_qsos
+            .write()
+            .unwrap()
+            .insert(super::super::active_tx_qso_key(&id));
+        id
+    }
+
+    async fn request_qso_bundle(h: &Harness, ids: &[String; 2], offsets: [f64; 2]) {
+        let texts = ["CQ W5AU FN20", "K1ABC W5AU FN20"];
+        let items = ids
+            .iter()
+            .zip(offsets)
+            .zip(texts)
+            .map(
+                |((id, frequency_offset), text)| crate::message_bus::TransmitRequestItem {
+                    message_text: text.into(),
+                    frequency_offset,
+                    qso_id: Some(id.clone()),
+                },
+            )
+            .collect();
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Autonomous,
+                ComponentId::Ft8Transmitter,
+                MessageType::MultiTransmitRequest {
+                    items,
+                    tx_parity: None,
+                    origin: TxOrigin::Local,
+                    remote_client_key_id: None,
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bundle_drops_without_keying_when_any_live_item_relocates_during_gate_wait() {
+        let h = worker_harness().await;
+        let (manager, id) = relocation_manager(&h).await;
+        let ids = [id.to_string(), second_relocation_qso(&h, &manager).await];
+        mirror_intent(&h, &ids[0], "CQ W5AU FN20", 1550.0);
+        mirror_intent(&h, &ids[1], "K1ABC W5AU FN20", 2250.0);
+        let held = h.coordinator.ptt_sync_gate.lock().await;
+        let mut switching = Box::pin(manager.apply_tx_offset_switch(
+            id,
+            1800.0,
+            pancetta_qso::qso_manager::OffsetRelocationOrigin::OperatorForced,
+        ));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                switching.as_mut(),
+                cx
+            )))
+            .await
+            .is_pending()
+        );
+        request_qso_bundle(&h, &ids, [1500.0, 2200.0]).await;
+        wait_for_ptt_gate(&h).await;
+        drop(held);
+        switching.await.unwrap();
+
+        assert_relocation_refusal(
+            &h,
+            &[(&ids[0], 1500.0), (&ids[1], 2200.0)],
+            "dropping multi-TX bundle at final pre-PTT check: QSO relocated during gate wait",
+        )
+        .await;
+
+        // Both prior pivot requests remain eligible after the whole-bundle
+        // refusal. Leaving either tombstone behind would drop its item.
+        mirror_intent(&h, &ids[0], "CQ W5AU FN20", 1800.0);
+        request_qso_bundle(&h, &ids, [1550.0, 2250.0]).await;
+        let deadline = Instant::now() + Duration::from_secs(40);
+        let mut sending_ids = std::collections::HashSet::new();
+        let mut keyed = false;
+        while Instant::now() < deadline && !keyed {
+            for msg in h.tui_rx.try_iter() {
+                if let MessageType::TxQueueStatus {
+                    sending: Some(head),
+                    queued,
+                } = msg.message_type
+                {
+                    sending_ids = std::iter::once(head)
+                        .chain(queued)
+                        .filter_map(|it| it.qso_id)
+                        .collect();
+                }
+            }
+            keyed |= h.hamlib_rx.try_iter().any(|msg| is_ptt_on(&msg));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(keyed, "the fresh bundle must remain eligible to key");
+        assert_eq!(
+            sending_ids,
+            ids.iter().cloned().collect(),
+            "both tombstones must be unwound"
+        );
+    }
+
+    #[tokio::test]
+    async fn bundle_keys_normally_when_no_relocation_races() {
+        let h = worker_harness().await;
+        let (manager, id) = relocation_manager(&h).await;
+        let ids = [id.to_string(), second_relocation_qso(&h, &manager).await];
+        let held = h.coordinator.ptt_sync_gate.lock().await;
+        request_qso_bundle(&h, &ids, [1500.0, 2200.0]).await;
+        wait_for_ptt_gate(&h).await;
+        drop(held);
+        assert!(await_ptt_on(&h, Duration::from_secs(5)).await);
     }
 
     /// PAN-119: a single TX-worker panic must not end the operating session.
@@ -20492,6 +21104,73 @@ mod pan118_worker_band_plan_tests {
         assert_eq!(done[0], Some(false), "item A must complete as failed");
         assert_eq!(done[1], Some(false), "item B must complete as failed");
         assert!(!ptt_on, "no SetPtt(true) for a fully out-of-band bundle");
+    }
+}
+
+/// PAN-208: the gap-straddling Gherkin end to end, through the real TX
+/// worker with a two-range `custom_bands` entry for 20m in its config. A
+/// frame whose base tone sits in the first range and top tone in the second
+/// is refused before `SetPtt{true}` reaches Hamlib; a frame wholly inside
+/// one range still keys.
+#[cfg(test)]
+mod pan208_worker_band_plan_tests {
+    use super::pan115_worker_gate_tests::{
+        await_completion, await_ptt_on, request, worker_harness_with_config, Harness,
+    };
+    use super::pan208_band_plan_gap_tests::gapped_plan;
+    use pancetta_config::Config;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    /// The worker snapshots the band plan at spawn, so it goes in the config.
+    async fn gapped_plan_harness() -> Harness {
+        let mut cfg = Config::default();
+        cfg.rig.frequency.band_plan = gapped_plan();
+        worker_harness_with_config(cfg).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gap_straddling_custom_plan_tx_is_refused_before_ptt() {
+        let h = gapped_plan_harness().await;
+        // Dial + 1,500 Hz audio offset = base tone 14,070,990 Hz; the FT8
+        // top tone lands at 14,071,033.75 Hz, across the excluded gap.
+        h.coordinator
+            .operating_frequency_hz
+            .store(14_069_490, Ordering::Relaxed);
+
+        request(&h, "CQ N0CALL FN20").await;
+        let (completed, diagnostics, ptt_on) =
+            await_completion(&h, "CQ N0CALL FN20", Duration::from_secs(5)).await;
+        assert_eq!(
+            completed,
+            Some(false),
+            "a gap-straddling TX must complete as failed"
+        );
+        assert!(
+            !ptt_on,
+            "no SetPtt{{true}} may reach Hamlib for a gap-straddling TX"
+        );
+        assert!(
+            diagnostics.iter().any(|d| d.contains(
+                "TX blocked (TX signal 14070990-14071034 Hz extends outside the configured amateur band plan)"
+            )),
+            "the admission gate must name the occupied range, got {diagnostics:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fully_inside_custom_plan_tx_still_keys() {
+        let h = gapped_plan_harness().await;
+        // Base tone 14,071,100 Hz; top tone 14,071,143.75 Hz — one range.
+        h.coordinator
+            .operating_frequency_hz
+            .store(14_069_600, Ordering::Relaxed);
+
+        request(&h, "CQ N0CALL FN20").await;
+        assert!(
+            await_ptt_on(&h, Duration::from_secs(40)).await,
+            "a TX wholly inside one custom range must still key"
+        );
     }
 }
 

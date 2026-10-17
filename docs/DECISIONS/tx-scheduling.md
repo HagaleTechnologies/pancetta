@@ -3,6 +3,31 @@
 
 # TX scheduling
 
+## Post-gate relocation revalidation (PAN-145, 2026-10-16)
+
+A successful QSO offset switch bumps a per-QSO epoch under `ptt_sync_gate`,
+before committing the frequency. The TX worker snapshots epochs before its
+intent read and compares them after acquiring the gate. An offset switch across
+that interval drops the single frame or the whole summed bundle before PTT,
+with unaired accounting and pivot-tombstone cleanup. Counters are keyed by raw
+QSO ids, shared through coordinator injection, and retained across manager
+clones. Unrelated QSOs and frames without a QSO id do not trigger this check.
+
+Only `apply_tx_offset_switch` bumps the counter. Other `QsoManager` paths that
+move a QSO's TX offset, for example the drift relatch on a Tx=Rx QSO and the
+Hound QSY, take neither the gate nor the counter, as before PAN-143. A newer
+request they produce reaches the worker as a `MessageToSend`; if it lands after
+the intent read, the old frame keys and the existing supersede handling applies.
+
+A second read of `latest_tx_intent` cannot establish freshness: the coordinator
+updates it asynchronously after the relocation publishes its events. Holding
+the gate through modulation would add DSP latency without closing that mirror
+gap. Rebuilding after the wait would duplicate the same vulnerable read and the
+encoding path. The epoch comparison therefore uses PAN-148's drop-only final
+gate; a fresh request can key a later eligible slot. The PTT gate still prevents
+any later offset switch while the worker is preparing to key. See the PAN-145
+amendment in `docs/superpowers/specs/2026-09-12-pan-143-ptt-shared-synchronization-design.md`.
+
 ## DX-slot-aware TX scheduling
 
 `pancetta/src/coordinator/tx.rs`: WSJT-X-style. Every `DecodedMessage` carries `slot_parity`; the QSO state machine latches `tx_parity = opposite_of(dx_parity)` at QSO start; the TX scheduler picks the next slot of that parity, padding silent samples if early or skip-ahead-cursoring into the modulated waveform if late (up to `tx_late_max_ms`, default 3s, minus the unconditional coalesce window + safety margin reserved at the queue-time acceptance check). Past that, defers 30s. Never collides with the DX's parity. See `docs/superpowers/specs/2026-04-27-dx-slot-aware-tx-design.md` — its "the first received decode will refine the parity for any subsequent QSO responses" promise is now implemented (2026-07-18 review, Batch 2): a QSO opened with no observed `dx_parity` (a cluster/DX-Hunter spot pick) latches a provisional parity and refines it to the true opposite-of-DX value on the first genuine decode from the latched partner.
@@ -287,6 +312,18 @@ pending/in-flight mute covers a command only once the Hamlib loop is applying it
 in a restart pending slot). Closing this needs a confirmed-RF source (the rig's split is never read
 back) or in-flight marking from the requested-value store through CAT application. That producer
 ordering predates PAN-118 and is follow-up scope.
+
+**PAN-208: the occupied interval must fit inside one allowed range.** The gate first checked the
+low and high edges as two independent point queries. Point membership is OR across a
+`custom_bands` entry's `ranges`, so a frame whose base tone sat in one range and top tone in the
+next keyed across the excluded gap between them. Deferred from PR #446's Codex P1 thread
+`PRRT_kwDORcJovs6s7i1s`; fixed by `pancetta_tui::app::tx_interval_out_of_band_plan`, which
+requires `[floor(low), ceil(low + span)]` to sit inside ONE candidate range resolved from the low
+edge (custom ranges are clipped to the band's global range, matching the point check). Every
+caller of `tx_band_plan_mute_reason` gets it with no call-site change; the two refusal messages
+are unchanged. Built-in region/global tables are unaffected: they give each band one contiguous
+range, and inter-band gaps are far wider than the 175 Hz maximum span. Overlapping custom ranges
+are not unioned: one range must contain the whole signal.
 
 The QSO stall-evidence closure (`qso.rs`) is deliberately untouched; whether band-plan refusals
 should suppress stall-escape counting is follow-up scope. The `coord_sim` fixture mirrors the gate

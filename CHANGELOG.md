@@ -137,6 +137,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer loses the field after a non-ASCII value (PAN-127). One malformed
   record no longer hides the others when importing.
 
+- The TX band-plan gate now refuses a frame that straddles the gap between
+  two ranges of a `custom_bands` entry (PAN-208). The whole occupied signal
+  must fit inside ONE allowed range; before, the low and high edges were
+  checked separately, each landed in some range, and the frame keyed across
+  the excluded gap. Built-in band plans behave as before.
+
+- TX now refuses a stale frame when a TX-offset switch relocates its QSO while
+  the worker waits for the PTT synchronization gate (PAN-145). A per-QSO
+  relocation counter detects the change even before the coordinator updates
+  its intent mirror. Single frames and summed bundles are dropped before PTT,
+  with unaired-frame accounting and duplicate-suppression cleanup so a fresh
+  request can retry. Other offset moves, such as the drift relatch and the
+  Hound QSY, do not use the counter and behave as before.
+
 - QSO log index and backups: when startup rebuilt `~/.pancetta/qso.db` from
   a newer `qsos.adi`, the SQLite logger had already opened the old file, so
   QSOs it logged that session never reached the live index and its startup

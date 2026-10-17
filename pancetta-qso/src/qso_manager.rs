@@ -1067,6 +1067,40 @@ pub struct UnsentAttemptPayload {
     pub remote_binding: Option<(bool, Option<String>)>,
 }
 
+/// Per-QSO relocation counters shared with the TX worker (PAN-145).
+///
+/// `apply_tx_offset_switch` bumps its raw QsoId key under `ptt_sync_gate`,
+/// before committing the offset. The worker snapshots before reading intent
+/// and compares after acquiring that gate. This detects the PAN-143 round-4
+/// race even while the coordinator's asynchronous intent mirror lags.
+/// Other paths that move a QSO's TX offset without the gate (for example the
+/// drift relatch and the Hound QSY) do not bump it.
+/// The map lock is never held across an await.
+#[derive(Default)]
+pub struct TxRelocationEpochs {
+    counter: AtomicU64,
+    per_qso: std::sync::Mutex<HashMap<String, u64>>,
+}
+
+impl TxRelocationEpochs {
+    /// Invalidate this QSO's earlier TX snapshots while holding `ptt_sync_gate`.
+    pub fn bump(&self, qso_id: &str) {
+        let mut epochs = self.per_qso.lock().expect("TX relocation epochs poisoned");
+        let next = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
+        epochs.insert(qso_id.to_owned(), next);
+    }
+
+    /// An untouched QSO starts at zero; raw QsoId strings are never normalized.
+    pub fn epoch(&self, qso_id: &str) -> u64 {
+        self.per_qso
+            .lock()
+            .expect("TX relocation epochs poisoned")
+            .get(qso_id)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
 /// QSO manager implementation
 pub struct QsoManager {
     /// Configuration
@@ -1158,6 +1192,9 @@ pub struct QsoManager {
     /// as before this field existed). See `docs/superpowers/specs/
     /// 2026-09-12-pan-143-ptt-shared-synchronization-design.md`.
     ptt_sync_gate: Arc<tokio::sync::Mutex<()>>,
+
+    /// PAN-145: shared with the worker; private until explicitly injected.
+    relocation_epochs: Arc<TxRelocationEpochs>,
 
     /// Global operator TX policy (`pancetta_core::TxPolicy` as `u8`), shared
     /// from the coordinator.
@@ -1596,6 +1633,7 @@ impl QsoManager {
             // source, behave exactly as this method did before PAN-143
             // existed (see the field's doc comment).
             ptt_sync_gate: Arc::new(tokio::sync::Mutex::new(())),
+            relocation_epochs: Arc::new(TxRelocationEpochs::default()),
             // Default Full: with no injected source, assume TX is live — the
             // pre-existing behavior (see the field's doc comment).
             tx_policy: Arc::new(std::sync::atomic::AtomicU8::new(
@@ -1663,6 +1701,12 @@ impl QsoManager {
     /// to).
     pub fn set_ptt_sync_gate_source(&mut self, source: Arc<tokio::sync::Mutex<()>>) {
         self.ptt_sync_gate = source;
+    }
+
+    /// Share the coordinator's relocation counters with its TX worker so a
+    /// gate wait cannot hide an offset change behind the async intent mirror.
+    pub fn set_relocation_epoch_source(&mut self, source: Arc<TxRelocationEpochs>) {
+        self.relocation_epochs = source;
     }
 
     /// Share the coordinator's global TX-policy atomic (encoded via
@@ -4118,6 +4162,8 @@ impl QsoManager {
         if self.ptt_active.load(std::sync::atomic::Ordering::Acquire) {
             return Err(QsoManagerError::OffsetActionPttInFlight { qso_id });
         }
+        // PAN-145: invalidate snapshots before committing, under the PTT gate.
+        self.relocation_epochs.bump(&qso_id.to_string());
         progress.metadata.frequency = applied_hz;
         progress.metadata.pending_freq_drift = None;
         progress.metadata.stall_cycles = 0;
@@ -7966,6 +8012,7 @@ impl Clone for QsoManager {
             tx_freq_mode: Arc::clone(&self.tx_freq_mode),
             ptt_active: Arc::clone(&self.ptt_active),
             ptt_sync_gate: Arc::clone(&self.ptt_sync_gate),
+            relocation_epochs: Arc::clone(&self.relocation_epochs),
             tx_policy: Arc::clone(&self.tx_policy),
             remote_tx_permitted: Arc::clone(&self.remote_tx_permitted),
             hamlib_hard_muted: Arc::clone(&self.hamlib_hard_muted),
@@ -11102,6 +11149,96 @@ mod tests {
             after.metadata.frequency, before.metadata.frequency,
             "frequency must be completely unchanged"
         );
+    }
+
+    #[tokio::test]
+    async fn apply_tx_offset_switch_bumps_the_relocation_epoch_under_the_sync_gate() {
+        let mut manager = auto_manager(test_config());
+        let epochs = Arc::new(TxRelocationEpochs::default());
+        manager.set_relocation_epoch_source(Arc::clone(&epochs));
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        manager.set_ptt_sync_gate_source(Arc::clone(&gate));
+        let qso_id = manager.start_cq(1500.0, None, false, None).await.unwrap();
+        let key = qso_id.to_string();
+        assert_eq!(epochs.epoch(&key), 0);
+        manager
+            .apply_tx_offset_switch(qso_id, 1800.0, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .unwrap();
+        let first = epochs.epoch(&key);
+        assert!(first >= 1);
+
+        let held = gate.lock().await;
+        // Poll the real switch to Pending while the gate is held. With no
+        // other contended locks, this reaches the gate deterministically.
+        let mut switching = Box::pin(manager.apply_tx_offset_switch(
+            qso_id,
+            2100.0,
+            OffsetRelocationOrigin::OperatorForced,
+        ));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                switching.as_mut(),
+                cx
+            )))
+            .await
+            .is_pending()
+        );
+        assert_eq!(epochs.epoch(&key), first);
+        drop(held);
+        switching.await.unwrap();
+        assert!(epochs.epoch(&key) > first);
+        assert_eq!(epochs.epoch("another-qso"), 0);
+        // QsoManager has a manual Clone implementation; it must share epochs.
+        assert_eq!(
+            manager.clone().relocation_epochs.epoch(&key),
+            epochs.epoch(&key)
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_tx_offset_switch_does_not_bump_the_epoch_on_hold_mode_refusal() {
+        let manager = QsoManager::new(test_config());
+        let qso_id = manager.start_cq(1500.0, None, false, None).await.unwrap();
+        let result = manager
+            .apply_tx_offset_switch(qso_id, 1800.0, OffsetRelocationOrigin::OperatorForced)
+            .await;
+        assert!(matches!(
+            result,
+            Err(QsoManagerError::OffsetActionHeld { .. })
+        ));
+        assert_eq!(manager.relocation_epochs.epoch(&qso_id.to_string()), 0);
+    }
+
+    #[tokio::test]
+    async fn apply_tx_offset_switch_does_not_bump_the_epoch_on_ptt_in_flight_refusal() {
+        let manager = auto_manager(test_config());
+        let qso_id = manager.start_cq(1500.0, None, false, None).await.unwrap();
+        manager.ptt_active.store(true, Ordering::Release);
+        let result = manager
+            .apply_tx_offset_switch(qso_id, 1800.0, OffsetRelocationOrigin::OperatorForced)
+            .await;
+        assert!(matches!(
+            result,
+            Err(QsoManagerError::OffsetActionPttInFlight { .. })
+        ));
+        assert_eq!(manager.relocation_epochs.epoch(&qso_id.to_string()), 0);
+    }
+
+    #[tokio::test]
+    async fn relocation_epoch_is_private_and_functional_when_no_source_is_injected() {
+        let manager = auto_manager(test_config());
+        let other = QsoManager::new(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual("K1ABC".into(), 1500.0, None)
+            .await
+            .unwrap();
+        manager
+            .apply_tx_offset_switch(qso_id, 1800.0, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .unwrap();
+        assert!(manager.relocation_epochs.epoch(&qso_id.to_string()) >= 1);
+        assert_eq!(other.relocation_epochs.epoch(&qso_id.to_string()), 0);
     }
 
     /// PAN-143: the actual regression test for the race PAN-140 round 2
