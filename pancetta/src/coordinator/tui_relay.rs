@@ -3067,16 +3067,19 @@ impl super::ApplicationCoordinator {
         };
         drop(tui_config_lock);
 
+        let dx_need_lookup = self.cached_lookup.clone();
+
         // Start TUI runner in a blocking task so it can own the terminal
         let tui_handle = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
             rt.block_on(async {
-                pancetta_tui::tui_runner::run_tui_with_message_bus(
+                pancetta_tui::tui_runner::run_tui_with_message_bus_and_need(
                     tui_config,
                     tui_msg_rx,
                     tui_cmd_tx,
                     shutdown,
                     tui_last_input,
+                    Some(dx_need_lookup),
                 )
                 .await
             })

@@ -34,6 +34,7 @@ use crate::config::Config;
 pub struct TuiRunner {
     /// Application state
     app: Arc<RwLock<App>>,
+    dx_need_lookup: Option<Arc<dyn crate::dx_need::DxNeedLookup>>,
     /// TUI configuration
     config: Config,
     /// Terminal instance. `None` only in unit tests built via
@@ -594,6 +595,7 @@ impl TuiRunner {
 
         Ok(Self {
             app,
+            dx_need_lookup: None,
             config,
             terminal: Some(terminal),
             message_rx,
@@ -624,6 +626,7 @@ impl TuiRunner {
     ) -> Result<Self> {
         Ok(Self {
             app,
+            dx_need_lookup: None,
             config,
             terminal: None,
             message_rx,
@@ -2365,6 +2368,10 @@ impl TuiRunner {
 
     /// Render a frame
     async fn render_frame(&mut self) -> Result<()> {
+        self.app
+            .write()
+            .await
+            .refresh_dx_need(self.dx_need_lookup.as_deref());
         let app = self.app.read().await;
 
         let Some(terminal) = self.terminal.as_mut() else {
@@ -3026,11 +3033,29 @@ pub async fn run_tui_with_message_bus(
     shutdown: Arc<AtomicBool>,
     last_input_ms: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<()> {
-    // Create app state
-    let app = Arc::new(RwLock::new(App::new(config.clone(), None).await?));
+    run_tui_with_message_bus_and_need(
+        config,
+        message_rx,
+        message_tx,
+        shutdown,
+        last_input_ms,
+        None,
+    )
+    .await
+}
 
-    // Create and run TUI runner
-    let runner = TuiRunner::new(app, config, message_rx, message_tx, shutdown, last_input_ms)?;
+/// Run with the coordinator's shared, read-only worked-history provider.
+pub async fn run_tui_with_message_bus_and_need(
+    config: Config,
+    message_rx: Receiver<TuiMessage>,
+    message_tx: Sender<TuiCommand>,
+    shutdown: Arc<AtomicBool>,
+    last_input_ms: Arc<std::sync::atomic::AtomicU64>,
+    lookup: Option<Arc<dyn crate::dx_need::DxNeedLookup>>,
+) -> Result<()> {
+    let app = Arc::new(RwLock::new(App::new(config.clone(), None).await?));
+    let mut runner = TuiRunner::new(app, config, message_rx, message_tx, shutdown, last_input_ms)?;
+    runner.dx_need_lookup = lookup;
     runner.run().await
 }
 
@@ -3192,6 +3217,58 @@ mod key_tests {
         )
         .unwrap();
         (runner, cmd_rx, app)
+    }
+
+    #[tokio::test]
+    async fn idle_headless_render_refreshes_need_without_a_message() {
+        use crate::dx_need::{DxNeedLookup, DxNeedStatus};
+        struct Need(AtomicBool);
+        impl DxNeedLookup for Need {
+            fn lookup_need(
+                &self,
+                _: &str,
+                _: Option<&str>,
+                _: Option<&str>,
+                hz: f64,
+            ) -> DxNeedStatus {
+                assert_eq!(hz, 14_074_000.0);
+                let needed = self.0.load(Ordering::Relaxed);
+                DxNeedStatus {
+                    grid_needed: Some(needed),
+                    state: Some("AR".into()),
+                    state_needed: Some(needed),
+                }
+            }
+        }
+        let (mut runner, _, app) = make_runner().await;
+        let provider = Arc::new(Need(AtomicBool::new(true)));
+        runner.dx_need_lookup = Some(provider.clone());
+        {
+            let mut app = app.write().await;
+            app.station_info.operating_frequency = 14.074;
+            app.add_dx_spot(
+                "W5ABC".into(),
+                14.074,
+                "FT8".into(),
+                -10,
+                false,
+                false,
+                false,
+                false,
+            );
+        }
+        runner.render_frame().await.unwrap();
+        assert_eq!(
+            app.read().await.dx_need_for("W5ABC").unwrap().state_needed,
+            Some(true)
+        );
+        provider.0.store(false, Ordering::Relaxed);
+        runner.render_frame().await.unwrap();
+        let app = app.read().await;
+        let need = app.dx_need_for("W5ABC").unwrap();
+        assert_eq!(need.grid_needed, Some(false));
+        assert_eq!(need.state_needed, Some(false));
+        assert_eq!(need.state.as_deref(), Some("AR"));
     }
 
     fn key(c: char) -> KeyEvent {

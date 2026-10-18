@@ -303,3 +303,45 @@ the six `tui_relay_tests::rig_config_refresh_*` tests, the `app::tests::apply_ri
 merge tests, and `tui_runner::key_tests::rig_picker_reaches_a_port_plugged_in_after_startup` /
 `rig_config_refresh_landing_mid_edit_keeps_the_edit` /
 `rig_config_refresh_landing_after_{enter,reopen}_keeps_the_submitted_rig`.
+
+## Needed grids and states in DX Hunter (PAN-86, 2026-10-18)
+
+DX Hunter displays `+EM34` for a grid not worked on the **current operating
+band**, across modes. It displays `United States - +AR` for a known US
+state/territory not worked on **any band or mode**. Both tokens use `+` and the
+existing bold needed-DXCC highlight; the glyph also conveys need without color.
+Only the state token gets the new Entity-cell highlight. Stale indicators retain
+the glyph in muted color, and selection retains reversed/bold styling. Existing
+callsign markers and other panels keep their meanings.
+
+Grid display uses the validated, uppercase four-character square in a five-cell
+column, retaining the complete locator in the row data. Invalid or missing grids
+show `---`. Narrow layouts omit the whole column. Grid need uses the current
+operating band even for a network spot from another band; an unknown operating
+frequency suppresses the grid indicator.
+
+These are local **worked** indicators, not confirmed WAS credits or award
+eligibility. The existing 56 validated state/territory codes remain distinct,
+including DC and territories. State knowledge alone does not record a contact.
+Historical seeding accumulates every valid US-related contact's state, so a
+station moving from AR to CA leaves both worked. The most recent historical
+state supplies the station label when no live value is already cached.
+
+The coordinator injects its shared `CachedStationLookup` into the TUI. Before
+every frame, the runner rebuilds a derived need map from the retained DX rows,
+current band, and memory-only cache lookups. No draw callback does I/O or retains
+a lookup lock. Existing rows lose their markers after a completed contact without
+another decode or spot; restored band snapshots are recalculated too.
+
+Grid and state history have independent availability flags. Opening/reopening
+history resets them, and each successful query publishes availability after its
+additive seed, including an empty log. Loading or failed reads show known values
+without claiming they are needed and log the failure through tracing. Unknown
+states still have no suffix. A runner without a provider keeps plain state values.
+
+Worked-cache updates retain the existing QSO-completion semantics: they do not
+wait for independent ADIF/SQLite writers to succeed. Persisted history determines
+status after restart. State learned by the upload subscriber's QRZ enrichment
+updates knowledge and worked state for this session only; it does not rewrite the
+already-delivered local log events. This feature adds no pre-contact lookup,
+state priority bonus, configuration, or remote-protocol field.

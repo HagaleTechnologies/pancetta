@@ -948,8 +948,11 @@ impl QsoDatabase {
     /// for #164's per-band-grid-new tier. Rows with no grid on the QSO are
     /// simply absent (`json_extract` on a missing/null field filters them via
     /// the `IS NOT NULL` clause), not an error.
-    pub async fn get_worked_bands_and_grids(&self) -> Vec<(String, String)> {
-        let result: Result<Vec<(String, String)>, sqlx::Error> = sqlx::query_as(
+    /// Fallible history read: a successful empty log differs from unavailable history.
+    pub async fn try_get_worked_bands_and_grids(
+        &self,
+    ) -> Result<Vec<(String, String)>, sqlx::Error> {
+        sqlx::query_as(
             "SELECT DISTINCT json_extract(adif_data, '$.band'), \
                              json_extract(metadata, '$.grids.theirs') \
              FROM qsos \
@@ -957,7 +960,11 @@ impl QsoDatabase {
                AND json_extract(metadata, '$.grids.theirs') IS NOT NULL",
         )
         .fetch_all(&self.pool)
-        .await;
+        .await
+    }
+
+    pub async fn get_worked_bands_and_grids(&self) -> Vec<(String, String)> {
+        let result = self.try_get_worked_bands_and_grids().await;
 
         match result {
             Ok(pairs) => pairs,
@@ -981,8 +988,11 @@ impl QsoDatabase {
     /// carries, and de-duplicating (callsign, state) pairs would keep the
     /// stale rows of a station that later moved. The cost is one redundant
     /// `record_state` per repeat contact at startup — a map insert, paid once.
-    pub async fn get_worked_callsigns_and_states(&self) -> Vec<(String, String)> {
-        let result: Result<Vec<(String, String)>, sqlx::Error> = sqlx::query_as(
+    /// Fallible history read: a successful empty log differs from unavailable history.
+    pub async fn try_get_worked_callsigns_and_states(
+        &self,
+    ) -> Result<Vec<(String, String)>, sqlx::Error> {
+        sqlx::query_as(
             "SELECT json_extract(metadata, '$.their_callsign'), \
                     json_extract(metadata, '$.their_state') \
              FROM qsos \
@@ -991,7 +1001,11 @@ impl QsoDatabase {
              ORDER BY json_extract(metadata, '$.start_time') ASC",
         )
         .fetch_all(&self.pool)
-        .await;
+        .await
+    }
+
+    pub async fn get_worked_callsigns_and_states(&self) -> Vec<(String, String)> {
+        let result = self.try_get_worked_callsigns_and_states().await;
 
         match result {
             Ok(pairs) => pairs,
@@ -1415,6 +1429,42 @@ mod tests {
         // Normal paths are returned unchanged.
         let p = "/home/op/.pancetta/backups/qso-2026.db";
         assert_eq!(escape_sqlite_string_literal(p), p);
+    }
+
+    #[tokio::test]
+    async fn state_history_is_chronological_not_insertion_order() {
+        let db = QsoDatabase::new_in_memory().await.unwrap();
+        let processor = AdifProcessor::new();
+        let file = processor.parse_string("<EOH>\n\
+            <CALL:5>W5ABC <QSO_DATE:8>20250102 <TIME_ON:6>120000 <MODE:3>FT8 <FREQ:9>14.074000 <STATE:2>CA <EOR>\n\
+            <CALL:5>W5ABC <QSO_DATE:8>20250101 <TIME_ON:6>120000 <MODE:3>FT8 <FREQ:9>14.074000 <STATE:2>AR <EOR>").unwrap();
+        db.insert_adif_records(&processor, &file.records)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.try_get_worked_callsigns_and_states().await.unwrap(),
+            vec![("W5ABC".into(), "AR".into()), ("W5ABC".into(), "CA".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn fallible_display_history_distinguishes_empty_from_failure() {
+        let db = QsoDatabase::open(":memory:").await.unwrap();
+        assert!(db
+            .try_get_worked_bands_and_grids()
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .try_get_worked_callsigns_and_states()
+            .await
+            .unwrap()
+            .is_empty());
+        db.pool.close().await;
+        assert!(db.try_get_worked_bands_and_grids().await.is_err());
+        assert!(db.try_get_worked_callsigns_and_states().await.is_err());
+        assert!(db.get_worked_bands_and_grids().await.is_empty());
+        assert!(db.get_worked_callsigns_and_states().await.is_empty());
     }
 
     #[tokio::test]
