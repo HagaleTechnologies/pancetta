@@ -222,7 +222,10 @@ mod tests {
             snap.degraded.as_deref(),
             Some("Remote audit unavailable; events may be missing")
         );
-        assert!(snap.tx_mute_causes.is_empty(), "audit health is not a TX mute cause");
+        assert!(
+            snap.tx_mute_causes.is_empty(),
+            "audit health is not a TX mute cause"
+        );
 
         *s.degraded_summary.lock().unwrap() = Some("dx_cluster: telnet closed".into());
         assert_eq!(

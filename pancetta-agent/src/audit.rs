@@ -476,8 +476,8 @@ impl AuditLog {
             }
         };
         let unavailable = self.health().unavailable;
-        let pending = st.pending.iter().any(KindCounts::is_pending)
-            || st.retention.iter().any(|r| r.pending);
+        let pending =
+            st.pending.iter().any(KindCounts::is_pending) || st.retention.iter().any(|r| r.pending);
         if !unavailable && !pending && !st.tail_invalid {
             return Ok(());
         }
@@ -1092,7 +1092,12 @@ mod tests {
     fn small_records_are_byte_identical_to_plain_serde() {
         let tp = TempPath::new("bytes");
         let log = AuditLog::new(tp.path().clone());
-        let e = ev(1000, AuditKind::TxRequested, Some("N0CALL"), "callStation K1ABC");
+        let e = ev(
+            1000,
+            AuditKind::TxRequested,
+            Some("N0CALL"),
+            "callStation K1ABC",
+        );
         log.append(&e).unwrap();
         let expected = format!("{}\n", serde_json::to_string(&e).unwrap());
         assert_eq!(std::fs::read_to_string(tp.path()).unwrap(), expected);
@@ -1138,7 +1143,9 @@ mod tests {
         let h = log.health();
         assert!(h.unavailable);
         assert_eq!(h.failed_events, 1);
-        assert!(log.append(&ev(2, AuditKind::Disarmed, None, "also")).is_err());
+        assert!(log
+            .append(&ev(2, AuditKind::Disarmed, None, "also"))
+            .is_err());
         assert_eq!(log.health().failed_events, 2);
     }
 
@@ -1185,12 +1192,20 @@ mod tests {
         let t = truncate_field(&s, 64);
         assert!(t.len() <= 64);
         assert!(t.ends_with(TRUNCATION_MARKER));
-        assert!(t.trim_end_matches(TRUNCATION_MARKER).chars().all(|c| c == 'é'));
+        assert!(t
+            .trim_end_matches(TRUNCATION_MARKER)
+            .chars()
+            .all(|c| c == 'é'));
         assert_eq!(truncate_field("short", 64), "short");
         assert_eq!(truncate_field("abcdef", 3), "abc");
 
         let l = Limits::default();
-        let e = ev(1, AuditKind::TxDenied, Some(&"W".repeat(200)), &"x".repeat(5000));
+        let e = ev(
+            1,
+            AuditKind::TxDenied,
+            Some(&"W".repeat(200)),
+            &"x".repeat(5000),
+        );
         let back: AuditEvent =
             serde_json::from_str(encode_record(&e, &l).unwrap().trim_end()).unwrap();
         assert_eq!(back.operator_callsign.unwrap().len(), 64);
@@ -1290,7 +1305,11 @@ mod tests {
             .unwrap();
         let sizes = managed_sizes(&tp);
         assert_eq!(sizes[2], Some(0), "oversized archive reset to zero");
-        assert_eq!(read_events(tp.path()).len(), 1, "active reset, then appended");
+        assert_eq!(
+            read_events(tp.path()).len(),
+            1,
+            "active reset, then appended"
+        );
         log.maintain(10_000).unwrap();
         let details: Vec<String> = read_events(tp.path())
             .into_iter()
@@ -1356,7 +1375,8 @@ mod tests {
             let tp = TempPath::new("faults");
             let clock = FakeClock::default();
             let log = log_with(&tp, Limits::default(), &clock);
-            log.append(&ev(1, AuditKind::Armed, None, "before")).unwrap();
+            log.append(&ev(1, AuditKind::Armed, None, "before"))
+                .unwrap();
             inject(&log, op);
             let err = log
                 .append(&ev(2, AuditKind::Armed, None, "fails"))
@@ -1381,7 +1401,10 @@ mod tests {
             .append(&ev(2, AuditKind::Armed, None, &"y".repeat(120)))
             .unwrap_err();
         assert_eq!(err.op, AuditOp::Rotate);
-        assert!(managed_sizes(&tp)[0].unwrap() <= 200, "no uncapped fallback");
+        assert!(
+            managed_sizes(&tp)[0].unwrap() <= 200,
+            "no uncapped fallback"
+        );
     }
 
     #[test]
@@ -1395,7 +1418,9 @@ mod tests {
         // Partial write, rollback succeeds.
         inject(&log, AuditOp::Write);
         assert_eq!(
-            log.append(&ev(2, AuditKind::Armed, None, "half")).unwrap_err().op,
+            log.append(&ev(2, AuditKind::Armed, None, "half"))
+                .unwrap_err()
+                .op,
             AuditOp::Write
         );
         assert_eq!(managed_sizes(&tp)[0], Some(first_len));
@@ -1424,7 +1449,12 @@ mod tests {
         let mut coalesced = 0;
         for _ in 0..100 {
             match log
-                .append(&ev(1000, AuditKind::TxRequested, Some("N0CALL"), "callStation K1ABC"))
+                .append(&ev(
+                    1000,
+                    AuditKind::TxRequested,
+                    Some("N0CALL"),
+                    "callStation K1ABC",
+                ))
                 .unwrap()
             {
                 AuditAppendOutcome::Recorded => recorded += 1,
@@ -1434,7 +1464,8 @@ mod tests {
         assert_eq!((recorded, coalesced), (20, 80));
         // Another kind has its own bucket.
         assert_eq!(
-            log.append(&ev(1001, AuditKind::Disarmed, None, "d")).unwrap(),
+            log.append(&ev(1001, AuditKind::Disarmed, None, "d"))
+                .unwrap(),
             AuditAppendOutcome::Recorded
         );
         // Silence, then maintenance writes the exact summary.
@@ -1464,7 +1495,11 @@ mod tests {
         for step in 0..(t_secs * 10) {
             for (k, kind) in EVENT_KINDS.iter().enumerate() {
                 for j in 0..100 {
-                    let ts = if j % 2 == 0 { i64::MAX - j } else { -(j as i64) };
+                    let ts = if j % 2 == 0 {
+                        i64::MAX - j
+                    } else {
+                        -j
+                    };
                     let op = format!("OP{step}-{k}-{j}");
                     if log.append(&ev(ts, kind.clone(), Some(&op), &op)).unwrap()
                         == AuditAppendOutcome::Recorded
@@ -1513,7 +1548,9 @@ mod tests {
         log.append(&ev(5000, AuditKind::Armed, None, "ok")).unwrap();
         clock.advance(Duration::from_secs(1));
         inject(&log, AuditOp::Open);
-        assert!(log.append(&ev(7000, AuditKind::Disarmed, None, "x")).is_err());
+        assert!(log
+            .append(&ev(7000, AuditKind::Disarmed, None, "x"))
+            .is_err());
         assert!(log.health().unavailable);
 
         // The summary write fails too: counts stay pending, health stays bad.
@@ -1522,12 +1559,16 @@ mod tests {
         assert!(log.maintain(9000).is_err());
         assert!(log.health().unavailable);
         // An ordinary successful append alone does not clear the episode.
-        log.append(&ev(9500, AuditKind::LocalKill, None, "ok")).unwrap();
+        log.append(&ev(9500, AuditKind::LocalKill, None, "ok"))
+            .unwrap();
         assert!(log.health().unavailable);
 
         clock.advance(Duration::from_secs(5));
         log.maintain(11_000).unwrap();
-        assert!(!log.health().unavailable, "recovered after a recorded summary");
+        assert!(
+            !log.health().unavailable,
+            "recovered after a recorded summary"
+        );
         assert_eq!(log.health().failed_events, 1);
         let last = serde_json::to_string(&read_events(tp.path()).pop().unwrap()).unwrap();
         assert_eq!(
@@ -1593,7 +1634,8 @@ mod tests {
         };
         let log = log_with(&tp, limits, &clock);
         for i in 0..3 {
-            log.append(&ev(i, AuditKind::TxRequested, None, "r")).unwrap();
+            log.append(&ev(i, AuditKind::TxRequested, None, "r"))
+                .unwrap();
         }
         log.maintain(1).unwrap();
         let summaries: usize = (0..=ARCHIVE_COUNT)
