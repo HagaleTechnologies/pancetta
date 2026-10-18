@@ -725,7 +725,7 @@ impl AuditLog {
                 continue;
             };
             if len > max {
-                self.truncate_to(slot, 0)?;
+                let f = self.truncate_to(slot, 0)?;
                 let notice = &mut st.retention[slot];
                 notice.discarded_bytes = notice.discarded_bytes.saturating_add(len);
                 notice.reset = true;
@@ -736,13 +736,15 @@ impl AuditLog {
                     discarded_bytes = len,
                     "audit retention: reset an oversized audit file"
                 );
+                self.sync_truncation(&f)?;
             } else if slot == 0 && len > 0 {
                 let keep = self.complete_prefix_len(len)?;
                 if keep < len {
-                    self.truncate_to(0, keep)?;
+                    let f = self.truncate_to(0, keep)?;
                     let notice = &mut st.retention[0];
                     notice.discarded_bytes = notice.discarded_bytes.saturating_add(len - keep);
                     notice.pending = true;
+                    self.sync_truncation(&f)?;
                 }
             }
         }
@@ -769,13 +771,22 @@ impl AuditLog {
         Ok(0)
     }
 
-    fn truncate_to(&self, slot: usize, len: u64) -> Result<(), AuditError> {
+    /// Cut a managed file to `len` and return it still open, so the caller
+    /// can record the cut before [`sync_truncation`](Self::sync_truncation)
+    /// runs: once `set_len` lands, a failed sync must not lose that fact.
+    fn truncate_to(&self, slot: usize, len: u64) -> Result<File, AuditError> {
         self.check(AuditOp::Truncate)
             .and_then(|()| {
                 let f = OpenOptions::new().write(true).open(self.slot_path(slot))?;
                 f.set_len(len)?;
-                f.sync_data()
+                Ok(f)
             })
+            .map_err(|e| AuditError::io(AuditOp::Truncate, &e))
+    }
+
+    fn sync_truncation(&self, f: &File) -> Result<(), AuditError> {
+        self.check(AuditOp::Truncate)
+            .and_then(|()| f.sync_data())
             .map_err(|e| AuditError::io(AuditOp::Truncate, &e))
     }
 
@@ -786,7 +797,9 @@ impl AuditLog {
     fn rotate(&self) -> Result<(), AuditError> {
         let archives = self.shared.limits.archives;
         if archives == 0 {
-            return self.truncate_to(0, 0);
+            return self
+                .truncate_to(0, 0)
+                .and_then(|f| self.sync_truncation(&f));
         }
         let ignore_absent = |r: io::Result<()>| match r {
             Err(e) if e.kind() != io::ErrorKind::NotFound => {
@@ -1550,6 +1563,51 @@ mod tests {
                 fragment.len()
             )
         );
+    }
+
+    #[test]
+    fn retention_notice_survives_a_failed_sync_after_truncation() {
+        let good = format!(
+            "{}\n",
+            serde_json::to_string(&ev(1, AuditKind::Armed, None, "ok")).unwrap()
+        );
+        let fragment = "{\"ts_unix_ms\":2,\"ki";
+        let cases = [
+            (
+                vec![b'a'; 1500],
+                0,
+                "audit retention: reset oversized active file; discarded_bytes=1500".to_string(),
+            ),
+            (
+                format!("{good}{fragment}").into_bytes(),
+                good.len() as u64,
+                format!(
+                    "audit retention: trimmed incomplete trailing record from active file; discarded_bytes={}",
+                    fragment.len()
+                ),
+            ),
+        ];
+        for (contents, kept, expected) in cases {
+            let tp = TempPath::new("truncate-sync-fault");
+            std::fs::write(tp.path(), contents).unwrap();
+            let clock = FakeClock::default();
+            let log = log_with(&tp, small_limits(1000), &clock);
+            // `set_len` lands; the `sync_data` after it fails.
+            inject_after(&log, AuditOp::Truncate, 1);
+            let err = log
+                .append(&ev(3, AuditKind::Disarmed, None, "x"))
+                .unwrap_err();
+            assert_eq!(err.op, AuditOp::Truncate);
+            assert_eq!(managed_sizes(&tp)[0], Some(kept), "the cut happened");
+            log.maintain(10_000).unwrap();
+            let retention: Vec<String> = read_events(tp.path())
+                .into_iter()
+                .filter(|e| e.kind == AuditKind::Summary)
+                .map(|e| e.detail)
+                .filter(|d| d.starts_with("audit retention:"))
+                .collect();
+            assert_eq!(retention, vec![expected]);
+        }
     }
 
     #[test]
