@@ -445,7 +445,7 @@ fn reconcile_authorizations<W: pancetta_agent::relay::WsConn>(
     }
 
     let controller_evicted = ctx.controller.as_ref().is_some_and(|c| evicted.contains(c));
-    let armer_evicted = {
+    let (armer_evicted, effects) = {
         let mut st = match ctx.arm.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -453,15 +453,17 @@ fn reconcile_authorizations<W: pancetta_agent::relay::WsConn>(
         let armer_evicted = st
             .armed_client_key_id()
             .is_some_and(|k| evicted.iter().any(|p| p == k));
+        let mut effects = Vec::new();
         if controller_evicted || armer_evicted {
-            let effects = st.disarm_with_reason(DisarmReason::AuthorizationRevoked, now.unix_ms);
+            effects = st.disarm_with_reason(DisarmReason::AuthorizationRevoked, now.unix_ms);
             if !effects.is_empty() {
                 warn!(target: "agent.tx", "controller evicted with a live arm — disarming");
             }
-            apply_arm_effects(&ctx.audit, &effects);
         }
-        armer_evicted
+        (armer_evicted, effects)
     };
+    // PAN-104: audit I/O only after the arm lock is released.
+    apply_arm_effects(&ctx.audit, &effects);
     let mut sends = Vec::new();
     if controller_evicted || armer_evicted {
         if controller_evicted {
@@ -496,7 +498,7 @@ fn scope_at_least(scopes: &[String], required: &str) -> bool {
 fn apply_arm_effects(audit: &AuditLog, effects: &[ArmEffect]) {
     for e in effects {
         match e {
-            ArmEffect::Audit(ev) => audit.append(ev),
+            ArmEffect::Audit(ev) => audit.record(ev),
             ArmEffect::Disarmed { reason } => {
                 debug!(target: "agent.tx", reason = ?reason, "remote arm disarmed");
             }
@@ -774,7 +776,7 @@ fn controller_gate(ctx: &mut ArmContext, peer: &str, now: ArmTime) -> Controller
         Some(_) => {
             // Rule 4 — exclusivity.
             warn!(target: "agent.control", peer = %peer, "control action refused — another client holds control");
-            ctx.audit.append(&AuditEvent {
+            ctx.audit.record(&AuditEvent {
                 ts_unix_ms: now.unix_ms,
                 kind: AuditKind::TxDenied,
                 operator_callsign: None,
@@ -871,7 +873,7 @@ async fn dispatch_action(
                 Err(reason) => {
                     // Fail-closed: audit the denial, do NOT arm. Any implicit-grab
                     // controlState still stands (the grab itself succeeded).
-                    ctx.audit.append(&AuditEvent {
+                    ctx.audit.record(&AuditEvent {
                         ts_unix_ms: now.unix_ms,
                         kind: AuditKind::TxDenied,
                         operator_callsign: None,
@@ -1042,7 +1044,7 @@ async fn dispatch_action(
                 Err(_) => (false, None),
             };
             if !consented {
-                ctx.audit.append(&AuditEvent {
+                ctx.audit.record(&AuditEvent {
                     ts_unix_ms: now.unix_ms,
                     kind: AuditKind::TxDenied,
                     operator_callsign,
@@ -1053,7 +1055,7 @@ async fn dispatch_action(
                 warn!(target: "agent.tx", peer = %peer, request = %detail, "txRequest refused — station-agent remote TX consent is off (remote_tx_enabled=false)");
                 return DispatchOutcome::cont_with(grab);
             }
-            ctx.audit.append(&AuditEvent {
+            ctx.audit.record(&AuditEvent {
                 ts_unix_ms: now.unix_ms,
                 kind: AuditKind::TxRequested,
                 operator_callsign: ctx
@@ -1611,6 +1613,7 @@ pub(crate) fn revoke_static_allow_list_entries(
     if removed.is_empty() {
         return false;
     }
+    let mut effects = Vec::new();
     let arm_changed = {
         let mut st = match arm.lock() {
             Ok(g) => g,
@@ -1620,8 +1623,9 @@ pub(crate) fn revoke_static_allow_list_entries(
             .armed_client_key_id()
             .is_some_and(|cur| removed.iter().any(|r| r == cur));
         if armed_removed {
-            let effects = st.disarm_with_reason(DisarmReason::AuthorizationRevoked, now_unix_ms);
-            apply_arm_effects(audit, &effects);
+            // PAN-104: the audit record is written after the locks are
+            // released and the revocation is published, never under them.
+            effects = st.disarm_with_reason(DisarmReason::AuthorizationRevoked, now_unix_ms);
             live.revocation_pending.store(true, Ordering::Release);
             warn!(
                 target: "agent.tx",
@@ -1658,6 +1662,7 @@ pub(crate) fn revoke_static_allow_list_entries(
     if changed {
         live.authz_generation.fetch_add(1, Ordering::AcqRel);
     }
+    apply_arm_effects(audit, &effects);
     changed
 }
 
@@ -2173,6 +2178,7 @@ async fn poll_authorizations_loop(
                 // `RemoteTxDisarmGuard::drop` — a poisoned arm mutex must
                 // never block publishing the refreshed TX-arm-eligible set.
                 let arm_changed;
+                let mut effects = Vec::new();
                 {
                     let mut st = match arm.lock() {
                         Ok(g) => g,
@@ -2182,9 +2188,10 @@ async fn poll_authorizations_loop(
                         .armed_client_key_id()
                         .is_some_and(|cur| !new_tx_arm_allow.contains(cur));
                     if should_disarm {
-                        let effects =
+                        // PAN-104: audited below, after the locks are
+                        // released and the refreshed lists are published.
+                        effects =
                             st.disarm_with_reason(DisarmReason::AuthorizationRevoked, now_ms());
-                        apply_arm_effects(&audit, &effects);
                         // Flag the session loop (a SEPARATE tokio task, so it
                         // cannot be signaled by directly calling
                         // control_state_sends/deliver_sends here) to
@@ -2217,6 +2224,7 @@ async fn poll_authorizations_loop(
                     // observes the new generation reads the new lists.
                     authz_generation.fetch_add(1, Ordering::AcqRel);
                 }
+                apply_arm_effects(&audit, &effects);
                 debug!(
                     target: "agent",
                     "authorizations poll: refreshed tx_allow_list ({} client(s) admitted for this agent, {} TX-arm-eligible)",

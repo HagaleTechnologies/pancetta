@@ -792,7 +792,7 @@ impl super::ApplicationCoordinator {
             let audit = self.audit_log();
             for effect in &effects {
                 if let pancetta_agent::arm::ArmEffect::Audit(ev) = effect {
-                    audit.append(ev);
+                    audit.record(ev);
                 }
             }
             if enabled {
@@ -933,7 +933,7 @@ impl super::ApplicationCoordinator {
         let audit = self.audit_log();
         for effect in &effects {
             if let pancetta_agent::arm::ArmEffect::Audit(ev) = effect {
-                audit.append(ev);
+                audit.record(ev);
             }
         }
         self.remote_tx_arm.clear_poison();

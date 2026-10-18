@@ -2525,6 +2525,31 @@ mod view_render_tests {
         assert!(buffer_contains(&buf, "QSOs completed"));
     }
 
+    /// PAN-104: the audit warning stays reachable in Shift+S at 80×24, also
+    /// once acknowledged.
+    #[tokio::test]
+    async fn health_panel_shows_audit_warning_at_80x24() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.station_readiness = Some(crate::readiness::StationReadiness {
+            degraded: Some("Remote audit unavailable; events may be missing".to_string()),
+            ..Default::default()
+        });
+        let buf = render_health_80x24(&app);
+        assert!(buffer_contains(
+            &buf,
+            "Degraded — Remote audit unavailable; events may be missing"
+        ));
+        assert_eq!(app.acknowledge_readiness(), 1);
+        let buf = render_health_80x24(&app);
+        assert!(buffer_contains(&buf, "Degraded (ack'd)"));
+        assert!(buffer_contains(
+            &buf,
+            "Remote audit unavailable; events may be missing"
+        ));
+    }
+
     #[tokio::test]
     async fn health_panel_readiness_header_before_first_snapshot() {
         let app = crate::app::App::new(crate::config::Config::default(), None)

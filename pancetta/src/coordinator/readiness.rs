@@ -33,6 +33,8 @@ pub(crate) struct ReadinessSources {
     ptt_off_unconfirmed: Arc<AtomicBool>,
     clock_skew: ClockSkewShared,
     degraded_summary: Arc<Mutex<Option<String>>>,
+    /// PAN-104: the shared audit log, read only through its health lock.
+    audit: pancetta_agent::audit::AuditLog,
     /// The cause list of the previous snapshot, so a changed TX verdict is
     /// logged once (in the gate's own words) rather than every tick.
     last_tx_mute_causes: RefCell<Option<Vec<TxMuteCause>>>,
@@ -52,6 +54,7 @@ impl ReadinessSources {
             ptt_off_unconfirmed: c.ptt_off_unconfirmed.clone(),
             clock_skew: c.clock_skew.clone(),
             degraded_summary: c.degraded_summary.clone(),
+            audit: c.audit_log(),
             last_tx_mute_causes: RefCell::new(None),
         }
     }
@@ -75,11 +78,12 @@ impl ReadinessSources {
             *last = Some(causes.clone());
         }
         let tx_mute_causes = causes.into_iter().map(tui_tx_mute_cause).collect();
-        let degraded = self
+        let supervisor = self
             .degraded_summary
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
+        let degraded = compose_degraded(supervisor, self.audit.health().unavailable);
         StationReadiness {
             tx_mute_causes,
             ptt_off_unconfirmed: self.ptt_off_unconfirmed.load(Ordering::Acquire),
@@ -88,6 +92,19 @@ impl ReadinessSources {
             rf_no_decode,
             input_silent,
         }
+    }
+}
+
+/// PAN-104: the strip's degraded text — the supervisor's summary, with the
+/// audit-health phrase appended (`; `) while an audit failure episode is
+/// open. Composed per snapshot so neither source overwrites the other, and
+/// audit health is never a TX mute cause.
+fn compose_degraded(supervisor: Option<String>, audit_unavailable: bool) -> Option<String> {
+    use pancetta_agent::audit::UNAVAILABLE_MESSAGE;
+    match (supervisor, audit_unavailable) {
+        (summary, false) => summary,
+        (None, true) => Some(UNAVAILABLE_MESSAGE.to_string()),
+        (Some(summary), true) => Some(format!("{summary}; {UNAVAILABLE_MESSAGE}")),
     }
 }
 
@@ -167,8 +184,75 @@ mod tests {
             ptt_off_unconfirmed: Arc::new(AtomicBool::new(false)),
             clock_skew: ClockSkewShared::new(),
             degraded_summary: Arc::new(Mutex::new(None)),
+            // Never written by these tests, so it stays healthy.
+            audit: pancetta_agent::audit::AuditLog::new(
+                std::env::temp_dir().join("pancetta-readiness-unused-audit.log"),
+            ),
             last_tx_mute_causes: RefCell::new(None),
         }
+    }
+
+    /// An audit log whose writes fail: its parent directory does not exist.
+    fn failing_audit() -> pancetta_agent::audit::AuditLog {
+        let log = pancetta_agent::audit::AuditLog::new(
+            std::env::temp_dir()
+                .join(format!("pancetta-readiness-missing-{}", std::process::id()))
+                .join("nope")
+                .join("audit.log"),
+        );
+        assert!(log
+            .append(&pancetta_agent::audit::AuditEvent {
+                ts_unix_ms: 1,
+                kind: pancetta_agent::audit::AuditKind::Armed,
+                operator_callsign: None,
+                detail: "x".into(),
+            })
+            .is_err());
+        log
+    }
+
+    /// PAN-104: an audit failure shows as a degraded warning composed with
+    /// (never replacing) the supervisor summary, and never mutes TX.
+    #[test]
+    fn audit_failure_composes_with_the_supervisor_summary() {
+        let mut s = sources();
+        s.audit = failing_audit();
+        let snap = s.snapshot(false, false);
+        assert_eq!(
+            snap.degraded.as_deref(),
+            Some("Remote audit unavailable; events may be missing")
+        );
+        assert!(snap.tx_mute_causes.is_empty(), "audit health is not a TX mute cause");
+
+        *s.degraded_summary.lock().unwrap() = Some("dx_cluster: telnet closed".into());
+        assert_eq!(
+            s.snapshot(false, false).degraded.as_deref(),
+            Some("dx_cluster: telnet closed; Remote audit unavailable; events may be missing")
+        );
+
+        // Supervisor recovery alone leaves the audit phrase.
+        *s.degraded_summary.lock().unwrap() = None;
+        assert_eq!(
+            s.snapshot(false, false).degraded.as_deref(),
+            Some("Remote audit unavailable; events may be missing")
+        );
+    }
+
+    #[test]
+    fn compose_degraded_covers_each_recovery_order() {
+        let sup = || Some("hamlib: gone".to_string());
+        assert_eq!(compose_degraded(None, false), None);
+        assert_eq!(compose_degraded(sup(), false), sup());
+        assert_eq!(
+            compose_degraded(None, true).as_deref(),
+            Some(pancetta_agent::audit::UNAVAILABLE_MESSAGE)
+        );
+        assert_eq!(
+            compose_degraded(sup(), true).as_deref(),
+            Some("hamlib: gone; Remote audit unavailable; events may be missing")
+        );
+        // A recurring audit episode reads the same as the first.
+        assert_eq!(compose_degraded(None, true), compose_degraded(None, true));
     }
 
     #[test]

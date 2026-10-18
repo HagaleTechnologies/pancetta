@@ -5241,7 +5241,7 @@ async fn emit_disarm_interrupt_signals(
         qso_id,
     )
     .await;
-    audit_log.append(&pancetta_agent::audit::AuditEvent {
+    audit_log.record(&pancetta_agent::audit::AuditEvent {
         ts_unix_ms: chrono::Utc::now().timestamp_millis(),
         kind: pancetta_agent::audit::AuditKind::TxDenied,
         operator_callsign,
@@ -6120,7 +6120,7 @@ pub(crate) async fn coalesce_backlog_into(
                     entry.qso_id.as_deref(),
                 )
                 .await;
-                audit_log.append(&pancetta_agent::audit::AuditEvent {
+                audit_log.record(&pancetta_agent::audit::AuditEvent {
                     // Round-11 review (Codex P2): the denial-time instant
                     // (the SAME `now_ms` `arm_snapshot` was taken under),
                     // not a fresh timestamp read whenever this detached
@@ -7787,7 +7787,7 @@ impl super::ApplicationCoordinator {
                                         let denial_reason = format!(
                                             "not armed/permitted: '{message_text}' at {frequency_offset:.0} Hz"
                                         );
-                                        audit_log.append(&pancetta_agent::audit::AuditEvent {
+                                        audit_log.record(&pancetta_agent::audit::AuditEvent {
                                             ts_unix_ms: chrono::Utc::now().timestamp_millis(),
                                             kind: pancetta_agent::audit::AuditKind::TxDenied,
                                             operator_callsign: tx_denied_operator_attribution(
@@ -10136,7 +10136,7 @@ impl super::ApplicationCoordinator {
                                             "not armed/permitted: multi-TX bundle of {} items",
                                             items.len()
                                         );
-                                        audit_log.append(&pancetta_agent::audit::AuditEvent {
+                                        audit_log.record(&pancetta_agent::audit::AuditEvent {
                                             ts_unix_ms: chrono::Utc::now().timestamp_millis(),
                                             kind: pancetta_agent::audit::AuditKind::TxDenied,
                                             operator_callsign: tx_denied_operator_attribution(

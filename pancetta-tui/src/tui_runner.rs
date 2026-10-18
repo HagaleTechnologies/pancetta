@@ -3483,6 +3483,48 @@ mod key_tests {
         assert!(!row.contains("PTT MAY STILL BE KEYED"), "row 1: {row}");
     }
 
+    /// PAN-104: the audit-health warning is a degraded strip warning that
+    /// decodes and status updates cannot erase; `!` hides it for its
+    /// episode, recovery clears it, and a new failure shows it again.
+    #[tokio::test]
+    async fn pan104_audit_warning_survives_decodes_and_recurs_after_recovery() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        let audit_down = || {
+            TuiMessage::StationReadiness(crate::readiness::StationReadiness {
+                degraded: Some("Remote audit unavailable; events may be missing".to_string()),
+                ..Default::default()
+            })
+        };
+        let warning = "⚠ DEGRADED: Remote audit unavailable; events may be missing";
+        r.handle_message(audit_down()).await.unwrap();
+        pan89_decode_burst(&mut r, 50).await;
+        r.handle_message(TuiMessage::StatusUpdate {
+            component: "QSO".to_string(),
+            status: "Calling K1ABC".to_string(),
+        })
+        .await
+        .unwrap();
+        let row = pan89_strip_row(&app).await;
+        assert!(row.contains("✓ TX READY"), "row 1: {row}");
+        assert!(row.contains(warning), "row 1: {row}");
+
+        r.handle_key_event(key_shift('!')).await.unwrap();
+        r.handle_message(audit_down()).await.unwrap();
+        let row = pan89_strip_row(&app).await;
+        assert!(!row.contains("Remote audit unavailable"), "row 1: {row}");
+        assert!(row.contains("1 ack'd"), "row 1: {row}");
+
+        // Recovery clears it; a later failure is a new episode.
+        r.handle_message(TuiMessage::StationReadiness(Default::default()))
+            .await
+            .unwrap();
+        let row = pan89_strip_row(&app).await;
+        assert!(!row.contains("ack'd"), "row 1: {row}");
+        r.handle_message(audit_down()).await.unwrap();
+        let row = pan89_strip_row(&app).await;
+        assert!(row.contains(warning), "row 1: {row}");
+    }
+
     #[tokio::test]
     async fn pan89_error_alert_survives_decode_burst_until_acknowledged() {
         let (mut r, _cmd_rx, app) = make_runner().await;
