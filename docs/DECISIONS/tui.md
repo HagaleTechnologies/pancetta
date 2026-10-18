@@ -328,10 +328,12 @@ station moving from AR to CA leaves both worked. The most recent historical
 state supplies the station label when no live value is already cached.
 
 The coordinator injects its shared `CachedStationLookup` into the TUI. Before
-every frame, the runner rebuilds a derived need map from the retained DX rows,
-current band, and memory-only cache lookups. No draw callback does I/O or retains
-a lookup lock. Existing rows lose their markers after a completed contact without
-another decode or spot; restored band snapshots are recalculated too.
+every frame, the runner scans retained DX rows but performs need lookups only for
+rows eligible for display: heard within 180 seconds and not our own callsign.
+The derived map uses the current band and memory-only cache lookups. No draw
+callback does I/O or retains a lookup lock. Existing rows lose their markers after
+a completed contact without another decode or spot; restored band snapshots are
+recalculated too.
 
 Grid and state history have independent availability flags. Opening/reopening
 history resets them, and each successful query publishes availability after its

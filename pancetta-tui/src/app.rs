@@ -2594,10 +2594,18 @@ impl App {
     /// Prepare owned display data, releasing every lookup lock before drawing.
     pub fn refresh_dx_need(&mut self, lookup: Option<&dyn crate::dx_need::DxNeedLookup>) {
         let current_hz = self.station_info.operating_frequency * 1_000_000.0;
+        // Match displayed_dx_stations eligibility before allocating or taking
+        // lookup locks. The backing station map can retain older, hidden rows.
+        let cutoff = Utc::now() - chrono::Duration::seconds(Self::DX_HUNTER_STALE_SECS);
+        let our_call = self.station_info.call_sign.trim();
         self.dx_need = lookup
             .map(|lookup| {
                 self.dx_stations
                     .iter()
+                    .filter(|(_, row)| row.last_seen > cutoff)
+                    .filter(|(_, row)| {
+                        our_call.is_empty() || !row.call_sign.eq_ignore_ascii_case(our_call)
+                    })
                     .map(|(key, row)| {
                         let status = lookup.lookup_need(
                             &row.call_sign,
@@ -5027,6 +5035,54 @@ mod tests {
                 state_needed: state.map(|_| !worked),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn dx_need_refresh_looks_up_only_display_eligible_rows() {
+        #[derive(Default)]
+        struct CountingNeed(std::sync::Mutex<Vec<String>>);
+        impl crate::dx_need::DxNeedLookup for CountingNeed {
+            fn lookup_need(
+                &self,
+                call: &str,
+                _: Option<&str>,
+                _: Option<&str>,
+                _: f64,
+            ) -> crate::dx_need::DxNeedStatus {
+                self.0.lock().unwrap().push(call.to_string());
+                crate::dx_need::DxNeedStatus::default()
+            }
+        }
+
+        let mut app = fixture_app().await;
+        let provider = CountingNeed::default();
+        let old = Utc::now() - chrono::Duration::seconds(App::DX_HUNTER_STALE_SECS + 5);
+        for i in 0..1000 {
+            let call = format!("W{i}OLD");
+            let mut row = dx_fixture(&call, 50, 10, 14.074, false);
+            row.last_seen = old;
+            app.dx_stations.insert(call, row);
+        }
+        app.station_info.call_sign = " W5SELF ".into();
+        for call in ["w5self", "W5ABC"] {
+            app.dx_stations
+                .insert(call.into(), dx_fixture(call, 50, 10, 14.074, false));
+        }
+        app.refresh_dx_need(Some(&provider));
+        assert_eq!(*provider.0.lock().unwrap(), vec!["W5ABC"]);
+        assert!(app.dx_need_for("W5ABC").is_some());
+        assert_eq!(app.dx_need.len(), 1);
+        assert_eq!(app.dx_stations.len(), 1002, "retain the backing history");
+
+        // An expired row loses its derived status; a newly heard row gains it.
+        provider.0.lock().unwrap().clear();
+        app.dx_stations.get_mut("W5ABC").unwrap().last_seen = old;
+        app.dx_stations.get_mut("W0OLD").unwrap().last_seen = Utc::now();
+        app.refresh_dx_need(Some(&provider));
+        assert_eq!(*provider.0.lock().unwrap(), vec!["W0OLD"]);
+        assert!(app.dx_need_for("W5ABC").is_none());
+        assert!(app.dx_need_for("W0OLD").is_some());
+        assert_eq!(app.dx_need.len(), 1);
     }
 
     #[tokio::test]

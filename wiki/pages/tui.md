@@ -33,7 +33,9 @@ normative in the digest — not restated here.
 
 DX Hunter's `+` on Grid means unworked on the current operating band; `+` on a
 known US state/territory means unworked across bands. A pre-frame refresh reads
-the shared cache, so existing rows update without another spot and restored band
-rows do not carry stale flags. Unknown history suppresses these indicators.
+the shared cache only for display-eligible rows, excluding spots older than 180
+seconds and our own callsign. Existing rows update without another spot and
+restored band rows do not carry stale flags. Unknown history suppresses these
+indicators.
 See [the PAN-86 decision](../../docs/DECISIONS/tui.md#needed-grids-and-states-in-dx-hunter-pan-86-2026-10-18)
 for history availability, state accumulation, and session-only QRZ enrichment.
