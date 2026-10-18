@@ -127,6 +127,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- With concurrent QSOs, a request the transmitter set aside while another QSO was on the air can no longer be overtaken by a newer one, or lost when its queue was full (PAN-73). Before, the older request could key while the fresher one was discarded.
+
 - The `i` rig picker now lists serial ports that appeared after pancetta started, so you can plug in a different rig and pick it without restarting (PAN-60). Opening the picker re-scans the ports without delaying TX, PTT or Shift+Q. A scan that finishes after you start editing keeps your edits. Reopening the picker after a rig change shows the configuration pancetta is actually using.
 
 - A split change that never reaches the rig no longer changes the TX

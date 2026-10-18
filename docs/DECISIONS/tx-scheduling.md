@@ -3,6 +3,31 @@
 
 # TX scheduling
 
+## The TX worker keeps what it takes off its channel (PAN-73 follow-up, 2026-10-17)
+
+During a keyed transmission the worker takes messages off its own
+`Ft8Transmitter` channel to look for a supersede. It used to send the ones it
+set aside back through the bus: a producer sending at the same time could
+land ahead of them (the coalescer then keyed the stale request and dropped
+the fresh one), and a full channel dropped them with no error. The same
+re-send pattern ran in the supersede callers, `supersede_multi_reenqueue` and
+`coalesce_backlog_into`, whose stop message also landed behind later traffic.
+
+The worker now reads a requeue front (`TxRequeue`, owned by the coordinator
+so a PAN-119 restart keeps it) before its channel, and everything it puts
+back goes on that front (`TxInbox::requeue_front`). Everything on the front
+was received before anything still in the channel, so arrival order holds
+with no lock against producers, and nothing can be dropped. A supersede
+winner goes on the front after the siphoned traffic, so it stays first
+(PR #346 round 4). Putting messages back is a synchronous splice, so it adds
+no await before a disarm's PTT-off, and nothing on the front runs before the
+playback-disarm flush finishes.
+
+Not done: a mutex-guarded intake for all producers (needed only for a
+cross-QSO priority scheduler), and checked sends for the re-sends (they
+still land behind concurrent producers). External producers still drop on
+a full channel (10000), the bus's general contract (review item H-49).
+
 ## Post-gate relocation revalidation (PAN-145, 2026-10-16)
 
 A successful QSO offset switch bumps a per-QSO epoch under `ptt_sync_gate`,

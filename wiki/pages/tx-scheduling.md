@@ -31,6 +31,7 @@ fixes, including the open double-PTT-for-73 bug — see that doc and
 
 ## How it works
 
+- **Worker inbox** — the TX worker reads its requeue front before its bus channel; anything it takes off the channel and puts back goes on that front (`TxInbox::requeue_front`), never back through the bus (PAN-73).
 - **Slot scheduling** — `resolve_required_parity` / `schedule_tx` in
   `pancetta/src/coordinator/tx.rs` pick and time the slot; early = pad silence,
   late = skip-ahead cursor up to a bounded budget, then defer.

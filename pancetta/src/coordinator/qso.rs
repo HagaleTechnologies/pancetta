@@ -12185,9 +12185,11 @@ mod respond_to_caller_admission_tests {
             uuid::Uuid::new_v4()
         )));
         let display_feed_enabled = Arc::new(AtomicBool::new(false));
+        let backlog_inbox =
+            crate::coordinator::tx::TxInbox::new(backlog_rx.clone(), Default::default());
         crate::coordinator::tx::coalesce_backlog_into(
             head,
-            &backlog_rx,
+            &backlog_inbox,
             &coordinator.message_bus,
             &coordinator.active_tx_qsos,
             &coordinator.fox_admitted_qsos,

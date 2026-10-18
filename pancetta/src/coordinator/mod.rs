@@ -1432,6 +1432,10 @@ pub struct ApplicationCoordinator {
     /// PAN-145: synchronous relocation evidence for post-gate TX revalidation.
     pub(crate) relocation_epochs: Arc<pancetta_qso::qso_manager::TxRelocationEpochs>,
 
+    /// PAN-73 follow-up: messages the TX worker took off its channel and has
+    /// not handled yet. Owned here so a supervised worker restart keeps them.
+    pub(crate) tx_requeue: tx::TxRequeue,
+
     /// Test handshake after waveform construction, immediately before the gate wait.
     #[cfg(test)]
     tx_before_ptt_gate: Arc<tokio::sync::Notify>,
@@ -2237,6 +2241,7 @@ impl ApplicationCoordinator {
             ptt_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ptt_sync_gate: Arc::new(tokio::sync::Mutex::new(())),
             relocation_epochs: Arc::new(pancetta_qso::qso_manager::TxRelocationEpochs::default()),
+            tx_requeue: tx::TxRequeue::default(),
             #[cfg(test)]
             tx_before_ptt_gate: Arc::new(tokio::sync::Notify::new()),
             last_ptt_on_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
