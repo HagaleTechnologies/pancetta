@@ -40,11 +40,12 @@ pub(super) enum DxHunterColumn {
     Rpt,
     Last,
     Pri,
+    Why,
 }
 
 impl DxHunterColumn {
     /// Display order (left to right).
-    pub(super) const ALL: [DxHunterColumn; 9] = [
+    pub(super) const ALL: [DxHunterColumn; 10] = [
         DxHunterColumn::Src,
         DxHunterColumn::Call,
         DxHunterColumn::Entity,
@@ -54,13 +55,14 @@ impl DxHunterColumn {
         DxHunterColumn::Rpt,
         DxHunterColumn::Last,
         DxHunterColumn::Pri,
+        DxHunterColumn::Why,
     ];
 
     /// The order columns join as the panel widens: the call (with its need
     /// markers), what entity it is, how strong it is and how much pancetta
     /// wants it come first; `Src`/`Rpt` are diagnostics. Freshness is
     /// already shown by dimming stale rows, so `Last` can wait for room.
-    const PRIORITY: [DxHunterColumn; 9] = [
+    const PRIORITY: [DxHunterColumn; 10] = [
         DxHunterColumn::Call,
         DxHunterColumn::Entity,
         DxHunterColumn::Snr,
@@ -70,6 +72,7 @@ impl DxHunterColumn {
         DxHunterColumn::Grid,
         DxHunterColumn::Rpt,
         DxHunterColumn::Src,
+        DxHunterColumn::Why,
     ];
 
     pub(super) fn header(self) -> &'static str {
@@ -83,6 +86,7 @@ impl DxHunterColumn {
             DxHunterColumn::Rpt => "Rpt",
             DxHunterColumn::Last => "Last",
             DxHunterColumn::Pri => "Pri",
+            DxHunterColumn::Why => "Why",
         }
     }
 
@@ -99,6 +103,7 @@ impl DxHunterColumn {
             DxHunterColumn::Rpt => Constraint::Length(3),
             DxHunterColumn::Last => Constraint::Length(5),
             DxHunterColumn::Pri => Constraint::Length(4),
+            DxHunterColumn::Why => Constraint::Min(24),
         }
     }
 
@@ -145,6 +150,7 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
     // operator actually wants to scan. PAN-88: narrow panels show fewer,
     // whole columns (see `visible_columns`).
     let columns = visible_columns(area.width);
+    let now = chrono::Utc::now();
     let header_cells = columns.iter().map(|c| {
         Cell::from(c.header()).style(
             Style::default()
@@ -166,7 +172,7 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
     // the selected row visible.
     let mut rows: Vec<Row> = dx_list
         .iter()
-        .map(|station| create_dx_row(station, app, &columns))
+        .map(|station| create_dx_row(station, app, &columns, now))
         .collect();
 
     // If no DX stations, show placeholder
@@ -270,7 +276,12 @@ fn needed_span(
     }
 }
 
-fn create_dx_row<'a>(station: &'a DxStation, app: &App, columns: &[DxHunterColumn]) -> Row<'a> {
+fn create_dx_row<'a>(
+    station: &'a DxStation,
+    app: &App,
+    columns: &[DxHunterColumn],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Row<'a> {
     // Cross-panel global focus (Task 2): when some OTHER panel is active and
     // this row's callsign is the operator's current focus, flag it here too
     // — but only when DX Hunter itself is NOT the active panel, so we never
@@ -306,7 +317,7 @@ fn create_dx_row<'a>(station: &'a DxStation, app: &App, columns: &[DxHunterColum
         station
             .last_seen_network
             .map(|ts| {
-                let age = chrono::Utc::now().timestamp() - ts;
+                let age = now.timestamp() - ts;
                 age > 600 // >10 minutes
             })
             .unwrap_or(false)
@@ -448,6 +459,31 @@ fn create_dx_row<'a>(station: &'a DxStation, app: &App, columns: &[DxHunterColum
         _ => dim,
     };
 
+    let why = if columns.contains(&DxHunterColumn::Why) {
+        let reason = crate::dx_reason::reason_for(station, need, now);
+        let spans = reason
+            .compact()
+            .split("; ")
+            .enumerate()
+            .flat_map(|(index, clause)| {
+                let style = if !is_stale && index > 0 && index <= reason.cautions.len() {
+                    Style::default().fg(app.theme.warning_color())
+                } else {
+                    dim
+                };
+                let mut spans = Vec::new();
+                if index > 0 {
+                    spans.push(Span::styled("; ", dim));
+                }
+                spans.push(Span::styled(clause.to_owned(), style));
+                spans
+            })
+            .collect::<Vec<_>>();
+        Cell::from(Line::from(spans))
+    } else {
+        Cell::default()
+    };
+
     // One cell per visible column (PAN-88), mirroring
     // `band_activity::create_message_row`.
     Row::new(
@@ -470,6 +506,7 @@ fn create_dx_row<'a>(station: &'a DxStation, app: &App, columns: &[DxHunterColum
                 DxHunterColumn::Pri,
                 Cell::from(pri_str).style(priority_style),
             ),
+            (DxHunterColumn::Why, why),
         ]
         .into_iter()
         .filter(|(col, _)| columns.contains(col))
@@ -770,8 +807,8 @@ mod tests {
 
     #[tokio::test]
     async fn five_cell_grid_is_whole_or_absent_and_empty_tiny_panels_do_not_panic() {
-        assert_eq!(visible_columns(64), DxHunterColumn::ALL);
-        assert_ne!(visible_columns(63), DxHunterColumn::ALL);
+        assert_eq!(visible_columns(64), DxHunterColumn::ALL[..9]);
+        assert_ne!(visible_columns(63), DxHunterColumn::ALL[..9]);
         assert!(!visible_columns(54).contains(&DxHunterColumn::Grid));
         assert!(visible_columns(55).contains(&DxHunterColumn::Grid));
         let mut app = needed_app().await;
@@ -798,6 +835,39 @@ mod tests {
     // ---- PAN-88: adaptive columns ----
     // Canonical panel widths: Operate's 40% right column at 80/100/120/132
     // columns, then the wide tier (160 columns, and Hunt view at 80).
+
+    #[tokio::test]
+    async fn why_cell_shows_compact_reason_and_portable_hedge() {
+        let mut app = super::super::station_card::tests::ranked_app("W5XYZ/P", false, false).await;
+        let buf = render_buffer(&app, 132, 8);
+        assert!(text(&buf).contains("maybe POTA/SOTA"), "{}", text(&buf));
+        let other = super::super::station_card::tests::ranked_app("JA1ABC", true, false).await;
+        app.dx_stations.extend(other.dx_stations);
+        let buf = render_buffer(&app, 132, 8);
+        assert!(text(&buf).contains("new entity on 20M"));
+    }
+
+    #[tokio::test]
+    async fn why_cell_is_muted_on_stale_rows() {
+        let mut app = super::super::station_card::tests::ranked_app("W5XYZ/P", false, true).await;
+        let station = app.dx_stations.get_mut("W5XYZ/P").unwrap();
+        station.source = SpotSource::Both;
+        station.last_seen_network = Some(chrono::Utc::now().timestamp() - 601);
+        let buf = render_buffer(&app, 200, 8);
+        for text in [
+            "no award need",
+            "QSO failed this session",
+            "maybe POTA/SOTA",
+        ] {
+            assert_eq!(cell_at_text(&buf, text).fg, app.theme.muted_color());
+        }
+    }
+
+    #[test]
+    fn why_column_joins_last_at_width_89() {
+        assert!(!visible_columns(88).contains(&DxHunterColumn::Why));
+        assert_eq!(visible_columns(89).last(), Some(&DxHunterColumn::Why));
+    }
 
     #[test]
     fn visible_columns_compact_tier_at_operate_80() {
@@ -828,8 +898,9 @@ mod tests {
 
     #[test]
     fn visible_columns_wide_tier_shows_all() {
-        assert_eq!(visible_columns(64), DxHunterColumn::ALL.to_vec());
-        assert_eq!(visible_columns(80), DxHunterColumn::ALL.to_vec());
+        assert_eq!(visible_columns(64), DxHunterColumn::ALL[..9]);
+        assert_eq!(visible_columns(80), DxHunterColumn::ALL[..9]);
+        assert_eq!(visible_columns(89), DxHunterColumn::ALL);
     }
 
     #[test]
@@ -1008,6 +1079,8 @@ mod tests {
             atno: false,
             band_needed: false,
             priority_score: 0,
+            local_rank: None,
+            network_rank: None,
             source: crate::app::SpotSource::Local,
             entity_name: None,
             rarity_tier: None,

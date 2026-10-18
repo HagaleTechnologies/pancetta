@@ -1198,6 +1198,8 @@ mod tests {
             atno: false,
             band_needed: false,
             priority_score: 0,
+            local_rank: None,
+            network_rank: None,
             source: crate::app::SpotSource::Local,
             entity_name: None,
             rarity_tier: None,

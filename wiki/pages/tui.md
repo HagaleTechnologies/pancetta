@@ -39,3 +39,9 @@ restored band rows do not carry stale flags. Unknown history suppresses these
 indicators.
 See [the PAN-86 decision](../../docs/DECISIONS/tui.md#needed-grids-and-states-in-dx-hunter-pan-86-2026-10-18)
 for history availability, state accumulation, and session-only QRZ enrichment.
+
+PAN-94 adds a Station-card reason, a Why column at panel width 89, and a `w`
+breakdown overlay. Reasons use the inputs stored with the latest score, and
+portable callsign suffixes are explicitly guesses. See
+[the PAN-94 decision](../../docs/DECISIONS/tui.md#dx-hunter-explains-its-ranking-pan-94-2026-10-18)
+for clause order, missing-history wording, score-source selection and keys.

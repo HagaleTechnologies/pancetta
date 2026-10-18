@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- DX Hunter explains its ranking (PAN-94): a `Why:` line on the Station card,
+  a `Why` column on wide DX Hunter panels, and `w` for the full score breakdown.
+  A `/P`-style suffix now reads `maybe POTA/SOTA (/P suffix)`; it is a callsign
+  guess, not a confirmed activation.
+
 - `pancetta import <FILE> [--dry-run]` (PAN-127): bring an existing ADIF
   log from WSJT-X, N1MM, LoTW, QRZ or another logger into Pancetta. New
   contacts are appended to `~/.pancetta/qsos.adi` with every field kept as
@@ -298,6 +303,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Q in the composer.
 
 ### Changed
+
+- DX Hunter scores follow the latest decode and cqdx spot, so a station drops
+  after you work it or a QSO with it fails.
 
 - TUI status surfaces (PAN-89): the `AUDIO DEAD` / `DECODER STUB` / `CLOCK`
   alarm chips move from the title bar to the readiness strip, where several can

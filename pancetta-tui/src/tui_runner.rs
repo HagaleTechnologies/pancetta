@@ -1646,6 +1646,19 @@ impl TuiRunner {
             return Ok(true);
         }
 
+        if app.show_why {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('w') => app.show_why = false,
+                KeyCode::Up => app.why_scroll = app.why_scroll.saturating_sub(1),
+                KeyCode::Down => app.why_scroll = app.why_scroll.saturating_add(1),
+                KeyCode::Char('k') if key.modifiers.is_empty() => {
+                    self.abort_selected_qso(&mut app)?
+                }
+                _ => {}
+            }
+            return Ok(true);
+        }
+
         // PAN-112: crossterm delivers Ctrl+C as Char('c') + CONTROL and
         // Ctrl+Space as Char(' ') + CONTROL. On Windows, Ctrl+Shift+T arrives
         // as Char('T') + CONTROL|SHIFT. Allow Shift for uppercase bindings;
@@ -1927,6 +1940,10 @@ impl TuiRunner {
             // outcome history: what happened to my last N QSOs). Lowercase
             // `r` is taken by re-send-last-TX, so Recent-QSOs uses R. Opens
             // scrolled to the newest entry.
+            KeyCode::Char('w') if !ctrl_or_alt_held => {
+                app.show_why = true;
+                app.why_scroll = 0;
+            }
             KeyCode::Char('R') => {
                 app.show_recent_qsos = true;
                 app.recent_qsos_scroll = app.recent_qsos.len().saturating_sub(1);
@@ -2368,11 +2385,8 @@ impl TuiRunner {
 
     /// Render a frame
     async fn render_frame(&mut self) -> Result<()> {
-        self.app
-            .write()
-            .await
-            .refresh_dx_need(self.dx_need_lookup.as_deref());
-        let app = self.app.read().await;
+        let mut app = self.app.write().await;
+        app.refresh_dx_need(self.dx_need_lookup.as_deref());
 
         let Some(terminal) = self.terminal.as_mut() else {
             // Headless mode (unit tests) — nothing to render.
@@ -2428,6 +2442,8 @@ impl TuiRunner {
                 crate::ui::render_health_panel(f, f.area(), &app);
             } else if app.show_recent_qsos {
                 crate::ui::render_recent_qsos_panel(f, f.area(), &app);
+            } else if app.show_why {
+                crate::ui::why::render_why_overlay(f, f.area(), &mut app);
             }
         })?;
 
@@ -3301,6 +3317,7 @@ mod key_tests {
             atno: false,
             band_needed: false,
             priority_score: None,
+            priority_factors: None,
             is_own_tx: false,
         }
     }
@@ -3531,6 +3548,8 @@ mod key_tests {
             atno: false,
             band_needed: false,
             priority_score: 800,
+            local_rank: None,
+            network_rank: None,
             source: crate::app::SpotSource::Local,
             entity_name: None,
             rarity_tier: None,
@@ -3677,6 +3696,7 @@ mod key_tests {
                     atno: false,
                     band_needed: false,
                     priority_score: None,
+                    priority_factors: None,
                     is_own_tx: false,
                 });
             a.callers_scroll = 0;
@@ -4172,7 +4192,7 @@ mod key_tests {
     async fn shift_q_emergency_stops_through_every_overlay() {
         type Open = fn(&mut crate::app::App);
         type IsOpen = fn(&crate::app::App) -> bool;
-        let cases: [(&str, Open, IsOpen); 13] = [
+        let cases: [(&str, Open, IsOpen); 14] = [
             (
                 "out-of-band ack",
                 |a| a.out_of_band_ack_visible = true,
@@ -4236,6 +4256,7 @@ mod key_tests {
                 |a| a.show_recent_qsos = true,
                 |a| a.show_recent_qsos,
             ),
+            ("why", |a| a.show_why = true, |a| a.show_why),
         ];
         for (name, open, is_open) in cases {
             let (mut r, cmd_rx, app) = make_runner().await;
@@ -5227,10 +5248,54 @@ mod key_tests {
     /// the round-1/round-2/PAN-24 remediations) — Ctrl+K/Alt+K must not
     /// abort there either.
     #[tokio::test]
+    async fn w_opens_and_closes_the_why_overlay() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        r.handle_key_event(key('w')).await.unwrap();
+        assert!(app.read().await.show_why);
+        r.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.read().await.why_scroll, 1);
+        r.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.read().await.why_scroll, 0);
+        r.handle_key_event(key('c')).await.unwrap();
+        assert!(cmd_rx.try_recv().is_err());
+        r.handle_key_event(key('w')).await.unwrap();
+        assert!(!app.read().await.show_why);
+        r.handle_key_event(key('w')).await.unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(!app.read().await.show_why);
+        // Opening a new explanation always starts at its first line.
+        app.write().await.why_scroll = 20;
+        r.handle_key_event(key('w')).await.unwrap();
+        assert_eq!(app.read().await.why_scroll, 0);
+    }
+
+    #[tokio::test]
+    async fn bare_k_aborts_through_why_overlay() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.apply_active_qsos(vec![banner("W1AW", "qso-1")], Vec::new());
+            a.show_why = true;
+        }
+        r.handle_key_event(key('k')).await.unwrap();
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1")
+        );
+        assert!(app.read().await.show_why);
+    }
+
+    #[tokio::test]
     async fn ctrl_k_and_alt_k_do_not_abort_through_overlays() {
         for set_overlay in [
             (|a: &mut crate::app::App| a.show_diagnostics = true) as fn(&mut crate::app::App),
             |a: &mut crate::app::App| a.show_recent_qsos = true,
+            |a: &mut crate::app::App| a.show_why = true,
             |a: &mut crate::app::App| a.show_health = true,
             |a: &mut crate::app::App| a.help_visible = true,
         ] {
@@ -5516,15 +5581,15 @@ mod key_tests {
 
     #[test]
     fn help_overlay_is_unchanged_when_everything_fits() {
-        let geom = help_overlay_geometry(Rect::new(0, 0, 160, 50));
+        let geom = help_overlay_geometry(Rect::new(0, 0, 160, 60));
         assert_eq!(geom.max_scroll, 0);
         assert_eq!(
             geom.total_lines as usize,
             crate::keymap::KEYBINDINGS.len(),
             "nothing wraps at full width"
         );
-        let buf = render_help(160, 50, 0);
-        let inner = help_inner(160, 50);
+        let buf = render_help(160, 60, 0);
+        let inner = help_inner(160, 60);
         let body: Vec<String> = (inner.y..inner.y + inner.height)
             .map(|y| cells_text(&buf, y, inner.x..inner.x + inner.width))
             .collect();
@@ -5536,7 +5601,7 @@ mod key_tests {
                 b.key
             );
         }
-        assert!(help_footer(160, 50, 0).contains("Press Escape or ? to close"));
+        assert!(help_footer(160, 60, 0).contains("Press Escape or ? to close"));
     }
 
     #[test]
@@ -5785,6 +5850,8 @@ mod key_tests {
                     atno: false,
                     band_needed: false,
                     priority_score: 800,
+                    local_rank: None,
+                    network_rank: None,
                     source: crate::app::SpotSource::Local,
                     entity_name: None,
                     rarity_tier: None,
@@ -6345,6 +6412,7 @@ mod key_tests {
             atno: false,
             band_needed: false,
             priority_score: None,
+            priority_factors: None,
             is_own_tx: false,
         };
         app.write().await.add_decoded_message(stale).await.unwrap();
@@ -6442,6 +6510,8 @@ mod key_tests {
                     atno: false,
                     band_needed: false,
                     priority_score: 800,
+                    local_rank: None,
+                    network_rank: None,
                     source: crate::app::SpotSource::Local,
                     entity_name: None,
                     rarity_tier: None,
@@ -6622,6 +6692,7 @@ mod key_tests {
                     atno: false,
                     band_needed: false,
                     priority_score: None,
+                    priority_factors: None,
                     is_own_tx: false,
                 });
             assert_eq!(a.focused_callsign().as_deref(), Some("G8KHF"));

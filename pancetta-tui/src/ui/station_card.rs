@@ -1,12 +1,6 @@
-//! Station card: a compact panel summarizing the currently-focused station
-//! (`App::focused_callsign`) — callsign, DXCC entity + need status, grid,
-//! distance, last-heard message, SNR, age, and whether we're engaged with
-//! them (active QSO) or free to call.
-//!
-//! This is Task 17 of the pancetta-tui redesign: the renderer in isolation.
-//! It is NOT yet wired into any layout function — Task 18 replaces Station
-//! Info's slot with it (`layout_operate`) and adds it below DX Hunter in
-//! `layout_hunt` when there's room.
+//! The focused station's card has four content lines: callsign and status,
+//! ranking reason, grid/distance/last-heard message, and QSO or call action.
+//! Hunt view reserves all four lines; Operate clips to its available height.
 //!
 //! **Documented spec divergence:** the original design (spec §4) sources
 //! "what they're doing right now" from the coordinator's `DxActivityMap`.
@@ -32,14 +26,10 @@ use ratatui::{
 use super::{create_panel_block, format_distance, format_time_ago};
 use crate::app::{App, DecodedMessageView};
 
-/// Render the station card into `area`. Three content lines when a station
-/// is focused (call/entity/status, grid/distance/last-msg, engaged-or-window),
+/// Render four content lines: call/entity/status, ranking reason,
+/// grid/distance/last-message, and engagement or transmit window;
 /// one fallback line when nothing is focused.
 pub fn render_station_card(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
-    // `is_active` styling is hardcoded false — there's no `ActivePanel`
-    // variant for this card yet (added when Task 18 wires it into a
-    // layout). Not a functional gap for this task: the renderer is tested
-    // directly, not via `draw()`.
     let block = create_panel_block("Station", false, app);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -53,7 +43,7 @@ pub fn render_station_card(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<(
         return Ok(());
     };
 
-    // Newest decode from the focused station drives lines 1-3 (see module
+    // Newest decode from the focused station drives activity lines (see module
     // doc for the DxActivityMap divergence).
     let last_decode = newest_decode_for(app, &call);
 
@@ -61,10 +51,50 @@ pub fn render_station_card(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<(
     let line2 = render_line2(app, last_decode);
     let line3 = render_line3(app, &call, last_decode);
 
-    let paragraph = Paragraph::new(vec![line1, line2, line3]);
+    let why = render_why_line(app, inner.width, chrono::Utc::now());
+    let paragraph = Paragraph::new(vec![line1, why, line2, line3]);
     f.render_widget(paragraph, inner);
 
     Ok(())
+}
+
+/// Fit complete clauses so clipping cannot hide a caution or a hedge.
+fn render_why_line(app: &App, width: u16, now: chrono::DateTime<chrono::Utc>) -> Line<'static> {
+    use crate::dx_reason::{self, FocusedReason};
+    let (clauses, caution_count) = match dx_reason::focused(app, now) {
+        FocusedReason::NoFocus => return Line::default(),
+        FocusedReason::NotRanked(_) => (
+            vec!["not ranked now (not heard or spotted in the last 3 min)".into()],
+            0,
+        ),
+        FocusedReason::Ranked(_, station) => {
+            let reason = dx_reason::reason_for(station, app.dx_need_for(&station.call_sign), now);
+            (reason.summary_clauses(), reason.cautions.len())
+        }
+    };
+    let fitted = dx_reason::fit_clauses(&clauses, width.saturating_sub(5) as usize);
+    let mut spans = vec![Span::styled(
+        "Why: ",
+        Style::default().fg(app.theme.muted_color()),
+    )];
+    for (index, clause) in fitted.split("; ").enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("; "));
+        }
+        let style = if clause == "…" {
+            Style::default().fg(app.theme.foreground_color())
+        } else if index == 0 {
+            Style::default()
+                .fg(app.theme.accent_color())
+                .add_modifier(Modifier::BOLD)
+        } else if index <= caution_count {
+            Style::default().fg(app.theme.warning_color())
+        } else {
+            Style::default().fg(app.theme.foreground_color())
+        };
+        spans.push(Span::styled(clause.to_owned(), style));
+    }
+    Line::from(spans)
 }
 
 /// The most recently decoded message from `call` (compound-aware match),
@@ -117,7 +147,7 @@ fn render_line1<'a>(app: &App, call: &str, last_decode: Option<&DecodedMessageVi
     ])
 }
 
-/// Line 2: `"{grid} {dist}km · {last-msg-text} ({snr:+}) {age}"`.
+/// Third content line: `"{grid} {dist}km · {last-msg-text} ({snr:+}) {age}"`.
 fn render_line2<'a>(app: &App, last_decode: Option<&DecodedMessageView>) -> Line<'a> {
     let grid = last_decode
         .and_then(|m| m.grid_square.clone())
@@ -137,7 +167,7 @@ fn render_line2<'a>(app: &App, last_decode: Option<&DecodedMessageView>) -> Line
     ))
 }
 
-/// Line 3: engaged → `"in QSO: {state}"`; else `"{E|O}-window · Space=call"`
+/// Fourth content line: engaged → `"in QSO: {state}"`; else `"{E|O}-window · Space=call"`
 /// (window = newest decode's `slot_parity`).
 fn render_line3<'a>(app: &App, call: &str, last_decode: Option<&DecodedMessageView>) -> Line<'a> {
     let engaged_state = app
@@ -164,7 +194,7 @@ fn render_line3<'a>(app: &App, call: &str, last_decode: Option<&DecodedMessageVi
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::ui) mod tests {
     use super::*;
     use crate::app::{ActivePanel, ActiveQsoBanner, App};
     use crate::config::Config;
@@ -173,7 +203,7 @@ mod tests {
     fn fixture_view(call: &str, snr: i32) -> DecodedMessageView {
         DecodedMessageView {
             timestamp: chrono::Utc::now(),
-            frequency: 14_074_000.0,
+            frequency: 14.074,
             mode: "FT8".to_string(),
             snr,
             delta_time: 0.0,
@@ -190,6 +220,7 @@ mod tests {
             atno: false,
             band_needed: false,
             priority_score: None,
+            priority_factors: None,
             is_own_tx: false,
         }
     }
@@ -226,12 +257,55 @@ mod tests {
         }
     }
 
+    struct RankingLookup {
+        band_new: bool,
+        failed: bool,
+    }
+    impl pancetta_qso::priority::WorkedStationLookup for RankingLookup {
+        fn is_duplicate(&self, _: &str, _: f64) -> bool {
+            false
+        }
+        fn is_recent_failure(&self, _: &str) -> bool {
+            self.failed
+        }
+        fn is_needed_dxcc(&self, _: &str) -> bool {
+            false
+        }
+        fn is_needed_grid(&self, _: &str) -> bool {
+            false
+        }
+        fn is_dxcc_needed_on_band(&self, _: &str, _: f64) -> bool {
+            self.band_new
+        }
+    }
+
+    pub(in crate::ui) async fn ranked_app(call: &str, band_new: bool, failed: bool) -> App {
+        use pancetta_qso::priority::{PriorityScorer, PriorityWeights};
+        let mut app = fixture_app().await;
+        let mut view = fixture_view(call, -3);
+        let explained = PriorityScorer::new(
+            PriorityWeights::default(),
+            Box::new(RankingLookup { band_new, failed }),
+        )
+        .score_tiered_explained(call, Some("FN42"), -3, 14_074_000.0);
+        view.priority_score = Some(explained.score.as_display_u32());
+        view.priority_factors = Some(explained.factors);
+        view.band_needed = band_new;
+        app.add_decoded_message(view).await.unwrap();
+        app.active_panel = ActivePanel::DxHunter;
+        app
+    }
+
     async fn fixture_app() -> App {
         App::new(Config::default(), None).await.unwrap()
     }
 
     fn render(app: &App) -> ratatui::buffer::Buffer {
-        let backend = TestBackend::new(60, 10);
+        render_at(app, 60, 10)
+    }
+
+    fn render_at(app: &App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(width, height);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| {
             let area = f.area();
@@ -250,9 +324,88 @@ mod tests {
         })
     }
 
-    /// The failing test from the brief: a focused, ATNO station renders its
-    /// callsign and the ATNO flag; with no focus at all, the fallback
-    /// message renders instead.
+    fn row(buf: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    #[tokio::test]
+    async fn focused_ranked_station_shows_why_line_second() {
+        let app = ranked_app("JA1ABC", true, false).await;
+        let buf = render_at(&app, 130, 6);
+        assert!(row(&buf, 2).contains("Why: new entity on 20M"));
+        assert!(row(&buf, 3).contains("CQ JA1ABC FN42"));
+        assert!(row(&buf, 4).contains("E-window · Space=call"));
+        let why = row(&buf, 2);
+        let col = why[..why.find("new entity").unwrap()].chars().count() as u16;
+        assert_eq!(buf[(col, 2)].fg, app.theme.accent_color());
+        assert!(buf[(col, 2)].modifier.contains(Modifier::BOLD));
+    }
+
+    #[tokio::test]
+    async fn why_line_states() {
+        let mut app = fixture_app().await;
+        assert!(!buffer_contains(&render_at(&app, 130, 6), "Why:"));
+        app.decoded_messages.push_back(fixture_view("JA1ABC", -7));
+        assert!(buffer_contains(
+            &render_at(&app, 130, 6),
+            "Why: not ranked now (not heard or spotted in the last 3 min)"
+        ));
+        let mut app = ranked_app("JA1ABC", true, false).await;
+        app.dx_stations.get_mut("JA1ABC").unwrap().last_seen -= chrono::Duration::minutes(4);
+        assert!(buffer_contains(
+            &render_at(&app, 130, 6),
+            "Why: not ranked now (not heard or spotted in the last 3 min)"
+        ));
+        let station = app.dx_stations.get_mut("JA1ABC").unwrap();
+        station.last_seen = chrono::Utc::now();
+        station.local_rank = None;
+        station.network_rank = None;
+        assert!(buffer_contains(
+            &render_at(&app, 130, 6),
+            "Why: not scored yet (no decode or cqdx data)"
+        ));
+    }
+
+    #[tokio::test]
+    async fn why_line_fits_whole_clauses() {
+        let app = ranked_app("K1ABC/P", false, true).await;
+        let buf = render_at(&app, 53, 6);
+        assert!(
+            row(&buf, 2).contains("Why: no award need; QSO failed this session; …"),
+            "{}",
+            row(&buf, 2)
+        );
+        let text = row(&buf, 2);
+        let col = text[..text.find("QSO failed").unwrap()].chars().count() as u16;
+        assert_eq!(buf[(col, 2)].fg, app.theme.warning_color());
+    }
+
+    #[tokio::test]
+    async fn why_line_follows_the_pinned_station_across_a_resort() {
+        let mut app = ranked_app("JA1ABC", true, false).await;
+        app.clamp_dx_hunter_selection();
+        assert!(buffer_contains(
+            &render_at(&app, 130, 6),
+            "Why: new entity on 20M"
+        ));
+        let mut view = fixture_view("VK9DX", -5);
+        view.priority_score = Some(5999);
+        app.add_decoded_message(view).await.unwrap();
+        assert_eq!(app.focused_callsign().as_deref(), Some("JA1ABC"));
+        assert!(buffer_contains(
+            &render_at(&app, 130, 6),
+            "Why: new entity on 20M"
+        ));
+    }
+
+    #[tokio::test]
+    async fn portable_station_card_hedges() {
+        let app = ranked_app("W5XYZ/P", false, false).await;
+        let buf = render_at(&app, 130, 6);
+        assert!(buffer_contains(&buf, "maybe POTA/SOTA (/P suffix)"));
+        assert!(!buffer_contains(&buf, "activation"));
+    }
+
     #[tokio::test]
     async fn focused_atno_station_shows_call_and_atno() {
         let mut app = fixture_app().await;
@@ -324,6 +477,8 @@ mod tests {
                 atno: false,
                 band_needed: false,
                 priority_score: 0,
+                local_rank: None,
+                network_rank: None,
                 source: crate::app::SpotSource::Local,
                 entity_name: Some("Japan".to_string()),
                 rarity_tier: None,

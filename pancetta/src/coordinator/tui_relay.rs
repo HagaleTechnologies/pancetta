@@ -31,6 +31,29 @@ use tracing::{debug, info, span, warn, Level};
 
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
 
+/// Capture score and explanation in one scoring call over the shared lookup.
+fn display_rank(
+    scorer: &pancetta_qso::PriorityScorer,
+    call_sign: Option<&str>,
+    grid: Option<&str>,
+    snr_db: f32,
+    dial_mhz: f64,
+) -> (Option<u32>, Option<pancetta_qso::priority::PriorityFactors>) {
+    let Some(call) = call_sign else {
+        return (None, None);
+    };
+    let explained = scorer.score_tiered_explained(
+        call,
+        grid,
+        snr_db.round().clamp(-128.0, 127.0) as i8,
+        dial_mhz * 1_000_000.0,
+    );
+    (
+        Some(explained.score.as_display_u32()),
+        Some(explained.factors),
+    )
+}
+
 impl super::ApplicationCoordinator {
     /// Start TUI component with point-to-point decoded message channel
     // rationale: wires many independent channel endpoints and shared handles into
@@ -282,13 +305,9 @@ impl super::ApplicationCoordinator {
                             // decodes (RR73/73/reports) get the same score
                             // but it won't influence the DX Hunter because
                             // only CQ frames are listed there.
-                            let priority_score = call_sign.as_deref().map(|cs| {
-                                let freq_hz = dial_mhz * 1_000_000.0;
-                                let snr_i8 = decoded_msg.snr_db.round().clamp(-128.0, 127.0) as i8;
-                                relay_scorer
-                                    .score_tiered(cs, grid_square.as_deref(), snr_i8, freq_hz)
-                                    .as_display_u32()
-                            });
+                            let (priority_score, priority_factors) = display_rank(
+                                &relay_scorer, call_sign.as_deref(), grid_square.as_deref(),
+                                decoded_msg.snr_db, dial_mhz);
 
                             let tui_decoded = pancetta_tui::DecodedMessageView {
                                 timestamp: chrono::Utc::now(),
@@ -312,6 +331,7 @@ impl super::ApplicationCoordinator {
                                 atno,
                                 band_needed,
                                 priority_score,
+                                priority_factors,
                                 is_own_tx: false,
                             };
 
@@ -4009,6 +4029,37 @@ where
 
 #[cfg(test)]
 mod tui_relay_tests {
+    #[test]
+    fn display_rank_carries_factors_from_the_shared_lookup() {
+        let lookup = crate::priority_evaluator::CachedStationLookup::new();
+        let scorer = pancetta_qso::PriorityScorer::new(
+            pancetta_qso::priority::PriorityWeights::default(),
+            Box::new(lookup.clone()),
+        );
+        let before = super::display_rank(&scorer, Some("K1ABC/P"), None, -3.0, 14.074);
+        lookup.record_failure("K1ABC/P");
+        let after = super::display_rank(&scorer, Some("K1ABC/P"), None, -3.0, 14.074);
+        let factors = after.1.unwrap();
+        assert!(factors.recent_failure);
+        assert_eq!(
+            factors.portable_suffix,
+            Some(pancetta_qso::priority::PortableSuffix::P)
+        );
+        assert!(after.0.unwrap() < before.0.unwrap());
+    }
+
+    #[test]
+    fn display_rank_is_none_without_a_callsign() {
+        let scorer = pancetta_qso::PriorityScorer::new(
+            pancetta_qso::priority::PriorityWeights::default(),
+            Box::new(pancetta_qso::priority::NullLookup),
+        );
+        assert_eq!(
+            super::display_rank(&scorer, None, None, -7.0, 14.074),
+            (None, None)
+        );
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8};
 

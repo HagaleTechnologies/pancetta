@@ -20,6 +20,7 @@ pub mod readiness_strip;
 pub mod station_card;
 pub mod station_info;
 pub mod tx_placement;
+pub mod why;
 
 use active_qsos::render_active_qsos;
 use band_activity::render_band_activity;
@@ -380,7 +381,8 @@ struct HuntRects {
 }
 
 fn compute_hunt_rects(content_area: Rect) -> HuntRects {
-    const STATION_CARD_HEIGHT: u16 = 5;
+    // Four content lines and two borders.
+    const STATION_CARD_HEIGHT: u16 = 6;
     // Threshold picked so the `draw()` resize-guard floor (MIN_H=20 →
     // content_area ~15 rows) never shows the card, while a normally-sized
     // terminal (TestBackend's 120x40 fixture → content_area 34 rows) does.
@@ -443,8 +445,7 @@ fn compute_hunt_rects(content_area: Rect) -> HuntRects {
 /// MIN_W/MIN_H resize-guard floor, whose content area is ~15 rows) keeps the
 /// pre-card layout untouched rather than starving DX Hunter/Band
 /// Activity/QSO Status for a card that would barely fit; a taller terminal
-/// gets the extra 5-row block (3 content lines + 2 border, matching
-/// `render_station_card`'s Operate-view sizing).
+/// gets a six-row block (four content lines and two borders).
 fn layout_hunt(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()> {
     let r = compute_hunt_rects(content_area);
 
@@ -2636,6 +2637,12 @@ mod view_render_tests {
         );
     }
 
+    #[test]
+    fn hunt_station_card_is_six_rows_when_shown() {
+        let rects = compute_hunt_rects(Rect::new(0, 0, 120, 40));
+        assert_eq!(rects.station_card.unwrap().height, 6);
+    }
+
     /// `layout_hunt` only adds the station card when the terminal has room
     /// to spare (Task 17 brief: "below DX Hunter if ≥4 rows spare") — a
     /// short terminal keeps the pre-card layout so DX Hunter / Band Activity
@@ -3312,6 +3319,8 @@ mod view_render_tests {
             atno: false,
             band_needed: true,
             priority_score: 3120,
+            local_rank: None,
+            network_rank: None,
             source: crate::app::SpotSource::Both,
             entity_name: Some("New Zealand".to_string()),
             rarity_tier: Some("rare".to_string()),
@@ -3347,6 +3356,7 @@ mod view_render_tests {
             atno: false,
             band_needed: false,
             priority_score: None,
+            priority_factors: None,
             is_own_tx: false,
         }
     }
