@@ -63,6 +63,10 @@ const RATE_REFILL_PER_SEC: u32 = 10;
 /// Minimum spacing between maintenance batches; also the minimum time a
 /// failure episode stays visible.
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
+/// Scheduling jitter tolerated when the five-second health tick calls
+/// [`AuditLog::maintain`], so a pass that reads the clock a little early is
+/// not skipped (which would double the effective cadence).
+const MAINTENANCE_SLACK: Duration = Duration::from_millis(250);
 /// Minimum spacing between repeated ERROR reports while failure persists.
 const ERROR_REPEAT_INTERVAL: Duration = Duration::from_secs(60);
 /// Suffix appended to a truncated field, inside its cap.
@@ -322,7 +326,8 @@ struct Shared {
     writer: Mutex<WriterState>,
     health: Mutex<HealthState>,
     #[cfg(test)]
-    faults: Mutex<Vec<AuditOp>>,
+    /// Injected faults: `(op, matching checks to let pass first)`.
+    faults: Mutex<Vec<(AuditOp, usize)>>,
 }
 
 /// A bounded, rotating JSONL audit log backed by files on disk.
@@ -481,10 +486,14 @@ impl AuditLog {
         if !unavailable && !pending && !st.tail_invalid {
             return Ok(());
         }
-        if st
-            .last_maintenance
-            .is_some_and(|last| now.saturating_sub(last) < self.shared.limits.maintenance_interval)
-        {
+        if st.last_maintenance.is_some_and(|last| {
+            now.saturating_sub(last)
+                < self
+                    .shared
+                    .limits
+                    .maintenance_interval
+                    .saturating_sub(MAINTENANCE_SLACK)
+        }) {
             return Ok(());
         }
         st.last_maintenance = Some(now);
@@ -595,16 +604,23 @@ impl AuditLog {
     fn take_token(&self, st: &mut WriterState, idx: usize, now: Duration) -> bool {
         let limits = &self.shared.limits;
         let full = u64::from(limits.burst) * 1000;
+        let rate = u128::from(limits.refill_per_sec);
         let b = &mut st.buckets[idx];
-        let elapsed = now.saturating_sub(b.last_refill);
-        let refill = elapsed
-            .as_millis()
-            .saturating_mul(u128::from(limits.refill_per_sec));
-        b.milli_tokens = u64::try_from(refill)
+        let elapsed = now.saturating_sub(b.last_refill).as_nanos();
+        // Thousandths of a token earned: rate tokens/s = rate milli-tokens/ms.
+        let earned = elapsed.saturating_mul(rate) / 1_000_000;
+        b.milli_tokens = u64::try_from(earned)
             .unwrap_or(u64::MAX)
             .saturating_add(b.milli_tokens)
             .min(full);
-        b.last_refill = b.last_refill.max(now);
+        if b.milli_tokens == full || rate == 0 {
+            b.last_refill = b.last_refill.max(now);
+        } else {
+            // Advance only by the time actually converted into tokens, so
+            // the fraction left over carries to the next call.
+            let used = u64::try_from(earned * 1_000_000 / rate).unwrap_or(u64::MAX);
+            b.last_refill += Duration::from_nanos(used);
+        }
         if b.milli_tokens >= 1000 {
             b.milli_tokens -= 1000;
             true
@@ -700,8 +716,10 @@ impl AuditLog {
             .map_err(|e| AuditError::io(AuditOp::Truncate, &e))
     }
 
-    /// Shift `.N-1`→`.N` … active→`.1`, removing the oldest first. Only an
-    /// absent slot (`NotFound`) is ignored.
+    /// Move the active file to `.1`, shifting archives up. Only when every
+    /// archive slot is occupied is the oldest removed first; otherwise the
+    /// lowest free slot absorbs the shift. That keeps a rotation interrupted
+    /// part-way (some renames done) from deleting another archive on retry.
     fn rotate(&self) -> Result<(), AuditError> {
         let archives = self.shared.limits.archives;
         if archives == 0 {
@@ -713,15 +731,28 @@ impl AuditLog {
             }
             _ => Ok(()),
         };
-        ignore_absent(
-            self.check(AuditOp::Rotate)
-                .and_then(|()| std::fs::remove_file(self.slot_path(archives))),
-        )?;
-        for slot in (0..archives).rev() {
-            ignore_absent(std::fs::rename(
-                self.slot_path(slot),
-                self.slot_path(slot + 1),
-            ))?;
+        let mut top = None;
+        for slot in 1..=archives {
+            if self.file_len(slot)?.is_none() {
+                top = Some(slot);
+                break;
+            }
+        }
+        let top = match top {
+            Some(slot) => slot,
+            None => {
+                ignore_absent(
+                    self.check(AuditOp::Rotate)
+                        .and_then(|()| std::fs::remove_file(self.slot_path(archives))),
+                )?;
+                archives
+            }
+        };
+        for slot in (0..top).rev() {
+            ignore_absent(
+                self.check(AuditOp::Rotate)
+                    .and_then(|()| std::fs::rename(self.slot_path(slot), self.slot_path(slot + 1))),
+            )?;
         }
         Ok(())
     }
@@ -802,7 +833,11 @@ impl AuditLog {
     #[cfg(test)]
     fn check(&self, op: AuditOp) -> io::Result<()> {
         let mut faults = self.shared.faults.lock().unwrap();
-        match faults.iter().position(|f| *f == op) {
+        match faults.iter().position(|f| f.0 == op) {
+            Some(i) if faults[i].1 > 0 => {
+                faults[i].1 -= 1;
+                Ok(())
+            }
             Some(i) => {
                 faults.remove(i);
                 Err(io::Error::other(format!("injected {op:?} fault")))
@@ -994,7 +1029,12 @@ mod tests {
     }
 
     fn inject(log: &AuditLog, op: AuditOp) {
-        log.shared.faults.lock().unwrap().push(op);
+        inject_after(log, op, 0);
+    }
+
+    /// Fail the `skip + 1`-th check of `op`.
+    fn inject_after(log: &AuditLog, op: AuditOp, skip: usize) {
+        log.shared.faults.lock().unwrap().push((op, skip));
     }
 
     fn ev(ts: i64, kind: AuditKind, op: Option<&str>, detail: &str) -> AuditEvent {
@@ -1254,6 +1294,89 @@ mod tests {
         assert_eq!(ts(1), vec![16, 17, 18], ".1 is the newest archive");
         assert_eq!(ts(2), vec![13, 14, 15]);
         assert_eq!(ts(3), vec![10, 11, 12]);
+    }
+
+    #[test]
+    fn interrupted_rotation_resumes_without_deleting_archives() {
+        let tp = TempPath::new("rotate-resume");
+        let clock = FakeClock::default();
+        let log = log_with(&tp, small_limits(300), &clock);
+        let record = |i: i64| {
+            let base = ev(i, AuditKind::LocalKill, None, "");
+            let pad = 100 - encode_record(&base, &Limits::default()).unwrap().len();
+            ev(i, AuditKind::LocalKill, None, &"p".repeat(pad))
+        };
+        for i in 1..=12 {
+            clock.advance(Duration::from_secs(1));
+            log.append(&record(i)).unwrap();
+        }
+        let ts = |slot: usize| -> Vec<i64> {
+            read_events(&tp.slot(slot))
+                .iter()
+                .map(|e| e.ts_unix_ms)
+                .collect()
+        };
+        assert_eq!(ts(3), vec![1, 2, 3]);
+        // Remove `.3`, shift `.2`→`.3` and `.1`→`.2`, then fail `active`→`.1`.
+        inject_after(&log, AuditOp::Rotate, 3);
+        assert_eq!(log.append(&record(13)).unwrap_err().op, AuditOp::Rotate);
+        assert!(!tp.slot(1).exists());
+        // Retries only finish the interrupted shift: no archive is deleted.
+        for i in 14..=16 {
+            clock.advance(Duration::from_secs(1));
+            log.append(&record(i)).unwrap();
+        }
+        assert_eq!(ts(3), vec![4, 5, 6]);
+        assert_eq!(ts(2), vec![7, 8, 9]);
+        assert_eq!(ts(1), vec![10, 11, 12]);
+        assert_eq!(ts(0), vec![14, 15, 16]);
+    }
+
+    #[test]
+    fn refill_keeps_fractional_time_between_rapid_events() {
+        let tp = TempPath::new("fractional");
+        let clock = FakeClock::default();
+        let log = log_with(&tp, Limits::default(), &clock);
+        let mut recorded = 0;
+        // One event every 0.5 ms for 10 s: 20 burst + 10/s refill.
+        for _ in 0..20_000 {
+            if log.append(&ev(1, AuditKind::TxDenied, None, "x")).unwrap()
+                == AuditAppendOutcome::Recorded
+            {
+                recorded += 1;
+            }
+            clock.advance(Duration::from_micros(500));
+        }
+        assert!((119..=120).contains(&recorded), "recorded={recorded}");
+    }
+
+    #[test]
+    fn maintenance_tolerates_tick_jitter_but_not_early_calls() {
+        let tp = TempPath::new("jitter");
+        let clock = FakeClock::default();
+        let log = log_with(
+            &tp,
+            Limits {
+                burst: 1,
+                ..Limits::default()
+            },
+            &clock,
+        );
+        let lines = || read_lines(tp.path()).len();
+        let coalesce = |ts: i64| {
+            log.append(&ev(ts, AuditKind::Armed, None, "a")).unwrap();
+        };
+        coalesce(1);
+        coalesce(2);
+        log.maintain(3).unwrap();
+        assert_eq!(lines(), 2, "record + summary");
+        coalesce(4);
+        clock.advance(Duration::from_secs(4));
+        log.maintain(5).unwrap();
+        assert_eq!(lines(), 2, "too early: throttled");
+        clock.advance(Duration::from_millis(900));
+        log.maintain(6).unwrap();
+        assert_eq!(lines(), 3, "a tick 100 ms early still runs");
     }
 
     #[test]
