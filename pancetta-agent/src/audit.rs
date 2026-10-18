@@ -1648,6 +1648,126 @@ mod tests {
         assert_eq!(log.maintain(1), Ok(()));
     }
 
+    /// Both ticket scenarios end to end: sustained traffic through shared
+    /// clones rotates within the byte bound, an injected storage failure is
+    /// surfaced and recovers, and every omitted event is accounted for.
+    #[test]
+    fn sustained_traffic_stays_bounded_and_failures_are_accounted() {
+        let tp = TempPath::new("sustained");
+        let clock = FakeClock::default();
+        let max = 32_768;
+        let log = log_with(&tp, small_limits(max), &clock);
+        let clones: Vec<AuditLog> = (0..3).map(|_| log.clone()).collect();
+        let (mut recorded, mut coalesced, mut failed) = (0u64, 0u64, 0u64);
+        let mut saw_unavailable = false;
+        for step in 0..600i64 {
+            if step == 300 {
+                inject(&log, AuditOp::Open);
+            }
+            for c in &clones {
+                for kind in [AuditKind::TxRequested, AuditKind::TxDenied] {
+                    for _ in 0..5 {
+                        match c.append(&ev(step, kind.clone(), Some("N0CALL"), "flood")) {
+                            Ok(AuditAppendOutcome::Recorded) => recorded += 1,
+                            Ok(AuditAppendOutcome::Coalesced) => coalesced += 1,
+                            Err(_) => failed += 1,
+                        }
+                    }
+                }
+            }
+            saw_unavailable |= log.health().unavailable;
+            clock.advance(Duration::from_millis(100));
+            if step % 50 == 0 {
+                let _ = clones[step as usize % 3].maintain(step * 100);
+            }
+        }
+        clock.advance(Duration::from_secs(5));
+        log.maintain(60_000).unwrap();
+        assert!(saw_unavailable, "the injected failure was surfaced");
+        assert!(!log.health().unavailable, "recovered with no new traffic");
+        assert!(failed >= 1 && coalesced > 0);
+
+        let sizes = managed_sizes(&tp);
+        assert!(sizes[..=ARCHIVE_COUNT].iter().all(|s| s.unwrap() <= max));
+        assert!(sizes[ARCHIVE_COUNT].is_some(), "rotated into every archive");
+        assert_eq!(sizes[ARCHIVE_COUNT + 1], None);
+
+        let events: Vec<AuditEvent> = (0..=ARCHIVE_COUNT)
+            .rev()
+            .flat_map(|slot| read_events(&tp.slot(slot)))
+            .collect();
+        let ordinary = events.iter().filter(|e| e.kind != AuditKind::Summary);
+        assert_eq!(ordinary.count() as u64, recorded);
+        let count = |key: &str| -> u64 {
+            events
+                .iter()
+                .filter(|e| e.kind == AuditKind::Summary)
+                .flat_map(|e| e.detail.split([' ', ';']))
+                .filter_map(|tok| tok.strip_prefix(key))
+                .map(|n| n.parse::<u64>().unwrap())
+                .sum()
+        };
+        assert_eq!(count("coalesced="), coalesced);
+        assert_eq!(count("failed="), failed);
+        assert!(events
+            .iter()
+            .filter(|e| e.kind == AuditKind::Summary)
+            .all(|e| e.operator_callsign.is_none()));
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn headless_error_is_reported_once_a_minute_and_recovery_once() {
+        let buf = Captured::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let tp = TempPath::new("headless");
+        let clock = FakeClock::default();
+        let log = log_with(&tp, Limits::default(), &clock);
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..10 {
+                inject(&log, AuditOp::Open);
+                let _ = log.append(&ev(1, AuditKind::TxDenied, None, "x"));
+            }
+            clock.advance(Duration::from_secs(59));
+            inject(&log, AuditOp::Open);
+            let _ = log.append(&ev(2, AuditKind::TxDenied, None, "x"));
+            clock.advance(Duration::from_secs(1));
+            inject(&log, AuditOp::Open);
+            let _ = log.append(&ev(3, AuditKind::TxDenied, None, "x"));
+            clock.advance(Duration::from_secs(5));
+            log.maintain(4).unwrap();
+            log.maintain(5).unwrap();
+        });
+        let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let errors: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains(UNAVAILABLE_MESSAGE))
+            .collect();
+        assert_eq!(errors.len(), 2, "{text}");
+        assert!(errors.iter().all(|l| l.contains("ERROR")), "{text}");
+        assert!(errors[0].contains("failed_events=1"), "{text}");
+        assert!(errors[1].contains("failed_events=12"), "{text}");
+        assert_eq!(text.matches(RECOVERED_MESSAGE).count(), 1, "{text}");
+        assert!(!log.health().unavailable);
+    }
+
     #[test]
     fn default_audit_path_ends_with_expected_suffix() {
         let p = default_audit_path();

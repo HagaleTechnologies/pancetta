@@ -3192,6 +3192,7 @@ dependencies = [
  "snow",
  "thiserror 2.0.21",
  "tracing",
+ "tracing-subscriber",
  "x25519-dalek",
 ]
 

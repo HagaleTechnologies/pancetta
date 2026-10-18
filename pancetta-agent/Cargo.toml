@@ -27,3 +27,4 @@ libc = "0.2"
 
 [dev-dependencies]
 hex = "0.4"
+tracing-subscriber = { workspace = true }
