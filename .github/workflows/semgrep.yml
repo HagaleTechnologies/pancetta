@@ -17,9 +17,52 @@ on:
   # not just until a post-merge push (caught in Codex review, PR #382, back when merge_group
   # genuinely never fired here).
 
+# PAN-107: this workflow used to be one job that echoed "skipping this run"
+# and exited 0 when SEMGREP_APP_TOKEN was absent, so a skipped scan reported
+# the same green "semgrep/ci" success as a completed one. It is now a decider
+# plus two jobs with mutually exclusive conditions, and GitHub's own job
+# conclusions carry the distinction:
+#   - token present (same-repo PR, push, merge_group, dispatch):
+#       `semgrep/ci` runs the platform scan; `semgrep/local-ruleset` skips.
+#   - token absent (fork PR, Dependabot without a provisioned secret):
+#       `semgrep/ci` is reported as natively *skipped* (grey, not green) and
+#       `semgrep/local-ruleset` runs a real scan from the pinned, vendored,
+#       secret-free ruleset in .semgrep/ -- see .semgrep/README.md.
+# The `secrets` context is not available in a job-level `if:` (actionlint
+# errors; GitHub fails the workflow with "Unrecognized named-value"), so the
+# decider job reads the secret in a step and exports only the mode string.
+# No token is ever exposed to untrusted PR execution, and no run reports
+# success for a scan that did not happen.
+# Structurally enforced by scripts/ci/test-ci-semgrep-modes.sh.
 jobs:
+  semgrep-mode:
+    name: semgrep/mode
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.decide.outputs.mode }}
+    steps:
+      # Reading the withheld-or-present secret here is safe: the step emits
+      # only 'platform' or 'local', never the token's value. For a fork PR or
+      # an unprovisioned Dependabot run the secret evaluates empty and the
+      # local-ruleset job takes over below.
+      - name: Decide scan mode
+        id: decide
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "$SEMGREP_APP_TOKEN" ]; then
+            echo "mode=platform" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=local" >> "$GITHUB_OUTPUT"
+          fi
+
   semgrep:
     name: semgrep/ci
+    needs: [semgrep-mode]
+    if: needs.semgrep-mode.outputs.mode == 'platform'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -30,19 +73,41 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # GitHub withholds repo Actions secrets from a fork-triggered pull_request and (unless
-      # separately provisioned as a Dependabot secret) from Dependabot-authored runs -- either
-      # case leaves SEMGREP_APP_TOKEN empty here, and semgrep ci has no local --config fallback,
-      # so it would otherwise fail every fork PR's and every dependency-bump PR's check outright
-      # (Codex round, cqdx #360/panino #109/widdershins #234/pancetta #297/coppa #87). Skip
-      # gracefully instead of either excluding those authors up front (which silently drops the
-      # exact PRs -- especially Dependabot's -- this scanner most needs to cover) or letting the
-      # run fail hard. Once SEMGREP_APP_TOKEN is added as a Dependabot secret (not yet done --
-      # CAT-307 follow-up), Dependabot PRs start getting scanned automatically with no further
-      # change here.
+      # separately provisioned as a Dependabot secret) from Dependabot-authored runs; the
+      # decider above routes both to semgrep-local instead (once SEMGREP_APP_TOKEN is added
+      # as a Dependabot secret -- still a CAT-307 follow-up -- Dependabot PRs start getting
+      # the platform scan automatically, with no further change here).
       - name: Run semgrep ci
         run: |
+          set -euo pipefail
+          # Fail closed: this job only starts in platform mode. If that guard
+          # is ever bypassed, refuse here -- a bare `semgrep ci` with no token
+          # resolves zero rules and still exits 0, which is exactly the
+          # silent skip this workflow must never report as success (PAN-107).
           if [ -z "$SEMGREP_APP_TOKEN" ]; then
-            echo "SEMGREP_APP_TOKEN not available (fork PR, or Dependabot secret not yet provisioned) -- skipping this run."
-            exit 0
+            echo "::error::SEMGREP_APP_TOKEN absent inside the semgrep/ci job -- refusing to report success for a scan that did not run" >&2
+            exit 1
           fi
           semgrep ci
+
+  semgrep-local:
+    name: semgrep/local-ruleset
+    needs: [semgrep-mode]
+    if: needs.semgrep-mode.outputs.mode == 'local'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container:
+      image: semgrep/semgrep@sha256:67319956da3dcb58baf5b322899c15458e3963e7018a86aeeb5cd224e69cb77a
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Secret-free fallback scan for token-absent runs: the p/secrets pack
+      # vendored into .semgrep/ (pinned + reviewed in-repo; no registry fetch
+      # and no token at scan time). --error makes a blocking finding fail the
+      # job, so this check's green means a scan actually completed.
+      # --exclude keeps the pack from matching its own regexes inside the
+      # vendored file (verified: without it the pack self-matches twice).
+      - name: Run pinned local-ruleset scan
+        run: |
+          set -euo pipefail
+          semgrep scan --config .semgrep/secrets.yaml --error --metrics=off --exclude .semgrep
