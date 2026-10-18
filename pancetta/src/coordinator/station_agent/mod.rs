@@ -4811,6 +4811,87 @@ mod tests {
         );
     }
 
+    /// PAN-104: audit failure never refuses a valid arm (availability
+    /// decision) and never blocks a disarm; an invalid arm stays refused.
+    #[tokio::test]
+    async fn failing_audit_sink_keeps_valid_arms_and_every_disarm_working() {
+        let mut ctx = ctx_with(true, true);
+        ctx.audit = failing_audit_log();
+        ctx.peers
+            .insert(PEER_B.to_string(), PeerCtx::unauthorized());
+        let bus = MessageBus::new(64).unwrap();
+
+        // Consent OFF: the arm is refused exactly as before.
+        dispatch_action(
+            arm_action("arm-jti-refused"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(!ctx.arm.lock().unwrap().is_armed());
+
+        with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
+        dispatch_action(
+            arm_action("arm-jti-1"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(ctx.arm.lock().unwrap().is_armed(), "valid arm proceeds");
+        assert!(ctx.audit.health().unavailable, "the failure is surfaced");
+        // The dead-man deadline still governs.
+        assert!(!ctx
+            .arm
+            .lock()
+            .unwrap()
+            .tx_permitted(at(NOW + HEARTBEAT_TIMEOUT_MS), ConsentChannel::StationAgent));
+
+        // A mismatched-JTI disarm from a non-controller still disarms.
+        dispatch_action(
+            ControlAction::Disarm {
+                arm_jti: "not-this-arm".into(),
+            },
+            PEER_B,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(!ctx.arm.lock().unwrap().is_armed());
+
+        // An explicit controller disarm too.
+        dispatch_action(
+            arm_action("arm-jti-2"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(ctx.arm.lock().unwrap().is_armed());
+        dispatch_action(
+            ControlAction::Disarm {
+                arm_jti: "arm-jti-2".into(),
+            },
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(!ctx.arm.lock().unwrap().is_armed());
+        assert!(ctx.audit.health().failed_events >= 2);
+    }
+
     /// Rule 2: `releaseControl` from the current controller disarms (if armed)
     /// and clears the controller; from anyone else it is a silent no-op.
     #[tokio::test]
@@ -8448,6 +8529,41 @@ mod tests {
             disarmed_before + 1,
             "no duplicate Disarmed record"
         );
+    }
+
+    /// PAN-104: an audit sink whose writes fail (its parent does not exist).
+    fn failing_audit_log() -> AuditLog {
+        AuditLog::new(audit_tmp().join("missing-dir").join("audit.log"))
+    }
+
+    /// PAN-104: a revocation still disarms and unpublishes eligibility when
+    /// the audit write fails, and the failure is surfaced.
+    #[tokio::test]
+    async fn static_revocation_disarms_despite_a_failing_audit_sink() {
+        let identity = AgentIdentity::generate();
+        let (mut ctx, _sess, _outbound, _transports, _ws) = two_authorized_peers(&identity);
+        ctx.audit = failing_audit_log();
+        arm_controller(&mut ctx, CLIENT_KEY_ID);
+        let live = live_handles_for(&ctx);
+        assert!(revoke_static_allow_list_entries(
+            &live,
+            &ctx.arm,
+            &ctx.audit,
+            &[CLIENT_KEY_ID.to_string()],
+            NOW,
+        ));
+        assert!(!ctx.arm.lock().unwrap().is_armed());
+        assert!(!live
+            .tx_arm_allow_list
+            .read()
+            .unwrap()
+            .contains(CLIENT_KEY_ID));
+        assert!(!crate::coordinator::tx::remote_tx_permitted_for(
+            &ctx.arm,
+            || at(NOW),
+            Some(CLIENT_KEY_ID)
+        ));
+        assert!(ctx.audit.health().unavailable);
     }
 
     #[tokio::test]

@@ -1809,7 +1809,7 @@ mod supervisor_tests {
 #[cfg(test)]
 mod degraded_summary_tests {
     use super::super::{ComponentState, ComponentStatus};
-    use super::degraded_summary;
+    use super::{degraded_summary, start_audit_maintenance};
     use crate::message_bus::ComponentId;
     use std::collections::HashMap;
     use std::time::Instant;

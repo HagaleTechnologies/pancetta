@@ -21689,7 +21689,9 @@ mod pan135_disarm_flush_tests {
 }
 #[cfg(test)]
 mod pan135_worker_disarm_tests {
-    use super::pan115_worker_gate_tests::{await_ptt_on, worker_harness, Harness};
+    use super::pan115_worker_gate_tests::{
+        await_ptt_on, worker_harness, worker_harness_with_config, Harness,
+    };
     use super::*;
     use crate::message_bus::{RigControlMessage, TxOrigin};
     use crossbeam_channel::Receiver;
@@ -21698,7 +21700,10 @@ mod pan135_worker_disarm_tests {
     const TEXT: &str = "CQ N0CALL FN20";
 
     async fn remote_playback() -> (Harness, Receiver<ComponentMessage>) {
-        let h = worker_harness().await;
+        remote_playback_with(worker_harness().await).await
+    }
+
+    async fn remote_playback_with(h: Harness) -> (Harness, Receiver<ComponentMessage>) {
         let (_, audio_rx) = h
             .coordinator
             .message_bus
@@ -21844,6 +21849,35 @@ mod pan135_worker_disarm_tests {
             "the stood-down guard must not duplicate the unkey"
         );
         assert!(!h.coordinator.ptt_active.load(Ordering::Acquire));
+    }
+
+    /// PAN-104: a failing audit sink never prevents or reorders the unkey;
+    /// the interrupt's audit record is attempted after PTT-off and its
+    /// failure is surfaced through the shared audit health.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_mid_playback_disarm_unkeys_with_a_failing_audit_sink() {
+        let mut cfg = pancetta_config::Config::default();
+        cfg.network.station_agent.audit_log_path = Some(
+            std::env::temp_dir()
+                .join(format!("pancetta-pan104-missing-{}", uuid::Uuid::new_v4()))
+                .join("audit.log")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let (h, audio_rx) = remote_playback_with(worker_harness_with_config(cfg).await).await;
+        disarm(&h);
+        let ack = flush_ack(&audio_rx).await;
+        assert_eq!(ptt_offs(&h), 1, "PTT-off precedes the flush");
+        ack.complete(true);
+        await_failed_completion(&h).await;
+        assert!(!h.coordinator.ptt_active.load(Ordering::Acquire));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !h.coordinator.audit_log().health().unavailable {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the failed audit write is surfaced");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
