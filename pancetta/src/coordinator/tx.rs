@@ -21856,15 +21856,8 @@ mod pan135_worker_disarm_tests {
     /// failure is surfaced through the shared audit health.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remote_mid_playback_disarm_unkeys_with_a_failing_audit_sink() {
-        let mut cfg = pancetta_config::Config::default();
-        cfg.network.station_agent.audit_log_path = Some(
-            std::env::temp_dir()
-                .join(format!("pancetta-pan104-missing-{}", uuid::Uuid::new_v4()))
-                .join("audit.log")
-                .to_string_lossy()
-                .into_owned(),
-        );
-        let (h, audio_rx) = remote_playback_with(worker_harness_with_config(cfg).await).await;
+        let (h, audio_rx) =
+            remote_playback_with(worker_harness_with_config(failing_audit_config()).await).await;
         disarm(&h);
         let ack = flush_ack(&audio_rx).await;
         assert_eq!(ptt_offs(&h), 1, "PTT-off precedes the flush");
@@ -21880,9 +21873,34 @@ mod pan135_worker_disarm_tests {
         .expect("the failed audit write is surfaced");
     }
 
+    fn failing_audit_config() -> pancetta_config::Config {
+        let mut cfg = pancetta_config::Config::default();
+        cfg.network.station_agent.audit_log_path = Some(
+            std::env::temp_dir()
+                .join(format!("pancetta-pan104-missing-{}", uuid::Uuid::new_v4()))
+                .join("audit.log")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        cfg
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remote_mid_playback_disarm_with_hamlib_backlogged_still_unkeys() {
         let (h, audio_rx) = remote_playback().await;
+        backlogged_disarm_still_unkeys(h, audio_rx).await;
+    }
+
+    /// PAN-104: the backlogged-Hamlib unkey and its flush-ack ordering hold
+    /// with a failing audit sink too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backlogged_disarm_unkeys_with_a_failing_audit_sink() {
+        let (h, audio_rx) =
+            remote_playback_with(worker_harness_with_config(failing_audit_config()).await).await;
+        backlogged_disarm_still_unkeys(h, audio_rx).await;
+    }
+
+    async fn backlogged_disarm_still_unkeys(h: Harness, audio_rx: Receiver<ComponentMessage>) {
         let bus = &h.coordinator.message_bus;
         let mut filled = 0;
         while bus

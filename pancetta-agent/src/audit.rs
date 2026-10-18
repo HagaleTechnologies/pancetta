@@ -1495,11 +1495,7 @@ mod tests {
         for step in 0..(t_secs * 10) {
             for (k, kind) in EVENT_KINDS.iter().enumerate() {
                 for j in 0..100 {
-                    let ts = if j % 2 == 0 {
-                        i64::MAX - j
-                    } else {
-                        -j
-                    };
+                    let ts = if j % 2 == 0 { i64::MAX - j } else { -j };
                     let op = format!("OP{step}-{k}-{j}");
                     if log.append(&ev(ts, kind.clone(), Some(&op), &op)).unwrap()
                         == AuditAppendOutcome::Recorded
