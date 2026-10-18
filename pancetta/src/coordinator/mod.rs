@@ -40,6 +40,7 @@ pub mod station_agent;
 mod tier;
 mod tui_relay;
 mod tx;
+mod tx_log;
 mod util;
 mod wav_playback;
 pub(crate) mod wsjtx_udp;
@@ -1436,6 +1437,11 @@ pub struct ApplicationCoordinator {
     /// not handled yet. Owned here so a supervised worker restart keeps them.
     pub(crate) tx_requeue: tx::TxRequeue,
 
+    /// PAN-122: the durable local TX log (`~/.pancetta/tx-log.jsonl`). Created
+    /// by the first `start_transmitter_component` and reused on every
+    /// supervisor restart, so the file never has two writers. `None` until then.
+    pub(crate) tx_frame_log: Option<Arc<tx_log::TxFrameLog>>,
+
     /// Test handshake after waveform construction, immediately before the gate wait.
     #[cfg(test)]
     tx_before_ptt_gate: Arc<tokio::sync::Notify>,
@@ -2242,6 +2248,7 @@ impl ApplicationCoordinator {
             ptt_sync_gate: Arc::new(tokio::sync::Mutex::new(())),
             relocation_epochs: Arc::new(pancetta_qso::qso_manager::TxRelocationEpochs::default()),
             tx_requeue: tx::TxRequeue::default(),
+            tx_frame_log: None,
             #[cfg(test)]
             tx_before_ptt_gate: Arc::new(tokio::sync::Notify::new()),
             last_ptt_on_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2713,6 +2720,9 @@ impl ApplicationCoordinator {
     ///   into a demo process.
     /// - Clock-skew monitor (`coordinator/clock_monitor.rs`) — not started, so
     ///   no SNTP query leaves a replay.
+    /// - Local TX log (`tx.rs`, `ensure_tx_frame_log`) — `~/.pancetta/tx-log.jsonl`
+    ///   is not opened. Replay starts no Hamlib, so no frame is really
+    ///   transmitted.
     ///
     /// Add new outbound integrations — and any new persistence of a
     /// "completed" contact — to that list rather than inventing a second

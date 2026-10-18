@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Local TX log (PAN-122): every transmitted frame is appended to
+  `~/.pancetta/tx-log.jsonl` as one JSON line (`v`, `utc`, `mode`, `dial_hz`,
+  `offset_hz`, `text`, `origin`, `qso_id`), headless or with the TUI. The TX
+  worker writes each record itself (never through the message bus) with one
+  `write_all` plus `sync_data` once the frame's audio is handed to the audio
+  output, so the record survives a burst of decodes or a crash right after.
+  Each bundle item gets its own line. The file rotates at 8 MiB and keeps 7
+  archives (`tx-log.jsonl.1` … `.7`, at most 64 MiB). `--replay` writes
+  nothing. A write failure never stops TX: it shows as an `ERROR` line that
+  carries the frame text, and a disk slower than 250 ms shows as a `WARN`
+  while the record is still written when the disk responds.
 - `pancetta import <FILE> [--dry-run]` (PAN-127): bring an existing ADIF
   log from WSJT-X, N1MM, LoTW, QRZ or another logger into Pancetta. New
   contacts are appended to `~/.pancetta/qsos.adi` with every field kept as

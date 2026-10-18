@@ -759,6 +759,44 @@ into a fresh `qsos.adi` before switching over. No manual action required.
 and backs up `qsos.adi` first. Do not copy another logger's file over
 `qsos.adi`: that replaces your own contacts.
 
+### TX log
+
+| File | Role | Safe to delete? |
+|---|---|---|
+| `~/.pancetta/tx-log.jsonl` | One JSON line per transmitted frame, appended (and fsynced) as the frame's audio starts. Written headless and with the TUI. | Yes — an operating record only; not used by pancetta at runtime. |
+| `~/.pancetta/tx-log.jsonl.1` … `.7` | Rotated archives, `.1` newest. Rotation happens before an append that would push the active file past 8 MiB; a bundle is never split across files. At most 64 MiB in total. | Yes — an operating record only; not used by pancetta at runtime. |
+
+Each line:
+
+```
+{"v":1,"utc":"2026-10-18T14:30:15.012345678Z","mode":"FT8","dial_hz":14074000,"offset_hz":1500.0,"text":"CQ W5AU EM10","origin":"Local","qso_id":null}
+```
+
+| Field | Meaning |
+|---|---|
+| `v` | Record schema version, `1`. |
+| `utc` | When the frame's audio was handed to the audio output (RFC 3339, UTC). The same instant as the TUI Band Activity row. |
+| `mode` | `"FT8"`, `"FT4"` or `"FT2"`. |
+| `dial_hz` | Effective TX dial in Hz, split-aware (the split dial when split is active, otherwise the RX dial). `null` when no dial is known yet (rig not reporting, rig-less dev modes). |
+| `offset_hz` | Audio offset in Hz. RF = `dial_hz + offset_hz`. |
+| `text` | The exact message transmitted. |
+| `origin` | `"Local"` or `"Remote"` (station-agent remote operation). |
+| `qso_id` | The QSO this frame belongs to; `null` for CQ / manual / test frames. |
+
+A record means the frame's audio was accepted for output while PTT was keyed.
+It does not mean the whole frame went out: an operator abort or remote disarm
+mid-frame still leaves the record, and a mid-slot re-key with fresher text
+adds a second record. Frames refused before PTT, denied at the last
+authorization check, or whose audio could not be enqueued get no record. The
+items of a multi-TX bundle each get a line and share one `utc`.
+
+Durability: each append is one `write_all` followed by `sync_data`, so a
+record survives a pancetta crash immediately afterwards, and an fsync is
+requested for OS crash or power loss (a disk's own write cache is outside
+that promise). A write failure never stops TX; it logs an `ERROR` line
+carrying the frame text. `--replay` opens no TX log. There are no settings
+for this file.
+
 ---
 
 ## Where to look next
