@@ -3225,6 +3225,7 @@ impl super::ApplicationCoordinator {
                 // file the rebuild deleted (#453). Nothing can complete a QSO
                 // before this point: the decode/command loops below have not
                 // started yet.
+                qso_lookup.reset_display_history();
                 let (_adif_writer, _async_logger, live_seed_db) = start_local_qso_log_writers(
                     replay_mode,
                     &adif_path,
@@ -3314,13 +3315,7 @@ impl super::ApplicationCoordinator {
                             qso_lookup.seed_worked_dxcc_from_list(band_callsign_pairs);
                         }
 
-                        let band_grid_pairs = db.get_worked_bands_and_grids().await;
-                        qso_lookup.seed_worked_grids_from_list(band_grid_pairs);
-
-                        // PAN-85: seed the DX Hunter's US-state display from
-                        // any prior contact whose log record carries a state.
-                        qso_lookup
-                            .seed_states_from_list(db.get_worked_callsigns_and_states().await);
+                        qso_lookup.seed_display_history(&db).await;
                     } else {
                         warn!(
                             "Could not open QSO database for startup seed ({}) — \
@@ -3377,14 +3372,7 @@ impl super::ApplicationCoordinator {
                                 qso_lookup.seed_worked_dxcc_from_list(band_callsign_pairs);
                             }
 
-                            let band_grid_pairs = db.get_worked_bands_and_grids().await;
-                            qso_lookup.seed_worked_grids_from_list(band_grid_pairs);
-
-                            // PAN-85: seed the DX Hunter's US-state display
-                            // from any prior contact whose log record
-                            // carries a state.
-                            qso_lookup
-                                .seed_states_from_list(db.get_worked_callsigns_and_states().await);
+                            qso_lookup.seed_display_history(&db).await;
                         }
                         Err(e) => {
                             info!(
@@ -3991,19 +3979,7 @@ impl super::ApplicationCoordinator {
                                     );
                                     let _ = snapshot_bus.send_message(recent_msg).await;
 
-                                    let band =
-                                        pancetta_qso::utils::frequency_to_band(metadata.frequency);
-                                    qso_lookup.record_worked(their_call, &band);
-                                    if let Some(grid) = metadata.grids.theirs.as_deref() {
-                                        qso_lookup.record_worked_grid(grid, &band);
-                                    }
-                                    // PAN-85: a completed QSO whose metadata carries
-                                    // a state (ADIF import, or QRZ enrichment on a
-                                    // prior QSO) makes it available to the DX Hunter
-                                    // display for the rest of the session.
-                                    if let Some(state) = metadata.their_state.as_deref() {
-                                        qso_lookup.record_state(their_call, state);
-                                    }
+                                    qso_lookup.record_completed_contact(&metadata);
 
                                     // item-2-auto-73: stash MANUAL completions so
                                     // that if this DX keeps re-sending RR73/RRR (they
@@ -9074,12 +9050,7 @@ fn start_qso_upload_subscriber(
                     // PAN-85: session-scoped only — the ADIF writer and the
                     // SQLite logger already consumed their own copies of this
                     // event, so this value is not persisted (see D6).
-                    if let (Some(call), Some(state)) = (
-                        metadata.their_callsign.as_deref(),
-                        metadata.their_state.as_deref(),
-                    ) {
-                        station_lookup.record_state(call, state);
-                    }
+                    station_lookup.record_completed_state(&metadata);
 
                     // Render the single ADIF record the same way the
                     // source-of-truth writer does.
@@ -9822,6 +9793,62 @@ mod qrz_enrichment_tests {
         let mut m = metadata(their_grid, None);
         m.their_callsign = Some("W5ABC".to_string());
         m
+    }
+
+    #[test]
+    fn completed_state_history_includes_metadata_and_late_qrz_only_after_completion() {
+        let cache = crate::priority_evaluator::CachedStationLookup::new();
+        let mut m = us_metadata(Some("EM34"));
+        cache.record_state("W5ABC", "AR");
+        cache.record_completed_contact(&m);
+        assert!(
+            cache.is_state_needed("AR"),
+            "missing completion state is not invented"
+        );
+        m.their_state = Some("TX".into());
+        cache.record_completed_contact(&m);
+        assert!(!cache.is_state_needed("TX"));
+        m.their_state = None;
+        merge_qrz_lookup(
+            &mut m,
+            &QrzLookup {
+                state: Some("AR".into()),
+                ..lookup(None, None)
+            },
+        );
+        cache.record_completed_state(&m);
+        assert!(!cache.is_state_needed("AR"));
+        assert_eq!(cache.state_for("W5ABC").as_deref(), Some("AR"));
+    }
+
+    #[tokio::test]
+    async fn live_and_replay_display_history_seeds_agree() {
+        use pancetta_qso::async_database::QsoDatabase;
+        use pancetta_qso::priority::WorkedStationLookup;
+        let dir = tempfile::tempdir().unwrap();
+        let adif_path = dir.path().join("history.adi");
+        let fixture = "<EOH>\n<CALL:5>W5ABC <QSO_DATE:8>20250102 <TIME_ON:6>120000 <MODE:3>FT8 <FREQ:9>14.074000 <GRIDSQUARE:4>EM34 <STATE:2>CA <EOR>\n<CALL:5>W5ABC <QSO_DATE:8>20250101 <TIME_ON:6>120000 <MODE:3>FT8 <FREQ:9>14.074000 <GRIDSQUARE:4>EM34 <STATE:2>AR <EOR>";
+        tokio::fs::write(&adif_path, fixture).await.unwrap();
+        let live = QsoDatabase::new_in_memory().await.unwrap();
+        let processor = pancetta_qso::AdifProcessor::new();
+        live.insert_adif_records(
+            &processor,
+            &processor.parse_string(fixture).unwrap().records,
+        )
+        .await
+        .unwrap();
+        let replay = QsoDatabase::replay_from_adif(":memory:", &adif_path)
+            .await
+            .unwrap();
+        for db in [&live, &replay] {
+            let cache = crate::priority_evaluator::CachedStationLookup::new();
+            cache.seed_display_history(db).await;
+            assert!(!cache.is_state_needed("AR"));
+            assert!(!cache.is_state_needed("CA"));
+            assert_eq!(cache.state_for("W5ABC").as_deref(), Some("CA"));
+            assert!(!cache.is_grid_needed_on_band("em34ab", 14_074_000.0));
+            assert!(cache.is_grid_needed_on_band("EM34", 7_074_000.0));
+        }
     }
 
     #[test]

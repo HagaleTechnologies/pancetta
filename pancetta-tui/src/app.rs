@@ -1378,6 +1378,8 @@ pub struct App {
     /// a per-spot observation, and because it must survive a station
     /// re-appearing from a different source (PAN-85 / D5).
     pub dx_states: HashMap<String, String>,
+    /// Rebuilt before each frame; deliberately absent from band snapshots.
+    dx_need: HashMap<String, crate::dx_need::DxNeedStatus>,
     pub band_activity_scroll: usize,
     /// The callsign the Band Activity cursor is pinned to. The list reorders
     /// on EVERY decode window (directed-at-us pinned first, then newest-first),
@@ -1708,6 +1710,7 @@ impl App {
             station_info,
             dx_stations: HashMap::new(),
             dx_states: HashMap::new(),
+            dx_need: HashMap::new(),
             band_activity_scroll: 0,
             band_activity_pinned_call: None,
             dx_hunter_scroll: 0,
@@ -2586,6 +2589,40 @@ impl App {
     pub fn station_state_for(&self, callsign: &str) -> Option<&str> {
         let key = station_state_key(callsign)?;
         self.dx_states.get(&key).map(String::as_str)
+    }
+
+    /// Prepare owned display data, releasing every lookup lock before drawing.
+    pub fn refresh_dx_need(&mut self, lookup: Option<&dyn crate::dx_need::DxNeedLookup>) {
+        let current_hz = self.station_info.operating_frequency * 1_000_000.0;
+        // Match displayed_dx_stations eligibility before allocating or taking
+        // lookup locks. The backing station map can retain older, hidden rows.
+        let cutoff = Utc::now() - chrono::Duration::seconds(Self::DX_HUNTER_STALE_SECS);
+        let our_call = self.station_info.call_sign.trim();
+        self.dx_need = lookup
+            .map(|lookup| {
+                self.dx_stations
+                    .iter()
+                    .filter(|(_, row)| row.last_seen > cutoff)
+                    .filter(|(_, row)| {
+                        our_call.is_empty() || !row.call_sign.eq_ignore_ascii_case(our_call)
+                    })
+                    .map(|(key, row)| {
+                        let status = lookup.lookup_need(
+                            &row.call_sign,
+                            row.grid_square.as_deref(),
+                            self.station_state_for(&row.call_sign),
+                            current_hz,
+                        );
+                        (key.clone(), status)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+
+    /// The exact DX-row key, including its original case/hash rendering.
+    pub fn dx_need_for(&self, key: &str) -> Option<&crate::dx_need::DxNeedStatus> {
+        self.dx_need.get(key)
     }
 
     /// Called when the radio reports its actual frequency (via hamlib/rigctld).
@@ -4979,6 +5016,172 @@ mod tests {
         App::new(Config::default(), None)
             .await
             .expect("default Config should construct App")
+    }
+
+    struct MutableNeed(std::sync::atomic::AtomicBool);
+
+    impl crate::dx_need::DxNeedLookup for MutableNeed {
+        fn lookup_need(
+            &self,
+            _call: &str,
+            grid: Option<&str>,
+            state: Option<&str>,
+            hz: f64,
+        ) -> crate::dx_need::DxNeedStatus {
+            let worked = self.0.load(std::sync::atomic::Ordering::Relaxed);
+            crate::dx_need::DxNeedStatus {
+                grid_needed: grid.map(|_| !worked || hz != 14_074_000.0),
+                state: state.map(str::to_string),
+                state_needed: state.map(|_| !worked),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dx_need_refresh_looks_up_only_display_eligible_rows() {
+        #[derive(Default)]
+        struct CountingNeed(std::sync::Mutex<Vec<String>>);
+        impl crate::dx_need::DxNeedLookup for CountingNeed {
+            fn lookup_need(
+                &self,
+                call: &str,
+                _: Option<&str>,
+                _: Option<&str>,
+                _: f64,
+            ) -> crate::dx_need::DxNeedStatus {
+                self.0.lock().unwrap().push(call.to_string());
+                crate::dx_need::DxNeedStatus::default()
+            }
+        }
+
+        let mut app = fixture_app().await;
+        let provider = CountingNeed::default();
+        let old = Utc::now() - chrono::Duration::seconds(App::DX_HUNTER_STALE_SECS + 5);
+        for i in 0..1000 {
+            let call = format!("W{i}OLD");
+            let mut row = dx_fixture(&call, 50, 10, 14.074, false);
+            row.last_seen = old;
+            app.dx_stations.insert(call, row);
+        }
+        app.station_info.call_sign = " W5SELF ".into();
+        for call in ["w5self", "W5ABC"] {
+            app.dx_stations
+                .insert(call.into(), dx_fixture(call, 50, 10, 14.074, false));
+        }
+        app.refresh_dx_need(Some(&provider));
+        assert_eq!(*provider.0.lock().unwrap(), vec!["W5ABC"]);
+        assert!(app.dx_need_for("W5ABC").is_some());
+        assert_eq!(app.dx_need.len(), 1);
+        assert_eq!(app.dx_stations.len(), 1002, "retain the backing history");
+
+        // An expired row loses its derived status; a newly heard row gains it.
+        provider.0.lock().unwrap().clear();
+        app.dx_stations.get_mut("W5ABC").unwrap().last_seen = old;
+        app.dx_stations.get_mut("W0OLD").unwrap().last_seen = Utc::now();
+        app.refresh_dx_need(Some(&provider));
+        assert_eq!(*provider.0.lock().unwrap(), vec!["W0OLD"]);
+        assert!(app.dx_need_for("W5ABC").is_none());
+        assert!(app.dx_need_for("W0OLD").is_some());
+        assert_eq!(app.dx_need.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dx_need_refresh_updates_existing_rows_and_drops_removed_keys() {
+        let mut app = fixture_app().await;
+        app.station_info.operating_frequency = 14.074;
+        let provider = MutableNeed(std::sync::atomic::AtomicBool::new(false));
+        for call in ["w5abc", "<W1XYZ>"] {
+            let mut view = fixture_view(call, -10);
+            view.grid_square = Some("em34ab".into());
+            app.add_decoded_message(view).await.unwrap();
+            app.set_station_state(call, "AR");
+        }
+        app.refresh_dx_need(Some(&provider));
+        for call in ["w5abc", "<W1XYZ>"] {
+            let status = app.dx_need_for(call).unwrap();
+            assert_eq!(status.grid_needed, Some(true));
+            assert_eq!(status.state_needed, Some(true));
+        }
+        provider.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        app.refresh_dx_need(Some(&provider));
+        for call in ["w5abc", "<W1XYZ>"] {
+            let status = app.dx_need_for(call).unwrap();
+            assert_eq!(status.grid_needed, Some(false));
+            assert_eq!(status.state_needed, Some(false));
+        }
+        app.dx_stations.remove("w5abc");
+        app.refresh_dx_need(Some(&provider));
+        assert!(app.dx_need_for("w5abc").is_none());
+        app.refresh_dx_need(None);
+        assert!(app.dx_need_for("<W1XYZ>").is_none());
+        assert_eq!(app.station_state_for("<W1XYZ>"), Some("AR"));
+    }
+
+    #[tokio::test]
+    async fn dx_need_uses_retained_grids_for_all_sources_and_current_band() {
+        let mut app = fixture_app().await;
+        app.station_info.operating_frequency = 14.074;
+        let provider = MutableNeed(std::sync::atomic::AtomicBool::new(true));
+        app.add_dx_spot(
+            "W5ABC".into(),
+            7.074,
+            "FT8".into(),
+            -10,
+            false,
+            false,
+            false,
+            false,
+        );
+        app.refresh_dx_need(Some(&provider));
+        assert_eq!(app.dx_need_for("W5ABC").unwrap().grid_needed, None);
+        let mut view = fixture_view("W5ABC", -10);
+        view.grid_square = Some("EM34".into());
+        app.add_decoded_message(view).await.unwrap();
+        app.add_decoded_message(fixture_view("W5ABC", -8))
+            .await
+            .unwrap();
+        app.merge_spot_groups(&[crate::tui_runner::CqdxSpotInfo {
+            dx_call: "W1XYZ".into(),
+            band: "40m".into(),
+            mode: "FT8".into(),
+            frequency_hz: 7_074_000,
+            grid: Some("EM34".into()),
+            rarity_tier: "common".into(),
+            reporter_count: 2,
+            best_snr: Some(-10),
+            confidence: 0.9,
+            first_seen: Utc::now().timestamp(),
+            last_seen: Utc::now().timestamp(),
+            is_notable: false,
+            notable_type: None,
+            entity_name: "United States".into(),
+            needed: false,
+            atno: false,
+        }]);
+        for call in ["W5ABC", "W1XYZ"] {
+            app.set_station_state(call, "AR");
+        }
+        app.refresh_dx_need(Some(&provider));
+        for call in ["W5ABC", "W1XYZ"] {
+            assert_eq!(app.dx_stations[call].grid_square.as_deref(), Some("EM34"));
+            assert_eq!(
+                app.dx_need_for(call).unwrap().grid_needed,
+                Some(false),
+                "current 20m even for an off-band row"
+            );
+        }
+        app.station_info.operating_frequency = 7.074;
+        app.refresh_dx_need(Some(&provider));
+        assert_eq!(app.dx_need_for("W1XYZ").unwrap().grid_needed, Some(true));
+        assert_eq!(app.dx_need_for("W1XYZ").unwrap().state_needed, Some(false));
+        app.station_info.operating_frequency = 14.074;
+        app.band_up();
+        app.refresh_dx_need(Some(&provider));
+        assert!(app.dx_need_for("W1XYZ").is_none());
+        app.band_down();
+        app.refresh_dx_need(Some(&provider));
+        assert_eq!(app.dx_need_for("W1XYZ").unwrap().grid_needed, Some(false));
+        assert_eq!(app.dx_need_for("W1XYZ").unwrap().state_needed, Some(false));
     }
 
     // --- PAN-85: per-callsign US state store ---

@@ -2,7 +2,7 @@ use anyhow::Result;
 use ratatui::{
     layout::{Constraint, Rect},
     style::{Modifier, Style},
-    text::Span,
+    text::{Line, Span},
     widgets::{Cell, Row, Table, TableState},
     Frame,
 };
@@ -93,7 +93,7 @@ impl DxHunterColumn {
             DxHunterColumn::Call => Constraint::Length(12),
             // Flexes into the freed Freq space.
             DxHunterColumn::Entity => Constraint::Min(8),
-            DxHunterColumn::Grid => Constraint::Length(4),
+            DxHunterColumn::Grid => Constraint::Length(5),
             DxHunterColumn::Snr => Constraint::Length(4),
             DxHunterColumn::Rarity => Constraint::Length(7),
             DxHunterColumn::Rpt => Constraint::Length(3),
@@ -246,6 +246,30 @@ fn entity_cell_text(station: &DxStation, state: Option<&str>) -> String {
     }
 }
 
+/// Needed Grid and state tokens share the existing DXCC `+`/bold convention.
+fn needed_span(
+    value: String,
+    needed: bool,
+    normal: Style,
+    stale: bool,
+    app: &App,
+) -> Span<'static> {
+    if needed {
+        Span::styled(
+            format!("+{value}"),
+            Style::default()
+                .fg(if stale {
+                    app.theme.muted_color()
+                } else {
+                    app.theme.error_color()
+                })
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(value, normal)
+    }
+}
+
 fn create_dx_row<'a>(station: &'a DxStation, app: &App, columns: &[DxHunterColumn]) -> Row<'a> {
     // Cross-panel global focus (Task 2): when some OTHER panel is active and
     // this row's callsign is the operator's current focus, flag it here too
@@ -336,8 +360,7 @@ fn create_dx_row<'a>(station: &'a DxStation, app: &App, columns: &[DxHunterColum
         call_style
     };
 
-    let grid_str = station.grid_square.as_deref().unwrap_or("---").to_string();
-    let entity_str = entity_cell_text(station, app.station_state_for(&station.call_sign));
+    let need = app.dx_need_for(&station.call_sign);
     // A pure network spot with no reported SNR stores snr:0, which is
     // indistinguishable from a real 0 dB. Render it as "---" so the operator
     // doesn't read a missing value as a strong-but-zero signal. Local decodes
@@ -356,6 +379,39 @@ fn create_dx_row<'a>(station: &'a DxStation, app: &App, columns: &[DxHunterColum
     } else {
         Style::default().fg(app.theme.foreground_color())
     };
+
+    let grid_span = match station
+        .grid_square
+        .as_deref()
+        .and_then(crate::dx_need::canonical_grid_square)
+    {
+        Some(square) => needed_span(
+            square,
+            need.is_some_and(|n| n.grid_needed == Some(true)),
+            dim,
+            is_stale,
+            app,
+        ),
+        None => Span::styled("---", dim),
+    };
+    let entity = entity_cell_text(station, None);
+    let state = need
+        .and_then(|n| n.state.as_deref())
+        .or_else(|| app.station_state_for(&station.call_sign))
+        .filter(|_| crate::dxcc::is_us_related_entity(&entity))
+        .and_then(crate::dxcc::normalize_us_state);
+    let entity_style = Style::default().fg(app.theme.accent_color());
+    let mut entity_spans = vec![Span::styled(entity, entity_style)];
+    if let Some(code) = state {
+        entity_spans.push(Span::styled(" - ", entity_style));
+        entity_spans.push(needed_span(
+            code.to_string(),
+            need.is_some_and(|n| n.state_needed == Some(true)),
+            entity_style,
+            is_stale,
+            app,
+        ));
+    }
 
     let rarity_style = match station.rarity_tier.as_deref() {
         Some("legendary") => Style::default()
@@ -401,11 +457,8 @@ fn create_dx_row<'a>(station: &'a DxStation, app: &App, columns: &[DxHunterColum
                 DxHunterColumn::Call,
                 Cell::from(call_display).style(call_style),
             ),
-            (
-                DxHunterColumn::Entity,
-                Cell::from(entity_str).style(Style::default().fg(app.theme.accent_color())),
-            ),
-            (DxHunterColumn::Grid, Cell::from(grid_str).style(dim)),
+            (DxHunterColumn::Entity, Cell::from(Line::from(entity_spans))),
+            (DxHunterColumn::Grid, Cell::from(Line::from(grid_span))),
             (DxHunterColumn::Snr, Cell::from(snr_str).style(snr_style)),
             (
                 DxHunterColumn::Rarity,
@@ -543,6 +596,204 @@ fn extract_base_prefix(call_sign: &str) -> String {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    struct Need(crate::dx_need::DxNeedStatus);
+    impl crate::dx_need::DxNeedLookup for Need {
+        fn lookup_need(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: f64,
+        ) -> crate::dx_need::DxNeedStatus {
+            self.0.clone()
+        }
+    }
+
+    fn refresh_need(app: &mut App, needed: Option<bool>) {
+        app.refresh_dx_need(Some(&Need(crate::dx_need::DxNeedStatus {
+            grid_needed: needed,
+            state: Some("AR".into()),
+            state_needed: needed,
+        })));
+    }
+
+    fn render_buffer(app: &App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|f| render_dx_hunter(f, f.area(), app).unwrap())
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn text(buf: &ratatui::buffer::Buffer) -> String {
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn cell_at_text<'a>(
+        buf: &'a ratatui::buffer::Buffer,
+        needle: &str,
+    ) -> &'a ratatui::buffer::Cell {
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            if let Some(byte) = row.find(needle) {
+                let x = row[..byte].chars().count() as u16;
+                return &buf[(x, y)];
+            }
+        }
+        panic!("missing {needle:?} in {}", text(buf));
+    }
+
+    async fn needed_app() -> App {
+        let mut app = App::new(crate::Config::default(), None).await.unwrap();
+        let mut station = make_test_station("W5ABC");
+        station.grid_square = Some("em34ab".into());
+        station.needed = true;
+        app.dx_stations.insert(station.call_sign.clone(), station);
+        app.set_station_state("W5ABC", "AR");
+        refresh_need(&mut app, Some(true));
+        app
+    }
+
+    #[tokio::test]
+    async fn needed_grid_and_state_render_glyphs_and_only_their_own_highlight() {
+        let mut app = needed_app().await;
+        let buf = render_buffer(&app, 100, 8);
+        assert!(text(&buf).contains("United States - +AR"));
+        assert!(
+            text(&buf).contains("+W5ABC"),
+            "existing call marker remains"
+        );
+        for token in ["+EM34", "+AR"] {
+            let cell = cell_at_text(&buf, token);
+            assert_eq!(cell.fg, app.theme.error_color());
+            assert!(cell.modifier.contains(Modifier::BOLD));
+        }
+        let entity = cell_at_text(&buf, "United States");
+        assert_eq!(entity.fg, app.theme.accent_color());
+        assert!(!entity.modifier.contains(Modifier::BOLD));
+        assert_eq!(
+            app.dx_stations["W5ABC"].grid_square.as_deref(),
+            Some("em34ab")
+        );
+        refresh_need(&mut app, Some(false));
+        let buf = render_buffer(&app, 100, 8);
+        assert!(text(&buf).contains("United States - AR"));
+        assert!(!text(&buf).contains("+AR"));
+        assert!(!text(&buf).contains("+EM34"));
+        assert!(text(&buf).contains("+W5ABC"));
+        let grid = cell_at_text(&buf, "EM34");
+        assert_eq!(grid.fg, app.theme.foreground_color());
+        assert!(!grid.modifier.contains(Modifier::BOLD));
+        assert_eq!(cell_at_text(&buf, "AR").fg, app.theme.accent_color());
+    }
+
+    #[tokio::test]
+    async fn stale_and_selected_need_markers_remain_legible() {
+        let mut app = needed_app().await;
+        let station = app.dx_stations.get_mut("W5ABC").unwrap();
+        station.source = SpotSource::Network;
+        station.last_seen_network = Some(chrono::Utc::now().timestamp() - 601);
+        for selected in [false, true] {
+            app.active_panel = if selected {
+                ActivePanel::DxHunter
+            } else {
+                ActivePanel::BandActivity
+            };
+            let buf = render_buffer(&app, 100, 8);
+            for token in ["+EM34", "+AR"] {
+                let cell = cell_at_text(&buf, token);
+                assert_eq!(cell.fg, app.theme.muted_color());
+                assert!(cell.modifier.contains(Modifier::BOLD));
+                assert_eq!(cell.modifier.contains(Modifier::REVERSED), selected);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_history_and_no_provider_render_plain_known_values() {
+        let mut app = needed_app().await;
+        for history in [None, Some(false)] {
+            refresh_need(&mut app, history);
+            let buf = render_buffer(&app, 100, 8);
+            assert!(text(&buf).contains("United States - AR"));
+            assert!(!text(&buf).contains("+EM34"));
+            assert!(!text(&buf).contains("+AR"));
+        }
+        app.refresh_dx_need(None);
+        let buf = render_buffer(&app, 100, 8);
+        assert!(text(&buf).contains("United States - AR"));
+        assert!(!text(&buf).contains("+EM34"));
+    }
+
+    #[tokio::test]
+    async fn render_validates_grid_and_state_and_preserves_entity_precedence() {
+        let mut app = needed_app().await;
+        for (call, entity, state, expected) in [
+            ("JA1ABC", None, Some("AR"), "Japan"),
+            ("KH6ABC", None, Some("HI"), "Hawaii - +HI"),
+            ("<W5ABC>", None, Some("ar"), "United States - +AR"),
+            ("W5ABC", Some("Japan"), Some("AR"), "Japan"),
+            ("W5ABC", None, Some("XX"), "United States"),
+            ("W5ABC", None, None, "United States"),
+            ("<...>", None, Some("AR"), "---"),
+        ] {
+            app.dx_stations.clear();
+            app.dx_states.clear();
+            let mut row = make_test_station(call);
+            row.entity_name = entity.map(str::to_string);
+            row.grid_square = Some("EM3é".into());
+            app.dx_stations.insert(call.into(), row);
+            app.refresh_dx_need(Some(&Need(crate::dx_need::DxNeedStatus {
+                grid_needed: Some(true),
+                state: state.map(str::to_string),
+                state_needed: Some(true),
+            })));
+            let buf = render_buffer(&app, 100, 8);
+            let output = text(&buf);
+            assert!(output.contains(expected), "{call}: {output}");
+            assert!(!output.contains("+EM"));
+            assert!(!output.contains("EM3é"));
+            if !expected.contains(" - ") {
+                assert!(!output.contains(" - +"), "{output}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn five_cell_grid_is_whole_or_absent_and_empty_tiny_panels_do_not_panic() {
+        assert_eq!(visible_columns(64), DxHunterColumn::ALL);
+        assert_ne!(visible_columns(63), DxHunterColumn::ALL);
+        assert!(!visible_columns(54).contains(&DxHunterColumn::Grid));
+        assert!(visible_columns(55).contains(&DxHunterColumn::Grid));
+        let mut app = needed_app().await;
+        app.active_panel = ActivePanel::DxHunter;
+        for width in 16..=110 {
+            let buf = render_buffer(&app, width, 8);
+            let output = text(&buf);
+            if visible_columns(width).contains(&DxHunterColumn::Grid) {
+                assert!(output.contains("+EM34"), "width {width}: {output}");
+                assert!(output.contains("Grid"));
+            } else {
+                assert!(!output.contains("+EM"), "width {width}: {output}");
+            }
+        }
+        app.dx_stations.clear();
+        let buf = render_buffer(&app, 100, 8);
+        assert!(text(&buf).contains("No DX"));
+        assert!(text(&buf).contains("stations"));
+        for (w, h) in [(0, 0), (1, 1), (2, 2), (4, 3)] {
+            render_buffer(&app, w, h);
+        }
+    }
 
     // ---- PAN-88: adaptive columns ----
     // Canonical panel widths: Operate's 40% right column at 80/100/120/132

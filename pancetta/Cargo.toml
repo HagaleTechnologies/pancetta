@@ -97,6 +97,7 @@ hound = "3.5"
 rustfft = "6.4"
 
 [dev-dependencies]
+ratatui = "0.30"
 tempfile = "3.27"
 criterion = { version = "0.8", features = ["html_reports"] }
 assert_cmd = "2.2"
