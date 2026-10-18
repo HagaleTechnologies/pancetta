@@ -597,3 +597,25 @@ remote-gateway acceptor does not follow this rule yet (PAN-99).
 - **Deferred.** Artifact attestation and signing (it needs `id-token: write` and
   `attestations: write` on `build`, so it gets its own decision), and pinning plus permission
   scoping for `demo-assets.yml`, `docs.yml`, `dependabot-auto-merge.yml` and `ci.yml`.
+
+## Semgrep skip visibility and local-ruleset fallback (PAN-107, 2026-10-18)
+
+- `semgrep.yml` is three jobs: `semgrep/mode` reads `SEMGREP_APP_TOKEN` in a
+  step and exports `mode=platform|local`; `semgrep/ci` runs only in platform
+  mode; `semgrep/local-ruleset` runs a secret-free scan of the vendored
+  `.semgrep/secrets.yaml` (`p/secrets`, digest in `.semgrep/README.md`)
+  otherwise. A token-absent run therefore reports `semgrep/ci` as natively
+  skipped (grey), never green-for-nothing.
+- The `secrets` context is not allowed in a job-level `if:` (actionlint errors;
+  GitHub fails the workflow) — the decider-job shape is the workaround, same
+  producer/consumer idiom as `codex-clean`/`wait-for-codex.yml`.
+- Rules: refresh `.semgrep/secrets.yaml` only by PR with the digest updated;
+  don't add other packs without re-checking they are clean on `main` (the
+  `rust`/`github-actions`/`ci` packs fire 136 accepted-state findings today).
+- Do not add an `environment:` block with a branch policy to these jobs: a
+  `merge_group` ref (`gh-readonly-queue/main/...`) would miss the policy,
+  empty the token, and silently shift merge-queue runs to the local ruleset
+  (the `harbor` trap recorded in the pool's backlog-grooming notes).
+- Deferred: provisioning `SEMGREP_APP_TOKEN` as a Dependabot secret (CAT-307
+  follow-up; after that, Dependabot PRs get platform scans automatically), and
+  the same PAN-107 fix in the sibling repos (cqdx/panino/widdershins/coppa).
