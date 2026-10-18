@@ -8,6 +8,7 @@ sources:
   - pancetta/src/coordinator/remote_gateway/mod.rs
   - pancetta/src/coordinator/station_agent/mod.rs
   - pancetta-agent/src/arm.rs
+  - pancetta-agent/src/audit.rs
   - pancetta-config/src/network.rs
   - docs/DECISIONS/remote-operation.md
 verified:
@@ -53,3 +54,17 @@ Read and TX are split so the low-risk view can ship freely while the TX path
 carries the full Part-97 safety burden: fail-closed, dead-man heartbeat,
 local-consent, and no autonomous-over-remote. The agent remains the final TX
 authority; no remote QSO frame is ever emitted as `TxOrigin::Local`.
+
+## Gotcha: the audit log is shared, bounded, and never on the safety path (PAN-104)
+
+Every `AuditLog` clone shares one writer mutex, rate buckets, counters and
+health, so rotation stays bounded across the station agent, the TX worker and
+config reload. Never write audit records while holding the arm mutex or an
+eligibility lock: collect the `ArmEffect`s under the lock, publish the disarm
+and the list change, then call `apply_arm_effects`. The two revocation paths
+(`revoke_static_allow_list_entries` and the authorization poll) used to audit
+under the arm lock, so a slow disk delayed both the revocation and every TX
+re-check queued behind it. TX-worker interrupts release PTT before the audit
+write. Audit failure is a readiness warning only, never a TX mute cause, and a
+valid arm proceeds. The normative text is in
+`docs/DECISIONS/remote-operation.md` (PAN-104) and `docs/CONFIG.md`.

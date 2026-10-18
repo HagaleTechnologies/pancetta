@@ -6877,6 +6877,88 @@ mod tests {
     /// `poll_authorizations_loop` end to end (a genuine mock cqdx HTTP
     /// server, not just a pure-predicate test), since the gap this closes is
     /// specifically about threading the shared `arm` into this task.
+    /// PAN-104: a poll-driven revocation disarms and unpublishes TX-arm
+    /// eligibility even when the audit write fails.
+    #[tokio::test]
+    async fn poll_revocation_disarms_despite_a_failing_audit_sink() {
+        let app = axum::Router::new().route(
+            "/api/v1/authorizations",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "authorizations": [{
+                        "id": "auth_1",
+                        "agentKeyId": "agent_this",
+                        "clientKeyId": CLIENT_KEY_ID,
+                        "scopes": ["status", "qsy"],
+                        "createdAt": "2026-08-15T00:00:00Z",
+                        "role": "owner",
+                        "delegatedBy": "some_owner_user_id"
+                    }]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let tx_arm_allow_list = Arc::new(std::sync::RwLock::new(HashSet::from([
+            CLIENT_KEY_ID.to_string()
+        ])));
+        let arm = Arc::new(Mutex::new(armed_state()));
+        let audit = failing_audit_log();
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = tokio::spawn(poll_authorizations_loop(
+            pancetta_config::network::CqdxConfig {
+                enabled: true,
+                base_url: format!("http://{addr}"),
+                token: Some("pat_test_token_0000000000".to_string()),
+                poll_interval_secs: 30,
+                authorizations_poll_interval_secs: 45,
+            },
+            "agent_this".to_string(),
+            std::env::temp_dir(),
+            Arc::new(std::sync::RwLock::new(HashSet::new())),
+            tx_arm_allow_list.clone(),
+            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            arm.clone(),
+            audit.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown.clone(),
+            Duration::from_millis(50),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while arm.lock().unwrap().is_armed() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the poll disarms despite the failing audit sink");
+        shutdown.store(true, Ordering::Release);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(!tx_arm_allow_list.read().unwrap().contains(CLIENT_KEY_ID));
+        assert!(audit.health().unavailable, "the failed write is surfaced");
+    }
+
+    /// PAN-104: task-drop cleanup disarms even when the audit write fails.
+    #[test]
+    fn disarm_guard_drop_disarms_despite_a_failing_audit_sink() {
+        let arm = Arc::new(Mutex::new(armed_state()));
+        let audit = failing_audit_log();
+        {
+            let _guard = RemoteTxDisarmGuard {
+                arm: arm.clone(),
+                audit: audit.clone(),
+                shutdown: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                normal_exit: false,
+            };
+        }
+        assert!(!arm.lock().unwrap().is_armed());
+        assert!(audit.health().unavailable);
+    }
+
     #[tokio::test]
     async fn poll_authorizations_loop_disarms_when_armed_clients_eligibility_is_revoked() {
         // Mock cqdx: every request returns ONE edge for CLIENT_KEY_ID with a

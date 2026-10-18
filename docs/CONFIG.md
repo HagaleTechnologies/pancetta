@@ -549,6 +549,44 @@ entry, `enabled = false` — apply to a running station when you save;
 every other change to this table needs a restart. See
 [Hot reload](#hot-reload).
 
+#### The remote-access audit log (`audit_log_path`)
+
+`audit_log_path` defaults to `~/.pancetta/agent-audit.log`. Pancetta
+manages that exact file plus three archives beside it, `<path>.1`
+(newest), `<path>.2` and `<path>.3` (oldest); don't put other files at
+those names. Each file is at most 1 MiB (1,048,576 bytes), so normal
+operation keeps at most 4 MiB. When the active file is full it becomes
+`.1` and the oldest archive is deleted. These are size limits, not a
+fixed number of days.
+
+Each line is one JSON object with `ts_unix_ms`, `kind`,
+`operator_callsign` and `detail`. Operator callsigns are capped at 64
+bytes and details at 1,024 bytes (cut text ends in `...[truncated]`).
+Each event kind may write a burst of 20 records, then 10 per second.
+Events over that rate are counted rather than written, and a `Summary`
+record (operator `null`) reports them about every five seconds, for
+example `audit summary: TxRequested coalesced=80 failed=0 first_ts=1000
+last_ts=1000`. `coalesced` counts events summarized by the rate limit;
+`failed` counts events whose recording could not be confirmed (some of
+them may have reached the file). Treat the log as a bounded diagnostic
+history, not a complete ledger, and handle the `Summary` kind in any
+tool that reads it.
+
+On upgrade, a managed file already larger than 1 MiB is reset to zero
+bytes before anything else is written, and a `Summary` records
+`audit retention: reset oversized active file; discarded_bytes=N` (or
+`archive=1` … `archive=3`). Copy the old file elsewhere first if you need
+it. Counts not yet written are lost if pancetta crashes.
+
+When a write fails (disk full, permissions, missing directory), the
+readiness strip shows `⚠ DEGRADED: Remote audit unavailable; events may
+be missing`, and headless mode logs the same text at ERROR (first
+failure, then at most once a minute). Remote arming keeps working, and
+disarm and PTT-off never wait on the log. To recover, check free space
+and the permissions of the configured file and its directory. Pancetta
+retries about every five seconds, writes the missing counts, clears
+the warning and logs `Remote audit recording recovered`.
+
 ---
 
 ### `[network.remote_gateway]` — local read-only view (Panino)

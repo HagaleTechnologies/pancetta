@@ -127,6 +127,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The remote-access audit log (`~/.pancetta/agent-audit.log`) now stays
+  within 4 MiB: it rotates at 1 MiB into `.1`–`.3` archives, caps long
+  fields, and writes a `Summary` record for events it skipped because of the
+  rate limit or a failed write (PAN-104). A failed audit write now shows
+  `⚠ DEGRADED: Remote audit unavailable; events may be missing` in the
+  readiness strip and logs an ERROR, and the warning clears itself once
+  writes work again. Disarm and PTT-off never wait on the log. A pre-existing
+  log over 1 MiB is reset on first use, so copy it elsewhere first if you
+  need it.
+
 - With concurrent QSOs, a request the transmitter set aside while another QSO was on the air can no longer be overtaken by a newer one, or lost when its queue was full (PAN-73). Before, the older request could key while the fresher one was discarded.
 
 - The `i` rig picker now lists serial ports that appeared after pancetta started, so you can plug in a different rig and pick it without restarting (PAN-60). Opening the picker re-scans the ports without delaying TX, PTT or Shift+Q. A scan that finishes after you start editing keeps your edits. Reopening the picker after a rig change shows the configuration pancetta is actually using.
