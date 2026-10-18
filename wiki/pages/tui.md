@@ -45,3 +45,8 @@ breakdown overlay. Reasons use the inputs stored with the latest score, and
 portable callsign suffixes are explicitly guesses. See
 [the PAN-94 decision](../../docs/DECISIONS/tui.md#dx-hunter-explains-its-ranking-pan-94-2026-10-18)
 for clause order, missing-history wording, score-source selection and keys.
+
+The local relay remembers the last decoded grid per exact callsign and band for
+its session. Grid-less reports and acknowledgments use that grid when rescoring;
+worked-grid and failure history are still read afresh. Otherwise a report could
+erase the grid-based rank while DX Hunter still displayed the earlier CQ's grid.

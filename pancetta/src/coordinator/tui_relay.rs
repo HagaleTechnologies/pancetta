@@ -31,6 +31,29 @@ use tracing::{debug, info, span, warn, Level};
 
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
 
+/// Keep the last decoded grid for this exact callsign and band during the relay
+/// session. Report/acknowledgment frames omit it; a later grid replaces it.
+fn display_grid(
+    last_grids: &mut std::collections::HashMap<(String, String), String>,
+    call_sign: Option<&str>,
+    grid: Option<&str>,
+    dial_mhz: f64,
+) -> Option<String> {
+    let Some(call) = call_sign else {
+        return grid.map(str::to_owned);
+    };
+    let key = (
+        call.to_owned(),
+        pancetta_qso::utils::frequency_to_band(dial_mhz * 1_000_000.0),
+    );
+    if let Some(grid) = grid {
+        last_grids.insert(key, grid.to_owned());
+        Some(grid.to_owned())
+    } else {
+        last_grids.get(&key).cloned()
+    }
+}
+
 /// Capture score and explanation in one scoring call over the shared lookup.
 fn display_rank(
     scorer: &pancetta_qso::PriorityScorer,
@@ -208,13 +231,17 @@ impl super::ApplicationCoordinator {
             // of an unchanged value are still suppressed.
             let mut sent_states: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
+            let mut last_grids = std::collections::HashMap::new();
             while !relay_shutdown.load(Ordering::Acquire) {
                 if !ft8_disconnected {
                     match ft8_to_tui_rx.try_recv() {
                         Ok(relayed) => {
                             let decoded_msg = &relayed.message;
                             let call_sign = decoded_msg.message.from_callsign.clone();
-                            let grid_square = decoded_msg.message.grid_square.clone();
+                            let dial_mhz = decode_view_dial_mhz(&relayed);
+                            let grid_square = display_grid(
+                                &mut last_grids, call_sign.as_deref(),
+                                decoded_msg.message.grid_square.as_deref(), dial_mhz);
                             // "Calling me" detection: the parser sets
                             // to_callsign = our call when someone replies
                             // to our CQ ("K5ARH F5ABC -10"). Match against
@@ -264,7 +291,6 @@ impl super::ApplicationCoordinator {
                             // stripping on the TUI side only would make the
                             // TUI flag stations the scorer still treats as
                             // new (divergence).
-                            let dial_mhz = decode_view_dial_mhz(&relayed);
                             let worked_before = worked_before_for(
                                 &relay_station_lookup,
                                 call_sign.as_deref(),
@@ -300,11 +326,9 @@ impl super::ApplicationCoordinator {
                             // per-band-DXCC-new > special-station >
                             // per-band-grid-new > everything else, encoded
                             // to a single sortable u32 — see
-                            // TieredScore::as_display_u32). Only meaningful
-                            // for CQ frames that carry a callsign; non-CQ
-                            // decodes (RR73/73/reports) get the same score
-                            // but it won't influence the DX Hunter because
-                            // only CQ frames are listed there.
+                            // TieredScore::as_display_u32). Every identified
+                            // frame updates DX Hunter, using the retained
+                            // grid and fresh signal/worked/failure inputs.
                             let (priority_score, priority_factors) = display_rank(
                                 &relay_scorer, call_sign.as_deref(), grid_square.as_deref(),
                                 decoded_msg.snr_db, dial_mhz);
@@ -4029,6 +4053,104 @@ where
 
 #[cfg(test)]
 mod tui_relay_tests {
+    #[tokio::test]
+    async fn gridless_decodes_keep_grid_rank_but_refresh_live_history() {
+        use pancetta_qso::priority::WorkedStationLookup;
+        use pancetta_tui::{app::App, Config, DecodedMessageView};
+
+        let lookup = crate::priority_evaluator::CachedStationLookup::new();
+        lookup.update_needed_dxcc(std::collections::HashSet::from(["DL".to_owned()]));
+        // The entity is already worked, but FN42 is still new on this band.
+        lookup.record_worked("W1XYZ", "20M");
+        let scorer = pancetta_qso::PriorityScorer::new(
+            pancetta_qso::priority::PriorityWeights::default(),
+            Box::new(lookup.clone()),
+        );
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        let mut last_grids = std::collections::HashMap::new();
+        for worked_grid in [false, true] {
+            if worked_grid {
+                lookup.record_worked_grid("FN42", "20M");
+                lookup.record_failure("K1ABC");
+            }
+            let frames = if worked_grid {
+                vec![("W1XYZ K1ABC -10", None)]
+            } else {
+                vec![
+                    ("CQ K1ABC FN42", Some("FN42")),
+                    ("W1XYZ K1ABC -10", None),
+                    ("W1XYZ K1ABC R-10", None),
+                    ("W1XYZ K1ABC RRR", None),
+                    ("W1XYZ K1ABC RR73", None),
+                    ("W1XYZ K1ABC 73", None),
+                ]
+            };
+            for (text, grid) in frames {
+                let grid = super::display_grid(&mut last_grids, Some("K1ABC"), grid, 14.074);
+                let (priority_score, priority_factors) =
+                    super::display_rank(&scorer, Some("K1ABC"), grid.as_deref(), -10.0, 14.074);
+                app.add_decoded_message(DecodedMessageView {
+                    timestamp: chrono::Utc::now(),
+                    frequency: 14.074,
+                    mode: "FT8".into(),
+                    snr: -10,
+                    delta_time: 0.0,
+                    delta_freq: 1500.0,
+                    call_sign: Some("K1ABC".into()),
+                    grid_square: grid,
+                    message: text.into(),
+                    distance: None,
+                    bearing: None,
+                    slot_parity: None,
+                    is_directed_at_us: false,
+                    worked_before: lookup.is_duplicate("K1ABC", 14_074_000.0),
+                    needed: lookup.is_needed_dxcc("K1ABC"),
+                    atno: lookup.is_atno("K1ABC"),
+                    band_needed: lookup.is_dxcc_needed_on_band("K1ABC", 14_074_000.0),
+                    priority_score,
+                    priority_factors,
+                    is_own_tx: false,
+                })
+                .await
+                .unwrap();
+                let row = &app.dx_stations["K1ABC"];
+                assert_eq!(row.grid_square.as_deref(), Some("FN42"));
+                let factors = row.local_rank.unwrap().factors.unwrap();
+                assert_eq!(factors.grid_new_on_band, !worked_grid, "{text}");
+                assert_eq!(factors.recent_failure, worked_grid, "{text}");
+                assert_eq!(
+                    pancetta_qso::priority::PriorityTier::from_display_u32(row.priority_score),
+                    if worked_grid {
+                        pancetta_qso::priority::PriorityTier::Standard
+                    } else {
+                        pancetta_qso::priority::PriorityTier::PerBandGridNew
+                    }
+                );
+                let reason =
+                    pancetta_tui::dx_reason::reason_for(row, None, chrono::Utc::now()).summary();
+                assert_eq!(reason.contains("grid FN42 may be new"), !worked_grid);
+                assert_eq!(reason.contains("QSO failed this session"), worked_grid);
+            }
+        }
+        // Never borrow another station's or another band's grid. A new
+        // grid-bearing frame replaces the remembered value for its own key.
+        for (call, band) in [
+            (Some("K2ABC"), 14.074),
+            (Some("K1ABC"), 7.074),
+            (None, 14.074),
+        ] {
+            assert_eq!(super::display_grid(&mut last_grids, call, None, band), None);
+        }
+        assert_eq!(
+            super::display_grid(&mut last_grids, Some("K1ABC"), Some("FN43"), 14.074).as_deref(),
+            Some("FN43")
+        );
+        assert_eq!(
+            super::display_grid(&mut last_grids, Some("K1ABC"), None, 14.074).as_deref(),
+            Some("FN43")
+        );
+    }
+
     #[test]
     fn display_rank_carries_factors_from_the_shared_lookup() {
         let lookup = crate::priority_evaluator::CachedStationLookup::new();
