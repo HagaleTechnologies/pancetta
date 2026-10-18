@@ -41,6 +41,8 @@ use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+#[cfg(any(test, feature = "test-hooks"))]
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -328,6 +330,30 @@ struct Shared {
     #[cfg(test)]
     /// Injected faults: `(op, matching checks to let pass first)`.
     faults: Mutex<Vec<(AuditOp, usize)>>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    /// Armed by [`AuditLog::block_next_write`]: `(entered, release)`.
+    write_block: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
+}
+
+/// Test-only handle from [`AuditLog::block_next_write`] (feature
+/// `test-hooks`). The held write resumes when this is released or dropped,
+/// so a failing test never leaves the writer stuck.
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug)]
+pub struct AuditWriteBlock {
+    entered: mpsc::Receiver<()>,
+    _release: mpsc::SyncSender<()>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl AuditWriteBlock {
+    /// Whether the held write started within `timeout`.
+    pub fn wait_entered(&self, timeout: Duration) -> bool {
+        self.entered.recv_timeout(timeout).is_ok()
+    }
+
+    /// Let the held write continue.
+    pub fn release(self) {}
 }
 
 /// A bounded, rotating JSONL audit log backed by files on disk.
@@ -381,7 +407,44 @@ impl AuditLog {
                 health: Mutex::new(HealthState::default()),
                 #[cfg(test)]
                 faults: Mutex::new(Vec::new()),
+                #[cfg(any(test, feature = "test-hooks"))]
+                write_block: Mutex::new(None),
             }),
+        }
+    }
+
+    /// Test-only seam (feature `test-hooks`): the next record write (an
+    /// `append`ed event or a maintenance `Summary`) stops at its start while
+    /// holding the writer lock, signals [`AuditWriteBlock::wait_entered`], and
+    /// waits there until the returned handle is released or dropped, as a
+    /// stalled filesystem call would. Arming again replaces an unused hold.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn block_next_write(&self) -> AuditWriteBlock {
+        let (entered_tx, entered) = mpsc::sync_channel(1);
+        let (release, release_rx) = mpsc::sync_channel(1);
+        *self
+            .shared
+            .write_block
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((entered_tx, release_rx));
+        AuditWriteBlock {
+            entered,
+            _release: release,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn hold_if_blocked(&self) {
+        let armed = self
+            .shared
+            .write_block
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((entered, release)) = armed {
+            let _ = entered.send(());
+            // Returns once the handle is dropped; nothing is ever sent on it.
+            let _ = release.recv();
         }
     }
 
@@ -759,6 +822,8 @@ impl AuditLog {
 
     /// The write transaction. Caller holds the writer lock.
     fn write_line(&self, st: &mut WriterState, line: &[u8]) -> Result<(), AuditError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.hold_if_blocked();
         if !st.normalized || st.tail_invalid {
             self.normalize(st)?;
         }

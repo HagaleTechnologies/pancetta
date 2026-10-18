@@ -28,3 +28,9 @@ libc = "0.2"
 [dev-dependencies]
 hex = "0.4"
 tracing-subscriber = { workspace = true }
+
+[features]
+# Test-only seams for dependent crates' tests (`AuditLog::block_next_write`).
+# `pancetta` enables it only through its dev-dependency, so a plain
+# `cargo build` never compiles it.
+test-hooks = []
