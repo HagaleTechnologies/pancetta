@@ -445,7 +445,7 @@ fn reconcile_authorizations<W: pancetta_agent::relay::WsConn>(
     }
 
     let controller_evicted = ctx.controller.as_ref().is_some_and(|c| evicted.contains(c));
-    let armer_evicted = {
+    let (armer_evicted, effects) = {
         let mut st = match ctx.arm.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -453,15 +453,17 @@ fn reconcile_authorizations<W: pancetta_agent::relay::WsConn>(
         let armer_evicted = st
             .armed_client_key_id()
             .is_some_and(|k| evicted.iter().any(|p| p == k));
+        let mut effects = Vec::new();
         if controller_evicted || armer_evicted {
-            let effects = st.disarm_with_reason(DisarmReason::AuthorizationRevoked, now.unix_ms);
+            effects = st.disarm_with_reason(DisarmReason::AuthorizationRevoked, now.unix_ms);
             if !effects.is_empty() {
                 warn!(target: "agent.tx", "controller evicted with a live arm — disarming");
             }
-            apply_arm_effects(&ctx.audit, &effects);
         }
-        armer_evicted
+        (armer_evicted, effects)
     };
+    // PAN-104: audit I/O only after the arm lock is released.
+    apply_arm_effects(&ctx.audit, &effects);
     let mut sends = Vec::new();
     if controller_evicted || armer_evicted {
         if controller_evicted {
@@ -496,7 +498,7 @@ fn scope_at_least(scopes: &[String], required: &str) -> bool {
 fn apply_arm_effects(audit: &AuditLog, effects: &[ArmEffect]) {
     for e in effects {
         match e {
-            ArmEffect::Audit(ev) => audit.append(ev),
+            ArmEffect::Audit(ev) => audit.record(ev),
             ArmEffect::Disarmed { reason } => {
                 debug!(target: "agent.tx", reason = ?reason, "remote arm disarmed");
             }
@@ -774,7 +776,7 @@ fn controller_gate(ctx: &mut ArmContext, peer: &str, now: ArmTime) -> Controller
         Some(_) => {
             // Rule 4 — exclusivity.
             warn!(target: "agent.control", peer = %peer, "control action refused — another client holds control");
-            ctx.audit.append(&AuditEvent {
+            ctx.audit.record(&AuditEvent {
                 ts_unix_ms: now.unix_ms,
                 kind: AuditKind::TxDenied,
                 operator_callsign: None,
@@ -871,7 +873,7 @@ async fn dispatch_action(
                 Err(reason) => {
                     // Fail-closed: audit the denial, do NOT arm. Any implicit-grab
                     // controlState still stands (the grab itself succeeded).
-                    ctx.audit.append(&AuditEvent {
+                    ctx.audit.record(&AuditEvent {
                         ts_unix_ms: now.unix_ms,
                         kind: AuditKind::TxDenied,
                         operator_callsign: None,
@@ -1042,7 +1044,7 @@ async fn dispatch_action(
                 Err(_) => (false, None),
             };
             if !consented {
-                ctx.audit.append(&AuditEvent {
+                ctx.audit.record(&AuditEvent {
                     ts_unix_ms: now.unix_ms,
                     kind: AuditKind::TxDenied,
                     operator_callsign,
@@ -1053,7 +1055,7 @@ async fn dispatch_action(
                 warn!(target: "agent.tx", peer = %peer, request = %detail, "txRequest refused — station-agent remote TX consent is off (remote_tx_enabled=false)");
                 return DispatchOutcome::cont_with(grab);
             }
-            ctx.audit.append(&AuditEvent {
+            ctx.audit.record(&AuditEvent {
                 ts_unix_ms: now.unix_ms,
                 kind: AuditKind::TxRequested,
                 operator_callsign: ctx
@@ -1611,6 +1613,7 @@ pub(crate) fn revoke_static_allow_list_entries(
     if removed.is_empty() {
         return false;
     }
+    let mut effects = Vec::new();
     let arm_changed = {
         let mut st = match arm.lock() {
             Ok(g) => g,
@@ -1620,8 +1623,9 @@ pub(crate) fn revoke_static_allow_list_entries(
             .armed_client_key_id()
             .is_some_and(|cur| removed.iter().any(|r| r == cur));
         if armed_removed {
-            let effects = st.disarm_with_reason(DisarmReason::AuthorizationRevoked, now_unix_ms);
-            apply_arm_effects(audit, &effects);
+            // PAN-104: the audit record is written after the locks are
+            // released and the revocation is published, never under them.
+            effects = st.disarm_with_reason(DisarmReason::AuthorizationRevoked, now_unix_ms);
             live.revocation_pending.store(true, Ordering::Release);
             warn!(
                 target: "agent.tx",
@@ -1658,6 +1662,7 @@ pub(crate) fn revoke_static_allow_list_entries(
     if changed {
         live.authz_generation.fetch_add(1, Ordering::AcqRel);
     }
+    apply_arm_effects(audit, &effects);
     changed
 }
 
@@ -2173,6 +2178,7 @@ async fn poll_authorizations_loop(
                 // `RemoteTxDisarmGuard::drop` — a poisoned arm mutex must
                 // never block publishing the refreshed TX-arm-eligible set.
                 let arm_changed;
+                let mut effects = Vec::new();
                 {
                     let mut st = match arm.lock() {
                         Ok(g) => g,
@@ -2182,9 +2188,10 @@ async fn poll_authorizations_loop(
                         .armed_client_key_id()
                         .is_some_and(|cur| !new_tx_arm_allow.contains(cur));
                     if should_disarm {
-                        let effects =
+                        // PAN-104: audited below, after the locks are
+                        // released and the refreshed lists are published.
+                        effects =
                             st.disarm_with_reason(DisarmReason::AuthorizationRevoked, now_ms());
-                        apply_arm_effects(&audit, &effects);
                         // Flag the session loop (a SEPARATE tokio task, so it
                         // cannot be signaled by directly calling
                         // control_state_sends/deliver_sends here) to
@@ -2217,6 +2224,7 @@ async fn poll_authorizations_loop(
                     // observes the new generation reads the new lists.
                     authz_generation.fetch_add(1, Ordering::AcqRel);
                 }
+                apply_arm_effects(&audit, &effects);
                 debug!(
                     target: "agent",
                     "authorizations poll: refreshed tx_allow_list ({} client(s) admitted for this agent, {} TX-arm-eligible)",
@@ -4803,6 +4811,87 @@ mod tests {
         );
     }
 
+    /// PAN-104: audit failure never refuses a valid arm (availability
+    /// decision) and never blocks a disarm; an invalid arm stays refused.
+    #[tokio::test]
+    async fn failing_audit_sink_keeps_valid_arms_and_every_disarm_working() {
+        let mut ctx = ctx_with(true, true);
+        ctx.audit = failing_audit_log();
+        ctx.peers
+            .insert(PEER_B.to_string(), PeerCtx::unauthorized());
+        let bus = MessageBus::new(64).unwrap();
+
+        // Consent OFF: the arm is refused exactly as before.
+        dispatch_action(
+            arm_action("arm-jti-refused"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(!ctx.arm.lock().unwrap().is_armed());
+
+        with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
+        dispatch_action(
+            arm_action("arm-jti-1"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(ctx.arm.lock().unwrap().is_armed(), "valid arm proceeds");
+        assert!(ctx.audit.health().unavailable, "the failure is surfaced");
+        // The dead-man deadline still governs.
+        assert!(!ctx
+            .arm
+            .lock()
+            .unwrap()
+            .tx_permitted(at(NOW + HEARTBEAT_TIMEOUT_MS), ConsentChannel::StationAgent));
+
+        // A mismatched-JTI disarm from a non-controller still disarms.
+        dispatch_action(
+            ControlAction::Disarm {
+                arm_jti: "not-this-arm".into(),
+            },
+            PEER_B,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(!ctx.arm.lock().unwrap().is_armed());
+
+        // An explicit controller disarm too.
+        dispatch_action(
+            arm_action("arm-jti-2"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(ctx.arm.lock().unwrap().is_armed());
+        dispatch_action(
+            ControlAction::Disarm {
+                arm_jti: "arm-jti-2".into(),
+            },
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(!ctx.arm.lock().unwrap().is_armed());
+        assert!(ctx.audit.health().failed_events >= 2);
+    }
+
     /// Rule 2: `releaseControl` from the current controller disarms (if armed)
     /// and clears the controller; from anyone else it is a silent no-op.
     #[tokio::test]
@@ -6788,6 +6877,174 @@ mod tests {
     /// `poll_authorizations_loop` end to end (a genuine mock cqdx HTTP
     /// server, not just a pure-predicate test), since the gap this closes is
     /// specifically about threading the shared `arm` into this task.
+    /// PAN-104: a poll-driven revocation disarms and unpublishes TX-arm
+    /// eligibility even when the audit write fails.
+    #[tokio::test]
+    async fn poll_revocation_disarms_despite_a_failing_audit_sink() {
+        let app = axum::Router::new().route(
+            "/api/v1/authorizations",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "authorizations": [{
+                        "id": "auth_1",
+                        "agentKeyId": "agent_this",
+                        "clientKeyId": CLIENT_KEY_ID,
+                        "scopes": ["status", "qsy"],
+                        "createdAt": "2026-08-15T00:00:00Z",
+                        "role": "owner",
+                        "delegatedBy": "some_owner_user_id"
+                    }]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let tx_arm_allow_list = Arc::new(std::sync::RwLock::new(HashSet::from([
+            CLIENT_KEY_ID.to_string()
+        ])));
+        let arm = Arc::new(Mutex::new(armed_state()));
+        let audit = failing_audit_log();
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = tokio::spawn(poll_authorizations_loop(
+            pancetta_config::network::CqdxConfig {
+                enabled: true,
+                base_url: format!("http://{addr}"),
+                token: Some("pat_test_token_0000000000".to_string()),
+                poll_interval_secs: 30,
+                authorizations_poll_interval_secs: 45,
+            },
+            "agent_this".to_string(),
+            std::env::temp_dir(),
+            Arc::new(std::sync::RwLock::new(HashSet::new())),
+            tx_arm_allow_list.clone(),
+            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            arm.clone(),
+            audit.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown.clone(),
+            Duration::from_millis(50),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while arm.lock().unwrap().is_armed() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the poll disarms despite the failing audit sink");
+        shutdown.store(true, Ordering::Release);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(!tx_arm_allow_list.read().unwrap().contains(CLIENT_KEY_ID));
+        assert!(audit.health().unavailable, "the failed write is surfaced");
+    }
+
+    /// PAN-104: a poll-driven revocation releases the arm lock and publishes
+    /// the disarm and the TX-arm removal before its audit write starts. The
+    /// write is held open; another thread must still take the arm lock and
+    /// see both. Multi-thread runtime: the held write parks one worker, and
+    /// the body's bounded waits run on the `block_on` thread, not a worker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn poll_revocation_releases_the_arm_lock_before_its_audit_write() {
+        let app = axum::Router::new().route(
+            "/api/v1/authorizations",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "authorizations": [{
+                        "id": "auth_1",
+                        "agentKeyId": "agent_this",
+                        "clientKeyId": CLIENT_KEY_ID,
+                        "scopes": ["status", "qsy"],
+                        "createdAt": "2026-08-15T00:00:00Z",
+                        "role": "owner",
+                        "delegatedBy": "some_owner_user_id"
+                    }]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let tx_arm_allow_list = Arc::new(std::sync::RwLock::new(HashSet::from([
+            CLIENT_KEY_ID.to_string()
+        ])));
+        let arm = Arc::new(Mutex::new(armed_state()));
+        let audit = AuditLog::new(audit_tmp());
+        let held = audit.block_next_write();
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = tokio::spawn(poll_authorizations_loop(
+            pancetta_config::network::CqdxConfig {
+                enabled: true,
+                base_url: format!("http://{addr}"),
+                token: Some("pat_test_token_0000000000".to_string()),
+                poll_interval_secs: 30,
+                authorizations_poll_interval_secs: 45,
+            },
+            "agent_this".to_string(),
+            std::env::temp_dir(),
+            Arc::new(std::sync::RwLock::new(HashSet::new())),
+            tx_arm_allow_list.clone(),
+            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            arm.clone(),
+            audit.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown.clone(),
+            Duration::from_millis(50),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ));
+        assert!(
+            held.wait_entered(Duration::from_secs(5)),
+            "the poll's revocation reached its audit write"
+        );
+        let seen = probe_arm_while_audit_held(&arm, &tx_arm_allow_list);
+        held.release();
+        assert_eq!(
+            seen,
+            Some((false, false)),
+            "while the audit write is held, the arm lock is free and shows the \
+             disarm and the TX-arm removal"
+        );
+        shutdown.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("the poll loop exits on shutdown")
+            .expect("the poll loop does not panic");
+        let records: Vec<AuditEvent> = std::fs::read_to_string(audit.path())
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        assert!(
+            records
+                .iter()
+                .any(|ev| ev.kind == AuditKind::Disarmed
+                    && ev.detail.contains("authorization-revoked")),
+            "the held write completes once released"
+        );
+    }
+
+    /// PAN-104: task-drop cleanup disarms even when the audit write fails.
+    #[test]
+    fn disarm_guard_drop_disarms_despite_a_failing_audit_sink() {
+        let arm = Arc::new(Mutex::new(armed_state()));
+        let audit = failing_audit_log();
+        {
+            let _guard = RemoteTxDisarmGuard {
+                arm: arm.clone(),
+                audit: audit.clone(),
+                shutdown: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                normal_exit: false,
+            };
+        }
+        assert!(!arm.lock().unwrap().is_armed());
+        assert!(audit.health().unavailable);
+    }
+
     #[tokio::test]
     async fn poll_authorizations_loop_disarms_when_armed_clients_eligibility_is_revoked() {
         // Mock cqdx: every request returns ONE edge for CLIENT_KEY_ID with a
@@ -8439,6 +8696,114 @@ mod tests {
             disarmed_records(&ctx).len(),
             disarmed_before + 1,
             "no duplicate Disarmed record"
+        );
+    }
+
+    /// PAN-104: an audit sink whose writes fail (its parent does not exist).
+    fn failing_audit_log() -> AuditLog {
+        AuditLog::new(audit_tmp().join("missing-dir").join("audit.log"))
+    }
+
+    /// PAN-104: a revocation still disarms and unpublishes eligibility when
+    /// the audit write fails, and the failure is surfaced.
+    #[tokio::test]
+    async fn static_revocation_disarms_despite_a_failing_audit_sink() {
+        let identity = AgentIdentity::generate();
+        let (mut ctx, _sess, _outbound, _transports, _ws) = two_authorized_peers(&identity);
+        ctx.audit = failing_audit_log();
+        arm_controller(&mut ctx, CLIENT_KEY_ID);
+        let live = live_handles_for(&ctx);
+        assert!(revoke_static_allow_list_entries(
+            &live,
+            &ctx.arm,
+            &ctx.audit,
+            &[CLIENT_KEY_ID.to_string()],
+            NOW,
+        ));
+        assert!(!ctx.arm.lock().unwrap().is_armed());
+        assert!(!live
+            .tx_arm_allow_list
+            .read()
+            .unwrap()
+            .contains(CLIENT_KEY_ID));
+        assert!(!crate::coordinator::tx::remote_tx_permitted_for(
+            &ctx.arm,
+            || at(NOW),
+            Some(CLIENT_KEY_ID)
+        ));
+        assert!(ctx.audit.health().unavailable);
+    }
+
+    /// PAN-104: from a second thread, take the arm lock while an audit write
+    /// is held mid-transaction and report `(armed, still TX-arm-eligible)`.
+    /// `None` when the lock stayed unavailable for two seconds.
+    fn probe_arm_while_audit_held(
+        arm: &Arc<Mutex<ArmState>>,
+        tx_arm_allow_list: &Arc<std::sync::RwLock<HashSet<String>>>,
+    ) -> Option<(bool, bool)> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (arm, list) = (arm.clone(), tx_arm_allow_list.clone());
+        std::thread::spawn(move || {
+            let st = arm.lock().unwrap_or_else(|p| p.into_inner());
+            let eligible = list.read().unwrap().contains(CLIENT_KEY_ID);
+            let _ = tx.send((st.is_armed(), eligible));
+        });
+        rx.recv_timeout(Duration::from_secs(2)).ok()
+    }
+
+    /// PAN-104: a static revocation releases the arm lock and publishes the
+    /// disarm and the TX-arm removal before its audit write starts. The write
+    /// is held open; another thread must still take the arm lock and see both.
+    #[test]
+    fn static_revocation_releases_the_arm_lock_before_its_audit_write() {
+        let arm = Arc::new(Mutex::new(armed_state()));
+        let audit = AuditLog::new(audit_tmp());
+        let both = HashSet::from([CLIENT_KEY_ID.to_string(), PEER_B.to_string()]);
+        let live = StationAgentLiveHandles {
+            tx_allow_list: Arc::new(std::sync::RwLock::new(both.clone())),
+            tx_arm_allow_list: Arc::new(std::sync::RwLock::new(both)),
+            client_keys: Default::default(),
+            revocation_pending: Default::default(),
+            authz_generation: Default::default(),
+            stop_requested: Default::default(),
+        };
+        let held = audit.block_next_write();
+        let writer = {
+            let (live, arm, audit) = (live.clone(), arm.clone(), audit.clone());
+            std::thread::spawn(move || {
+                revoke_static_allow_list_entries(
+                    &live,
+                    &arm,
+                    &audit,
+                    &[CLIENT_KEY_ID.to_string()],
+                    NOW,
+                )
+            })
+        };
+        assert!(
+            held.wait_entered(Duration::from_secs(5)),
+            "the revocation reached its audit write"
+        );
+        let seen = probe_arm_while_audit_held(&arm, &live.tx_arm_allow_list);
+        held.release();
+        assert_eq!(
+            seen,
+            Some((false, false)),
+            "while the audit write is held, the arm lock is free and shows the \
+             disarm and the TX-arm removal"
+        );
+        assert!(writer.join().unwrap());
+        let records: Vec<AuditEvent> = std::fs::read_to_string(audit.path())
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        assert!(
+            records
+                .iter()
+                .any(|ev| ev.kind == AuditKind::Disarmed
+                    && ev.detail.contains("authorization-revoked")),
+            "the held write completes once released"
         );
     }
 
