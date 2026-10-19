@@ -1,28 +1,8 @@
-//! # Pancetta - High-Performance Amateur Radio FT8 Processing Application
+//! # Pancetta - an FT8 station in one binary
 //!
-//! The main entry point for the Pancetta application, which integrates:
-//! - Real-time audio processing (pancetta-audio)
-//! - Digital signal processing pipeline (pancetta-dsp)
-//! - FT8 decoder with >95% accuracy (pancetta-ft8)
-//! - Interactive terminal user interface (pancetta-tui)
-//! - Comprehensive configuration management (pancetta-config)
-//!
-//! ## Architecture
-//!
-//! Pancetta uses a message-driven architecture with dedicated components:
-//! - **Audio Coordinator**: Manages audio input and real-time processing
-//! - **DSP Pipeline**: Processes audio with <1ms latency
-//! - **FT8 Decoder**: Decodes 50+ simultaneous FT8 signals
-//! - **TUI Manager**: Provides real-time user interface
-//! - **Message Bus**: High-performance inter-component communication
-//!
-//! ## Performance Goals
-//!
-//! - Audio processing latency: <1ms
-//! - FT8 decode accuracy: >95% at -20dB SNR
-//! - Simultaneous decodes: 50+
-//! - Memory usage: <100MB
-//! - CPU usage: <25% on modern hardware
+//! The main entry point: decoder, priority scoring, the QSO state machine,
+//! rig control through rigctld, and per-QSO logbook upload in one process.
+//! What each capability has been proven to do: README.md § Capability status.
 
 #![allow(dead_code, unused_imports)]
 
@@ -45,29 +25,24 @@ mod doctor;
 #[derive(Clone, Parser)]
 #[command(name = "pancetta")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
-#[command(about = "High-performance amateur radio FT8 processing")]
+#[command(about = "A full FT8 station in one binary — decode, score, work, log")]
 #[command(long_about = r#"
-Pancetta is a high-performance amateur radio application optimized for FT8 digital mode processing.
+Pancetta is an FT8 station in one binary: decoder, priority scoring, the
+QSO state machine, rig control through rigctld, and per-QSO logbook upload.
+FT4 is supported too.
 
-Features:
-- Real-time audio processing with <1ms latency
-- FT8 decoder with >95% accuracy at -20dB SNR
-- Support for 50+ simultaneous decodes
-- Interactive terminal user interface
-- Comprehensive configuration management
-- Hot-reload configuration support
+Run it with no command to start the station in the terminal UI
+(--headless logs instead). The first run starts the setup wizard;
+`pancetta doctor` checks config, clock, audio, decoder and rig.
 
-The application integrates multiple specialized components:
-- Audio input and real-time streaming
-- Digital signal processing pipeline
-- FT8 signal decoding and analysis
-- User interface with band activity monitoring
-- Configuration management with validation
+Configuration is read at startup. While Pancetta runs, only remote-access
+consent switches and revocations apply live (remote-TX consent on or off,
+allow-list removals, disabling the station agent); any other change needs
+a restart.
 
-Performance targets:
-- Audio latency: <1ms
-- Memory usage: <100MB
-- CPU usage: <25% on modern hardware
+What works, how it was tested, and on which radio: the "Capability status"
+section of README.md, shipped with every release. Measured decoder
+performance: docs/decoder-comparison.md in the source repository.
 "#)]
 struct Cli {
     #[command(subcommand)]
@@ -2965,9 +2940,14 @@ mod tests {
     fn test_cli_help() {
         let mut cmd = Command::cargo_bin("pancetta").unwrap();
         cmd.arg("--help");
+        // PAN-124: the help points at the capability matrix, states the
+        // live-apply scope, and makes none of the removed unmeasured claims.
         cmd.assert()
             .success()
-            .stdout(predicate::str::contains("high-performance amateur radio"));
+            .stdout(predicate::str::contains("Capability status"))
+            .stdout(predicate::str::contains("only remote-access"))
+            .stdout(predicate::str::contains("Hot-reload configuration support").not())
+            .stdout(predicate::str::contains(">95%").not());
     }
 
     /// `test-audio --list` enumerates devices and exits 0 (the previous stub

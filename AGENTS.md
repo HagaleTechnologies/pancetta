@@ -19,17 +19,19 @@ Pancetta is an autonomous FT8 ham radio station written in Rust. The goal is a f
 | `pancetta-ft8` | FT8 encoder/decoder/modulator/OSD | Bit-exact with ft8_lib/WSJT-X |
 | `pancetta-audio` | Real-time audio I/O (cpal + ringbuf) | Functional |
 | `pancetta-dsp` | DSP pipeline (FFT, filtering, resampling) | Functional |
-| `pancetta-config` | Configuration with hot-reload | Production-ready |
+| `pancetta-config` | Configuration loading, validation; file watch live-applies remote-access consent and revocations only | Production-ready |
 | `pancetta-qso` | QSO management, priority scoring, frequency allocation, autonomous operator | Core logic |
-| `pancetta-dx` | DX cluster + PSKReporter + per-QSO logbook upload (ClubLog/QRZ/cqdx/LoTW/eQSL) + QRZ XML lookup | Live + scaffolded |
-| `pancetta-hamlib` | Hamlib CAT control FFI | Bindings done, integration stub |
-| `pancetta-cqdx` | cqdx.io HTTP client, cache, types | Needs live API validation |
+| `pancetta-dx` | DX cluster + PSKReporter + per-QSO logbook upload (ClubLog/QRZ/cqdx/LoTW/eQSL) + QRZ XML lookup | Live; eQSL awaiting live-account check; LoTW web-scrape module is unused scaffolding |
+| `pancetta-hamlib` | Hamlib CAT/PTT via rigctld TCP client (native FFI removed) | Live; on-air validated (FTdx10) |
+| `pancetta-cqdx` | cqdx.io HTTP client, cache, types | Live; spots envelope unverified against live API |
 | `pancetta-tui` | Terminal UI | Default UI (`--headless` to disable) |
 | `pancetta-core` | Shared types, error handling | Stable |
 | `pancetta-agent` | Remote-TX security: arm gating, session binding | Live |
 | `pancetta-protocol` | Remote-operation wire protocol | Live |
 | `pancetta-research` | Local-only decoder-iteration harness | Excluded from CI; never builds in GitHub Actions |
 | `pancetta` | Main binary, coordinator, message bus, runtime | Integration point |
+
+Operator-facing capability state: README.md § Capability status — keep both consistent.
 
 ## Building and Testing
 
@@ -41,7 +43,7 @@ cargo build
 cargo test --workspace --features transmit
 
 # FT8 tests (encoder is feature-gated behind `transmit`)
-cargo test --features transmit -p pancetta-ft8    # all ~295 FT8 tests
+cargo test --features transmit -p pancetta-ft8    # all FT8 tests
 cargo test -p pancetta-ft8                         # LDPC/CRC tests only
 
 # Loopback integration tests (end-to-end QSO through encode→modulate→decode)

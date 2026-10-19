@@ -299,6 +299,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `pancetta --help` no longer claims general config hot-reload or unmeasured
+  decoder, latency and memory figures; it says which settings apply live and
+  points to the new Capability status table in README.md (PAN-124). That
+  table rates each capability experimental, implemented, integration-tested
+  or radio-qualified, with the environment it was proven in. CONTRIBUTING.md
+  and SECURITY.md now describe the real build commands, review process,
+  stored credentials and `unsafe` sites.
+
 - TUI status surfaces (PAN-89): the `AUDIO DEAD` / `DECODER STUB` / `CLOCK`
   alarm chips move from the title bar to the readiness strip, where several can
   show at once (the title bar's alarm slot showed one and was cut off at 80

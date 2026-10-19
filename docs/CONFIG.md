@@ -184,8 +184,8 @@ offset — falls outside the plan, with a `TX blocked (TX frequency … Hz is
 outside the configured amateur band plan)` diagnostic. A multi-TX bundle
 drops only its out-of-privilege items; in-privilege siblings still key. The
 check is skipped while the dial is not yet known (mock rig / CAT-disabled
-modes). Edits take effect on restart — config is loaded once at startup, and
-the runtime hot-reload apply task is a documented no-op.
+modes). Edits take effect on restart (the band plan is not among the
+[live-applied settings](#hot-reload)).
 
 ---
 
