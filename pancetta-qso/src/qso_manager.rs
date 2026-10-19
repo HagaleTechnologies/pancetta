@@ -17009,12 +17009,7 @@ mod state_regression_tests {
 
         // Now exercise the full path: it must NOT emit from the transition (no
         // exchange arm); the per-slot rearm owns the R re-send.
-        let last_before = manager
-            .get_qso(qso_id)
-            .await
-            .unwrap()
-            .metadata
-            .last_call_at;
+        let last_before = manager.get_qso(qso_id).await.unwrap().metadata.last_call_at;
         manager
             .process_message(
                 MessageType::SignalReport {
@@ -17036,12 +17031,7 @@ mod state_regression_tests {
         );
         // PAN-129: the repeat sends nothing, so it must not hold the rearm
         // back either — `last_call_at` is left where our last call put it.
-        let last = manager
-            .get_qso(qso_id)
-            .await
-            .unwrap()
-            .metadata
-            .last_call_at;
+        let last = manager.get_qso(qso_id).await.unwrap().metadata.last_call_at;
         assert_eq!(
             last, last_before,
             "a repeated report must leave last_call_at unchanged"
@@ -21618,8 +21608,11 @@ mod pan72_stall_detection_tests {
         let dx_parity = tx_parity.opposite();
 
         let slot_ms = slot_ns / 1_000_000;
-        let anchor =
-            next_slot_with_parity_with_period(Utc::now() + Duration::seconds(120), dx_parity, slot_ns);
+        let anchor = next_slot_with_parity_with_period(
+            Utc::now() + Duration::seconds(120),
+            dx_parity,
+            slot_ns,
+        );
         // Repeat k goes out in the DX slot starting 2k slots after the
         // anchor and decodes `decode_offset_ms` after that slot ends.
         let decodes: Vec<DateTime<Utc>> = (0..PAN129_REPEATS)
