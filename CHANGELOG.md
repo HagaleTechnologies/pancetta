@@ -127,6 +127,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The remote-access audit log (`~/.pancetta/agent-audit.log`) now stays
+  within 4 MiB: it rotates at 1 MiB into `.1`–`.3` archives, caps long
+  fields, and writes a `Summary` record for events it skipped because of the
+  rate limit or a failed write (PAN-104). A failed audit write now shows
+  `⚠ DEGRADED: Remote audit unavailable; events may be missing` in the
+  readiness strip and logs an ERROR, and the warning clears itself once
+  writes work again. Disarm and PTT-off never wait on the log. A pre-existing
+  log over 1 MiB is reset on first use, so copy it elsewhere first if you
+  need it.
+
 - With concurrent QSOs, a request the transmitter set aside while another QSO was on the air can no longer be overtaken by a newer one, or lost when its queue was full (PAN-73). Before, the older request could key while the fresher one was discarded.
 
 - The `i` rig picker now lists serial ports that appeared after pancetta started, so you can plug in a different rig and pick it without restarting (PAN-60). Opening the picker re-scans the ports without delaying TX, PTT or Shift+Q. A scan that finishes after you start editing keeps your edits. Reopening the picker after a rig change shows the configuration pancetta is actually using.
@@ -330,6 +340,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and rig pickers also keep comments and section order.
 - `pancetta config --generate` writes the same header-annotated schema as
   `pancetta-config/defaults.toml`, without a random `[metadata]` block.
+- WAV recording of decode windows is now off by default (PAN-125). Pancetta
+  used to write every 15-second window to `~/.pancetta/recordings` (about
+  1.7 GB a day, up to 10 GB) on every install, ignoring `[audio.recording]`.
+  It now records only with `[audio.recording] auto_record = true`, into
+  `audio.recording.directory` (a leading `~` is expanded), and `--replay`
+  and `--no-audio` runs never record (closes #265). The once-per-start
+  `raw_48khz_diagnostic.wav` follows the same switch. The startup log says
+  whether recording is on and where. To keep recording into the old
+  location, set `auto_record = true` and
+  `directory = "~/.pancetta/recordings"` before upgrading. Existing
+  recordings are left in place.
 
 ### Removed
 

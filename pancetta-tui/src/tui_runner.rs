@@ -3069,20 +3069,25 @@ pub(crate) struct HelpGeometry {
     pub modal: Rect,
     /// Rows available to the scrolling binding list.
     pub body_height: u16,
-    /// Rendered (wrapped) binding lines.
+    /// Rendered body lines: group headings plus wrapped binding lines.
     pub total_lines: u16,
     /// Largest useful scroll offset; 0 when everything fits.
     pub max_scroll: u16,
 }
 
-/// Modal sizing: as wide as the widest unwrapped "  <key:24><desc>" line,
-/// capped to the terminal; as tall as every line plus chrome (title, 2
-/// blank rows, footer, borders), capped likewise. Whatever doesn't fit
-/// scrolls.
+/// Modal sizing: as wide as the widest unwrapped "  <key:24><desc>" or
+/// "  <heading>" line, capped to the terminal; as tall as every line plus
+/// chrome (title, 2 blank rows, footer, borders), capped likewise. Whatever
+/// doesn't fit scrolls.
 pub(crate) fn help_overlay_geometry(area: Rect) -> HelpGeometry {
     let widest_line = crate::keymap::KEYBINDINGS
         .iter()
         .map(|b| 2 + HELP_KEY_COL + b.action.chars().count())
+        .chain(
+            crate::keymap::Category::ALL
+                .iter()
+                .map(|c| 2 + c.heading().chars().count()),
+        )
         .max()
         .unwrap_or(50);
     // +2 for the left/right borders.
@@ -3140,32 +3145,46 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// The `?` overlay's binding list for a modal `inner_width` columns wide:
-/// one line per binding, with a description that doesn't fit wrapped under
-/// its own column (a hanging indent of `2 + HELP_KEY_COL`), never back to
-/// column 0.
+/// The `?` overlay's binding list for a modal `inner_width` columns wide.
+/// PAN-111: grouped by task — a heading line per `Category::ALL` entry (the
+/// same headings and order as docs/KEYBINDINGS.md), then that group's
+/// bindings in table order. One line per binding, with a description that
+/// doesn't fit wrapped under its own column (a hanging indent of
+/// `2 + HELP_KEY_COL`), never back to column 0.
 fn help_body_lines(inner_width: u16) -> Vec<ratatui::text::Line<'static>> {
     use ratatui::text::{Line, Span};
     let desc_width = (inner_width as usize).saturating_sub(2 + HELP_KEY_COL);
+    let heading_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let key_style = Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
     let desc_style = Style::default().fg(Color::White);
     let mut out = Vec::new();
-    for b in crate::keymap::KEYBINDINGS {
-        let mut desc_lines = wrap_words(b.action, desc_width).into_iter();
-        out.push(Line::from(vec![
-            Span::styled(
-                format!("  {:<width$}", b.key, width = HELP_KEY_COL),
-                key_style,
-            ),
-            Span::styled(desc_lines.next().unwrap_or_default(), desc_style),
-        ]));
-        for cont in desc_lines {
+    for category in crate::keymap::Category::ALL {
+        out.push(Line::from(Span::styled(
+            format!("  {}", category.heading()),
+            heading_style,
+        )));
+        for b in crate::keymap::KEYBINDINGS
+            .iter()
+            .filter(|b| b.category == category)
+        {
+            let mut desc_lines = wrap_words(b.action, desc_width).into_iter();
             out.push(Line::from(vec![
-                Span::raw(" ".repeat(2 + HELP_KEY_COL)),
-                Span::styled(cont, desc_style),
+                Span::styled(
+                    format!("  {:<width$}", b.key, width = HELP_KEY_COL),
+                    key_style,
+                ),
+                Span::styled(desc_lines.next().unwrap_or_default(), desc_style),
             ]));
+            for cont in desc_lines {
+                out.push(Line::from(vec![
+                    Span::raw(" ".repeat(2 + HELP_KEY_COL)),
+                    Span::styled(cont, desc_style),
+                ]));
+            }
         }
     }
     out
@@ -3481,6 +3500,48 @@ mod key_tests {
         .unwrap();
         let row = pan89_strip_row(&app).await;
         assert!(!row.contains("PTT MAY STILL BE KEYED"), "row 1: {row}");
+    }
+
+    /// PAN-104: the audit-health warning is a degraded strip warning that
+    /// decodes and status updates cannot erase; `!` hides it for its
+    /// episode, recovery clears it, and a new failure shows it again.
+    #[tokio::test]
+    async fn pan104_audit_warning_survives_decodes_and_recurs_after_recovery() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        let audit_down = || {
+            TuiMessage::StationReadiness(crate::readiness::StationReadiness {
+                degraded: Some("Remote audit unavailable; events may be missing".to_string()),
+                ..Default::default()
+            })
+        };
+        let warning = "⚠ DEGRADED: Remote audit unavailable; events may be missing";
+        r.handle_message(audit_down()).await.unwrap();
+        pan89_decode_burst(&mut r, 50).await;
+        r.handle_message(TuiMessage::StatusUpdate {
+            component: "QSO".to_string(),
+            status: "Calling K1ABC".to_string(),
+        })
+        .await
+        .unwrap();
+        let row = pan89_strip_row(&app).await;
+        assert!(row.contains("✓ TX READY"), "row 1: {row}");
+        assert!(row.contains(warning), "row 1: {row}");
+
+        r.handle_key_event(key_shift('!')).await.unwrap();
+        r.handle_message(audit_down()).await.unwrap();
+        let row = pan89_strip_row(&app).await;
+        assert!(!row.contains("Remote audit unavailable"), "row 1: {row}");
+        assert!(row.contains("1 ack'd"), "row 1: {row}");
+
+        // Recovery clears it; a later failure is a new episode.
+        r.handle_message(TuiMessage::StationReadiness(Default::default()))
+            .await
+            .unwrap();
+        let row = pan89_strip_row(&app).await;
+        assert!(!row.contains("ack'd"), "row 1: {row}");
+        r.handle_message(audit_down()).await.unwrap();
+        let row = pan89_strip_row(&app).await;
+        assert!(row.contains(warning), "row 1: {row}");
     }
 
     #[tokio::test]
@@ -5514,17 +5575,81 @@ mod key_tests {
         );
     }
 
+    /// PAN-111: the 80×24 sweep again at the crate's minimum supported
+    /// terminal (`MIN_TERMINAL_HEIGHT` = 20 rows).
+    #[test]
+    fn help_overlay_reaches_every_binding_at_80x20() {
+        let geom = help_overlay_geometry(Rect::new(0, 0, 80, 20));
+        assert!(geom.max_scroll > 0, "80x20 can't fit every binding");
+        let inner = help_inner(80, 20);
+        let mut seen = std::collections::HashSet::new();
+        for scroll in 0..=geom.max_scroll {
+            let buf = render_help(80, 20, scroll);
+            for y in inner.y + 1..inner.y + 1 + geom.body_height {
+                let key = cells_text(&buf, y, inner.x + 2..inner.x + 2 + HELP_KEY_COL as u16);
+                seen.insert(key.trim().to_string());
+            }
+        }
+        for b in crate::keymap::KEYBINDINGS {
+            assert!(seen.contains(b.key), "binding {:?} never shown", b.key);
+        }
+        assert!(seen.contains("Shift+Q") && seen.contains("Esc"));
+    }
+
+    /// PAN-111: the body is grouped by task — one heading per
+    /// `Category::ALL` entry, in that order, each followed by exactly its
+    /// own bindings.
+    #[test]
+    fn help_overlay_groups_bindings_by_category() {
+        use crate::keymap::{Category, KEYBINDINGS};
+        let rows: Vec<String> = help_body_lines(200)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let headings: Vec<usize> = Category::ALL
+            .iter()
+            .map(|c| {
+                let want = format!("  {}", c.heading());
+                rows.iter()
+                    .position(|r| *r == want)
+                    .unwrap_or_else(|| panic!("heading {want:?} missing"))
+            })
+            .collect();
+        assert_eq!(headings[0], 0, "the body opens with a heading");
+        assert!(
+            headings.windows(2).all(|w| w[0] < w[1]),
+            "headings out of Category::ALL order: {headings:?}"
+        );
+        for b in KEYBINDINGS {
+            let idx = Category::ALL.iter().position(|c| *c == b.category).unwrap();
+            let start = headings[idx];
+            let end = headings.get(idx + 1).copied().unwrap_or(rows.len());
+            let want = format!("  {:<width$}", b.key, width = HELP_KEY_COL);
+            assert!(
+                rows[start + 1..end].iter().any(|r| r.starts_with(&want)),
+                "{:?} not under {:?}",
+                b.key,
+                b.category.heading()
+            );
+        }
+        assert_eq!(
+            rows.len(),
+            KEYBINDINGS.len() + Category::ALL.len(),
+            "one heading per group, nothing wraps at 200 cols"
+        );
+    }
+
     #[test]
     fn help_overlay_is_unchanged_when_everything_fits() {
-        let geom = help_overlay_geometry(Rect::new(0, 0, 160, 50));
+        let geom = help_overlay_geometry(Rect::new(0, 0, 160, 60));
         assert_eq!(geom.max_scroll, 0);
         assert_eq!(
             geom.total_lines as usize,
-            crate::keymap::KEYBINDINGS.len(),
-            "nothing wraps at full width"
+            crate::keymap::KEYBINDINGS.len() + crate::keymap::Category::ALL.len(),
+            "nothing wraps at full width; one heading per group"
         );
-        let buf = render_help(160, 50, 0);
-        let inner = help_inner(160, 50);
+        let buf = render_help(160, 60, 0);
+        let inner = help_inner(160, 60);
         let body: Vec<String> = (inner.y..inner.y + inner.height)
             .map(|y| cells_text(&buf, y, inner.x..inner.x + inner.width))
             .collect();
@@ -5536,7 +5661,7 @@ mod key_tests {
                 b.key
             );
         }
-        assert!(help_footer(160, 50, 0).contains("Press Escape or ? to close"));
+        assert!(help_footer(160, 60, 0).contains("Press Escape or ? to close"));
     }
 
     #[test]

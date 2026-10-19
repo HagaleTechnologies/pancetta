@@ -709,3 +709,49 @@ Scope: `Report`/`ReportAck` opens are deliberately not covered — their states
 are rearm-eligible and `frame_reaches_the_air` already refuses to compound a
 denial (no further false `Sent`, no stall accounting), so they self-correct
 under the manual keep-call watchdog.
+
+## The remote-access audit log is bounded and its failures are visible (PAN-104), 2026-10-18
+
+**Decision.** `pancetta-agent/src/audit.rs` keeps the synchronous writer but
+bounds it: the active file and three archives (`.1` newest) are each at most
+1 MiB; operator/detail fields are capped at 64/1,024 UTF-8 bytes and each
+record at 8,192 bytes; each of the six event kinds has a token bucket (burst
+20, refill 10/s), so any T-second window admits at most `120 + 60*T`
+ordinary-record attempts. Over-limit events are counted in fixed per-kind
+counters and written as `Summary` records (operator `null`) by
+`AuditLog::maintain`, which the five-second health monitor runs on the
+blocking pool with at most one pass in flight (it skips a busy writer rather
+than waiting). Clones share one writer mutex, the buckets, the counters and
+the health. Oversized pre-existing files are reset to zero bytes, with a
+`discarded_bytes` notice; an incomplete trailing record is trimmed.
+
+`append` returns `Result<AuditAppendOutcome, AuditError>`. Every failure
+marks the shared health before returning; the readiness snapshot appends
+`Remote audit unavailable; events may be missing` to the degraded summary
+(composed per snapshot, never written into `degraded_summary`), and headless
+logs it at ERROR, then at most once per 60 s. A failure episode clears only
+after maintenance has repaired storage and written every pending count, and
+no sooner than five seconds after it began; an ordinary successful append
+does not clear it.
+
+**Availability, not an audit gate.** A valid remote arm proceeds while
+auditing is failing. `verify_and_arm` publishes the arm before it writes the
+record, so refusing on a failed write would briefly expose a live arm and
+then retract it; a transactionally audited arm needs its own prepare/commit
+design. Audit health is not a `TxMuteCause`, not part of `TxPolicy`, and not
+an input to `ArmState::tx_permitted`. Every identity, scope, consent, expiry
+and heartbeat check is unchanged.
+
+**Lock and PTT ordering.** Audit I/O never runs under the arm mutex, the
+eligibility locks or the PTT path. The eviction, static-revocation and
+authorization-poll disarms collect their `ArmEffect`s under the lock, publish
+the disarm and eligibility change (and bump the generation), then write the
+audit records. TX-worker interrupts release PTT before
+`emit_disarm_interrupt_signals` writes its `TxDenied` record. Control paths
+use `AuditLog::record`, which ignores the outcome because the sink has
+already recorded the failure.
+
+**Limits.** There is no hard deadline on a hung filesystem syscall, no
+multi-process writer coordination, and no immutable retention. `sync_data`
+confirms the record write, not directory renames across power loss.
+In-memory counts are lost on a crash.

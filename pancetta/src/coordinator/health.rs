@@ -3,14 +3,36 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
-use tokio::time::{interval, sleep};
-use tracing::{error, info, warn};
+use tokio::time::{interval, sleep, MissedTickBehavior};
+use tracing::{debug, error, info, warn};
 
 use super::{
     component_criticality, component_restart_policy, degradation_message, ComponentCriticality,
     ComponentState, ComponentStatus, RestartPolicy,
 };
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
+
+/// PAN-104: start one audit-log maintenance pass (pending `Summary` records,
+/// storage repair, failure-episode recovery) on the blocking pool, unless the
+/// previous pass in `job` is still running. At most one pass is ever in
+/// flight, so a stalled filesystem cannot queue more work or stall the health
+/// tick. Returns whether a pass was started. A failure is reported through
+/// the audit log's own health, which the readiness strip reads.
+pub(crate) fn start_audit_maintenance(
+    audit: &pancetta_agent::audit::AuditLog,
+    job: &mut Option<JoinHandle<()>>,
+) -> bool {
+    if job.as_ref().is_some_and(|h| !h.is_finished()) {
+        return false;
+    }
+    let audit = audit.clone();
+    *job = Some(tokio::task::spawn_blocking(move || {
+        if let Err(e) = audit.maintain(chrono::Utc::now().timestamp_millis()) {
+            debug!(target: "agent.audit", error = %e, "audit maintenance pass failed");
+        }
+    }));
+    true
+}
 
 /// PAN-89: the supervisor's degraded-components summary: one
 /// `"<component>: <error>"` part per `ComponentState::Failed` component,
@@ -401,7 +423,10 @@ impl super::ApplicationCoordinator {
     ///
     /// Runs every `health_check_interval` (5s) and:
     /// 1. Reads the component_status map (populated by `check_task_handles()`)
-    /// 2. Stores its [`degraded_summary`] in the coordinator's shared
+    /// 2. Starts one audit-log maintenance pass (PAN-104,
+    ///    [`start_audit_maintenance`]) so pending `Summary` records are
+    ///    written and a failure episode can clear without new traffic.
+    /// 3. Stores its [`degraded_summary`] in the coordinator's shared
     ///    `degraded_summary` (PAN-89), which the TUI relay's readiness
     ///    snapshot reads. It used to send a `StatusUpdate("Degraded -- …")`
     ///    every tick instead, which overwrote the status line and never
@@ -415,11 +440,16 @@ impl super::ApplicationCoordinator {
         let shutdown = self.shutdown_signal.clone();
         let component_status = self.component_status.clone();
         let shared_summary = self.degraded_summary.clone();
+        let audit = self.audit_log();
         let mut health_interval = interval(Duration::from_secs(5));
+        // PAN-104: a late tick never triggers a catch-up burst of passes.
+        health_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         tokio::spawn(async move {
+            let mut audit_job = None;
             while !shutdown.load(Ordering::Acquire) {
                 health_interval.tick().await;
+                start_audit_maintenance(&audit, &mut audit_job);
 
                 // Build the summary from the component_status map
                 // (populated by check_task_handles in the main loop).
@@ -1779,7 +1809,7 @@ mod supervisor_tests {
 #[cfg(test)]
 mod degraded_summary_tests {
     use super::super::{ComponentState, ComponentStatus};
-    use super::degraded_summary;
+    use super::{degraded_summary, start_audit_maintenance};
     use crate::message_bus::ComponentId;
     use std::collections::HashMap;
     use std::time::Instant;
@@ -1837,5 +1867,55 @@ mod degraded_summary_tests {
             degraded_summary(&one),
             Some(format!("{}: rigctld gone", ComponentId::Hamlib))
         );
+    }
+
+    /// PAN-104: at most one audit-maintenance pass is in flight, and a pass
+    /// writes pending summaries with no further traffic.
+    #[tokio::test]
+    async fn audit_maintenance_runs_one_pass_at_a_time() {
+        use pancetta_agent::audit::{AuditEvent, AuditKind, AuditLog};
+        let path = std::env::temp_dir().join(format!(
+            "pancetta-health-audit-maintenance-{}.log",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let audit = AuditLog::new(&path);
+        for _ in 0..25 {
+            audit
+                .append(&AuditEvent {
+                    ts_unix_ms: 1,
+                    kind: AuditKind::TxRequested,
+                    operator_callsign: None,
+                    detail: "r".into(),
+                })
+                .unwrap();
+        }
+        let lines = |p: &std::path::Path| std::fs::read_to_string(p).unwrap().lines().count();
+        assert_eq!(lines(&path), 20, "burst recorded, the rest coalesced");
+
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let mut job = Some(tokio::task::spawn_blocking(move || {
+            let _ = wait.recv();
+        }));
+        assert!(
+            !start_audit_maintenance(&audit, &mut job),
+            "no second pass while one is in flight"
+        );
+        release.send(()).unwrap();
+        job.take().unwrap().await.unwrap();
+
+        assert!(start_audit_maintenance(&audit, &mut job));
+        job.take().unwrap().await.unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 21, "{text}");
+        assert!(text.contains("audit summary: TxRequested coalesced=5 failed=0"));
+
+        // Nothing pending: further passes write nothing.
+        for _ in 0..3 {
+            assert!(start_audit_maintenance(&audit, &mut job));
+            job.take().unwrap().await.unwrap();
+        }
+        assert_eq!(lines(&path), 21);
+        let _ = std::fs::remove_file(&path);
     }
 }
