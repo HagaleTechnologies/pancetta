@@ -311,13 +311,16 @@ pub const DEFAULT_SLOT_NS: i64 = 15_000_000_000;
 /// the round-7 re-review's staleness fix).
 ///
 /// [`QsoManager::rearm_manual_calls_at`] re-emits at most one frame per slot
-/// and — since PAN-72 — counts each such re-send as one silent cycle against
-/// [`crate::states::QsoMetadata::stall_cycles`]. Both are *slot* quantities:
-/// `TimeoutConfig::qso_stall_switch_after` is documented in slots, and the
-/// keep-calling cadence is "one call per transmit period". The gate was a
-/// hardcoded 15 s, which is only FT8's period — under FT4 a threshold of 4
-/// took ~60 s (8 real slots) instead of 4, and under FT2 far worse, delaying
-/// adaptive recovery until the ordinary QSO watchdog had already won.
+/// and — since PAN-72 — counts silent cycles against
+/// [`crate::states::QsoMetadata::stall_cycles`]. The re-send cadence is a
+/// *slot* quantity, but the stall count is not (PAN-128): a QSO transmits
+/// only on its own parity, so only the first emission feeding each
+/// own-parity TX slot counts — one count per real TX opportunity, every
+/// other slot. `TimeoutConfig::qso_stall_switch_after` is documented in
+/// those own TX slots. The gate was a hardcoded 15 s, which is only FT8's
+/// period — under FT4 a threshold of 4 took ~60 s (8 real slots) instead
+/// of 4, and under FT2 far worse, delaying adaptive recovery until the
+/// ordinary QSO watchdog had already won.
 ///
 /// The input is the LIVE slot length the coordinator derives from the active
 /// protocol (`pancetta_ft8::Protocol::slot_ns()`, i.e. `cycle_duration * 1e9`:
@@ -335,6 +338,48 @@ pub fn rearm_slot_millis_from_ns(slot_ns: i64) -> i64 {
         DEFAULT_SLOT_NS / 1_000_000
     } else {
         millis
+    }
+}
+
+/// The own-parity TX slot a keep-call rearm emission at `now` feeds
+/// (PAN-128): the start of the first own-parity slot STRICTLY after `now`.
+///
+/// A QSO is parity-constrained and only keys on slots matching its latched
+/// `QsoMetadata::tx_parity` — every OTHER protocol slot (every 30 s under
+/// FT8) — while `rearm_manual_calls_at` re-emits once per protocol slot.
+/// The stall counter therefore cannot count emissions (it would run at
+/// twice the real on-air cadence and trip
+/// `TimeoutConfig::qso_stall_switch_after` after roughly half the
+/// unanswered transmissions the operator configured); it counts the TX
+/// slots those emissions feed, via this anchor:
+///
+/// - `tx_parity = Some(p)`: `pancetta_core::slot::next_slot_with_parity_
+///   with_period(now, p, slot_ns)` — the period-aware form the parity latch
+///   and the TX scheduler's `resolve_required_parity` already use.
+/// - `tx_parity = None` (never left unresolved by `QsoManager`'s own
+///   creation paths — a defensive fallback): every slot is its own TX slot,
+///   so the next slot of either parity, matching per-slot counting.
+///
+/// "Strictly after" is deliberate. An emission in our own slot past
+/// `tx_late_max_ms` is deferred by the TX worker to the next own slot, and
+/// so is the following off-parity emission, so those two share a
+/// `tx_slot`. An emission in the first seconds of our slot can still key
+/// in that slot but is attributed one own slot later. That shifts WHICH
+/// slot holds the count but never doubles it.
+///
+/// Known approximation (documented in the PAN-128 plan): a runtime mode
+/// switch or the one-time `tx_parity_provisional` correction changes the
+/// values this returns, which can add at most one extra count at the
+/// boundary.
+fn keep_call_tx_slot(
+    now: DateTime<Utc>,
+    slot_millis: i64,
+    tx_parity: Option<pancetta_core::slot::SlotParity>,
+) -> DateTime<Utc> {
+    let slot_ns = slot_millis * 1_000_000;
+    match tx_parity {
+        Some(p) => pancetta_core::slot::next_slot_with_parity_with_period(now, p, slot_ns),
+        None => pancetta_core::slot::next_slot_start_with_period(now, Duration::zero(), slot_ns),
     }
 }
 
@@ -664,12 +709,14 @@ pub struct TimeoutConfig {
     /// Consecutive stalled cycles (see [`crate::states::QsoMetadata::
     /// stall_cycles`]) before an in-progress QSO's TX offset is switched (or
     /// reverted to its last known-good offset) — Auto TX-freq mode only.
-    /// Default 4 (PAN-72). Distinct from `AutonomousConfig::
-    /// cq_no_response_switch_after` (a different struct, governs the
-    /// self-CQ-hunting case before any QSO exists), though the two are
-    /// exposed under the same `[autonomous]` TOML section by the coordinator
-    /// (see `pancetta-config`) since they're one logical "adaptive TX
-    /// behavior" knob from the operator's point of view.
+    /// Counted in the QSO's own-parity transmit slots — one every other
+    /// protocol slot (every 30 s under FT8, every 15 s under FT4), i.e. one
+    /// per real transmit opportunity (PAN-128). Default 4 (PAN-72). Distinct
+    /// from `AutonomousConfig::cq_no_response_switch_after` (a different
+    /// struct, governs the self-CQ-hunting case before any QSO exists),
+    /// though the two are exposed under the same `[autonomous]` TOML section
+    /// by the coordinator (see `pancetta-config`) since they're one logical
+    /// "adaptive TX behavior" knob from the operator's point of view.
     #[serde(default = "default_qso_stall_switch_after")]
     pub qso_stall_switch_after: u32,
 }
@@ -1013,7 +1060,16 @@ struct KeepCallAttempt {
     emitted_at: DateTime<Utc>,
     raw_text: String,
     prev_last_call_at: Option<DateTime<Utc>>,
+    // This attempt holds its `tx_slot`'s stall increment (PAN-128): exactly
+    // one surviving attempt per own-parity TX slot carries `true`, so
+    // `stall_cycles` rises once per own TX slot, not once per emission.
     bumped_stall: bool,
+    // The own-parity TX slot this emission feeds (`keep_call_tx_slot`);
+    // `None` for attempts that never count toward the stall streak and
+    // never inherit one either (`resend_last_tx`, the offset-switch
+    // retransmit, and anything a stall reset cleared — the reset retires
+    // the slot key with the increment).
+    tx_slot: Option<DateTime<Utc>>,
     recorded_sent: bool,
     // What the emission carried besides its text. A TX pivot can replace a
     // frame with one that differs only in offset or remote binding.
@@ -3746,7 +3802,12 @@ impl QsoManager {
 
     // Called under the qsos write lock at either stall-reset site. Those
     // contributions are already gone; delayed failure must not subtract
-    // them from a later streak. Call-count and timeline eligibility remain.
+    // them from a later streak. `tx_slot` is cleared too: a reset must
+    // also retire the slot key, or the PAN-128 heir rule in
+    // `roll_back_replaced_attempt_at` could hand a post-reset count to a
+    // pre-reset attempt that feeds the same slot (its increment was
+    // deliberately cleared here). Call-count and timeline eligibility
+    // remain.
     fn clear_recorded_stall_increments(&self, qso_id: QsoId) {
         let mut ledger = self
             .keep_call_ledger
@@ -3755,6 +3816,7 @@ impl QsoManager {
         if let Some(entry) = ledger.get_mut(&qso_id) {
             for attempt in &mut entry.attempts {
                 attempt.bumped_stall = false;
+                attempt.tx_slot = None;
             }
             entry.stall_action_revoked = false;
         }
@@ -3854,11 +3916,28 @@ impl QsoManager {
             progress.metadata.last_call_at = attempt.prev_last_call_at;
         }
         if attempt.bumped_stall {
-            let threshold = self.config.timeouts.qso_stall_switch_after;
-            let was_at_threshold = progress.metadata.stall_cycles >= threshold;
-            progress.metadata.stall_cycles = progress.metadata.stall_cycles.saturating_sub(1);
-            if was_at_threshold && progress.metadata.stall_cycles < threshold {
-                entry.stall_action_revoked = true;
+            // PAN-128 (the "heir" rule): a counted attempt and an uncounted
+            // twin can feed the SAME own-parity TX slot (two rearms one
+            // protocol slot apart). If the counted one is rolled back while
+            // a same-slot sibling survives, the sibling inherits the slot's
+            // increment and nothing is decremented — the slot still has a
+            // frame that can air, so it keeps its count. Only with no
+            // surviving sibling does the existing decrement (and the
+            // `stall_action_revoked` path below) run.
+            let heir = attempt
+                .tx_slot
+                .and_then(|slot| entry.attempts.iter().rposition(|a| a.tx_slot == Some(slot)));
+            match heir {
+                Some(index) => entry.attempts[index].bumped_stall = true,
+                None => {
+                    let threshold = self.config.timeouts.qso_stall_switch_after;
+                    let was_at_threshold = progress.metadata.stall_cycles >= threshold;
+                    progress.metadata.stall_cycles =
+                        progress.metadata.stall_cycles.saturating_sub(1);
+                    if was_at_threshold && progress.metadata.stall_cycles < threshold {
+                        entry.stall_action_revoked = true;
+                    }
+                }
             }
         }
         if attempt.recorded_sent {
@@ -3928,6 +4007,7 @@ impl QsoManager {
                             raw_text: self.render_sent_text(&message),
                             prev_last_call_at,
                             bumped_stall: false,
+                            tx_slot: None,
                             recorded_sent: false,
                             frequency_hz: frequency,
                             remote_origin: progress.metadata.remote_origin,
@@ -4371,6 +4451,7 @@ impl QsoManager {
                         raw_text,
                         prev_last_call_at,
                         bumped_stall: false,
+                        tx_slot: None,
                         recorded_sent: true,
                         frequency_hz: progress.metadata.frequency,
                         remote_origin: progress.metadata.remote_origin,
@@ -7242,7 +7323,9 @@ impl QsoManager {
     /// Re-arming increments `call_count` and updates `last_call_at`; the
     /// watchdog ([`Self::check_timeouts_at`]) reads `call_count` and
     /// `first_call_at` (Manual) or the per-state `report_timeout` (Auto) to
-    /// decide when to stop.
+    /// decide when to stop. The stall streak (`stall_cycles`) counts once
+    /// per own-parity TX slot these re-sends feed, not once per emission
+    /// (PAN-128).
     /// Failed TX outcomes can reverse accounting via [`Self::roll_back_unsent_attempt_at`].
     /// The ledger emission anchor preserves cadence even when accounting is restored.
     pub async fn rearm_manual_calls_at(&self, now: DateTime<Utc>) {
@@ -7488,11 +7571,30 @@ impl QsoManager {
                 // the DX did not advance the QSO since the last slot, so we
                 // count it against the stall streak. A forward advance
                 // (`process_message_for_qso`) resets this to 0 elsewhere;
-                // this is now the sole increment site (see
+                // this is the sole increment site (see
                 // `QsoMetadata::stall_cycles`'s doc comment). Reached only
                 // when `frame_reaches_the_air` (above), so the existing
                 // count-intact-on-mute behavior is preserved by construction.
-                progress.metadata.stall_cycles = progress.metadata.stall_cycles.saturating_add(1);
+                //
+                // PAN-128: the QSO only transmits on its own parity — every
+                // OTHER slot — so an emission counts once per own-parity TX
+                // slot it feeds, not once per emission. The first emission
+                // feeding a slot no surviving attempt has claimed holds the
+                // slot's count (`bumped_stall`); its same-slot successors
+                // keep pre-arming the TX worker without inflating the
+                // streak, so `qso_stall_switch_after` measures real
+                // unanswered TX opportunities.
+                let tx_slot = keep_call_tx_slot(now, slot_millis, progress.metadata.tx_parity);
+                let counts_toward_stall = !ledger.get(&qso_id).is_some_and(|entry| {
+                    entry
+                        .attempts
+                        .iter()
+                        .any(|a| a.bumped_stall && a.tx_slot == Some(tx_slot))
+                });
+                if counts_toward_stall {
+                    progress.metadata.stall_cycles =
+                        progress.metadata.stall_cycles.saturating_add(1);
+                }
 
                 let tx_auto = pancetta_core::TxFreqMode::from_u8(
                     self.tx_freq_mode.load(std::sync::atomic::Ordering::Relaxed),
@@ -7565,7 +7667,8 @@ impl QsoManager {
                         emitted_at: now,
                         raw_text,
                         prev_last_call_at,
-                        bumped_stall: true,
+                        bumped_stall: counts_toward_stall,
+                        tx_slot: Some(tx_slot),
                         recorded_sent: true,
                         frequency_hz: progress.metadata.frequency,
                         remote_origin: progress.metadata.remote_origin,
@@ -18068,10 +18171,12 @@ mod pan72_stall_detection_tests {
     //! Replaces the old identical/differing-frame `DX_STUCK_REPEAT_THRESHOLD`
     //! hop (see the deleted `stuck_dx_tests` cases) with a single counter
     //! (`QsoMetadata::stall_cycles`) incremented solely by
-    //! `QsoManager::rearm_manual_calls_at` on each real per-slot re-send —
-    //! i.e. driven by *silence* (the DX not responding this slot), not by
-    //! inspecting incoming frame content. A genuine forward advance resets
-    //! the counter and records the current offset as
+    //! `QsoManager::rearm_manual_calls_at` on each real re-send that feeds a
+    //! not-yet-counted own-parity TX slot — i.e. driven by *silence* (the DX
+    //! not responding on our transmit slots), not by inspecting incoming
+    //! frame content, and once per real TX opportunity rather than once per
+    //! protocol slot (PAN-128). A genuine forward advance resets the counter
+    //! and records the current offset as
     //! `QsoMetadata::last_known_good_offset_hz`. When the counter trips
     //! `TimeoutConfig::qso_stall_switch_after` (Auto TX-freq mode only), the
     //! manager emits `QsoEvent::TxOffsetActionNeeded`: `Switch` if we're
@@ -18194,9 +18299,11 @@ mod pan72_stall_detection_tests {
             "no action expected before the threshold, got {events:?}"
         );
 
-        // Second rearm tick: threshold (2) hit -> Switch.
+        // Second rearm tick, two slots after the first so it feeds a
+        // DISTINCT own-parity TX slot (PAN-128): threshold (2) hit ->
+        // Switch.
         manager
-            .rearm_manual_calls_at(opened_at + Duration::seconds(30))
+            .rearm_manual_calls_at(opened_at + Duration::seconds(45))
             .await;
 
         let mut saw_switch = false;
@@ -18260,7 +18367,7 @@ mod pan72_stall_detection_tests {
             .last_call_at
             .unwrap();
 
-        for slot in 1..=2i64 {
+        for slot in [1i64, 3] {
             manager
                 .rearm_manual_calls_at(opened_at + Duration::seconds(15 * slot))
                 .await;
@@ -18783,8 +18890,9 @@ mod pan72_stall_detection_tests {
             .last_call_at
             .unwrap();
 
-        // Two REAL FT4 slots (7.5 s each).
-        for slot in 1..=2i64 {
+        // Two rearms two FT4 slots (2 × 7.5 s) apart, each feeding a
+        // distinct own-parity FT4 TX slot (PAN-128).
+        for slot in [1i64, 3] {
             manager
                 .rearm_manual_calls_at(opened_at + Duration::milliseconds(7_500 * slot))
                 .await;
@@ -18929,7 +19037,7 @@ mod pan72_stall_detection_tests {
             .last_call_at
             .unwrap();
 
-        for slot in 1..=2i64 {
+        for slot in [1i64, 3] {
             manager
                 .rearm_manual_calls_at(opened_at + Duration::milliseconds(7_500 * slot))
                 .await;
@@ -19184,12 +19292,14 @@ mod pan72_stall_detection_tests {
         let entered_at = after_advance.metadata.last_call_at.unwrap();
         let _ = drain(&mut rx);
 
-        // Two silent rearm cycles on the (still known-good) offset -> Switch.
+        // Two silent rearm cycles (two slots apart, so each feeds a
+        // distinct own-parity TX slot — PAN-128) on the (still known-good)
+        // offset -> Switch.
         manager
             .rearm_manual_calls_at(entered_at + Duration::seconds(15))
             .await;
         manager
-            .rearm_manual_calls_at(entered_at + Duration::seconds(30))
+            .rearm_manual_calls_at(entered_at + Duration::seconds(45))
             .await;
         let first_action = drain(&mut rx).into_iter().find_map(|e| match e {
             QsoEvent::TxOffsetActionNeeded { action, .. } => Some(action),
@@ -19214,13 +19324,14 @@ mod pan72_stall_detection_tests {
             .expect("committing the resolved Switch");
         assert_eq!(applied, new_freq);
 
-        // Two more silent rearm cycles on the NEW (non-known-good) offset ->
-        // Revert back to the known-good offset, not another Switch.
+        // Two more silent rearm cycles (again two slots apart) on the NEW
+        // (non-known-good) offset -> Revert back to the known-good offset,
+        // not another Switch.
         manager
-            .rearm_manual_calls_at(entered_at + Duration::seconds(45))
+            .rearm_manual_calls_at(entered_at + Duration::seconds(75))
             .await;
         manager
-            .rearm_manual_calls_at(entered_at + Duration::seconds(60))
+            .rearm_manual_calls_at(entered_at + Duration::seconds(105))
             .await;
         let second_action = drain(&mut rx).into_iter().find_map(|e| match e {
             QsoEvent::TxOffsetActionNeeded { action, .. } => Some(action),
@@ -19260,9 +19371,10 @@ mod pan72_stall_detection_tests {
             .last_call_at
             .unwrap();
 
-        // Three unanswered CQ slots: stall_cycles -> 3 (still below the
-        // default-shaped threshold of 4).
-        for i in 1..=3i64 {
+        // Three unanswered CQ slots (rearms two slots apart, so each feeds
+        // a distinct own-parity TX slot — PAN-128): stall_cycles -> 3
+        // (still below the default-shaped threshold of 4).
+        for i in [1i64, 3, 5] {
             manager
                 .rearm_manual_calls_at(opened_at + Duration::seconds(15 * i))
                 .await;
@@ -19371,15 +19483,16 @@ mod pan72_stall_detection_tests {
         );
 
         // Now the Fox goes silent. Two stalled `SendingReport` rearm cycles
-        // must produce a Switch (we're still on our known-good offset), NOT a
-        // Revert to the abandoned low calling offset.
+        // (two slots apart, feeding distinct own-parity TX slots — PAN-128)
+        // must produce a Switch (we're still on our known-good offset), NOT
+        // a Revert to the abandoned low calling offset.
         let entered_at = after.metadata.last_call_at.unwrap();
         let _ = drain(&mut rx);
         manager
             .rearm_manual_calls_at(entered_at + Duration::seconds(15))
             .await;
         manager
-            .rearm_manual_calls_at(entered_at + Duration::seconds(30))
+            .rearm_manual_calls_at(entered_at + Duration::seconds(45))
             .await;
         let action = drain(&mut rx).into_iter().find_map(|e| match e {
             QsoEvent::TxOffsetActionNeeded { action, .. } => Some(action),
@@ -19999,13 +20112,15 @@ mod pan72_stall_detection_tests {
             .unwrap();
         let _ = drain(&mut rx);
 
-        // Two silent rearm cycles: nobody has come back to our CQ, so the
-        // stall detector trips and asks for a Switch off this offset.
+        // Two silent rearm cycles (two slots apart, feeding distinct
+        // own-parity TX slots — PAN-128): nobody has come back to our CQ,
+        // so the stall detector trips and asks for a Switch off this
+        // offset.
         manager
             .rearm_manual_calls_at(opened_at + Duration::seconds(15))
             .await;
         manager
-            .rearm_manual_calls_at(opened_at + Duration::seconds(30))
+            .rearm_manual_calls_at(opened_at + Duration::seconds(45))
             .await;
         let action = drain(&mut rx).into_iter().find_map(|e| match e {
             QsoEvent::TxOffsetActionNeeded { action, .. } => Some(action),
@@ -20094,13 +20209,15 @@ mod pan72_stall_detection_tests {
             .unwrap();
         let _ = drain(&mut rx);
 
-        // Two silent rearm cycles. The SECOND one both re-emits our CQ at FREQ
-        // (the frame a caller can answer) and trips the stall threshold.
+        // Two silent rearm cycles, two slots apart so the second feeds a
+        // distinct own-parity TX slot (PAN-128). The SECOND one both
+        // re-emits our CQ at FREQ (the frame a caller can answer) and trips
+        // the stall threshold.
         manager
             .rearm_manual_calls_at(opened_at + Duration::seconds(15))
             .await;
         manager
-            .rearm_manual_calls_at(opened_at + Duration::seconds(30))
+            .rearm_manual_calls_at(opened_at + Duration::seconds(45))
             .await;
         let events = drain(&mut rx);
         assert!(
@@ -20751,6 +20868,539 @@ mod pan72_stall_detection_tests {
         assert_eq!(
             after.metadata.stall_cycles, 1,
             "the stall evidence must survive a repeated report"
+        );
+    }
+
+    // ── PAN-128: one stall count per own-parity TX slot ──────────────────
+    //
+    // A QSO transmits only on its own parity — every OTHER protocol slot —
+    // so the stall counter counts the own-parity TX slots the rearm
+    // emissions FEED, not the emissions. Rearm times below are anchored to
+    // the QSO's own-parity slot grid (`next_slot_with_parity_with_period`)
+    // so the results never depend on the wall-clock slot phase at test
+    // start.
+
+    /// The first own-parity FT8 slot start strictly after `opened_at + one
+    /// slot` — the anchor the PAN-128 cadence tests rearm relative to.
+    fn next_own_ft8_slot(
+        after: DateTime<Utc>,
+        tx_parity: pancetta_core::slot::SlotParity,
+    ) -> DateTime<Utc> {
+        pancetta_core::slot::next_slot_with_parity_with_period(after, tx_parity, 15_000_000_000)
+    }
+
+    #[test]
+    fn keep_call_tx_slot_is_the_next_own_parity_slot_start() {
+        use chrono::TimeZone;
+        use pancetta_core::slot::SlotParity;
+
+        // 2026-01-01T00:00:00Z is timestamp 1767225600 = 15 * 117815040 —
+        // an Even slot start under both the FT8 (15 s) and FT4 (7.5 s)
+        // grids, so every expectation below is grid-aligned.
+        let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let s = Duration::seconds;
+
+        // FT8, both parities, mid-slot.
+        assert_eq!(
+            keep_call_tx_slot(base + s(5), 15_000, Some(SlotParity::Odd)),
+            base + s(15)
+        );
+        assert_eq!(
+            keep_call_tx_slot(base + s(5), 15_000, Some(SlotParity::Even)),
+            base + s(30)
+        );
+        // Exactly on a boundary: strictly after — never `now` itself.
+        assert_eq!(
+            keep_call_tx_slot(base, 15_000, Some(SlotParity::Even)),
+            base + s(30)
+        );
+        assert_eq!(
+            keep_call_tx_slot(base, 15_000, Some(SlotParity::Odd)),
+            base + s(15)
+        );
+        // FT4's 7.5 s period: Odd slots at +7.5 s/+22.5 s, Even at +15 s.
+        assert_eq!(
+            keep_call_tx_slot(base + s(1), 7_500, Some(SlotParity::Odd)),
+            base + Duration::milliseconds(7_500)
+        );
+        assert_eq!(
+            keep_call_tx_slot(base + s(1), 7_500, Some(SlotParity::Even)),
+            base + s(15)
+        );
+        // No latched parity: the next slot of either parity, still strictly
+        // after `now`.
+        assert_eq!(keep_call_tx_slot(base + s(5), 15_000, None), base + s(15));
+        assert_eq!(keep_call_tx_slot(base, 15_000, None), base + s(15));
+    }
+
+    /// Rearms every protocol slot starting INSIDE our own slot: the
+    /// in-our-slot emission and the off-parity one after it feed the SAME
+    /// own-parity TX slot, so the streak climbs once per own TX slot
+    /// ([1,1,2,2,...]) while `call_count` rises on every emission, and the
+    /// threshold trips on the emission feeding the N-th distinct slot.
+    #[tokio::test]
+    async fn stall_counts_once_per_own_parity_tx_slot_when_rearms_start_in_our_slot() {
+        use pancetta_core::slot::SlotParity;
+
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 4;
+        let manager = manager_auto(config);
+        let mut rx = manager.subscribe();
+        // The DX was heard on Odd, so we latch and hold tx_parity = Even.
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, Some(SlotParity::Odd))
+            .await
+            .unwrap();
+        let opened = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(opened.metadata.tx_parity, Some(SlotParity::Even));
+        let opened_at = opened.metadata.last_call_at.unwrap();
+        let _ = drain(&mut rx);
+
+        let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+        let mut first_action_on_rearm = None;
+        for k in 0..8i64 {
+            manager
+                .rearm_manual_calls_at(x + Duration::seconds(1 + 15 * k))
+                .await;
+            assert_eq!(
+                manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles as i64,
+                [1, 1, 2, 2, 3, 3, 4, 4][k as usize],
+                "rearm {} must count once per own-parity TX slot it feeds",
+                k + 1
+            );
+            assert_eq!(
+                manager.get_qso(qso_id).await.unwrap().metadata.call_count,
+                2 + k as u32,
+                "the keep-call still goes out on every protocol slot"
+            );
+            if first_action_on_rearm.is_none()
+                && drain(&mut rx)
+                    .iter()
+                    .any(|e| matches!(e, QsoEvent::TxOffsetActionNeeded { .. }))
+            {
+                first_action_on_rearm = Some(k + 1);
+            }
+        }
+        assert_eq!(
+            first_action_on_rearm,
+            Some(7),
+            "threshold 4 must trip on the emission feeding the 4th distinct \
+             own-parity TX slot — the 7th rearm, not the 4th"
+        );
+    }
+
+    /// The mirror start: the first rearm lands in the DX's (off-parity)
+    /// slot, so it feeds the own slot AFTER the one its successor feeds —
+    /// every own slot in the window still counts exactly once.
+    #[tokio::test]
+    async fn stall_counts_once_per_own_parity_tx_slot_when_rearms_start_in_their_slot() {
+        use pancetta_core::slot::SlotParity;
+
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 4;
+        let manager = manager_auto(config);
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, Some(SlotParity::Odd))
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        let _ = drain(&mut rx);
+
+        let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+        // x+16 s lands in the off-parity slot before the own slot x+30 —
+        // and is always past the one-slot rearm gate relative to opened_at.
+        let mut first_action_on_rearm = None;
+        for k in 0..6i64 {
+            manager
+                .rearm_manual_calls_at(x + Duration::seconds(16 + 15 * k))
+                .await;
+            assert_eq!(
+                manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles as i64,
+                [1, 2, 2, 3, 3, 4][k as usize],
+                "rearm {} must count once per own-parity TX slot it feeds",
+                k + 1
+            );
+            if first_action_on_rearm.is_none()
+                && drain(&mut rx)
+                    .iter()
+                    .any(|e| matches!(e, QsoEvent::TxOffsetActionNeeded { .. }))
+            {
+                first_action_on_rearm = Some(k + 1);
+            }
+        }
+        assert_eq!(
+            first_action_on_rearm,
+            Some(6),
+            "threshold 4 must trip on the 6th rearm — the one feeding the \
+             4th distinct own-parity TX slot"
+        );
+    }
+
+    /// FT4's 7.5 s slot: own-parity TX slots come every 15 s, so two
+    /// protocol-slot-apart rearms can share one, and the counter must
+    /// still climb once per own FT4 slot.
+    #[tokio::test]
+    async fn ft4_stall_counts_once_per_own_parity_ft4_slot() {
+        use pancetta_core::slot::{next_slot_with_parity_with_period, SlotParity};
+
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        config.active_mode = "FT4".to_string();
+        let mut manager = manager_auto(config);
+        manager
+            .set_active_slot_ns_source(Arc::new(std::sync::atomic::AtomicI64::new(7_500_000_000)));
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, Some(SlotParity::Odd))
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        let _ = drain(&mut rx);
+
+        let x = next_slot_with_parity_with_period(
+            opened_at + Duration::milliseconds(7_500),
+            SlotParity::Even,
+            7_500_000_000,
+        );
+        let mut switched = false;
+        for k in 0..3i64 {
+            manager
+                .rearm_manual_calls_at(x + Duration::milliseconds(1_000 + 7_500 * k))
+                .await;
+            assert_eq!(
+                manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles as i64,
+                [1, 1, 2][k as usize],
+                "FT4 rearm {} must count once per own-parity FT4 TX slot",
+                k + 1
+            );
+            switched |= drain(&mut rx)
+                .iter()
+                .any(|e| matches!(e, QsoEvent::TxOffsetActionNeeded { .. }));
+        }
+        assert!(
+            switched,
+            "threshold 2 must trip on the rearm feeding the 2nd distinct \
+             own-parity FT4 slot"
+        );
+    }
+
+    /// Two rearms feeding ONE own-parity TX slot: rolling back the
+    /// uncounted twin (the newest, which newest-first matching picks) must
+    /// leave the slot's count with the counted attempt; only rolling back
+    /// the counted one takes the slot's count away.
+    #[tokio::test]
+    async fn rolling_back_the_uncounted_twin_keeps_the_stall_count() {
+        use pancetta_core::slot::SlotParity;
+
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, Some(SlotParity::Odd))
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+        // Both emissions feed the own-parity slot at x+30.
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(1))
+            .await;
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(16))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1,
+            "two rearms feeding one own-parity TX slot count once"
+        );
+        let text = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .messages
+            .last()
+            .unwrap()
+            .raw_text
+            .clone();
+
+        // Newest-first matching removes the uncounted twin.
+        assert!(matches!(
+            manager
+                .roll_back_unsent_attempt_at(qso_id, &text, x + Duration::seconds(20))
+                .await,
+            UnsentAttemptRollback::RolledBack { .. }
+        ));
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1,
+            "the slot keeps its count while its counted attempt survives"
+        );
+
+        // Now the counted attempt itself: no same-slot sibling survives.
+        assert!(matches!(
+            manager
+                .roll_back_unsent_attempt_at(qso_id, &text, x + Duration::seconds(21))
+                .await,
+            UnsentAttemptRollback::RolledBack { .. }
+        ));
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            0,
+            "with no surviving attempt for the slot, the count goes too"
+        );
+    }
+
+    /// PAN-128 D2 (the heir rule): a payload-scoped rollback that removes
+    /// the COUNTED attempt while an uncounted same-slot twin survives hands
+    /// the slot's count to that twin instead of decrementing.
+    #[tokio::test]
+    async fn rolling_back_the_counted_attempt_hands_its_count_to_a_surviving_twin() {
+        use pancetta_core::slot::SlotParity;
+
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, Some(SlotParity::Odd))
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+        // Emission A (at FREQ) is counted; then a TX pivot changes only the
+        // offset (no commit, so no streak reset); emission B (at FREQ+100)
+        // feeds the SAME own-parity slot and stays uncounted.
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(1))
+            .await;
+        manager
+            .qsos
+            .write()
+            .await
+            .get_mut(&qso_id)
+            .unwrap()
+            .metadata
+            .frequency = FREQ + 100.0;
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(16))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1
+        );
+        let text = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .messages
+            .last()
+            .unwrap()
+            .raw_text
+            .clone();
+
+        // The replaced frame is the one carrying FREQ — attempt A, the
+        // counted one. Its count moves to twin B, not to zero.
+        let replaced = UnsentAttemptPayload {
+            frequency_hz: FREQ,
+            remote_binding: Some((false, None)),
+        };
+        assert!(matches!(
+            manager
+                .roll_back_replaced_attempt_at(
+                    qso_id,
+                    &text,
+                    Some(&replaced),
+                    x + Duration::seconds(20)
+                )
+                .await,
+            UnsentAttemptRollback::RolledBack { .. }
+        ));
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1,
+            "a surviving same-slot twin inherits the slot's stall count"
+        );
+
+        // Rolling back the twin too (it carried FREQ+100) finally drops it.
+        let aired = UnsentAttemptPayload {
+            frequency_hz: FREQ + 100.0,
+            remote_binding: Some((false, None)),
+        };
+        assert!(matches!(
+            manager
+                .roll_back_replaced_attempt_at(
+                    qso_id,
+                    &text,
+                    Some(&aired),
+                    x + Duration::seconds(21)
+                )
+                .await,
+            UnsentAttemptRollback::RolledBack { .. }
+        ));
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            0
+        );
+    }
+
+    /// A slot whose only attempt was rolled back counts again when a later
+    /// rearm feeds it — the count belongs to the slot, held by whatever
+    /// surviving attempt feeds it.
+    #[tokio::test]
+    async fn a_rolled_back_slot_counts_again_when_a_later_rearm_feeds_it() {
+        use pancetta_core::slot::SlotParity;
+
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, Some(SlotParity::Odd))
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(1))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1
+        );
+        let text = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .messages
+            .last()
+            .unwrap()
+            .raw_text
+            .clone();
+        assert!(matches!(
+            manager
+                .roll_back_unsent_attempt_at(qso_id, &text, x + Duration::seconds(2))
+                .await,
+            UnsentAttemptRollback::RolledBack { .. }
+        ));
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            0
+        );
+
+        // One protocol slot later, still inside the window that feeds the
+        // same own-parity slot at x+30.
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(16))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1,
+            "a slot whose attempt was fully rolled back counts again when a \
+             later rearm feeds it"
+        );
+    }
+
+    /// PAN-128: a stall reset must clear each attempt's slot key along
+    /// with its increment, so the heir rule can never hand a post-reset
+    /// count to a pre-reset attempt. The first post-reset rearm, rolled
+    /// back unsent, must DECREMENT — not park its count on a cleared
+    /// attempt that happens to feed the same own-parity TX slot.
+    #[tokio::test]
+    async fn heir_does_not_cross_a_committed_switch_reset() {
+        use pancetta_core::slot::SlotParity;
+
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        let manager = manager_auto(config);
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, Some(SlotParity::Odd))
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+        // Feeds the own-parity slot at x+30 …
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(1))
+            .await;
+        // … and P, one protocol slot later inside our own slot, feeds x+60
+        // and trips threshold 2.
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(31))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            2
+        );
+        // The commit resets the streak AND must retire P's slot key.
+        manager
+            .apply_tx_offset_switch(qso_id, FREQ + 300.0, stall_origin(&manager, qso_id).await)
+            .await
+            .expect("commit");
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            0
+        );
+        // R, in the off-parity slot before x+60, feeds the same slot P fed
+        // and is the only COUNTED attempt since the reset.
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(46))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1
+        );
+        let text = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .messages
+            .last()
+            .unwrap()
+            .raw_text
+            .clone();
+        assert!(matches!(
+            manager
+                .roll_back_unsent_attempt_at(qso_id, &text, x + Duration::seconds(47))
+                .await,
+            UnsentAttemptRollback::RolledBack { .. }
+        ));
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            0,
+            "a pre-reset attempt must not inherit a post-reset count"
         );
     }
 }
