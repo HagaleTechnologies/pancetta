@@ -11476,11 +11476,14 @@ mod respond_to_caller_admission_tests {
             .metadata
             .last_call_at
             .unwrap();
+        // PAN-128: the two rearms are two slots apart so each feeds a
+        // distinct own-parity TX slot — the stall counter counts own TX
+        // slots, not protocol slots.
         manager
             .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(15))
             .await;
         manager
-            .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(30))
+            .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(45))
             .await;
 
         let mut found = false;
