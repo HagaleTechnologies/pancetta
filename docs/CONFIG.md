@@ -128,6 +128,46 @@ need to touch them; see `defaults.toml` for the full key list.
 input. Negative values attenuate; useful when a hot CODEC saturates the
 ADC even with the rig's audio output turned all the way down.
 
+### `[audio.recording]` — save decode windows as WAV (off by default)
+
+Pancetta can save every live decode window it hands the decoder as a WAV
+file, for offline decoder validation and corpus building. Recording is off
+unless you turn it on:
+
+```toml
+[audio.recording]
+auto_record = true
+directory = "~/.pancetta/recordings"
+```
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `auto_record` | bool | `false` | `true` writes one WAV per live decode window. |
+| `directory` | string | `"~/Documents/Pancetta/Recordings"` | Where recordings go; created if missing. A leading `~` is your home directory (`~user` is not expanded). Empty means `~/.pancetta/recordings`. |
+
+- Each file is a 12 kHz, mono, 16-bit WAV of one decode window (about
+  300 KB for FT8), named `ft8_<UTC date>_<time>[_<band>].wav`. Windows of
+  digital silence (rig off or unplugged) are skipped. A full day of FT8 is
+  about 1.7 GB.
+- The directory is capped at 10 GB of top-level `*.wav` files. Past that,
+  the oldest recording (by filename) is deleted for each new one.
+- With recording on, pancetta also saves the first 90 s of raw capture once
+  per start as `raw_48khz_diagnostic.wav` (about 17 MB) in the same directory.
+- `--replay` and `--no-audio` runs never record, whatever this says.
+- The other keys in this table (`format`, `bit_depth`, `sample_rate`,
+  `max_length_minutes`, `filename_pattern`, `compression_level`) are not
+  read. Recordings always use the format above.
+- Changes take effect after a restart.
+- The startup log says which way it went: `WAV recording enabled: dir=…`
+  or `WAV recording disabled -- set audio.recording.auto_record = true …`.
+
+**Station decoder corpus.** The corpus offload job (magazzino
+`clients/pancetta-wav-offload.sh`) and the decoder research tools
+(`curate --source-dir ~/.pancetta/recordings`, see docs/RUNBOOK.md) read
+`~/.pancetta/recordings`. A station that feeds them must set both keys as
+shown above. `auto_record = true` on its own records into the default
+`~/Documents/Pancetta/Recordings`, which nothing collects.
+
 ---
 
 ## `[rig]` — CAT control
@@ -796,6 +836,19 @@ into a fresh `qsos.adi` before switching over. No manual action required.
 `--dry-run` to preview). It appends only the contacts you don't already have
 and backs up `qsos.adi` first. Do not copy another logger's file over
 `qsos.adi`: that replaces your own contacts.
+
+### Decode-window recordings
+
+Decode-window WAVs exist only on a station whose config sets
+`[audio.recording] auto_record = true`, and land in
+`audio.recording.directory` (see the `[audio.recording]` section above).
+The station decoder corpus — the magazzino offload job and the
+`pancetta-research` curation tools — reads `~/.pancetta/recordings`, so a
+corpus station sets `directory = "~/.pancetta/recordings"` explicitly.
+Releases before this setting existed recorded every window into
+`~/.pancetta/recordings` unconditionally; upgrading does not touch those
+files, and deleting them reclaims the space (the directory was capped at
+10 GB).
 
 ---
 
