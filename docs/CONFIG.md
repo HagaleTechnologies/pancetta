@@ -787,6 +787,7 @@ All persistent state lives under `~/.pancetta/`.
 | `~/.pancetta/qsos.adi` | Durable, append-only ADIF source of truth. Point WSJT-X / N1MM / LoTW / eQSL at this file directly. | No — back this up. |
 | `~/.pancetta/qso.db` | sqlx-backed query index. Rebuilt from ADIF on startup if missing or stale. | Yes — safe to delete; the next run will replay ADIF into a fresh index. |
 | `~/.pancetta/qsos.adi.bak`, `qsos.adi.bak.N` | Your logbook as it was before a `pancetta import` added contacts (one per import). | This *is* the recovery copy. |
+| `~/.pancetta/backups/qso_backup_YYYYMMDD_HHMMSS.db` | Automatic backups of `qso.db` (every 24 h, 7 kept), regardless of the directory Pancetta was launched from. Covers the query index only — the `qsos.adi` source of truth is not copied here. | Yes — same recovery path as `qso.db`. |
 
 **Migration note:** if you are upgrading from an earlier release that wrote only
 `qso.db`, the first startup will automatically export every row from the old database
