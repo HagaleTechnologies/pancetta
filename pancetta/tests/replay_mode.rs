@@ -263,24 +263,26 @@ fn replay_never_records_even_when_recording_is_enabled() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(log.contains("DSP: FT8 window #1"), "no window decoded:\n{log}");
+    assert!(
+        log.contains("DSP: FT8 window #1"),
+        "no window decoded:\n{log}"
+    );
     assert!(
         log.contains("Replay mode: WAV recording suppressed"),
         "replay must state that recording is suppressed:\n{log}"
     );
     assert!(
-        !station
-            .home
-            .path()
-            .join(".pancetta/recordings")
-            .exists(),
+        !station.home.path().join(".pancetta/recordings").exists(),
         "a replay must not create the recordings directory"
     );
 
     // No *.wav anywhere under the scratch home outside the replay corpus.
     let mut stray = Vec::new();
     collect_wavs(station.home.path(), &dir, &mut stray);
-    assert!(stray.is_empty(), "replay wrote WAVs outside the corpus: {stray:?}");
+    assert!(
+        stray.is_empty(),
+        "replay wrote WAVs outside the corpus: {stray:?}"
+    );
 }
 
 /// Every `*.wav` under `root` except the `exclude` subtree.

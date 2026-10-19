@@ -967,7 +967,10 @@ mod raw_diagnostic_capture_tests {
         assert!(!cap.push(&[0.1; 4]), "target not reached yet");
         assert!(!tmp.path().join(RAW_DIAGNOSTIC_WAV).exists());
 
-        assert!(cap.push(&[0.1; 4]), "target reached: the caller must drop it");
+        assert!(
+            cap.push(&[0.1; 4]),
+            "target reached: the caller must drop it"
+        );
 
         let path = tmp.path().join(RAW_DIAGNOSTIC_WAV);
         let reader = hound::WavReader::open(&path).unwrap();
@@ -1003,6 +1006,10 @@ mod raw_diagnostic_capture_tests {
 
         let reader = hound::WavReader::open(tmp.path().join(RAW_DIAGNOSTIC_WAV)).unwrap();
         // hound's `len()` counts interleaved samples across both channels.
-        assert_eq!(reader.len(), 6, "the whole batch was buffered, not truncated");
+        assert_eq!(
+            reader.len(),
+            6,
+            "the whole batch was buffered, not truncated"
+        );
     }
 }

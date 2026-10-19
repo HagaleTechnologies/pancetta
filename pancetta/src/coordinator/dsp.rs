@@ -382,9 +382,7 @@ pub(crate) const MSG_WAV_RECORDING_NO_AUDIO: &str =
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WavRecording {
     /// `auto_record = true` on a live-audio run: record into `dir`.
-    Enabled {
-        dir: std::path::PathBuf,
-    },
+    Enabled { dir: std::path::PathBuf },
     /// `auto_record` unset/false: record nothing.
     DisabledByConfig,
     /// `--replay`: never write replayed windows back out as fresh captures.
@@ -394,9 +392,7 @@ pub(crate) enum WavRecording {
     /// The configured `directory` needs `~` expanded but no home directory
     /// is resolvable; recording stays off rather than writing somewhere
     /// arbitrary.
-    NoHomeDir {
-        directory: String,
-    },
+    NoHomeDir { directory: String },
 }
 
 /// Config first (so the default case always names the setting), then the
@@ -638,7 +634,11 @@ impl super::ApplicationCoordinator {
                 match WavRecorder::open(dir.clone(), WAV_RECORDING_MAX_BYTES) {
                     Ok(r) => Some(r),
                     Err(e) => {
-                        warn!("WAV recording disabled: cannot use {}: {}", dir.display(), e);
+                        warn!(
+                            "WAV recording disabled: cannot use {}: {}",
+                            dir.display(),
+                            e
+                        );
                         None
                     }
                 }
@@ -1878,7 +1878,12 @@ mod wav_recording_gate_tests {
     #[test]
     fn enabled_expands_leading_tilde() {
         assert_eq!(
-            resolve_wav_recording(&rec(true, "~/.pancetta/recordings"), false, false, Some(&home())),
+            resolve_wav_recording(
+                &rec(true, "~/.pancetta/recordings"),
+                false,
+                false,
+                Some(&home())
+            ),
             WavRecording::Enabled {
                 dir: home().join(".pancetta").join("recordings")
             }
@@ -1897,7 +1902,9 @@ mod wav_recording_gate_tests {
     fn windows_style_tilde_expands() {
         assert_eq!(
             resolve_wav_recording(&rec(true, "~\\rec"), false, false, Some(&home())),
-            WavRecording::Enabled { dir: home().join("rec") }
+            WavRecording::Enabled {
+                dir: home().join("rec")
+            }
         );
     }
 
@@ -1916,7 +1923,9 @@ mod wav_recording_gate_tests {
         // `~user` is not expanded (same as the config loader's tilde).
         assert_eq!(
             resolve_wav_recording(&rec(true, "~user/rec"), false, false, Some(&home())),
-            WavRecording::Enabled { dir: "~user/rec".into() }
+            WavRecording::Enabled {
+                dir: "~user/rec".into()
+            }
         );
     }
 
@@ -1924,7 +1933,9 @@ mod wav_recording_gate_tests {
     fn surrounding_whitespace_is_trimmed() {
         assert_eq!(
             resolve_wav_recording(&rec(true, "  ~/rec  "), false, false, Some(&home())),
-            WavRecording::Enabled { dir: home().join("rec") }
+            WavRecording::Enabled {
+                dir: home().join("rec")
+            }
         );
     }
 
@@ -2003,10 +2014,7 @@ mod wav_recording_gate_tests {
 
         // `open()` logs the enabled line with the directory.
         assert_eq!(
-            WavRecording::Enabled {
-                dir: "/rec".into()
-            }
-            .startup_message(),
+            WavRecording::Enabled { dir: "/rec".into() }.startup_message(),
             None
         );
     }

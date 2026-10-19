@@ -43,9 +43,7 @@ impl ScratchRun {
         let config = dot_pancetta.join("pancetta.toml");
         fs::write(
             &config,
-            format!(
-                "[station]\ncallsign = \"K5ARH\"\ngrid_square = \"EM12\"\n{extra_toml}"
-            ),
+            format!("[station]\ncallsign = \"K5ARH\"\ngrid_square = \"EM12\"\n{extra_toml}"),
         )
         .unwrap();
 
@@ -190,10 +188,11 @@ fn enabled_recording_writes_windows_into_the_configured_directory() {
     run.wait_for(
         "a recorded window in ~/stub-recordings",
         Duration::from_secs(60),
-        |r| {
-            wavs_under(&rec_dir, None)
-                .iter()
-                .any(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("ft8_")))
+        |_| {
+            wavs_under(&rec_dir, None).iter().any(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("ft8_"))
+            })
         },
     );
 
@@ -202,7 +201,10 @@ fn enabled_recording_writes_windows_into_the_configured_directory() {
         log.contains(&format!("WAV recording enabled: dir={}", rec_dir.display())),
         "the enabled line must name the expanded directory:\n{log}"
     );
-    assert!(log.contains("cap=10.0 GB"), "the cap must stay at 10 GB:\n{log}");
+    assert!(
+        log.contains("cap=10.0 GB"),
+        "the cap must stay at 10 GB:\n{log}"
+    );
 
     // Everything landed inside the configured directory; the old hardcoded
     // path and the default directory were never created.
