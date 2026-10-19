@@ -1065,9 +1065,10 @@ struct KeepCallAttempt {
     // `stall_cycles` rises once per own TX slot, not once per emission.
     bumped_stall: bool,
     // The own-parity TX slot this emission feeds (`keep_call_tx_slot`);
-    // `None` for attempts that never count toward the stall streak
-    // (`resend_last_tx`, the offset-switch retransmit) and never inherit
-    // one either.
+    // `None` for attempts that never count toward the stall streak and
+    // never inherit one either (`resend_last_tx`, the offset-switch
+    // retransmit, and anything a stall reset cleared — the reset retires
+    // the slot key with the increment).
     tx_slot: Option<DateTime<Utc>>,
     recorded_sent: bool,
     // What the emission carried besides its text. A TX pivot can replace a
@@ -3801,7 +3802,12 @@ impl QsoManager {
 
     // Called under the qsos write lock at either stall-reset site. Those
     // contributions are already gone; delayed failure must not subtract
-    // them from a later streak. Call-count and timeline eligibility remain.
+    // them from a later streak. `tx_slot` is cleared too: a reset must
+    // also retire the slot key, or the PAN-128 heir rule in
+    // `roll_back_replaced_attempt_at` could hand a post-reset count to a
+    // pre-reset attempt that feeds the same slot (its increment was
+    // deliberately cleared here). Call-count and timeline eligibility
+    // remain.
     fn clear_recorded_stall_increments(&self, qso_id: QsoId) {
         let mut ledger = self
             .keep_call_ledger
@@ -3810,6 +3816,7 @@ impl QsoManager {
         if let Some(entry) = ledger.get_mut(&qso_id) {
             for attempt in &mut entry.attempts {
                 attempt.bumped_stall = false;
+                attempt.tx_slot = None;
             }
             entry.stall_action_revoked = false;
         }
@@ -21316,6 +21323,84 @@ mod pan72_stall_detection_tests {
             1,
             "a slot whose attempt was fully rolled back counts again when a \
              later rearm feeds it"
+        );
+    }
+
+    /// PAN-128: a stall reset must clear each attempt's slot key along
+    /// with its increment, so the heir rule can never hand a post-reset
+    /// count to a pre-reset attempt. The first post-reset rearm, rolled
+    /// back unsent, must DECREMENT — not park its count on a cleared
+    /// attempt that happens to feed the same own-parity TX slot.
+    #[tokio::test]
+    async fn heir_does_not_cross_a_committed_switch_reset() {
+        use pancetta_core::slot::SlotParity;
+
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        let manager = manager_auto(config);
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, Some(SlotParity::Odd))
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+        // Feeds the own-parity slot at x+30 …
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(1))
+            .await;
+        // … and P, one protocol slot later inside our own slot, feeds x+60
+        // and trips threshold 2.
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(31))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            2
+        );
+        // The commit resets the streak AND must retire P's slot key.
+        manager
+            .apply_tx_offset_switch(qso_id, FREQ + 300.0, stall_origin(&manager, qso_id).await)
+            .await
+            .expect("commit");
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            0
+        );
+        // R, in the off-parity slot before x+60, feeds the same slot P fed
+        // and is the only COUNTED attempt since the reset.
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(46))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1
+        );
+        let text = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .messages
+            .last()
+            .unwrap()
+            .raw_text
+            .clone();
+        assert!(matches!(
+            manager
+                .roll_back_unsent_attempt_at(qso_id, &text, x + Duration::seconds(47))
+                .await,
+            UnsentAttemptRollback::RolledBack { .. }
+        ));
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            0,
+            "a pre-reset attempt must not inherit a post-reset count"
         );
     }
 }

@@ -403,7 +403,9 @@ ledger field wedges when the counted attempt is rolled back (the field would
 still claim the slot was counted).
 Rearm, explicit resend and operator offset-switch retransmits record attempts.
 A forward advance or committed offset switch clears the remembered stall
-contributions too, so a delayed failure cannot subtract from a newer streak.
+contributions too — each attempt's increment AND its slot key, so the heir
+hand-off can never cross a reset — so a delayed failure cannot subtract from
+a newer streak.
 Relinking stamps preserves any intervening forward advance.
 
 The ledger keeps a separate `last_emitted_at` anchor. Rearm pacing uses the later
