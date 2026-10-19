@@ -45,10 +45,11 @@ We pledge to make participation in our project a harassment-free experience for 
 
 Before contributing, ensure you have:
 
-1. **Rust 1.70+**: Install from [rustup.rs](https://rustup.rs/)
+1. **Rust via rustup**: Install from [rustup.rs](https://rustup.rs/). The
+   repo pins its toolchain in [`rust-toolchain.toml`](rust-toolchain.toml),
+   and rustup installs that version on first `cargo` use.
 2. **Git**: For version control
 3. **GitHub Account**: For submitting PRs
-4. **Discord** (optional): Join our community for discussions
 
 ### Fork and Clone
 
@@ -71,13 +72,13 @@ git remote -v
 
 ```bash
 # Build all packages
-cargo build --all
+cargo build --workspace
 
 # Build in release mode
 cargo build --release
 
-# Run tests
-cargo test --all
+# Run tests (the encoder is behind the `transmit` feature)
+cargo test --workspace --features transmit
 
 # Run with debug logging
 RUST_LOG=debug cargo run --bin pancetta
@@ -151,24 +152,25 @@ Follow these guidelines:
 ### 4. Test Your Changes
 
 ```bash
-# Run all tests
-cargo test --all
+# Run all tests -- the exact command CI's Test workspace step runs
+# (pancetta-research is a local-only harness, excluded from CI)
+cargo test --workspace --exclude pancetta-research --features transmit
 
-# Run specific test
-cargo test test_name
+# pancetta-hamlib's mock-rig tests run single-threaded
+cargo test -p pancetta-hamlib --lib -- --test-threads=1
 
-# Run benchmarks
-cargo bench
+# Run one test
+cargo test -p <crate> <test_name>
 
 # Check formatting
 cargo fmt --all -- --check
 
-# Run clippy
-cargo clippy --all -- -D warnings
+# Run clippy -- the exact command CI's Clippy step runs (no -D warnings)
+cargo clippy --workspace --exclude pancetta-research --features transmit
 
-# Test with different features
-cargo test --no-default-features
-cargo test --all-features
+# Or run the local pre-flight: a fast subset of CI plus a compile check of
+# pancetta-research, not a full CI mirror (`--fast` skips the test run)
+scripts/check.sh
 ```
 
 ### 5. Commit Your Changes
@@ -265,23 +267,15 @@ capture invariants, motivation, and the "gotcha" that a future reader
 will trip on.
 
 ```rust
-/// FT8 decoder with configurable parameters.
+/// FT8 decoder.
 ///
 /// Implements the WSJT-X FT8 protocol with optimizations for weak-signal
 /// decoding (Costas sync, soft LDPC, OSD second-pass, AP injection).
 /// The decoder is bit-exact with `ft8_lib` across the test corpus —
-/// behaviour-changing edits must be validated against `tests/wsjtx_corpus.rs`
-/// before landing.
-///
-/// # Example
-///
-/// ```
-/// use pancetta_ft8::Decoder;
-///
-/// let decoder = Decoder::new(DecoderConfig::default());
-/// let messages = decoder.decode(&samples)?;
-/// ```
-pub struct Decoder {
+/// behaviour-changing edits must be validated against
+/// `pancetta-ft8/tests/ft8lib_crossval_tests.rs` and
+/// `pancetta-ft8/tests/wsjtx_compat_tests.rs` before landing.
+pub struct Ft8Decoder {
     // ...
 }
 ```
@@ -384,7 +378,7 @@ Place integration tests in `tests/` directory:
 
 ```rust
 // tests/integration_test.rs
-use pancetta::*;
+use pancetta_lib::*;
 
 #[test]
 fn test_full_pipeline() {
@@ -403,18 +397,6 @@ fn bench_ft8_decode(c: &mut Criterion) {
         b.iter(|| decode_ft8(black_box(&samples)))
     });
 }
-```
-
-### Test Coverage
-
-Aim for >80% test coverage:
-
-```bash
-# Install cargo-tarpaulin
-cargo install cargo-tarpaulin
-
-# Generate coverage report
-cargo tarpaulin --out Html
 ```
 
 ## Documentation
@@ -454,27 +436,9 @@ cargo doc --document-private-items
 
 ### Pull Request Template
 
-```markdown
-## Description
-Brief description of changes
-
-## Type of Change
-- [ ] Bug fix
-- [ ] New feature
-- [ ] Breaking change
-- [ ] Documentation update
-
-## Testing
-- [ ] Unit tests pass
-- [ ] Integration tests pass
-- [ ] Manual testing completed
-
-## Checklist
-- [ ] Code follows style guidelines
-- [ ] Self-review completed
-- [ ] Documentation updated
-- [ ] No new warnings
-```
+GitHub pre-fills
+[`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md);
+fill in every section.
 
 ### Before Submitting
 
@@ -506,7 +470,7 @@ Brief description of changes
 ### What to Expect
 
 1. **Automated Checks**: CI will run tests, formatting, and linting
-2. **Code Review**: Maintainers will review within 48 hours
+2. **Code Review**: CI and an automated Codex review run on every PR ([convergence policy](docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md)). The maintainer reviews and merges; there is no guaranteed turnaround.
 3. **Feedback**: Address any requested changes
 4. **Merge**: PRs are reviewed and merged by the maintainer. CI (fmt, clippy, full test suite, cargo-deny) must be green.
 
