@@ -334,8 +334,11 @@ cargo clippy --workspace --features transmit
 cargo fmt --all -- --check
 ```
 
-CI runs all of this per PR plus a macOS `cargo check` lane; `cargo deny check`
-guards advisories and license drift. The 14-crate strictly layered workspace
+CI runs the workspace tests and clippy with `--exclude pancetta-research`
+(the local-only harness), checks formatting, builds the examples, and adds a
+macOS `cargo check` lane; it has no separate single-threaded hamlib run.
+`cargo deny check` guards advisories and license drift. The exact CI commands
+are in [`.github/workflows/ci.yml`](.github/workflows/ci.yml). The 14-crate strictly layered workspace
 is mapped in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Documentation

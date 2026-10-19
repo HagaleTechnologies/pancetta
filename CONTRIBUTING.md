@@ -152,8 +152,9 @@ Follow these guidelines:
 ### 4. Test Your Changes
 
 ```bash
-# Run all tests (what CI runs)
-cargo test --workspace --features transmit
+# Run all tests -- the exact command CI's Test workspace step runs
+# (pancetta-research is a local-only harness, excluded from CI)
+cargo test --workspace --exclude pancetta-research --features transmit
 
 # pancetta-hamlib's mock-rig tests run single-threaded
 cargo test -p pancetta-hamlib --lib -- --test-threads=1
@@ -164,10 +165,11 @@ cargo test -p <crate> <test_name>
 # Check formatting
 cargo fmt --all -- --check
 
-# Run clippy (CI runs it without -D warnings)
-cargo clippy --workspace --features transmit
+# Run clippy -- the exact command CI's Clippy step runs (no -D warnings)
+cargo clippy --workspace --exclude pancetta-research --features transmit
 
-# Or run the local pre-flight that mirrors CI (`--fast` skips the test run)
+# Or run the local pre-flight: a fast subset of CI plus a compile check of
+# pancetta-research, not a full CI mirror (`--fast` skips the test run)
 scripts/check.sh
 ```
 
