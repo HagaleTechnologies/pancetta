@@ -293,14 +293,14 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 | FT2 | Experimental | Only in builds with the `ft2` cargo feature (release binaries leave it off); two incompatible FT2 specs exist | [modes](docs/DECISIONS/modes.md) |
 | Rig control (CAT + PTT via `rigctld`) | Radio-qualified (FTdx10 only) | Frequency, split, PTT; Pancetta does not set the rig mode. Other Hamlib rigs are mapped but unproven | [rigctld redial test](pancetta-hamlib/tests/rigctld_redial.rs) |
 | Config changes while running | Implemented, *Unreleased* | Only remote-access consent switches and revocations apply live; every other change needs a restart ([details](docs/CONFIG.md#hot-reload)) | [config reload](pancetta/src/coordinator/config_reload.rs) |
-| ClubLog, QRZ Logbook upload | Implemented | Opt-in. Tests check request building and response parsing; no mock-server or live-account run recorded. Best-effort: a failed upload is logged, not retried; `~/.pancetta/qsos.adi` stays complete | [upload clients](pancetta-dx/src/qso_upload.rs) |
+| ClubLog, QRZ Logbook upload | Integration-tested | Opt-in. Local mock server only; no live-account run recorded. Best-effort: a failed upload is logged, not retried; `~/.pancetta/qsos.adi` stays complete | [upload clients](pancetta-dx/src/qso_upload.rs) |
 | cqdx.io QSO upload and spots | Integration-tested | Upload matches the cqdx API contract (2026-06-27). The live-spots response shape is unverified against the live API | [cqdx client](pancetta-cqdx/src/client.rs) |
 | LoTW upload (through TQSL) | Implemented | Needs your installed `tqsl`, certificate and station location. Tests check the `tqsl` command line only; no end-to-end LoTW upload recorded | [upload clients](pancetta-dx/src/qso_upload.rs) |
 | eQSL upload | Experimental | Field mapping and request form still need a live-account check | [upload clients](pancetta-dx/src/qso_upload.rs) |
 | PSKReporter reporting | Implemented | Opt-in; not checked against pskreporter.info | [PSKReporter client](pancetta-dx/src/pskreporter.rs) |
 | DX cluster | Integration-tested | Local mock server only | [cluster client](pancetta-dx/src/cluster.rs) |
 | WSJT-X UDP interop | Integration-tested | Local sockets only | [WSJT-X UDP](pancetta/src/coordinator/wsjtx_udp/mod.rs) |
-| Remote operation (station agent, local gateway) | Integration-tested | Off by default; remote TX also needs a local arm | [remote-operation decisions](docs/DECISIONS/remote-operation.md) |
+| Remote operation (station agent, local gateway) | Integration-tested | Off by default; station-agent remote TX also needs local consent (`remote_tx_enabled`) and a signed arm from an allow-listed client | [remote-operation decisions](docs/DECISIONS/remote-operation.md) |
 | ADIF export / import | Integration-tested; import *Unreleased* | Imported contacts are never uploaded | [import test](pancetta/tests/import_cli.rs) |
 | Platforms | — | macOS (development), Linux (CI), Windows 11 (the maintainer's station). Linux aarch64 release builds are smoke-tested on a cloud ARM64 runner, never on a Raspberry Pi | [release workflow](.github/workflows/release.yml) |
 

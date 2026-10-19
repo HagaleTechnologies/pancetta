@@ -24,7 +24,7 @@ in `pancetta.toml` (see docs/CONFIG.md) — no code changes required.
 
 ## Priority Scoring Engine
 
-Each decoded CQ is scored against a weighted set of criteria: needed DXCC entity (35%), needed grid square (20%), POTA/SOTA activation (15%), rarity score (10%), signal strength (5%), plus a +0.15 bonus for an all-time new one (ATNO), with duplicate and recent-failure penalties applied on top. A separate 5-tier ranking drives the DX Hunter panel. The weights are fully configurable via `PriorityWeights`, making it straightforward to tune for DX chasing, grid hunting, or contest operating. Scoring is stateless and synchronous — all external state (worked stations, recent failures, DXCC/grid needed sets) is injected via the `WorkedStationLookup` trait, keeping the engine pure and unit-testable. Score breakdowns are emitted per candidate for logging and diagnostics.
+Each decoded CQ is scored against a weighted set of criteria: needed DXCC entity (35%), needed grid square (20%), POTA/SOTA activation (15%), rarity score (10%), signal strength (5%), plus a +0.15 bonus for an all-time new one (ATNO), with duplicate and recent-failure penalties applied on top. A separate 6-tier ranking drives the DX Hunter panel. The weights are fully configurable via `PriorityWeights`, making it straightforward to tune for DX chasing, grid hunting, or contest operating. Scoring is stateless and synchronous — all external state (worked stations, recent failures, DXCC/grid needed sets) is injected via the `WorkedStationLookup` trait, keeping the engine pure and unit-testable. Score breakdowns are emitted per candidate for logging and diagnostics.
 
 ## Multi-Stream TX
 

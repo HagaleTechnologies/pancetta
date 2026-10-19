@@ -77,10 +77,12 @@ magnitudes are sent to authorized clients.
 ### Remote Operation
 
 Both remote channels are off by default. The local gateway
-(`[network.remote_gateway]`) requires `auth_token` and `allowed_origins`, and
+(`[network.remote_gateway]`) requires `auth_token`. It accepts browser pages
+only from origins in `allowed_origins`, which defaults to an empty list, and
 binds a non-loopback address only with `allow_network_exposure = true`.
 Remote TX through the station agent (`[network.station_agent]`) needs local
-consent plus an arm at the station. Both sections are described in
+consent (`remote_tx_enabled`) and a signed arm from an allow-listed client.
+Both sections are described in
 [docs/CONFIG.md](docs/CONFIG.md).
 
 ### `unsafe` Code
