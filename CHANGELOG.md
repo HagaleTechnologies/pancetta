@@ -128,6 +128,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A DX that kept repeating its report to a manual QSO held back our
+  keep-call R-report by a full slot after every decode. On FT2 that skipped
+  re-sends and delayed the adaptive TX-offset switch to as late as the 11th
+  repeat. A repeated report now leaves keep-calling to run exactly as it does
+  while the DX is silent (PAN-129).
+
 - The stall detector behind adaptive TX-offset switching counted every
   keep-call re-send, so it ran at twice the rate of real transmissions and
   moved a silent QSO after about two unanswered transmissions instead of

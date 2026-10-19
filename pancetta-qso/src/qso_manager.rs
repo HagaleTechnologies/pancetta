@@ -4701,9 +4701,11 @@ impl QsoManager {
         // Detect a manual state regression: the DX sent an EARLIER-stage
         // message and `determine_state_transition` either backed us up the
         // ladder (rank decreased) or kept us in SendingReport on a repeated
-        // report. Used to (a) count the re-send against the manual watchdog cap
-        // and (b) gate the per-slot rearm so it does not double-send in the
-        // same slot.
+        // report. When the regression queues a re-send (`reply_to_emit`), used
+        // to (a) count that re-send against the manual watchdog cap and (b)
+        // gate the per-slot rearm so it does not double-send in the same slot;
+        // a repeated report in SendingReport queues none, so neither applies
+        // (PAN-129). Every regression cancels the C3 reprieve.
         let is_manual_regression = qso_initiated_by == CallInitiation::Manual
             && (Self::ladder_rank(&new_state) < Self::ladder_rank(&old_state)
                 || (matches!(old_state, QsoState::SendingReport { .. })
@@ -4870,7 +4872,7 @@ impl QsoManager {
             }
 
             // Rearm-coordination fix: a genuine forward advance stamps
-            // `last_call_at` exactly like the manual-regression re-send does
+            // `last_call_at` like a manual regression that re-sends does
             // (below). Without this, the per-slot keep-call rearm
             // (`rearm_manual_calls_at`) has no way to know a response arrived
             // THIS slot — if the DX's decode lands late in the slot, the 5s
@@ -4906,18 +4908,27 @@ impl QsoManager {
             }
         }
 
-        // Count a manual regression re-send against the keep-calling watchdog
+        // Count a manual regression RE-SEND against the keep-calling watchdog
         // so a DX that keeps repeating an earlier message cannot drive an
-        // unbounded ping-pong. We bump `call_count` and stamp `last_call_at`
-        // to `message.timestamp`; the latter also gates `rearm_manual_calls_at`
-        // (which only re-emits when ≥1 slot has elapsed since `last_call_at`),
-        // so the in-slot transition re-send and the per-slot rearm never both
-        // fire in the same slot. `first_call_at` is left untouched — a
-        // regression must not reset the watchdog clock.
+        // unbounded ping-pong. Only a regression that queued a reply this
+        // decode (REGRESSION 1/3) re-sends: it bumps `call_count` and stamps
+        // `last_call_at` to `message.timestamp`; the latter also gates
+        // `rearm_manual_calls_at` (which only re-emits when ≥1 slot has
+        // elapsed since `last_call_at`), so that re-send and the per-slot
+        // rearm never both fire in the same slot. A repeated report in
+        // SendingReport (REGRESSION 2) sends nothing — the rearm owns that
+        // re-send — so it leaves both fields alone, and the rearm keeps its
+        // silence cadence and counts the stall (PAN-129). Its old restamp
+        // held the rearm back a full slot from every decode, which on FT2
+        // (3.2 s slot, 5 s poll) skipped re-sends and delayed the stall
+        // switch. `first_call_at` is left untouched — a regression must not
+        // reset the watchdog clock.
         if is_manual_regression {
             if let Some(progress) = qsos.get_mut(&qso_id) {
-                progress.metadata.call_count += 1;
-                progress.metadata.last_call_at = Some(message.timestamp);
+                if reply_to_emit.is_some() {
+                    progress.metadata.call_count += 1;
+                    progress.metadata.last_call_at = Some(message.timestamp);
+                }
                 // A regression is the opposite of forward progress (the DX
                 // repeated an earlier message), so it cancels any pending C3
                 // reprieve from an earlier advance — a stuck DX repeating must
@@ -16787,8 +16798,9 @@ mod state_regression_tests {
     //! - REGRESSION 2 (SendingReport + repeated report → stays SendingReport):
     //!   the transition does NOT emit (exchange has no (SendingReport,
     //!   SignalReport) arm); `rearm_manual_calls_at` (FIX 4) owns the R re-send.
-    //!   The transition only updates the latched reports. Stamping `last_call_at`
-    //!   on the regression gates rearm so the two never double-send in one slot.
+    //!   The transition only updates the latched reports. The repeat leaves
+    //!   `last_call_at` and `call_count` alone: the rearm paces and counts its
+    //!   own re-sends, exactly as it does while the DX is silent (PAN-129).
     use super::*;
 
     const OUR: &str = "K5ARH";
@@ -16881,6 +16893,7 @@ mod state_regression_tests {
         let mut rx = manager.subscribe();
         let qso_id = manual_to_waiting_confirmation(&manager).await;
         let _ = drain(&mut rx);
+        let calls_before = manager.get_qso(qso_id).await.unwrap().metadata.call_count;
 
         // DX re-sends their report — with a NEW value — having never copied
         // our RR73. snr -9 → our report -9.
@@ -16911,6 +16924,13 @@ mod state_regression_tests {
             }
             other => panic!("expected SendingReport, got {:?}", other),
         }
+        // The regression's in-slot R re-send counts against the keep-calling
+        // budget exactly once.
+        assert_eq!(
+            progress.metadata.call_count,
+            calls_before + 1,
+            "REGRESSION 1's re-send must count as one call"
+        );
 
         // R-report re-emitted this slot.
         let emitted = sends(&drain(&mut rx));
@@ -16989,6 +17009,12 @@ mod state_regression_tests {
 
         // Now exercise the full path: it must NOT emit from the transition (no
         // exchange arm); the per-slot rearm owns the R re-send.
+        let last_before = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at;
         manager
             .process_message(
                 MessageType::SignalReport {
@@ -17008,16 +17034,22 @@ mod state_regression_tests {
             "transition must not re-send (rearm owns it), got {:?}",
             from_transition
         );
-
-        // A slot later, rearm re-sends our R-report (and not before — the
-        // regression stamped last_call_at, so no double-send in this slot).
+        // PAN-129: the repeat sends nothing, so it must not hold the rearm
+        // back either — `last_call_at` is left where our last call put it.
         let last = manager
             .get_qso(qso_id)
             .await
             .unwrap()
             .metadata
-            .last_call_at
-            .unwrap();
+            .last_call_at;
+        assert_eq!(
+            last, last_before,
+            "a repeated report must leave last_call_at unchanged"
+        );
+        let last = last.unwrap();
+
+        // A slot after our last call, rearm re-sends our R-report: it paces
+        // from its own last call, exactly as it does while the DX is silent.
         manager
             .rearm_manual_calls_at(last + Duration::seconds(15))
             .await;
@@ -17027,6 +17059,100 @@ mod state_regression_tests {
             matches!(rearmed[0], MessageType::ReportAck { .. }),
             "rearm must re-send ReportAck, got {:?}",
             rearmed[0]
+        );
+    }
+
+    /// PAN-129: a repeated report in SendingReport queues no reply, so it
+    /// spends no call and does not restamp `last_call_at` — the rearm, which
+    /// owns that re-send, paces and counts it exactly as it does for silence.
+    /// It still cancels a pending C3 reprieve (the DX is not progressing).
+    #[tokio::test]
+    async fn repeated_report_leaves_call_count_and_last_call_at_alone() {
+        let manager = manager();
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                format!("{} {} -07", OUR, DX),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+        // Pin `last_call_at` well away from "now" so a restamp to the decode
+        // time cannot coincide with it, and arm a C3 reprieve to cancel.
+        let pinned_last_call_at = Utc::now() - Duration::seconds(20);
+        {
+            let mut qsos = manager.qsos.write().await;
+            let progress = qsos.get_mut(&qso_id).unwrap();
+            assert!(
+                matches!(
+                    progress.state,
+                    QsoState::SendingReport {
+                        their_report: Some(_),
+                        ..
+                    }
+                ),
+                "precondition: SendingReport with the DX's report, got {:?}",
+                progress.state
+            );
+            progress.metadata.last_call_at = Some(pinned_last_call_at);
+            progress.metadata.progressed_this_cycle = true;
+        }
+        let calls_before = manager.get_qso(qso_id).await.unwrap().metadata.call_count;
+        let mut rx = manager.subscribe();
+
+        // The DX repeats the identical report (it did not copy our R).
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                format!("{} {} -07", OUR, DX),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(
+                progress.state,
+                QsoState::SendingReport {
+                    their_report: Some(-7),
+                    ..
+                }
+            ),
+            "must stay in SendingReport, got {:?}",
+            progress.state
+        );
+        assert_eq!(
+            progress.metadata.call_count, calls_before,
+            "a repeat that sends nothing must not spend a call"
+        );
+        assert_eq!(
+            progress.metadata.last_call_at,
+            Some(pinned_last_call_at),
+            "a repeat that sends nothing must not hold the rearm back"
+        );
+        assert!(
+            !progress.metadata.progressed_this_cycle,
+            "a repeat is not progress: it must cancel the C3 reprieve"
+        );
+        let emitted = sends(&drain(&mut rx));
+        assert!(
+            emitted.is_empty(),
+            "the repeat itself must not emit (the rearm owns the re-send), got {emitted:?}"
         );
     }
 
@@ -17043,8 +17169,12 @@ mod state_regression_tests {
         let manager = manager_with(3, 60); // cap 3, generous 60-min time window
         let qso_id = manual_to_waiting_confirmation(&manager).await;
 
-        // DX re-requests its report many times → regress to SendingReport and
-        // blow well past the call cap.
+        // DX re-requests its report many times → regress to SendingReport, and
+        // keep-calling re-sends our R after each repeat until the call cap is
+        // reached. A repeated report itself spends no call (PAN-129), so the
+        // cap is reached through the rearm's real re-sends, one own TX slot
+        // (30 s) apart, starting a slot after the regression's re-send.
+        let mut rearm_at: Option<DateTime<Utc>> = None;
         for _ in 0..6 {
             manager
                 .process_message(
@@ -17059,6 +17189,21 @@ mod state_regression_tests {
                 )
                 .await
                 .unwrap();
+            let at = match rearm_at {
+                Some(previous) => previous + Duration::seconds(30),
+                None => {
+                    manager
+                        .get_qso(qso_id)
+                        .await
+                        .unwrap()
+                        .metadata
+                        .last_call_at
+                        .unwrap()
+                        + Duration::seconds(15)
+                }
+            };
+            manager.rearm_manual_calls_at(at).await;
+            rearm_at = Some(at);
         }
         let prog = manager.get_qso(qso_id).await.unwrap();
         assert!(
@@ -21402,6 +21547,191 @@ mod pan72_stall_detection_tests {
             0,
             "a pre-reset attempt must not inherit a post-reset count"
         );
+    }
+
+    // PAN-129: a DX stuck repeating its report.
+    //
+    // While a manual QSO sits in `SendingReport` and the DX keeps repeating
+    // its report, the R re-send — and with it the stall count — comes from
+    // the rearm, which `timeout_check_loop` runs every 5 s at a phase that
+    // has nothing to do with the slot grid. A repeat queues no reply, so it
+    // must leave that rearm running exactly as it does while the DX is
+    // silent. The helper below drives the real manager through both
+    // schedules — the DX's decodes and the rearm ticks — merged in time
+    // order on a synthetic timeline anchored to the slot grid, so the result
+    // never depends on the wall-clock phase at test start.
+
+    /// The DX repeats (or silent DX-parity slots) each schedule covers.
+    const PAN129_REPEATS: i64 = 12;
+    /// `timeout_check_loop`'s rearm interval.
+    const PAN129_TICK_MS: i64 = 5_000;
+
+    /// What one keep-call schedule produced.
+    struct KeepCallSchedule {
+        stall_cycles: u32,
+        /// `MessageToSend` emissions for the QSO.
+        emissions: usize,
+        /// The own-parity TX slots those emissions feed.
+        fed_tx_slots: std::collections::BTreeSet<DateTime<Utc>>,
+        /// DX repeats decoded before the first `TxOffsetActionNeeded`.
+        repeats_before_first_action: Option<usize>,
+    }
+
+    /// Run a manual `SendingReport { their_report: Some }` QSO in Auto TX-freq
+    /// mode through [`PAN129_REPEATS`] DX slot pairs. With `dx_repeats`, the
+    /// DX repeats its identical report in each of its own slots, decoded
+    /// `decode_offset_ms` after that slot ends; otherwise it stays silent.
+    /// The rearm ticks every [`PAN129_TICK_MS`], starting `tick_phase_ms`
+    /// into the first DX slot. A decode due at the same instant as a tick is
+    /// processed first.
+    async fn run_keep_call_schedule(
+        slot_ns: i64,
+        decode_offset_ms: i64,
+        tick_phase_ms: i64,
+        dx_repeats: bool,
+    ) -> KeepCallSchedule {
+        use pancetta_core::slot::{next_slot_with_parity_with_period, SlotParity};
+
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 4;
+        config.timeouts.manual_call_max_calls = 1_000;
+        let mut manager = manager_auto(config);
+        manager.set_active_slot_ns_source(Arc::new(std::sync::atomic::AtomicI64::new(slot_ns)));
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        send_report(&manager, -7, "K5ARH K9ZZ -07").await;
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(
+                progress.state,
+                QsoState::SendingReport {
+                    their_report: Some(_),
+                    ..
+                }
+            ),
+            "precondition: SendingReport with the DX's report, got {:?}",
+            progress.state
+        );
+        let tx_parity = progress.metadata.tx_parity.expect("tx_parity latched");
+        let dx_parity = tx_parity.opposite();
+
+        let slot_ms = slot_ns / 1_000_000;
+        let anchor =
+            next_slot_with_parity_with_period(Utc::now() + Duration::seconds(120), dx_parity, slot_ns);
+        // Repeat k goes out in the DX slot starting 2k slots after the
+        // anchor and decodes `decode_offset_ms` after that slot ends.
+        let decodes: Vec<DateTime<Utc>> = (0..PAN129_REPEATS)
+            .map(|k| anchor + Duration::milliseconds((2 * k + 1) * slot_ms + decode_offset_ms))
+            .collect();
+        let end = anchor + Duration::milliseconds(2 * PAN129_REPEATS * slot_ms);
+
+        let mut rx = manager.subscribe();
+        let mut outcome = KeepCallSchedule {
+            stall_cycles: 0,
+            emissions: 0,
+            fed_tx_slots: std::collections::BTreeSet::new(),
+            repeats_before_first_action: None,
+        };
+        let mut decoded = 0usize;
+        let mut next_tick = anchor + Duration::milliseconds(tick_phase_ms);
+        loop {
+            let next_decode = decodes.get(decoded).copied().filter(|_| dx_repeats);
+            let tick_due = next_tick < end;
+            let at = match next_decode {
+                Some(decode_at) if !tick_due || decode_at <= next_tick => {
+                    let before = manager.get_qso(qso_id).await.unwrap().metadata.last_call_at;
+                    send_report(&manager, -7, "K5ARH K9ZZ -07").await;
+                    // `process_message` stamps the wall clock. Move any stamp
+                    // it made onto the synthetic timeline (the decode
+                    // instant), where it holds the rearm back exactly as it
+                    // would on the air.
+                    if let Some(progress) = manager.qsos.write().await.get_mut(&qso_id) {
+                        if progress.metadata.last_call_at != before {
+                            progress.metadata.last_call_at = Some(decode_at);
+                        }
+                    }
+                    decoded += 1;
+                    decode_at
+                }
+                _ if tick_due => {
+                    let tick_at = next_tick;
+                    manager.rearm_manual_calls_at(tick_at).await;
+                    next_tick += Duration::milliseconds(PAN129_TICK_MS);
+                    tick_at
+                }
+                _ => break,
+            };
+            for event in drain(&mut rx) {
+                match event {
+                    QsoEvent::MessageToSend { qso_id: id, .. } if id == qso_id => {
+                        outcome.emissions += 1;
+                        outcome
+                            .fed_tx_slots
+                            .insert(next_slot_with_parity_with_period(at, tx_parity, slot_ns));
+                    }
+                    QsoEvent::TxOffsetActionNeeded { qso_id: id, .. } if id == qso_id => {
+                        outcome.repeats_before_first_action.get_or_insert(decoded);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        outcome.stall_cycles = manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles;
+        outcome
+    }
+
+    /// PAN-129: a DX repeating its report must leave keep-calling exactly as
+    /// a silent DX does — same stall count, same own-parity TX slots fed,
+    /// same number of re-sends — and the stall switch must fire by the 4th
+    /// repeat (threshold 4). Swept over FT8/FT4/FT2, an early and a late
+    /// decode, and every 250 ms rearm phase. Before the fix each repeat
+    /// restamped `last_call_at` at its decode instant, holding the rearm back
+    /// a full slot: FT8/FT4 lost half their re-sends, and FT2 skipped TX
+    /// slots and switched as late as the 11th repeat.
+    #[tokio::test]
+    async fn repeating_dx_trips_the_stall_switch_on_the_silence_cadence() {
+        for (mode, slot_ns) in [
+            ("FT8", 15_000_000_000i64),
+            ("FT4", 7_500_000_000),
+            ("FT2", 3_200_000_000),
+        ] {
+            for decode_offset_ms in [-1_000i64, 500] {
+                for tick_phase_ms in (0..PAN129_TICK_MS).step_by(250) {
+                    let case = format!(
+                        "{mode}, decode {decode_offset_ms:+} ms from slot end, \
+                         rearm phase {tick_phase_ms} ms"
+                    );
+                    let silent =
+                        run_keep_call_schedule(slot_ns, decode_offset_ms, tick_phase_ms, false)
+                            .await;
+                    let repeating =
+                        run_keep_call_schedule(slot_ns, decode_offset_ms, tick_phase_ms, true)
+                            .await;
+                    assert_eq!(
+                        repeating.stall_cycles, silent.stall_cycles,
+                        "{case}: a repeating DX must count stalls like a silent one"
+                    );
+                    assert_eq!(
+                        repeating.fed_tx_slots, silent.fed_tx_slots,
+                        "{case}: a repeating DX must feed the same own TX slots as a silent one"
+                    );
+                    assert_eq!(
+                        repeating.emissions, silent.emissions,
+                        "{case}: a repeating DX must keep the silence re-send cadence"
+                    );
+                    let first_action = repeating
+                        .repeats_before_first_action
+                        .unwrap_or_else(|| panic!("{case}: the stall switch never fired"));
+                    assert!(
+                        first_action <= 4,
+                        "{case}: the stall switch must fire by the 4th repeat, \
+                         fired after {first_action}"
+                    );
+                }
+            }
+        }
     }
 }
 
