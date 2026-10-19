@@ -332,6 +332,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and rig pickers also keep comments and section order.
 - `pancetta config --generate` writes the same header-annotated schema as
   `pancetta-config/defaults.toml`, without a random `[metadata]` block.
+- WAV recording of decode windows is now off by default (PAN-125). Pancetta
+  used to write every 15-second window to `~/.pancetta/recordings` (about
+  1.7 GB a day, up to 10 GB) on every install, ignoring `[audio.recording]`.
+  It now records only with `[audio.recording] auto_record = true`, into
+  `audio.recording.directory` (a leading `~` is expanded), and `--replay`
+  and `--no-audio` runs never record (closes #265). The once-per-start
+  `raw_48khz_diagnostic.wav` follows the same switch. The startup log says
+  whether recording is on and where. To keep recording into the old
+  location, set `auto_record = true` and
+  `directory = "~/.pancetta/recordings"` before upgrading. Existing
+  recordings are left in place.
 
 ### Removed
 

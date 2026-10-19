@@ -2713,6 +2713,11 @@ impl ApplicationCoordinator {
     ///   into a demo process.
     /// - Clock-skew monitor (`coordinator/clock_monitor.rs`) — not started, so
     ///   no SNTP query leaves a replay.
+    /// - WAV recording (`dsp.rs`'s `resolve_wav_recording`, which also gates
+    ///   `audio.rs`'s raw 48 kHz diagnostic capture) — never enabled, even
+    ///   with `[audio.recording] auto_record = true`, so a replayed window
+    ///   is never written back out as a fresh capture stamped with today's
+    ///   date and a `_20m` band (GH #265).
     ///
     /// Add new outbound integrations — and any new persistence of a
     /// "completed" contact — to that list rather than inventing a second
@@ -3499,6 +3504,34 @@ mod tests {
         assert!(
             replaying.replay_mode(),
             "--replay must be visible to every outbound gate"
+        );
+    }
+
+    /// PAN-125: the WAV-recording decision consults `replay_mode()` and
+    /// `no_audio`, so an operator who enabled `[audio.recording]
+    /// auto_record = true` still gets no recording in either mode.
+    #[tokio::test]
+    async fn wav_recording_is_refused_under_replay_and_no_audio_even_when_enabled() {
+        let enabled = pancetta_config::RecordingConfig {
+            auto_record: true,
+            directory: "/tmp/pan125-never".into(),
+            ..Default::default()
+        };
+        let replaying =
+            build_coordinator_with_replay(Some(PathBuf::from("/some/capture/dir"))).await;
+        assert_eq!(
+            replaying.wav_recording(&enabled),
+            dsp::WavRecording::SuppressedReplay
+        );
+        // The helper builds with no_audio = true and no replay.
+        let no_audio = build_coordinator(Config::default()).await;
+        assert_eq!(
+            no_audio.wav_recording(&enabled),
+            dsp::WavRecording::SuppressedNoAudio
+        );
+        assert_eq!(
+            no_audio.wav_recording(&Default::default()),
+            dsp::WavRecording::DisabledByConfig
         );
     }
 

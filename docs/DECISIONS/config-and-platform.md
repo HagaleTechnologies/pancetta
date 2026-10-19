@@ -619,3 +619,24 @@ remote-gateway acceptor does not follow this rule yet (PAN-99).
 - Deferred: provisioning `SEMGREP_APP_TOKEN` as a Dependabot secret (CAT-307
   follow-up; after that, Dependabot PRs get platform scans automatically), and
   the same PAN-107 fix in the sibling repos (cqdx/panino/widdershins/coppa).
+
+## WAV recording is opt-in (PAN-125, 2026-10-19)
+
+- `[audio.recording] auto_record` (default `false`) gates both WAV writers:
+  the DSP decode-window recorder (`dsp.rs`, `WavRecorder`) and the one-shot
+  `raw_48khz_diagnostic.wav` capture in the audio relay (`audio.rs`). One
+  function, `resolve_wav_recording`, decides for both. `--replay` and
+  `--no-audio` refuse even when enabled (replay joins the `replay_mode()`
+  list; closes GH #265).
+- `directory` is honored, and pancetta expands a leading `~` itself: the
+  config loader never expands `~` inside values (`loader.rs` tests). Empty
+  means `~/.pancetta/recordings`.
+- The `directory` default stays `~/Documents/Pancetta/Recordings`, and
+  `defaults.toml` is unchanged. The station corpus offload (magazzino
+  `clients/pancetta-wav-offload.sh`) reads `~/.pancetta/recordings`, so a
+  corpus station sets `directory` explicitly. sophon did so on 2026-10-16,
+  before this shipped.
+- The cap stays a hardcoded 10 GB. The other `[audio.recording]` keys stay
+  unread. Restart-required like every non-live key — including across DSP
+  supervisor restarts, because the running config snapshot is patched only
+  for security fields.
