@@ -127,6 +127,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Pressing `u` on a Hound QSO right after the Fox's report moved it off its
+  calling offset now moves the QSO at least `min_separation_hz` from its real
+  TX offset, instead of leaving it in place or shifting it by only a few Hz
+  (PAN-130).
+
 - The remote-access audit log (`~/.pancetta/agent-audit.log`) now stays
   within 4 MiB: it rotates at 1 MiB into `.1`–`.3` archives, caps long
   fields, and writes a `Summary` record for events it skipped because of the

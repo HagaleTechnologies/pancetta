@@ -743,7 +743,9 @@ pub struct DuplicateCheckConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum OffsetAction {
     /// We're on the last known-good offset (or none is recorded yet) — find
-    /// a new one, avoiding this one.
+    /// a new one, avoiding this one. The coordinator's drain avoids the QSO's
+    /// live `metadata.frequency` whenever the QSO still exists; this value is
+    /// only the fallback (PAN-130).
     Switch { avoid_hz: f64 },
     /// We stalled again on a previously-switched offset — go back to the one
     /// that was last confirmed working, no allocator call needed.
