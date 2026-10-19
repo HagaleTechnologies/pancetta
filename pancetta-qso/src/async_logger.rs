@@ -889,15 +889,20 @@ mod tests {
 
     #[test]
     fn test_resolve_backup_directory() {
-        let db = Path::new("/home/op/.pancetta/qso.db");
+        // A platform-native absolute root: on Windows `/home/...` has no
+        // drive prefix, so it is not absolute.
+        let root = if cfg!(windows) {
+            Path::new(r"C:\")
+        } else {
+            Path::new("/")
+        };
+        let db = root.join("home/op/.pancetta/qso.db");
         assert_eq!(
-            resolve_backup_directory(Path::new("backups"), db),
-            PathBuf::from("/home/op/.pancetta/backups")
+            resolve_backup_directory(Path::new("backups"), &db),
+            root.join("home/op/.pancetta/backups")
         );
-        assert_eq!(
-            resolve_backup_directory(Path::new("/srv/bk"), db),
-            PathBuf::from("/srv/bk")
-        );
+        let abs_dir = root.join("srv/bk");
+        assert_eq!(resolve_backup_directory(&abs_dir, &db), abs_dir);
         // No absolute database directory (`:memory:`, or a relative database
         // path): anchor at the fixed state directory, never the cwd (PAN-126).
         let state_backups = dirs::home_dir().unwrap().join(".pancetta").join("backups");
