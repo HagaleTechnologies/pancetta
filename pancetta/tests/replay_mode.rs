@@ -236,6 +236,71 @@ fn replay_mode_rejects_dsp_incompatible_sample_rate() {
         .stderr(predicates::str::contains("sample_rate"));
 }
 
+/// PAN-125 (and GH #265): a replay decodes windows but must never write
+/// them back out as fresh captures, even with recording enabled. Before
+/// PAN-125 the recorder ran unconditionally, so a replay stamped replayed
+/// audio with today's date and a `_20m` band label (the `--replay` dial
+/// seed) and evicted genuine recordings from the shared 10 GB cap.
+#[test]
+fn replay_never_records_even_when_recording_is_enabled() {
+    let station = ScratchStation::new(
+        "[audio.recording]\nauto_record = true\ndirectory = \"~/.pancetta/recordings\"\n",
+    );
+    let dir = station.wav_dir();
+    // >= one full 12.64 s window of non-silent audio.
+    write_short_wav(&dir.join("a.wav"), 12000, 16.0);
+
+    // Worst case: startup + <=15 s slot-boundary preroll + 16 s of audio +
+    // REPLAY_GRACE_PERIOD (20 s) ~= 53 s; 90 s adds CI headroom.
+    let mut cmd = station.command();
+    cmd.args(["--headless", "--replay"])
+        .arg(&dir)
+        .timeout(Duration::from_secs(90));
+
+    let output = cmd.assert().success().get_output().clone();
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(log.contains("DSP: FT8 window #1"), "no window decoded:\n{log}");
+    assert!(
+        log.contains("Replay mode: WAV recording suppressed"),
+        "replay must state that recording is suppressed:\n{log}"
+    );
+    assert!(
+        !station
+            .home
+            .path()
+            .join(".pancetta/recordings")
+            .exists(),
+        "a replay must not create the recordings directory"
+    );
+
+    // No *.wav anywhere under the scratch home outside the replay corpus.
+    let mut stray = Vec::new();
+    collect_wavs(station.home.path(), &dir, &mut stray);
+    assert!(stray.is_empty(), "replay wrote WAVs outside the corpus: {stray:?}");
+}
+
+/// Every `*.wav` under `root` except the `exclude` subtree.
+fn collect_wavs(dir: &std::path::Path, exclude: &std::path::Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.starts_with(exclude) {
+            continue;
+        }
+        if path.is_dir() {
+            collect_wavs(&path, exclude, out);
+        } else if path.extension().is_some_and(|e| e == "wav") {
+            out.push(path);
+        }
+    }
+}
+
 /// Guard for the isolation above: the scratch config really is what the
 /// binary loads, and the operator's real home is never consulted.
 #[test]

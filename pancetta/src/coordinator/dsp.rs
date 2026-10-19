@@ -8,10 +8,13 @@
 //! In parallel, computes a 1 Hz waterfall via a 2048-point Hann-windowed
 //! FFT and an audio-level RMS meter — both forwarded to the TUI.
 //!
-//! Validation captures: when `WavRecorder::new` succeeds, every full
-//! window is written to `~/.pancetta/recordings/ft8_*.wav` for off-line
-//! decoder comparison. Disk usage is capped at 10 GB; oldest files are
-//! evicted when the cap is hit.
+//! Validation captures (PAN-125): only when
+//! `[audio.recording] auto_record = true` on a live-audio run, every full
+//! window is written to `audio.recording.directory` (a leading `~`
+//! expanded; empty means `~/.pancetta/recordings`) as `ft8_*.wav` for
+//! off-line decoder comparison — `--replay` and `--no-audio` never record.
+//! Disk usage is capped at 10 GB; oldest files are evicted when the cap is
+//! hit. The decision is made once per start by [`resolve_wav_recording`].
 //!
 //! Task W5.3 (decoder-tp-sensitivity plan): the emitted window's lead-in
 //! before the slot boundary — real retained audio, not zero-padding — is
@@ -184,14 +187,6 @@ struct WavRecorder {
 }
 
 impl WavRecorder {
-    fn new() -> Result<Self> {
-        let dir = dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".pancetta")
-            .join("recordings");
-        Self::open(dir, WAV_RECORDING_MAX_BYTES)
-    }
-
     fn open(dir: std::path::PathBuf, max_bytes: u64) -> Result<Self> {
         std::fs::create_dir_all(&dir)?;
 
@@ -200,7 +195,7 @@ impl WavRecorder {
         // bound available at startup.
         let total_bytes = Self::dir_size(&dir).map(|(bytes, _)| bytes).unwrap_or(0);
         info!(
-            "WAV recorder: dir={}, existing={:.1} MB, cap={:.1} GB",
+            "WAV recording enabled: dir={}, existing={:.1} MB, cap={:.1} GB",
             dir.display(),
             total_bytes as f64 / 1_048_576.0,
             max_bytes as f64 / 1_073_741_824.0,
@@ -367,6 +362,155 @@ impl WavRecorder {
     }
 }
 
+/// Operator-facing startup line when `[audio.recording]` leaves recording
+/// off (PAN-125). Names the setting that turns it back on.
+pub(crate) const MSG_WAV_RECORDING_DISABLED: &str =
+    "WAV recording disabled -- set audio.recording.auto_record = true to record live decode windows";
+/// Operator-facing startup line when `--replay` refuses an enabled
+/// recording config (house phrasing: `Replay mode: X suppressed -- reason`).
+pub(crate) const MSG_WAV_RECORDING_REPLAY: &str =
+    "Replay mode: WAV recording suppressed -- replayed windows are not live captures";
+/// Operator-facing startup line when `--no-audio` refuses an enabled
+/// recording config.
+pub(crate) const MSG_WAV_RECORDING_NO_AUDIO: &str =
+    "WAV recording suppressed -- --no-audio has no live audio to record";
+
+/// Whether this run records decode windows, and where. Decided once per
+/// component start from `[audio.recording]` plus the run mode; both WAV
+/// writers (this file's [`WavRecorder`], `audio.rs`'s raw diagnostic)
+/// obey it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WavRecording {
+    /// `auto_record = true` on a live-audio run: record into `dir`.
+    Enabled {
+        dir: std::path::PathBuf,
+    },
+    /// `auto_record` unset/false: record nothing.
+    DisabledByConfig,
+    /// `--replay`: never write replayed windows back out as fresh captures.
+    SuppressedReplay,
+    /// `--no-audio`: no live audio exists to record.
+    SuppressedNoAudio,
+    /// The configured `directory` needs `~` expanded but no home directory
+    /// is resolvable; recording stays off rather than writing somewhere
+    /// arbitrary.
+    NoHomeDir {
+        directory: String,
+    },
+}
+
+/// Config first (so the default case always names the setting), then the
+/// unconditional `--replay` / `--no-audio` refusals, then directory
+/// resolution. See [`ApplicationCoordinator::wav_recording`] for the
+/// process-level entry point.
+pub(crate) fn resolve_wav_recording(
+    recording: &pancetta_config::RecordingConfig,
+    replay: bool,
+    no_audio: bool,
+    home: Option<&std::path::Path>,
+) -> WavRecording {
+    if !recording.auto_record {
+        return WavRecording::DisabledByConfig;
+    }
+    if replay {
+        return WavRecording::SuppressedReplay;
+    }
+    if no_audio {
+        return WavRecording::SuppressedNoAudio;
+    }
+    match expand_recording_dir(&recording.directory, home) {
+        Some(dir) => WavRecording::Enabled { dir },
+        None => WavRecording::NoHomeDir {
+            directory: recording.directory.trim().to_string(),
+        },
+    }
+}
+
+/// Expand a leading `~` (`~`, `~/x`, `~\x`) against `home`; anything else
+/// passes through trimmed. `~user` is not expanded. The config loader never
+/// expands `~` inside values (its tests pin that), so this is the only
+/// place. An empty/whitespace directory means the location pancetta always
+/// recorded to before PAN-125: `<home>/.pancetta/recordings`.
+///
+/// Returns `None` only when the value needs `home` and none exists.
+fn expand_recording_dir(
+    directory: &str,
+    home: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    let trimmed = directory.trim();
+    if trimmed.is_empty() {
+        return home.map(|h| h.join(".pancetta").join("recordings"));
+    }
+    if let Some(rest) = trimmed.strip_prefix('~') {
+        if let Some(home) = home {
+            if rest.is_empty() {
+                return Some(home.to_path_buf());
+            }
+            if let Some(rel) = rest.strip_prefix('/').or_else(|| rest.strip_prefix('\\')) {
+                return Some(home.join(rel));
+            }
+        }
+        if rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\') {
+            return None; // needs a home directory to expand against
+        }
+    }
+    // `~user/...` and every non-tilde value pass through as written.
+    Some(std::path::PathBuf::from(trimmed))
+}
+
+impl WavRecording {
+    pub(crate) fn dir(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::Enabled { dir } => Some(dir),
+            _ => None,
+        }
+    }
+
+    /// The one startup log line for this decision. `None` for `Enabled`:
+    /// [`WavRecorder::open`] logs that line with the directory.
+    pub(crate) fn startup_message(&self) -> Option<String> {
+        match self {
+            Self::Enabled { .. } => None,
+            Self::DisabledByConfig => Some(MSG_WAV_RECORDING_DISABLED.to_string()),
+            Self::SuppressedReplay => Some(MSG_WAV_RECORDING_REPLAY.to_string()),
+            Self::SuppressedNoAudio => Some(MSG_WAV_RECORDING_NO_AUDIO.to_string()),
+            Self::NoHomeDir { directory } => Some(format!(
+                "WAV recording disabled -- cannot expand audio.recording.directory = \
+                 \"{directory}\": no home directory"
+            )),
+        }
+    }
+
+    /// Emit the startup line (`NoHomeDir` at `warn!`, the rest `info!`).
+    fn log_startup(&self) {
+        if let Some(message) = self.startup_message() {
+            if matches!(self, Self::NoHomeDir { .. }) {
+                warn!("{message}");
+            } else {
+                info!("{message}");
+            }
+        }
+    }
+}
+
+impl super::ApplicationCoordinator {
+    /// The recording decision for this process: config, then the
+    /// `--replay` / `--no-audio` overrides, then directory resolution.
+    /// Uses [`Self::replay_mode`] — the single replay predicate — not a
+    /// second replay check.
+    pub(crate) fn wav_recording(
+        &self,
+        recording: &pancetta_config::RecordingConfig,
+    ) -> WavRecording {
+        resolve_wav_recording(
+            recording,
+            self.replay_mode(),
+            self.no_audio,
+            dirs::home_dir().as_deref(),
+        )
+    }
+}
+
 impl super::ApplicationCoordinator {
     /// Start DSP pipeline with point-to-point channels
     ///
@@ -422,7 +566,12 @@ impl super::ApplicationCoordinator {
         // reads the same config field independently at its own spawn and
         // must resolve to the same value — see `resolve_window_lead_secs`.
         let window_lead_secs = super::resolve_window_lead_secs(&config.decoder);
+        // PAN-125: decide WAV recording here, under the config guard — the
+        // worker closure below only ever sees the resolved directory.
+        let wav_recording = self.wav_recording(&config.audio.recording);
         drop(config);
+        wav_recording.log_startup();
+        let wav_recording_dir = wav_recording.dir().map(std::path::Path::to_path_buf);
         let timing =
             super::derive_dsp_timing(&pancetta_ft8::ProtocolParams::from_protocol(protocol));
         let dsp_window_samples = timing.window_samples;
@@ -482,14 +631,18 @@ impl super::ApplicationCoordinator {
             // non-zero dial read simply seeds the baseline.
             let mut band_ref_dial_hz: u64 = 0;
 
-            // WAV recorder for decoder validation
-            let mut wav_recorder = match WavRecorder::new() {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    warn!("WAV recorder disabled: {}", e);
-                    None
+            // WAV recorder for decoder validation (PAN-125): present only
+            // when `[audio.recording] auto_record = true` resolved to a
+            // directory above. An unusable directory stays non-fatal.
+            let mut wav_recorder = wav_recording_dir.and_then(|dir| {
+                match WavRecorder::open(dir.clone(), WAV_RECORDING_MAX_BYTES) {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        warn!("WAV recording disabled: cannot use {}: {}", dir.display(), e);
+                        None
+                    }
                 }
-            };
+            });
 
             // Live waterfall state
             let mut last_live_wf_samples: usize = 0;
@@ -1681,6 +1834,180 @@ mod wav_recorder_tests {
             rec.total_bytes >= 3 * FILE,
             "estimate reset to {}",
             rec.total_bytes
+        );
+    }
+}
+
+#[cfg(test)]
+mod wav_recording_gate_tests {
+    use super::*;
+
+    fn rec(auto_record: bool, directory: &str) -> pancetta_config::RecordingConfig {
+        pancetta_config::RecordingConfig {
+            auto_record,
+            directory: directory.into(),
+            ..Default::default()
+        }
+    }
+
+    fn home() -> std::path::PathBuf {
+        std::path::PathBuf::from("/home/op")
+    }
+
+    #[test]
+    fn default_config_is_disabled() {
+        assert_eq!(
+            resolve_wav_recording(&Default::default(), false, false, Some(&home())),
+            WavRecording::DisabledByConfig
+        );
+    }
+
+    #[test]
+    fn disabled_wins_over_replay_and_no_audio() {
+        let off = rec(false, "~/rec");
+        assert_eq!(
+            resolve_wav_recording(&off, true, false, Some(&home())),
+            WavRecording::DisabledByConfig
+        );
+        assert_eq!(
+            resolve_wav_recording(&off, false, true, Some(&home())),
+            WavRecording::DisabledByConfig
+        );
+    }
+
+    #[test]
+    fn enabled_expands_leading_tilde() {
+        assert_eq!(
+            resolve_wav_recording(&rec(true, "~/.pancetta/recordings"), false, false, Some(&home())),
+            WavRecording::Enabled {
+                dir: home().join(".pancetta").join("recordings")
+            }
+        );
+    }
+
+    #[test]
+    fn bare_tilde_is_home() {
+        assert_eq!(
+            resolve_wav_recording(&rec(true, "~"), false, false, Some(&home())),
+            WavRecording::Enabled { dir: home() }
+        );
+    }
+
+    #[test]
+    fn windows_style_tilde_expands() {
+        assert_eq!(
+            resolve_wav_recording(&rec(true, "~\\rec"), false, false, Some(&home())),
+            WavRecording::Enabled { dir: home().join("rec") }
+        );
+    }
+
+    #[test]
+    fn absolute_and_relative_pass_through() {
+        assert_eq!(
+            resolve_wav_recording(&rec(true, "/abs/rec"), false, false, Some(&home())),
+            WavRecording::Enabled {
+                dir: "/abs/rec".into()
+            }
+        );
+        assert_eq!(
+            resolve_wav_recording(&rec(true, "rec"), false, false, Some(&home())),
+            WavRecording::Enabled { dir: "rec".into() }
+        );
+        // `~user` is not expanded (same as the config loader's tilde).
+        assert_eq!(
+            resolve_wav_recording(&rec(true, "~user/rec"), false, false, Some(&home())),
+            WavRecording::Enabled { dir: "~user/rec".into() }
+        );
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_trimmed() {
+        assert_eq!(
+            resolve_wav_recording(&rec(true, "  ~/rec  "), false, false, Some(&home())),
+            WavRecording::Enabled { dir: home().join("rec") }
+        );
+    }
+
+    #[test]
+    fn empty_directory_falls_back_to_dot_pancetta_recordings() {
+        for directory in ["", "   "] {
+            assert_eq!(
+                resolve_wav_recording(&rec(true, directory), false, false, Some(&home())),
+                WavRecording::Enabled {
+                    dir: home().join(".pancetta").join("recordings")
+                },
+                "directory = {directory:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_overrides_enabled() {
+        assert_eq!(
+            resolve_wav_recording(&rec(true, "~/rec"), true, false, Some(&home())),
+            WavRecording::SuppressedReplay
+        );
+    }
+
+    #[test]
+    fn no_audio_overrides_enabled() {
+        assert_eq!(
+            resolve_wav_recording(&rec(true, "~/rec"), false, true, Some(&home())),
+            WavRecording::SuppressedNoAudio
+        );
+    }
+
+    #[test]
+    fn tilde_without_home_disables() {
+        assert_eq!(
+            resolve_wav_recording(&rec(true, "~/rec"), false, false, None),
+            WavRecording::NoHomeDir {
+                directory: "~/rec".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn absolute_without_home_still_records() {
+        assert_eq!(
+            resolve_wav_recording(&rec(true, "/abs/rec"), false, false, None),
+            WavRecording::Enabled {
+                dir: "/abs/rec".into()
+            }
+        );
+    }
+
+    #[test]
+    fn startup_messages_name_the_setting() {
+        let disabled = WavRecording::DisabledByConfig.startup_message();
+        assert_eq!(
+            disabled.as_deref(),
+            Some(MSG_WAV_RECORDING_DISABLED),
+            "exact string: end-to-end tests and docs pin it"
+        );
+        assert!(
+            disabled
+                .as_ref()
+                .is_some_and(|m| m.contains("audio.recording.auto_record = true")),
+            "the disabled line must name the setting: {disabled:?}"
+        );
+
+        let replay = WavRecording::SuppressedReplay.startup_message();
+        assert_eq!(replay.as_deref(), Some(MSG_WAV_RECORDING_REPLAY));
+        assert!(replay.is_some_and(|m| m.starts_with("Replay mode: ")));
+
+        assert_eq!(
+            WavRecording::SuppressedNoAudio.startup_message().as_deref(),
+            Some(MSG_WAV_RECORDING_NO_AUDIO)
+        );
+
+        // `open()` logs the enabled line with the directory.
+        assert_eq!(
+            WavRecording::Enabled {
+                dir: "/rec".into()
+            }
+            .startup_message(),
+            None
         );
     }
 }
