@@ -128,10 +128,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+<<<<<<< HEAD
 - Pressing `u` just before the DX moved the QSO on (or before a caller
   answered an autonomous CQ) could record a new TX offset that nothing was
   ever sent on. The nudge is now dropped and the QSO stays on the offset it
   is really using (PAN-131).
+=======
+- Pressing `u` on a Hound QSO right after the Fox's report moved it off its
+  calling offset now moves the QSO at least `min_separation_hz` from its real
+  TX offset, instead of leaving it in place or shifting it by only a few Hz
+  (PAN-130).
+>>>>>>> 4ebec230145dd5257fa210670ff509b12da4fc11
 
 - A DX that kept repeating its report to a manual QSO held back our
   keep-call R-report by a full slot after every decode. On FT2 that skipped
