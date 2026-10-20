@@ -391,8 +391,14 @@ before the coordinator's drain commits a stall offset action that attempt
 raised, the commit is refused (`OffsetActionStallRolledBack`) until the streak
 reaches the threshold again. A rollback that arrives after the commit cannot
 undo the move (follow-up: PAN-182). Since PAN-128 each attempt records the
-own-parity TX slot its emission feeds; when a payload-scoped rollback removes
-the attempt holding a slot's count while a same-slot sibling survives, the
+own-parity TX slot its emission feeds, derived with the TX scheduler's own
+current-slot acceptance rule (the CURRENT slot while inside the mode-scaled
+`tx_late_max_ms` late-start window, else the first own slot strictly after —
+a PR-review follow-up; attributing an in-window emission to the next own
+slot instead split one real TX opportunity across two ledger keys and both
+incremented, firing the switch one transmission early); when a
+payload-scoped rollback removes the
+attempt holding a slot's count while a same-slot sibling survives, the
 count is handed to that sibling instead of being decremented (the slot still
 has a frame that can air), and `resend_last_tx`/offset-switch retransmit
 attempts (which record no slot) never count and never inherit one. Rejected

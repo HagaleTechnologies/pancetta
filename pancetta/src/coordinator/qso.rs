@@ -2899,6 +2899,11 @@ impl super::ApplicationCoordinator {
         // setting (Task 6) actually reaches the QSO engine's Rust default
         // (Task 2) instead of being silently overridden by it.
         let qso_stall_switch_after = config.autonomous.qso_stall_switch_after;
+        // PAN-128 PR review: the stall ledger's current-slot acceptance must
+        // mirror the TX scheduler's own late-start window, so the operator's
+        // `[station] tx_late_max_ms` reaches `keep_call_tx_slot` — the same
+        // value the TX worker snapshots for `schedule_tx`.
+        let station_tx_late_max_ms = config.station.tx_late_max_ms;
         drop(config);
 
         // cqdx.io logbook upload is opt-in just like ClubLog/QRZ: it requires
@@ -3079,6 +3084,12 @@ impl super::ApplicationCoordinator {
         // atomic on every switch, so the running loop tracks it in both
         // directions.
         qso_manager.set_active_slot_ns_source(self.active_slot_ns());
+        // PAN-128 PR review: the stall ledger's slot attribution uses the
+        // scheduler's current-slot acceptance window — inject the operator's
+        // real `tx_late_max_ms` so `keep_call_tx_slot` and `schedule_tx`
+        // decide against the same cap. Snapshot semantics match the TX
+        // worker's own startup read of the same field.
+        qso_manager.set_tx_late_max_ms(station_tx_late_max_ms);
         // PAN-72 (Codex round 7 on PR #350, finding 3): the policy above is
         // only ONE of the two gates a rearmed frame must clear. A QSO with
         // `remote_origin` emits every frame as `TxOrigin::Remote`, and the TX

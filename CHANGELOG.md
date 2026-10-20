@@ -138,7 +138,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keep-call re-send, so it ran at twice the rate of real transmissions and
   moved a silent QSO after about two unanswered transmissions instead of
   `qso_stall_switch_after`. It now counts each of the QSO's own transmit
-  slots once (PAN-128).
+  slots once (PAN-128), attributing an emission to the slot the TX
+  scheduler actually targets — the current slot while inside the
+  mode-scaled `tx_late_max_ms` window, otherwise the next own-parity slot —
+  so a re-arm pair aimed at one real TX opportunity can never count twice
+  and trip the switch a transmission early (PR-review follow-up).
 
 - The remote-access audit log (`~/.pancetta/agent-audit.log`) now stays
   within 4 MiB: it rotates at 1 MiB into `.1`–`.3` archives, caps long
