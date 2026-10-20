@@ -128,6 +128,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A remote client that disarmed or lost control while pancetta was busy could
+  still use up its manual-call budget. Repeating a call on an existing QSO
+  charged the resend, and could advance or complete the QSO, after the
+  permission check had already passed. The check, the rebind and the charge
+  now happen under one lock. An automatic 73 resend that emits no frame
+  because the client lost permission or the engine refused it no longer
+  uses one of the three automatic resends (PAN-138).
+
 - When another remote client took control, the previous controller's QSOs
   could hold the TX window and a QSO slot until the manual-call watchdog
   ended them, by default five minutes after they started. They now end with

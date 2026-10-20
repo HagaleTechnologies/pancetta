@@ -55,6 +55,15 @@ cited, not restated. Spec:
   transport failure must end the whole session (the socket is shared by every
   peer), which then disarms and reconnects.
 
+- **Gotcha: check and charge under one guard (PAN-138).** An engine path
+  that charges a budget or mutates an existing QSO on a remote caller's
+  behalf must evaluate `remote_tx_permitted` inside the same `qsos` write
+  guard as the mutation, with no `.await` between them. See
+  `resend_existing_if_permitted`, `advance_existing_qso_to_step` and
+  `rearm_manual_calls_at`. A caller that charges its own budget before
+  calling the engine must use `respond_to_caller_with_outcome` and roll
+  back when `!emitted_frame()` or the call returns an error.
+
 ## Why it is shaped this way
 
 Read and TX are split so the low-risk view can ship freely while the TX path

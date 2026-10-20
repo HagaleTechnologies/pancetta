@@ -1242,6 +1242,30 @@ pub enum UnsentAttemptRollback {
     QsoNotActive,
 }
 
+/// What a manual open or re-call actually did (PAN-138).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualCallOutcome {
+    /// A new QSO was created and its first frame emitted.
+    Opened,
+    /// An existing QSO's latest outbound frame was re-emitted and charged.
+    Resent,
+    /// An existing QSO moved to a later step and that step's frame was emitted.
+    Advanced,
+    /// Nothing emitted: the remote client was not TX-permitted when re-checked
+    /// under the `qsos` write guard.
+    NotPermitted,
+    /// Nothing emitted: the existing QSO had no prior `Sent` frame, or was
+    /// gone by the time the guard was taken.
+    NothingToResend,
+}
+
+impl ManualCallOutcome {
+    /// Whether a `MessageToSend` was emitted.
+    pub fn emitted_frame(self) -> bool {
+        matches!(self, Self::Opened | Self::Resent | Self::Advanced)
+    }
+}
+
 /// The payload of a frame a TX pivot replaced (PAN-75). Text alone cannot
 /// tell that frame apart from the fresher same-text frame that aired in its
 /// place when the pivot changed only the offset or the remote binding.
@@ -2637,6 +2661,30 @@ impl QsoManager {
         remote_origin: bool,
         remote_client_key_id: Option<String>,
     ) -> Result<QsoId, QsoManagerError> {
+        self.respond_to_cq_with_outcome(
+            target_callsign,
+            frequency,
+            dx_parity,
+            initiated_by,
+            partner_freq,
+            remote_origin,
+            remote_client_key_id,
+        )
+        .await
+        .map(|(qso_id, _)| qso_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn respond_to_cq_with_outcome(
+        &self,
+        target_callsign: String,
+        frequency: f64,
+        dx_parity: Option<pancetta_core::slot::SlotParity>,
+        initiated_by: CallInitiation,
+        partner_freq: Option<f64>,
+        remote_origin: bool,
+        remote_client_key_id: Option<String>,
+    ) -> Result<(QsoId, ManualCallOutcome), QsoManagerError> {
         if self.config.our_callsign == "NOCALL" || self.config.our_callsign == "N0CALL" {
             return Err(QsoManagerError::Configuration {
                 message: format!(
@@ -2692,39 +2740,10 @@ impl QsoManager {
                     "Re-call of {} on {:.1} Hz — continuing existing QSO {} (idempotent keep-call, no new QSO)",
                     target_callsign, frequency, existing_id
                 );
-                // Round-10 review (Codex P2): decide whether this resend
-                // would even be attempted BEFORE rebinding/resending —
-                // checked here, not after, so a resend the TX layer would
-                // reject anyway never charges the manual-call budget.
-                // Mirrors the periodic rearm loop's `frame_reaches_the_air`
-                // gate (`rearm_manual_calls_at`) for the identical reason.
-                let should_resend =
-                    !remote_origin || (self.remote_tx_permitted)(remote_client_key_id.as_deref());
-                if should_resend {
-                    // Codex P1, round 20: only rebind when the action is
-                    // actually permitted — rebinding unconditionally left the
-                    // QSO's metadata claiming a DENIED client's identity even
-                    // though no fresh `MessageToSend` was emitted to publish
-                    // that change, so the coordinator's `latest_tx_intent`
-                    // stayed stale (still the prior owner's) and a later
-                    // key-time comparison could see matching stale
-                    // authorization without ever checking the new client's
-                    // arm. Deferring the rebind here (rather than publishing
-                    // the change on the denied path) keeps the QSO's identity
-                    // metadata meaning what every other call site already
-                    // assumes: "the last ACCEPTED client's action."
-                    //
-                    // Round-3 review (Codex P2): rebind to whichever client's
-                    // action was just accepted, BEFORE resending — see
-                    // `rebind_remote_identity`'s doc.
-                    self.rebind_remote_identity(existing_id, remote_origin, remote_client_key_id)
-                        .await;
-                    // Re-emit the QSO's most-recent outbound as a keep-call.
-                    // This is a benign no-op if it somehow has no prior Sent
-                    // message.
-                    let _ = self.resend_last_tx(existing_id).await;
-                }
-                return Ok(existing_id);
+                let outcome = self
+                    .resend_existing_if_permitted(existing_id, remote_origin, remote_client_key_id)
+                    .await;
+                return Ok((existing_id, outcome));
             }
         }
 
@@ -2864,7 +2883,7 @@ impl QsoManager {
             target_callsign, frequency, qso_id
         );
 
-        Ok(qso_id)
+        Ok((qso_id, ManualCallOutcome::Opened))
     }
 
     /// Respond to a station **calling us**, opening the exchange at an
@@ -2915,6 +2934,35 @@ impl QsoManager {
         remote_origin: bool,
         remote_client_key_id: Option<String>,
     ) -> Result<QsoId, QsoManagerError> {
+        self.respond_to_caller_with_outcome(
+            target,
+            frequency,
+            dx_parity,
+            step,
+            our_snr_of_them,
+            their_report,
+            partner_freq,
+            remote_origin,
+            remote_client_key_id,
+        )
+        .await
+        .map(|(qso_id, _)| qso_id)
+    }
+
+    /// [`Self::respond_to_caller`], also reporting whether a frame was emitted (PAN-138).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn respond_to_caller_with_outcome(
+        &self,
+        target: String,
+        frequency: f64,
+        dx_parity: Option<pancetta_core::slot::SlotParity>,
+        step: pancetta_core::ResponseStep,
+        our_snr_of_them: Option<f32>,
+        their_report: Option<i8>,
+        partner_freq: Option<f64>,
+        remote_origin: bool,
+        remote_client_key_id: Option<String>,
+    ) -> Result<(QsoId, ManualCallOutcome), QsoManagerError> {
         use pancetta_core::ResponseStep;
 
         // PAN-23: refuse FT8's literal unresolved-hash placeholder "<...>"
@@ -2940,7 +2988,7 @@ impl QsoManager {
         // the existing path so there is a single source of truth for it.
         if step == ResponseStep::Grid {
             return self
-                .respond_to_cq_with(
+                .respond_to_cq_with_outcome(
                     target,
                     frequency,
                     dx_parity,
@@ -2995,46 +3043,22 @@ impl QsoManager {
                          (ahead of its current stage)",
                         target, step, existing_id
                     );
-                    // Round-13 review (Codex P1): unlike the resend
-                    // branches, advancing MUTATES the QSO's ladder state —
-                    // records a `Sent` message, changes state, and at
-                    // `SeventyThree` completes the QSO and logs the ADIF
-                    // contact. Doing that unconditionally for a client the
-                    // TX layer will deny anyway would leave a permanently
-                    // wrong exchange state (or a false log entry) even
-                    // though nothing ever transmitted — worse than the
-                    // resend branches' merely-wasted budget charge. Decide
-                    // BEFORE rebinding/advancing, same as those branches.
-                    let should_advance = !remote_origin
-                        || (self.remote_tx_permitted)(remote_client_key_id.as_deref());
-                    if should_advance {
-                        // Codex P1, round 20: only rebind once the action is
-                        // permitted — see the identical fix in the
-                        // idempotent keep-call branch above for the full
-                        // rationale (an unconditional rebind on a DENIED
-                        // action leaves stale-looking-legitimate identity
-                        // metadata behind with no fresh intent published to
-                        // correct it).
-                        //
-                        // Round-3 review (Codex P2): rebind before advancing
-                        // — see `rebind_remote_identity`'s doc.
-                        self.rebind_remote_identity(
-                            existing_id,
-                            remote_origin,
-                            remote_client_key_id,
-                        )
-                        .await;
-                        self.advance_existing_qso_to_step(
+                    // Round 13 / PAN-138: advancing can complete and log a
+                    // contact. Check permission inside the advance's write
+                    // guard before changing identity or exchange state.
+                    let outcome = self
+                        .advance_existing_qso_to_step(
                             existing_id,
                             &target,
                             frequency,
                             step,
                             our_report,
                             their_report_val,
+                            remote_origin,
+                            remote_client_key_id,
                         )
                         .await?;
-                    }
-                    return Ok(existing_id);
+                    return Ok((existing_id, outcome));
                 }
                 _ => {
                     info!(
@@ -3042,27 +3066,14 @@ impl QsoManager {
                          current outbound (idempotent keep-call)",
                         target, step, existing_id
                     );
-                    // Round-10 review (Codex P2): decide before
-                    // rebinding/resending — see the analogous fix in
-                    // `respond_to_cq_with`'s idempotent keep-call branch.
-                    let should_resend = !remote_origin
-                        || (self.remote_tx_permitted)(remote_client_key_id.as_deref());
-                    if should_resend {
-                        // Codex P1, round 20: only rebind once permitted —
-                        // see the identical fix above for the full
-                        // rationale.
-                        //
-                        // Round-3 review (Codex P2): rebind before resending
-                        // — see `rebind_remote_identity`'s doc.
-                        self.rebind_remote_identity(
+                    let outcome = self
+                        .resend_existing_if_permitted(
                             existing_id,
                             remote_origin,
                             remote_client_key_id,
                         )
                         .await;
-                        let _ = self.resend_last_tx(existing_id).await;
-                    }
-                    return Ok(existing_id);
+                    return Ok((existing_id, outcome));
                 }
             }
         }
@@ -3095,22 +3106,10 @@ impl QsoManager {
                      grace window, re-sending existing QSO {}'s last frame",
                     target, step, existing_id
                 );
-                // Round-10 review (Codex P2): decide before
-                // rebinding/resending — see the analogous fix in
-                // `respond_to_cq_with`'s idempotent keep-call branch.
-                let should_resend =
-                    !remote_origin || (self.remote_tx_permitted)(remote_client_key_id.as_deref());
-                if should_resend {
-                    // Codex P1, round 20: only rebind once permitted — see
-                    // the identical fix above for the full rationale.
-                    //
-                    // Round-3 review (Codex P2): rebind before resending —
-                    // see `rebind_remote_identity`'s doc.
-                    self.rebind_remote_identity(existing_id, remote_origin, remote_client_key_id)
-                        .await;
-                    let _ = self.resend_last_tx(existing_id).await;
-                }
-                return Ok(existing_id);
+                let outcome = self
+                    .resend_existing_if_permitted(existing_id, remote_origin, remote_client_key_id)
+                    .await;
+                return Ok((existing_id, outcome));
             }
         }
 
@@ -3375,7 +3374,7 @@ impl QsoManager {
             .await;
         }
 
-        Ok(qso_id)
+        Ok((qso_id, ManualCallOutcome::Opened))
     }
 
     /// Two-strike confirm-before-relatch at the current time. See
@@ -3972,41 +3971,41 @@ impl QsoManager {
         .await;
     }
 
-    /// Rebind an existing QSO's remote-origin identity to whoever's action
-    /// was just accepted for it (round-3 review, Codex P2).
-    ///
-    /// `respond_to_cq_with`/`respond_to_caller`'s idempotent-keep-call and
-    /// advance-existing-QSO branches resend or advance an ALREADY-EXISTING
-    /// QSO object rather than creating a new one — but until this fix they
-    /// left that QSO's `metadata.remote_client_key_id` bound to whichever
-    /// client originally created it. If client A created the QSO and client
-    /// B later takes control (arms) and repeats the same accepted action
-    /// (e.g. `callStation` for the same callsign/band), the resend/advance
-    /// still carries A's stale identity, so B's own valid arm rejects it —
-    /// every repeated action from the new controller keeps resolving to the
-    /// same still-A-bound QSO until it terminates. `send_message` (used by
-    /// both `resend_last_tx` and `advance_existing_qso_to_step`) reads
-    /// `metadata.remote_client_key_id`/`remote_origin` fresh at call time,
-    /// so rebinding here before either of those runs is sufficient — no
-    /// change needed to how the actual `MessageToSend` is emitted.
-    ///
-    /// A no-op if the QSO no longer exists (defensive; the caller always
-    /// just looked it up).
-    async fn rebind_remote_identity(
+    /// PAN-138: re-key an EXISTING QSO on behalf of a (possibly remote)
+    /// caller. The permission check, the identity rebind (round 3) and the
+    /// attempt's bookkeeping share ONE `qsos` write guard with no await
+    /// between them, like `rearm_manual_calls_at`'s `frame_reaches_the_air`.
+    /// A denied caller rebinds nothing (round 20) and charges nothing
+    /// (round 10). `send_message` re-reads the binding when emitting.
+    async fn resend_existing_if_permitted(
         &self,
         qso_id: QsoId,
         remote_origin: bool,
         remote_client_key_id: Option<String>,
-    ) {
-        if let Some(progress) = self.qsos.write().await.get_mut(&qso_id) {
+    ) -> ManualCallOutcome {
+        let now = Utc::now();
+        let (message, frequency) = {
+            let mut qsos = self.qsos.write().await;
+            let Some(progress) = qsos.get_mut(&qso_id) else {
+                return ManualCallOutcome::NothingToResend;
+            };
+            if remote_origin && !(self.remote_tx_permitted)(remote_client_key_id.as_deref()) {
+                return ManualCallOutcome::NotPermitted;
+            }
             progress.metadata.remote_origin = remote_origin;
             progress.metadata.remote_client_key_id = remote_client_key_id;
-        }
+            match self.charge_resend_locked(qso_id, progress, now) {
+                Some(emit) => emit,
+                None => return ManualCallOutcome::NothingToResend,
+            }
+        };
+        self.send_message(qso_id, message, frequency).await;
+        ManualCallOutcome::Resent
     }
 
     /// Read `qso_id`'s CURRENT remote-identity binding rather than trusting a
     /// value captured before the caller released the `qsos` write lock — a
-    /// concurrent [`Self::rebind_remote_identity`] can change it in that
+    /// concurrent [`Self::resend_existing_if_permitted`] can change it in that
     /// window, and acting on a stale snapshot afterward can misattribute a
     /// reply's origin/client to the wrong controller (Codex P1, PR #362
     /// round 17). Falls back to `snapshot` only if the QSO itself is gone by
@@ -4208,51 +4207,60 @@ impl QsoManager {
     /// same-text emission the rearm/coalescer machinery doesn't know about.
     pub async fn resend_last_tx(&self, qso_id: QsoId) -> Result<(), QsoManagerError> {
         let now = Utc::now();
-        let (message, frequency) = {
+        let emit = {
             let mut qsos = self.qsos.write().await;
             let progress = qsos
                 .get_mut(&qso_id)
                 .ok_or(QsoManagerError::QsoNotFound { qso_id })?;
-            match progress
-                .messages
-                .iter()
-                .rev()
-                .find(|m| m.direction == MessageDirection::Sent)
-            {
-                Some(m) => {
-                    let message = m.message_type.clone();
-                    let frequency = progress.metadata.frequency;
-                    let prev_last_call_at = progress.metadata.last_call_at;
-                    progress.metadata.call_count += 1;
-                    progress.metadata.last_call_at = Some(now);
-                    self.record_keep_call_attempt(
-                        &mut self
-                            .keep_call_ledger
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner()),
-                        qso_id,
-                        KeepCallAttempt {
-                            emitted_at: now,
-                            raw_text: self.render_sent_text(&message),
-                            prev_last_call_at,
-                            bumped_stall: false,
-                            tx_slot: None,
-                            recorded_sent: false,
-                            frequency_hz: frequency,
-                            remote_origin: progress.metadata.remote_origin,
-                            remote_client_key_id: progress.metadata.remote_client_key_id.clone(),
-                        },
-                    );
-                    (message, frequency)
-                }
-                None => {
-                    info!("resend_last_tx: no prior Sent message for QSO {}", qso_id);
-                    return Ok(());
-                }
-            }
+            self.charge_resend_locked(qso_id, progress, now)
         };
-        self.send_message(qso_id, message, frequency).await;
+        match emit {
+            Some((message, frequency)) => self.send_message(qso_id, message, frequency).await,
+            None => info!("resend_last_tx: no prior Sent message for QSO {}", qso_id),
+        }
         Ok(())
+    }
+
+    /// The bookkeeping half of a re-send, run under the caller's `qsos` write
+    /// guard: bump `call_count`, stamp `last_call_at` and record the PAN-75
+    /// ledger attempt. Returns what to emit once the guard is dropped, or
+    /// `None` when the QSO has no prior `Sent` message (nothing charged).
+    fn charge_resend_locked(
+        &self,
+        qso_id: QsoId,
+        progress: &mut QsoProgress,
+        now: DateTime<Utc>,
+    ) -> Option<(MessageType, f64)> {
+        let message = progress
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.direction == MessageDirection::Sent)?
+            .message_type
+            .clone();
+        let frequency = progress.metadata.frequency;
+        let prev_last_call_at = progress.metadata.last_call_at;
+        progress.metadata.call_count += 1;
+        progress.metadata.last_call_at = Some(now);
+        self.record_keep_call_attempt(
+            &mut self
+                .keep_call_ledger
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+            qso_id,
+            KeepCallAttempt {
+                emitted_at: now,
+                raw_text: self.render_sent_text(&message),
+                prev_last_call_at,
+                bumped_stall: false,
+                tx_slot: None,
+                recorded_sent: false,
+                frequency_hz: frequency,
+                remote_origin: progress.metadata.remote_origin,
+                remote_client_key_id: progress.metadata.remote_client_key_id.clone(),
+            },
+        );
+        Some((message, frequency))
     }
 
     /// External commit point for PAN-72's stall-switch/revert and the manual
@@ -5466,7 +5474,7 @@ impl QsoManager {
         if let Some(reply) = reply_to_emit {
             // Re-read the remote binding here rather than trusting the
             // pre-drop snapshot: a concurrent takeover can rebind this QSO's
-            // remote identity (`rebind_remote_identity`) and publish its own
+            // remote identity (`resend_existing_if_permitted`) and publish its own
             // Remote resend in the window since the write lock was released
             // above. Emitting the stale origin/client-id would misattribute
             // this reply (e.g. advertise it as Local) and could let a later
@@ -7204,6 +7212,7 @@ impl QsoManager {
     /// The QSO's latched `tx_parity` and `initiated_by` are preserved (we reuse
     /// what was latched at QSO start). Used when an operator context-replies at
     /// a step ahead of where the QSO currently is.
+    #[allow(clippy::too_many_arguments)]
     async fn advance_existing_qso_to_step(
         &self,
         qso_id: QsoId,
@@ -7212,7 +7221,9 @@ impl QsoManager {
         step: pancetta_core::ResponseStep,
         our_report: SignalReport,
         their_report_val: SignalReport,
-    ) -> Result<(), QsoManagerError> {
+        remote_origin: bool,
+        remote_client_key_id: Option<String>,
+    ) -> Result<ManualCallOutcome, QsoManagerError> {
         use pancetta_core::ResponseStep;
         let now = Utc::now();
 
@@ -7220,7 +7231,9 @@ impl QsoManager {
             ResponseStep::Grid => {
                 // Grid never ranks ahead of an active QSO, so the caller never
                 // routes here; re-send current as a safe fallback.
-                return self.resend_last_tx(qso_id).await;
+                return Ok(self
+                    .resend_existing_if_permitted(qso_id, remote_origin, remote_client_key_id)
+                    .await);
             }
             ResponseStep::Report => (
                 QsoState::SendingReport {
@@ -7291,6 +7304,19 @@ impl QsoManager {
             let Some(progress) = qsos.get_mut(&qso_id) else {
                 return Err(QsoManagerError::QsoNotFound { qso_id });
             };
+            // PAN-138 / round 13: check, rebind and advance under this one
+            // guard, so no other `qsos` holder (QSO processing, a PAN-137
+            // retire) runs between the check and the mutation. The check is
+            // still a point-in-time read of `ArmState`, not a TX gate: a
+            // disarm or expiry after it is caught only by the TX worker at
+            // key time. The advance is not undone then (advances record no
+            // PAN-75 attempt), and a completion it records stays logged
+            // (known gap, 2026-07-development-phases-and-gaps.md).
+            if remote_origin && !(self.remote_tx_permitted)(remote_client_key_id.as_deref()) {
+                return Ok(ManualCallOutcome::NotPermitted);
+            }
+            progress.metadata.remote_origin = remote_origin;
+            progress.metadata.remote_client_key_id = remote_client_key_id;
             let old_state = progress.state.clone();
             progress.state = new_state.clone();
             progress.state_history.push(StateTransition {
@@ -7381,7 +7407,7 @@ impl QsoManager {
             })
             .await;
         }
-        Ok(())
+        Ok(ManualCallOutcome::Advanced)
     }
 
     /// FIX 3: retire every active (non-terminal) QSO with `callsign` on the
@@ -23516,9 +23542,10 @@ mod current_remote_binding_tests {
 
         // A concurrent takeover rebinds it to a new remote controller —
         // simulating exactly the race the round-17 finding described.
-        manager
-            .rebind_remote_identity(qso_id, true, Some("newclient".to_string()))
-            .await;
+        if let Some(progress) = manager.qsos.write().await.get_mut(&qso_id) {
+            progress.metadata.remote_origin = true;
+            progress.metadata.remote_client_key_id = Some("newclient".to_string());
+        }
 
         // Reading with the OLD (pre-rebind) snapshot must still return the
         // LIVE binding, not the stale value passed in.
@@ -23540,5 +23567,373 @@ mod current_remote_binding_tests {
                 .await,
             snapshot
         );
+    }
+}
+
+#[cfg(test)]
+mod pan138_recheck_tests {
+    //! PAN-138: re-keying an EXISTING QSO for a (possibly remote) caller
+    //! re-checks TX permission under the same `qsos` write guard that rebinds
+    //! the QSO and charges the resend (or advances it). The permission source
+    //! doubles as a probe: when primed, its next evaluation tries to take the
+    //! `qsos` write lock itself, standing in for concurrent QSO processing
+    //! that grabs the lock right after the check. If it gets the lock, the
+    //! check ran outside the critical section and a disarm could land between
+    //! the check and the charge.
+    use super::*;
+    use pancetta_core::slot::SlotParity;
+    use pancetta_core::ResponseStep;
+    use std::future::Future;
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+
+    const DX: &str = "K9ZZ";
+    const FREQ: f64 = 1500.0;
+
+    type ParkedGuard = tokio::sync::OwnedRwLockWriteGuard<HashMap<QsoId, QsoProgress>>;
+
+    #[derive(Default)]
+    struct Probe {
+        permitted: AtomicBool,
+        primed: AtomicBool,
+        interposed: AtomicBool,
+        checked_under_lock: AtomicBool,
+        parked: std::sync::Mutex<Option<ParkedGuard>>,
+    }
+
+    fn manager_with_probe() -> (Arc<QsoManager>, Arc<Probe>) {
+        let mut manager = QsoManager::new(QsoManagerConfig {
+            our_callsign: "K5ARH".into(),
+            our_grid: Some("EM12".into()),
+            ..QsoManagerConfig::default()
+        });
+        let probe = Arc::new(Probe::default());
+        probe.permitted.store(true, SeqCst);
+        let qsos = Arc::clone(&manager.qsos);
+        let p = Arc::clone(&probe);
+        manager.set_remote_tx_permitted_source(Arc::new(move |_| {
+            let permitted = p.permitted.load(SeqCst);
+            if p.primed.swap(false, SeqCst) {
+                match Arc::clone(&qsos).try_write_owned() {
+                    Ok(guard) => {
+                        *p.parked.lock().unwrap() = Some(guard);
+                        p.interposed.store(true, SeqCst);
+                    }
+                    Err(_) => p.checked_under_lock.store(true, SeqCst),
+                }
+            }
+            permitted
+        }));
+        (Arc::new(manager), probe)
+    }
+
+    /// Run `action` with the probe primed. The client disarms as soon as the
+    /// probe has interposed (or once `action` is done), then the parked guard
+    /// is released so `action` can finish.
+    async fn race<T: Send + 'static>(
+        probe: &Probe,
+        action: impl Future<Output = T> + Send + 'static,
+    ) -> T {
+        probe.primed.store(true, SeqCst);
+        let task = tokio::spawn(action);
+        while !probe.interposed.load(SeqCst) && !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        probe.permitted.store(false, SeqCst);
+        drop(probe.parked.lock().unwrap().take());
+        task.await.unwrap()
+    }
+
+    fn assert_check_shares_the_guard(probe: &Probe) {
+        assert!(
+            !probe.interposed.load(SeqCst),
+            "another task took the qsos write lock between the permission \
+             check and the charge, so a disarm there would still be charged"
+        );
+        assert!(
+            probe.checked_under_lock.load(SeqCst),
+            "the permission check must run under the qsos write guard"
+        );
+    }
+
+    async fn open(manager: &QsoManager, step: ResponseStep, client: &str) -> QsoId {
+        manager
+            .respond_to_caller(
+                DX.into(),
+                FREQ,
+                Some(SlotParity::Even),
+                step,
+                None,
+                None,
+                None,
+                true,
+                Some(client.into()),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn reply(
+        manager: &Arc<QsoManager>,
+        step: ResponseStep,
+        client: &str,
+    ) -> impl Future<Output = Result<QsoId, QsoManagerError>> + Send + 'static {
+        let manager = Arc::clone(manager);
+        let client = client.to_string();
+        async move {
+            manager
+                .respond_to_caller(
+                    DX.into(),
+                    FREQ,
+                    Some(SlotParity::Even),
+                    step,
+                    None,
+                    None,
+                    None,
+                    true,
+                    Some(client),
+                )
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn keep_call_recheck_shares_the_charge_guard() {
+        let (manager, probe) = manager_with_probe();
+        let id = manager
+            .respond_to_cq_with(
+                DX.into(),
+                FREQ,
+                Some(SlotParity::Even),
+                CallInitiation::Manual,
+                None,
+                true,
+                Some("client-a".into()),
+            )
+            .await
+            .unwrap();
+        let m = Arc::clone(&manager);
+        let again = race(&probe, async move {
+            m.respond_to_cq_with(
+                DX.into(),
+                FREQ,
+                Some(SlotParity::Even),
+                CallInitiation::Manual,
+                None,
+                true,
+                Some("client-b".into()),
+            )
+            .await
+        })
+        .await
+        .unwrap();
+        assert_eq!(again, id);
+        assert_check_shares_the_guard(&probe);
+        let after = manager.get_qso(id).await.unwrap();
+        assert_eq!(after.metadata.call_count, 2);
+        assert_eq!(
+            after.metadata.remote_client_key_id.as_deref(),
+            Some("client-b")
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotent_reply_recheck_shares_the_charge_guard() {
+        let (manager, probe) = manager_with_probe();
+        let id = open(&manager, ResponseStep::Report, "client-a").await;
+        let again = race(&probe, reply(&manager, ResponseStep::Report, "client-b"))
+            .await
+            .unwrap();
+        assert_eq!(again, id);
+        assert_check_shares_the_guard(&probe);
+        assert_eq!(manager.get_qso(id).await.unwrap().metadata.call_count, 2);
+    }
+
+    #[tokio::test]
+    async fn completed_qso_rekey_recheck_shares_the_charge_guard() {
+        let (manager, probe) = manager_with_probe();
+        let id = open(&manager, ResponseStep::SeventyThree, "client-a").await;
+        let again = race(
+            &probe,
+            reply(&manager, ResponseStep::SeventyThree, "client-a"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(again, id);
+        assert_check_shares_the_guard(&probe);
+        assert_eq!(manager.get_qso(id).await.unwrap().metadata.call_count, 2);
+    }
+
+    #[tokio::test]
+    async fn advance_recheck_shares_the_mutation_guard() {
+        let (manager, probe) = manager_with_probe();
+        let id = open(&manager, ResponseStep::Report, "client-a").await;
+        let again = race(
+            &probe,
+            reply(&manager, ResponseStep::SeventyThree, "client-b"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(again, id);
+        assert_check_shares_the_guard(&probe);
+        assert!(matches!(
+            manager.get_qso(id).await.unwrap().state,
+            QsoState::Completed { .. }
+        ));
+    }
+}
+
+#[cfg(test)]
+mod pan138_outcome_tests {
+    //! PAN-138: `respond_to_caller_with_outcome` reports whether a frame was
+    //! emitted, so a caller that charged its own budget first (auto-73) can
+    //! roll that charge back.
+    use super::*;
+    use pancetta_core::slot::SlotParity;
+    use pancetta_core::ResponseStep;
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+
+    const DX: &str = "K9ZZ";
+    const FREQ: f64 = 1500.0;
+
+    fn manager(permitted: Arc<AtomicBool>) -> QsoManager {
+        let mut manager = QsoManager::new(QsoManagerConfig {
+            our_callsign: "K5ARH".into(),
+            our_grid: Some("EM12".into()),
+            ..QsoManagerConfig::default()
+        });
+        manager.set_remote_tx_permitted_source(Arc::new(move |_| permitted.load(SeqCst)));
+        manager
+    }
+
+    async fn reply(
+        manager: &QsoManager,
+        step: ResponseStep,
+        remote: Option<&str>,
+    ) -> (QsoId, ManualCallOutcome) {
+        manager
+            .respond_to_caller_with_outcome(
+                DX.into(),
+                FREQ,
+                Some(SlotParity::Even),
+                step,
+                None,
+                None,
+                None,
+                remote.is_some(),
+                remote.map(str::to_string),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn sends(rx: &mut broadcast::Receiver<QsoEvent>) -> usize {
+        let mut n = 0;
+        while let Ok(ev) = rx.try_recv() {
+            n += usize::from(matches!(ev, QsoEvent::MessageToSend { .. }));
+        }
+        n
+    }
+
+    #[tokio::test]
+    async fn outcome_names_what_each_branch_did() {
+        let permitted = Arc::new(AtomicBool::new(true));
+        let manager = manager(Arc::clone(&permitted));
+        let (id, opened) = reply(&manager, ResponseStep::Report, Some("client-a")).await;
+        assert_eq!(opened, ManualCallOutcome::Opened);
+        assert_eq!(
+            reply(&manager, ResponseStep::Report, Some("client-a")).await,
+            (id, ManualCallOutcome::Resent)
+        );
+        assert_eq!(
+            reply(&manager, ResponseStep::SeventyThree, Some("client-a")).await,
+            (id, ManualCallOutcome::Advanced)
+        );
+        assert_eq!(
+            reply(&manager, ResponseStep::SeventyThree, Some("client-a")).await,
+            (id, ManualCallOutcome::Resent),
+            "FIX B re-keys the completed QSO"
+        );
+        assert!(ManualCallOutcome::Resent.emitted_frame());
+        assert!(!ManualCallOutcome::NotPermitted.emitted_frame());
+        assert!(!ManualCallOutcome::NothingToResend.emitted_frame());
+    }
+
+    #[tokio::test]
+    async fn a_denied_rekey_reports_not_permitted_and_changes_nothing() {
+        for step in [ResponseStep::Report, ResponseStep::SeventyThree] {
+            let permitted = Arc::new(AtomicBool::new(true));
+            let manager = manager(Arc::clone(&permitted));
+            // Report: idempotent re-send of an active QSO; SeventyThree: FIX B
+            // re-key of the QSO this open just completed.
+            let (id, _) = reply(&manager, step, Some("client-a")).await;
+            let before = manager.get_qso(id).await.unwrap();
+            let mut rx = manager.subscribe();
+            permitted.store(false, SeqCst);
+            assert_eq!(
+                reply(&manager, step, Some("client-b")).await,
+                (id, ManualCallOutcome::NotPermitted)
+            );
+            let after = manager.get_qso(id).await.unwrap();
+            assert_eq!(after.metadata.call_count, before.metadata.call_count);
+            assert_eq!(after.metadata.last_call_at, before.metadata.last_call_at);
+            assert_eq!(
+                after.metadata.remote_client_key_id.as_deref(),
+                Some("client-a")
+            );
+            assert_eq!(sends(&mut rx), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_disarm_while_waiting_for_the_qsos_lock_is_honoured() {
+        let permitted = Arc::new(AtomicBool::new(true));
+        let manager = Arc::new(manager(Arc::clone(&permitted)));
+        let (id, _) = reply(&manager, ResponseStep::Report, Some("client-a")).await;
+        let mut rx = manager.subscribe();
+        // Concurrent QSO processing holds the lock; the client disarms
+        // before it lets go.
+        let busy = Arc::clone(&manager.qsos).write_owned().await;
+        let m = Arc::clone(&manager);
+        let task =
+            tokio::spawn(
+                async move { reply(&m, ResponseStep::SeventyThree, Some("client-a")).await },
+            );
+        tokio::task::yield_now().await;
+        permitted.store(false, SeqCst);
+        drop(busy);
+        assert_eq!(task.await.unwrap(), (id, ManualCallOutcome::NotPermitted));
+        let after = manager.get_qso(id).await.unwrap();
+        assert!(matches!(after.state, QsoState::SendingReport { .. }));
+        assert_eq!(sends(&mut rx), 0);
+    }
+
+    #[tokio::test]
+    async fn a_local_rekey_ignores_the_remote_predicate() {
+        let permitted = Arc::new(AtomicBool::new(false));
+        let manager = manager(permitted);
+        let (id, _) = reply(&manager, ResponseStep::Report, None).await;
+        assert_eq!(
+            reply(&manager, ResponseStep::Report, None).await,
+            (id, ManualCallOutcome::Resent)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_qso_with_nothing_sent_reports_nothing_to_resend() {
+        let manager = manager(Arc::new(AtomicBool::new(true)));
+        let (id, _) = reply(&manager, ResponseStep::Report, Some("client-a")).await;
+        manager
+            .qsos
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .messages
+            .clear();
+        assert_eq!(
+            reply(&manager, ResponseStep::Report, Some("client-a")).await,
+            (id, ManualCallOutcome::NothingToResend)
+        );
+        assert_eq!(manager.get_qso(id).await.unwrap().metadata.call_count, 1);
     }
 }
