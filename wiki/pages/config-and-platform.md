@@ -38,3 +38,10 @@ Second gotcha (PAN-90): **a new config struct needs container-level
 fails — every table must accept a partial table. Record/map entry types are the
 only allowlisted exceptions. Config snippets added to `README.md` or top-level
 `docs/*.md` are loaded by `tests/docs_snippets.rs` and must parse with zero warnings.
+
+Queue recovery gotcha (PAN-150): restoring a missing native queue rule does not
+schedule a retry. Rerun the failed handler after restoration. An interrupted
+bot-owned pause can repair its missing provenance marker on handoff rerun;
+human pauses remain in force. See
+[Interrupted native queue recovery](../../docs/DECISIONS/config-and-platform.md#interrupted-native-queue-recovery-pan-150-2026-10-20)
+for ownership checks and recovery limits.
