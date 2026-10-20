@@ -128,6 +128,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Pressing `u` to move an established QSO that had no TX/RX split could be
+  undone automatically. The DX's next reply recorded the offset you had just
+  left as the one that works, so if the QSO later went quiet it moved straight
+  back there. The reply now credits the offset you moved to, and a later stall
+  looks for a new offset instead (PAN-132).
+
 - Pressing `u` on a Hound QSO right after the Fox's report moved it off its
   calling offset now moves the QSO at least `min_separation_hz` from its real
   TX offset, instead of leaving it in place or shifting it by only a few Hz

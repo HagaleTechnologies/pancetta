@@ -4367,10 +4367,11 @@ impl QsoManager {
         // (`is_message_relevant`) and stays a CANDIDATE for the offset a
         // forward advance credits as known-good (`process_message_for_qso`).
         //
-        // Round 6, finding 2: the provenance travels with it. On a pre-existing
-        // split the DX's reply frequency cannot discriminate our two offsets,
-        // and the right fallback there depends entirely on whether the stall
-        // detector or the operator moved us. See
+        // Round 6, finding 2: the provenance travels with it. On any split —
+        // including the one the latch below creates for an established simplex
+        // QSO (PAN-132) — the DX's reply frequency cannot discriminate our two
+        // offsets, and the right fallback there depends entirely on whether the
+        // stall detector or the operator moved us. See
         // `QsoMetadata::pre_switch_offset` and
         // `PreSwitchOffset::operator_forced`.
         progress.metadata.pre_switch_offset = Some(crate::states::PreSwitchOffset {
@@ -4409,7 +4410,9 @@ impl QsoManager {
         // An already-`Some` `partner_freq` (Hound, an offset hold, a collision
         // nudge, a passband clamp) is deliberately left alone: it is already
         // the correct "where we hear the DX", and this is purely a TX-side
-        // move.
+        // move. The crediting block in `process_message_for_qso` treats the
+        // split this latch creates exactly like an already-`Some` one, so its
+        // provenance rule decides the known-good offset (PAN-132).
         //
         // The latch also requires an ESTABLISHED DX identity
         // (`their_callsign().is_some()` — the same discriminator
@@ -5101,18 +5104,33 @@ impl QsoManager {
                 // a reason that says nothing about which frame was answered, and
                 // crediting the never-transmitted new offset off the back of it
                 // is strictly worse than round 4's behaviour. So the check is
-                // applied only when the QSO is Tx=Rx: no split at all, or a
-                // split this very switch created (`partner_freq` still equal to
-                // the offset we just vacated, compared with the same
-                // [`TX_OFFSET_NOOP_TOLERANCE_HZ`] float-noise bound that latch
-                // site uses).
+                // applied only when the QSO is Tx=Rx: no `partner_freq` at all.
                 //
-                // Round 6, finding 2: on a PRE-EXISTING split the fallback is
-                // not one answer but two, and the provenance of the relocation
-                // picks between them (`PreSwitchOffset::operator_forced`). The
-                // DX transmits at `partner_freq` no matter where we key, so its
-                // reply frequency is silent about which of our offsets it
-                // answered — but the two provenances carry different priors:
+                // PAN-132 (Codex round 15 on PR #350, P2): that includes a split
+                // this switch itself created. `apply_tx_offset_switch`'s
+                // established-QSO latch sets `partner_freq` to exactly the
+                // offset it vacated, so round 5's re-review counted that QSO as
+                // Tx=Rx. But the latch exists because the DX is still
+                // transmitting there, whatever moved us, so its reply decodes at
+                // the vacated offset whichever of our frames it answered. The
+                // relevance gate has already admitted it against that same
+                // baseline with the same tolerance, so the check could not fail:
+                // an operator nudge credited the offset it had just left, and
+                // the next stall `Revert`ed the nudge. A `partner_freq` that
+                // merely coincides with the vacated offset (an earlier move
+                // landed back on it) is the same case. Within the grace,
+                // `partner_freq` is therefore `None` only after a switch on an
+                // unanswered `CallingCq`, where the latch deliberately does not
+                // fire — the only case where the reply frequency is evidence.
+                //
+                // Round 6, finding 2: on ANY split — one that predates the
+                // switch, or the one its own latch just created (PAN-132) — the
+                // fallback is not one answer but two, and the provenance of the
+                // relocation picks between them
+                // (`PreSwitchOffset::operator_forced`). The DX transmits at
+                // `partner_freq` no matter where we key, so its reply frequency
+                // is silent about which of our offsets it answered — but the two
+                // provenances carry different priors:
                 //
                 // - a STALL-triggered switch only fires BECAUSE the old offset
                 //   demonstrably stopped working, and the triggering resend went
@@ -5139,10 +5157,7 @@ impl QsoManager {
                 progress.metadata.last_known_good_offset_hz = Some(match vacated {
                     None => current_hz,
                     Some(pre) => {
-                        let tx_equals_rx =
-                            progress.metadata.partner_freq.is_none_or(|partner_hz| {
-                                (partner_hz - pre.offset_hz).abs() <= TX_OFFSET_NOOP_TOLERANCE_HZ
-                            });
+                        let tx_equals_rx = progress.metadata.partner_freq.is_none();
                         if tx_equals_rx {
                             // The decode frequency IS evidence here: it is the
                             // same number as our own TX offset.
@@ -5165,14 +5180,12 @@ impl QsoManager {
                                 // bigger than the decoder's narrow window
                                 // stalls the exchange right after rescuing it.
                                 //
-                                // Gated on `partner_freq` still being `None`
-                                // here — an already-established QSO (Hound, an
-                                // `o` hold, a de-conflict nudge, a passband
-                                // clamp) reaches this same sub-case with
-                                // `partner_freq` already latched to
-                                // `pre.offset_hz` by `apply_tx_offset_switch`
-                                // itself, and must come out of this block
-                                // exactly as that switch left it.
+                                // Since PAN-132 `tx_equals_rx` is exactly
+                                // `partner_freq.is_none()`, so this guard always
+                                // holds here. It stays so that a future
+                                // widening of `tx_equals_rx` can never let this
+                                // latch overwrite a split an established QSO
+                                // already carries.
                                 if progress.metadata.partner_freq.is_none() {
                                     progress.metadata.partner_freq = Some(pre.offset_hz);
                                 }
@@ -20699,7 +20712,10 @@ mod pan72_stall_detection_tests {
     /// vacated offset), but the advance it drives must NOT record the brand-new
     /// offset — which has never been transmitted on — as `last_known_good`.
     /// Doing so poisons the Revert target: a later stall would "revert" to the
-    /// offset it is already on, and the genuinely-proven one is lost.
+    /// offset it is already on, and the genuinely-proven one is lost. Since
+    /// PAN-132 this QSO's latched split routes through the round-6 provenance
+    /// rule instead of the decode-frequency check; this test pins that the
+    /// stall-triggered outcome is unchanged.
     #[tokio::test]
     async fn an_advance_answering_the_pre_switch_frame_credits_the_old_offset() {
         let mut config = test_config();
@@ -20991,6 +21007,158 @@ mod pan72_stall_detection_tests {
         assert_eq!(
             after.metadata.pre_switch_offset, None,
             "the first advance after a relocation consumes the grace either way"
+        );
+    }
+
+    /// PAN-132 (Codex round 15 on PR #350, P2): the test above without a
+    /// pre-existing split. A simplex QSO has `partner_freq: None` until a switch
+    /// moves it; `apply_tx_offset_switch`'s established-QSO latch then sets
+    /// `partner_freq` to exactly the offset it vacated — for an operator nudge
+    /// as much as for a stall switch. The DX keeps transmitting there whatever
+    /// we do, so its reply says nothing about which of our offsets it answered,
+    /// and provenance must decide, exactly as on a pre-existing split. The
+    /// crediting block used to count that latch as Tx=Rx; its decode-frequency
+    /// check then always matched, and the nudge credited the offset the operator
+    /// had just left.
+    #[tokio::test]
+    async fn an_operator_nudge_on_an_established_simplex_qso_credits_the_new_offset() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.partner_freq,
+            None,
+            "precondition: a simplex QSO — no split before the nudge"
+        );
+
+        let new_offset = FREQ + 400.0;
+        assert_eq!(
+            manager
+                .apply_tx_offset_switch(qso_id, new_offset, OffsetRelocationOrigin::OperatorForced)
+                .await
+                .unwrap(),
+            new_offset
+        );
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.partner_freq,
+            Some(FREQ),
+            "precondition: the established-QSO latch created the split"
+        );
+
+        // The DX answers where it has always transmitted — the vacated offset,
+        // now latched as `partner_freq`. Well inside `PRE_SWITCH_OFFSET_GRACE`.
+        send_report(&manager, -7, &format!("{OUR} {DX} -07")).await;
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.frequency, new_offset,
+            "precondition: the advance routed and the QSO is on the nudged offset"
+        );
+        assert_eq!(
+            after.metadata.last_known_good_offset_hz,
+            Some(new_offset),
+            "the operator moved us to {new_offset} Hz — crediting the vacated \
+             {FREQ} Hz would aim a later Revert at the offset the nudge left"
+        );
+        assert_eq!(
+            after.metadata.partner_freq,
+            Some(FREQ),
+            "crediting must leave the latch exactly as the switch set it"
+        );
+        assert_eq!(
+            after.metadata.pre_switch_offset, None,
+            "the first advance after a relocation consumes the grace either way"
+        );
+    }
+
+    /// PAN-132: the same rule when `partner_freq` equals the vacated offset
+    /// for a reason other than this switch's latch — an earlier move put us
+    /// back onto the DX's frequency, and the operator now nudges off it again.
+    /// Who created the split is irrelevant: the DX transmits at `partner_freq`
+    /// regardless, so provenance decides.
+    #[tokio::test]
+    async fn an_operator_nudge_off_a_coincident_partner_offset_credits_the_new_offset() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        // Out (the latch sets `partner_freq = FREQ`), back onto FREQ, out again.
+        let final_offset = FREQ + 250.0;
+        for hz in [FREQ + 400.0, FREQ, final_offset] {
+            manager
+                .apply_tx_offset_switch(qso_id, hz, OffsetRelocationOrigin::OperatorForced)
+                .await
+                .unwrap();
+        }
+        let switched = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(switched.metadata.partner_freq, Some(FREQ));
+        assert_eq!(
+            switched.metadata.pre_switch_offset.map(|pre| pre.offset_hz),
+            Some(FREQ),
+            "precondition: the last switch vacated the DX's own frequency"
+        );
+
+        send_report(&manager, -7, &format!("{OUR} {DX} -07")).await;
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(after.metadata.frequency, final_offset);
+        assert_eq!(
+            after.metadata.last_known_good_offset_hz,
+            Some(final_offset),
+            "an operator nudge credits where it moved us, however the split arose"
+        );
+    }
+
+    /// PAN-132: the harm the ticket names, end to end. After a nudge on a
+    /// simplex QSO and the DX's advancing reply, the next stall must look for a
+    /// new offset — not `Revert` onto the offset the operator deliberately left.
+    #[tokio::test]
+    async fn a_stall_after_an_operator_nudge_on_a_simplex_qso_switches_instead_of_reverting() {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        let manager = manager_auto(config);
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let new_offset = FREQ + 400.0;
+        manager
+            .apply_tx_offset_switch(qso_id, new_offset, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .unwrap();
+        send_report(&manager, -7, &format!("{OUR} {DX} -07")).await;
+        let entered_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        let _ = drain(&mut rx);
+
+        // Two silent rearms, two slots apart, so each feeds a distinct
+        // own-parity TX slot (PAN-128) and the second trips the threshold.
+        manager
+            .rearm_manual_calls_at(entered_at + Duration::seconds(15))
+            .await;
+        manager
+            .rearm_manual_calls_at(entered_at + Duration::seconds(45))
+            .await;
+        let action = drain(&mut rx).into_iter().find_map(|e| match e {
+            QsoEvent::TxOffsetActionNeeded { action, .. } => Some(action),
+            _ => None,
+        });
+        assert_eq!(
+            action,
+            Some(OffsetAction::Switch {
+                avoid_hz: new_offset
+            }),
+            "the nudged offset is the known-good one, so a stall Switches away \
+             from it rather than Reverting onto the {FREQ} Hz the operator left"
         );
     }
 
