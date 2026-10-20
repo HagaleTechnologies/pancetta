@@ -848,14 +848,22 @@ result, including an engine error, restores the previous `resends` and
 or a newer commit is left alone. The existing active-QSO skip still keeps
 its charge to bound retries while the live exchange handles the station.
 
-Two authorization windows remain outside this change. A disarm after the
+Two authorization windows remain outside this change. The guard orders the
+check against other `qsos` holders, not against `ArmState`: the predicate
+releases the arm mutex before the mutation, and a grant can also expire on
+the clock, so the check is a point-in-time read. A disarm after the
 engine's guarded check but before key time still makes the TX worker drop
-the frame. PAN-75 compensates active QSOs, but completed-QSO auto-73 attempts
-need a separate pending-attempt marker to distinguish them from an
-operator's same-text re-key before compensation can be extended. A
-brand-new close-step open still checks permission before awaited supersede
-and insert operations. Closing that window requires supersede and insert
-under one guard. These limits, plus the auto-73 grace-window budget reset,
+the frame. Holding the arm mutex across the mutation would not change that,
+because the frame keys seconds later, in its own slot. PAN-75 compensates
+charged resends on active QSOs, but completed-QSO auto-73 attempts need a
+separate pending-attempt marker to distinguish them from an operator's
+same-text re-key before compensation can be extended. A ladder advance that
+passed the check records no PAN-75 attempt, so a dropped frame leaves the
+advanced state in place. An advance to 73 records the completion and emits
+`QsoCompleted` before key time, so the contact stays logged even if the TX
+worker then drops the 73. A brand-new close-step open still checks
+permission before awaited supersede and insert operations. Closing that
+window requires supersede and insert under one guard. These limits, plus the auto-73 grace-window budget reset,
 are recorded in [known gaps](2026-07-development-phases-and-gaps.md).
 
 No wire, config or persisted-schema changes are involved. The outcome type

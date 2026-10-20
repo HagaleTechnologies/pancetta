@@ -7305,8 +7305,13 @@ impl QsoManager {
                 return Err(QsoManagerError::QsoNotFound { qso_id });
             };
             // PAN-138 / round 13: check, rebind and advance under this one
-            // guard, so a disarm cannot land between the check and a
-            // completion that logs a contact which never aired.
+            // guard, so no other `qsos` holder (QSO processing, a PAN-137
+            // retire) runs between the check and the mutation. The check is
+            // still a point-in-time read of `ArmState`, not a TX gate: a
+            // disarm or expiry after it is caught only by the TX worker at
+            // key time. The advance is not undone then (advances record no
+            // PAN-75 attempt), and a completion it records stays logged
+            // (known gap, 2026-07-development-phases-and-gaps.md).
             if remote_origin && !(self.remote_tx_permitted)(remote_client_key_id.as_deref()) {
                 return Ok(ManualCallOutcome::NotPermitted);
             }
