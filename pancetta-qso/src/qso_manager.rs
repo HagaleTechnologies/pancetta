@@ -617,6 +617,20 @@ pub enum QsoManagerError {
          raised it was rolled back as unsent"
     )]
     OffsetActionStallRolledBack { qso_id: QsoId },
+
+    /// PAN-131 (Codex round 13 on PR #350, P2): an operator `u` nudge was
+    /// queued while its QSO sat in a nudge-eligible state, but the DX moved
+    /// the QSO on before the once-per-slot drain committed it — into a state
+    /// neither `rearm_manual_calls_at`'s cadence nor the commit's own one-shot
+    /// retransmission sends anything from (see [`operator_nudge_retransmits`]).
+    /// Committing would move the offset with nothing ever sent on it. Expected,
+    /// not a fault — the DX's progress supersedes the nudge, exactly as a DX
+    /// advance supersedes a stall action through `OffsetActionStale`.
+    #[error(
+        "operator TX-offset nudge for QSO {qso_id} superseded — the QSO \
+         advanced to a state no retransmission covers"
+    )]
+    OffsetActionNudgeSuperseded { qso_id: QsoId },
 }
 
 impl QsoManagerError {
@@ -636,6 +650,7 @@ impl QsoManagerError {
                 | QsoManagerError::OffsetActionHeld { .. }
                 | QsoManagerError::OffsetActionPttInFlight { .. }
                 | QsoManagerError::OffsetActionStallRolledBack { .. }
+                | QsoManagerError::OffsetActionNudgeSuperseded { .. }
         )
     }
 }
@@ -881,8 +896,9 @@ pub enum OffsetAction {
 /// - [`QsoManager::apply_tx_offset_switch`]'s staleness guard (round 1, finding
 ///   8) discards a `StallDetected` request whose
 ///   [`crate::states::QsoMetadata::advance_generation`] has moved since it was
-///   raised. An `OperatorForced` nudge is current by definition and carries no
-///   token, so nothing can supersede it;
+///   raised. An `OperatorForced` nudge carries no token and is never
+///   generation-checked, but a DX advance out of the nudge-eligible states
+///   still supersedes it at commit time (guard 2a, PAN-131);
 /// - the known-good crediting site in `process_message_for_qso` (round 6,
 ///   finding 2) needs to know whether anything actually indicted the offset we
 ///   left. A stall switch happens BECAUSE the old offset stopped working; an
@@ -943,13 +959,52 @@ impl OffsetActionRequest {
         }
     }
 
-    /// An operator-forced action (the `u` nudge) — never stale.
+    /// An operator-forced action (the `u` nudge) — never generation-checked;
+    /// see [`QsoManager::apply_tx_offset_switch`]'s guard 2a.
     pub fn operator_forced(qso_id: QsoId, action: OffsetAction) -> Self {
         Self {
             qso_id,
             action,
             origin: OffsetRelocationOrigin::OperatorForced,
         }
+    }
+}
+
+/// PAN-131 (Codex round 13 on PR #350, P2): does `progress`'s CURRENT state
+/// still get a frame sent at a new offset if an operator `u` nudge commits
+/// against it now?
+///
+/// [`QsoManager::apply_tx_offset_switch`]'s guard 2a reads this at commit time,
+/// because an `OperatorForced` origin carries no generation token and guard 2
+/// cannot see a DX advance that happened after the keypress. Each `true` arm
+/// names the mechanism that retransmits after the commit:
+///
+/// - `CallingCq` (any initiation): `rearm_manual_calls_at`'s keep-calling
+///   cadence for a Manual CQ; the commit's own one-shot `cq_retransmit` for an
+///   Auto self-CQ (round 10, Fix A), which that cadence never re-sends.
+/// - `WaitingForReport` (Manual only): `rearm_manual_calls_at` re-sends the
+///   latched report (SM-F4). An Auto self-CQ that a caller answered also sits
+///   here, but neither mechanism sends anything for it, so it is `false`.
+/// - `RespondingToCq` / `SendingReport` (any initiation):
+///   `rearm_manual_calls_at` below its call cap, and `cq_retransmit` for an
+///   Auto QSO at or past `AUTO_RESEND_MAX_CALLS` (round 14).
+///
+/// No cap logic, matching keypress-time selection: a Manual QSO past
+/// `manual_call_max_calls` is watchdog-retirement territory. Every later state
+/// (`WaitingForConfirmation`, `SendingConfirmation`, contest exchange, …) falls
+/// to both mechanisms' `_` arm.
+///
+/// Must stay equal to the selection-time union in
+/// `pancetta/src/coordinator/tui_relay.rs` (`qso_state_is_rearm_eligible` ∪
+/// `auto_calling_cq_ids`). If the two drift, the commit refuses a nudge the
+/// TUI accepted — the safe direction.
+pub fn operator_nudge_retransmits(progress: &QsoProgress) -> bool {
+    let is_manual = progress.metadata.initiated_by == CallInitiation::Manual;
+    match &progress.state {
+        QsoState::CallingCq { .. } => true,
+        QsoState::WaitingForReport { .. } => is_manual,
+        QsoState::RespondingToCq { .. } | QsoState::SendingReport { .. } => true,
+        _ => false,
     }
 }
 
@@ -4231,10 +4286,10 @@ impl QsoManager {
     /// coordinator can mirror it into its own `active_tx_offsets` snapshot
     /// without re-deriving the clamp.
     ///
-    /// Four guards run BEFORE anything is mutated. The first three are
-    /// staleness guards, all because the coordinator only drains its request
-    /// mailbox once per 15-second slot, so a lot can happen between an action
-    /// being raised and committed; the fourth rejects a move that isn't one:
+    /// These guards run BEFORE anything is mutated. Guards 1–3 are staleness
+    /// guards, all because the coordinator only drains its request mailbox
+    /// once per 15-second slot, so a lot can happen between an action being
+    /// raised and committed; guard 4 rejects a move that isn't one:
     ///
     /// 1. **Terminal QSO** (Codex round 1 on PR #350, finding 3). Completed
     ///    entries are retained in the map, and completion deliberately keeps
@@ -4252,8 +4307,18 @@ impl QsoManager {
     ///    is already recorded known-good, so applying the queued action would
     ///    move us off the offset that just demonstrably worked.
     ///    [`OffsetRelocationOrigin::OperatorForced`] carries no generation —
-    ///    the nudge is current by construction and must never be discarded this
-    ///    way.
+    ///    an ordinary advance must never discard the nudge this way; guard 2a
+    ///    covers the advances that do supersede it.
+    ///
+    ///    **2a. Operator nudge superseded by DX progress** (PAN-131, Codex
+    ///    round 13 on PR #350, P2). An `OperatorForced` commit is refused when
+    ///    the QSO's current state fails [`operator_nudge_retransmits`]: the DX
+    ///    moved it, after the keypress, into a state neither
+    ///    `rearm_manual_calls_at` nor this method's one-shot retransmission
+    ///    sends anything from, so committing would move the offset with no
+    ///    frame ever sent on it. An advance that stays inside the
+    ///    nudge-eligible states (`RespondingToCq` → `SendingReport`) still
+    ///    commits — a generation token would have refused that too.
     /// 3. **Outside the live Hound region** (Codex round 4, finding 2). A
     ///    Hound's TX offset is procedurally pinned to the calling region before
     ///    the Fox answers and to the response region after the QSY, and the
@@ -4283,7 +4348,7 @@ impl QsoManager {
     ///    the caller's last check but before this commit — re-reading
     ///    `tx_freq_mode` here, inside the same locked section, closes it.
     ///
-    /// All five refusals are expected outcomes, not faults — see
+    /// All these refusals are expected outcomes, not faults — see
     /// [`QsoManagerError::is_expected_offset_action_refusal`].
     ///
     /// `origin` is also what the known-good crediting site reads back off
@@ -4327,6 +4392,21 @@ impl QsoManager {
             {
                 return Err(QsoManagerError::OffsetActionStallRolledBack { qso_id });
             }
+        }
+        // 2a. **Operator nudge superseded by DX progress** (PAN-131, Codex
+        //    round 13 on PR #350, P2). The `u` nudge was queued while its QSO
+        //    was nudge-eligible, but it carries no `raised_at_generation`, so
+        //    guard 2 cannot see the DX moving the QSO on before this drain. If
+        //    the QSO now sits in a state nothing retransmits from
+        //    (`WaitingForConfirmation`, an answered Auto self-CQ's
+        //    `WaitingForReport`, …), committing would move the offset with no
+        //    frame ever sent on it. Revalidating the STATE rather than adding
+        //    a token keeps the nudge alive across an advance that stays
+        //    retransmittable (`RespondingToCq` → `SendingReport` bumps the
+        //    generation too). Ahead of guard 6, so the drain discards this
+        //    refusal instead of requeuing it.
+        if origin.is_operator_forced() && !operator_nudge_retransmits(progress) {
+            return Err(QsoManagerError::OffsetActionNudgeSuperseded { qso_id });
         }
         // 3. **Outside the live Hound region** (Codex round 4 on PR #350,
         //    finding 2). The coordinator picks the window from a `get_qso`
@@ -20118,6 +20198,172 @@ mod pan72_stall_detection_tests {
             .await
             .expect("an operator-forced nudge is never stale");
         assert_eq!(forced, FREQ + 500.0);
+    }
+
+    /// PAN-131 (Codex round 13 on PR #350, P2): the operator pressed `u` while
+    /// the QSO was rearm-eligible, then the DX's R-report moved it to
+    /// `WaitingForConfirmation` before the once-per-slot drain committed the
+    /// nudge. Nothing retransmits from that state, so committing would move
+    /// the offset with no frame ever sent on it. The nudge carries no
+    /// generation, so guard 2 cannot see the advance; guard 2a must refuse it.
+    #[tokio::test]
+    async fn an_operator_nudge_is_superseded_when_the_dx_advances_to_waiting_for_confirmation() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        // The DX skips its plain report and sends R-07 before the drain runs.
+        manager
+            .process_message(
+                MessageType::ReportAck {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                format!("{OUR} {DX} R-07"),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+        let before = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(before.state, QsoState::WaitingForConfirmation { .. }),
+            "precondition: the R-report must advance the QSO to \
+             WaitingForConfirmation, got {:?}",
+            before.state
+        );
+        let mut rx = manager.subscribe();
+        let _ = drain(&mut rx);
+
+        let err = manager
+            .apply_tx_offset_switch(qso_id, FREQ + 400.0, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .expect_err("a nudge the DX's progress superseded must not commit");
+        assert!(
+            matches!(err, QsoManagerError::OffsetActionNudgeSuperseded { qso_id: id } if id == qso_id),
+            "expected OffsetActionNudgeSuperseded, got {err:?}"
+        );
+        assert!(
+            err.is_expected_offset_action_refusal(),
+            "DX progress overtaking a queued nudge is an expected race, not a fault"
+        );
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.frequency, before.metadata.frequency,
+            "the QSO must stay on the offset it is actually transmitting on"
+        );
+        assert_eq!(after.state.frequency(), before.state.frequency());
+        assert_eq!(after.metadata.partner_freq, before.metadata.partner_freq);
+        let events = drain(&mut rx);
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                QsoEvent::TxOffsetApplied { .. } | QsoEvent::MessageToSend { .. }
+            )),
+            "a refused nudge must neither announce a move nor send a frame, got {events:?}"
+        );
+    }
+
+    /// PAN-131: the second path into the same gap. An autonomous self-CQ is
+    /// nudge-selectable while it is `CallingCq` (`auto_calling_cq_ids`), and
+    /// a caller answering moves it to `WaitingForReport` with
+    /// `CallInitiation::Auto` kept. `cq_retransmit` only re-sends `CallingCq`,
+    /// and `rearm_manual_calls_at` only re-sends a Manual `WaitingForReport`,
+    /// so a nudge committed here would send nothing at the new offset.
+    #[tokio::test]
+    async fn an_operator_nudge_is_superseded_when_an_auto_self_cq_is_answered() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager.start_cq(FREQ, None, false, None).await.unwrap();
+        manager
+            .process_message(
+                MessageType::CqResponse {
+                    calling_station: OUR.into(),
+                    responding_station: DX.into(),
+                    grid: Some("FN42".into()),
+                },
+                format!("{OUR} {DX} FN42"),
+                FREQ,
+                Some(-9.0),
+            )
+            .await
+            .unwrap();
+        let before = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(before.state, QsoState::WaitingForReport { .. }),
+            "precondition: the answer must advance the self-CQ to \
+             WaitingForReport, got {:?}",
+            before.state
+        );
+        assert_eq!(
+            before.metadata.initiated_by,
+            CallInitiation::Auto,
+            "precondition: the answered self-CQ stays autonomous"
+        );
+
+        let err = manager
+            .apply_tx_offset_switch(qso_id, FREQ + 400.0, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .expect_err(
+                "nothing retransmits an Auto WaitingForReport, so the nudge must not commit",
+            );
+        assert!(
+            matches!(err, QsoManagerError::OffsetActionNudgeSuperseded { qso_id: id } if id == qso_id),
+            "expected OffsetActionNudgeSuperseded, got {err:?}"
+        );
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(after.metadata.frequency, before.metadata.frequency);
+        assert_eq!(after.state.frequency(), before.state.frequency());
+    }
+
+    /// PAN-131, the control case: an advance that keeps the QSO inside the
+    /// nudge-eligible states must NOT supersede the nudge. `RespondingToCq` →
+    /// `SendingReport` bumps `advance_generation` exactly like the advance
+    /// above, which is why the fix revalidates the state at commit time rather
+    /// than giving the nudge a generation token — a token would refuse this
+    /// nudge too, though the next rearm sends at the new offset.
+    #[tokio::test]
+    async fn an_operator_nudge_survives_an_advance_that_stays_retransmittable() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        send_report(&manager, -7, &format!("{OUR} {DX} -07")).await;
+        let advanced = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(advanced.state, QsoState::SendingReport { .. }),
+            "precondition: the DX's report must advance the QSO to SendingReport, got {:?}",
+            advanced.state
+        );
+
+        let applied = manager
+            .apply_tx_offset_switch(qso_id, FREQ + 400.0, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .expect("a nudge on a still-retransmittable QSO must commit");
+        assert_eq!(applied, FREQ + 400.0);
+
+        let mut rx = manager.subscribe();
+        manager
+            .rearm_manual_calls_at(Utc::now() + Duration::seconds(60))
+            .await;
+        let sent_at: Vec<f64> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|e| match e {
+                QsoEvent::MessageToSend {
+                    qso_id: id,
+                    frequency,
+                    ..
+                } if id == qso_id => Some(frequency),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            sent_at.contains(&(FREQ + 400.0)),
+            "the next rearm must send at the nudged offset, got {sent_at:?}"
+        );
     }
 
     /// PAN-79 / PAN-72 (Codex round 3 on PR #350, finding 2): a resolution that

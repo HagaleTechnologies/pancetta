@@ -3334,6 +3334,10 @@ fn map_recent_qso_outcome(
 /// `SendingConfirmation`, a contest-exchange state, `Idle`, terminal states,
 /// etc.) falls to `rearm_manual_calls_at`'s own `_ => continue` and is
 /// therefore NOT eligible here either.
+///
+/// PAN-131: this predicate together with `auto_calling_cq_ids` must equal
+/// `pancetta_qso::operator_nudge_retransmits`, the same check
+/// `apply_tx_offset_switch` re-runs at commit time (its guard 2a).
 fn qso_state_is_rearm_eligible(progress: &pancetta_qso::QsoProgress) -> bool {
     let is_manual = progress.metadata.initiated_by == pancetta_qso::states::CallInitiation::Manual;
     match &progress.state {
@@ -3405,7 +3409,9 @@ fn resolve_nudge_tx_offset(
             if let Ok(mut pending) = pending_qso_offset_requests.lock() {
                 // Operator-forced: no staleness token (PAN-72 finding 8).
                 // The operator pressed `u` for the QSO as it stands right
-                // now, so there is nothing for a later advance to supersede.
+                // now, so an ordinary advance does not supersede it — but
+                // `apply_tx_offset_switch`'s guard 2a refuses it if the QSO
+                // has left the nudge-eligible states by commit time (PAN-131).
                 pending.push(
                     pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
                         qso_id,

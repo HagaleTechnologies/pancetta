@@ -128,6 +128,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+<<<<<<< HEAD
 - When another remote client took control, the previous controller's QSOs
   could hold the TX window and a QSO slot until the manual-call watchdog
   ended them, by default five minutes after they started. They now end with
@@ -137,6 +138,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `takeControl` and the first control action after the previous controller
   leaves. Disarming, a heartbeat timeout, releasing control or disconnecting
   without a new controller still leaves that client's QSO to resume (PAN-137).
+=======
+- Pressing `u` just before the DX moved the QSO on (or before a caller
+  answered an autonomous CQ) could record a new TX offset that nothing was
+  ever sent on. The nudge is now dropped and the QSO stays on the offset it
+  is really using (PAN-131).
+>>>>>>> d3594a23f72cda077ac67f14cc997bfcbaef1ede
 
 - Pressing `u` to move an established QSO that had no TX/RX split could be
   undone automatically. The DX's next reply recorded the offset you had just
