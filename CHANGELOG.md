@@ -128,6 +128,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A DX that kept repeating its report to a manual QSO held back our
+  keep-call R-report by a full slot after every decode. On FT2 that skipped
+  re-sends and delayed the adaptive TX-offset switch to as late as the 11th
+  repeat. A repeated report now leaves keep-calling to run exactly as it does
+  while the DX is silent (PAN-129).
+
 - The stall detector behind adaptive TX-offset switching counted every
   keep-call re-send, so it ran at twice the rate of real transmissions and
   moved a silent QSO after about two unanswered transmissions instead of
@@ -315,6 +321,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Q in the composer.
 
 ### Changed
+
+- `pancetta --help` no longer claims general config hot-reload or unmeasured
+  decoder, latency and memory figures; it says which settings apply live and
+  points to the new Capability status table in README.md (PAN-124). That
+  table rates each capability experimental, implemented, integration-tested
+  or radio-qualified, with the environment it was proven in. CONTRIBUTING.md
+  and SECURITY.md now describe the real build commands, review process,
+  stored credentials and `unsafe` sites.
 
 - TUI status surfaces (PAN-89): the `AUDIO DEAD` / `DECODER STUB` / `CLOCK`
   alarm chips move from the title bar to the readiness strip, where several can

@@ -167,9 +167,6 @@ pub struct BackupConfig {
 
     /// Compress backups
     pub compress: bool,
-
-    /// Include ADIF exports in backups
-    pub include_exports: bool,
 }
 
 /// Integration configuration
@@ -328,7 +325,6 @@ impl Default for BackupConfig {
             backup_interval: 24,
             retain_count: 7,
             compress: false,
-            include_exports: true,
         }
     }
 }
@@ -387,17 +383,22 @@ fn first_backup_delay(period: Duration) -> Duration {
     STARTUP_BACKUP_DELAY.min(period)
 }
 
-/// A relative `backup_directory` is anchored next to the database file
-/// (`~/.pancetta/backups` for `~/.pancetta/qso.db`), not the process cwd.
-/// An absolute directory, or a database with no parent directory
-/// (`:memory:`), is used as-is.
+/// A relative `backup_directory` is anchored next to an absolute database
+/// path (`~/.pancetta/backups` for `~/.pancetta/qso.db`), or at the fixed
+/// state directory `~/.pancetta` when the database path is relative or has
+/// no directory (`:memory:`) — never relative to the process cwd (PAN-126).
+/// An absolute directory is used as-is. Only a home-less environment keeps
+/// the relative path.
 fn resolve_backup_directory(dir: &Path, database_path: &Path) -> PathBuf {
     if dir.is_absolute() {
         return dir.to_path_buf();
     }
     match database_path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.join(dir),
-        _ => dir.to_path_buf(),
+        Some(parent) if !parent.as_os_str().is_empty() && parent.is_absolute() => parent.join(dir),
+        _ => match dirs::home_dir() {
+            Some(home) => home.join(".pancetta").join(dir),
+            None => dir.to_path_buf(),
+        },
     }
 }
 
@@ -888,19 +889,30 @@ mod tests {
 
     #[test]
     fn test_resolve_backup_directory() {
-        let db = Path::new("/home/op/.pancetta/qso.db");
+        // A platform-native absolute root: on Windows `/home/...` has no
+        // drive prefix, so it is not absolute.
+        let root = if cfg!(windows) {
+            Path::new(r"C:\")
+        } else {
+            Path::new("/")
+        };
+        let db = root.join("home/op/.pancetta/qso.db");
         assert_eq!(
-            resolve_backup_directory(Path::new("backups"), db),
-            PathBuf::from("/home/op/.pancetta/backups")
+            resolve_backup_directory(Path::new("backups"), &db),
+            root.join("home/op/.pancetta/backups")
         );
-        assert_eq!(
-            resolve_backup_directory(Path::new("/srv/bk"), db),
-            PathBuf::from("/srv/bk")
-        );
-        // `:memory:` has no directory to anchor to.
+        let abs_dir = root.join("srv/bk");
+        assert_eq!(resolve_backup_directory(&abs_dir, &db), abs_dir);
+        // No absolute database directory (`:memory:`, or a relative database
+        // path): anchor at the fixed state directory, never the cwd (PAN-126).
+        let state_backups = dirs::home_dir().unwrap().join(".pancetta").join("backups");
         assert_eq!(
             resolve_backup_directory(Path::new("backups"), Path::new(":memory:")),
-            PathBuf::from("backups")
+            state_backups.clone()
+        );
+        assert_eq!(
+            resolve_backup_directory(Path::new("backups"), Path::new("qso.db")),
+            state_backups
         );
     }
 
