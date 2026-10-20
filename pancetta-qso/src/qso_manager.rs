@@ -4135,9 +4135,10 @@ impl QsoManager {
     ///    [`OffsetRelocationOrigin::OperatorForced`] carries no generation —
     ///    an ordinary advance must never discard the nudge this way; guard 2a
     ///    covers the advances that do supersede it.
-    /// 2a. **Operator nudge superseded by DX progress** (PAN-131, Codex round
-    ///    13 on PR #350, P2). An `OperatorForced` commit is refused when the
-    ///    QSO's current state fails [`operator_nudge_retransmits`]: the DX
+    ///
+    ///    **2a. Operator nudge superseded by DX progress** (PAN-131, Codex
+    ///    round 13 on PR #350, P2). An `OperatorForced` commit is refused when
+    ///    the QSO's current state fails [`operator_nudge_retransmits`]: the DX
     ///    moved it, after the keypress, into a state neither
     ///    `rearm_manual_calls_at` nor this method's one-shot retransmission
     ///    sends anything from, so committing would move the offset with no
@@ -20093,7 +20094,9 @@ mod pan72_stall_detection_tests {
         let err = manager
             .apply_tx_offset_switch(qso_id, FREQ + 400.0, OffsetRelocationOrigin::OperatorForced)
             .await
-            .expect_err("nothing retransmits an Auto WaitingForReport, so the nudge must not commit");
+            .expect_err(
+                "nothing retransmits an Auto WaitingForReport, so the nudge must not commit",
+            );
         assert!(
             matches!(err, QsoManagerError::OffsetActionNudgeSuperseded { qso_id: id } if id == qso_id),
             "expected OffsetActionNudgeSuperseded, got {err:?}"

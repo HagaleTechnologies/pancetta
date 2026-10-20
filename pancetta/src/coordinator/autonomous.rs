@@ -5945,7 +5945,12 @@ mod drain_pending_qso_offset_requests_tests {
         .await;
 
         assert_eq!(
-            qso_manager.get_qso(qso_id).await.unwrap().metadata.frequency,
+            qso_manager
+                .get_qso(qso_id)
+                .await
+                .unwrap()
+                .metadata
+                .frequency,
             1500.0,
             "a superseded nudge must not move the QSO off the offset it is on"
         );
