@@ -398,10 +398,13 @@ pub struct PreSwitchOffset {
     /// silence-driven stall detector did.
     ///
     /// PAN-72 (Codex round 6 on PR #350, finding 2). This is the ONLY thing
-    /// that can separate the two cases on a pre-existing split, where the DX
-    /// transmits at `partner_freq` no matter where we key and its reply
-    /// frequency therefore cannot discriminate our vacated offset from our new
-    /// one. The two provenances warrant opposite conclusions there:
+    /// that can separate the two cases on any split — one that predates the
+    /// switch, or the one `QsoManager::apply_tx_offset_switch`'s
+    /// established-QSO latch creates by setting `partner_freq` to the vacated
+    /// offset (PAN-132) — where the DX transmits at `partner_freq` no matter
+    /// where we key and its reply frequency therefore cannot discriminate our
+    /// vacated offset from our new one. The two provenances warrant opposite
+    /// conclusions there:
     ///
     /// - a STALL-triggered switch only happens BECAUSE the old offset
     ///   demonstrably stopped working, and the frame that triggered it went out
@@ -694,10 +697,11 @@ pub struct QsoMetadata {
     /// known-good and aim a later `Revert` straight back at it.
     ///
     /// Round 6, finding 2: the decode-frequency comparison round 5 added is
-    /// evidence only on a Tx=Rx QSO. On a PRE-EXISTING split (Hound, an `o`
-    /// hold, a de-conflict nudge, a passband clamp) the DX's frequency does not
-    /// move when OUR TX offset moves, so it can never say which of our two
-    /// offsets was answered — which is exactly why
+    /// evidence only on a Tx=Rx QSO. On any split — a pre-existing one (Hound,
+    /// an `o` hold, a de-conflict nudge, a passband clamp), or the one the
+    /// switch's own established-QSO latch creates (PAN-132) — the DX's
+    /// frequency does not move when OUR TX offset moves, so it can never say
+    /// which of our two offsets was answered — which is exactly why
     /// [`PreSwitchOffset::operator_forced`] is carried alongside the offset. See
     /// its doc comment.
     #[serde(default)]

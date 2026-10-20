@@ -509,6 +509,15 @@ tested.
   its `StateChanged` event already put the calling offset there; excluding that stale value let
   the allocator pick the QSO's own live offset (refused as `OffsetActionNoOp`) or a spot a few Hz
   from it, and with no valid candidate it returned the stale value itself as a jump.
+- **Amended by PAN-132 (Codex round 15 on PR #350, P2).** Round 6's provenance rule now decides
+  the known-good credit for every QSO with a `partner_freq`, not only one whose split predates
+  the switch. `apply_tx_offset_switch`'s established-QSO latch sets `partner_freq` to exactly the
+  offset it vacates, and round 5's re-review had counted that as Tx=Rx. Because the DX keeps
+  transmitting at the vacated offset, the decode-frequency check always matched there, so an
+  operator `u` nudge on a simplex QSO credited the offset it left and the next stall emitted
+  `Revert` back onto it. `tx_equals_rx` is now `partner_freq.is_none()`: the decode frequency
+  decides only after a switch on an unanswered `CallingCq`. Stall-triggered outcomes are
+  unchanged.
 
 ## Manual "nudge" keystroke — `pancetta-tui`
 
