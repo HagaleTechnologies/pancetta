@@ -874,9 +874,11 @@ fn controller_gate(ctx: &mut ArmContext, peer: &str, now: ArmTime) -> Controller
 /// - `TxRequest(_)` → refused (audited `TxDenied`) while this channel's own
 ///   consent (`remote_tx_enabled`) is off; otherwise audited `TxRequested` +
 ///   routed into the REAL QSO engine via a `remote_origin = true`
-///   `QsoMessage` (P3.4c). Creating the QSO is
-///   allowed; TRANSMISSION is gated — every TransmitRequest the QSO emits is
-///   `TxOrigin::Remote` and dropped by the armed-TX gate unless armed. This
+///   `QsoMessage` (P3.4c). A retry `error` is returned instead while a
+///   PAN-137 cleanup is owed or when the QSO inbox does not accept the
+///   intent. Creating the QSO is allowed; TRANSMISSION is gated — every
+///   TransmitRequest the QSO emits is `TxOrigin::Remote` and dropped by the
+///   armed-TX gate unless armed. This
 ///   arm never keys TX directly (no bypass).
 /// - `TakeControl` moves control, disarms a displaced controller and owes the
 ///   PAN-137 QSO cleanup. `ReleaseControl` disarms and releases control.
@@ -1133,7 +1135,21 @@ async fn dispatch_action(
                 return DispatchOutcome::cont_with(sends);
             }
             let qso_msg = tx_kind_to_qso_message(kind, peer);
-            send_qso(bus, qso_msg).await;
+            if !send_qso(bus, qso_msg).await {
+                // The cleanup above may have taken the inbox's last slot.
+                warn!(target: "agent.tx", peer = %peer, request = %detail, "txRequest not enqueued on the QSO inbox; asking the client to retry");
+                let mut sends = grab;
+                sends.push(PeerSend {
+                    to: SendTarget::One(peer.to_string()),
+                    frame: pancetta_protocol::ServerFrame::Event {
+                        event: pancetta_protocol::ServerEvent::Error {
+                            component: "stationAgent".into(),
+                            message: "QSO request not delivered; retry the QSO request".into(),
+                        },
+                    },
+                });
+                return DispatchOutcome::cont_with(sends);
+            }
             info!(
                 target: "agent.tx",
                 request = %detail,
@@ -1514,16 +1530,21 @@ async fn send_rig(bus: &MessageBus, msg: RigControlMessage) {
 /// Forward a QSO-control message to the QSO component. Used to route a remote
 /// operator's TX-initiation into the real QSO engine. The messages carry
 /// `remote_origin = true`, so the QSO's TransmitRequests are `TxOrigin::Remote`
-/// and armed-TX gated downstream (this call itself keys nothing).
-async fn send_qso(bus: &MessageBus, msg: crate::message_bus::QsoMessage) {
+/// and armed-TX gated downstream (this call itself keys nothing). Returns
+/// whether the QSO inbox actually accepted the message.
+async fn send_qso(bus: &MessageBus, msg: crate::message_bus::QsoMessage) -> bool {
     let m = ComponentMessage::new(
         ComponentId::StationAgent,
         ComponentId::Qso,
         MessageType::QsoMessage(msg),
         std::time::Instant::now(),
     );
-    if let Err(e) = bus.send_message(m).await {
-        debug!(target: "agent.control", "qso-control forward failed: {e}");
+    match bus.send_message_checked(m).await {
+        Ok(enqueued) => enqueued,
+        Err(e) => {
+            debug!(target: "agent.control", "qso-control forward failed: {e}");
+            false
+        }
     }
 }
 
@@ -4898,6 +4919,30 @@ mod tests {
             qso_inbox_tags(&rx),
             [format!("start:W1XYZ:{CLIENT_KEY_ID}")]
         );
+    }
+
+    #[tokio::test]
+    async fn a_tx_request_reports_an_intent_its_cleanup_crowded_out_of_the_inbox() {
+        let mut ctx = controller_change_ctx();
+        // One free slot: the owed cleanup takes it and the intent finds none.
+        let bus = MessageBus::new(1).unwrap();
+        let (_tx, rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        grab_a(&mut ctx, &bus).await;
+        let out = dispatch_action(
+            call_w1xyz(),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(ctx.qso_cleanup_owed.is_none());
+        assert!(out.sends.iter().any(|s| matches!(&s.frame,
+            pancetta_protocol::ServerFrame::Event { event: pancetta_protocol::ServerEvent::Error { message, .. } }
+                if message.contains("not delivered; retry")
+        )), "an intent the QSO inbox did not accept must be refused with a retry error");
+        assert_eq!(qso_inbox_tags(&rx), [format!("changed:{CLIENT_KEY_ID}")]);
     }
 
     // ── Each TxKind maps to the right remote-origin QsoMessage ──────────────
