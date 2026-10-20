@@ -448,8 +448,10 @@ jobs:
             exit 1
           fi
           if ! printf '%s' "$rules" | jq -e '[.[] | select(.type == "merge_queue")] | length > 0' >/dev/null 2>&1; then
-            echo "::notice::Native merge_queue ruleset rule is confirmed absent on main -- standing down without re-arming (gh pr merge --auto would only enable ordinary auto-merge) and without consuming this head's retry budget."
-            exit 0
+            # Admission can stand down during rollout, but this failed attempt
+            # must remain eligible for redelivery instead of being marked handled.
+            echo "::error::Native merge_queue ruleset rule is missing on main. No retry was consumed or armed. Restore the rule, then rerun this workflow to retry this attempt."
+            exit 1
           fi
 
           # --match-head-commit: without it, a race between the pr-state fetch and this call
@@ -566,14 +568,6 @@ jobs:
             exit 0
           fi
 
-          # Recorded before the create/POST below: if queue-needs-human-review was already
-          # attached by another source (a maintainer's manual label), this handoff isn't the
-          # true provenance owner and must not post its own SHA marker, or the staleness
-          # classifier in auto-merge-trigger.yml would misattribute someone else's still-
-          # valid pause to this event and auto-clear it on the next push.
-          labels_before=$(gh api --paginate "repos/${REPO}/issues/${PR}/labels" --jq '.[].name')
-          already_present=$(grep -qxF "queue-needs-human-review" <<< "$labels_before" && echo true || echo false)
-
           gh label create queue-needs-human-review --color b60205 \
             --description "Needs a human decision -- an automated handler could not safely proceed" \
             --repo "${REPO}" >/dev/null 2>&1 || true
@@ -584,33 +578,29 @@ jobs:
             exit 1
           fi
 
-          # Codex P1, round 7: labels_before/already_present alone can't tell "we own this
-          # pause" from "a maintainer's manual label landed in the race window between that
-          # read and the idempotent create/POST above" -- the POST no-ops silently either
-          # way. Re-derive ownership from the timeline's own LATEST labeling event instead:
-          # if a human (not this workflow's own github-actions[bot] identity) authored it,
-          # this handoff must not claim provenance, or a later fix push's staleness check
-          # (which matches this exact bot identity in its own marker search -- see
-          # auto-merge-trigger.yml's needs_human_is_stale()) would misattribute the
-          # maintainer's still-valid manual pause as handler-generated and auto-clear it.
-          # Codex P1, round 8: a timeline FETCH FAILURE and "no matching event found" both
-          # collapsed to the same empty latest_label_actor, which left already_present at
-          # its pre-mutation value on failure -- silently falling back to the fail-OPEN
-          # race this safeguard exists to close (an unreadable timeline is exactly the case
-          # this can't confirm ownership either way). A distinct sentinel on fetch failure
-          # forces the explicit "treat as externally owned, don't claim provenance" branch
-          # below regardless of what the pre-mutation snapshot said.
-          if raw=$(gh api --paginate --slurp "repos/${REPO}/issues/${PR}/timeline" 2>/dev/null); then
-            latest_label_actor=$(printf '%s' "$raw" | jq -r '(add // []) | [.[] | select(.event == "labeled" and .label.name == "queue-needs-human-review")] | if length > 0 then (last | .actor.login) else "" end' 2>/dev/null) || latest_label_actor="__UNREADABLE__"
-          else
-            latest_label_actor="__UNREADABLE__"
-          fi
-          if [ "$latest_label_actor" = "__UNREADABLE__" ]; then
-            echo "::notice::Could not read PR #$PR's timeline to confirm queue-needs-human-review's provenance -- treating as unconfirmed/externally owned and skipping this handoff's own provenance marker."
-            already_present=true
-          elif [ -n "$latest_label_actor" ] && [ "$latest_label_actor" != "github-actions[bot]" ]; then
-            echo "::notice::PR #$PR's queue-needs-human-review label's latest timeline event is attributed to @$latest_label_actor, not this handler -- treating as already maintainer-owned and skipping this handoff's own provenance marker."
-            already_present=true
+          # PAN-150: presence does not establish ownership. An earlier interrupted
+          # handoff may have attached the label without recording its marker, while
+          # an idempotent POST can race a human attachment. Only the latest labeling
+          # event after the POST establishes who owns the current pause.
+          pause_owner=unknown
+          if raw=$(gh api --paginate --slurp "repos/${REPO}/issues/${PR}/timeline" 2>/dev/null) &&
+             label_info=$(printf '%s' "$raw" | jq -er '
+               if type == "array" and all(.[]; type == "array" and all(.[]; type == "object"))
+               then (add // []) else error("invalid timeline pages") end |
+               [.[] | select(.event == "labeled" and .label.name == "queue-needs-human-review")] |
+               last |
+               select(.actor.login | type == "string" and length > 0) |
+               select(.created_at | type == "string") |
+               select(.created_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) |
+               select(.created_at | . == (fromdateiso8601 | todateiso8601)) |
+               [.actor.login, .created_at] | @tsv' 2>/dev/null); then
+            latest_label_actor=$(cut -f1 <<< "$label_info")
+            last_labeled_at=$(cut -f2 <<< "$label_info")
+            if [ "$latest_label_actor" = "github-actions[bot]" ]; then
+              pause_owner=handler
+            else
+              pause_owner=external
+            fi
           fi
 
           # Disarm/dequeue any concurrently re-armed auto-merge: a trusted `edited` run of
@@ -643,9 +633,40 @@ jobs:
             fi
           fi
 
-          if [ "$already_present" = "true" ]; then
-            gh pr comment "$PR" --repo "${REPO}" --body "Merge-group CI failed again for commit \`$HEAD_SHA12\` after its one automatic retry ([run]($RUN_URL)). queue-needs-human-review was already attached before this handoff ran (from another source) -- not claiming provenance over it; the existing pause stands as-is." || true
+          # Uncertain provenance still requires the disarm work above. It cannot
+          # count as a completed handoff or authorize publishing a handler marker.
+          if [ "$pause_owner" = "unknown" ]; then
+            echo "::error::Could not establish queue-needs-human-review's current owner and attachment time for PR #$PR. Keeping the pause and leaving this attempt eligible for rerun."
+            exit 1
+          elif [ "$pause_owner" = "external" ]; then
+            gh pr comment "$PR" --repo "${REPO}" --body "Merge-group CI failed again for commit \`$HEAD_SHA12\` after its one automatic retry ([run]($RUN_URL)). queue-needs-human-review belongs to @$latest_label_actor. Keeping that pause without claiming handler provenance." || true
           else
+            # Match the admission consumer's bot identity, marker syntax and
+            # attachment-time boundary. Keep an existing marker's original SHA,
+            # even if a newer head would make that pause stale on admission.
+            if ! raw=$(gh api --paginate --slurp "repos/${REPO}/issues/${PR}/comments" 2>/dev/null) ||
+               ! marker_present=$(printf '%s' "$raw" | jq -er --arg attached "$last_labeled_at" '
+                 if type == "array" and all(.[]; type == "array" and all(.[]; type == "object"))
+                 then (add // []) else error("invalid comment pages") end |
+                 if all(.[];
+                   (.user.login | type == "string" and length > 0) and
+                   (.body | type == "string") and
+                   (.created_at | type == "string") and
+                   (.created_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+                   (.created_at | . == (fromdateiso8601 | todateiso8601)))
+                 then . else error("invalid comment") end |
+                 [.[] | select(.user.login == "github-actions[bot]") |
+                   select(.body | test("queue-retry-handler:queue-needs-human-review sha=[0-9a-f]{12}")) |
+                   select(.created_at >= $attached)] |
+                 if length > 0 then "present" else "absent" end' 2>/dev/null); then
+              echo "::error::Could not read queue-needs-human-review's marker history for PR #$PR. Keeping the pause and leaving this attempt eligible for rerun."
+              exit 1
+            fi
+            if [ "$marker_present" = "present" ]; then
+              echo "::notice::The current handler-owned pause already has verified provenance. Preserving its original marker."
+              exit 0
+            fi
+
             # Codex P2, round 2: `|| true` here would let the handoff and "mark handled" steps
             # succeed while silently losing the ONLY provenance auto-merge-trigger.yml's
             # needs_human_is_stale() has for auto-clearing this label on a later fix push --
