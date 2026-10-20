@@ -128,6 +128,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- When another remote client took control, the previous controller's QSOs
+  could hold the TX window and a QSO slot until the manual-call watchdog
+  ended them, by default five minutes after they started. They now end with
+  the reason "remote control passed to another client". The previous client's
+  queued calls are dropped, so a waiting call from the new controller or
+  local operator can start as soon as the window is free. This applies to
+  `takeControl` and the first control action after the previous controller
+  leaves. Disarming, a heartbeat timeout, releasing control or disconnecting
+  without a new controller still leaves that client's QSO to resume (PAN-137).
+
 - Pressing `u` just before the DX moved the QSO on (or before a caller
   answered an autonomous CQ) could record a new TX offset that nothing was
   ever sent on. The nudge is now dropped and the QSO stays on the offset it

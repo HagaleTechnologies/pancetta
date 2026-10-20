@@ -451,3 +451,157 @@ async fn remote_origin_persists_across_the_reply_ladder() {
         "PAN-91: the manual-CQ remote_origin path must also bind client identity"
     );
 }
+
+// PAN-137: controller ownership changes retire stale bindings, not paused arms.
+async fn open(
+    manager: &QsoManager,
+    call: &str,
+    freq: f64,
+    origin: bool,
+    client: Option<&str>,
+) -> pancetta_qso::QsoId {
+    manager
+        .respond_to_cq_with(
+            call.to_string(),
+            freq,
+            Some(SlotParity::Even),
+            CallInitiation::Manual,
+            None,
+            origin,
+            client.map(str::to_string),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn controller_change_retires_qsos_bound_to_other_clients_and_frees_their_parity() {
+    use pancetta_qso::qso_manager::{admit_new_qso, TxAdmission};
+    use pancetta_qso::{QsoFailureReason, QsoState};
+    let manager = QsoManager::new(config());
+    let mut rx = manager.subscribe();
+    let id_a = open(&manager, "K9XYZ", 1500.0, true, Some("client-a")).await;
+    assert_eq!(manager.current_tx_side().await, Some(SlotParity::Odd));
+    assert_eq!(
+        admit_new_qso(manager.current_tx_side().await, Some(SlotParity::Even)),
+        TxAdmission::Queue
+    );
+    while rx.try_recv().is_ok() {}
+
+    assert_eq!(
+        manager
+            .retire_qsos_bound_to_other_remote_clients("client-b")
+            .await,
+        vec![id_a]
+    );
+    assert!(matches!(rx.try_recv().unwrap(), QsoEvent::StateChanged {
+        qso_id, new_state: QsoState::Failed { reason: QsoFailureReason::ControlTransferred, .. }, ..
+    } if qso_id == id_a));
+    assert!(matches!(rx.try_recv().unwrap(), QsoEvent::QsoFailed {
+        qso_id, reason: QsoFailureReason::ControlTransferred, metadata, ..
+    } if qso_id == id_a && metadata.remote_client_key_id.as_deref() == Some("client-a")));
+    assert!(manager.get_qso(id_a).await.is_err());
+    assert_eq!(manager.current_tx_side().await, None);
+    assert_eq!(manager.active_qso_count().await, 0);
+    assert_eq!(
+        admit_new_qso(manager.current_tx_side().await, Some(SlotParity::Even)),
+        TxAdmission::Admit
+    );
+}
+
+#[tokio::test]
+async fn controller_change_keeps_the_new_controllers_local_and_unbound_qsos() {
+    let manager = QsoManager::new(config());
+    let a = open(&manager, "K1AAA", 1500.0, true, Some("client-a")).await;
+    let b = open(&manager, "K2BBB", 1700.0, true, Some("client-b")).await;
+    let local = open(&manager, "K3CCC", 1900.0, false, None).await;
+    let udp = open(&manager, "K4DDD", 2100.0, true, None).await;
+    assert_eq!(
+        manager
+            .retire_qsos_bound_to_other_remote_clients("client-b")
+            .await,
+        vec![a]
+    );
+    for id in [b, local, udp] {
+        assert!(manager.get_qso(id).await.unwrap().state.is_active());
+    }
+}
+
+#[tokio::test]
+async fn controller_change_keeps_a_qso_already_rebound_to_the_new_controller() {
+    let manager = QsoManager::new(config());
+    let a = open(&manager, "K9XYZ", 1500.0, true, Some("client-a")).await;
+    let b = open(&manager, "K9XYZ", 1500.0, true, Some("client-b")).await;
+    assert_eq!(a, b);
+    assert!(manager
+        .retire_qsos_bound_to_other_remote_clients("client-b")
+        .await
+        .is_empty());
+    let qso = manager.get_qso(b).await.unwrap();
+    assert!(qso.state.is_active());
+    assert_eq!(
+        qso.metadata.remote_client_key_id.as_deref(),
+        Some("client-b")
+    );
+}
+
+#[tokio::test]
+async fn controller_change_to_the_same_client_is_a_no_op() {
+    let manager = QsoManager::new(config());
+    let mut rx = manager.subscribe();
+    let a = open(&manager, "K9XYZ", 1500.0, true, Some("client-a")).await;
+    while rx.try_recv().is_ok() {}
+    assert!(manager
+        .retire_qsos_bound_to_other_remote_clients("client-a")
+        .await
+        .is_empty());
+    assert!(manager.get_qso(a).await.unwrap().state.is_active());
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn a_retired_qso_is_reopened_fresh_for_the_new_controller() {
+    let manager = QsoManager::new(config());
+    let a = open(&manager, "K9XYZ", 1500.0, true, Some("client-a")).await;
+    assert_eq!(
+        manager
+            .retire_qsos_bound_to_other_remote_clients("client-b")
+            .await,
+        vec![a]
+    );
+    let b = open(&manager, "K9XYZ", 1500.0, true, Some("client-b")).await;
+    assert_ne!(a, b);
+    let qso = manager.get_qso(b).await.unwrap();
+    assert_eq!(
+        qso.metadata.remote_client_key_id.as_deref(),
+        Some("client-b")
+    );
+    assert!(qso.state.is_active());
+    assert_eq!(manager.active_qso_count().await, 1);
+}
+
+#[tokio::test]
+async fn an_identity_denied_rearm_alone_never_retires_the_qso() {
+    let mut manager = QsoManager::new(config());
+    let a = open(&manager, "K9XYZ", 1500.0, true, Some("client-a")).await;
+    manager.set_remote_tx_permitted_source(std::sync::Arc::new(|k: Option<&str>| {
+        k == Some("client-b")
+    }));
+    let opened = manager
+        .get_qso(a)
+        .await
+        .unwrap()
+        .metadata
+        .last_call_at
+        .unwrap();
+    for slot in 1..=4 {
+        manager
+            .rearm_manual_calls_at(opened + chrono::Duration::seconds(15 * slot))
+            .await;
+    }
+    assert!(manager.get_qso(a).await.unwrap().state.is_active());
+    assert_eq!(manager.current_tx_side().await, Some(SlotParity::Odd));
+}

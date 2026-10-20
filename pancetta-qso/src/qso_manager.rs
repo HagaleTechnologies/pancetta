@@ -1583,6 +1583,16 @@ pub fn admit_within_capacity(active: usize, cap: usize) -> CapacityAdmission {
     }
 }
 
+/// PAN-137: whether a QSO or queued call belongs to a station-agent client
+/// other than the current controller. Local and unbound WSJT-X QSOs stay.
+pub fn bound_to_other_remote_client(
+    remote_origin: bool,
+    remote_client_key_id: Option<&str>,
+    controller_key_id: &str,
+) -> bool {
+    remote_origin && remote_client_key_id.is_some_and(|k| k != controller_key_id)
+}
+
 impl QsoManager {
     /// Current true RF frequency for an audio-offset frequency, using the
     /// live rig dial (+ split TX dial if active) -- the same `effective_tx_dial`
@@ -3873,6 +3883,61 @@ impl QsoManager {
         }
 
         Ok(())
+    }
+
+    /// PAN-137: end active QSOs bound to another station-agent client, freeing
+    /// their TX window and capacity slots. Selection and removal share one
+    /// write lock so a QSO already rebound to the new controller is kept.
+    /// Emit the normal failure events after releasing that lock.
+    pub async fn retire_qsos_bound_to_other_remote_clients(
+        &self,
+        controller_key_id: &str,
+    ) -> Vec<QsoId> {
+        let removed: Vec<(QsoId, QsoProgress)> = {
+            let mut qsos = self.qsos.write().await;
+            let ids: Vec<QsoId> = qsos
+                .iter()
+                .filter(|(_, p)| {
+                    p.state.is_active()
+                        && bound_to_other_remote_client(
+                            p.metadata.remote_origin,
+                            p.metadata.remote_client_key_id.as_deref(),
+                            controller_key_id,
+                        )
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| qsos.remove(&id).map(|p| (id, p)))
+                .collect()
+        };
+        let mut retired = Vec::with_capacity(removed.len());
+        for (qso_id, mut progress) in removed {
+            let old_state = progress.state.clone();
+            let reason = QsoFailureReason::ControlTransferred;
+            progress.state = QsoState::Failed {
+                reason: reason.clone(),
+                failed_at: Utc::now(),
+                last_state: Box::new(old_state.clone()),
+            };
+            self.emit_state_change(qso_id, old_state.clone(), progress.state.clone())
+                .await;
+            self.emit_event(QsoEvent::QsoFailed {
+                qso_id,
+                reason,
+                last_state: old_state,
+                metadata: progress.metadata.clone(),
+                state_history: progress.state_history.clone(),
+                messages: progress.messages.clone(),
+            })
+            .await;
+            if let Some(callsign) = progress.metadata.their_callsign.as_ref() {
+                self.remove_callsign_mapping(callsign, qso_id).await;
+            }
+            info!("Retired QSO {qso_id}: remote control passed to {controller_key_id}");
+            retired.push(qso_id);
+        }
+        retired
     }
 
     /// Emit a MessageToSend event for a QSO.
@@ -8358,6 +8423,14 @@ impl Clone for QsoManager {
 mod tests {
     use super::*;
     use tokio_test;
+
+    #[test]
+    fn bound_to_other_remote_client_preserves_local_and_unbound_qsos() {
+        assert!(bound_to_other_remote_client(true, Some("a"), "b"));
+        assert!(!bound_to_other_remote_client(true, Some("b"), "b"));
+        assert!(!bound_to_other_remote_client(true, None, "b"));
+        assert!(!bound_to_other_remote_client(false, Some("a"), "b"));
+    }
 
     async fn rollback_fixture() -> (QsoManager, QsoId, DateTime<Utc>, String) {
         let manager = QsoManager::new(test_config());
