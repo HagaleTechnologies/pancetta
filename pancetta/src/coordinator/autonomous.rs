@@ -5894,45 +5894,6 @@ mod drain_pending_qso_offset_requests_tests {
         );
     }
 
-<<<<<<< HEAD
-    /// PAN-131 (Codex round 13 on PR #350, P2): an operator `u` nudge queued
-    /// while the QSO was rearm-eligible, drained after the DX's R-report moved
-    /// it to `WaitingForConfirmation`. Nothing retransmits from there, so
-    /// `apply_tx_offset_switch` refuses it (`OffsetActionNudgeSuperseded`),
-    /// and the drain must discard it — no move, no mirror update, no requeue.
-    #[tokio::test]
-    async fn an_operator_nudge_the_dx_superseded_is_discarded_not_committed() {
-        let mut op = operator_with_live_allocator();
-        let qso_manager = manager();
-        let qso_id = qso_manager
-            .respond_to_cq_manual("K9ZZ".to_string(), 1500.0, None)
-            .await
-            .unwrap();
-        // The DX's R-report lands between the keypress and the drain.
-        qso_manager
-            .process_message(
-                pancetta_qso::MessageType::ReportAck {
-                    to_station: "W1ABC".into(),
-                    from_station: "K9ZZ".into(),
-                    report: -7,
-                },
-                "W1ABC K9ZZ R-07".to_string(),
-                1500.0,
-                Some(-15.0),
-            )
-            .await
-            .unwrap();
-        let before = qso_manager.get_qso(qso_id).await.unwrap();
-        assert!(
-            matches!(
-                before.state,
-                pancetta_qso::states::QsoState::WaitingForConfirmation { .. }
-            ),
-            "test premise: the R-report must advance the QSO to \
-             WaitingForConfirmation, got {:?}",
-            before.state
-        );
-=======
     /// PAN-130 (Codex round 12 on PR #350, P2): an operator `u` nudge carries
     /// its `avoid_hz` from the `active_tx_offsets` mirror, which still holds
     /// the Hound's low calling offset after the calling→response QSY (the QSY
@@ -6072,7 +6033,6 @@ mod drain_pending_qso_offset_requests_tests {
             )
             .await
             .expect("the setup move must commit");
->>>>>>> 4ebec230145dd5257fa210670ff509b12da4fc11
 
         let key = crate::coordinator::active_tx_qso_key(&qso_id.to_string());
         let active_tx_offsets =
@@ -6083,10 +6043,6 @@ mod drain_pending_qso_offset_requests_tests {
                 pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: 1500.0 },
             ),
         ]);
-<<<<<<< HEAD
-
-=======
->>>>>>> 4ebec230145dd5257fa210670ff509b12da4fc11
         drain_pending_qso_offset_requests(
             &mut op,
             &qso_manager,
@@ -6104,26 +6060,92 @@ mod drain_pending_qso_offset_requests_tests {
                 .unwrap()
                 .metadata
                 .frequency,
-<<<<<<< HEAD
-            1500.0,
-            "a superseded nudge must not move the QSO off the offset it is on"
-=======
             2000.0,
             "no valid relocation: the QSO stays where it really is"
->>>>>>> 4ebec230145dd5257fa210670ff509b12da4fc11
         );
         assert_eq!(
             active_tx_offsets.read().unwrap().get(&key),
             Some(&1500.0),
-<<<<<<< HEAD
+            "a no-op commits nothing, so the drain writes nothing to the mirror"
+        );
+    }
+
+    /// PAN-131 (Codex round 13 on PR #350, P2): an operator `u` nudge queued
+    /// while the QSO was rearm-eligible, drained after the DX's R-report moved
+    /// it to `WaitingForConfirmation`. Nothing retransmits from there, so
+    /// `apply_tx_offset_switch` refuses it (`OffsetActionNudgeSuperseded`),
+    /// and the drain must discard it — no move, no mirror update, no requeue.
+    #[tokio::test]
+    async fn an_operator_nudge_the_dx_superseded_is_discarded_not_committed() {
+        let mut op = operator_with_live_allocator();
+        let qso_manager = manager();
+        let qso_id = qso_manager
+            .respond_to_cq_manual("K9ZZ".to_string(), 1500.0, None)
+            .await
+            .unwrap();
+        // The DX's R-report lands between the keypress and the drain.
+        qso_manager
+            .process_message(
+                pancetta_qso::MessageType::ReportAck {
+                    to_station: "W1ABC".into(),
+                    from_station: "K9ZZ".into(),
+                    report: -7,
+                },
+                "W1ABC K9ZZ R-07".to_string(),
+                1500.0,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+        let before = qso_manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(
+                before.state,
+                pancetta_qso::states::QsoState::WaitingForConfirmation { .. }
+            ),
+            "test premise: the R-report must advance the QSO to \
+             WaitingForConfirmation, got {:?}",
+            before.state
+        );
+
+        let key = crate::coordinator::active_tx_qso_key(&qso_id.to_string());
+        let active_tx_offsets =
+            std::sync::RwLock::new(std::collections::HashMap::from([(key.clone(), 1500.0)]));
+        let pending = std::sync::Mutex::new(vec![
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                qso_id,
+                pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: 1500.0 },
+            ),
+        ]);
+
+        drain_pending_qso_offset_requests(
+            &mut op,
+            &qso_manager,
+            &pending,
+            &active_tx_offsets,
+            &auto_mode(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await;
+
+        assert_eq!(
+            qso_manager
+                .get_qso(qso_id)
+                .await
+                .unwrap()
+                .metadata
+                .frequency,
+            1500.0,
+            "a superseded nudge must not move the QSO off the offset it is on"
+        );
+        assert_eq!(
+            active_tx_offsets.read().unwrap().get(&key),
+            Some(&1500.0),
             "the mirror keeps the offset the QSO never left"
         );
         assert!(
             pending.lock().unwrap().is_empty(),
             "a superseded nudge is discarded, never requeued"
-=======
-            "a no-op commits nothing, so the drain writes nothing to the mirror"
->>>>>>> 4ebec230145dd5257fa210670ff509b12da4fc11
         );
     }
 
