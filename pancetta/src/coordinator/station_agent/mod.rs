@@ -236,7 +236,11 @@ struct ArmContext {
     /// control-mutating action (rule 4), but `Disarm`/`Heartbeat` are accepted
     /// from ANY established peer regardless (fail-safe TX-OFF, rule 5). Cleared
     /// when the controller leaves (rule 6) or on any session teardown.
+    /// PAN-137: changes to Some(peer) owe cleanup of other clients' QSOs.
     controller: Option<String>,
+    /// PAN-137: newest controller cleanup not yet confirmed enqueued. Kept
+    /// across session teardown because the displacement already happened.
+    qso_cleanup_owed: Option<OwedQsoCleanup>,
     /// Set by `poll_authorizations_loop` (round-1 review fix, PR #261) the
     /// instant a live authorization refresh disarms the current controller
     /// (`DisarmReason::AuthorizationRevoked`) — the poll task runs in a
@@ -744,6 +748,51 @@ fn control_state_sends(ctx: &ArmContext, now: ArmTime, only: Option<&str>) -> Ve
         .collect()
 }
 
+/// PAN-137: cleanup remains owed until the QSO inbox accepts it.
+struct OwedQsoCleanup {
+    controller: String,
+    failed_attempts: u32,
+}
+
+/// Record the newest displacement; an undelivered older cleanup is obsolete.
+fn owe_qso_cleanup(ctx: &mut ArmContext, peer: &str) {
+    info!(target: "agent.control", peer = %peer, "controller changed; ending QSOs bound to other remote clients");
+    ctx.qso_cleanup_owed = Some(OwedQsoCleanup {
+        controller: peer.to_string(),
+        failed_attempts: 0,
+    });
+}
+
+/// Confirm enqueue on the QSO inbox, keeping failed deliveries owed for the
+/// next session tick. This task is the only sender; FIFO delivery and refusing
+/// intents while cleanup remains owed prevent an intent overtaking cleanup.
+async fn flush_qso_cleanup(ctx: &mut ArmContext, bus: &MessageBus) {
+    let Some(controller) = ctx.qso_cleanup_owed.as_ref().map(|o| o.controller.clone()) else {
+        return;
+    };
+    let msg = ComponentMessage::new(
+        ComponentId::StationAgent,
+        ComponentId::Qso,
+        MessageType::QsoMessage(crate::message_bus::QsoMessage::RemoteControllerChanged {
+            controller_key_id: controller,
+        }),
+        std::time::Instant::now(),
+    );
+    match bus.send_message_checked(msg).await {
+        Ok(true) => ctx.qso_cleanup_owed = None,
+        Ok(false) | Err(_) => {
+            if let Some(owed) = ctx.qso_cleanup_owed.as_mut() {
+                owed.failed_attempts = owed.failed_attempts.saturating_add(1);
+                if owed.failed_attempts == 1 {
+                    warn!(target: "agent.control", "controller-change QSO cleanup not delivered; retrying each tick; displaced clients' QSOs stay active until delivery");
+                } else {
+                    debug!(target: "agent.control", attempts = owed.failed_attempts, "controller-change QSO cleanup still not delivered");
+                }
+            }
+        }
+    }
+}
+
 /// The outcome of the one-controller-at-a-time gate for a control-mutating
 /// action (`Arm`/`Qsy`/`SetSplit`/`TxRequest`/`StopCq`).
 enum ControllerGate {
@@ -767,8 +816,9 @@ fn controller_gate(ctx: &mut ArmContext, peer: &str, now: ArmTime) -> Controller
         None => {
             // Rule 3 — implicit grab keeps a single connected client (today's
             // only real-world case, which never sends takeControl) working with
-            // zero behavior change.
+            // zero behavior change. PAN-137 also cleans up other clients' QSOs.
             ctx.controller = Some(peer.to_string());
+            owe_qso_cleanup(ctx, peer);
             debug!(target: "agent.control", peer = %peer, "implicit control grab (no controller set)");
             ControllerGate::Proceed(control_state_sends(ctx, now, None))
         }
@@ -828,8 +878,9 @@ fn controller_gate(ctx: &mut ArmContext, peer: &str, now: ArmTime) -> Controller
 ///   allowed; TRANSMISSION is gated — every TransmitRequest the QSO emits is
 ///   `TxOrigin::Remote` and dropped by the armed-TX gate unless armed. This
 ///   arm never keys TX directly (no bypass).
-/// - `StopCq` / `TakeControl` / `ReleaseControl` / `Unsupported` → logged no-op
-///   in v1.
+/// - `TakeControl` moves control, disarms a displaced controller and owes the
+///   PAN-137 QSO cleanup. `ReleaseControl` disarms and releases control.
+/// - `StopCq` / `Unsupported` are otherwise logged no-ops in v1.
 async fn dispatch_action(
     action: ControlAction,
     peer: &str,
@@ -1065,6 +1116,22 @@ async fn dispatch_action(
                     .and_then(|s| s.operator_callsign().map(str::to_string)),
                 detail: detail.clone(),
             });
+            flush_qso_cleanup(ctx, bus).await;
+            if ctx.qso_cleanup_owed.is_some() {
+                // A full inbox can drain between two sends. Do not let this
+                // intent overtake a cleanup whose enqueue just failed.
+                let mut sends = grab;
+                sends.push(PeerSend {
+                    to: SendTarget::One(peer.to_string()),
+                    frame: pancetta_protocol::ServerFrame::Event {
+                        event: pancetta_protocol::ServerEvent::Error {
+                            component: "stationAgent".into(),
+                            message: "control change pending; retry the QSO request".into(),
+                        },
+                    },
+                });
+                return DispatchOutcome::cont_with(sends);
+            }
             let qso_msg = tx_kind_to_qso_message(kind, peer);
             send_qso(bus, qso_msg).await;
             info!(
@@ -1101,6 +1168,10 @@ async fn dispatch_action(
                     debug!(target: "agent.control", peer = %peer, "takeControl displaced a controller with a live arm — disarming first");
                 }
                 apply_arm_effects(&ctx.audit, &effects);
+            }
+            // PAN-137: only a different identity owes QSO cleanup.
+            if ctx.controller.as_deref() != Some(peer) {
+                owe_qso_cleanup(ctx, peer);
             }
             ctx.controller = Some(peer.to_string());
             info!(target: "agent.control", peer = %peer, "control taken (free grab)");
@@ -2307,6 +2378,7 @@ async fn run_session_loop(mut cfg: RunConfig) {
         peers: std::collections::HashMap::new(),
         // No controller until a peer grabs it (explicitly or implicitly).
         controller: None,
+        qso_cleanup_owed: None,
         revocation_pending: cfg.revocation_pending,
         authz_generation: cfg.authz_generation,
         // Set from the live generation at the start of every session.
@@ -2520,6 +2592,7 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
             debug!(target: "agent", "shutdown requested; ending relay session");
             return;
         }
+        flush_qso_cleanup(ctx, bus).await;
         let polled = sess.process_next(RECV_TICK);
         // PAN-97: expire a lapsed arm on EVERY iteration, before acting on
         // what was received — time spent receiving counts, and no branch below
@@ -2885,6 +2958,7 @@ mod tests {
             // already-established peer with no granted scope yet.
             peers: peers_with(CLIENT_KEY_ID, None),
             controller: None,
+            qso_cleanup_owed: None,
             revocation_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             authz_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             authz_generation_seen: 0,
@@ -4432,6 +4506,11 @@ mod tests {
             !ctx.arm.lock().unwrap().is_armed(),
             "routing a TX-initiation must not arm or key TX"
         );
+        // The implicit grab's cleanup must precede its first QSO intent.
+        assert!(matches!(qso_rx.try_recv().unwrap().message_type,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::RemoteControllerChanged { controller_key_id })
+                if controller_key_id == CLIENT_KEY_ID
+        ));
         // A StartQso with remote_origin=true was forwarded to the QSO engine.
         let msg = qso_rx.try_recv().expect("StartQso must be routed to Qso");
         match msg.message_type {
@@ -4456,6 +4535,369 @@ mod tests {
             }
             other => panic!("expected StartQso, got {other:?}"),
         }
+    }
+
+    // PAN-137: controller cleanup uses the same ordered inbox as QSO intents.
+    fn controller_change_ctx() -> ArmContext {
+        let mut ctx = ctx_with(true, true);
+        with_channel_consent(&ctx, ConsentChannel::StationAgent, true);
+        ctx.tx_allow_list
+            .write()
+            .unwrap()
+            .insert(PEER_B.to_string());
+        ctx.peers
+            .insert(PEER_B.to_string(), PeerCtx::unauthorized());
+        ctx
+    }
+
+    fn qso_inbox_tags(rx: &crossbeam_channel::Receiver<ComponentMessage>) -> Vec<String> {
+        rx.try_iter()
+            .map(|m| match m.message_type {
+                MessageType::QsoMessage(
+                    crate::message_bus::QsoMessage::RemoteControllerChanged { controller_key_id },
+                ) => format!("changed:{controller_key_id}"),
+                MessageType::QsoMessage(crate::message_bus::QsoMessage::StartQso {
+                    callsign,
+                    remote_client_key_id,
+                    ..
+                }) => format!("start:{callsign}:{}", remote_client_key_id.unwrap()),
+                other => panic!("unexpected QSO inbox message: {other:?}"),
+            })
+            .collect()
+    }
+
+    async fn grab_a(ctx: &mut ArmContext, bus: &MessageBus) {
+        dispatch_action(
+            arm_action("pan137-arm"),
+            CLIENT_KEY_ID,
+            ctx,
+            bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
+        assert!(ctx.arm.lock().unwrap().is_armed());
+    }
+
+    async fn take_b(ctx: &mut ArmContext, bus: &MessageBus) {
+        dispatch_action(
+            ControlAction::TakeControl,
+            PEER_B,
+            ctx,
+            bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert_eq!(ctx.controller.as_deref(), Some(PEER_B));
+    }
+
+    fn call_w1xyz() -> ControlAction {
+        ControlAction::TxRequest(TxKind::CallStation {
+            callsign: "W1XYZ".into(),
+            frequency_hz: 1500.0,
+            dx_parity: Some("odd".into()),
+        })
+    }
+
+    #[tokio::test]
+    async fn take_control_from_another_peer_sends_a_controller_change_for_the_new_controller() {
+        let mut ctx = controller_change_ctx();
+        let bus = MessageBus::new(64).unwrap();
+        let (_tx, rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        grab_a(&mut ctx, &bus).await;
+        flush_qso_cleanup(&mut ctx, &bus).await;
+        assert_eq!(qso_inbox_tags(&rx), [format!("changed:{CLIENT_KEY_ID}")]);
+        assert!(ctx.qso_cleanup_owed.is_none());
+        take_b(&mut ctx, &bus).await;
+        assert_eq!(ctx.qso_cleanup_owed.as_ref().unwrap().controller, PEER_B);
+        flush_qso_cleanup(&mut ctx, &bus).await;
+        assert_eq!(qso_inbox_tags(&rx), [format!("changed:{PEER_B}")]);
+        assert!(ctx.qso_cleanup_owed.is_none());
+    }
+
+    #[tokio::test]
+    async fn take_control_by_the_current_controller_sends_nothing() {
+        let mut ctx = controller_change_ctx();
+        let bus = MessageBus::new(64).unwrap();
+        let (_tx, rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        grab_a(&mut ctx, &bus).await;
+        flush_qso_cleanup(&mut ctx, &bus).await;
+        assert_eq!(qso_inbox_tags(&rx).len(), 1);
+        dispatch_action(
+            ControlAction::TakeControl,
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(ctx.qso_cleanup_owed.is_none());
+        flush_qso_cleanup(&mut ctx, &bus).await;
+        assert!(qso_inbox_tags(&rx).is_empty());
+        assert!(ctx.arm.lock().unwrap().is_armed());
+    }
+
+    #[tokio::test]
+    async fn ordinary_arm_loss_sends_no_controller_change() {
+        for loss in [
+            "disarm",
+            "heartbeat",
+            "ttl",
+            "release",
+            "capability",
+            "clear",
+            "teardown",
+            "kill",
+            "eviction",
+        ] {
+            let mut ctx = controller_change_ctx();
+            let bus = MessageBus::new(64).unwrap();
+            let (_tx, rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+            grab_a(&mut ctx, &bus).await;
+            flush_qso_cleanup(&mut ctx, &bus).await;
+            assert_eq!(qso_inbox_tags(&rx).len(), 1);
+            match loss {
+                "disarm" => {
+                    dispatch_action(
+                        ControlAction::Disarm {
+                            arm_jti: "pan137-arm".into(),
+                        },
+                        CLIENT_KEY_ID,
+                        &mut ctx,
+                        &bus,
+                        SESSION_ID,
+                        at(NOW),
+                    )
+                    .await;
+                }
+                "heartbeat" => {
+                    dispatch_action(
+                        ControlAction::Heartbeat {
+                            arm_jti: "pan137-arm".into(),
+                            seq: 1,
+                        },
+                        CLIENT_KEY_ID,
+                        &mut ctx,
+                        &bus,
+                        SESSION_ID,
+                        at(NOW + HEARTBEAT_TIMEOUT_MS),
+                    )
+                    .await;
+                }
+                "ttl" => {
+                    sweep_arm_expiry(&ctx, at(NOW + 300_001));
+                }
+                "release" => {
+                    dispatch_action(
+                        ControlAction::ReleaseControl,
+                        CLIENT_KEY_ID,
+                        &mut ctx,
+                        &bus,
+                        SESSION_ID,
+                        at(NOW),
+                    )
+                    .await;
+                }
+                "capability" | "clear" => {
+                    ctx.peers.insert(
+                        CLIENT_KEY_ID.into(),
+                        PeerCtx::authorized_until(vec!["status".into(), "tx".into()], NOW + 100),
+                    );
+                    if loss == "capability" {
+                        expire_peer_auth(&mut ctx, at(NOW + 101));
+                    } else {
+                        clear_peer_auth(&mut ctx, CLIENT_KEY_ID, NOW);
+                    }
+                }
+                "teardown" => disarm_on_loss(&mut ctx),
+                "kill" => {
+                    ctx.arm.lock().unwrap().set_local_kill(true, NOW);
+                }
+                "eviction" => {
+                    let identity = AgentIdentity::generate();
+                    let ws = scripted_ws_for_peer_down(&identity, CLIENT_KEY_ID);
+                    let mut session = MultiPeerSession::new(
+                        ws,
+                        &identity,
+                        ctx.tx_allow_list.read().unwrap().clone(),
+                    );
+                    ctx.tx_allow_list.write().unwrap().remove(CLIENT_KEY_ID);
+                    ctx.authz_generation.fetch_add(1, Ordering::Release);
+                    reconcile_authorizations(&mut ctx, &mut session, at(NOW));
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                !ctx.arm
+                    .lock()
+                    .unwrap()
+                    .tx_permitted(at(NOW), ConsentChannel::StationAgent),
+                "{loss} must deny TX"
+            );
+            assert!(
+                ctx.qso_cleanup_owed.is_none(),
+                "{loss} must not owe cleanup"
+            );
+            flush_qso_cleanup(&mut ctx, &bus).await;
+            assert!(
+                qso_inbox_tags(&rx).is_empty(),
+                "{loss} must not send cleanup"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_implicit_grab_after_release_sends_a_controller_change() {
+        let mut ctx = controller_change_ctx();
+        let bus = MessageBus::new(64).unwrap();
+        let (_tx, rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        grab_a(&mut ctx, &bus).await;
+        flush_qso_cleanup(&mut ctx, &bus).await;
+        assert_eq!(qso_inbox_tags(&rx).len(), 1);
+        dispatch_action(
+            ControlAction::ReleaseControl,
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(ctx.qso_cleanup_owed.is_none());
+        // Every control-mutating verb implicitly grabs, even StopCq.
+        dispatch_action(
+            ControlAction::StopCq,
+            PEER_B,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert_eq!(ctx.controller.as_deref(), Some(PEER_B));
+        flush_qso_cleanup(&mut ctx, &bus).await;
+        assert_eq!(qso_inbox_tags(&rx), [format!("changed:{PEER_B}")]);
+    }
+
+    #[tokio::test]
+    async fn a_tx_request_forwards_the_controller_change_before_its_qso_intent() {
+        let mut ctx = controller_change_ctx();
+        let bus = MessageBus::new(64).unwrap();
+        let (_tx, rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        grab_a(&mut ctx, &bus).await;
+        flush_qso_cleanup(&mut ctx, &bus).await;
+        assert_eq!(qso_inbox_tags(&rx).len(), 1);
+        take_b(&mut ctx, &bus).await;
+        dispatch_action(call_w1xyz(), PEER_B, &mut ctx, &bus, SESSION_ID, at(NOW)).await;
+        assert_eq!(
+            qso_inbox_tags(&rx),
+            [format!("changed:{PEER_B}"), format!("start:W1XYZ:{PEER_B}")]
+        );
+        assert!(ctx.qso_cleanup_owed.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_undelivered_controller_change_stays_owed_until_enqueued() {
+        let mut ctx = controller_change_ctx();
+        let bus = MessageBus::new(64).unwrap();
+        grab_a(&mut ctx, &bus).await;
+        flush_qso_cleanup(&mut ctx, &bus).await;
+        assert_eq!(
+            ctx.qso_cleanup_owed.as_ref().unwrap().controller,
+            CLIENT_KEY_ID
+        );
+        assert_eq!(ctx.qso_cleanup_owed.as_ref().unwrap().failed_attempts, 1);
+        let (_tx, rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        flush_qso_cleanup(&mut ctx, &bus).await;
+        assert_eq!(qso_inbox_tags(&rx), [format!("changed:{CLIENT_KEY_ID}")]);
+        assert!(ctx.qso_cleanup_owed.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_newer_controller_change_replaces_an_undelivered_one() {
+        let mut ctx = controller_change_ctx();
+        let bus = MessageBus::new(64).unwrap();
+        grab_a(&mut ctx, &bus).await;
+        flush_qso_cleanup(&mut ctx, &bus).await;
+        take_b(&mut ctx, &bus).await;
+        // Teardown does not erase a displacement which already happened.
+        disarm_on_loss(&mut ctx);
+        let (_tx, rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        flush_qso_cleanup(&mut ctx, &bus).await;
+        assert_eq!(qso_inbox_tags(&rx), [format!("changed:{PEER_B}")]);
+        assert!(ctx.qso_cleanup_owed.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_session_loop_sends_an_owed_controller_change() {
+        let identity = AgentIdentity::generate();
+        let mut ctx = controller_change_ctx();
+        let bus = MessageBus::new(64).unwrap();
+        let (_tx, rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        grab_a(&mut ctx, &bus).await;
+        let ws = scripted_ws_for_peer_down(&identity, CLIENT_KEY_ID);
+        run_one_session(
+            ws,
+            &identity,
+            &mut ctx,
+            &bus,
+            &mut None,
+            net::RELAY_HELLO_TIMEOUT,
+        )
+        .await;
+        assert_eq!(qso_inbox_tags(&rx), [format!("changed:{CLIENT_KEY_ID}")]);
+        assert!(ctx.qso_cleanup_owed.is_none());
+        assert!(ctx.controller.is_none());
+        assert!(!ctx.arm.lock().unwrap().is_armed());
+    }
+
+    #[tokio::test]
+    async fn a_tx_request_is_refused_until_its_controller_cleanup_is_enqueued() {
+        let mut ctx = controller_change_ctx();
+        let bus = MessageBus::new(1).unwrap();
+        let (tx, rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        tx.try_send(ComponentMessage::new(
+            ComponentId::Tui,
+            ComponentId::Qso,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::CancelAllQsos),
+            std::time::Instant::now(),
+        ))
+        .unwrap();
+        grab_a(&mut ctx, &bus).await;
+        let out = dispatch_action(
+            call_w1xyz(),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert!(ctx.qso_cleanup_owed.is_some());
+        assert!(out.sends.iter().any(|s| matches!(&s.frame,
+            pancetta_protocol::ServerFrame::Event { event: pancetta_protocol::ServerEvent::Error { message, .. } }
+                if message.contains("retry")
+        )), "an undelivered cleanup must refuse the intent with a retry error");
+        assert_eq!(rx.len(), 1);
+        rx.try_recv().unwrap();
+        flush_qso_cleanup(&mut ctx, &bus).await;
+        assert_eq!(qso_inbox_tags(&rx), [format!("changed:{CLIENT_KEY_ID}")]);
+        dispatch_action(
+            call_w1xyz(),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            at(NOW),
+        )
+        .await;
+        assert_eq!(
+            qso_inbox_tags(&rx),
+            [format!("start:W1XYZ:{CLIENT_KEY_ID}")]
+        );
     }
 
     // ── Each TxKind maps to the right remote-origin QsoMessage ──────────────
@@ -5467,6 +5909,7 @@ mod tests {
             audit: AuditLog::new(audit_tmp()),
             peers: std::collections::HashMap::new(),
             controller: None,
+            qso_cleanup_owed: None,
             revocation_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             authz_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             authz_generation_seen: 0,
@@ -5569,6 +6012,7 @@ mod tests {
             audit: AuditLog::new(audit_tmp()),
             peers: std::collections::HashMap::new(),
             controller: None,
+            qso_cleanup_owed: None,
             revocation_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             authz_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             authz_generation_seen: 0,
@@ -6599,6 +7043,7 @@ mod tests {
             audit: AuditLog::new(audit_tmp()),
             peers: peers_with(CLIENT_KEY_ID, None),
             controller: None,
+            qso_cleanup_owed: None,
             revocation_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             authz_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             authz_generation_seen: 0,

@@ -795,6 +795,10 @@ pub enum QsoMessage {
         /// New dial frequency in Hz.
         new_hz: u64,
     },
+    /// PAN-137: a station-agent client took control. Retire active QSOs and
+    /// queued calls bound to other clients, on all bands. Local and unbound
+    /// WSJT-X QSOs stay. Enqueued before the new controller's next QSO intent.
+    RemoteControllerChanged { controller_key_id: String },
     /// Open an **autonomous** QSO (`CallInitiation::Auto`) from the autonomous
     /// operator's decision (Phase 5). Routed to the QSO component so the
     /// `QsoManager` owns the exchange and auto-sequences it to completion,
