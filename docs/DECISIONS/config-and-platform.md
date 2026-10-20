@@ -492,6 +492,20 @@ push clears the pause. An external owner keeps the pause with the inert
 step after the pause is recorded. Pauses already carrying only `no-more-retries`
 are not migrated.
 
+Both marker publishers, this fallback and the second-failure handoff, re-read
+the latest attachment once the marker comment exists. A maintainer can remove
+and re-attach the pause between the ownership read and the comment, and
+admission trusts the newest bot marker when it is at or after the latest
+attachment. If the attachment changed or is unreadable, the step edits the
+marker out (the fallback leaves the inert marker), reads the comment back, and
+fails. If that edit cannot be confirmed, or the comment's ID is unknown, the
+step only fails and asks for the marker to be removed by hand; a rerun does not
+repair it. A fallback pause whose marker was withdrawn stays until removed by
+hand. Two races remain open: a re-attachment the timeline does not show yet, and
+one within the same second as the comment, because admission compares whole
+seconds. Closing them would mean binding the marker to a labeling event in the
+admission consumer.
+
 ## Partial tables, fatal file-load errors, and an honest `config --validate` (PAN-90, 2026-10-10)
 
 Every documented "just add this block" recipe failed to parse on its own (README's

@@ -542,18 +542,23 @@ jobs:
                 # the second-failure handoff's ownership rules: a maintainer can attach
                 # the label between this step's opening label read and the idempotent
                 # POST above, and a marker must never make their pause clearable.
+                # Prints the latest pause attachment as actor<TAB>created_at.
+                latest_pause_attachment() {
+                  local raw
+                  raw=$(gh api --paginate --slurp "repos/${REPO}/issues/${PR}/timeline" 2>/dev/null) &&
+                    printf '%s' "$raw" | jq -er '
+                      if type == "array" and all(.[]; type == "array" and all(.[]; type == "object"))
+                      then (add // []) else error("invalid timeline pages") end |
+                      [.[] | select(.event == "labeled" and .label.name == "queue-needs-human-review")] |
+                      last |
+                      select(.actor.login | type == "string" and length > 0) |
+                      select(.created_at | type == "string") |
+                      select(.created_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) |
+                      select(.created_at | . == (fromdateiso8601 | todateiso8601)) |
+                      [.actor.login, .created_at] | @tsv' 2>/dev/null
+                }
                 pause_owner=unknown
-                if raw=$(gh api --paginate --slurp "repos/${REPO}/issues/${PR}/timeline" 2>/dev/null) &&
-                   label_info=$(printf '%s' "$raw" | jq -er '
-                     if type == "array" and all(.[]; type == "array" and all(.[]; type == "object"))
-                     then (add // []) else error("invalid timeline pages") end |
-                     [.[] | select(.event == "labeled" and .label.name == "queue-needs-human-review")] |
-                     last |
-                     select(.actor.login | type == "string" and length > 0) |
-                     select(.created_at | type == "string") |
-                     select(.created_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) |
-                     select(.created_at | . == (fromdateiso8601 | todateiso8601)) |
-                     [.actor.login, .created_at] | @tsv' 2>/dev/null); then
+                if label_info=$(latest_pause_attachment); then
                   if [ "$(cut -f1 <<< "$label_info")" = "github-actions[bot]" ]; then
                     pause_owner=handler
                   else
@@ -564,14 +569,37 @@ jobs:
                 if [ "$pause_owner" = "handler" ]; then
                   pause_marker="<!-- queue-retry-handler:queue-needs-human-review sha=$HEAD_SHA12 -->"
                 fi
-                comment_url=$(gh pr comment "$PR" --repo "${REPO}" --body "Merge-group CI failed for this revision (commit \`$HEAD_SHA12\`), and the retry-tracking label could not be recorded. Disarmed and attached queue-needs-human-review rather than risk retrying unboundedly -- this needs a human: push a fix, or remove the pause and manually run \`gh pr merge --auto --squash\` once the labeling problem is resolved. $pause_marker" 2>/dev/null) || comment_url=""
+                pause_text="Merge-group CI failed for this revision (commit \`$HEAD_SHA12\`), and the retry-tracking label could not be recorded. Disarmed and attached queue-needs-human-review rather than risk retrying unboundedly -- this needs a human: push a fix, or remove the pause and manually run \`gh pr merge --auto --squash\` once the labeling problem is resolved."
+                comment_url=$(gh pr comment "$PR" --repo "${REPO}" --body "$pause_text $pause_marker" 2>/dev/null) || comment_url=""
                 if [ "$pause_owner" = "unknown" ]; then
                   echo "::error::Could not establish queue-needs-human-review's current owner for PR #$PR (commit $HEAD_SHA12). Keeping the pause without a staleness marker; remove it by hand once a fix is pushed."
                   exit 1
                 elif [ "$pause_owner" = "handler" ]; then
+                  comment_id=$(printf '%s' "$comment_url" | grep -oE '[0-9]+$' || echo "")
+                  # Codex P1 (PAN-152 review): the ownership read above is a snapshot.
+                  # A maintainer can remove and re-attach the pause before this comment
+                  # exists, and admission trusts the newest bot marker when it is at or
+                  # after the latest attachment, so it would make their pause clearable.
+                  # Re-read it now that the comment exists; on any change, or if it is
+                  # now unreadable, rewrite the marker to the inert one and fail. Not
+                  # covered: a re-attachment the timeline does not show yet, or one within
+                  # the same second as this comment (admission compares whole seconds).
+                  current_attachment=$(latest_pause_attachment) || current_attachment=""
+                  if [ "$current_attachment" != "$label_info" ]; then
+                    withdrawn_body=""
+                    if [ -n "$comment_id" ] &&
+                       gh api --method PATCH "repos/${REPO}/issues/comments/${comment_id}" -f "body=$pause_text $NO_MORE_RETRIES_MARKER" >/dev/null 2>&1; then
+                      withdrawn_body=$(gh api "repos/${REPO}/issues/comments/${comment_id}" --jq '.body' 2>/dev/null || echo "")
+                    fi
+                    if [ -z "$withdrawn_body" ] || [[ "$withdrawn_body" == *"$pause_marker"* ]]; then
+                      echo "::error::queue-needs-human-review on PR #$PR changed hands, or became unreadable, while this step recorded its provenance, and the clearable marker could not be confirmed withdrawn. Remove the queue-needs-human-review sha=$HEAD_SHA12 marker from this handler's comment by hand, or a later push can clear that pause."
+                      exit 1
+                    fi
+                    echo "::error::queue-needs-human-review on PR #$PR changed hands, or became unreadable, while this step recorded its provenance. Replaced the clearable marker with the inert one so a later push cannot clear that pause; it now stays until removed by hand."
+                    exit 1
+                  fi
                   # Verify this exact comment, as the handoff does: without it a later
                   # fix push cannot prove this pause stale.
-                  comment_id=$(printf '%s' "$comment_url" | grep -oE '[0-9]+$' || echo "")
                   posted_body=""
                   if [ -n "$comment_id" ]; then
                     posted_body=$(gh api "repos/${REPO}/issues/comments/${comment_id}" --jq '.body' 2>/dev/null || echo "")
@@ -626,18 +654,23 @@ jobs:
           # handoff may have attached the label without recording its marker, while
           # an idempotent POST can race a human attachment. Only the latest labeling
           # event after the POST establishes who owns the current pause.
+          # Prints the latest pause attachment as actor<TAB>created_at.
+          latest_pause_attachment() {
+            local raw
+            raw=$(gh api --paginate --slurp "repos/${REPO}/issues/${PR}/timeline" 2>/dev/null) &&
+              printf '%s' "$raw" | jq -er '
+                if type == "array" and all(.[]; type == "array" and all(.[]; type == "object"))
+                then (add // []) else error("invalid timeline pages") end |
+                [.[] | select(.event == "labeled" and .label.name == "queue-needs-human-review")] |
+                last |
+                select(.actor.login | type == "string" and length > 0) |
+                select(.created_at | type == "string") |
+                select(.created_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) |
+                select(.created_at | . == (fromdateiso8601 | todateiso8601)) |
+                [.actor.login, .created_at] | @tsv' 2>/dev/null
+          }
           pause_owner=unknown
-          if raw=$(gh api --paginate --slurp "repos/${REPO}/issues/${PR}/timeline" 2>/dev/null) &&
-             label_info=$(printf '%s' "$raw" | jq -er '
-               if type == "array" and all(.[]; type == "array" and all(.[]; type == "object"))
-               then (add // []) else error("invalid timeline pages") end |
-               [.[] | select(.event == "labeled" and .label.name == "queue-needs-human-review")] |
-               last |
-               select(.actor.login | type == "string" and length > 0) |
-               select(.created_at | type == "string") |
-               select(.created_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) |
-               select(.created_at | . == (fromdateiso8601 | todateiso8601)) |
-               [.actor.login, .created_at] | @tsv' 2>/dev/null); then
+          if label_info=$(latest_pause_attachment); then
             latest_label_actor=$(cut -f1 <<< "$label_info")
             last_labeled_at=$(cut -f2 <<< "$label_info")
             if [ "$latest_label_actor" = "github-actions[bot]" ]; then
@@ -728,9 +761,31 @@ jobs:
             # pause on a later fix push. `gh pr comment` prints the new comment's own URL on
             # success -- extract its ID and verify THAT exact comment, not a substring search.
             MARKER="<!-- queue-retry-handler:queue-needs-human-review sha=$HEAD_SHA12 -->"
-            comment_url=$(gh pr comment "$PR" --repo "${REPO}" --body "Merge-group CI failed again for commit \`$HEAD_SHA12\` after its one automatic retry ([run]($RUN_URL)). Not retrying again -- this needs a human decision: push a fix, or investigate and manually re-run \`gh pr merge --auto --squash\` if it's a known flake.
+            handoff_text="Merge-group CI failed again for commit \`$HEAD_SHA12\` after its one automatic retry ([run]($RUN_URL)). Not retrying again -- this needs a human decision: push a fix, or investigate and manually re-run \`gh pr merge --auto --squash\` if it's a known flake."
+            comment_url=$(gh pr comment "$PR" --repo "${REPO}" --body "$handoff_text
             $MARKER" 2>/dev/null) || comment_url=""
             comment_id=$(printf '%s' "$comment_url" | grep -oE '[0-9]+$' || echo "")
+            # Codex P1 (PAN-152 review): same snapshot race as the Retry step's
+            # fallback. A maintainer can remove and re-attach the pause after the
+            # ownership read above but before this comment exists, and admission
+            # would then accept this marker as provenance for their pause. Re-read
+            # it now; on any change, or if it is now unreadable, strip the marker
+            # and fail. Not covered: a re-attachment the timeline does not show yet,
+            # or one within the same second as this comment.
+            current_attachment=$(latest_pause_attachment) || current_attachment=""
+            if [ "$current_attachment" != "$label_info" ]; then
+              withdrawn_body=""
+              if [ -n "$comment_id" ] &&
+                 gh api --method PATCH "repos/${REPO}/issues/comments/${comment_id}" -f "body=$handoff_text" >/dev/null 2>&1; then
+                withdrawn_body=$(gh api "repos/${REPO}/issues/comments/${comment_id}" --jq '.body' 2>/dev/null || echo "")
+              fi
+              if [ -z "$withdrawn_body" ] || [[ "$withdrawn_body" == *"$MARKER"* ]]; then
+                echo "::error::queue-needs-human-review on PR #$PR changed hands, or became unreadable, while this handoff recorded its provenance, and the clearable marker could not be confirmed withdrawn. Remove the queue-needs-human-review sha=$HEAD_SHA12 marker from this handler's comment by hand, or a later push can clear that pause."
+                exit 1
+              fi
+              echo "::error::queue-needs-human-review on PR #$PR changed hands, or became unreadable, while this handoff recorded its provenance. Removed the clearable marker so a later push cannot clear that pause; rerun to re-check ownership."
+              exit 1
+            fi
             if [ -z "$comment_id" ]; then
               echo "::error::Could not confirm the queue-needs-human-review provenance marker was recorded for PR #$PR -- gh pr comment did not return a comment URL to verify. Failing this step so the attempt isn't marked handled."
               exit 1

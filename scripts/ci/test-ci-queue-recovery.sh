@@ -111,6 +111,15 @@ Dir.mktmpdir('pan150-queue-') do |dir|
             args[5] == '--description' && args[7..8] == ['--repo', 'test/repo']
         # Creating the label definition does not attach it to the PR.
       elsif args.length == 7 && args[0..5] == ['pr', 'comment', '17', '--repo', 'test/repo', '--body']
+        # A maintainer can remove and re-attach the pause after the ownership read
+        # but before this comment exists, or the timeline can stop answering.
+        if s['reattach_before_comment']
+          s['timeline'] << {'event' => 'unlabeled', 'label' => {'name' => 'queue-needs-human-review'}}
+          s['timeline'] << {'event' => 'labeled', 'label' => {'name' => 'queue-needs-human-review'},
+                           'actor' => {'login' => 'maintainer'}, 'created_at' => s['now']}
+          s['reattach_before_comment'] = false
+        end
+        s['timeline_mode'] = 'error' if s['timeline_error_after_comment']
         if s['post_error']
           code = 1
         else
@@ -127,6 +136,18 @@ Dir.mktmpdir('pan150-queue-') do |dir|
         raise 'readback of unknown comment' unless comment
         code = 1 if s['readback_error']
         result = s['readback_missing_marker'] ? 'unmarked body' : comment['body']
+      elsif args.length == 6 && args[0..2] == ['api', '--method', 'PATCH'] &&
+            args[3].match?(%r{\Arepos/test/repo/issues/comments/[0-9]+\z}) &&
+            args[4] == '-f' && args[5].start_with?('body=')
+        id = args[3].split('/').last
+        comment = s['comments'].find { |c| c['id'].to_s == id }
+        raise 'edit of unknown comment' unless comment
+        if s['patch_error']
+          code = 1
+        else
+          comment['body'] = args[5].delete_prefix('body=')
+          s['mutations'] << "edit:#{id}"
+        end
       elsif args[0..2] == ['api', 'graphql', '-f'] &&
             args[4..9] == ['-f', 'owner=test', '-f', 'name=repo', '-F', 'pr=17'] &&
             args.length == 10 && args[3].include?('query(') && args[3].include?('isInMergeQueue')
@@ -442,6 +463,34 @@ Dir.mktmpdir('pan150-queue-') do |dir|
       result = event.call
       raise 'unverified marker succeeded' unless result['steps.retry.conclusion'] == 'failure'
       raise 'unverified marker marked handled' if state.call['labels'].include?(attempt_label)
+      raise 'lost pause' unless state.call['labels'].include?(pause)
+    end
+  end
+  # Codex P1 (PAN-152 review): admission trusts the newest bot marker when it is at
+  # or after the latest attachment, so a marker posted after a maintainer re-attached
+  # the pause would let the next push clear their pause.
+  [['fallback', fallback_state, 'steps.retry.conclusion'],
+   ['handoff', handoff_state, 'steps.handoff.conclusion']].each do |path, setup, key|
+    [
+      ['re-attachment during publication', {'reattach_before_comment' => true}],
+      ['unreadable ownership after publication', {'timeline_error_after_comment' => true}]
+    ].each do |name, overrides|
+      check.call("#{path} #{name} withdraws the clearable marker") do
+        setup.call(overrides)
+        result = event.call
+        raise 'raced publication succeeded' unless result[key] == 'failure'
+        raise 'raced publication marked handled' if state.call['labels'].include?(attempt_label)
+        raise 'lost pause' unless state.call['labels'].include?(pause)
+        raise 'clearable marker left behind' unless marker_comments.call.empty?
+        raise 'withdrawn comment missing' if state.call['comments'].empty?
+        raise 'human pause stale' if stale.call('b' * 12)
+      end
+    end
+    check.call("#{path} unconfirmed marker withdrawal fails closed") do
+      setup.call('reattach_before_comment' => true, 'patch_error' => true)
+      result = event.call
+      raise 'unconfirmed withdrawal succeeded' unless result[key] == 'failure'
+      raise 'unconfirmed withdrawal marked handled' if state.call['labels'].include?(attempt_label)
       raise 'lost pause' unless state.call['labels'].include?(pause)
     end
   end
