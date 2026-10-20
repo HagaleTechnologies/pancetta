@@ -343,8 +343,9 @@ pub enum MessageType {
     /// Decode-effort preset echo for the TUI's "DECODE: <PRESET> <ms>ms"
     /// title-bar chip (decoder-speed-overhaul Task 15, operator `e`
     /// keybinding). Sent by the coordinator's TUI-relay command handler
-    /// after `effort::cycle_decode_effort` advances the preset and writes
-    /// the resulting budget into `decode_effort_budget_ms`. Unlike
+    /// after `effort::cycle_decode_effort` advances the preset and
+    /// publishes the resulting budget with its decoder config
+    /// (`DecodeWindowConfig`). Unlike
     /// `ModeStatus` (which can be refused while a QSO is active) this
     /// cycle never fails — a budget change never invalidates in-flight
     /// decode state (spec §6.2) — so this is always the NEW preset, never
@@ -353,8 +354,9 @@ pub enum MessageType {
         /// New decode-effort preset label ("ECO"/"STANDARD"/"DEEP"/"MAX"/
         /// "AUTO"), from `pancetta_config::DecodeEffort::label`.
         effort: String,
-        /// The budget (ms) now written into `decode_effort_budget_ms` for
-        /// this preset (`0` = unlimited).
+        /// The budget (ms) now published with its decoder config
+        /// (`DecodeWindowConfig`) for this preset (`0` = the protocol
+        /// ceiling).
         budget_ms: u64,
     },
 
