@@ -708,7 +708,7 @@ mod tests {
         ] {
             assert!(
                 !probe_completion_should_reseed_budget(cycled),
-                "probe completion must not re-seed the budget atomic when the \
+                "probe completion must not re-seed the published budget when the \
                  operator has cycled to {cycled:?} — doing so would silently \
                  revert their live choice (final-review Finding 1)"
             );
