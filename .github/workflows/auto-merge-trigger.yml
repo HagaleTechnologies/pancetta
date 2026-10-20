@@ -196,8 +196,13 @@ jobs:
               echo "::notice::PR #$pr_number's base is now '${live_base:-<unreadable>}', not '$base' -- standing down without arming (a concurrency-group wait can let the base change underneath this run)."
               return 0
             fi
-            native_merge_queue_installed "$repo" "$base"
-            install_status=$?
+            # Capture all probe results even when this function is called under
+            # errexit without an outer conditional guard.
+            if native_merge_queue_installed "$repo" "$base"; then
+              install_status=0
+            else
+              install_status=$?
+            fi
             if [ "$install_status" -eq 2 ]; then
               echo "::error::Could not read the ruleset state for ${base} to confirm the native merge_queue rule is installed -- refusing to silently report success (an opened/synchronize admission event may have no later chance to retry this PR)." >&2
               return 1
