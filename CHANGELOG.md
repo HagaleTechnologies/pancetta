@@ -128,18 +128,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-<<<<<<< HEAD
 - Pressing `u` just before the DX moved the QSO on (or before a caller
   answered an autonomous CQ) could record a new TX offset that nothing was
   ever sent on. The nudge is now dropped and the QSO stays on the offset it
   is really using (PAN-131).
-=======
+
 - Pressing `u` to move an established QSO that had no TX/RX split could be
   undone automatically. The DX's next reply recorded the offset you had just
   left as the one that works, so if the QSO later went quiet it moved straight
   back there. The reply now credits the offset you moved to, and a later stall
   looks for a new offset instead (PAN-132).
->>>>>>> 5aeb69571ead52c9b17fecb82b7b223ced2c0476
 
 - Pressing `u` on a Hound QSO right after the Fox's report moved it off its
   calling offset now moves the QSO at least `min_separation_hz` from its real
