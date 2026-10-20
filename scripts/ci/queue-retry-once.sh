@@ -21,26 +21,20 @@ if grep -qxF "queue-needs-human-review" <<< "$current_labels"; then
   # rather than trusting that something else already did.
   echo "::notice::PR #$PR carries queue-needs-human-review as of right now -- disarming/dequeuing any auto-merge a racing admission run may have already armed, rather than merely standing down."
   gh pr merge "$PR" --repo "${REPO}" --disable-auto >/dev/null 2>&1 || true
-  # GraphQL expands these variables; Bash must leave them literal.
-  # shellcheck disable=SC2016
-  pause_queue_state=$(gh api graphql -f query='
-    query($owner: String!, $name: String!, $pr: Int!) {
-      repository(owner: $owner, name: $name) { pullRequest(number: $pr) { id isInMergeQueue } }
-    }' -f owner="${REPO%%/*}" -f name="${REPO##*/}" -F pr="$PR" 2>/dev/null)
+  pause_queue_state=$(gh api graphql -f query="
+    query(\$owner: String!, \$name: String!, \$pr: Int!) {
+      repository(owner: \$owner, name: \$name) { pullRequest(number: \$pr) { id isInMergeQueue } }
+    }" -f owner="${REPO%%/*}" -f name="${REPO##*/}" -F pr="$PR" 2>/dev/null)
   pause_pr_node_id=$(echo "$pause_queue_state" | jq -r '.data.repository.pullRequest.id')
   pause_in_queue=$(echo "$pause_queue_state" | jq -r '.data.repository.pullRequest.isInMergeQueue')
   if [ "$pause_in_queue" = "true" ] && [ -n "$pause_pr_node_id" ] && [ "$pause_pr_node_id" != "null" ]; then
-    # GraphQL expands these variables; Bash must leave them literal.
-    # shellcheck disable=SC2016
-    gh api graphql -f query='mutation($id: ID!) { dequeuePullRequest(input: {id: $id}) { clientMutationId } }' -f id="$pause_pr_node_id" >/dev/null 2>&1 || true
+    gh api graphql -f query="mutation(\$id: ID!) { dequeuePullRequest(input: {id: \$id}) { clientMutationId } }" -f id="$pause_pr_node_id" >/dev/null 2>&1 || true
   fi
   pause_still_armed=$(gh pr view "$PR" --repo "${REPO}" --json autoMergeRequest --jq '.autoMergeRequest != null')
-  # GraphQL expands these variables; Bash must leave them literal.
-  # shellcheck disable=SC2016
-  pause_still_queued=$(gh api graphql -f query='
-    query($owner: String!, $name: String!, $pr: Int!) {
-      repository(owner: $owner, name: $name) { pullRequest(number: $pr) { isInMergeQueue } }
-    }' -f owner="${REPO%%/*}" -f name="${REPO##*/}" -F pr="$PR" 2>/dev/null | jq -r '.data.repository.pullRequest.isInMergeQueue')
+  pause_still_queued=$(gh api graphql -f query="
+    query(\$owner: String!, \$name: String!, \$pr: Int!) {
+      repository(owner: \$owner, name: \$name) { pullRequest(number: \$pr) { isInMergeQueue } }
+    }" -f owner="${REPO%%/*}" -f name="${REPO##*/}" -F pr="$PR" 2>/dev/null | jq -r '.data.repository.pullRequest.isInMergeQueue')
   if [ "$pause_still_armed" = "true" ] || [ "$pause_still_queued" = "true" ]; then
     echo "::error::PR #$PR carries queue-needs-human-review but is STILL ARMED/QUEUED despite the disable-auto/dequeue calls -- the explicit maintainer stop cannot be relied on until this is fixed by hand."
     gh pr comment "$PR" --repo "${REPO}" --body "queue-needs-human-review is attached to this PR (commit \`$HEAD_SHA12\`), but auto-merge could not be confirmed disarmed -- a racing admission run may have armed it before this pause was observed. This needs urgent human attention." || true
@@ -102,26 +96,20 @@ if ! rules=$(gh api "repos/${REPO}/rules/branches/main" 2>/dev/null); then
   # unreadable result is treated as "still armed" (fail-closed) rather than
   # silently treated as safe, same as every other unreadable-state check in this
   # fleet's admission workflows.
-  # GraphQL expands these variables; Bash must leave them literal.
-  # shellcheck disable=SC2016
-  ruleset_fail_queue_state=$(gh api graphql -f query='
-    query($owner: String!, $name: String!, $pr: Int!) {
-      repository(owner: $owner, name: $name) { pullRequest(number: $pr) { id isInMergeQueue } }
-    }' -f owner="${REPO%%/*}" -f name="${REPO##*/}" -F pr="$PR" 2>/dev/null) || ruleset_fail_queue_state=""
+  ruleset_fail_queue_state=$(gh api graphql -f query="
+    query(\$owner: String!, \$name: String!, \$pr: Int!) {
+      repository(owner: \$owner, name: \$name) { pullRequest(number: \$pr) { id isInMergeQueue } }
+    }" -f owner="${REPO%%/*}" -f name="${REPO##*/}" -F pr="$PR" 2>/dev/null) || ruleset_fail_queue_state=""
   ruleset_fail_pr_node_id=$(printf '%s' "$ruleset_fail_queue_state" | jq -r '.data.repository.pullRequest.id // empty' 2>/dev/null) || ruleset_fail_pr_node_id=""
   ruleset_fail_in_queue=$(printf '%s' "$ruleset_fail_queue_state" | jq -r '.data.repository.pullRequest.isInMergeQueue // empty' 2>/dev/null) || ruleset_fail_in_queue=""
   if [ "$ruleset_fail_in_queue" = "true" ] && [ -n "$ruleset_fail_pr_node_id" ] && [ "$ruleset_fail_pr_node_id" != "null" ]; then
-    # GraphQL expands these variables; Bash must leave them literal.
-    # shellcheck disable=SC2016
-    gh api graphql -f query='mutation($id: ID!) { dequeuePullRequest(input: {id: $id}) { clientMutationId } }' -f id="$ruleset_fail_pr_node_id" >/dev/null 2>&1 || true
+    gh api graphql -f query="mutation(\$id: ID!) { dequeuePullRequest(input: {id: \$id}) { clientMutationId } }" -f id="$ruleset_fail_pr_node_id" >/dev/null 2>&1 || true
   fi
   ruleset_fail_still_armed=$(gh pr view "$PR" --repo "${REPO}" --json autoMergeRequest --jq '.autoMergeRequest != null' 2>/dev/null) || ruleset_fail_still_armed="unreadable"
-  # GraphQL expands these variables; Bash must leave them literal.
-  # shellcheck disable=SC2016
-  ruleset_fail_still_queued=$(gh api graphql -f query='
-    query($owner: String!, $name: String!, $pr: Int!) {
-      repository(owner: $owner, name: $name) { pullRequest(number: $pr) { isInMergeQueue } }
-    }' -f owner="${REPO%%/*}" -f name="${REPO##*/}" -F pr="$PR" 2>/dev/null | jq -r '.data.repository.pullRequest.isInMergeQueue // empty' 2>/dev/null) || ruleset_fail_still_queued="unreadable"
+  ruleset_fail_still_queued=$(gh api graphql -f query="
+    query(\$owner: String!, \$name: String!, \$pr: Int!) {
+      repository(owner: \$owner, name: \$name) { pullRequest(number: \$pr) { isInMergeQueue } }
+    }" -f owner="${REPO%%/*}" -f name="${REPO##*/}" -F pr="$PR" 2>/dev/null | jq -r '.data.repository.pullRequest.isInMergeQueue // empty' 2>/dev/null) || ruleset_fail_still_queued="unreadable"
   gh label create queue-needs-human-review --color b60205 \
     --description "Needs a human decision -- an automated handler could not safely proceed" \
     --repo "${REPO}" >/dev/null 2>&1 || true
@@ -135,8 +123,10 @@ if ! rules=$(gh api "repos/${REPO}/rules/branches/main" 2>/dev/null); then
   exit 1
 fi
 if ! printf '%s' "$rules" | jq -e '[.[] | select(.type == "merge_queue")] | length > 0' >/dev/null 2>&1; then
-  echo "::notice::Native merge_queue ruleset rule is confirmed absent on main -- standing down without re-arming (gh pr merge --auto would only enable ordinary auto-merge) and without consuming this head's retry budget."
-  exit 0
+  # Admission can stand down during rollout, but this failed attempt
+  # must remain eligible for redelivery instead of being marked handled.
+  echo "::error::Native merge_queue ruleset rule is missing on main. No retry was consumed or armed. Restore the rule, then rerun this workflow to retry this attempt."
+  exit 1
 fi
 
 # --match-head-commit: without it, a race between the pr-state fetch and this call
@@ -172,12 +162,10 @@ if GH_TOKEN="$MERGE_TOKEN" gh pr merge "$PR" --repo "${REPO}" --auto --squash --
     if ! still_armed=$(gh pr view "$PR" --repo "${REPO}" --json autoMergeRequest --jq '.autoMergeRequest != null' 2>/dev/null); then
       still_armed="__UNREADABLE__"
     fi
-    # GraphQL expands these variables; Bash must leave them literal.
-    # shellcheck disable=SC2016
-    if ! in_queue=$(gh api graphql -f query='
-      query($owner: String!, $name: String!, $pr: Int!) {
-        repository(owner: $owner, name: $name) { pullRequest(number: $pr) { id isInMergeQueue } }
-      }' -f owner="${REPO%%/*}" -f name="${REPO##*/}" -F pr="$PR" 2>/dev/null); then
+    if ! in_queue=$(gh api graphql -f query="
+      query(\$owner: String!, \$name: String!, \$pr: Int!) {
+        repository(owner: \$owner, name: \$name) { pullRequest(number: \$pr) { id isInMergeQueue } }
+      }" -f owner="${REPO%%/*}" -f name="${REPO##*/}" -F pr="$PR" 2>/dev/null); then
       in_queue='{}'
     fi
     pr_node_id=$(echo "$in_queue" | jq -r '.data.repository.pullRequest.id' 2>/dev/null)
@@ -185,16 +173,12 @@ if GH_TOKEN="$MERGE_TOKEN" gh pr merge "$PR" --repo "${REPO}" --auto --squash --
     case "$in_queue_val" in true|false) : ;; *) in_queue_val="__UNREADABLE__" ;; esac
     if [ "$in_queue_val" = "true" ] || [ "$in_queue_val" = "__UNREADABLE__" ]; then
       if [ -n "$pr_node_id" ] && [ "$pr_node_id" != "null" ]; then
-        # GraphQL expands these variables; Bash must leave them literal.
-        # shellcheck disable=SC2016
-        gh api graphql -f query='mutation($id: ID!) { dequeuePullRequest(input: {id: $id}) { clientMutationId } }' -f id="$pr_node_id" >/dev/null 2>&1 || true
+        gh api graphql -f query="mutation(\$id: ID!) { dequeuePullRequest(input: {id: \$id}) { clientMutationId } }" -f id="$pr_node_id" >/dev/null 2>&1 || true
       fi
-      # GraphQL expands these variables; Bash must leave them literal.
-      # shellcheck disable=SC2016
-      if ! in_queue_val=$(gh api graphql -f query='
-        query($owner: String!, $name: String!, $pr: Int!) {
-          repository(owner: $owner, name: $name) { pullRequest(number: $pr) { isInMergeQueue } }
-        }' -f owner="${REPO%%/*}" -f name="${REPO##*/}" -F pr="$PR" 2>/dev/null | jq -r '.data.repository.pullRequest.isInMergeQueue' 2>/dev/null); then
+      if ! in_queue_val=$(gh api graphql -f query="
+        query(\$owner: String!, \$name: String!, \$pr: Int!) {
+          repository(owner: \$owner, name: \$name) { pullRequest(number: \$pr) { isInMergeQueue } }
+        }" -f owner="${REPO%%/*}" -f name="${REPO##*/}" -F pr="$PR" 2>/dev/null | jq -r '.data.repository.pullRequest.isInMergeQueue' 2>/dev/null); then
         in_queue_val="__UNREADABLE__"
       fi
       case "$in_queue_val" in true|false) : ;; *) in_queue_val="__UNREADABLE__" ;; esac
