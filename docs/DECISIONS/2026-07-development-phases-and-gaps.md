@@ -8,6 +8,28 @@
 
 # Known gaps and TODOs
 
+- **Auto-73 after the 45-second rework grace can reset the resend cap.**
+  Without a QSO inside `COMPLETED_QSO_REWORK_GRACE`, an auto-73 opens a new
+  completed QSO and emits `QsoCompleted`. The completion handler then
+  replaces the callsign's cache entry with `resends: 0`, although
+  `AUTO_73_WINDOW` lasts three minutes. The engine event was reproduced
+  during planning; the resulting reset and any duplicate ADIF write still
+  need an end-to-end test. (Surfaced by PAN-138, 2026-10-20.)
+
+- **Completed-QSO resends denied at key time are not compensated.** A
+  disarm after the engine's in-lock check makes the TX worker report
+  `TxFrameNotSent`, but `roll_back_unsent_attempt` returns `QsoNotActive`
+  for a completed QSO and the auto-73 counter stays charged. Compensation
+  needs a per-entry pending-attempt marker to distinguish an auto-73 from
+  an operator's same-text FIX B re-key. (Surfaced by PAN-138, 2026-10-20.)
+
+- **Brand-new close-step opens still have an authorization await gap.**
+  `respond_to_caller_with_outcome` checks remote permission before
+  `supersede_active_qsos_for(...).await` and the subsequent insert. A disarm
+  between those operations can still create a completed QSO and emit
+  `QsoCompleted` for a frame the TX worker rejects. Closing this window
+  requires supersede and insert under one guard. (Surfaced by PAN-138, 2026-10-20.)
+
 - **Supervisor coverage:** the restartable set includes Dsp/Ft8Decoder (PAN-4, using retained
   `DecodePipelineHandles`), Hamlib/StationAgent (PAN-5, with pre-restart teardown) and
   Ft8Transmitter (PAN-119, cheap restart relying on `PttGuard`'s `Drop` for PTT release). Audio

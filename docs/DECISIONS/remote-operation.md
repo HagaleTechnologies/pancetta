@@ -755,3 +755,52 @@ already recorded the failure.
 multi-process writer coordination, and no immutable retention. `sync_data`
 confirms the record write, not directory renames across power loss.
 In-memory counts are lost on a crash.
+
+
+## PAN-138: re-check remote TX permission under the lock that charges the resend
+
+The existing-QSO keep-call path in `respond_to_cq_with` and the idempotent
+reply, recently completed re-key (FIX B), and ladder-advance paths in
+`respond_to_caller` now check remote permission under the same `qsos` write
+guard that rebinds identity and charges or advances the QSO. There is no
+`.await` between the check and the mutation. This follows
+`rearm_manual_calls_at`'s existing pattern. A denial leaves identity, call
+count, pacing timestamp and exchange state unchanged and emits no frame or
+completion event.
+
+`resend_existing_if_permitted` owns the guarded resend. Its bookkeeping
+helper, `charge_resend_locked`, is also used by the local TUI's
+`resend_last_tx`; that API keeps its behavior. The permission predicate
+remains `!remote_origin || remote_tx_permitted(key)`, so local actions do not
+depend on a remote arm. The TX worker remains the final authority at key
+time.
+
+`respond_to_caller_with_outcome` returns a `ManualCallOutcome` alongside the
+QSO id. The original `respond_to_caller` and `respond_to_cq_with` signatures
+remain wrappers, so existing callers need no changes. The Grid route uses
+the private `respond_to_cq_with_outcome` to preserve the outcome.
+`emitted_frame()` means a `MessageToSend` event was emitted, not that RF
+transmission succeeded.
+
+`maybe_auto_resend_73` retains its early permission check as a fast path and
+uses the engine outcome for the authoritative result. Every non-emitting
+result, including an engine error, restores the previous `resends` and
+`last_resend_at` and shows no "Re-sending 73" status. Both refusal paths use
+`roll_back_auto_73_commit`, which only restores the entry with the same
+`qso_id` and this attempt's `last_resend_at` stamp. A replacement completion
+or a newer commit is left alone. The existing active-QSO skip still keeps
+its charge to bound retries while the live exchange handles the station.
+
+Two authorization windows remain outside this change. A disarm after the
+engine's guarded check but before key time still makes the TX worker drop
+the frame. PAN-75 compensates active QSOs, but completed-QSO auto-73 attempts
+need a separate pending-attempt marker to distinguish them from an
+operator's same-text re-key before compensation can be extended. A
+brand-new close-step open still checks permission before awaited supersede
+and insert operations. Closing that window requires supersede and insert
+under one guard. These limits, plus the auto-73 grace-window budget reset,
+are recorded in [known gaps](2026-07-development-phases-and-gaps.md).
+
+No wire, config or persisted-schema changes are involved. The outcome type
+is internal to the unpublished workspace crates, so no dispensa proposal is
+needed.

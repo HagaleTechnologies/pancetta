@@ -729,6 +729,8 @@ async fn emit_status(message_bus: &MessageBus, text: impl Into<String>) {
 /// path the Callers/Space close uses; the resulting Completed QSO is handled
 /// by the drop-stale-TX grace window (the 73 frame goes out, then drops), so
 /// there is no runaway. After the cap/window the entry is dropped.
+/// A late permission denial or an engine error that emits no frame restores
+/// the resend budget and its pacing timestamp.
 #[allow(clippy::too_many_arguments)]
 async fn maybe_auto_resend_73(
     msg_type: &pancetta_qso::states::MessageType,
@@ -848,17 +850,9 @@ async fn maybe_auto_resend_73(
             Err(_) => (entry_remote_origin, entry_remote_client_key_id),
         };
 
-    // Round-14 review (Codex P1): `respond_to_caller`'s idempotent-resend
-    // branch silently SKIPS the resend (round-10 fix) when the bound
-    // client isn't currently TX-permitted, but still returns `Ok` — so
-    // this function can't tell "a frame went out" from "the resend was
-    // skipped" from that return value alone. Left unchecked, the counter
-    // commit above would still burn the auto-73 budget for a resend that
-    // never actually transmitted, exhausting it and leaving no automatic
-    // resend if the original controller (or a newly-authorized one)
-    // retakes control within the window. Roll the commit back to exactly
-    // what it was before, and skip calling `respond_to_caller` entirely,
-    // when the frame would be denied anyway.
+    // Round 14 / PAN-138: this early check is a fast path for an already
+    // denied client. The engine's re-check under its QSO write guard is
+    // authoritative; its ManualCallOutcome also triggers rollback below.
     if entry_remote_origin
         && !crate::coordinator::tx::remote_tx_permitted_for(
             remote_tx_arm,
@@ -866,11 +860,15 @@ async fn maybe_auto_resend_73(
             entry_remote_client_key_id.as_deref(),
         )
     {
-        let mut map = completions.lock().await;
-        if let Some(entry) = map.get_mut(&key) {
-            entry.resends = prev_resends;
-            entry.last_resend_at = prev_last_resend_at;
-        }
+        roll_back_auto_73_commit(
+            completions,
+            &key,
+            entry_qso_id,
+            now,
+            prev_resends,
+            prev_last_resend_at,
+        )
+        .await;
         return;
     }
 
@@ -908,8 +906,11 @@ async fn maybe_auto_resend_73(
         from_station, resend_n, AUTO_73_MAX_RESENDS
     );
 
-    match qso_manager
-        .respond_to_caller(
+    // PAN-138: the engine re-checks permission under its own `qsos` guard
+    // and reports whether a frame went out. Anything else (a late denial,
+    // nothing to resend, or an error) un-charges this resend.
+    let outcome = qso_manager
+        .respond_to_caller_with_outcome(
             from_station.clone(),
             frequency_hz,
             dx_parity,
@@ -920,9 +921,9 @@ async fn maybe_auto_resend_73(
             entry_remote_origin, // inherit the completed QSO's origin
             entry_remote_client_key_id,
         )
-        .await
-    {
-        Ok(_) => {
+        .await;
+    match outcome {
+        Ok((_, outcome)) if outcome.emitted_frame() => {
             emit_status(
                 message_bus,
                 format!(
@@ -932,11 +933,56 @@ async fn maybe_auto_resend_73(
             )
             .await;
         }
+        Ok((_, outcome)) => {
+            info!(
+                target: "qso",
+                "auto-73 re-send to {} not sent ({:?}); budget restored", from_station, outcome
+            );
+            roll_back_auto_73_commit(
+                completions,
+                &key,
+                entry_qso_id,
+                now,
+                prev_resends,
+                prev_last_resend_at,
+            )
+            .await;
+        }
         Err(e) => {
             warn!(
                 target: "qso",
                 "auto-73 re-send to {} failed: {}", from_station, e
             );
+            roll_back_auto_73_commit(
+                completions,
+                &key,
+                entry_qso_id,
+                now,
+                prev_resends,
+                prev_last_resend_at,
+            )
+            .await;
+        }
+    }
+}
+
+/// Undo `maybe_auto_resend_73`'s budget commit for a resend that emitted no
+/// frame. Only touches the entry this call committed (same completed QSO,
+/// `last_resend_at` still its own stamp), so a newer completion stashed for
+/// the same callsign meanwhile is left alone.
+async fn roll_back_auto_73_commit(
+    completions: &RecentManualCompletions,
+    key: &str,
+    qso_id: pancetta_qso::QsoId,
+    committed_at: chrono::DateTime<chrono::Utc>,
+    prev_resends: u8,
+    prev_last_resend_at: Option<chrono::DateTime<chrono::Utc>>,
+) {
+    let mut map = completions.lock().await;
+    if let Some(entry) = map.get_mut(key) {
+        if entry.qso_id == qso_id && entry.last_resend_at == Some(committed_at) {
+            entry.resends = prev_resends;
+            entry.last_resend_at = prev_last_resend_at;
         }
     }
 }
@@ -8483,12 +8529,9 @@ mod auto_73_tests {
         assert_eq!(map.lock().await.get(DX).map(|e| e.resends), Some(1));
     }
 
-    /// Round-14 review (Codex P1): a remote-origin completion bound to
-    /// client-a, while a DIFFERENT client (client-b) holds the arm, must
-    /// not consume the auto-73 budget — `respond_to_caller`'s own resend
-    /// path silently skips the doomed resend (round-10 fix) but still
-    /// returns `Ok`, so this function must independently verify permission
-    /// and roll its own commit back rather than trusting that return value.
+    /// Round 14 / PAN-138: a completion bound to client-a must not consume
+    /// the auto-73 budget while client-b holds the arm. The early check is
+    /// a fast path; the engine outcome also reports a later denial.
     #[tokio::test]
     async fn denied_identity_rolls_back_the_resend_commit() {
         let mgr = manager().await;
@@ -8564,6 +8607,150 @@ mod auto_73_tests {
             "last_resend_at must also be rolled back, or a genuine later RR73 \
              could be wrongly suppressed by the per-slot guard"
         );
+    }
+
+    fn armed_for(client: &str) -> Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>> {
+        let mut st = pancetta_agent::arm::ArmState::new();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        st.set_channel_consent(
+            pancetta_agent::arm::ConsentChannel::StationAgent,
+            true,
+            now_ms,
+        );
+        st.set_channel_consent(pancetta_agent::arm::ConsentChannel::WsjtxUdp, true, now_ms);
+        st.arm(
+            pancetta_agent::arm::VerifiedArmGrant {
+                operator_callsign: "W1AW".to_string(),
+                ttl_ms: 120_000,
+                armed_until_ms: now_ms + 120_000,
+                heartbeat_interval_sec: 10,
+                scope_tx: true,
+                jti: "pan138-auto73-jti".to_string(),
+                client_key_id: client.to_string(),
+            },
+            pancetta_agent::arm::ArmTime::now(),
+        );
+        Arc::new(std::sync::Mutex::new(st))
+    }
+
+    /// PAN-138 (round 16 on PR #362): the coordinator's early check passes
+    /// (client-a holds the arm), but by the time the engine re-checks under
+    /// its `qsos` guard client-a has disarmed. The resend emits nothing, so
+    /// its budget commit must be undone and no "Re-sending 73" status shown.
+    async fn engine_denial_rolls_back(rekey_existing: bool) {
+        let engine_permits = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut mgr = QsoManager::new(QsoManagerConfig {
+            our_callsign: OUR.to_string(),
+            our_grid: Some("EM10".to_string()),
+            ..Default::default()
+        });
+        let permits = Arc::clone(&engine_permits);
+        mgr.set_remote_tx_permitted_source(Arc::new(move |_| {
+            permits.load(std::sync::atomic::Ordering::SeqCst)
+        }));
+        mgr.start().await.expect("manager start");
+        // FIX B re-keys a QSO completed inside the 45 s grace; without one
+        // the engine refuses a brand-new close-step open with an error.
+        let qso_id = if rekey_existing {
+            mgr.respond_to_caller(
+                DX.into(),
+                1500.0,
+                Some(SlotParity::Even),
+                pancetta_core::ResponseStep::SeventyThree,
+                None,
+                None,
+                None,
+                true,
+                Some("client-a".into()),
+            )
+            .await
+            .unwrap()
+        } else {
+            uuid::Uuid::new_v4()
+        };
+        let map = {
+            let mut m = HashMap::new();
+            m.insert(
+                DX.to_string(),
+                RecentManualCompletion {
+                    completed_at: chrono::Utc::now() - chrono::Duration::seconds(40),
+                    frequency_hz: 1500.0,
+                    dx_parity: Some(SlotParity::Even),
+                    resends: 0,
+                    last_resend_at: None,
+                    remote_origin: true,
+                    remote_client_key_id: Some("client-a".to_string()),
+                    qso_id,
+                },
+            );
+            Arc::new(Mutex::new(m))
+        };
+        let policy = AtomicU8::new(TxPolicy::Full.as_u8());
+        let bus = bus();
+        let (_tui_s, tui) = bus
+            .create_channel(crate::message_bus::ComponentId::Tui)
+            .await
+            .unwrap();
+        let mut rx = mgr.subscribe();
+        engine_permits.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        maybe_auto_resend_73(
+            &rr73_to_us(),
+            OUR,
+            1500.0,
+            Some(SlotParity::Even),
+            &mgr,
+            &map,
+            &policy,
+            &bus,
+            &armed_for("client-a"),
+        )
+        .await;
+
+        assert_eq!(drain_sends(&mut rx), 0);
+        let entry = map.lock().await.get(DX).cloned().expect("entry retained");
+        assert_eq!(entry.resends, 0, "the resend commit must be rolled back");
+        assert_eq!(entry.last_resend_at, None);
+        while let Ok(msg) = tui.try_recv() {
+            if let crate::message_bus::MessageType::StatusUpdate(text) = &msg.message_type {
+                assert!(
+                    !text.contains("Re-sending 73"),
+                    "status claimed a resend: {text}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_denial_of_a_completed_qso_rekey_rolls_back_the_commit() {
+        engine_denial_rolls_back(true).await;
+    }
+
+    #[tokio::test]
+    async fn engine_refusal_of_a_new_close_step_open_rolls_back_the_commit() {
+        engine_denial_rolls_back(false).await;
+    }
+
+    /// The rollback only undoes the commit it made: a newer completion
+    /// stashed for the same callsign in the meantime is left alone.
+    #[tokio::test]
+    async fn rollback_leaves_a_replaced_entry_alone() {
+        let map = map_with_dx();
+        let newer = map.lock().await.get(DX).cloned().unwrap();
+        let committed_at = chrono::Utc::now();
+        super::roll_back_auto_73_commit(&map, DX, uuid::Uuid::new_v4(), committed_at, 0, None)
+            .await;
+        let after = map.lock().await.get(DX).cloned().unwrap();
+        assert_eq!(after.qso_id, newer.qso_id);
+        assert_eq!(after.resends, newer.resends);
+
+        if let Some(e) = map.lock().await.get_mut(DX) {
+            e.resends = 2;
+            e.last_resend_at = Some(committed_at);
+        }
+        super::roll_back_auto_73_commit(&map, DX, newer.qso_id, committed_at, 1, None).await;
+        let after = map.lock().await.get(DX).cloned().unwrap();
+        assert_eq!((after.resends, after.last_resend_at), (1, None));
     }
 
     /// Guard for the [duplicate_checking] wiring: the pancetta-config defaults
