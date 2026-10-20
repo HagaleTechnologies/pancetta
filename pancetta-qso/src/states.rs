@@ -553,17 +553,22 @@ pub struct QsoMetadata {
     #[serde(default)]
     pub progressed_this_cycle: bool,
 
-    /// Consecutive silent per-slot rearm cycles since this QSO last made
-    /// forward progress (a genuinely new/advancing DX message). Incremented
-    /// solely by `QsoManager::rearm_manual_calls_at` — each real per-slot
-    /// re-send (the DX did not respond that slot) counts once; incoming
-    /// frame content is no longer inspected for this (the old
-    /// identical/differing-frame counting in `process_message` was replaced
-    /// by PAN-72). Reset to 0 in exactly two places — `process_message_for_qso`
-    /// on any forward state advance, and `QsoManager::apply_tx_offset_switch`
-    /// when a relocation actually COMMITS. See
-    /// [`Self::last_known_good_offset_hz`] for what happens once this trips a
-    /// switch (PAN-72).
+    /// Silent rearms since this QSO last made forward progress (a genuinely
+    /// new/advancing DX message), counted once per own-parity TX slot the
+    /// re-sends feed (PAN-128) — not once per protocol slot. Incremented
+    /// solely by `QsoManager::rearm_manual_calls_at`: each real re-send (the
+    /// DX did not respond) counts only if no surviving attempt already
+    /// holds the count for the own-parity TX slot it feeds, so the streak
+    /// climbs once per real TX opportunity (every other protocol slot under
+    /// FT8); incoming frame content is no longer inspected for this (the
+    /// old identical/differing-frame counting in `process_message` was
+    /// replaced by PAN-72). Since the last reset the counter has gained one
+    /// per distinct TX slot among the counted rearm attempts, and a slot
+    /// keeps its count while any of its attempts survives. Reset to 0 in
+    /// exactly two places — `process_message_for_qso` on any forward state
+    /// advance, and `QsoManager::apply_tx_offset_switch` when a relocation
+    /// actually COMMITS. See [`Self::last_known_good_offset_hz`] for what
+    /// happens once this trips a switch (PAN-72).
     ///
     /// Raising `QsoEvent::TxOffsetActionNeeded` deliberately does NOT reset it
     /// (Codex round 7 on PR #350, finding 2). The coordinator drains that

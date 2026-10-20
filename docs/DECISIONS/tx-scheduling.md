@@ -97,7 +97,7 @@ Bundles are **not** allowed to silently disagree on parity or collide in frequen
 
 `pancetta-qso/src/qso_manager.rs`, `states.rs`, `autonomous.rs`, `pancetta/src/coordinator/{qso.rs,autonomous.rs,tui_relay.rs}`: we hold a QSO's TX audio offset for the whole exchange. The offset is latched once at QSO open into `QsoMetadata.frequency` and reused for every reply/keep-call (the allocator runs only at open); the one mid-QSO mover is the adaptive stall escape (PAN-72, 2026-09-04).
 
-**Detection (`QsoMetadata.stall_cycles`).** The per-slot keep-call re-send in `rearm_manual_calls_at` *is* the stall signal — reaching it means the DX did not advance the QSO since the last slot — so that site is the sole incrementer of `stall_cycles`. This counts **silence** as well as a repeated/non-advancing frame, which the superseded mechanism never did. Any genuine forward advance (`process_message_for_qso`) resets it to 0 and latches the current offset into `QsoMetadata.last_known_good_offset_hz`.
+**Detection (`QsoMetadata.stall_cycles`).** The keep-call re-send in `rearm_manual_calls_at` *is* the stall signal — reaching it means the DX did not advance the QSO since the last slot — so that site is the sole incrementer of `stall_cycles`. Since PAN-128 the count is per own-parity TX slot, not per emission: a QSO only keys on its own parity (every OTHER protocol slot), so each rearm records the own-parity TX slot it feeds and only the first emission feeding a slot no surviving attempt holds counts; with `qso_stall_switch_after = N` the switch trips on the emission feeding the N-th distinct own TX slot. This counts **silence** as well as a repeated/non-advancing frame, which the superseded mechanism never did. A repeated report in `SendingReport` sends nothing and leaves `last_call_at`/`call_count` untouched, so the rearm treats it exactly like silence (PAN-129). Before, its restamp held the rearm back a full slot from every decode, so FT8/FT4 detection relied on the 5 s poll fitting the window, and FT2 skipped re-sends and switched late. Any genuine forward advance (`process_message_for_qso`) resets it to 0 and latches the current offset into `QsoMetadata.last_known_good_offset_hz`.
 
 **Action (`QsoEvent::TxOffsetActionNeeded`).** Once `stall_cycles >= TimeoutConfig::qso_stall_switch_after` (default 4, operator-facing as `[autonomous] qso_stall_switch_after`) and **only in `TxFreqMode::Auto`**, the manager emits `TxOffsetActionNeeded{qso_id, action}` and resets `stall_cycles` so one stall fires once. The Switch/Revert ping-pong is decided against `last_known_good_offset_hz`: none recorded, or we are currently *on* it → `Switch{avoid_hz: current}`; we are on a previously-switched offset → `Revert{target_hz: last_known_good}`. So a QSO switches away from known-good on the first stall, comes back on the second, switches away again on the third.
 
@@ -390,10 +390,22 @@ If a rollback takes `stall_cycles` from the switch threshold back below it
 before the coordinator's drain commits a stall offset action that attempt
 raised, the commit is refused (`OffsetActionStallRolledBack`) until the streak
 reaches the threshold again. A rollback that arrives after the commit cannot
-undo the move (follow-up: PAN-182).
+undo the move (follow-up: PAN-182). Since PAN-128 each attempt records the
+own-parity TX slot its emission feeds; when a payload-scoped rollback removes
+the attempt holding a slot's count while a same-slot sibling survives, the
+count is handed to that sibling instead of being decremented (the slot still
+has a frame that can air), and `resend_last_tx`/offset-switch retransmit
+attempts (which record no slot) never count and never inherit one. Rejected
+alternatives: gating on the CURRENT slot's parity matching `tx_parity`
+undercounts (a 20 s emission gap can skip our slot entirely and the first
+rearm's count would depend on phase), and a single `last_counted_tx_slot`
+ledger field wedges when the counted attempt is rolled back (the field would
+still claim the slot was counted).
 Rearm, explicit resend and operator offset-switch retransmits record attempts.
 A forward advance or committed offset switch clears the remembered stall
-contributions too, so a delayed failure cannot subtract from a newer streak.
+contributions too — each attempt's increment AND its slot key, so the heir
+hand-off can never cross a reset — so a delayed failure cannot subtract from
+a newer streak.
 Relinking stamps preserves any intervening forward advance.
 
 The ledger keeps a separate `last_emitted_at` anchor. Rearm pacing uses the later

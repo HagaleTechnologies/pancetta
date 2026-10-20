@@ -62,9 +62,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0.3 s to under 1.0 s, which it used to PASS.
 
 - Adaptive TX-offset switching (PAN-72): in `AUTO` TX-frequency mode, an
-  in-progress QSO that goes `[autonomous] qso_stall_switch_after` slots (default
-  4) without the DX advancing — **silence now counts, not just a repeated
-  frame** — moves to a fresh offset picked by the smart frequency allocator. If
+  in-progress QSO that goes `[autonomous] qso_stall_switch_after` of its own
+  transmit slots (default 4) without the DX advancing — **silence now
+  counts, not just a repeated frame** — moves to a fresh offset picked by
+  the smart frequency allocator. If
   it stalls again on that new offset it reverts to the last offset the QSO was
   known to work on, ping-ponging rather than wandering. New `u` keystroke forces
   the same move on demand without leaving `AUTO`: it nudges the active QSO, or
@@ -127,10 +128,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+<<<<<<< HEAD
 - Pressing `u` on a Hound QSO right after the Fox's report moved it off its
   calling offset now moves the QSO at least `min_separation_hz` from its real
   TX offset, instead of leaving it in place or shifting it by only a few Hz
   (PAN-130).
+=======
+- A DX that kept repeating its report to a manual QSO held back our
+  keep-call R-report by a full slot after every decode. On FT2 that skipped
+  re-sends and delayed the adaptive TX-offset switch to as late as the 11th
+  repeat. A repeated report now leaves keep-calling to run exactly as it does
+  while the DX is silent (PAN-129).
+
+- The stall detector behind adaptive TX-offset switching counted every
+  keep-call re-send, so it ran at twice the rate of real transmissions and
+  moved a silent QSO after about two unanswered transmissions instead of
+  `qso_stall_switch_after`. It now counts each of the QSO's own transmit
+  slots once (PAN-128).
+>>>>>>> 069129ec5c552bf650c890b2be88017c6e6d36a4
 
 - The remote-access audit log (`~/.pancetta/agent-audit.log`) now stays
   within 4 MiB: it rotates at 1 MiB into `.1`–`.3` archives, caps long
