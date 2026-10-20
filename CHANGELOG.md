@@ -128,6 +128,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Pressing `u` on a Hound QSO right after the Fox's report moved it off its
+  calling offset now moves the QSO at least `min_separation_hz` from its real
+  TX offset, instead of leaving it in place or shifting it by only a few Hz
+  (PAN-130).
+
 - A DX that kept repeating its report to a manual QSO held back our
   keep-call R-report by a full slot after every decode. On FT2 that skipped
   re-sends and delayed the adaptive TX-offset switch to as late as the 11th

@@ -501,6 +501,14 @@ tested.
     lookup table redundant: it is already the authoritative live slot length (it also correctly
     reports 15 s for a `mode=FT2` config on a build without the `ft2` feature, where the decoder
     really is running FT8 timing — the table said 3.2 s there).
+- **Amended by PAN-130 (Codex round 12 on PR #350, P2).** A `Switch` now resolves against the
+  drain's own `get_qso` read of `metadata.frequency` (`current_hz`) instead of the queued
+  `avoid_hz`, which is used only as a fallback when the QSO is gone — the same fallback the
+  `Revert` arm's occupied-target path already used. An operator nudge reads `avoid_hz` from the
+  `active_tx_offsets` mirror, and the Hound calling→response QSY moves `metadata.frequency` after
+  its `StateChanged` event already put the calling offset there; excluding that stale value let
+  the allocator pick the QSO's own live offset (refused as `OffsetActionNoOp`) or a spot a few Hz
+  from it, and with no valid candidate it returned the stale value itself as a jump.
 
 ## Manual "nudge" keystroke — `pancetta-tui`
 
