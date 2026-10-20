@@ -193,6 +193,10 @@ pub enum QsoFailureReason {
     /// unencodable message for the full manual-call-watchdog window (see
     /// `QsoManager::check_timeouts_at`).
     MessageUnencodable(String),
+
+    /// PAN-137: another station-agent client took control. End this client's
+    /// QSO to free its TX window and capacity slot; arms never transfer.
+    ControlTransferred,
 }
 
 /// Why the QSO engine refused a decoded frame on sender-verification grounds.

@@ -41,6 +41,13 @@ cited, not restated. Spec:
   a pure AND of armed ∧ scope ∧ TTL ∧ heartbeat-fresh ∧ consent ∧ ¬kill; the
   coordinator gate [[fail-closed-arm-gate]] fails CLOSED and ANDs under
   `TxPolicy`.
+- **Gotcha: a remote QSO's identity outlives its controller (PAN-137).**
+  `current_tx_side()` and `active_qso_count()` count every active QSO regardless
+  of arm state, so a displaced client's QSO still holds the TX window and a
+  slot. The station agent ends these QSOs only on a controller identity change
+  via `RemoteControllerChanged`. A disarm, heartbeat lapse, release or disconnect
+  leaves them for the same client to resume. Keep parity admission independent
+  of arm state: a momentarily unarmed QSO must keep its window.
 - **Gotcha: relay IO must stay bounded (PAN-102).** Never add an untimed
   `block_in_place` wait to `RealWsConn`: code inside `block_in_place` cannot
   be cancelled, so an unbounded wait can hold the session task past

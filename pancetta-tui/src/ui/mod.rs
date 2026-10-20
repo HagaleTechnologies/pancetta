@@ -1663,7 +1663,7 @@ fn recent_qso_failure_color(reason: &pancetta_qso::QsoFailureReason) -> Color {
         | R::FrequencyConflict
         | R::ProtocolError(_)
         | R::MessageUnencodable(_) => Color::Red,
-        R::Duplicate | R::UserCancelled | R::Superseded => Color::Gray,
+        R::Duplicate | R::UserCancelled | R::Superseded | R::ControlTransferred => Color::Gray,
     }
 }
 
@@ -2989,6 +2989,11 @@ mod view_render_tests {
     /// for Completed, red/yellow/gray by failure reason for Failed.
     #[tokio::test]
     async fn render_recent_qsos_panel_smoke_test() {
+        assert_eq!(
+            recent_qso_failure_color(&pancetta_qso::QsoFailureReason::ControlTransferred),
+            Color::Gray
+        );
+
         let mut app = crate::app::App::new(crate::config::Config::default(), None)
             .await
             .unwrap();

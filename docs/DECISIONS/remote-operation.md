@@ -757,6 +757,7 @@ confirms the record write, not directory renames across power loss.
 In-memory counts are lost on a crash.
 
 
+<<<<<<< HEAD
 ## PAN-138: re-check remote TX permission under the lock that charges the resend
 
 The existing-QSO keep-call path in `respond_to_cq_with` and the idempotent
@@ -804,3 +805,61 @@ are recorded in [known gaps](2026-07-development-phases-and-gaps.md).
 No wire, config or persisted-schema changes are involved. The outcome type
 is internal to the unpublished workspace crates, so no dispensa proposal is
 needed.
+=======
+## PAN-137: a controller change ends the previous controller's QSOs
+
+PR #362's round-7 review found an availability issue. A QSO bound to a
+previous controller could no longer pass the identity-bound arm gate, but
+still held the station's TX parity and a capacity slot until its watchdog
+expired. A new opposite-parity call therefore stayed queued for minutes.
+
+Whenever the station agent's controller becomes `Some(P)` and was not
+already P, it owes cleanup for P. This covers explicit `takeControl` and
+implicit grabs after release, disconnect or expiry. A same-peer takeover
+owes nothing. Arm loss alone, including disarm, heartbeat/TTL expiry,
+release, disconnect, authorization eviction and local kill, ends no QSO.
+The client can return and resume. Retiring on a denied frame would confuse
+these pauses with displacement; waiting for a blocked call would leave
+stale QSOs consuming capacity and require fixes in every admission path.
+
+Cleanup covers every band and only QSOs or queued calls with
+`remote_origin == true` and `remote_client_key_id == Some(k)` where k differs
+from P. Local QSOs, unbound WSJT-X UDP QSOs and P's QSOs stay. The manager
+and pending-call queue use the same `bound_to_other_remote_client` predicate.
+The parity and capacity gates still count every active QSO regardless of
+arm state. A temporarily unarmed QSO must keep its window.
+
+The station agent sends `QsoMessage::RemoteControllerChanged` to the QSO
+component. Under the admission lock, the handler first purges other clients'
+queued calls, then calls `retire_qsos_bound_to_other_remote_clients`.
+Purging first prevents retirement's failure events from promoting an old
+client's queued call into a fresh stale QSO. Selection and removal share
+one manager write lock, and normal `StateChanged` and `QsoFailed` events
+follow after unlocking. Those events purge TX state and promote waiting
+calls. A queue-only change also pushes a fresh display snapshot.
+
+Cleanup stays owed until `send_message_checked` confirms enqueue. A newer
+controller change replaces an undelivered cleanup. The session loop retries
+every tick, and `TxRequest` flushes before forwarding an intent. If that
+flush fails, the request receives the existing station-agent error event
+asking the client to retry. A full inbox could otherwise drain between the
+failed cleanup and the intent send, allowing the intent to overtake it.
+One sender and FIFO delivery preserve the order once enqueue succeeds.
+The retry does not sleep in the session loop; heartbeats remain serviceable.
+Teardown does not erase cleanup already owed by a displacement.
+
+Retirement uses `ControlTransferred`, displayed as "remote control passed
+to another client" in the status line and Recent-QSOs panel, in gray. It
+uses the existing failure-backoff behavior. TX authorization gates stay
+unchanged and continue to deny displaced clients while cleanup is pending.
+
+Taking over and repeating the previous client's exact call now starts a
+fresh QSO after retirement. The new client can use `answerCaller` with a
+`step` to select the exchange rung. Automatically inheriting the old QSO
+would let its arm authorize transmissions it never requested. A QSO already
+rebound to P before retirement is kept; other repeat/rebind paths still work.
+
+This changes no wire schema, config key, CLI or persisted schema, and needs
+no dispensa proposal. Remote clients observe removal through the existing
+active-QSO snapshot. The retry error uses an existing event type.
+>>>>>>> c448a8d00510a1d23a5793d18ae0146efa86f211
