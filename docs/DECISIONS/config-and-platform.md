@@ -482,6 +482,16 @@ attempts already marked handled are not swept automatically. Offline regressions
 in `scripts/ci/test-ci-queue-recovery.sh` execute the workflow Bash and jq through
 the existing CI test discovery.
 
+PAN-152: the Retry step's fallback, taken when a re-armed head's
+`queue-retry-used` label cannot be confirmed, now applies the same ownership
+rule. Only once disarm is confirmed and the pause label is visible, and only for
+a `github-actions[bot]` attachment, does it post the admission
+`queue-needs-human-review sha=` marker and verify that exact comment, so a later
+push clears the pause. An external owner keeps the pause with the inert
+`no-more-retries` marker. Unknown ownership or an unverified marker fails the
+step after the pause is recorded. Pauses already carrying only `no-more-retries`
+are not migrated.
+
 ## Partial tables, fatal file-load errors, and an honest `config --validate` (PAN-90, 2026-10-10)
 
 Every documented "just add this block" recipe failed to parse on its own (README's

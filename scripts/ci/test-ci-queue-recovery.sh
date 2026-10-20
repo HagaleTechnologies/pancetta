@@ -99,7 +99,8 @@ Dir.mktmpdir('pan150-queue-') do |dir|
                            'actor' => {'login' => 'maintainer'}, 'created_at' => s['now']}
           s['human_attach_race'] = false
         end
-        unless s['labels'].include?(label)
+        # A POST can exit 0 without the label becoming visible on the PR.
+        unless s['labels'].include?(label) || s['unattachable'].include?(label)
           s['labels'] << label
           s['timeline'] << {'event' => 'labeled', 'label' => {'name' => label},
                            'actor' => {'login' => 'github-actions[bot]'}, 'created_at' => s['now']}
@@ -154,7 +155,7 @@ Dir.mktmpdir('pan150-queue-') do |dir|
          'RETRY_LABEL' => retry_label, 'GITHUB_OUTPUT' => File.join(dir, 'output')}
   fresh = lambda do |overrides = {}|
     state = {'base' => 'main', 'rules' => 'present', 'arms' => 0,
-             'calls' => [], 'unexpected' => [], 'labels' => [], 'comments' => [],
+             'calls' => [], 'unexpected' => [], 'labels' => [], 'comments' => [], 'unattachable' => [],
              'timeline' => [], 'mutations' => [], 'armed' => false, 'queued' => false,
              'head' => head, 'now' => '2026-10-20T12:00:00Z'}.merge(overrides)
     File.write(state_path, JSON.generate(state))
@@ -217,6 +218,8 @@ Dir.mktmpdir('pan150-queue-') do |dir|
   handoff_state = lambda do |overrides = {}|
     fresh.call({'labels' => [retry_label, pause], 'timeline' => [label_event.call]}.merge(overrides))
   end
+  # The Retry step re-arms, but its retry-used label never becomes visible.
+  fallback_state = ->(o = {}) { fresh.call({'unattachable' => [retry_label]}.merge(o)) }
   failed_handoff = lambda do
     result = event.call
     raise 'handoff did not fail' unless result['steps.handoff.conclusion'] == 'failure'
@@ -404,6 +407,42 @@ Dir.mktmpdir('pan150-queue-') do |dir|
       if %w[disarm_error dequeue_error].include?(failure)
         raise 'marker published before safe disarm' unless marker_comments.call.empty?
       end
+    end
+  end
+  check.call('fallback handler-owned pause publishes verified clearable marker') do
+    fallback_state.call
+    result = event.call
+    raise 'fallback retry failed' unless result['steps.retry.conclusion'] == 'success'
+    raise 'missing pause or handled label' unless ([pause, attempt_label] - state.call['labels']).empty?
+    raise 'fallback left PR armed/queued' if state.call['armed'] || state.call['queued']
+    raise 'missing marker' unless marker_comments.call.length == 1
+    raise 'marker not read back' unless state.call['mutations'].include?('readback:1')
+    raise 'unchanged head stale' if stale.call(head[0, 12])
+    raise 'changed head not stale' unless stale.call('b' * 12)
+  end
+  [
+    ['human attach race', {'human_attach_race' => true}, 'success'],
+    ['unknown owner', {'timeline_mode' => 'error'}, 'failure'],
+    ['disarm unconfirmed', {'disarm_error' => true}, 'failure'],
+    ['pause not visible', {'unattachable' => [retry_label, pause]}, 'failure']
+  ].each do |name, overrides, conclusion|
+    check.call("fallback #{name} publishes no clearable marker") do
+      fallback_state.call(overrides)
+      result = event.call
+      raise 'wrong retry result' unless result['steps.retry.conclusion'] == conclusion
+      raise 'wrong handled result' unless state.call['labels'].include?(attempt_label) == (conclusion == 'success')
+      raise 'claimed clearable provenance' unless marker_comments.call.empty?
+      raise 'fallback comment not posted' if state.call['comments'].empty?
+      raise 'fallback pause stale' if stale.call('b' * 12)
+    end
+  end
+  %w[post_error missing_comment_id readback_error readback_missing_marker].each do |failure|
+    check.call("fallback #{failure} fails closed") do
+      fallback_state.call(failure => true)
+      result = event.call
+      raise 'unverified marker succeeded' unless result['steps.retry.conclusion'] == 'failure'
+      raise 'unverified marker marked handled' if state.call['labels'].include?(attempt_label)
+      raise 'lost pause' unless state.call['labels'].include?(pause)
     end
   end
   check.call('moved head takes moot path without creating provenance') do
