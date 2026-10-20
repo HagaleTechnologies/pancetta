@@ -644,19 +644,21 @@ jobs:
             # Match the admission consumer's bot identity, marker syntax and
             # attachment-time boundary. Keep an existing marker's original SHA,
             # even if a newer head would make that pause stale on admission.
+            # Validate only the fields matching needs, on bot-authored candidates:
+            # a schema-valid unrelated comment (e.g. a deleted author's `user: null`)
+            # must not block repair. Malformed pages, bot comment bodies (which the
+            # consumer cannot read either) and marker timestamps still fail closed.
             if ! raw=$(gh api --paginate --slurp "repos/${REPO}/issues/${PR}/comments" 2>/dev/null) ||
                ! marker_present=$(printf '%s' "$raw" | jq -er --arg attached "$last_labeled_at" '
                  if type == "array" and all(.[]; type == "array" and all(.[]; type == "object"))
                  then (add // []) else error("invalid comment pages") end |
-                 if all(.[];
-                   (.user.login | type == "string" and length > 0) and
-                   (.body | type == "string") and
-                   (.created_at | type == "string") and
-                   (.created_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
-                   (.created_at | . == (fromdateiso8601 | todateiso8601)))
-                 then . else error("invalid comment") end |
                  [.[] | select(.user.login == "github-actions[bot]") |
+                   if (.body | type == "string") then . else error("invalid bot comment") end |
                    select(.body | test("queue-retry-handler:queue-needs-human-review sha=[0-9a-f]{12}")) |
+                   if (.created_at | type == "string") and
+                      (.created_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+                      (.created_at | . == (fromdateiso8601 | todateiso8601))
+                   then . else error("invalid marker comment") end |
                    select(.created_at >= $attached)] |
                  if length > 0 then "present" else "absent" end' 2>/dev/null); then
               echo "::error::Could not read queue-needs-human-review's marker history for PR #$PR. Keeping the pause and leaving this attempt eligible for rerun."

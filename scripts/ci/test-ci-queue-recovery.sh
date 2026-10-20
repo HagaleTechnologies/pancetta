@@ -345,7 +345,10 @@ Dir.mktmpdir('pan150-queue-') do |dir|
     ['empty comment history', []],
     ['marker predates current attachment', [marker.call(head[0, 12], '2026-10-20T11:59:59Z')]],
     ['other actor marker', [marker.call(head[0, 12], '2026-10-20T12:00:00Z', 'maintainer')]],
-    ['malformed marker', [marker.call('not-a-sha')]]
+    ['malformed marker', [marker.call('not-a-sha')]],
+    # GitHub's issue-comment schema makes the author nullable.
+    ['unrelated comment with null author',
+     [{'id' => 1, 'user' => nil, 'created_at' => '2026-10-20T11:30:00Z', 'body' => 'unrelated'}]]
   ].each do |name, comments|
     check.call("repair #{name}") do
       handoff_state.call('comments' => comments)
