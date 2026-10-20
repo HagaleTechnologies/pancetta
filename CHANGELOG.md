@@ -128,6 +128,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Pressing `u` just before the DX moved the QSO on (or before a caller
+  answered an autonomous CQ) could record a new TX offset that nothing was
+  ever sent on. The nudge is now dropped and the QSO stays on the offset it
+  is really using (PAN-131).
+
 - Pressing `u` to move an established QSO that had no TX/RX split could be
   undone automatically. The DX's next reply recorded the offset you had just
   left as the one that works, so if the QSO later went quiet it moved straight

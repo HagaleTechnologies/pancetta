@@ -556,6 +556,13 @@ tested.
     preserves the pre-filter behavior. This is a SELECTION-time filter complementing round 1's
     commit-time refusal: the commit check keeps the engine correct, this one keeps the status
     line honest.
+  - **Amended by PAN-131 (Codex round 13 on PR #350, P2):** the nudge still carries no
+    generation token, but `apply_tx_offset_switch` now refuses an operator nudge with
+    `OffsetActionNudgeSuperseded` when the DX has moved the QSO out of the selection-time
+    eligible set before the drain commits it (guard 2a, `operator_nudge_retransmits`), so the
+    offset no longer moves with nothing sent on it. This is the commit-time counterpart of round
+    9's selection-time filter. An advance that stays inside the set (`RespondingToCq` →
+    `SendingReport`) still commits, and the next rearm sends at the new offset.
   - Else, if the Autonomous task's current state is `CallingCq` (hunting), trigger today's
     CQ-switch immediately: a new `pending_cq_offset_nudge: Arc<AtomicBool>` flag, set here and
     checked by the tick loop alongside its existing `should_switch` computation — same
