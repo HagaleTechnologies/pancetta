@@ -10,7 +10,7 @@
 //! acknowledgement, so a stalled disk can never hold PTT.
 
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 #[cfg(test)]
@@ -172,11 +172,99 @@ pub(crate) fn append_batch(
         }
     }
 
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    file.write_all(&buf)?;
-    file.sync_data()?;
+    let mut file = ActiveFile {
+        file: OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(path)?,
+        path,
+    };
+    append_whole_lines(&mut file, &buf)?;
+    file.file.sync_data()?;
     if created {
         sync_parent_dir(path);
+    }
+    Ok(())
+}
+
+/// The file operations [`append_whole_lines`] needs; a trait so a test can
+/// inject a file whose write fails part-way through.
+trait LogFile: Read + Write + Seek {
+    fn truncate_to(&mut self, len: u64) -> io::Result<()>;
+}
+
+/// The open active file. It is opened for append, which on Windows grants no
+/// `FILE_WRITE_DATA`, so a truncation that the append handle cannot do falls
+/// back to a short-lived write handle.
+struct ActiveFile<'a> {
+    file: fs::File,
+    path: &'a Path,
+}
+
+impl Read for ActiveFile<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.file.read(buf)
+    }
+}
+
+impl Write for ActiveFile<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.file.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl Seek for ActiveFile<'_> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.file.seek(pos)
+    }
+}
+
+impl LogFile for ActiveFile<'_> {
+    fn truncate_to(&mut self, len: u64) -> io::Result<()> {
+        self.file
+            .set_len(len)
+            .or_else(|_| OpenOptions::new().write(true).open(self.path)?.set_len(len))
+    }
+}
+
+/// Append `buf` (whole `\n`-terminated lines) so the file stays a sequence
+/// of whole JSON lines.
+///
+/// Review (PR #468): a `write_all` that fails part-way (disk full) leaves a
+/// fragment at EOF that the next append would extend into one invalid line.
+/// So a failed write is rolled back to the pre-append length; and should
+/// that rollback fail too (or a crash tore the tail), the next append sees a
+/// tail without a trailing newline and terminates it first, confining the
+/// damage to the torn line and keeping every later record parseable.
+fn append_whole_lines<F: LogFile>(file: &mut F, buf: &[u8]) -> io::Result<()> {
+    let start = file.seek(SeekFrom::End(0))?;
+    let mut torn_tail = false;
+    if start > 0 {
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0u8; 1];
+        file.read_exact(&mut last)?;
+        torn_tail = last[0] != b'\n';
+    }
+    let written = (|| {
+        if torn_tail {
+            file.write_all(b"\n")?;
+        }
+        file.write_all(buf)
+    })();
+    if let Err(e) = written {
+        if let Err(rollback) = file.truncate_to(start) {
+            warn!(
+                target: LOG_TARGET,
+                "TX log: could not roll back a partial append ({}); the next append will terminate the torn line",
+                rollback
+            );
+        }
+        return Err(e);
     }
     Ok(())
 }
@@ -575,6 +663,108 @@ mod tests {
         append_batch(&path, RotationPolicy::default(), &second).unwrap();
         let expected: Vec<TxFrameRecord> = first.into_iter().chain(second).collect();
         assert_eq!(read_records(&path), expected);
+    }
+
+    /// An in-memory log file whose writes fail once `budget` bytes are spent,
+    /// after writing whatever still fits (a disk filling mid-append).
+    struct FillingDisk {
+        data: io::Cursor<Vec<u8>>,
+        budget: usize,
+    }
+
+    impl Read for FillingDisk {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.data.read(buf)
+        }
+    }
+
+    impl Write for FillingDisk {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.budget == 0 {
+                return Err(io::Error::other("no space left on device"));
+            }
+            let n = buf.len().min(self.budget);
+            self.budget -= n;
+            self.data.write(&buf[..n])
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Seek for FillingDisk {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.data.seek(pos)
+        }
+    }
+
+    impl LogFile for FillingDisk {
+        fn truncate_to(&mut self, len: u64) -> io::Result<()> {
+            self.data.get_mut().truncate(len as usize);
+            Ok(())
+        }
+    }
+
+    fn lines(records: &[TxFrameRecord]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for record in records {
+            serde_json::to_writer(&mut buf, record).unwrap();
+            buf.push(b'\n');
+        }
+        buf
+    }
+
+    fn parse_lines(bytes: &[u8]) -> Vec<TxFrameRecord> {
+        std::str::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each line is one record"))
+            .collect()
+    }
+
+    #[test]
+    fn a_write_that_fails_part_way_is_rolled_back_before_the_next_append() {
+        // Review (PR #468): a disk-full partial write must not leave a fragment
+        // that the next append concatenates onto.
+        let first = vec![rec("CQ N0CALL FN20")];
+        let lost = vec![rec("K1ABC W5AU -12")];
+        let next = vec![rec("73")];
+        let mut file = FillingDisk {
+            data: io::Cursor::new(Vec::new()),
+            budget: usize::MAX,
+        };
+        append_whole_lines(&mut file, &lines(&first)).unwrap();
+        file.budget = 10;
+        assert!(append_whole_lines(&mut file, &lines(&lost)).is_err());
+        assert_eq!(file.data.get_ref(), &lines(&first), "fragment rolled back");
+        file.budget = usize::MAX;
+        append_whole_lines(&mut file, &lines(&next)).unwrap();
+        let expected: Vec<TxFrameRecord> = first.into_iter().chain(next).collect();
+        assert_eq!(parse_lines(file.data.get_ref()), expected);
+    }
+
+    #[test]
+    fn a_torn_tail_is_terminated_so_later_records_stay_parseable() {
+        // A crash mid-write (or a rollback that itself failed) leaves a line
+        // without its newline; the next append must start on a fresh line.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(TX_LOG_FILE_NAME);
+        let first = vec![rec("CQ N0CALL FN20")];
+        append_batch(&path, RotationPolicy::default(), &first).unwrap();
+        let mut torn = fs::read(&path).unwrap();
+        torn.extend_from_slice(b"{\"v\":1,\"utc\":\"20");
+        fs::write(&path, &torn).unwrap();
+        let next = vec![rec("73")];
+        append_batch(&path, RotationPolicy::default(), &next).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        let good: Vec<TxFrameRecord> = content
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let expected: Vec<TxFrameRecord> = first.into_iter().chain(next).collect();
+        assert_eq!(good, expected);
+        assert_eq!(content.lines().count(), 3, "torn line kept on its own line");
     }
 
     #[test]
