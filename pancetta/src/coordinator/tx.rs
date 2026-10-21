@@ -12433,7 +12433,10 @@ impl super::ApplicationCoordinator {
                                                         tx_dial_hz,
                                                         item.frequency_offset,
                                                         item.message_text.clone(),
-                                                        origin,
+                                                        // Each item's own provenance (PAN-136), not the
+                                                        // bundle's fail-safe folded `origin`, which is
+                                                        // `Remote` for any mixed bundle (PR #468 review).
+                                                        item.origin,
                                                         item.qso_id.clone(),
                                                     )
                                                 })
@@ -23208,11 +23211,15 @@ mod pan122_tx_log_worker_tests {
                             message_text: "CQ N0CALL FN20".to_string(),
                             frequency_offset: 1000.0,
                             qso_id: None,
+                            origin: TxOrigin::Local,
+                            remote_client_key_id: None,
                         },
                         TransmitRequestItem {
                             message_text: "CQ N0CALL EN27".to_string(),
                             frequency_offset: 1600.0,
                             qso_id: None,
+                            origin: TxOrigin::Local,
+                            remote_client_key_id: None,
                         },
                     ],
                     tx_parity: None,
@@ -23231,6 +23238,11 @@ mod pan122_tx_log_worker_tests {
         assert_eq!(lines[1].text, "CQ N0CALL EN27");
         assert_eq!(lines[1].offset_hz, 1600.0);
         assert_eq!(lines[0].utc, lines[1].utc, "one bundle, one key instant");
+        assert_eq!(
+            [lines[0].origin, lines[1].origin],
+            [TxOrigin::Local, TxOrigin::Local],
+            "each record carries its own item's origin"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

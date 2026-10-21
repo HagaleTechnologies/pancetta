@@ -844,6 +844,7 @@ and backs up `qsos.adi` first. Do not copy another logger's file over
 |---|---|---|
 | `~/.pancetta/tx-log.jsonl` | One JSON line per transmitted frame, appended (and fsynced) as the frame's audio starts. Written headless and with the TUI. | Yes — an operating record only; not used by pancetta at runtime. |
 | `~/.pancetta/tx-log.jsonl.1` … `.7` | Rotated archives, `.1` newest. Rotation happens before an append that would push the active file past 8 MiB; a bundle is never split across files. At most 64 MiB in total. | Yes — an operating record only; not used by pancetta at runtime. |
+| `~/.pancetta/tx-log.jsonl.rotating` | The active file mid-rotation; normally absent. A rotation that fails (for example another program holds the file open on Windows) puts it back and pancetta keeps appending to the active file without shifting or dropping archives; one left by a crash holds records and is moved to `.1` by the next rotation. | Yes, but it holds the most recent records before the archives. |
 
 Each line:
 
@@ -859,7 +860,7 @@ Each line:
 | `dial_hz` | Effective TX dial in Hz, split-aware (the split dial when split is active, otherwise the RX dial). `null` when no dial is known yet (rig not reporting, rig-less dev modes). |
 | `offset_hz` | Audio offset in Hz. RF = `dial_hz + offset_hz`. |
 | `text` | The exact message transmitted. |
-| `origin` | `"Local"` or `"Remote"` (station-agent remote operation). |
+| `origin` | `"Local"` or `"Remote"` (station-agent remote operation). Per frame: in a multi-TX bundle that mixes local and remote streams, each item keeps its own origin. |
 | `qso_id` | The QSO this frame belongs to; `null` for CQ / manual / test frames. |
 
 A record means the frame's audio was accepted for output while PTT was keyed.

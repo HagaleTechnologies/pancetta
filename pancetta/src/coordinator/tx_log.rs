@@ -194,20 +194,70 @@ fn sync_parent_dir(path: &Path) {
     let _ = path;
 }
 
-/// Shift `.1 … .archives-1` up by one (dropping `.archives`), then move the
-/// active file to `.1`.
+/// Move the active file into the archive chain, non-destructively on failure.
+///
+/// The active file is moved aside to `tx-log.jsonl.rotating` FIRST — the step
+/// a Windows sharing lock (another process holding the file open without
+/// delete sharing) blocks — so a blocked rotation fails before any archive is
+/// touched. Only then are the archives shifted; a later failure undoes the
+/// shifts already made and moves the active file back. A rotation that keeps
+/// failing therefore drops at most the one oldest archive it was meant to
+/// drop, never walks the whole history off the end. A `.rotating` file left
+/// by an interrupted earlier rotation still holds records, so it is archived
+/// before the active file is moved aside.
 fn rotate(path: &Path, archives: usize) -> io::Result<()> {
     if archives == 0 {
         return remove_if_exists(path);
     }
+    let staged = staging_path(path);
+    if staged.exists() {
+        push_archive(path, &staged, archives)?;
+    }
+    fs::rename(path, &staged)?;
+    if let Err(e) = push_archive(path, &staged, archives) {
+        // Restore the active file; if even that fails, the staged file is
+        // archived by the next rotation (above), so nothing is lost.
+        let _ = fs::rename(&staged, path);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Drop `.archives`, shift `.1 … .archives-1` up by one, then move `src` to
+/// `.1`. On failure every shift already made is undone, so the chain is left
+/// as it was (minus the dropped oldest, whose slot then stays free and makes a
+/// retry drop nothing more).
+fn push_archive(path: &Path, src: &Path, archives: usize) -> io::Result<()> {
     remove_if_exists(&archive_path(path, archives))?;
+    let mut shifted = Vec::new();
+    let mut result = Ok(());
     for n in (1..archives).rev() {
         let from = archive_path(path, n);
         if from.exists() {
-            fs::rename(&from, archive_path(path, n + 1))?;
+            if let Err(e) = fs::rename(&from, archive_path(path, n + 1)) {
+                result = Err(e);
+                break;
+            }
+            shifted.push(n);
         }
     }
-    fs::rename(path, archive_path(path, 1))
+    if result.is_ok() {
+        result = fs::rename(src, archive_path(path, 1));
+    }
+    if result.is_err() {
+        // `shifted` is descending; undo ascending so each target slot is free.
+        for n in shifted.into_iter().rev() {
+            let _ = fs::rename(archive_path(path, n + 1), archive_path(path, n));
+        }
+    }
+    result
+}
+
+/// `tx-log.jsonl.rotating` — the active file mid-rotation.
+fn staging_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".rotating");
+    PathBuf::from(name)
 }
 
 fn remove_if_exists(path: &Path) -> io::Result<()> {
@@ -612,6 +662,80 @@ mod tests {
             "rotated whole"
         );
         assert_eq!(read_records(&path), next);
+    }
+
+    fn seed_archives(path: &Path, archives: usize) {
+        for n in 1..=archives {
+            fs::write(archive_path(path, n), format!("archive {n}\n")).unwrap();
+        }
+    }
+
+    fn archive_contents(path: &Path, archives: usize) -> Vec<Option<String>> {
+        (1..=archives)
+            .map(|n| fs::read_to_string(archive_path(path, n)).ok())
+            .collect()
+    }
+
+    #[test]
+    fn a_failing_archive_push_undoes_its_shifts_and_retries_drop_nothing_more() {
+        // Review (PR #468): a rotation that fails after shifting archives must
+        // not walk the retained history off the end on every retry.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(TX_LOG_FILE_NAME);
+        seed_archives(&path, 3);
+        // `src` does not exist, so the final move to `.1` fails after the
+        // shifts have run.
+        let missing = dir.path().join("missing");
+        for _ in 0..5 {
+            assert!(push_archive(&path, &missing, 3).is_err());
+        }
+        assert_eq!(
+            archive_contents(&path, 3),
+            vec![
+                Some("archive 1\n".to_string()),
+                Some("archive 2\n".to_string()),
+                None,
+            ],
+            "only the oldest (the one rotation was meant to drop) is gone"
+        );
+    }
+
+    #[test]
+    fn a_failed_rotation_keeps_the_active_file_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(TX_LOG_FILE_NAME);
+        fs::write(&path, "active\n").unwrap();
+        seed_archives(&path, 2);
+        // A non-empty directory squatting on `.1`'s target after the shift
+        // (`.2`) makes the `.1 -> .2` shift fail.
+        fs::remove_file(archive_path(&path, 2)).unwrap();
+        fs::create_dir(archive_path(&path, 2)).unwrap();
+        fs::write(archive_path(&path, 2).join("x"), "x").unwrap();
+        assert!(rotate(&path, 2).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "active\n");
+        assert_eq!(
+            fs::read_to_string(archive_path(&path, 1)).unwrap(),
+            "archive 1\n"
+        );
+        assert!(!staging_path(&path).exists(), "active file moved back");
+    }
+
+    #[test]
+    fn a_leftover_staged_file_is_archived_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(TX_LOG_FILE_NAME);
+        fs::write(staging_path(&path), "interrupted\n").unwrap();
+        fs::write(&path, "active\n").unwrap();
+        rotate(&path, 3).unwrap();
+        assert_eq!(
+            archive_contents(&path, 3),
+            vec![
+                Some("active\n".to_string()),
+                Some("interrupted\n".to_string()),
+                None,
+            ]
+        );
+        assert!(!path.exists() && !staging_path(&path).exists());
     }
 
     #[tokio::test]
