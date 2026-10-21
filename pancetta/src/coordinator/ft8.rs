@@ -2084,8 +2084,9 @@ impl super::ApplicationCoordinator {
                         let native_call_start = Instant::now();
                         // PAN-165: production's deadline is anchored at window
                         // receipt, so this is what the native call really has.
-                        let pre_native_ms =
-                            native_call_start.duration_since(window_ready_at).as_millis() as u64;
+                        let pre_native_ms = native_call_start
+                            .duration_since(window_ready_at)
+                            .as_millis() as u64;
                         let headroom_at_native = headroom_ms(&decode_budget, native_call_start);
                         let (native_messages, native_budget_report) = std::panic::catch_unwind(
                             std::panic::AssertUnwindSafe(|| {
@@ -3232,7 +3233,10 @@ mod window_timing_tests {
     fn headroom_is_deadline_minus_instant() {
         let base = Instant::now();
         let b = DecodeBudget::until(base + Duration::from_millis(2000));
-        assert_eq!(headroom_ms(&b, base + Duration::from_millis(500)), Some(1500));
+        assert_eq!(
+            headroom_ms(&b, base + Duration::from_millis(500)),
+            Some(1500)
+        );
     }
 
     #[test]
@@ -3247,7 +3251,10 @@ mod window_timing_tests {
         let base = Instant::now();
         let b = DecodeBudget::until(base + Duration::from_millis(2000));
         assert_eq!(over_deadline_ms(&b, base + Duration::from_millis(1999)), 0);
-        assert_eq!(over_deadline_ms(&b, base + Duration::from_millis(2600)), 600);
+        assert_eq!(
+            over_deadline_ms(&b, base + Duration::from_millis(2600)),
+            600
+        );
     }
 
     #[test]

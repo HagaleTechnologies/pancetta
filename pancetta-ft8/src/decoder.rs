@@ -6021,11 +6021,6 @@ impl Ft8Decoder {
         );
     }
 
-    /// Subtract a decoded signal with sidelobe cancellation at ±1 tone spacing.
-    ///
-    /// After main signal subtraction, removes first sidelobes of the Hann window
-    /// at ±6.25 Hz (one tone spacing). Hann first sidelobe is ~15% (-16 dB) of
-    /// the main lobe, so we use a 0.15 scale factor for the sidelobe subtraction.
     /// PAN-165: end-of-pass residual subtraction that stops as soon as
     /// the remaining `DecodeBudget` falls below `needed` (one pass's
     /// unconditional cost), checked before each message. Returns
@@ -6047,6 +6042,11 @@ impl Ft8Decoder {
         (subtracted, msgs.len() as u32 - subtracted)
     }
 
+    /// Subtract a decoded signal with sidelobe cancellation at ±1 tone spacing.
+    ///
+    /// After main signal subtraction, removes first sidelobes of the Hann window
+    /// at ±6.25 Hz (one tone spacing). Hann first sidelobe is ~15% (-16 dB) of
+    /// the main lobe, so we use a 0.15 scale factor for the sidelobe subtraction.
     fn subtract_with_sidelobes(&self, audio: &mut [f32], msg: &DecodedMessage) {
         use std::f64::consts::PI;
 

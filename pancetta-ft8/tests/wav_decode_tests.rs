@@ -999,7 +999,10 @@ fn max_shape_expired_budget_runs_one_pass_and_never_subtracts() {
     assert_eq!(report.passes_run, 1, "stages: {:?}", report.stages);
     let find = |label: &str| report.stages.iter().find(|(l, _, _, _)| *l == label);
     let sub = find("multipass-subtract").expect("multipass-subtract must be reported");
-    assert_eq!(sub.2, 0, "nothing may be subtracted under an expired budget");
+    assert_eq!(
+        sub.2, 0,
+        "nothing may be subtracted under an expired budget"
+    );
     assert!(sub.3 > 0, "pass 0's decodes must be reported as skipped");
     // Either gate may refuse pass 1 first: the legacy tracker only wins when
     // pass 0 itself took over 2000 ms (a very slow runner).
@@ -1008,7 +1011,10 @@ fn max_shape_expired_budget_runs_one_pass_and_never_subtracts() {
         .filter_map(find)
         .collect();
     assert_eq!(gates.len(), 1, "stages: {:?}", report.stages);
-    assert_eq!(gates[0].3, 1, "exactly one pass must be recorded as skipped");
+    assert_eq!(
+        gates[0].3, 1,
+        "exactly one pass must be recorded as skipped"
+    );
 }
 
 /// PAN-165: under an unlimited budget every configured pass is either run or
