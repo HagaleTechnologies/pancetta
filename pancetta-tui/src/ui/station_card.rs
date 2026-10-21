@@ -366,6 +366,28 @@ pub(in crate::ui) mod tests {
         ));
     }
 
+    /// PAN-228: after a completed QSO, with no later decode, the card and
+    /// the Why line agree the station is already worked.
+    #[tokio::test]
+    async fn completed_qso_card_and_why_line_say_worked() {
+        let mut app = ranked_app("JA1ABC", false, false).await;
+        assert!(buffer_contains(&render_at(&app, 130, 6), " new"));
+        let mut factors = app.dx_stations["JA1ABC"]
+            .local_rank
+            .unwrap()
+            .factors
+            .unwrap();
+        factors.worked_on_band = true;
+        app.refresh_local_rank("JA1ABC", 900, factors);
+        let buf = render_at(&app, 130, 6);
+        let line1 = row(&buf, 1);
+        assert!(line1.contains(" worked"), "{line1}");
+        assert!(!line1.contains(" new"), "{line1}");
+        let why = row(&buf, 2);
+        assert!(why.contains("Why: "), "{why}");
+        assert!(why.contains("already worked on 20M"), "{why}");
+    }
+
     #[tokio::test]
     async fn why_line_fits_whole_clauses() {
         let app = ranked_app("K1ABC/P", false, true).await;
