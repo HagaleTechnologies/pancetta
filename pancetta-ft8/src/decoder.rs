@@ -43,7 +43,7 @@ use rustfft::FftPlanner;
 use std::collections::HashSet;
 use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tracing::{debug, info};
 
 use crate::parallel::BudgetTracker;
@@ -3250,44 +3250,45 @@ impl Ft8Decoder {
         let auto_passband_active = self.config.auto_passband_enabled && freq_bin_range.is_none();
         let mut auto_passband_range: Option<RangeInclusive<usize>> = None;
 
+        // PAN-165: the largest time any pass in this call took from its
+        // start through S1-floor completion, i.e. the unconditional prefix
+        // of a pass. The next pass and the end-of-pass subtraction only
+        // start while the budget still has at least this much left.
+        let mut pass_floor_cost = Duration::ZERO;
+
         for pass in 0..loop_passes {
             if budget.expired() {
+                // PAN-165: make the legacy call-anchored deadline visible
+                // (same tuple shape as `multipass-outer`); it used to cancel
+                // the remaining passes with no stage entry at all.
+                self.current_budget_report.stages.push((
+                    "multipass-legacy-deadline",
+                    0,
+                    0,
+                    (loop_passes - pass) as u32,
+                ));
                 info!(pass, "Decode budget expired, stopping early");
                 break;
             }
 
-            // Task W4.3: gate additional multipass iterations (pass >= 1)
-            // on the REAL anytime `DecodeBudget` (`self.current_budget`,
-            // production-wired via `decode_effort_budget_ms`), not just
-            // the legacy `BudgetTracker` above (an osd_depth-derived
-            // wall-clock heuristic, unrelated to the operator's
-            // configured effort preset). Without this check, an
-            // additional pass — a full spectrogram recompute plus a
-            // fresh Costas sweep plus S1..S7 candidate decoding, roughly
-            // as expensive as pass 0 itself — would always be attempted
-            // once `pass_unique` is non-empty, regardless of how little
-            // of the configured budget remains. That is exactly the
-            // W3.3b starvation shape (one expensive unit of work
-            // consuming the whole remaining budget) but one level up:
-            // instead of one costly candidate starving the rest of a
-            // pass's candidates, one costly extra pass would starve
-            // every later stage of every later pass — and unlike
-            // per-candidate work, an outer pass has NO internal
-            // early-exit once started (S1-floor within it decodes
-            // unconditionally). Checking `has_time()` here, BEFORE the
-            // pass starts, is therefore the correct checkpoint
-            // granularity: it can actually prevent the expensive unit of
-            // work rather than merely observing it ran over budget
-            // afterward. Pass 0 is exempt (`pass > 0` guard) so a
-            // decoder is always guaranteed at least one full pass's
-            // worth of results, mirroring S1-floor's own "always runs"
-            // invariant at the per-candidate level. Under
-            // `DecodeBudget::unlimited()` (every existing entry point
-            // except the budgeted ones) `has_time()` is always `true`,
-            // so this is a byte-identical no-op — the same invariant
-            // every other `current_budget.has_time()` call site in this
-            // file relies on.
-            if pass > 0 && !self.current_budget.has_time() {
+            // Gate every pass after the first on the anytime `DecodeBudget`
+            // (`self.current_budget`), which production anchors at window
+            // RECEIPT (`pancetta/src/coordinator/ft8.rs`), so waterfall,
+            // scoped and ft8_lib time already spent before this call is
+            // accounted for. A pass's prefix (preprocessing, spectrogram,
+            // Costas sweep, S1-floor) runs unconditionally once started,
+            // so "any time left" is not enough: PAN-165 measured windows
+            // overrunning the deadline by seconds when a pass started with
+            // a sliver of budget. The pass only starts while at least
+            // `pass_floor_cost` (the costliest prefix this call has already
+            // paid) remains; the budget-gated stages after S1-floor
+            // self-limit on whatever is left. Task W4.3 introduced the
+            // `has_time()` form of this gate. Pass 0 is exempt so a decoder
+            // always returns at least one full pass. The 4th-pass-after-a7
+            // iteration shares this gate. Under `DecodeBudget::unlimited()`
+            // `has_time_for` is always `true`, so this is a byte-identical
+            // no-op, like every other budget gate in this file.
+            if pass > 0 && !self.current_budget.has_time_for(pass_floor_cost) {
                 self.current_budget_report.budget_exhausted = true;
                 self.current_budget_report.stages.push((
                     "multipass-outer",
@@ -3298,6 +3299,11 @@ impl Ft8Decoder {
                 info!(
                     pass,
                     loop_passes,
+                    needed_ms = pass_floor_cost.as_millis() as u64,
+                    remaining_ms = self
+                        .current_budget
+                        .remaining()
+                        .map(|r| r.as_millis() as u64),
                     "DecodeBudget exhausted, stopping before additional multipass iteration"
                 );
                 break;
@@ -3314,6 +3320,8 @@ impl Ft8Decoder {
             if is_fourth_pass_after_a7 && a7_discovered_calls.is_empty() {
                 break;
             }
+            self.current_budget_report.passes_run += 1;
+            let pass_start = Instant::now();
 
             // Select the AP context for this iteration. Standard passes
             // use the supplied `ap_context` exactly as before — that
@@ -4257,6 +4265,7 @@ impl Ft8Decoder {
                 floor_done,
                 0,
             ));
+            pass_floor_cost = pass_floor_cost.max(pass_start.elapsed());
 
             // S2-rest: only decoded if there's time left. Re-checked
             // mid-stream (not just once up front) via a shared
@@ -4708,33 +4717,33 @@ impl Ft8Decoder {
             // that were previously sitting under an a7-decoded signal's
             // ambiguity".
             //
-            // Task W4.3 budget fix: also gate this on
-            // `current_budget.has_time()`, not just `pass + 1 <
-            // loop_passes`. Found via A/B measurement, not by
-            // inspection: the top-of-loop `pass > 0` checkpoint added
-            // above only guards the NEXT pass's redecode work — it does
-            // NOT stop this unconditional subtraction step, which runs
-            // at the END of the CURRENT pass, one full iteration before
-            // that checkpoint is next evaluated. When
-            // `time_varying_subtraction_enabled` is on, subtraction
-            // itself is expensive (per-decoded-message GFSK synthesis +
-            // Hilbert transform + a sliding-window per-block 2x2 LS
-            // fit) — under a real bounded `DecodeBudget` this cost was
-            // being paid in full even on windows where the budget was
-            // then immediately exhausted at the very next loop-top
-            // check, so the next pass never ran anyway and the
-            // subtraction was pure waste. Skipping it when there is
-            // provably no time left for another pass closes that gap:
-            // the decision to pay for setup work (subtraction) is now
-            // conditioned on the same budget the decision to use that
-            // setup work (the next pass) is conditioned on. Under
-            // `DecodeBudget::unlimited()` `has_time()` is always
-            // `true`, so this is a byte-identical no-op for every
-            // existing entry point, matching every other
-            // `current_budget.has_time()` call site in this file.
-            if pass + 1 < loop_passes && self.current_budget.has_time() {
-                for msg in &pass_unique {
-                    self.subtract_with_sidelobes(&mut residual_samples, msg);
+            // Subtraction is paid for only while the next pass can still
+            // fit: each message is checked against the same
+            // `pass_floor_cost` the next pass's gate uses, before it is
+            // subtracted. Its cost scales with decode count (time-varying
+            // subtraction measured ~140 ms/message on a 2-core host) and
+            // cannot be predicted up front, so PAN-165 moved the check from
+            // once per pass to once per message: the worst-case overrun is
+            // one message, not a whole busy window's worth (which ran
+            // windows ~3 s past the deadline before). Task W4.3 introduced
+            // the once-per-pass `has_time()` form. Under
+            // `DecodeBudget::unlimited()` every message is subtracted, a
+            // byte-identical no-op.
+            if pass + 1 < loop_passes {
+                let subtract_start = Instant::now();
+                let (subtracted, skipped) = self.subtract_within_headroom(
+                    &mut residual_samples,
+                    &pass_unique,
+                    pass_floor_cost,
+                );
+                self.current_budget_report.stages.push((
+                    "multipass-subtract",
+                    subtract_start.elapsed().as_millis() as u32,
+                    subtracted,
+                    skipped,
+                ));
+                if skipped > 0 {
+                    self.current_budget_report.budget_exhausted = true;
                 }
             }
 
@@ -6017,6 +6026,27 @@ impl Ft8Decoder {
     /// After main signal subtraction, removes first sidelobes of the Hann window
     /// at ±6.25 Hz (one tone spacing). Hann first sidelobe is ~15% (-16 dB) of
     /// the main lobe, so we use a 0.15 scale factor for the sidelobe subtraction.
+    /// PAN-165: end-of-pass residual subtraction that stops as soon as
+    /// the remaining `DecodeBudget` falls below `needed` (one pass's
+    /// unconditional cost), checked before each message. Returns
+    /// `(subtracted, skipped)`.
+    fn subtract_within_headroom(
+        &self,
+        residual: &mut [f32],
+        msgs: &[DecodedMessage],
+        needed: Duration,
+    ) -> (u32, u32) {
+        let mut subtracted = 0u32;
+        for msg in msgs {
+            if !self.current_budget.has_time_for(needed) {
+                break;
+            }
+            self.subtract_with_sidelobes(residual, msg);
+            subtracted += 1;
+        }
+        (subtracted, msgs.len() as u32 - subtracted)
+    }
+
     fn subtract_with_sidelobes(&self, audio: &mut [f32], msg: &DecodedMessage) {
         use std::f64::consts::PI;
 
@@ -22068,6 +22098,98 @@ mod w42_time_varying_subtraction_tests {
 //   3. a7-discovered callsign threads into the extended AP context.
 //   4. Loop-passes config arithmetic short-circuits when a7 is off.
 // ============================================================================
+/// PAN-165: `subtract_within_headroom` stops subtracting as soon as the
+/// remaining budget no longer covers one pass's unconditional cost.
+#[cfg(test)]
+mod pan165_subtract_within_headroom_tests {
+    use super::*;
+    use crate::WINDOW_SAMPLES;
+    use std::time::{Duration, Instant};
+
+    /// Real decodes (with tone symbols) from a busy fixture, Max shape,
+    /// unlimited budget, plus the decoder and the window they came from.
+    fn decoded_window() -> (Ft8Decoder, Vec<f32>, Vec<DecodedMessage>) {
+        let path = format!(
+            "{}/tests/fixtures/wav/wsjt/210703_133430.wav",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut samples: Vec<f32> = hound::WavReader::open(&path)
+            .unwrap()
+            .into_samples::<i16>()
+            .map(|s| s.unwrap() as f32 / 32768.0)
+            .collect();
+        if samples.len() < WINDOW_SAMPLES {
+            samples.resize(WINDOW_SAMPLES, 0.0);
+        }
+        let config = Ft8Config {
+            max_decode_passes: 2,
+            time_varying_subtraction_enabled: true,
+            ..Ft8Config::default()
+        };
+        let mut decoder = Ft8Decoder::new(config).unwrap();
+        let (msgs, _) = decoder
+            .decode_window_budgeted(&samples, DecodeBudget::unlimited())
+            .unwrap();
+        assert!(!msgs.is_empty(), "fixture must decode at least one message");
+        (decoder, samples, msgs)
+    }
+
+    #[test]
+    fn subtract_within_headroom_unlimited_subtracts_everything() {
+        let (mut d, mut residual, msgs) = decoded_window();
+        d.current_budget = DecodeBudget::unlimited();
+        let n = msgs.len() as u32;
+        let got = d.subtract_within_headroom(&mut residual, &msgs, Duration::from_secs(3600));
+        assert_eq!(got, (n, 0));
+    }
+
+    #[test]
+    fn subtract_within_headroom_expired_budget_subtracts_nothing() {
+        let (mut d, mut residual, msgs) = decoded_window();
+        let before = residual.clone();
+        d.current_budget = DecodeBudget::until(Instant::now() - Duration::from_millis(1));
+        let n = msgs.len() as u32;
+        let got = d.subtract_within_headroom(&mut residual, &msgs, Duration::ZERO);
+        assert_eq!(got, (0, n));
+        assert!(
+            residual
+                .iter()
+                .zip(&before)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "a refused subtraction must leave the residual bit-identical"
+        );
+    }
+
+    #[test]
+    fn subtract_within_headroom_refuses_when_needed_exceeds_remaining() {
+        let (mut d, mut residual, msgs) = decoded_window();
+        d.current_budget = DecodeBudget::until(Instant::now() + Duration::from_secs(3600));
+        let n = msgs.len() as u32;
+        let got = d.subtract_within_headroom(&mut residual, &msgs, Duration::from_secs(7200));
+        assert_eq!(got, (0, n));
+    }
+
+    #[test]
+    fn subtract_within_headroom_runs_when_remaining_covers_needed() {
+        let (mut d, mut residual, msgs) = decoded_window();
+        let mut expected = residual.clone();
+        for msg in &msgs {
+            d.subtract_with_sidelobes(&mut expected, msg);
+        }
+        d.current_budget = DecodeBudget::until(Instant::now() + Duration::from_secs(3600));
+        let n = msgs.len() as u32;
+        let got = d.subtract_within_headroom(&mut residual, &msgs, Duration::from_secs(1));
+        assert_eq!(got, (n, 0));
+        assert!(
+            residual
+                .iter()
+                .zip(&expected)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "the gated loop must match the old unconditional loop"
+        );
+    }
+}
+
 #[cfg(test)]
 mod fourth_pass_a7_tests {
     use super::*;
