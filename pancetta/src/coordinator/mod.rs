@@ -4902,3 +4902,146 @@ mod tests {
         }
     }
 }
+
+/// PAN-147: shared test-only guard for audit-log temp paths.
+///
+/// The three former per-module `audit_tmp()` helpers (two in `tx.rs`, one in
+/// `station_agent/mod.rs`) handed out `(pid, counter)`-keyed paths and never
+/// deleted the files. `pancetta_agent::audit::AuditLog` opens its file in
+/// append mode on every write, so a leftover file at a path a later
+/// PID-reusing process regenerates corrupts that test's read-back (the
+/// PAN-147 incident: a 2-line read where 1 was written). This guard models
+/// the proven `TempPath` helper in `pancetta-agent/src/audit.rs`'s own test
+/// module (private to that crate, hence this replication): it deletes any
+/// stale occupant of the path — and its rotation-archive siblings — before
+/// handing it out, and deletes them again on drop.
+#[cfg(test)]
+pub(crate) mod audit_test_util {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Deterministic unique suffix for temp files — NOT a clock, NOT random.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// A temp-file path (and its rotation archives) with cleanup before
+    /// first use and on drop.
+    pub(crate) struct TempPath(PathBuf);
+
+    impl TempPath {
+        /// A fresh `{prefix}-{pid}-{n}.log` path under `std::env::temp_dir()`,
+        /// pre-cleaned so a PID-reusing earlier run's leftover cannot collide.
+        pub(crate) fn new(prefix: &str) -> Self {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("{prefix}-{}-{n}.log", std::process::id()));
+            let tp = Self(path);
+            // Ensure a clean slate if a prior run left files behind.
+            tp.cleanup();
+            tp
+        }
+
+        /// Guard an explicit path (same pre-clean). Used by this module's own
+        /// tests; available for deterministic fixtures elsewhere.
+        pub(crate) fn at(path: PathBuf) -> Self {
+            let tp = Self(path);
+            tp.cleanup();
+            tp
+        }
+
+        pub(crate) fn path(&self) -> PathBuf {
+            self.0.clone()
+        }
+
+        fn slot(&self, n: usize) -> PathBuf {
+            if n == 0 {
+                return self.0.clone();
+            }
+            let mut s = self.0.clone().into_os_string();
+            s.push(format!(".{n}"));
+            PathBuf::from(s)
+        }
+
+        fn cleanup(&self) {
+            // 4 = ARCHIVE_COUNT + 1 margin, hardcoded because
+            // `pancetta_agent::audit::ARCHIVE_COUNT` is private to that crate.
+            for n in 0..=4 {
+                let p = self.slot(n);
+                let _ = std::fs::remove_file(&p);
+                let _ = std::fs::remove_dir_all(&p);
+            }
+        }
+    }
+
+    impl Drop for TempPath {
+        fn drop(&mut self) {
+            self.cleanup();
+        }
+    }
+
+    mod tests {
+        use super::*;
+
+        /// PAN-147 regression: a stale file left at the exact path a later
+        /// PID-reusing run regenerates used to precede that run's append-mode
+        /// writes, inflating the read-back (2 lines instead of 1). The guard
+        /// must sweep both the stale file and a stale rotation sibling before
+        /// use, and everything again on drop.
+        #[test]
+        fn stale_leftover_file_and_archive_are_swept_before_use() {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let p = std::env::temp_dir().join(format!(
+                "pancetta-audit-util-test-{}-{n}.log",
+                std::process::id()
+            ));
+            let sibling = p.with_extension("log.1");
+            std::fs::write(&p, "stale line\n").unwrap();
+            std::fs::write(&sibling, "stale archive\n").unwrap();
+
+            let t = TempPath::at(p.clone());
+            assert!(!p.exists(), "stale base file must be gone before use");
+            assert!(!sibling.exists(), "stale archive sibling must be gone");
+
+            let audit = pancetta_agent::audit::AuditLog::new(p.clone());
+            audit
+                .append(&pancetta_agent::audit::AuditEvent {
+                    ts_unix_ms: 0,
+                    kind: pancetta_agent::audit::AuditKind::TxDenied,
+                    operator_callsign: None,
+                    detail: "one fresh line".into(),
+                })
+                .expect("append must record");
+            let lines = std::fs::read_to_string(&p)
+                .unwrap()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .count();
+            assert_eq!(
+                lines, 1,
+                "exactly this run's record — stale bytes must not precede it"
+            );
+
+            drop(t);
+            assert!(!p.exists(), "drop must delete the base file");
+            assert!(!sibling.exists(), "drop must delete archive siblings");
+        }
+
+        #[test]
+        fn new_names_carry_prefix_pid_and_unique_counter() {
+            let a = TempPath::new("pancetta-audit-util-naming");
+            let path = a.path();
+            assert!(path.starts_with(std::env::temp_dir()));
+            let name = path
+                .file_name()
+                .expect("path has a file name")
+                .to_string_lossy()
+                .into_owned();
+            assert!(name.contains("pancetta-audit-util-naming"), "{name}");
+            assert!(
+                name.contains(&std::process::id().to_string()),
+                "{name} must carry the pid"
+            );
+            let b = TempPath::new("pancetta-audit-util-naming");
+            assert_ne!(a.path(), b.path(), "counter must keep paths distinct");
+        }
+    }
+}
