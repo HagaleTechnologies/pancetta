@@ -195,11 +195,12 @@ fn resolve_effective_effort(effort: DecodeEffort, tier: HardwareTier) -> DecodeE
 ///   reproduces the SAME 55.6%→97.2% weak-signal win under the actual
 ///   production budget, on the same (slow, virtualized) test hardware
 ///   the round-9 diagnostic showed exhausting a 250ms Standard budget on
-///   pass 1 alone. 2000ms is generous enough on this hardware; whether
-///   it holds on genuinely slower target hardware (e.g. the Windows
-///   MiniPC tier) is unverified and should be checked before an on-air
-///   soak, not assumed from this one measurement.
+///   pass 1 alone. 2000ms was generous enough on that hardware (the
+///   12-core aarch64 runner behind the prodmax scorecards); slower hosts
+///   are covered by the production-anchored record below, and the
+///   Windows MiniPC tier still needs its own rerun before an on-air soak.
 ///
+<<<<<<< HEAD
 ///   **Round-13 review finding, second measurement-fidelity gap:** the
 ///   `prodmax` scorecards above still don't fully reproduce production
 ///   timing — `research/decoder.rs`'s harness starts its 2000ms deadline
@@ -217,6 +218,21 @@ fn resolve_effective_effort(effort: DecodeEffort, tier: HardwareTier) -> DecodeE
 ///   gets less time than 2000ms in a given window,
 ///   `DecodeBudget::has_time()` gating already makes pass 2 gracefully
 ///   skip for that window — not a wrong decode or a crash.
+=======
+///   **Round-13 review finding (PAN-165), resolved:** the prodmax
+///   harness started a fresh 2000ms deadline right before the native
+///   call, while production anchors it at window receipt and spends part
+///   of it on waterfall generation, the optional scoped fast-path decode
+///   and the ft8_lib call first. The measurement was re-run with that
+///   receipt-anchored sequence
+///   (`research/experiments/2026-10-21-pan165-production-anchored-max-timing.md`,
+///   `research/scorecards/pan165-*.json`). The decoder's multipass loop
+///   now subtracts and starts another pass only while the receipt-anchored
+///   budget still has room for a pass's unconditional work, so a late
+///   native call skips pass 2 instead of overrunning the slot. On hosts
+///   where one pass takes about 2 s, `Max` yields no recall gain over
+///   `Deep`.
+>>>>>>> a4726c339acda83e4f0481846509f62cdc127b60
 /// - `Max`'s override ALSO requires `config.protocol == Protocol::Ft8`
 ///   (round-9 review finding): the coherent-subtraction machinery it
 ///   enables is FT8-79-symbol-specific, so on FT4 (105 symbols) a

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- DX Hunter explains its ranking (PAN-94): a `Why:` line on the Station card,
+  a `Why` column on wide DX Hunter panels, and `w` for the full score breakdown.
+  A `/P`-style suffix now reads `maybe POTA/SOTA (/P suffix)`; it is a callsign
+  guess, not a confirmed activation.
+
 - `pancetta import <FILE> [--dry-run]` (PAN-127): bring an existing ADIF
   log from WSJT-X, N1MM, LoTW, QRZ or another logger into Pancetta. New
   contacts are appended to `~/.pancetta/qsos.adi` with every field kept as
@@ -127,6 +132,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Fixed
+
+- Decode effort `Max` no longer delays a busy window's decodes by seconds on
+  slower computers. Before an extra decode pass, pancetta now checks that the
+  pass fits in the time left before the next slot, and skips it when it would
+  not (PAN-165).
 
 - A remote client that disarmed or lost control while pancetta was busy could
   still use up its manual-call budget. Repeating a call on an existing QSO
@@ -361,6 +371,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- DX Hunter scores follow the latest decode and cqdx spot, so a station drops
+  after you work it or a QSO with it fails.
 - `pancetta --help` no longer claims general config hot-reload or unmeasured
   decoder, latency and memory figures; it says which settings apply live and
   points to the new Capability status table in README.md (PAN-124). That
@@ -419,6 +431,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Responses from cqdx.io, QRZ, the online logbooks, the DX cluster and the station-agent relay are now read within fixed size limits (PAN-101).
 - Station agent: a relay connection that stops responding or stops accepting data is now closed within seconds, remote TX is disarmed, and the agent reconnects (PAN-102).
 - Release workflow: every GitHub Action is pinned to a full commit SHA, and only the job that creates the draft release can write to the repository (PAN-106).
+- Station agent: when a remote client takes over one QSO of a multi-QSO transmission while it waits for its slot, the transmission is now checked against that client's arm before it keys, and a frame bound to a different remote client than the rest of the transmission is held for the next slot (PAN-136).
 - Semgrep workflow: a run without `SEMGREP_APP_TOKEN` (fork PRs, Dependabot) no longer reports the same success as a completed scan — the platform check now shows as skipped and a separate secret-free scan of a vendored, pinned ruleset runs instead (PAN-107).
 
 ## [0.9.6] - 2026-09-02

@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info};
 
 use crate::config::{Config, Theme};
+use pancetta_qso::priority::PriorityFactors;
 
 /// Bounds for a real, in-band FT8 audio-offset decode — used to guard against
 /// genuinely out-of-range decoder output (split-VFO artifacts, reference
@@ -73,6 +74,8 @@ struct DxStationLookupAdapter {
     atno: bool,
     band_needed: bool,
     worked_before: bool,
+    /// Session failure history the relay's local rescore found (PAN-94).
+    recent_failure: bool,
     rarity_tier: Option<String>,
     is_notable: bool,
 }
@@ -82,7 +85,7 @@ impl pancetta_qso::priority::WorkedStationLookup for DxStationLookupAdapter {
         self.worked_before
     }
     fn is_recent_failure(&self, _callsign: &str) -> bool {
-        false
+        self.recent_failure
     }
     fn is_needed_dxcc(&self, _callsign: &str) -> bool {
         self.needed
@@ -183,6 +186,9 @@ pub struct DecodedMessageView {
     /// fixtures and legacy paths.
     #[serde(default)]
     pub priority_score: Option<u32>,
+    /// Inputs from the same scoring call as priority_score (PAN-94).
+    #[serde(default)]
+    pub priority_factors: Option<PriorityFactors>,
     /// `true` when this row is a frame WE transmitted, not a decoded RX
     /// message (#172). `call_sign` is always `None` for these rows — the
     /// full exchange text is already in `message`. Test-default false.
@@ -431,6 +437,20 @@ impl std::fmt::Display for SpotSource {
     }
 }
 
+/// A score and the exact inputs that produced it, captured together.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RankedBy {
+    pub score: u32,
+    pub factors: Option<PriorityFactors>,
+    pub at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RankOrigin {
+    LocalDecode,
+    NetworkSpot,
+}
+
 #[derive(Debug, Clone)]
 pub struct DxStation {
     pub call_sign: String,
@@ -452,6 +472,8 @@ pub struct DxStation {
     /// band). 2026-07-18, DX Hunter per-band-needed gap.
     pub band_needed: bool,
     pub priority_score: u32,
+    pub local_rank: Option<RankedBy>,
+    pub network_rank: Option<RankedBy>,
     // CQDX network metadata
     pub source: SpotSource,
     /// DXCC entity / country name (e.g. "Japan"), from the cqdx live-spot
@@ -486,6 +508,88 @@ pub struct DxStation {
     /// Bulk-resynced each autonomous tick via `apply_dx_watchlist` — never
     /// diffed, so a stale `true` can't linger past the next tick.
     pub watchlisted: bool,
+}
+
+impl DxStation {
+    /// Explain the displayed score. Local history wins equal scores.
+    pub fn rank_basis(&self) -> Option<(RankOrigin, &RankedBy)> {
+        match (&self.local_rank, &self.network_rank) {
+            (Some(local), Some(network)) if network.score > local.score => {
+                Some((RankOrigin::NetworkSpot, network))
+            }
+            (Some(local), _) => Some((RankOrigin::LocalDecode, local)),
+            (None, Some(network)) => Some((RankOrigin::NetworkSpot, network)),
+            (None, None) => None,
+        }
+    }
+
+    fn refresh_priority_score(&mut self) {
+        self.priority_score = self.rank_basis().map_or(0, |(_, rank)| rank.score);
+    }
+
+    /// Score this row's latest cqdx spot. Worked and failure history from the
+    /// relay's local rank applies too, so a QSO outcome lowers both sources
+    /// (PAN-94).
+    fn score_network_spot(&self, at: DateTime<Utc>) -> RankedBy {
+        let local = self.local_rank.and_then(|rank| rank.factors);
+        let adapter = DxStationLookupAdapter {
+            needed: self.needed,
+            atno: self.atno,
+            band_needed: self.band_needed,
+            worked_before: self.worked_before || local.is_some_and(|f| f.worked_on_band),
+            recent_failure: local.is_some_and(|f| f.recent_failure),
+            rarity_tier: self.rarity_tier.clone(),
+            is_notable: self.is_notable,
+        };
+        tui_rank(
+            adapter,
+            &self.call_sign,
+            self.grid_square.as_deref(),
+            self.best_snr_network.unwrap_or(0),
+            self.frequency,
+            at,
+        )
+    }
+}
+
+/// Exact station identity for worked status: a resolved hash render matches
+/// its plain call, but a portable variant is a different station, matching
+/// the scorer's exact-call duplicate check (PAN-94, PAN-228).
+pub(crate) fn same_station(a: &str, b: &str) -> bool {
+    let a = a.trim().to_uppercase();
+    let b = b.trim().to_uppercase();
+    matches!(
+        (
+            pancetta_core::callsign::resolve_hash_render(&a),
+            pancetta_core::callsign::resolve_hash_render(&b),
+        ),
+        (Some(a), Some(b)) if a == b
+    )
+}
+
+fn tui_rank(
+    adapter: DxStationLookupAdapter,
+    call: &str,
+    grid: Option<&str>,
+    snr: i32,
+    freq_mhz: f64,
+    at: DateTime<Utc>,
+) -> RankedBy {
+    let scorer = pancetta_qso::PriorityScorer::new(
+        pancetta_qso::priority::PriorityWeights::default(),
+        Box::new(adapter),
+    );
+    let explained = scorer.score_tiered_explained(
+        call,
+        grid,
+        snr.clamp(-128, 127) as i8,
+        freq_mhz * 1_000_000.0,
+    );
+    RankedBy {
+        score: explained.score.as_display_u32(),
+        factors: Some(explained.factors),
+        at,
+    }
 }
 
 /// Status data received from the autonomous operator.
@@ -560,8 +664,7 @@ pub struct RecentQsoOutcome {
 /// One scored candidate slice in the TX-placement instrument, mirroring
 /// `pancetta_qso::frequency::FrequencyCandidate` field-for-field (minus
 /// `clear_both_slots`/`noise_floor`, which the instrument doesn't need).
-/// Deliberately a TUI-local type — `pancetta-tui` must not depend on
-/// `pancetta-qso`; the coordinator's relay layer (`tui_relay.rs`) converts.
+/// The coordinator's relay layer (`tui_relay.rs`) converts to this display type.
 #[derive(Debug, Clone)]
 pub struct PlacementSlice {
     pub offset_hz: f64,
@@ -1308,6 +1411,8 @@ pub struct App {
     /// to `show_diagnostics`; lowercase `r` is taken (Re-send last TX), so
     /// this uses R.
     pub show_recent_qsos: bool,
+    pub show_why: bool,
+    pub why_scroll: u16,
     /// Scroll cursor into `diagnostic_events` while the overlay is open.
     pub diagnostics_scroll: usize,
     /// Scroll cursor into `recent_qsos` while the overlay is open. Same
@@ -1694,6 +1799,8 @@ impl App {
             show_health: false,
             health_scroll: 0,
             show_recent_qsos: false,
+            show_why: false,
+            why_scroll: 0,
             diagnostics_scroll: 0,
             recent_qsos_scroll: 0,
             session_completed: 0,
@@ -2192,7 +2299,7 @@ impl App {
             // FT8 passband. Used by the Space call-target.
             let audio_offset_hz =
                 (message.delta_freq as u64).clamp(AUDIO_PASSBAND_MIN_HZ, AUDIO_PASSBAND_MAX_HZ);
-            let local_score = self.calculate_dx_priority(&message);
+            let local_rank = self.calculate_dx_priority(&message);
 
             // Merge into any existing entry rather than wholesale-replacing
             // it. A blanket `insert` would clobber network metadata
@@ -2224,11 +2331,9 @@ impl App {
                         SpotSource::Network | SpotSource::Both => SpotSource::Both,
                         SpotSource::Local => SpotSource::Local,
                     };
-                    // Re-score from the richer of local vs whatever network
-                    // metadata is still attached. For purely local entries
-                    // this is just the local score; network spots keep
-                    // their score raised on merge() and we don't lower it.
-                    entry.priority_score = entry.priority_score.max(local_score);
+                    // Keep the latest observation from each source, so ranks can fall.
+                    entry.local_rank = Some(local_rank);
+                    entry.refresh_priority_score();
                 }
                 None => {
                     self.dx_stations.insert(
@@ -2250,7 +2355,9 @@ impl App {
                             needed: message.needed,
                             atno: message.atno,
                             band_needed: message.band_needed,
-                            priority_score: local_score,
+                            priority_score: local_rank.score,
+                            local_rank: Some(local_rank),
+                            network_rank: None,
                             source: SpotSource::Local,
                             entity_name: None,
                             rarity_tier: None,
@@ -2284,11 +2391,15 @@ impl App {
         Ok(())
     }
 
-    fn calculate_dx_priority(&self, message: &DecodedMessageView) -> u32 {
+    fn calculate_dx_priority(&self, message: &DecodedMessageView) -> RankedBy {
         // If the coordinator pre-computed a nuanced score from the real
         // `PriorityScorer` (#164 tiered encoding), use it directly.
         if let Some(pre_computed) = message.priority_score {
-            return pre_computed;
+            return RankedBy {
+                score: pre_computed,
+                factors: message.priority_factors,
+                at: message.timestamp,
+            };
         }
         // Fallback: no precomputed score (legacy/test paths). Same
         // reduced-signal adapter as merge_spot_groups's network-spot path.
@@ -2297,22 +2408,18 @@ impl App {
             atno: message.atno,
             band_needed: message.band_needed,
             worked_before: message.worked_before,
+            recent_failure: false,
             rarity_tier: None,
             is_notable: false,
         };
-        let scorer = pancetta_qso::priority::PriorityScorer::new(
-            pancetta_qso::priority::PriorityWeights::default(),
-            Box::new(adapter),
-        );
-        let freq_hz = message.frequency * 1_000_000.0;
-        scorer
-            .score_tiered(
-                message.call_sign.as_deref().unwrap_or(""),
-                message.grid_square.as_deref(),
-                message.snr.clamp(-128, 127) as i8,
-                freq_hz,
-            )
-            .as_display_u32()
+        tui_rank(
+            adapter,
+            message.call_sign.as_deref().unwrap_or(""),
+            message.grid_square.as_deref(),
+            message.snr,
+            message.frequency,
+            message.timestamp,
+        )
     }
 
     fn scroll_up(&mut self) {
@@ -2640,7 +2747,7 @@ impl App {
     /// last heard (operator request). The underlying `dx_stations` store keeps
     /// it for the 24 h `cleanup_old_data` window (snapshots / worked tracking);
     /// this only governs what the operator sees as "current" DX.
-    const DX_HUNTER_STALE_SECS: i64 = 180; // 3 minutes
+    pub(crate) const DX_HUNTER_STALE_SECS: i64 = 180; // 3 minutes
     /// Cap on the number of bands kept in the snapshot cache so memory stays
     /// bounded regardless of how much the operator band-hops.
     const BAND_CACHE_MAX: usize = 4;
@@ -3022,6 +3129,7 @@ impl App {
             atno: false,
             band_needed: false,
             priority_score: None,
+            priority_factors: None,
             is_own_tx: true,
         });
         // Same highlight-preservation bump `add_decoded_message` does
@@ -3158,6 +3266,8 @@ impl App {
             atno,
             band_needed,
             priority_score: 0,
+            local_rank: None,
+            network_rank: None,
             source: SpotSource::Local,
             entity_name: None,
             rarity_tier: None,
@@ -3273,6 +3383,42 @@ impl App {
         if was_at_end || self.show_recent_qsos && self.recent_qsos.len() == 1 {
             self.recent_qsos_scroll = self.recent_qsos.len().saturating_sub(1);
         }
+    }
+
+    /// Replace a row's local-decode rank with the relay's rescore after a QSO
+    /// with that station ended (PAN-94), and rescore its cqdx spot with the
+    /// same history so a stale network score cannot keep the row up. Keeps
+    /// when each source was heard; rows with no local decode are left alone.
+    ///
+    /// A completed QSO (`worked_on_band`) also marks the row and its retained
+    /// decodes worked, so the DX Hunter partition and the Station card agree
+    /// with the Why line before the station is decoded again (PAN-228).
+    /// Decodes match by the relay's hash-render identity, not by base call.
+    pub fn refresh_local_rank(&mut self, callsign: &str, score: u32, factors: PriorityFactors) {
+        let Some(entry) = self.dx_stations.get_mut(callsign) else {
+            return;
+        };
+        let Some(rank) = entry.local_rank.as_mut() else {
+            return;
+        };
+        rank.score = score;
+        rank.factors = Some(factors);
+        if factors.worked_on_band {
+            entry.worked_before = true;
+            for m in &mut self.decoded_messages {
+                if m.call_sign
+                    .as_deref()
+                    .is_some_and(|c| same_station(c, callsign))
+                {
+                    m.worked_before = true;
+                }
+            }
+        }
+        if let Some(network_at) = entry.network_rank.map(|rank| rank.at) {
+            entry.network_rank = Some(entry.score_network_spot(network_at));
+        }
+        entry.refresh_priority_score();
+        self.clamp_dx_hunter_selection();
     }
 
     /// Apply a fresh TX-placement snapshot (relayed from the coordinator's
@@ -3837,6 +3983,14 @@ impl App {
     /// The station under the operator's attention: the ACTIVE panel's pinned
     /// (or cursor-resolved) callsign. One focus, shared by every panel —
     /// renderers highlight it everywhere via `is_focused`.
+    pub fn dx_station_for(&self, call: &str) -> Option<&DxStation> {
+        self.dx_stations.get(call).or_else(|| {
+            self.dx_stations
+                .values()
+                .find(|row| pancetta_core::callsign::callsigns_match(&row.call_sign, call))
+        })
+    }
+
     pub fn focused_callsign(&self) -> Option<String> {
         match self.active_panel {
             ActivePanel::BandActivity => self
@@ -4253,6 +4407,8 @@ impl App {
                     // rely on cqdx's own `needed`/`atno` flags instead.
                     band_needed: false,
                     priority_score: 0,
+                    local_rank: None,
+                    network_rank: None,
                     source: SpotSource::Network,
                     entity_name: Some(spot.entity_name.clone()).filter(|s| !s.is_empty()),
                     rarity_tier: Some(spot.rarity_tier.clone()),
@@ -4296,34 +4452,11 @@ impl App {
                 }
             }
 
-            // Score the spot. `is_new_dxcc` / `is_new_band` aren't tracked
-            // in the TUI (the coordinator owns the worked-set), so pass
-            // false; rarity_tier is the dominant term for cluster spots
-            // anyway. Keep the higher of any pre-existing local score and
-            // the network score so a station heard both ways doesn't lose
-            // rank on a merge tick.
-            let adapter = DxStationLookupAdapter {
-                needed: entry.needed,
-                atno: entry.atno,
-                band_needed: entry.band_needed,
-                worked_before: entry.worked_before,
-                rarity_tier: entry.rarity_tier.clone(),
-                is_notable: entry.is_notable,
-            };
-            let scorer = pancetta_qso::priority::PriorityScorer::new(
-                pancetta_qso::priority::PriorityWeights::default(),
-                Box::new(adapter),
-            );
-            let freq_hz = entry.frequency * 1_000_000.0;
-            let net_score = scorer
-                .score_tiered(
-                    &entry.call_sign,
-                    entry.grid_square.as_deref(),
-                    entry.snr.clamp(-128, 127) as i8,
-                    freq_hz,
-                )
-                .as_display_u32();
-            entry.priority_score = entry.priority_score.max(net_score);
+            // Replace this source's score using the latest spot signal.
+            // Local band/worked history remains available when previously decoded.
+            // The display chooses the higher of the two latest source scores.
+            entry.network_rank = Some(entry.score_network_spot(Utc::now()));
+            entry.refresh_priority_score();
         }
 
         // A network-spot merge can re-sort the DX-Hunter list; keep the cursor
@@ -4802,6 +4935,316 @@ fn band_plan_candidate_ranges(
 mod tests {
     use super::*;
 
+    fn reason_spot(call: &str, needed: bool) -> crate::tui_runner::CqdxSpotInfo {
+        crate::tui_runner::CqdxSpotInfo {
+            dx_call: call.into(),
+            band: "20m".into(),
+            mode: "FT8".into(),
+            frequency_hz: 14_074_000,
+            grid: Some("PM95".into()),
+            rarity_tier: "common".into(),
+            reporter_count: 1,
+            best_snr: Some(-7),
+            confidence: 0.9,
+            first_seen: Utc::now().timestamp(),
+            last_seen: Utc::now().timestamp(),
+            is_notable: false,
+            notable_type: None,
+            entity_name: "Japan".into(),
+            needed,
+            atno: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn local_score_follows_the_latest_decode() {
+        let mut app = fixture_app().await;
+        let mut msg = fixture_view("JA1ABC", -7);
+        msg.priority_score = Some(4600);
+        app.add_decoded_message(msg.clone()).await.unwrap();
+        msg.priority_score = Some(1200);
+        msg.worked_before = true;
+        msg.priority_factors = Some(
+            pancetta_qso::PriorityScorer::new(
+                pancetta_qso::priority::PriorityWeights::default(),
+                Box::new(pancetta_qso::priority::NullLookup),
+            )
+            .score_tiered_explained("JA1ABC", None, -7, 14_074_000.0)
+            .factors,
+        );
+        app.add_decoded_message(msg.clone()).await.unwrap();
+        let row = &app.dx_stations["JA1ABC"];
+        assert_eq!(row.priority_score, 1200);
+        let (origin, rank) = row.rank_basis().unwrap();
+        assert_eq!(origin, RankOrigin::LocalDecode);
+        assert_eq!(rank.factors, msg.priority_factors);
+    }
+
+    #[tokio::test]
+    async fn network_score_follows_the_latest_spot() {
+        let mut app = fixture_app().await;
+        app.merge_spot_groups(&[reason_spot("JA1ABC", true)]);
+        assert_eq!(app.dx_stations["JA1ABC"].priority_score / 1000, 4);
+        app.merge_spot_groups(&[reason_spot("JA1ABC", false)]);
+        assert_eq!(app.dx_stations["JA1ABC"].priority_score / 1000, 1);
+        let before = app.dx_stations["JA1ABC"].priority_score;
+        let mut weak = reason_spot("JA1ABC", false);
+        weak.best_snr = Some(-24);
+        app.merge_spot_groups(&[weak]);
+        let row = &app.dx_stations["JA1ABC"];
+        assert!(row.priority_score < before);
+        assert_eq!(row.network_rank.unwrap().factors.unwrap().snr_db, -24);
+    }
+
+    #[tokio::test]
+    async fn both_sources_display_the_higher_latest_score() {
+        let mut app = fixture_app().await;
+        let mut msg = fixture_view("JA1ABC", -7);
+        msg.priority_score = Some(1500);
+        app.add_decoded_message(msg.clone()).await.unwrap();
+        let mut spot = reason_spot("JA1ABC", false);
+        spot.is_notable = true;
+        app.merge_spot_groups(&[spot.clone()]);
+        let row = &app.dx_stations["JA1ABC"];
+        assert_eq!(row.priority_score, row.network_rank.unwrap().score);
+        assert_eq!(row.rank_basis().unwrap().0, RankOrigin::NetworkSpot);
+        msg.priority_score = Some(4100);
+        app.add_decoded_message(msg).await.unwrap();
+        spot.is_notable = false;
+        app.merge_spot_groups(&[spot]);
+        let row = &app.dx_stations["JA1ABC"];
+        assert_eq!(row.priority_score, 4100);
+        assert_eq!(row.rank_basis().unwrap().0, RankOrigin::LocalDecode);
+    }
+
+    #[tokio::test]
+    async fn qso_outcome_refresh_also_lowers_a_winning_network_rank() {
+        let mut app = fixture_app().await;
+        let mut msg = fixture_view("JA1ABC", -7);
+        msg.priority_score = Some(1500);
+        app.add_decoded_message(msg).await.unwrap();
+        let mut spot = reason_spot("JA1ABC", false);
+        spot.is_notable = true;
+        app.merge_spot_groups(&[spot.clone()]);
+        let row = &app.dx_stations["JA1ABC"];
+        assert_eq!(row.rank_basis().unwrap().0, RankOrigin::NetworkSpot);
+        let before = row.priority_score;
+        let spotted_at = row.network_rank.unwrap().at;
+
+        let mut factors = row.network_rank.unwrap().factors.unwrap();
+        factors.recent_failure = true;
+        app.refresh_local_rank("JA1ABC", 900, factors);
+        let row = &app.dx_stations["JA1ABC"];
+        let network = row.network_rank.unwrap();
+        assert!(network.factors.unwrap().recent_failure);
+        assert!(network.score < before, "{} >= {before}", network.score);
+        assert_eq!(network.at, spotted_at, "a rescore is not a new spot");
+        assert!(row.priority_score < before);
+
+        // The next spot keeps the session's failure history.
+        app.merge_spot_groups(&[spot]);
+        let network = app.dx_stations["JA1ABC"].network_rank.unwrap();
+        assert!(network.factors.unwrap().recent_failure);
+    }
+
+    /// Rescore factors as the relay sends them once a QSO with `call` ended.
+    fn outcome_factors(app: &App, call: &str, worked: bool, failed: bool) -> PriorityFactors {
+        let mut factors = app.dx_stations[call].local_rank.unwrap().factors.unwrap();
+        factors.worked_on_band = worked;
+        factors.recent_failure = failed;
+        factors
+    }
+
+    fn null_factors(call: &str) -> PriorityFactors {
+        pancetta_qso::PriorityScorer::new(
+            pancetta_qso::priority::PriorityWeights::default(),
+            Box::new(pancetta_qso::priority::NullLookup),
+        )
+        .score_tiered_explained(call, None, -7, 14_074_000.0)
+        .factors
+    }
+
+    async fn two_unworked_rows() -> App {
+        let mut app = fixture_app().await;
+        let mut lead = fixture_view("JA1ABC", -7);
+        lead.priority_score = Some(4100);
+        lead.priority_factors = Some(null_factors("JA1ABC"));
+        app.add_decoded_message(lead).await.unwrap();
+        let mut other = fixture_view("K1AAA", -7);
+        other.priority_score = Some(1500);
+        other.priority_factors = Some(null_factors("K1AAA"));
+        app.add_decoded_message(other).await.unwrap();
+        let order: Vec<_> = app
+            .displayed_dx_stations()
+            .iter()
+            .map(|s| s.call_sign.clone())
+            .collect();
+        assert_eq!(order, ["JA1ABC", "K1AAA"]);
+        app
+    }
+
+    /// PAN-228: a completed QSO marks the row worked before the station is
+    /// decoded again, so it leaves the unworked-first partition.
+    #[tokio::test]
+    async fn completed_qso_moves_the_row_out_of_the_unworked_partition() {
+        let mut app = two_unworked_rows().await;
+        let factors = outcome_factors(&app, "JA1ABC", true, false);
+        app.refresh_local_rank("JA1ABC", 4100, factors);
+        let order: Vec<_> = app
+            .displayed_dx_stations()
+            .iter()
+            .map(|s| (s.call_sign.clone(), s.worked_before))
+            .collect();
+        assert_eq!(
+            order,
+            [("K1AAA".to_owned(), false), ("JA1ABC".to_owned(), true)]
+        );
+        // The Station card reads the retained decode.
+        let decode = app
+            .decoded_messages
+            .iter()
+            .find(|m| m.call_sign.as_deref() == Some("JA1ABC"))
+            .unwrap();
+        assert!(decode.worked_before);
+        let other = app
+            .decoded_messages
+            .iter()
+            .find(|m| m.call_sign.as_deref() == Some("K1AAA"))
+            .unwrap();
+        assert!(!other.worked_before);
+    }
+
+    /// PAN-228: retained decodes match the completed call by the same
+    /// hash-render identity the relay's outcome refresh uses (PAN-94), and
+    /// never by base call.
+    #[tokio::test]
+    async fn completed_qso_marks_hash_rendered_decodes_only() {
+        let mut app = fixture_app().await;
+        let mut msg = fixture_view("JA1ABC", -7);
+        msg.priority_score = Some(1500);
+        msg.priority_factors = Some(null_factors("JA1ABC"));
+        app.add_decoded_message(msg).await.unwrap();
+        app.decoded_messages.push_back(fixture_view("<JA1ABC>", -7));
+        app.decoded_messages.push_back(fixture_view("JA1ABC/P", -7));
+        let factors = outcome_factors(&app, "JA1ABC", true, false);
+        app.refresh_local_rank("JA1ABC", 1500, factors);
+        let worked: Vec<_> = app
+            .decoded_messages
+            .iter()
+            .map(|m| (m.call_sign.clone().unwrap(), m.worked_before))
+            .collect();
+        assert_eq!(
+            worked,
+            [
+                ("JA1ABC".to_owned(), true),
+                ("<JA1ABC>".to_owned(), true),
+                ("JA1ABC/P".to_owned(), false),
+            ]
+        );
+    }
+
+    /// PAN-228: a failed QSO is not a worked station.
+    #[tokio::test]
+    async fn failed_qso_keeps_the_row_in_the_unworked_partition() {
+        let mut app = two_unworked_rows().await;
+        let factors = outcome_factors(&app, "JA1ABC", false, true);
+        app.refresh_local_rank("JA1ABC", 4100, factors);
+        let row = &app.dx_stations["JA1ABC"];
+        assert!(!row.worked_before);
+        assert_eq!(app.displayed_dx_stations()[0].call_sign, "JA1ABC");
+        assert!(app.decoded_messages.iter().all(|m| !m.worked_before));
+    }
+
+    #[tokio::test]
+    async fn equal_scores_prefer_the_local_basis() {
+        let mut app = fixture_app().await;
+        app.merge_spot_groups(&[reason_spot("JA1ABC", false)]);
+        let mut msg = fixture_view("JA1ABC", -7);
+        msg.priority_score = Some(app.dx_stations["JA1ABC"].priority_score);
+        app.add_decoded_message(msg).await.unwrap();
+        assert_eq!(
+            app.dx_stations["JA1ABC"].rank_basis().unwrap().0,
+            RankOrigin::LocalDecode
+        );
+    }
+
+    #[tokio::test]
+    async fn dx_cluster_spot_has_no_rank_and_sentinel_score() {
+        let mut app = fixture_app().await;
+        app.add_dx_spot(
+            "JA1ABC".into(),
+            14.074,
+            "FT8".into(),
+            -10,
+            false,
+            false,
+            false,
+            false,
+        );
+        let row = &app.dx_stations["JA1ABC"];
+        assert_eq!(row.priority_score, 0);
+        assert!(row.local_rank.is_none() && row.network_rank.is_none());
+    }
+
+    #[tokio::test]
+    async fn fallback_scoring_records_factors() {
+        let mut app = fixture_app().await;
+        let msg = fixture_view("JA1ABC", -7);
+        let expected = app.calculate_dx_priority(&msg);
+        app.add_decoded_message(msg).await.unwrap();
+        let row = &app.dx_stations["JA1ABC"];
+        assert_eq!(row.priority_score, expected.score);
+        assert!(row.local_rank.unwrap().factors.is_some());
+    }
+
+    #[tokio::test]
+    async fn precomputed_score_without_factors_is_kept() {
+        let mut app = fixture_app().await;
+        let mut msg = fixture_view("JA1ABC", -7);
+        msg.priority_score = Some(723);
+        app.add_decoded_message(msg).await.unwrap();
+        let rank = app.dx_stations["JA1ABC"].local_rank.unwrap();
+        assert_eq!(rank.score, 723);
+        assert_eq!(rank.factors, None);
+    }
+
+    #[tokio::test]
+    async fn pinned_selection_survives_a_score_drop_resort() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::DxHunter;
+        let mut msg = fixture_view("JA1ABC", -7);
+        msg.priority_score = Some(4600);
+        app.add_decoded_message(msg.clone()).await.unwrap();
+        let mut other = fixture_view("W1ABC", -7);
+        other.priority_score = Some(3000);
+        app.add_decoded_message(other).await.unwrap();
+        app.dx_hunter_scroll = 0;
+        app.repin_dx_hunter();
+        msg.priority_score = Some(1200);
+        app.add_decoded_message(msg).await.unwrap();
+        assert_eq!(app.focused_callsign().as_deref(), Some("JA1ABC"));
+        assert_eq!(
+            app.displayed_dx_stations()[app.dx_hunter_scroll].call_sign,
+            "JA1ABC"
+        );
+        assert_eq!(app.dx_hunter_scroll, 1);
+    }
+
+    #[tokio::test]
+    async fn pinned_selection_survives_a_network_drop_resort() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::DxHunter;
+        app.merge_spot_groups(&[reason_spot("JA1ABC", true)]);
+        let mut other = fixture_view("W1ABC", -7);
+        other.priority_score = Some(3000);
+        app.add_decoded_message(other).await.unwrap();
+        app.dx_hunter_scroll = 0;
+        app.repin_dx_hunter();
+        app.merge_spot_groups(&[reason_spot("JA1ABC", false)]);
+        assert_eq!(app.focused_callsign().as_deref(), Some("JA1ABC"));
+        assert_eq!(app.dx_hunter_scroll, 1);
+    }
+
     /// Monotonic counter giving each test its own `tui_state_path()`
     /// override, so concurrently-running tests never share (and race on)
     /// the same file — mirrors `tui_runner.rs`'s `TEST_STATE_PATH_COUNTER`
@@ -4827,6 +5270,7 @@ mod tests {
             atno: true,
             band_needed: false,
             worked_before: true,
+            recent_failure: true,
             rarity_tier: Some("rare".to_string()),
             is_notable: true,
         };
@@ -4834,9 +5278,9 @@ mod tests {
         assert!(adapter.is_atno("JA1ABC"));
         assert!(!adapter.is_dxcc_needed_on_band("JA1ABC", 14_074_000.0));
         assert!(adapter.is_duplicate("JA1ABC", 14_074_000.0));
+        assert!(adapter.is_recent_failure("JA1ABC"));
         assert!(adapter.is_notable("JA1ABC"));
         assert!((adapter.rarity("JA1ABC") - 0.65).abs() < f64::EPSILON);
-        assert!(!adapter.is_recent_failure("JA1ABC"));
         assert!(!adapter.is_needed_grid("PM95"));
     }
 
@@ -4862,9 +5306,10 @@ mod tests {
             atno: true,
             band_needed: false,
             priority_score: None,
+            priority_factors: None,
             is_own_tx: false,
         };
-        let score = app.calculate_dx_priority(&message);
+        let score = app.calculate_dx_priority(&message).score;
         // ATNO + needed -> PriorityTier::Atno -> display range 5000-5999
         // (PAN-54 shifted every band +1000 to make room for the Suspect tier).
         // The old coarse dx_priority_score function would have scored this
@@ -4960,6 +5405,7 @@ mod tests {
             atno: false,
             band_needed: false,
             priority_score: None,
+            priority_factors: None,
             is_own_tx: false,
         }
     }
@@ -6534,6 +6980,8 @@ mod tests {
                 atno: false,
                 band_needed: false,
                 priority_score: 0,
+                local_rank: None,
+                network_rank: None,
                 source: SpotSource::Local,
                 entity_name: None,
                 rarity_tier: None,
@@ -6681,6 +7129,8 @@ mod tests {
             atno: false,
             band_needed: false,
             priority_score: priority,
+            local_rank: None,
+            network_rank: None,
             source: SpotSource::Local,
             entity_name: None,
             rarity_tier: None,

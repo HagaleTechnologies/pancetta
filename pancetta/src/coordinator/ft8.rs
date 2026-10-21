@@ -62,6 +62,7 @@ pub(crate) fn decode_budget_ceiling_ms(slot_ns: u64) -> u64 {
     }
 }
 
+<<<<<<< HEAD
 /// The `Ft8Config` fields a live `Ft8Decoder` bakes in at construction.
 /// When any of them changes, the hot loop rebuilds the decoder before it
 /// uses the budget published with that change. Every field
@@ -158,6 +159,20 @@ pub(crate) fn refresh_decode_window<E>(
         }
         Err(e) => DecodeWindowRefresh::RebuildFailed(e),
     }
+=======
+/// PAN-165: ms left on `budget` at `at` (`None` = unlimited).
+fn headroom_ms(budget: &pancetta_ft8::DecodeBudget, at: Instant) -> Option<u64> {
+    budget
+        .deadline()
+        .map(|d| d.saturating_duration_since(at).as_millis() as u64)
+}
+
+/// PAN-165: ms past `budget`'s deadline at `at` (0 when on time or unlimited).
+fn over_deadline_ms(budget: &pancetta_ft8::DecodeBudget, at: Instant) -> u64 {
+    budget
+        .deadline()
+        .map_or(0, |d| at.saturating_duration_since(d).as_millis() as u64)
+>>>>>>> a4726c339acda83e4f0481846509f62cdc127b60
 }
 
 /// Compute the active protocol's slot parity for a decoded window.
@@ -1609,9 +1624,16 @@ impl super::ApplicationCoordinator {
                         // whichever budgeted decode call(s) run this window
                         // (the scoped fast-path only runs conditionally; the
                         // primary native decode always runs) and reported once
-                        // at the end of the window.
+                        // at the end of the window. It counts only the
+                        // two decode calls; the pre-native breakdown
+                        // (waterfall, scoped, ft8_lib, headroom left when the
+                        // native call starts) is in the `window timing` line
+                        // instead (PAN-165).
                         let mut window_decode_elapsed_ms: u64 = 0;
                         let mut window_decode_budget_exhausted = false;
+                        // PAN-165: scoped fast-path time for this window's
+                        // `window timing` line (0 when it did not run).
+                        let mut window_scoped_ms: u64 = 0;
 
                         // Re-read the active protocol slot length/decode phase
                         // once per iteration (not once at thread startup) so a
@@ -1739,6 +1761,9 @@ impl super::ApplicationCoordinator {
 
                         info!("FT8 decoder: received window ({} samples)", window.len());
 
+                        // PAN-165: covers generation, normalisation and the
+                        // channel sends below, all time the native call loses.
+                        let waterfall_start = Instant::now();
                         // Generate waterfall data
                         let audio_f64: Vec<f64> = window.iter().map(|&s| s as f64).collect();
                         match decoder.generate_waterfall_data(&audio_f64) {
@@ -1825,6 +1850,7 @@ impl super::ApplicationCoordinator {
                                 warn!("Waterfall generation error: {}", e);
                             }
                         }
+                        let waterfall_ms = waterfall_start.elapsed().as_millis() as u64;
 
                         // hb-091 scoped fast-path: when activeQso is set
                         // and scoped_fast_path is enabled (hb-216 S2: set
@@ -1915,6 +1941,7 @@ impl super::ApplicationCoordinator {
                                     let scoped_elapsed_ms =
                                         scoped_call_start.elapsed().as_millis() as u64;
                                     window_decode_elapsed_ms += scoped_elapsed_ms;
+                                    window_scoped_ms = scoped_elapsed_ms;
                                     window_decode_budget_exhausted |= report.budget_exhausted;
                                     debug!(
                                         target: "decode.budget",
@@ -1996,6 +2023,7 @@ impl super::ApplicationCoordinator {
                         // use panic="unwind" for this. NOTE: a native abort
                         // inside the ft8_lib C code cannot unwind — the OS
                         // supervisor (docs/RUNBOOK.md) is the backstop for that.
+                        let ft8lib_start = Instant::now();
                         let ft8lib_messages = std::panic::catch_unwind(
                             std::panic::AssertUnwindSafe(|| {
                                 pancetta_ft8::Ft8Decoder::decode_window_ft8lib_protocol(
@@ -2014,6 +2042,7 @@ impl super::ApplicationCoordinator {
                             );
                             Vec::new()
                         });
+                        let ft8lib_ms = ft8lib_start.elapsed().as_millis() as u64;
 
                         // Secondary: our native decoder with AP enhancement.
                         //
@@ -2109,6 +2138,12 @@ impl super::ApplicationCoordinator {
                         // conditional scoped fast-path above), so it carries
                         // the representative per-window budget telemetry.
                         let native_call_start = Instant::now();
+                        // PAN-165: production's deadline is anchored at window
+                        // receipt, so this is what the native call really has.
+                        let pre_native_ms = native_call_start
+                            .duration_since(window_ready_at)
+                            .as_millis() as u64;
+                        let headroom_at_native = headroom_ms(&decode_budget, native_call_start);
                         let (native_messages, native_budget_report) = std::panic::catch_unwind(
                             std::panic::AssertUnwindSafe(|| {
                                 decoder.decode_window_with_ap_scoped_partner_budgeted(
@@ -2219,6 +2254,20 @@ impl super::ApplicationCoordinator {
                             "window total: elapsed={}ms exhausted={}",
                             window_decode_elapsed_ms,
                             window_decode_budget_exhausted,
+                        );
+                        let window_end = Instant::now();
+                        debug!(
+                            target: "decode.budget",
+                            "window timing: waterfall={}ms scoped={}ms ft8lib={}ms pre_native={}ms headroom_at_native={} native={}ms passes_run={} total={}ms over_deadline={}ms",
+                            waterfall_ms,
+                            window_scoped_ms,
+                            ft8lib_ms,
+                            pre_native_ms,
+                            headroom_at_native.map_or("unlimited".to_string(), |h| format!("{h}ms")),
+                            native_elapsed_ms,
+                            native_budget_report.passes_run,
+                            window_end.duration_since(window_ready_at).as_millis(),
+                            over_deadline_ms(&decode_budget, window_end),
                         );
 
                         health_total_decodes
@@ -3226,6 +3275,49 @@ mod slot_parity_for_receipt_tests {
         // different (correct) parity. A stale-cache bug would keep
         // returning `ft8_parity` for both.
         assert_ne!(ft8_parity, ft4_parity);
+    }
+}
+
+/// PAN-165: the pure helpers behind the hot loop's `window timing` line.
+#[cfg(test)]
+mod window_timing_tests {
+    use super::{headroom_ms, over_deadline_ms};
+    use pancetta_ft8::DecodeBudget;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn headroom_is_deadline_minus_instant() {
+        let base = Instant::now();
+        let b = DecodeBudget::until(base + Duration::from_millis(2000));
+        assert_eq!(
+            headroom_ms(&b, base + Duration::from_millis(500)),
+            Some(1500)
+        );
+    }
+
+    #[test]
+    fn headroom_saturates_at_zero_past_the_deadline() {
+        let base = Instant::now();
+        let b = DecodeBudget::until(base + Duration::from_millis(2000));
+        assert_eq!(headroom_ms(&b, base + Duration::from_millis(2600)), Some(0));
+    }
+
+    #[test]
+    fn over_deadline_is_zero_on_time_and_positive_when_late() {
+        let base = Instant::now();
+        let b = DecodeBudget::until(base + Duration::from_millis(2000));
+        assert_eq!(over_deadline_ms(&b, base + Duration::from_millis(1999)), 0);
+        assert_eq!(
+            over_deadline_ms(&b, base + Duration::from_millis(2600)),
+            600
+        );
+    }
+
+    #[test]
+    fn unlimited_budget_has_no_headroom_figure_and_never_overruns() {
+        let b = DecodeBudget::unlimited();
+        assert_eq!(headroom_ms(&b, Instant::now()), None);
+        assert_eq!(over_deadline_ms(&b, Instant::now()), 0);
     }
 }
 

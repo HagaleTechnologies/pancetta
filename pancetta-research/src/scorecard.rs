@@ -1,3 +1,4 @@
+use crate::decoder::{BudgetAnchor, WindowTiming};
 use crate::Mode;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -178,6 +179,127 @@ pub struct TierResult {
     /// don't preflight a curated manifest.
     #[serde(default)]
     pub preflight_seconds: f64,
+    /// PAN-165: per-window decode timing, recorded only when `eval` ran
+    /// with `--budget-anchor`. Absent from every unanchored scorecard.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub window_timing: Option<WindowTimingSummary>,
+    /// PAN-165: synth-pair strong/weak recovery, recorded only when `eval`
+    /// ran with `--budget-anchor` (the same totals the tier prints to
+    /// stderr). Absent from every unanchored scorecard.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub pair_recovery: Option<PairRecovery>,
+}
+
+/// PAN-165: distribution of one per-window timing field, in milliseconds.
+/// Percentiles use the same inclusive nearest-rank convention as
+/// [`TtfdDistribution`]: index `round(p * (n - 1))` of the sorted values.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Dist {
+    pub p50: f64,
+    pub p95: f64,
+    pub max: f64,
+    pub min: f64,
+}
+
+impl Dist {
+    /// `None` for an empty input.
+    pub fn from_values(values: impl IntoIterator<Item = f64>) -> Option<Self> {
+        let mut sorted: Vec<f64> = values.into_iter().collect();
+        if sorted.is_empty() {
+            return None;
+        }
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let n = sorted.len();
+        let pct = |p: f64| sorted[((p * (n - 1) as f64).round() as usize).min(n - 1)];
+        Some(Self {
+            p50: pct(0.50),
+            p95: pct(0.95),
+            max: sorted[n - 1],
+            min: sorted[0],
+        })
+    }
+}
+
+/// PAN-165: aggregate of a tier's per-window [`WindowTiming`]s, plus the
+/// run settings needed to read them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WindowTimingSummary {
+    /// `"call"` or `"receipt"` (see [`BudgetAnchor`]).
+    pub anchor: String,
+    /// Per-window budget in ms (`None` = unlimited).
+    pub budget_ms: Option<u64>,
+    /// Whether the ft8_lib FFI decoder was compiled in. With a stub, the
+    /// receipt model's `ft8lib_ms` understates production's cost.
+    pub ft8lib_available: bool,
+    /// Simulated QSO partner frequency, when `--qso-partner-hz` was set.
+    pub qso_partner_hz: Option<f64>,
+    /// Windows with a recorded timing.
+    pub windows: u32,
+    pub waterfall_ms: Dist,
+    /// `None` when the scoped fast-path call never ran.
+    pub scoped_ms: Option<Dist>,
+    pub ft8lib_ms: Dist,
+    pub pre_native_ms: Dist,
+    /// `None` under an unlimited budget.
+    pub headroom_at_native_ms: Option<Dist>,
+    pub native_ms: Dist,
+    pub window_total_ms: Dist,
+    /// Windows whose native call ran two or more multipass passes.
+    pub windows_multipass_ran: u32,
+    /// Windows whose native call ended past the deadline.
+    pub windows_over_deadline: u32,
+    /// Largest overrun past the deadline, in ms (0 when none overran).
+    pub max_over_deadline_ms: f64,
+}
+
+impl WindowTimingSummary {
+    /// `None` for an empty `timings` slice.
+    pub fn from_timings(
+        timings: &[WindowTiming],
+        anchor: BudgetAnchor,
+        budget_ms: Option<u64>,
+        ft8lib_available: bool,
+        qso_partner_hz: Option<f64>,
+    ) -> Option<Self> {
+        let dist = |field: fn(&WindowTiming) -> f64| Dist::from_values(timings.iter().map(field));
+        let scoped_ms = if timings.iter().any(|t| t.scoped_ms > 0.0) {
+            dist(|t| t.scoped_ms)
+        } else {
+            None
+        };
+        Some(Self {
+            anchor: anchor.as_str().to_string(),
+            budget_ms,
+            ft8lib_available,
+            qso_partner_hz,
+            windows: timings.len() as u32,
+            waterfall_ms: dist(|t| t.waterfall_ms)?,
+            scoped_ms,
+            ft8lib_ms: dist(|t| t.ft8lib_ms)?,
+            pre_native_ms: dist(|t| t.pre_native_ms)?,
+            headroom_at_native_ms: Dist::from_values(
+                timings.iter().filter_map(|t| t.headroom_at_native_ms),
+            ),
+            native_ms: dist(|t| t.native_ms)?,
+            window_total_ms: dist(|t| t.window_total_ms)?,
+            windows_multipass_ran: timings.iter().filter(|t| t.passes_run >= 2).count() as u32,
+            windows_over_deadline: timings.iter().filter(|t| t.over_deadline_ms > 0.0).count()
+                as u32,
+            max_over_deadline_ms: timings
+                .iter()
+                .map(|t| t.over_deadline_ms)
+                .fold(0.0, f64::max),
+        })
+    }
+}
+
+/// PAN-165: synth-pair recovery counts, so an anchored scorecard carries
+/// the weak-signal number rather than leaving it in stderr.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PairRecovery {
+    pub strong_recovered: u32,
+    pub weak_recovered: u32,
+    pub wavs: u32,
 }
 
 /// hb-129: aggregate Time-To-First-Decode distribution across WAVs in a tier.
@@ -348,6 +470,77 @@ mod tests {
         for w in d.per_wav_seconds.windows(2) {
             assert!(w[0] <= w[1]);
         }
+    }
+
+    fn timing(pre_native_ms: f64, over_deadline_ms: f64, passes_run: u32) -> WindowTiming {
+        WindowTiming {
+            waterfall_ms: 5.0,
+            ft8lib_ms: 13.0,
+            pre_native_ms,
+            headroom_at_native_ms: Some(2000.0 - pre_native_ms),
+            native_ms: 1500.0,
+            window_total_ms: pre_native_ms + 1500.0,
+            over_deadline_ms,
+            passes_run,
+            ..WindowTiming::default()
+        }
+    }
+
+    #[test]
+    fn window_timing_summary_aggregates_percentiles_and_overruns() {
+        let timings = [
+            timing(30.0, 0.0, 1),
+            timing(10.0, 120.5, 2),
+            timing(50.0, 0.0, 2),
+            timing(20.0, 40.0, 1),
+            timing(40.0, 0.0, 1),
+        ];
+        let s = WindowTimingSummary::from_timings(
+            &timings,
+            BudgetAnchor::Receipt,
+            Some(2000),
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.anchor, "receipt");
+        assert_eq!(s.windows, 5);
+        // Sorted pre_native: 10, 20, 30, 40, 50. p50 = idx round(0.5*4) = 2;
+        // p95 = idx round(0.95*4) = 4.
+        assert_eq!(
+            s.pre_native_ms,
+            Dist {
+                p50: 30.0,
+                p95: 50.0,
+                max: 50.0,
+                min: 10.0
+            }
+        );
+        assert_eq!(s.windows_over_deadline, 2);
+        assert_eq!(s.max_over_deadline_ms, 120.5);
+        assert_eq!(s.windows_multipass_ran, 2);
+        assert_eq!(s.scoped_ms, None);
+        assert_eq!(s.headroom_at_native_ms.unwrap().min, 1950.0);
+        assert!(WindowTimingSummary::from_timings(
+            &[],
+            BudgetAnchor::Receipt,
+            Some(2000),
+            true,
+            None
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn tier_result_without_window_timing_serializes_without_the_key() {
+        let json = serde_json::to_value(TierResult::default()).unwrap();
+        assert!(json.get("window_timing").is_none(), "{json}");
+    }
+
+    #[test]
+    fn tier_result_without_pair_recovery_serializes_without_the_key() {
+        let json = serde_json::to_value(TierResult::default()).unwrap();
+        assert!(json.get("pair_recovery").is_none(), "{json}");
     }
 
     #[test]
