@@ -5222,7 +5222,9 @@ pub fn remote_tx_permitted_for(
 }
 
 /// PAN-134: authorization for all four safety-critical sends. Evaluated
-/// inside MessageBus's read lock by `send_message_if`, after the lock wait.
+/// immediately before the enqueue: for audio inside MessageBus's read lock by
+/// `send_message_if`, after the lock wait; for PTT-on by
+/// `send_rig_command_if`, with no lock (PAN-202).
 /// Never check this and then use plain `send_message`: that restores the gap.
 fn tx_send_authorized(
     origin: crate::message_bus::TxOrigin,
