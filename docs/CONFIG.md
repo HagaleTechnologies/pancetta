@@ -404,9 +404,12 @@ with your TQSL certificate and handles the actual upload itself.
 
 When a QSO completes, pancetta can upload that single QSO (as one ADIF
 record) straight to your online logbooks. All four integrations are
-**opt-in and default `enabled = false`**. They run best-effort and never
-block or fail the QSO pipeline; results are logged under the
-`qso.upload` target. **Credentials stay local** — they are read from
+**opt-in and default `enabled = false`**. They never block or fail the
+QSO pipeline. ClubLog, QRZ Logbook, eQSL and cqdx.io uploads go through a
+durable pending-upload queue (`~/.pancetta/upload_outbox.json`) with
+retries and readiness-strip warnings — see
+[Upload retries and the pending-upload queue](#upload-retries-and-the-pending-upload-queue)
+below. Results are logged under the `qso.upload` target. **Credentials stay local** — they are read from
 this file and never logged. Keep the file readable only by you:
 `chmod 600 ~/.pancetta/pancetta.toml`.
 
@@ -414,8 +417,9 @@ this file and never logged. Keep the file readable only by you:
 > must be digitally signed with your TQSL certificate, not a raw ADIF
 > POST — so instead of an HTTP client, pancetta shells out to your
 > locally-installed `tqsl` binary per completed QSO (`[network.lotw]`
-> above). If `tqsl` is missing or fails, the upload is skipped
-> best-effort, same as ClubLog/QRZ. `~/.pancetta/qsos.adi` remains
+> above). If `tqsl` is missing or fails, the upload is skipped after
+> that single attempt: LoTW does not use the retry queue the HTTP
+> services use. `~/.pancetta/qsos.adi` remains
 > available if you'd rather point WSJT-X / TQSL at it manually.
 
 ```toml
@@ -498,6 +502,77 @@ poll_interval_secs = 30      # how often to poll for new priority spots
   than one "Profile" (QTH) configured on eQSL, set `qth_nickname` to the
   one uploads should file under; leave it empty for a single-location
   account.
+
+### Upload retries and the pending-upload queue
+
+Every ClubLog, QRZ Logbook, eQSL and cqdx.io upload for a completed QSO
+is written to `~/.pancetta/upload_outbox.json` **before** its first
+attempt, and leaves it only when the service accepts it (or reports it as
+a duplicate). The queue is sent again at every start, so a service
+outage or a restart no longer loses an upload. LoTW (tqsl) keeps its
+single attempt.
+
+`[network.reliability.retry]` sets the quick retries:
+
+```toml
+[network.reliability.retry]
+max_attempts       = 3       # tries in the quick burst, counting the first (>= 1)
+base_delay_ms      = 1000    # wait after the first failure
+max_delay_ms       = 10000   # cap on any quick-retry wait (>= base_delay_ms)
+backoff_multiplier = 2.0     # each wait = previous × this (>= 1.0)
+jitter_factor      = 0.1     # each wait varies by ± this fraction (0.0–1.0)
+```
+
+| Key | Meaning |
+|---|---|
+| `max_attempts` | Tries in the quick burst, counting the first. Must be at least 1. |
+| `base_delay_ms` | Wait after the first failure. Must not exceed `max_delay_ms`. |
+| `max_delay_ms` | Cap on any quick-retry wait. Upload retries never wait longer than 24 hours, whatever this says. |
+| `backoff_multiplier` | Each wait is the previous one times this. Finite, at least 1.0. |
+| `jitter_factor` | Each wait varies by ± this fraction. Finite, 0.0–1.0. |
+
+With the defaults a failing upload is tried at 0 s, about 1 s and about
+2 s. After that its service retries every 5 minutes until it accepts an
+upload again (and again at every start). Each service is retried on its
+own, one upload at a time, with sends spaced 1 s apart; an upload that
+keeps failing never blocks the ones behind it. A change to this section
+needs a restart.
+
+How failures are treated:
+
+- **Transient** (HTTP 5xx, 408/425/429, a timeout, a refused
+  connection, an unrecognised response page): retried as above. After
+  the quick retries the readiness strip shows
+  `⚠ <SERVICE> UPLOAD RETRYING · N QUEUED` until the service accepts an
+  upload again.
+- **Login rejected** (HTTP 401/403, QRZ `RESULT=AUTH`, an eQSL bad
+  login, an invalid cqdx.io token): pancetta stops sending to that
+  service for the session and shows `⚠ <SERVICE> LOGIN REJECTED`. Every
+  upload for it stays queued. Fix the credentials and restart; the held
+  uploads go out at startup.
+- **Record rejected** (any other 4xx, QRZ `RESULT=FAIL`, an oversized
+  response): that one upload is held and the strip shows
+  `⚠ <SERVICE> REJECTED N QSO(S)`; the others keep going. Held uploads
+  are tried again at the next start. Nothing is ever dropped
+  automatically.
+
+These are **warnings**: they can be acknowledged with `!`, are listed in
+the Shift+S station-status overlay, get one Shift+D diagnostics row per
+change, and never hold TX.
+
+The queue holds at most 5,000 uploads. Past that, new uploads are not
+queued (the strip shows `⚠ UPLOAD QUEUE FULL`); those QSOs are still in
+`~/.pancetta/qsos.adi`.
+
+The queue file (mode 0600 on Unix) is pretty-printed JSON holding QSO
+data only — credentials are added at send time and are never stored.
+Each entry has a `destination` (`clublog`, `qrz_logbook`, `eqsl`,
+`cqdx`), the `payload` that is sent, the attempt count, the last error
+and a `state` (`pending` or `held`). To discard queued uploads, stop
+pancetta and delete the file, or delete single entries from it. A file
+pancetta cannot read is never deleted: it is renamed to
+`upload_outbox.json.corrupt-<unix-seconds>` and pancetta starts with an
+empty queue. `--replay` never opens the queue.
 
 ### Customizing PSKReporter
 

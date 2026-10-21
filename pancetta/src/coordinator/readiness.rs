@@ -13,9 +13,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use pancetta_tui::readiness::{ClockState, StationReadiness, TxMuteCause as TuiTxMuteCause};
+use pancetta_tui::readiness::{
+    ClockState, StationReadiness, TxMuteCause as TuiTxMuteCause, UploadIssue, UploadIssueKind,
+};
 
 use super::tx::{self, TxMuteCause};
+use super::upload_outbox::{clip, OutboxTiming, UploadHealth};
 use crate::clock_skew::{ClockSkewShared, ClockStatus};
 use crate::message_bus::ComponentMessage;
 use tracing::debug;
@@ -33,6 +36,8 @@ pub(crate) struct ReadinessSources {
     ptt_off_unconfirmed: Arc<AtomicBool>,
     clock_skew: ClockSkewShared,
     degraded_summary: Arc<Mutex<Option<String>>>,
+    /// PAN-57: the upload worker's state.
+    upload_health: Arc<Mutex<UploadHealth>>,
     /// PAN-104: the shared audit log, read only through its health lock.
     audit: pancetta_agent::audit::AuditLog,
     /// The cause list of the previous snapshot, so a changed TX verdict is
@@ -54,6 +59,7 @@ impl ReadinessSources {
             ptt_off_unconfirmed: c.ptt_off_unconfirmed.clone(),
             clock_skew: c.clock_skew.clone(),
             degraded_summary: c.degraded_summary.clone(),
+            upload_health: c.upload_health.clone(),
             audit: c.audit_log(),
             last_tx_mute_causes: RefCell::new(None),
         }
@@ -83,6 +89,12 @@ impl ReadinessSources {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
+        let (upload_issues, upload_queue_refused) = tui_upload_issues(
+            &self
+                .upload_health
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
         let degraded = compose_degraded(supervisor, self.audit.health().unavailable);
         StationReadiness {
             tx_mute_causes,
@@ -91,8 +103,57 @@ impl ReadinessSources {
             degraded,
             rf_no_decode,
             input_silent,
+            upload_issues,
+            upload_queue_refused,
         }
     }
+}
+
+/// PAN-57: the strip's upload warnings. A login-rejected destination shows
+/// only that (its count is every upload it holds); otherwise held entries
+/// and the slow lane each show. Order follows `UploadDestination::ALL`.
+fn tui_upload_issues(h: &UploadHealth) -> (Vec<UploadIssue>, usize) {
+    let mut issues = Vec::new();
+    for d in &h.destinations {
+        let dest = d.destination;
+        let issue =
+            |kind, count, last_error: Option<&String>, last_call: Option<&String>| UploadIssue {
+                service: dest.label().to_string(),
+                config_section: dest.config_section().to_string(),
+                kind,
+                count,
+                last_error: clip(last_error.map(String::as_str).unwrap_or("")),
+                last_call: last_call.cloned(),
+            };
+        if let Some(reason) = d.login_rejected.as_ref() {
+            issues.push(issue(
+                UploadIssueKind::LoginRejected,
+                d.pending + d.held,
+                Some(reason),
+                None,
+            ));
+            continue;
+        }
+        if d.held > 0 {
+            issues.push(issue(
+                UploadIssueKind::Rejected,
+                d.held,
+                d.last_held_error.as_ref(),
+                d.last_held_call.as_ref(),
+            ));
+        }
+        if d.retrying {
+            issues.push(issue(
+                UploadIssueKind::Retrying {
+                    every_mins: OutboxTiming::PRODUCTION.slow_retry_mins(),
+                },
+                d.pending,
+                d.last_error.as_ref(),
+                None,
+            ));
+        }
+    }
+    (issues, h.refused_full)
 }
 
 /// PAN-104: the strip's degraded text — the supervisor's summary, with the
@@ -170,6 +231,8 @@ impl ReadinessPublisher {
 mod tests {
     use super::*;
     use crate::coordinator::hamlib::RigConnState;
+    use crate::coordinator::upload_outbox::DestinationHealth;
+    use pancetta_dx::upload_outbox::UploadDestination;
 
     fn sources() -> ReadinessSources {
         ReadinessSources {
@@ -184,6 +247,7 @@ mod tests {
             ptt_off_unconfirmed: Arc::new(AtomicBool::new(false)),
             clock_skew: ClockSkewShared::new(),
             degraded_summary: Arc::new(Mutex::new(None)),
+            upload_health: Arc::new(Mutex::new(UploadHealth::default())),
             // Never written by these tests, so it stays healthy.
             audit: pancetta_agent::audit::AuditLog::new(
                 std::env::temp_dir().join("pancetta-readiness-unused-audit.log"),
@@ -278,6 +342,8 @@ mod tests {
                 degraded: Some("dx_cluster: telnet closed".into()),
                 rf_no_decode: true,
                 input_silent: true,
+                upload_issues: vec![],
+                upload_queue_refused: 0,
             }
         );
 
@@ -298,6 +364,88 @@ mod tests {
             s.snapshot(false, false).degraded.as_deref(),
             Some("dx_cluster: telnet closed")
         );
+    }
+
+    fn dest_health(d: UploadDestination) -> DestinationHealth {
+        DestinationHealth {
+            destination: d,
+            pending: 0,
+            held: 0,
+            login_rejected: None,
+            retrying: false,
+            last_error: None,
+            last_held_call: None,
+            last_held_error: None,
+        }
+    }
+
+    #[test]
+    fn snapshot_maps_upload_health() {
+        let s = sources();
+        let long = "x".repeat(400);
+        *s.upload_health.lock().unwrap() = UploadHealth {
+            destinations: vec![
+                DestinationHealth {
+                    held: 2,
+                    last_held_call: Some("JA1XYZ".into()),
+                    last_held_error: Some("HTTP 400".into()),
+                    ..dest_health(UploadDestination::ClubLog)
+                },
+                DestinationHealth {
+                    pending: 2,
+                    held: 1,
+                    login_rejected: Some("RESULT=AUTH".into()),
+                    ..dest_health(UploadDestination::QrzLogbook)
+                },
+                DestinationHealth {
+                    pending: 4,
+                    retrying: true,
+                    last_error: Some(long),
+                    ..dest_health(UploadDestination::Eqsl)
+                },
+            ],
+            refused_full: 1,
+        };
+        let snap = s.snapshot(false, false);
+        assert_eq!(snap.upload_queue_refused, 1);
+        let kinds: Vec<_> = snap
+            .upload_issues
+            .iter()
+            .map(|i| (i.service.as_str(), i.kind, i.count))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("ClubLog", UploadIssueKind::Rejected, 2),
+                ("QRZ Logbook", UploadIssueKind::LoginRejected, 3),
+                ("eQSL", UploadIssueKind::Retrying { every_mins: 5 }, 4),
+            ]
+        );
+        assert_eq!(snap.upload_issues[0].last_call.as_deref(), Some("JA1XYZ"));
+        assert_eq!(
+            snap.upload_issues[1].config_section,
+            "[network.qrz_logbook]"
+        );
+        let cut = &snap.upload_issues[2].last_error;
+        assert_eq!(cut.chars().count(), 161);
+        assert!(cut.ends_with('…'));
+        // Upload trouble never reaches the TX causes.
+        assert!(snap.tx_mute_causes.is_empty());
+    }
+
+    #[test]
+    fn healthy_destinations_produce_no_issue() {
+        let s = sources();
+        *s.upload_health.lock().unwrap() = UploadHealth {
+            destinations: vec![DestinationHealth {
+                pending: 3,
+                ..dest_health(UploadDestination::ClubLog)
+            }],
+            refused_full: 0,
+        };
+        let snap = s.snapshot(false, false);
+        assert!(snap.upload_issues.is_empty());
+        assert_eq!(snap.upload_queue_refused, 0);
     }
 
     #[test]

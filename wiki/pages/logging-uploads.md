@@ -8,16 +8,18 @@ sources:
   - docs/DECISIONS/logging-uploads.md
   - pancetta/src/coordinator/qso.rs
 verified:
-  commit: eac7aab
-  date: 2026-07-07
+  commit: a13a126
+  date: 2026-10-17
 links:
   - overview
 ---
 QSO logging is an ADIF-first hybrid: `~/.pancetta/qsos.adi` is the durable,
 append-only, vendor-neutral source of truth, and `~/.pancetta/qso.db` is a
 disposable SQLite index rebuilt from it. On completion the coordinator
-best-effort uploads each QSO to any enabled online logbook (ClubLog, QRZ, cqdx,
-LoTW, eQSL), all default OFF. It is shaped this way so the operator's log
+uploads each QSO to any enabled online logbook (ClubLog, QRZ, cqdx, LoTW,
+eQSL), all default OFF. ClubLog/QRZ/eQSL/cqdx go through a durable
+pending-upload queue (`~/.pancetta/upload_outbox.json`, PAN-57) with retries,
+a slow lane and readiness-strip warnings; LoTW keeps a single tqsl attempt. It is shaped this way so the operator's log
 survives any store corruption and so uploads can never block or fail the QSO
 pipeline. Full digest: `docs/DECISIONS/logging-uploads.md`; cqdx contract:
 `docs/cqdx-api-requirements.md`.

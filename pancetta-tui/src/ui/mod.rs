@@ -2332,6 +2332,30 @@ mod view_render_tests {
     }
 
     #[tokio::test]
+    async fn strip_shows_upload_warning_chip() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.station_readiness = Some(crate::readiness::StationReadiness {
+            upload_issues: vec![crate::readiness::UploadIssue {
+                service: "QRZ Logbook".to_string(),
+                config_section: "[network.qrz_logbook]".to_string(),
+                kind: crate::readiness::UploadIssueKind::LoginRejected,
+                count: 3,
+                last_error: "QRZ Logbook insert rejected (RESULT=AUTH)".to_string(),
+                last_call: Some("K1ABC".to_string()),
+            }],
+            ..Default::default()
+        });
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(f, &app).unwrap()).unwrap();
+        let buf = term.backend().buffer().clone();
+        let row = row_text(&buf, 1);
+        assert!(row.contains("⚠ QRZ LOGBOOK LOGIN REJECTED"), "{row}");
+        assert!(row.contains("✓ TX READY"), "{row}");
+    }
+
+    #[tokio::test]
     async fn title_bar_no_longer_carries_alarm_chips() {
         let (buf, _) = strip_row_with_clock(Some(1.2), false).await;
         let title = row_text(&buf, 0);
@@ -2479,6 +2503,14 @@ mod view_render_tests {
             ptt_off_unconfirmed: true,
             clock: crate::readiness::ClockState::Unreachable,
             tx_mute_causes: vec![crate::readiness::TxMuteCause::RigDisconnected],
+            upload_issues: vec![crate::readiness::UploadIssue {
+                service: "eQSL".to_string(),
+                config_section: "[network.eqsl]".to_string(),
+                kind: crate::readiness::UploadIssueKind::Retrying { every_mins: 5 },
+                count: 4,
+                last_error: "HTTP 503".to_string(),
+                last_call: None,
+            }],
             ..Default::default()
         });
         app.tx_output_default = true;

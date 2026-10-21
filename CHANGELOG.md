@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Pending-upload queue for ClubLog, QRZ Logbook, eQSL and cqdx.io uploads
+  (PAN-57). Each completed QSO's uploads are saved to
+  `~/.pancetta/upload_outbox.json` before the first attempt and leave it only
+  when the service accepts them, so an outage, a rate limit or a restart no
+  longer loses an upload. Transient failures (5xx, 429, timeouts, refused
+  connections) are retried with capped exponential backoff and then every 5
+  minutes, and the queue is sent again at every start. A rejected login or
+  record now shows as an acknowledgeable readiness-strip warning
+  (`⚠ QRZ LOGBOOK LOGIN REJECTED`, `⚠ CLUBLOG REJECTED 1 QSO`,
+  `⚠ EQSL UPLOAD RETRYING · 4 QUEUED`, `⚠ UPLOAD QUEUE FULL`) with details in
+  Shift+S and one Shift+D row per change; upload warnings never hold TX.
+  LoTW keeps its single tqsl attempt.
+
 - Local TX log (PAN-122): every transmitted frame is appended to
   `~/.pancetta/tx-log.jsonl` as one JSON line (`v`, `utc`, `mode`, `dial_hz`,
   `offset_hz`, `text`, `origin`, `qso_id`), headless or with the TUI. The TX
@@ -397,8 +410,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `[network.reliability.retry]` now controls per-QSO upload retries
+  (PAN-57) and is validated: `max_attempts` must be at least 1,
+  `backoff_multiplier` finite and at least 1.0, `jitter_factor` finite and
+  between 0.0 and 1.0, and `base_delay_ms` not above `max_delay_ms`. The
+  defaults are unchanged.
+
 - DX Hunter scores follow the latest decode and cqdx spot, so a station drops
   after you work it or a QSO with it fails.
+
 - `pancetta --help` no longer claims general config hot-reload or unmeasured
   decoder, latency and memory figures; it says which settings apply live and
   points to the new Capability status table in README.md (PAN-124). That

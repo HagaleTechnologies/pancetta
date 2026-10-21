@@ -2889,6 +2889,8 @@ impl super::ApplicationCoordinator {
         let lotw_cfg = config.network.lotw.clone();
         let eqsl_cfg = config.network.eqsl.clone();
         let cqdx_cfg = config.network.cqdx.clone();
+        // PAN-57: the quick-retry schedule for the pending-upload queue.
+        let retry_cfg = config.network.reliability.retry.clone();
         // QRZ paid-XML callsign lookup — a gated, best-effort enrichment that
         // fills a MISSING their-grid (and name/dxcc for logging) on a completed
         // QSO's metadata before the ADIF record is rendered for upload.
@@ -2985,6 +2987,55 @@ impl super::ApplicationCoordinator {
 
         let qso_lookup = self.cached_lookup.clone();
         let upload_our_callsign = our_callsign.clone();
+
+        // PAN-57: ClubLog, QRZ Logbook, eQSL and cqdx.io uploads go through
+        // the one process-wide pending-upload worker. It is started on the
+        // first Qso start that has a destination and reused on every restart
+        // (a crash-restart can briefly leave the old subscriber alive; two
+        // writers on the queue file must never happen).
+        let outbox_dests = super::upload_outbox::outbox_destinations(
+            clublog_cfg.enabled,
+            qrz_cfg.enabled,
+            eqsl_cfg.enabled,
+            cqdx_upload_enabled,
+            replay_mode,
+        );
+        if upload_enabled && !outbox_dests.is_empty() && self.upload_outbox.is_none() {
+            let clients = super::upload_outbox::build_logbook_clients(
+                &clublog_cfg,
+                &qrz_cfg,
+                &eqsl_cfg,
+                &cqdx_cfg,
+                &upload_our_callsign,
+            );
+            let path = pancetta_home(&pancetta_home_override)
+                .join(".pancetta")
+                .join(pancetta_dx::upload_outbox::OUTBOX_FILE_NAME);
+            let schedule = pancetta_dx::upload_outbox::RetrySchedule::new(
+                retry_cfg.max_attempts,
+                retry_cfg.base_delay_ms,
+                retry_cfg.max_delay_ms,
+                retry_cfg.backoff_multiplier,
+                retry_cfg.jitter_factor,
+                super::upload_outbox::OutboxTiming::PRODUCTION.slow_retry,
+            );
+            let (handle, task) = super::upload_outbox::start_upload_outbox(
+                path,
+                std::sync::Arc::new(clients),
+                schedule,
+                super::upload_outbox::OutboxTiming::PRODUCTION,
+                self.upload_health.clone(),
+                Some(self.message_bus.clone()),
+                self.shutdown_signal.clone(),
+            );
+            self.upload_outbox = Some(handle);
+            self.upload_outbox_task = Some(task);
+        }
+        let upload_outbox = if outbox_dests.is_empty() {
+            None
+        } else {
+            self.upload_outbox.clone()
+        };
         let active_qso_ap = self.active_qso_ap.clone();
         // Task 5: `max_ap_qsos` is hot-reloadable, so the AP-context write
         // site below re-reads it fresh from this shared handle on every
@@ -3268,10 +3319,7 @@ impl super::ApplicationCoordinator {
                 // own doc comment) -- tests point it at an isolated temp dir so
                 // the replay-history-seed read below (and, outside replay, the
                 // real writers) never touch the operator's actual `~/.pancetta`.
-                let pancetta_home = pancetta_home_override
-                    .clone()
-                    .or_else(dirs::home_dir)
-                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                let pancetta_home = pancetta_home(&pancetta_home_override);
 
                 // Rebuildable SQLite index at ~/.pancetta/qso.db.
                 let db_path = pancetta_home.join(".pancetta").join("qso.db");
@@ -3306,18 +3354,16 @@ impl super::ApplicationCoordinator {
                 // + eQSL + LoTW), with optional QRZ-XML grid enrichment applied
                 // first. Opt-in: only spawned when at least one upload target OR
                 // QRZ XML enrichment is enabled, and never under `--replay`
-                // (see `upload_enabled`). Best-effort and fully decoupled
-                // from the QSO pipeline — each upload runs in its own task so a
-                // slow/failing service never blocks logging.
+                // (see `upload_enabled`). Fully decoupled from the QSO
+                // pipeline: ClubLog/QRZ/eQSL/cqdx.io uploads are handed to the
+                // durable pending-upload queue (PAN-57), which retries them
+                // and survives restarts; LoTW keeps its single tqsl attempt in
+                // its own task.
                 if upload_enabled {
                     start_qso_upload_subscriber(
-                        clublog_cfg.clone(),
-                        qrz_cfg.clone(),
+                        upload_outbox.clone(),
                         lotw_cfg.clone(),
-                        eqsl_cfg.clone(),
-                        cqdx_cfg.clone(),
                         qrz_xml_cfg.clone(),
-                        upload_our_callsign.clone(),
                         station_power_watts,
                         qso_manager.subscribe(),
                         shutdown.clone(),
@@ -8846,9 +8892,11 @@ mod auto_73_tests {
 /// `docs/cqdx-api-requirements.md`) — built from the same `QsoMetadata`, using
 /// the dial+offset RF frequency already stamped on the completed metadata.
 ///
-/// Best-effort by design: uploads are decoupled from the QSO pipeline and never
-/// block it. Each per-service upload is spawned in its own task. Successes log
-/// at `info!`, duplicates at `info!` (non-fatal), failures at `warn!` (target
+/// Decoupled from the QSO pipeline and never blocks it. ClubLog, QRZ
+/// Logbook, eQSL and cqdx.io uploads are handed to the durable pending-upload
+/// queue (`upload_outbox`, PAN-57), which retries them and survives restarts;
+/// LoTW keeps a single tqsl attempt in its own task. Successes log at
+/// `info!`, duplicates at `info!` (non-fatal), failures at `warn!` (target
 /// `"qso.upload"`). Credentials / tokens are never logged.
 /// Whether the opt-in cqdx.io per-QSO logbook upload should run: the
 /// `[network.cqdx]` integration must be enabled AND carry a non-empty PAT
@@ -8856,6 +8904,15 @@ mod auto_73_tests {
 /// subscriber never fires unless the operator opts in.
 fn cqdx_logbook_upload_enabled(cfg: &pancetta_config::network::CqdxConfig) -> bool {
     cfg.enabled && cfg.token.as_ref().is_some_and(|t| !t.is_empty())
+}
+
+/// The directory holding `.pancetta/`: the test-only override, else the home
+/// directory, else the working directory.
+fn pancetta_home(override_: &Option<std::path::PathBuf>) -> std::path::PathBuf {
+    override_
+        .clone()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
 /// Whether the per-QSO logbook upload subscriber should run at all: at least
@@ -9131,18 +9188,15 @@ async fn maybe_enrich_from_qrz(
     }
 }
 
-// rationale: one explicit config arg per upload destination (ClubLog, QRZ,
-// cqdx, LoTW, eQSL) plus the event source + shared handles — bundling them into
-// a struct would just move the same fields without improving clarity.
+// rationale: the queue handle, one explicit config arg per remaining direct
+// destination (LoTW, QRZ XML) plus the event source + shared handles —
+// bundling them into a struct would just move the same fields without
+// improving clarity.
 #[allow(clippy::too_many_arguments)]
 fn start_qso_upload_subscriber(
-    clublog_cfg: pancetta_config::network::ClubLogConfig,
-    qrz_cfg: pancetta_config::network::QrzLogbookConfig,
+    outbox: Option<super::upload_outbox::UploadOutboxHandle>,
     lotw_cfg: pancetta_config::network::LotwUploadConfig,
-    eqsl_cfg: pancetta_config::network::EqslConfig,
-    cqdx_cfg: pancetta_config::network::CqdxConfig,
     qrz_xml_cfg: pancetta_config::network::QrzXmlConfig,
-    our_callsign: String,
     station_power_watts: u32,
     mut events: tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -9150,58 +9204,8 @@ fn start_qso_upload_subscriber(
 ) {
     use std::sync::Arc;
 
-    // Build the enabled clients once and share them across uploads.
-    let clublog_client = if clublog_cfg.enabled {
-        // Fall back to the QSO's own call when no station call is configured.
-        let callsign = if clublog_cfg.callsign.is_empty() {
-            our_callsign.clone()
-        } else {
-            clublog_cfg.callsign.clone()
-        };
-        // An empty configured key falls back to Pancetta's own compiled-in
-        // ClubLog application key (empty on a source build) — resolved here,
-        // at point of use, rather than baked into the config value itself,
-        // so a rotated compiled key takes effect immediately with no config
-        // file changes and a config resave never freezes in a stale one.
-        let api_key = if clublog_cfg.api_key.is_empty() {
-            pancetta_config::default_clublog_api_key()
-        } else {
-            clublog_cfg.api_key.clone()
-        };
-        Some(Arc::new(pancetta_dx::ClubLogClient::new(
-            clublog_cfg.email.clone(),
-            clublog_cfg.password.clone(),
-            callsign,
-            api_key,
-        )))
-    } else {
-        None
-    };
-
-    let qrz_client = if qrz_cfg.enabled {
-        Some(Arc::new(pancetta_dx::QrzLogbookClient::new(
-            qrz_cfg.api_key.clone(),
-        )))
-    } else {
-        None
-    };
-
-    // eQSL.cc client. Opt-in: enabled + username/password (config validation
-    // already rejects enabled-without-creds). QTH nickname is optional.
-    let eqsl_client = if eqsl_cfg.enabled {
-        let nick = if eqsl_cfg.qth_nickname.is_empty() {
-            None
-        } else {
-            Some(eqsl_cfg.qth_nickname.clone())
-        };
-        Some(Arc::new(pancetta_dx::EqslClient::new(
-            eqsl_cfg.username.clone(),
-            eqsl_cfg.password.clone(),
-            nick,
-        )))
-    } else {
-        None
-    };
+    // ClubLog, QRZ Logbook, eQSL and cqdx.io clients live in the
+    // pending-upload worker (`upload_outbox::build_logbook_clients`).
 
     // LoTW client. Opt-in: enabled + tqsl_path + station_location (config
     // validation already rejects enabled-without-creds). Signs + uploads each
@@ -9212,30 +9216,6 @@ fn start_qso_upload_subscriber(
             lotw_cfg.tqsl_path.clone(),
             lotw_cfg.station_location.clone(),
         )))
-    } else {
-        None
-    };
-
-    // cqdx.io logbook client. Opt-in: enabled + a non-empty PAT token. A
-    // malformed token (CqdxClient::new validation) is logged once at WARN and
-    // simply disables the cqdx upload — it never takes down the subscriber.
-    let cqdx_client = if cqdx_cfg.enabled {
-        match cqdx_cfg.token.as_ref().filter(|t| !t.is_empty()) {
-            Some(token) => {
-                match pancetta_cqdx::CqdxClient::new(cqdx_cfg.base_url.clone(), token.clone()) {
-                    Ok(c) => Some(Arc::new(c)),
-                    Err(e) => {
-                        // Token value is wrapped/redacted; the error never prints it.
-                        warn!(
-                            target: "qso.upload",
-                            "cqdx.io upload disabled — client init failed: {}", e
-                        );
-                        None
-                    }
-                }
-            }
-            None => None,
-        }
     } else {
         None
     };
@@ -9266,20 +9246,8 @@ fn start_qso_upload_subscriber(
     let qrz_xml_cache: Arc<Mutex<HashMap<String, Option<pancetta_dx::QrzLookup>>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    if clublog_client.is_some() {
-        info!(target: "qso.upload", "ClubLog per-QSO upload enabled");
-    }
-    if qrz_client.is_some() {
-        info!(target: "qso.upload", "QRZ Logbook per-QSO upload enabled");
-    }
-    if eqsl_client.is_some() {
-        info!(target: "qso.upload", "eQSL.cc per-QSO upload enabled");
-    }
     if lotw_client.is_some() {
         info!(target: "qso.upload", "LoTW per-QSO (TQSL-signed) upload enabled");
-    }
-    if cqdx_client.is_some() {
-        info!(target: "qso.upload", "cqdx.io per-QSO logbook upload enabled");
     }
     if qrz_xml_client.is_some() {
         info!(
@@ -9330,69 +9298,35 @@ fn start_qso_upload_subscriber(
                         .clone()
                         .unwrap_or_else(|| "?".to_string());
 
-                    if let Some(client) = clublog_client.clone() {
-                        let record = record.clone();
-                        let their = their.clone();
-                        tokio::spawn(async move {
-                            match client.upload_adif(&record).await {
-                                Ok(()) => info!(
-                                    target: "qso.upload",
-                                    "ClubLog: uploaded QSO with {}", their
-                                ),
-                                Err(e) => warn!(
-                                    target: "qso.upload",
-                                    "ClubLog: upload failed for {}: {}", their, e
-                                ),
-                            }
-                        });
-                    }
-
-                    if let Some(client) = qrz_client.clone() {
-                        let record = record.clone();
-                        let their = their.clone();
-                        tokio::spawn(async move {
-                            match client.upload_adif(&record).await {
-                                Ok(pancetta_dx::QrzInsertOutcome::Inserted { logid }) => info!(
-                                    target: "qso.upload",
-                                    "QRZ: uploaded QSO with {} (logid={})",
-                                    their,
-                                    logid.as_deref().unwrap_or("?")
-                                ),
-                                Ok(pancetta_dx::QrzInsertOutcome::Duplicate { .. }) => info!(
-                                    target: "qso.upload",
-                                    "QRZ: QSO with {} already logged (duplicate, skipped)",
-                                    their
-                                ),
-                                Err(e) => warn!(
-                                    target: "qso.upload",
-                                    "QRZ: upload failed for {}: {}", their, e
-                                ),
-                            }
-                        });
-                    }
-
-                    // eQSL.cc takes the same rendered ADIF record (the client
-                    // prepends an ADIF header carrying the account credentials).
-                    if let Some(client) = eqsl_client.clone() {
-                        let record = record.clone();
-                        let their = their.clone();
-                        tokio::spawn(async move {
-                            match client.upload_adif(&record).await {
-                                Ok(pancetta_dx::QsoUploadOutcome::Logged) => info!(
-                                    target: "qso.upload",
-                                    "eQSL: uploaded QSO with {}", their
-                                ),
-                                Ok(pancetta_dx::QsoUploadOutcome::Duplicate) => info!(
-                                    target: "qso.upload",
-                                    "eQSL: QSO with {} already logged (duplicate, skipped)",
-                                    their
-                                ),
-                                Err(e) => warn!(
-                                    target: "qso.upload",
-                                    "eQSL: upload failed for {}: {}", their, e
-                                ),
-                            }
-                        });
+                    // PAN-57: ClubLog, QRZ Logbook, eQSL and cqdx.io go
+                    // through the durable pending-upload queue. ClubLog/QRZ/
+                    // eQSL take the rendered ADIF record (eQSL's client adds
+                    // its credential header at send time, so the queue never
+                    // stores a secret). cqdx.io takes the structured QsoRecord
+                    // its `POST /api/v1/qsos` endpoint expects, built once
+                    // here so every retry carries the same startTime/endTime
+                    // and hits the same idempotency key; it is skipped when
+                    // the contra-callsign is unknown. Frequency is the
+                    // dial+offset RF value already stamped on the metadata.
+                    if let Some(outbox) = &outbox {
+                        let cqdx_payload = if outbox
+                            .destinations()
+                            .contains(&pancetta_dx::upload_outbox::UploadDestination::Cqdx)
+                        {
+                            cqdx_record_from_metadata(&metadata)
+                                .and_then(|qso| serde_json::to_string(&qso).ok())
+                        } else {
+                            None
+                        };
+                        outbox
+                            .enqueue(super::upload_outbox::outbox_batch(
+                                metadata.qso_id,
+                                &their,
+                                &record,
+                                cqdx_payload,
+                                outbox.destinations(),
+                            ))
+                            .await;
                     }
 
                     // LoTW signs + uploads the same rendered ADIF record by
@@ -9418,34 +9352,6 @@ fn start_qso_upload_subscriber(
                                 ),
                             }
                         });
-                    }
-
-                    // cqdx.io takes the structured QsoRecord its
-                    // `POST /api/v1/qsos` endpoint expects (not ADIF). We only
-                    // have something to upload once the contra-callsign is
-                    // known; skip otherwise. Frequency is the dial+offset RF
-                    // value already stamped on the completed metadata.
-                    if let Some(client) = cqdx_client.clone() {
-                        if let Some(qso) = cqdx_record_from_metadata(&metadata) {
-                            let their = their.clone();
-                            tokio::spawn(async move {
-                                match client.log_qso(qso).await {
-                                    Ok(pancetta_cqdx::QsoUploadOutcome::Logged) => info!(
-                                        target: "qso.upload",
-                                        "cqdx.io: uploaded QSO with {}", their
-                                    ),
-                                    Ok(pancetta_cqdx::QsoUploadOutcome::Duplicate) => info!(
-                                        target: "qso.upload",
-                                        "cqdx.io: QSO with {} already logged (duplicate, skipped)",
-                                        their
-                                    ),
-                                    Err(e) => warn!(
-                                        target: "qso.upload",
-                                        "cqdx.io: upload failed for {}: {}", their, e
-                                    ),
-                                }
-                            });
-                        }
                     }
                 }
                 Ok(_) => {}
@@ -11006,6 +10912,92 @@ mod replay_history_seed_tests {
         .expect("coordinator creation should succeed");
         coordinator.pancetta_home_override = Some(home.to_path_buf());
         coordinator
+    }
+
+    /// PAN-57: the pending-upload worker is owned once per process. A Qso
+    /// restart re-runs `start_qso_component`, which must reuse the worker
+    /// rather than start a second writer on `upload_outbox.json`. With an
+    /// empty queue nothing is sent and no queue file is created.
+    #[tokio::test]
+    async fn upload_outbox_is_started_once_across_qso_restarts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut coordinator = live_coordinator_with_home(tmp.path()).await;
+        {
+            let mut cfg = coordinator.config.write().await;
+            cfg.network.clublog.enabled = true;
+            cfg.network.clublog.email = "op@example.com".to_string();
+            cfg.network.clublog.password = "dummy".to_string();
+            cfg.network.clublog.api_key = "dummy".to_string();
+        }
+        coordinator.start_qso_component().await.unwrap();
+        let first = coordinator
+            .upload_outbox
+            .clone()
+            .expect("ClubLog enabled on a live run starts the worker");
+        assert_eq!(
+            first.destinations(),
+            &[pancetta_dx::upload_outbox::UploadDestination::ClubLog]
+        );
+        coordinator.start_qso_component().await.unwrap();
+        let second = coordinator.upload_outbox.clone().unwrap();
+        assert!(
+            first.same_worker(&second),
+            "a Qso restart reuses the worker"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!tmp
+            .path()
+            .join(".pancetta")
+            .join(pancetta_dx::upload_outbox::OUTBOX_FILE_NAME)
+            .exists());
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// PAN-57: coordinator shutdown waits for the upload worker, so a batch
+    /// it has taken is saved before the runtime can cancel the task.
+    #[tokio::test]
+    async fn coordinator_shutdown_waits_for_the_upload_worker_to_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut coordinator = live_coordinator_with_home(tmp.path()).await;
+        {
+            let mut cfg = coordinator.config.write().await;
+            cfg.network.clublog.enabled = true;
+            cfg.network.clublog.email = "op@example.com".to_string();
+            cfg.network.clublog.password = "dummy".to_string();
+            cfg.network.clublog.api_key = "dummy".to_string();
+        }
+        coordinator.start_qso_component().await.unwrap();
+        let handle = coordinator.upload_outbox.clone().unwrap();
+        // Flag first, so the worker never sends (no network); the batch is
+        // still in the channel when shutdown starts.
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+        handle
+            .enqueue(vec![pancetta_dx::upload_outbox::NewUpload {
+                qso_id: uuid::Uuid::new_v4(),
+                destination: pancetta_dx::upload_outbox::UploadDestination::ClubLog,
+                call: "K1ABC".to_string(),
+                payload: "<CALL:5>K1ABC<EOR>".to_string(),
+            }])
+            .await;
+        coordinator.shutdown().await.unwrap();
+        // Shutdown returned only after the worker finished, not while it is
+        // still in its grace window.
+        assert!(
+            handle.worker_stopped(),
+            "shutdown did not wait for the worker"
+        );
+        drop(handle);
+        let path = tmp
+            .path()
+            .join(".pancetta")
+            .join(pancetta_dx::upload_outbox::OUTBOX_FILE_NAME);
+        let (store, _) = pancetta_dx::upload_outbox::OutboxStore::open(path);
+        assert_eq!(store.len(), 1, "batch taken before shutdown was saved");
+        assert_eq!(store.entries()[0].call, "K1ABC");
     }
 
     /// sophon 2026-10-07 / 2026-10-15: the SQLite logger opened `qso.db`

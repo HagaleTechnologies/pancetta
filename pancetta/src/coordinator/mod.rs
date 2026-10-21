@@ -41,6 +41,7 @@ mod tier;
 mod tui_relay;
 mod tx;
 mod tx_log;
+pub(crate) mod upload_outbox;
 mod util;
 mod wav_playback;
 pub(crate) mod wsjtx_udp;
@@ -1590,6 +1591,21 @@ pub struct ApplicationCoordinator {
     /// `component_status` lock, so the relay's OS thread can read it.
     pub(crate) degraded_summary: Arc<std::sync::Mutex<Option<String>>>,
 
+    /// PAN-57: the one process-wide pending-upload worker for ClubLog, QRZ
+    /// Logbook, eQSL and cqdx.io uploads. Started by the first
+    /// `start_qso_component` that has an upload destination and reused on
+    /// every Qso restart, so the queue file never has two writers.
+    pub(crate) upload_outbox: Option<upload_outbox::UploadOutboxHandle>,
+
+    /// PAN-57: the upload worker's task, awaited by `shutdown` so runtime
+    /// teardown never cancels it while it drains and saves the queue.
+    pub(crate) upload_outbox_task: Option<tokio::task::JoinHandle<()>>,
+
+    /// PAN-57: the upload worker's readiness view, read by the TUI relay's
+    /// readiness snapshot (`readiness::ReadinessSources`). A std mutex for
+    /// the same reason as `degraded_summary`.
+    pub(crate) upload_health: Arc<std::sync::Mutex<upload_outbox::UploadHealth>>,
+
     /// Command channel into the dedicated audio thread for **live device
     /// switching**. The TUI `SelectDevice` handler sends an
     /// [`AudioReopenRequest`](crate::coordinator::audio::AudioReopenRequest)
@@ -2350,6 +2366,9 @@ impl ApplicationCoordinator {
             ptt_off_unconfirmed: Arc::new(AtomicBool::new(false)),
             ptt_off_confirmations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             degraded_summary: Arc::new(std::sync::Mutex::new(None)),
+            upload_outbox: None,
+            upload_outbox_task: None,
+            upload_health: Arc::new(std::sync::Mutex::new(Default::default())),
             audio_reopen_tx: None,
             hamlib_reconnect_tx,
             hamlib_reconnect_rx: Some(hamlib_reconnect_rx),

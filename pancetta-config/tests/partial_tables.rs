@@ -197,6 +197,27 @@ model = "FTdx10"
     assert_eq!(c.rig.model, "FTdx10");
 }
 
+/// docs/CONFIG.md "Upload retries and the pending-upload queue" (PAN-57).
+#[test]
+fn config_md_upload_retry_recipe_parses() {
+    let c = load_recipe(
+        r#"[network.reliability.retry]
+max_attempts       = 3       # tries in the quick burst, counting the first (>= 1)
+base_delay_ms      = 1000    # wait after the first failure
+max_delay_ms       = 10000   # cap on any quick-retry wait (>= base_delay_ms)
+backoff_multiplier = 2.0     # each wait = previous × this (>= 1.0)
+jitter_factor      = 0.1     # each wait varies by ± this fraction (0.0–1.0)
+"#,
+    );
+    let r = &c.network.reliability.retry;
+    assert_eq!(r.max_attempts, 3);
+    assert_eq!(r.base_delay_ms, 1000);
+    assert_eq!(r.max_delay_ms, 10_000);
+    assert_eq!(r.backoff_multiplier, 2.0);
+    assert_eq!(r.jitter_factor, 0.1);
+    c.validate().expect("documented retry recipe validates");
+}
+
 /// An old example file's partial `[metadata]` table must not fail the load.
 #[test]
 fn partial_metadata_table_parses() {
