@@ -552,6 +552,21 @@ impl DxStation {
     }
 }
 
+/// Exact station identity for worked status: a resolved hash render matches
+/// its plain call, but a portable variant is a different station, matching
+/// the scorer's exact-call duplicate check (PAN-94, PAN-228).
+pub(crate) fn same_station(a: &str, b: &str) -> bool {
+    let a = a.trim().to_uppercase();
+    let b = b.trim().to_uppercase();
+    matches!(
+        (
+            pancetta_core::callsign::resolve_hash_render(&a),
+            pancetta_core::callsign::resolve_hash_render(&b),
+        ),
+        (Some(a), Some(b)) if a == b
+    )
+}
+
 fn tui_rank(
     adapter: DxStationLookupAdapter,
     call: &str,
@@ -3374,6 +3389,11 @@ impl App {
     /// with that station ended (PAN-94), and rescore its cqdx spot with the
     /// same history so a stale network score cannot keep the row up. Keeps
     /// when each source was heard; rows with no local decode are left alone.
+    ///
+    /// A completed QSO (`worked_on_band`) also marks the row and its retained
+    /// decodes worked, so the DX Hunter partition and the Station card agree
+    /// with the Why line before the station is decoded again (PAN-228).
+    /// Decodes match by the relay's hash-render identity, not by base call.
     pub fn refresh_local_rank(&mut self, callsign: &str, score: u32, factors: PriorityFactors) {
         let Some(entry) = self.dx_stations.get_mut(callsign) else {
             return;
@@ -3383,6 +3403,17 @@ impl App {
         };
         rank.score = score;
         rank.factors = Some(factors);
+        if factors.worked_on_band {
+            entry.worked_before = true;
+            for m in &mut self.decoded_messages {
+                if m.call_sign
+                    .as_deref()
+                    .is_some_and(|c| same_station(c, callsign))
+                {
+                    m.worked_before = true;
+                }
+            }
+        }
         if let Some(network_at) = entry.network_rank.map(|rank| rank.at) {
             entry.network_rank = Some(entry.score_network_spot(network_at));
         }
@@ -5014,6 +5045,114 @@ mod tests {
         app.merge_spot_groups(&[spot]);
         let network = app.dx_stations["JA1ABC"].network_rank.unwrap();
         assert!(network.factors.unwrap().recent_failure);
+    }
+
+    /// Rescore factors as the relay sends them once a QSO with `call` ended.
+    fn outcome_factors(app: &App, call: &str, worked: bool, failed: bool) -> PriorityFactors {
+        let mut factors = app.dx_stations[call].local_rank.unwrap().factors.unwrap();
+        factors.worked_on_band = worked;
+        factors.recent_failure = failed;
+        factors
+    }
+
+    fn null_factors(call: &str) -> PriorityFactors {
+        pancetta_qso::PriorityScorer::new(
+            pancetta_qso::priority::PriorityWeights::default(),
+            Box::new(pancetta_qso::priority::NullLookup),
+        )
+        .score_tiered_explained(call, None, -7, 14_074_000.0)
+        .factors
+    }
+
+    async fn two_unworked_rows() -> App {
+        let mut app = fixture_app().await;
+        let mut lead = fixture_view("JA1ABC", -7);
+        lead.priority_score = Some(4100);
+        lead.priority_factors = Some(null_factors("JA1ABC"));
+        app.add_decoded_message(lead).await.unwrap();
+        let mut other = fixture_view("K1AAA", -7);
+        other.priority_score = Some(1500);
+        other.priority_factors = Some(null_factors("K1AAA"));
+        app.add_decoded_message(other).await.unwrap();
+        let order: Vec<_> = app
+            .displayed_dx_stations()
+            .iter()
+            .map(|s| s.call_sign.clone())
+            .collect();
+        assert_eq!(order, ["JA1ABC", "K1AAA"]);
+        app
+    }
+
+    /// PAN-228: a completed QSO marks the row worked before the station is
+    /// decoded again, so it leaves the unworked-first partition.
+    #[tokio::test]
+    async fn completed_qso_moves_the_row_out_of_the_unworked_partition() {
+        let mut app = two_unworked_rows().await;
+        let factors = outcome_factors(&app, "JA1ABC", true, false);
+        app.refresh_local_rank("JA1ABC", 4100, factors);
+        let order: Vec<_> = app
+            .displayed_dx_stations()
+            .iter()
+            .map(|s| (s.call_sign.clone(), s.worked_before))
+            .collect();
+        assert_eq!(
+            order,
+            [("K1AAA".to_owned(), false), ("JA1ABC".to_owned(), true)]
+        );
+        // The Station card reads the retained decode.
+        let decode = app
+            .decoded_messages
+            .iter()
+            .find(|m| m.call_sign.as_deref() == Some("JA1ABC"))
+            .unwrap();
+        assert!(decode.worked_before);
+        let other = app
+            .decoded_messages
+            .iter()
+            .find(|m| m.call_sign.as_deref() == Some("K1AAA"))
+            .unwrap();
+        assert!(!other.worked_before);
+    }
+
+    /// PAN-228: retained decodes match the completed call by the same
+    /// hash-render identity the relay's outcome refresh uses (PAN-94), and
+    /// never by base call.
+    #[tokio::test]
+    async fn completed_qso_marks_hash_rendered_decodes_only() {
+        let mut app = fixture_app().await;
+        let mut msg = fixture_view("JA1ABC", -7);
+        msg.priority_score = Some(1500);
+        msg.priority_factors = Some(null_factors("JA1ABC"));
+        app.add_decoded_message(msg).await.unwrap();
+        app.decoded_messages.push_back(fixture_view("<JA1ABC>", -7));
+        app.decoded_messages.push_back(fixture_view("JA1ABC/P", -7));
+        let factors = outcome_factors(&app, "JA1ABC", true, false);
+        app.refresh_local_rank("JA1ABC", 1500, factors);
+        let worked: Vec<_> = app
+            .decoded_messages
+            .iter()
+            .map(|m| (m.call_sign.clone().unwrap(), m.worked_before))
+            .collect();
+        assert_eq!(
+            worked,
+            [
+                ("JA1ABC".to_owned(), true),
+                ("<JA1ABC>".to_owned(), true),
+                ("JA1ABC/P".to_owned(), false),
+            ]
+        );
+    }
+
+    /// PAN-228: a failed QSO is not a worked station.
+    #[tokio::test]
+    async fn failed_qso_keeps_the_row_in_the_unworked_partition() {
+        let mut app = two_unworked_rows().await;
+        let factors = outcome_factors(&app, "JA1ABC", false, true);
+        app.refresh_local_rank("JA1ABC", 4100, factors);
+        let row = &app.dx_stations["JA1ABC"];
+        assert!(!row.worked_before);
+        assert_eq!(app.displayed_dx_stations()[0].call_sign, "JA1ABC");
+        assert!(app.decoded_messages.iter().all(|m| !m.worked_before));
     }
 
     #[tokio::test]
