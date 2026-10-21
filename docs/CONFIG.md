@@ -527,7 +527,7 @@ jitter_factor      = 0.1     # each wait varies by ± this fraction (0.0–1.0)
 |---|---|
 | `max_attempts` | Tries in the quick burst, counting the first. Must be at least 1. |
 | `base_delay_ms` | Wait after the first failure. Must not exceed `max_delay_ms`. |
-| `max_delay_ms` | Cap on any quick-retry wait. |
+| `max_delay_ms` | Cap on any quick-retry wait. Upload retries never wait longer than 24 hours, whatever this says. |
 | `backoff_multiplier` | Each wait is the previous one times this. Finite, at least 1.0. |
 | `jitter_factor` | Each wait varies by ± this fraction. Finite, 0.0–1.0. |
 

@@ -332,6 +332,10 @@ pub(crate) struct OutboxTiming {
     pub drain_spacing: Duration,
     /// How often the worker wakes up to look for due work.
     pub tick: Duration,
+    /// After shutdown, how long the worker keeps taking new batches (a
+    /// subscriber may already be handling a completed QSO) before it closes
+    /// the channel. Ends early once every handle is dropped.
+    pub shutdown_grace: Duration,
 }
 
 impl OutboxTiming {
@@ -339,6 +343,7 @@ impl OutboxTiming {
         slow_retry: Duration::from_secs(300),
         drain_spacing: Duration::from_secs(1),
         tick: Duration::from_secs(1),
+        shutdown_grace: Duration::from_secs(2),
     };
 
     /// The slow-lane interval in whole minutes (at least 1), for display.
@@ -590,9 +595,25 @@ impl<T: OutboxTransport> Worker<T> {
                 _ = tokio::time::sleep(self.timing.tick) => {}
             }
         }
-        // Shutdown: start no new attempts, but save every batch the channel
-        // already took. Closing first makes a later `enqueue` fail at once
-        // instead of leaving its batch unread in the channel.
+        // Shutdown: start no new attempts. A subscriber that was already
+        // handling a completed QSO when the flag flipped enqueues just after
+        // it, so keep saving batches (and recording attempts that finish) for
+        // a short grace window, or until every handle is gone.
+        let grace = tokio::time::sleep(self.timing.shutdown_grace);
+        tokio::pin!(grace);
+        while inbox_open {
+            tokio::select! {
+                batch = inbox.recv() => match batch {
+                    Some(batch) => self.on_batch(&mut store, batch).await,
+                    None => inbox_open = false,
+                },
+                Some(result) = results.recv() => self.on_result(&mut store, result).await,
+                _ = &mut grace => break,
+            }
+        }
+        // Then save every batch the channel already took. Closing first
+        // makes a later `enqueue` fail at once instead of leaving its batch
+        // unread in the channel.
         inbox.close();
         while let Some(batch) = inbox.recv().await {
             self.on_batch(&mut store, batch).await;
@@ -968,6 +989,7 @@ mod tests {
         slow_retry: Duration::from_millis(200),
         drain_spacing: Duration::from_millis(5),
         tick: Duration::from_millis(5),
+        shutdown_grace: Duration::from_millis(100),
     };
 
     fn schedule() -> RetrySchedule {
@@ -1303,6 +1325,36 @@ mod tests {
         assert_eq!(store.len(), 1);
         assert_eq!(store.entries()[0].call, "K1ABC");
         assert_eq!(rig.transport.calls_to(ClubLog), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_saves_a_batch_enqueued_just_after_the_flag() {
+        // A subscriber still handling a completed QSO enqueues after the
+        // worker has already seen shutdown: the batch is saved, not sent.
+        let rig = start(FakeTransport::new(&[ClubLog]));
+        rig.shutdown.store(true, Ordering::Release);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!rig.task.is_finished(), "worker waits out the grace window");
+        rig.handle.enqueue(vec![upload(ClubLog, "K1ABC")]).await;
+        tokio::time::timeout(Duration::from_secs(1), rig.task)
+            .await
+            .expect("worker stops within 1s")
+            .unwrap();
+        let (store, _) = OutboxStore::open(rig.path.clone());
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.entries()[0].call, "K1ABC");
+        assert_eq!(rig.transport.calls_to(ClubLog), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_ends_early_once_every_handle_is_dropped() {
+        let rig = start(FakeTransport::new(&[ClubLog]));
+        rig.shutdown.store(true, Ordering::Release);
+        drop(rig.handle);
+        tokio::time::timeout(Duration::from_millis(50), rig.task)
+            .await
+            .expect("worker stops before the grace window ends")
+            .unwrap();
     }
 
     #[tokio::test]

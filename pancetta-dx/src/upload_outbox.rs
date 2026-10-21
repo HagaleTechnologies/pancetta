@@ -433,6 +433,16 @@ pub enum RetryDelay {
     Slow(Duration),
 }
 
+/// The longest wait any retry schedules, whatever the configuration says, so
+/// `Instant + wait` always stays representable.
+pub const MAX_RETRY_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// `now + wait`, with `wait` capped at [`MAX_RETRY_WAIT`]; never panics.
+fn due_after(now: Instant, wait: Duration) -> Instant {
+    let wait = wait.min(MAX_RETRY_WAIT);
+    now.checked_add(wait).unwrap_or(now)
+}
+
 /// Capped exponential backoff, then a slow lane.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RetrySchedule {
@@ -458,10 +468,12 @@ impl RetrySchedule {
         Self {
             max_attempts: max_attempts.max(1),
             base_ms: base_delay_ms as f64,
-            max_ms: max_delay_ms as f64,
+            // `max_delay_ms` bounds every quick retry; `MAX_RETRY_WAIT` bounds
+            // `max_delay_ms`.
+            max_ms: (max_delay_ms as f64).min(MAX_RETRY_WAIT.as_millis() as f64),
             multiplier: backoff_multiplier as f64,
             jitter: jitter_factor as f64,
-            slow: slow_retry,
+            slow: slow_retry.min(MAX_RETRY_WAIT),
         }
     }
 
@@ -522,7 +534,7 @@ impl Lane {
         self.in_flight = false;
         self.failures = 0;
         self.slow = false;
-        self.next_due = Some(now + spacing);
+        self.next_due = Some(due_after(now, spacing));
         recovered
     }
 
@@ -538,7 +550,7 @@ impl Lane {
                 d
             }
         };
-        self.next_due = Some(now + wait);
+        self.next_due = Some(due_after(now, wait));
         delay
     }
 
@@ -547,7 +559,7 @@ impl Lane {
         self.in_flight = false;
         self.failures = 0;
         self.slow = false;
-        self.next_due = Some(now + spacing);
+        self.next_due = Some(due_after(now, spacing));
     }
 
     /// The service refused the account: stop for this session.
@@ -650,6 +662,24 @@ mod tests {
             s.delay_after(5, -1.0),
             RetryDelay::Burst(Duration::from_millis(9000))
         );
+    }
+
+    #[test]
+    fn huge_configured_delays_never_overflow_the_deadline() {
+        // `base_delay_ms = max_delay_ms = u64::MAX` passes config validation;
+        // the wait is capped and `Lane::failed` must not panic on `Instant + wait`.
+        let s = RetrySchedule::new(3, u64::MAX, u64::MAX, 2.0, 1.0, Duration::MAX);
+        assert_eq!(s.delay_after(1, 1.0), RetryDelay::Burst(MAX_RETRY_WAIT));
+        assert_eq!(s.delay_after(3, 0.0), RetryDelay::Slow(MAX_RETRY_WAIT));
+        let mut lane = Lane::default();
+        let now = Instant::now();
+        lane.started();
+        lane.failed(now, &s, 1.0);
+        assert!(!lane.ready(now + MAX_RETRY_WAIT - Duration::from_millis(1)));
+        assert!(lane.ready(now + MAX_RETRY_WAIT));
+        lane.started();
+        lane.delivered(now, Duration::MAX);
+        assert!(lane.ready(now + MAX_RETRY_WAIT));
     }
 
     #[test]
