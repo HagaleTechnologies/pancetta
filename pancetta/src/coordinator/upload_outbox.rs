@@ -9,6 +9,11 @@
 //! for the session; a record rejection holds that one entry until the next
 //! start. The queue is drained again at every start.
 //!
+//! An upload is never sent before it is on disk: while the queue file cannot
+//! be written (disk full, directory unwritable), new uploads stay held in
+//! memory, the write is retried with capped backoff, and they are sent once
+//! a write succeeds.
+//!
 //! There is exactly one worker per process (owned by the coordinator, reused
 //! across Qso restarts), because a Qso crash-restart can briefly leave two
 //! upload subscribers alive, and two writers on one file must never happen.
@@ -17,7 +22,7 @@
 //! emitted as one Diagnostics row each. LoTW keeps its single tqsl attempt in
 //! the subscriber and never enters the queue.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -336,6 +341,10 @@ pub(crate) struct OutboxTiming {
     /// subscriber may already be handling a completed QSO) before it closes
     /// the channel. Ends early once every handle is dropped.
     pub shutdown_grace: Duration,
+    /// First retry delay after a failed queue write; doubles per failure.
+    pub persist_retry: Duration,
+    /// Longest delay between retries of a failing queue write.
+    pub persist_retry_cap: Duration,
 }
 
 impl OutboxTiming {
@@ -344,7 +353,17 @@ impl OutboxTiming {
         drain_spacing: Duration::from_secs(1),
         tick: Duration::from_secs(1),
         shutdown_grace: Duration::from_secs(2),
+        persist_retry: Duration::from_secs(1),
+        persist_retry_cap: Duration::from_secs(60),
     };
+
+    /// The wait before the next write attempt after `failures` failures.
+    fn persist_backoff(&self, failures: u32) -> Duration {
+        let shift = failures.saturating_sub(1).min(16);
+        self.persist_retry
+            .saturating_mul(1u32 << shift)
+            .min(self.persist_retry_cap)
+    }
 
     /// The slow-lane interval in whole minutes (at least 1), for display.
     pub(crate) fn slow_retry_mins(&self) -> u64 {
@@ -471,6 +490,9 @@ fn spawn_upload_outbox<T: OutboxTransport>(
         refused_full: 0,
         persist_blocked: false,
         persist_error_reported: false,
+        unsaved: HashSet::new(),
+        persist_failures: 0,
+        persist_retry_at: None,
         results_tx,
     };
     let task = tokio::spawn(worker.run(rx, results_rx));
@@ -494,6 +516,14 @@ struct Worker<T: OutboxTransport> {
     /// The unreadable queue file could not be moved aside: never overwrite it.
     persist_blocked: bool,
     persist_error_reported: bool,
+    /// Entries added since the last successful queue write: never sent
+    /// until a write succeeds.
+    unsaved: HashSet<Uuid>,
+    /// Consecutive failed queue writes.
+    persist_failures: u32,
+    /// When the next write retry is due; `Some` while the file on disk is
+    /// behind the queue in memory.
+    persist_retry_at: Option<Instant>,
     results_tx: mpsc::UnboundedSender<DeliveryResult>,
 }
 
@@ -585,6 +615,9 @@ impl<T: OutboxTransport> Worker<T> {
 
         let mut inbox_open = true;
         while !self.shutdown.load(Ordering::Acquire) {
+            if self.persist_retry_at.is_some_and(|at| Instant::now() >= at) {
+                self.persist(&store).await;
+            }
             self.dispatch(&store);
             tokio::select! {
                 batch = inbox.recv(), if inbox_open => match batch {
@@ -618,6 +651,10 @@ impl<T: OutboxTransport> Worker<T> {
         while let Some(batch) = inbox.recv().await {
             self.on_batch(&mut store, batch).await;
         }
+        // A last try to save anything still only in memory.
+        if self.persist_retry_at.is_some() {
+            self.persist(&store).await;
+        }
         debug!(target: "qso.upload", "upload queue worker stopped; {} uploads stay queued", store.len());
     }
 
@@ -632,6 +669,10 @@ impl<T: OutboxTransport> Worker<T> {
             let Some(entry) = store.next_for(d) else {
                 continue;
             };
+            if self.unsaved.contains(&entry.id) {
+                // Not on disk yet: held until a queue write succeeds.
+                continue;
+            }
             lane.started();
             let id = entry.id;
             let payload = entry.payload.clone();
@@ -645,8 +686,13 @@ impl<T: OutboxTransport> Worker<T> {
     }
 
     async fn on_batch(&mut self, store: &mut OutboxStore, batch: Vec<NewUpload>) {
+        let before = store.len();
         let r = store.add(batch, Utc::now());
         if r.added > 0 {
+            if !self.persist_blocked {
+                self.unsaved
+                    .extend(store.entries()[before..].iter().map(|e| e.id));
+            }
             self.persist(store).await;
         }
         if r.refused_full > 0 {
@@ -788,6 +834,9 @@ impl<T: OutboxTransport> Worker<T> {
     }
 
     /// Write the queue to disk (off the runtime threads) and wait for it.
+    ///
+    /// On success every held new upload becomes sendable. On failure they
+    /// stay held and the write is retried with capped backoff.
     async fn persist(&mut self, store: &OutboxStore) {
         if self.persist_blocked {
             return;
@@ -798,17 +847,44 @@ impl<T: OutboxTransport> Worker<T> {
                 match tokio::task::spawn_blocking(move || OutboxStore::write_atomic(&path, &bytes))
                     .await
                 {
-                    Ok(Ok(())) => return,
-                    Ok(Err(e)) => e.to_string(),
-                    Err(e) => e.to_string(),
+                    Ok(Ok(())) => None,
+                    Ok(Err(e)) => Some(e.to_string()),
+                    Err(e) => Some(e.to_string()),
                 }
             }
-            Err(e) => e.to_string(),
+            Err(e) => Some(e.to_string()),
         };
+        let Some(err) = err else {
+            let held = self.unsaved.len();
+            self.unsaved.clear();
+            self.persist_failures = 0;
+            self.persist_retry_at = None;
+            if self.persist_error_reported {
+                self.persist_error_reported = false;
+                info!(
+                    target: "qso.upload",
+                    "Upload queue saved to {} again — {} held upload(s) released",
+                    store.path().display(),
+                    held
+                );
+                self.diag(
+                    DiagnosticLevel::Info,
+                    format!("Upload queue saved again — {held} held upload(s) sending now"),
+                    None,
+                )
+                .await;
+            }
+            return;
+        };
+        self.persist_failures = self.persist_failures.saturating_add(1);
+        let wait = self.timing.persist_backoff(self.persist_failures);
+        self.persist_retry_at = Some(Instant::now() + wait);
         warn!(
             target: "qso.upload",
-            "Upload queue could not be saved to {}: {}",
+            "Upload queue could not be saved to {} ({} upload(s) held, retry in {}): {}",
             store.path().display(),
+            self.unsaved.len(),
+            format_wait(wait),
             err
         );
         if !self.persist_error_reported {
@@ -816,7 +892,7 @@ impl<T: OutboxTransport> Worker<T> {
             self.diag(
                 DiagnosticLevel::Error,
                 format!(
-                    "Upload queue could not be saved: {} — queued uploads will not survive a restart",
+                    "Upload queue could not be saved: {} — new uploads are held, not sent, until it can be saved; retrying",
                     clip(&err)
                 ),
                 None,
@@ -990,6 +1066,8 @@ mod tests {
         drain_spacing: Duration::from_millis(5),
         tick: Duration::from_millis(5),
         shutdown_grace: Duration::from_millis(100),
+        persist_retry: Duration::from_millis(5),
+        persist_retry_cap: Duration::from_millis(20),
     };
 
     fn schedule() -> RetrySchedule {
@@ -1433,6 +1511,142 @@ mod tests {
             "{}",
             rows[0].2
         );
+    }
+
+    /// A worker whose queue file sits in the (empty) directory `<dir>/q/`,
+    /// plus the `q` path. See [`block_writes`].
+    fn start_blockable(transport: FakeTransport, bus: Option<MessageBus>) -> (Rig, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let q = dir.path().join("q");
+        std::fs::create_dir(&q).unwrap();
+        let path = q.join(OUTBOX_FILE_NAME);
+        let transport = Arc::new(transport);
+        let health = Arc::new(std::sync::Mutex::new(UploadHealth::default()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (handle, task) = spawn_upload_outbox(
+            path.clone(),
+            OUTBOX_MAX_ENTRIES,
+            transport.clone(),
+            schedule(),
+            TIMING,
+            health.clone(),
+            bus,
+            shutdown.clone(),
+        );
+        let rig = Rig {
+            _dir: dir,
+            path,
+            transport,
+            handle,
+            task,
+            health,
+            shutdown,
+        };
+        (rig, q)
+    }
+
+    /// Swap the queue directory `q` for a regular file, so every queue write
+    /// fails (even as root). Removing the file lets writes succeed again.
+    ///
+    /// Async so the worker runs first: `#[tokio::test]` is a current-thread
+    /// runtime, and one yield lets the spawned worker open the queue (a
+    /// synchronous step) before `q` stops being a directory; otherwise the
+    /// open itself would fail and quarantine.
+    async fn block_writes(q: &std::path::Path) {
+        tokio::task::yield_now().await;
+        std::fs::remove_dir(q).unwrap();
+        std::fs::write(q, b"not a directory").unwrap();
+    }
+
+    fn diag_rows(
+        receiver: &crossbeam_channel::Receiver<crate::message_bus::ComponentMessage>,
+    ) -> Vec<(DiagnosticLevel, String)> {
+        let mut rows = Vec::new();
+        while let Ok(msg) = receiver.try_recv() {
+            if let crate::message_bus::MessageType::DiagnosticEvent { level, text, .. } =
+                msg.message_type
+            {
+                rows.push((level, text));
+            }
+        }
+        rows
+    }
+
+    #[tokio::test]
+    async fn failing_queue_write_holds_new_uploads_until_it_succeeds() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_s, receiver) = bus.create_channel(ComponentId::Tui).await.unwrap();
+        let notify = Arc::new(Notify::new());
+        let transport = FakeTransport {
+            block: Some(notify.clone()),
+            ..FakeTransport::new(&[ClubLog])
+        };
+        let (rig, q) = start_blockable(transport, Some(bus));
+        block_writes(&q).await;
+        rig.handle.enqueue(vec![upload(ClubLog, "K1ABC")]).await;
+        // Several retry periods pass: still nothing sent, nothing on disk.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(rig.transport.calls_to(ClubLog), 0, "sent before saved");
+        assert!(!rig.path.exists());
+        let rows = diag_rows(&receiver);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, DiagnosticLevel::Error);
+        assert!(
+            rows[0].1.contains("new uploads are held, not sent"),
+            "{}",
+            rows[0].1
+        );
+
+        // The write recovers on a retry: the upload is on disk before its
+        // first attempt, then delivered.
+        std::fs::remove_file(&q).unwrap();
+        wait_until(|| rig.transport.calls_to(ClubLog) == 1).await;
+        let on_disk = rig.entries();
+        assert_eq!(on_disk.len(), 1);
+        assert_eq!(on_disk[0].call, "K1ABC");
+        notify.notify_one();
+        wait_until(|| rig.entries().is_empty()).await;
+        assert_eq!(rig.transport.calls_to(ClubLog), 1);
+        let rows = diag_rows(&receiver);
+        assert!(
+            rows.iter()
+                .any(|(l, t)| *l == DiagnosticLevel::Info
+                    && t.starts_with("Upload queue saved again")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn queue_write_retries_back_off() {
+        let timing = TIMING;
+        assert_eq!(timing.persist_backoff(1), Duration::from_millis(5));
+        assert_eq!(timing.persist_backoff(2), Duration::from_millis(10));
+        assert_eq!(timing.persist_backoff(3), Duration::from_millis(20));
+        assert_eq!(timing.persist_backoff(4), Duration::from_millis(20));
+        assert_eq!(timing.persist_backoff(u32::MAX), Duration::from_millis(20));
+        let p = OutboxTiming::PRODUCTION;
+        assert_eq!(p.persist_backoff(1), Duration::from_secs(1));
+        assert_eq!(p.persist_backoff(40), Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn held_upload_is_saved_at_shutdown_once_the_write_recovers() {
+        let (rig, q) = start_blockable(FakeTransport::new(&[ClubLog]), None);
+        block_writes(&q).await;
+        rig.handle.enqueue(vec![upload(ClubLog, "K1ABC")]).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(rig.transport.calls_to(ClubLog), 0);
+        rig.shutdown.store(true, Ordering::Release);
+        std::fs::remove_file(&q).unwrap();
+        drop(rig.handle);
+        tokio::time::timeout(Duration::from_secs(1), rig.task)
+            .await
+            .expect("worker stops within 1s")
+            .unwrap();
+        let (store, _) = OutboxStore::open(rig.path.clone());
+        assert_eq!(store.len(), 1, "held upload lost at shutdown");
+        assert_eq!(store.entries()[0].call, "K1ABC");
+        assert_eq!(rig.transport.calls_to(ClubLog), 0);
     }
 
     // ----- Coordinator helpers ----------------------------------------------
