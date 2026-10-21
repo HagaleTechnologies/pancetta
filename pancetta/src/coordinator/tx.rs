@@ -9718,6 +9718,9 @@ impl super::ApplicationCoordinator {
                                                 )
                                             })
                                             .await;
+                                        // PR #468 review: playback is timed from the enqueue, so the
+                                        // bounded TX-log wait below never extends key-down past the audio.
+                                        let audio_enqueued_at = tokio::time::Instant::now();
                                         match outcome {
                                             Ok(SendIfOutcome::Enqueued) => {
                                                 // Band Activity's own-TX history logs the actual
@@ -9817,10 +9820,12 @@ impl super::ApplicationCoordinator {
                                         // supersedes it (aborts + re-keys), flushing the still-
                                         // playing samples on the retry's Step 7.
                                         // PAN-135: expected playback end bounds an unconfirmed disarm flush.
-                                        let playback_end = tokio::time::Instant::now()
+                                        let playback_end = audio_enqueued_at
                                             + Duration::from_millis(audio_duration_ms);
                                         match interruptible_sleep_or_supersede(
-                                            Duration::from_millis(audio_duration_ms),
+                                            playback_end.saturating_duration_since(
+                                                tokio::time::Instant::now(),
+                                            ),
                                             &shutdown,
                                             &abort_current_tx,
                                             &inbox,
@@ -12443,6 +12448,9 @@ impl super::ApplicationCoordinator {
                                             )
                                         })
                                         .await;
+                                    // PR #468 review: playback is timed from the enqueue, so the
+                                    // bounded TX-log wait below never extends key-down past the audio.
+                                    let audio_enqueued_at = tokio::time::Instant::now();
                                     match outcome {
                                         Ok(SendIfOutcome::Enqueued) => {
                                             // Band Activity's own-TX history logs the actual
@@ -12551,10 +12559,11 @@ impl super::ApplicationCoordinator {
                                     // supersedes the bundle (same bundle-add-or-replace decision
                                     // as Step 6 via `supersede_multi_reenqueue`).
                                     // PAN-135: expected playback end bounds an unconfirmed disarm flush.
-                                    let playback_end = tokio::time::Instant::now()
+                                    let playback_end = audio_enqueued_at
                                         + Duration::from_millis(audio_duration_ms);
                                     match interruptible_sleep_or_supersede(
-                                        Duration::from_millis(audio_duration_ms),
+                                        playback_end
+                                            .saturating_duration_since(tokio::time::Instant::now()),
                                         &shutdown,
                                         &abort_current_tx,
                                         &inbox,
@@ -23261,6 +23270,7 @@ mod pan135_worker_disarm_tests {
 mod pan122_tx_log_worker_tests {
     use super::super::tx_log::{
         tx_log_path, RotationPolicy, TxFrameLog, TxFrameRecord, TxLogAppend, WriterGate,
+        TX_LOG_ACK_WAIT,
     };
     use super::super::ApplicationCoordinator;
     use super::pan115_worker_gate_tests::{
@@ -23518,13 +23528,32 @@ mod pan122_tx_log_worker_tests {
             )));
         })
         .await;
+        let (_, audio_rx) = h
+            .coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Audio)
+            .await
+            .unwrap();
 
         request(&h, TEXT).await;
         let deadline = Instant::now() + Duration::from_secs(45);
         let mut ptt_on = false;
         let mut ptt_off_after_on = false;
+        let mut ptt_off_at = None;
+        let mut audio = None;
         let mut completed = None;
         while completed.is_none() && Instant::now() < deadline {
+            while let Ok(msg) = audio_rx.try_recv() {
+                if let MessageType::AudioOutput {
+                    samples,
+                    sample_rate,
+                    ..
+                } = msg.message_type
+                {
+                    let len = Duration::from_secs_f64(samples.len() as f64 / sample_rate as f64);
+                    audio.get_or_insert((Instant::now(), len));
+                }
+            }
             while let Ok(msg) = h.hamlib_rx.try_recv() {
                 if let MessageType::RigControl(RigControlMessage::SetPtt { state }) =
                     msg.message_type
@@ -23533,6 +23562,7 @@ mod pan122_tx_log_worker_tests {
                         ptt_on = true;
                     } else if ptt_on {
                         ptt_off_after_on = true;
+                        ptt_off_at.get_or_insert(Instant::now());
                     }
                 }
             }
@@ -23557,7 +23587,10 @@ mod pan122_tx_log_worker_tests {
                 if let MessageType::RigControl(RigControlMessage::SetPtt { state: false }) =
                     msg.message_type
                 {
-                    ptt_off_after_on |= ptt_on;
+                    if ptt_on {
+                        ptt_off_after_on = true;
+                        ptt_off_at.get_or_insert(Instant::now());
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -23569,6 +23602,15 @@ mod pan122_tx_log_worker_tests {
         );
         assert!(ptt_on, "PTT keyed");
         assert!(ptt_off_after_on, "PTT released while the writer is blocked");
+        // PR #468 review: the full TX_LOG_ACK_WAIT spent waiting on the blocked
+        // writer must not be added to key-down after the audio ends.
+        let (audio_at, audio_len) = audio.expect("audio enqueued");
+        let ptt_off_at = ptt_off_at.expect("PTT-off observed in the playback loop");
+        let overhang = ptt_off_at.saturating_duration_since(audio_at + audio_len);
+        assert!(
+            overhang < TX_LOG_ACK_WAIT - Duration::from_millis(50),
+            "PTT stayed keyed {overhang:?} past the audio (log wait leaked into playback)"
+        );
         assert!(
             tx_log_lines(&h).is_empty(),
             "the blocked writer wrote nothing"
