@@ -3019,7 +3019,7 @@ impl super::ApplicationCoordinator {
                 retry_cfg.jitter_factor,
                 super::upload_outbox::OutboxTiming::PRODUCTION.slow_retry,
             );
-            self.upload_outbox = Some(super::upload_outbox::start_upload_outbox(
+            let (handle, task) = super::upload_outbox::start_upload_outbox(
                 path,
                 std::sync::Arc::new(clients),
                 schedule,
@@ -3027,7 +3027,9 @@ impl super::ApplicationCoordinator {
                 self.upload_health.clone(),
                 Some(self.message_bus.clone()),
                 self.shutdown_signal.clone(),
-            ));
+            );
+            self.upload_outbox = Some(handle);
+            self.upload_outbox_task = Some(task);
         }
         let upload_outbox = if outbox_dests.is_empty() {
             None
@@ -10939,6 +10941,51 @@ mod replay_history_seed_tests {
         coordinator
             .shutdown_signal
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// PAN-57: coordinator shutdown waits for the upload worker, so a batch
+    /// it has taken is saved before the runtime can cancel the task.
+    #[tokio::test]
+    async fn coordinator_shutdown_waits_for_the_upload_worker_to_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut coordinator = live_coordinator_with_home(tmp.path()).await;
+        {
+            let mut cfg = coordinator.config.write().await;
+            cfg.network.clublog.enabled = true;
+            cfg.network.clublog.email = "op@example.com".to_string();
+            cfg.network.clublog.password = "dummy".to_string();
+            cfg.network.clublog.api_key = "dummy".to_string();
+        }
+        coordinator.start_qso_component().await.unwrap();
+        let handle = coordinator.upload_outbox.clone().unwrap();
+        // Flag first, so the worker never sends (no network); the batch is
+        // still in the channel when shutdown starts.
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+        handle
+            .enqueue(vec![pancetta_dx::upload_outbox::NewUpload {
+                qso_id: uuid::Uuid::new_v4(),
+                destination: pancetta_dx::upload_outbox::UploadDestination::ClubLog,
+                call: "K1ABC".to_string(),
+                payload: "<CALL:5>K1ABC<EOR>".to_string(),
+            }])
+            .await;
+        coordinator.shutdown().await.unwrap();
+        // Shutdown returned only after the worker finished, not while it is
+        // still in its grace window.
+        assert!(
+            handle.worker_stopped(),
+            "shutdown did not wait for the worker"
+        );
+        drop(handle);
+        let path = tmp
+            .path()
+            .join(".pancetta")
+            .join(pancetta_dx::upload_outbox::OUTBOX_FILE_NAME);
+        let (store, _) = pancetta_dx::upload_outbox::OutboxStore::open(path);
+        assert_eq!(store.len(), 1, "batch taken before shutdown was saved");
+        assert_eq!(store.entries()[0].call, "K1ABC");
     }
 
     /// sophon 2026-10-07 / 2026-10-15: the SQLite logger opened `qso.db`

@@ -1591,6 +1591,10 @@ pub struct ApplicationCoordinator {
     /// every Qso restart, so the queue file never has two writers.
     pub(crate) upload_outbox: Option<upload_outbox::UploadOutboxHandle>,
 
+    /// PAN-57: the upload worker's task, awaited by `shutdown` so runtime
+    /// teardown never cancels it while it drains and saves the queue.
+    pub(crate) upload_outbox_task: Option<tokio::task::JoinHandle<()>>,
+
     /// PAN-57: the upload worker's readiness view, read by the TUI relay's
     /// readiness snapshot (`readiness::ReadinessSources`). A std mutex for
     /// the same reason as `degraded_summary`.
@@ -2344,6 +2348,7 @@ impl ApplicationCoordinator {
             ptt_off_confirmations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             degraded_summary: Arc::new(std::sync::Mutex::new(None)),
             upload_outbox: None,
+            upload_outbox_task: None,
             upload_health: Arc::new(std::sync::Mutex::new(Default::default())),
             audio_reopen_tx: None,
             hamlib_reconnect_tx,

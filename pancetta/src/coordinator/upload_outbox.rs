@@ -427,6 +427,12 @@ impl UploadOutboxHandle {
         }
     }
 
+    /// Whether the worker has stopped taking batches (it closed its inbox).
+    #[cfg(test)]
+    pub(crate) fn worker_stopped(&self) -> bool {
+        self.tx.is_closed()
+    }
+
     /// Both handles talk to the same worker.
     #[cfg(test)]
     pub(crate) fn same_worker(&self, other: &Self) -> bool {
@@ -443,7 +449,7 @@ pub(crate) fn start_upload_outbox<T: OutboxTransport>(
     health: Arc<std::sync::Mutex<UploadHealth>>,
     bus: Option<MessageBus>,
     shutdown: Arc<AtomicBool>,
-) -> UploadOutboxHandle {
+) -> (UploadOutboxHandle, tokio::task::JoinHandle<()>) {
     spawn_upload_outbox(
         path,
         OUTBOX_MAX_ENTRIES,
@@ -454,11 +460,40 @@ pub(crate) fn start_upload_outbox<T: OutboxTransport>(
         bus,
         shutdown,
     )
-    .0
 }
 
-/// [`start_upload_outbox`] with an explicit queue capacity, also returning
-/// the worker task (tests await it).
+/// How long coordinator shutdown waits for the worker beyond its grace
+/// window: time to save the batches it already took and record attempts
+/// that finish.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
+
+/// Coordinator shutdown: drop the coordinator's own handle (so the worker's
+/// grace window can end once the subscribers are gone too) and wait for the
+/// worker to drain and save, bounded by the grace window plus
+/// [`SHUTDOWN_DRAIN`]. Awaiting it here keeps runtime teardown from
+/// cancelling the worker mid-save. The shutdown flag must already be set.
+pub(crate) async fn stop_upload_outbox(
+    handle: Option<UploadOutboxHandle>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    timing: OutboxTiming,
+) {
+    drop(handle);
+    let Some(task) = task else {
+        return;
+    };
+    let limit = timing.shutdown_grace + SHUTDOWN_DRAIN;
+    match tokio::time::timeout(limit, task).await {
+        Ok(Ok(())) => debug!(target: "qso.upload", "upload queue worker drained"),
+        Ok(Err(e)) => warn!(target: "qso.upload", "upload queue worker ended abnormally: {e}"),
+        Err(_) => warn!(
+            target: "qso.upload",
+            "upload queue worker still saving after {} — shutdown continues without it",
+            format_wait(limit)
+        ),
+    }
+}
+
+/// [`start_upload_outbox`] with an explicit queue capacity.
 // rationale: the same explicit inputs as `start_upload_outbox` plus the
 // capacity tests shrink; bundling them into a struct would only move the
 // fields.
@@ -576,7 +611,7 @@ impl<T: OutboxTransport> Worker<T> {
             );
             let text = if q.rename_failed {
                 format!(
-                    "Upload queue file was unreadable and could not be moved aside ({}) — queued uploads will not be saved this session",
+                    "Upload queue file was unreadable and could not be moved aside ({}) — new uploads are held, not sent, this session (the QSOs are in qsos.adi)",
                     q.reason
                 )
             } else {
@@ -689,10 +724,10 @@ impl<T: OutboxTransport> Worker<T> {
         let before = store.len();
         let r = store.add(batch, Utc::now());
         if r.added > 0 {
-            if !self.persist_blocked {
-                self.unsaved
-                    .extend(store.entries()[before..].iter().map(|e| e.id));
-            }
+            // Held until a write succeeds; with `persist_blocked` that is
+            // never this session, so they wait for the next start.
+            self.unsaved
+                .extend(store.entries()[before..].iter().map(|e| e.id));
             self.persist(store).await;
         }
         if r.refused_full > 0 {
@@ -1468,6 +1503,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn uploads_stay_held_when_the_unreadable_queue_cannot_be_moved_aside() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_s, receiver) = bus.create_channel(ComponentId::Tui).await.unwrap();
+        let (rig, q) = start_blockable(FakeTransport::new(&[ClubLog]), Some(bus));
+        // Before the worker's first poll: the queue path's directory is a
+        // file, so the open fails (not "missing") and so does the rename.
+        std::fs::remove_dir(&q).unwrap();
+        std::fs::write(&q, b"not a directory").unwrap();
+        rig.handle.enqueue(vec![upload(ClubLog, "K1ABC")]).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            rig.transport.calls_to(ClubLog),
+            0,
+            "sent with no durable copy"
+        );
+        let rows = diag_rows(&receiver);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, DiagnosticLevel::Error);
+        assert!(
+            rows[0].1.contains("could not be moved aside")
+                && rows[0].1.contains("new uploads are held, not sent"),
+            "{}",
+            rows[0].1
+        );
+        // The unreadable "file" is never overwritten.
+        assert_eq!(std::fs::read(&q).unwrap(), b"not a directory");
+    }
+
+    #[tokio::test]
+    async fn stop_upload_outbox_waits_for_the_worker_to_save() {
+        let rig = start(FakeTransport::new(&[ClubLog]));
+        rig.shutdown.store(true, Ordering::Release);
+        rig.handle.enqueue(vec![upload(ClubLog, "K1ABC")]).await;
+        // Current-thread runtime: the worker has not run yet, so only
+        // awaiting it gets the batch saved.
+        stop_upload_outbox(Some(rig.handle), Some(rig.task), TIMING).await;
+        let (store, _) = OutboxStore::open(rig.path.clone());
+        assert_eq!(store.len(), 1);
+        assert_eq!(rig.transport.calls_to(ClubLog), 0);
+    }
+
+    #[tokio::test]
     async fn login_rejection_emits_one_diagnostic_row() {
         let bus = MessageBus::new(16).unwrap();
         let (_s, receiver) = bus.create_channel(ComponentId::Tui).await.unwrap();
@@ -1838,7 +1915,8 @@ mod tests {
             health,
             None,
             Arc::new(AtomicBool::new(false)),
-        );
+        )
+        .0;
         handle
             .enqueue(vec![NewUpload {
                 qso_id: Uuid::new_v4(),
@@ -1884,7 +1962,8 @@ mod tests {
             Arc::new(std::sync::Mutex::new(UploadHealth::default())),
             None,
             Arc::new(AtomicBool::new(false)),
-        );
+        )
+        .0;
         handle
             .enqueue(vec![NewUpload {
                 qso_id: Uuid::new_v4(),
