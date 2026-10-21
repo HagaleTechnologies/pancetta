@@ -20,8 +20,8 @@ fix and a disclosure timeline with you.
 
 ## Supported Versions
 
-Pancetta is pre-1.0. Only the `main` branch is currently maintained for
-security updates. Tagged releases will be added to this table once they exist.
+Pancetta is pre-1.0. Only `main` receives security fixes; they ship in the
+next tagged release. Earlier tags (v0.9.5, v0.9.6) are not patched.
 
 ## Known Security Considerations
 
@@ -30,11 +30,22 @@ can make an informed deployment choice:
 
 ### Plaintext Credentials in Config Files
 
-`pancetta-config` accepts passwords for QRZ, LoTW, eQSL, Clublog, and HTTP
-proxies in `~/.pancetta/pancetta.toml`. **These values are stored as plaintext
-on disk** (the single-operator station trust model — the same posture as
-WSJT-X's `.ini`). The fields were previously misnamed `*_encrypted`; that name
-implied encryption that does not exist.
+`~/.pancetta/pancetta.toml` can hold these secrets, and **all of them are
+stored as plaintext on disk** (the single-operator station trust model — the
+same posture as WSJT-X's `.ini`):
+
+- the ClubLog password and API key;
+- the QRZ password and the QRZ Logbook API key;
+- the eQSL password;
+- the cqdx.io token;
+- `[network.remote_gateway].auth_token`;
+- the HTTP proxy password and the TLS key password.
+
+LoTW stores no credential here: TQSL holds your certificate, and Pancetta only
+records the `tqsl` path and station location. The unused `[network.web_api]`
+section still has fields named `key_encrypted` and `secret_encrypted`; nothing
+encrypts them. No running component reads `[network.web_api]` or
+`[network.proxy]`.
 
 Mitigations:
 
@@ -45,8 +56,6 @@ Mitigations:
   it yourself on Unix; on Windows the per-user profile ACL applies.
 - Never commit the config file to a shared repo (it lives in `~/.pancetta`,
   outside the source tree).
-- Prefer leaving these fields unset and supplying credentials at runtime via
-  environment variables when the integration supports it.
 - A future release may add OS-keyring lookup; until then, treat the config
   file as you would `~/.netrc`.
 
@@ -61,21 +70,37 @@ loopback unless you have a specific reason otherwise.
 
 Pancetta opens audio input and output streams via cpal. On macOS this
 triggers a Microphone permission prompt; on Linux it requires read access
-to the relevant ALSA / PulseAudio device. Pancetta does not transmit audio
-contents anywhere off the local machine — audio is consumed by the FT8
-decoder and discarded.
+to the relevant ALSA / PulseAudio device. Raw audio never leaves the
+machine. When remote operation is enabled, decoded messages and waterfall
+magnitudes are sent to authorized clients.
+
+### Remote Operation
+
+Both remote channels are off by default. The local gateway
+(`[network.remote_gateway]`) requires `auth_token`. It accepts browser pages
+only from origins in `allowed_origins`, which defaults to an empty list, and
+binds a non-loopback address only with `allow_network_exposure = true`.
+Remote TX through the station agent (`[network.station_agent]`) needs local
+consent (`remote_tx_enabled`) and a signed arm from an allow-listed client.
+Both sections are described in
+[docs/CONFIG.md](docs/CONFIG.md).
 
 ### `unsafe` Code
 
-The workspace contains `unsafe` blocks in:
+Production code contains `unsafe` in three files:
 
-- `pancetta-ft8` — SIMD intrinsics and FFI to the bundled `ft8_lib` C
-  decoder, contained in dedicated modules.
-- `pancetta-hamlib/src/bindings.rs` — currently dead-code FFI stubs for
-  libhamlib; not invoked by the active rigctld path. Slated for removal.
+- `pancetta-ft8/src/ft8_lib_ffi.rs` — FFI to the bundled `ft8_lib` C
+  decoder. The C struct layouts are pinned by compile-time size asserts, and
+  decoded text is read only within a bounded buffer.
+- `pancetta/src/runtime.rs` — the Linux `setpriority` call.
+- `pancetta-agent/src/arm.rs` — `clock_gettime`.
 
-Each `unsafe` block has a justification comment. Independent review of the
-SIMD and FFI boundaries is welcome.
+Only the `arm.rs` site carries a `SAFETY:` comment. The FFI module has no
+per-block justification comments; its safeguards are the layout asserts and
+the bounded-buffer text reader described above. The `runtime.rs` call has no
+justification comment either. `pancetta-protocol` forbids
+`unsafe_code` and `pancetta-qso` denies it. Independent review of the FFI
+boundary is welcome.
 
 ## Coordinated Disclosure
 

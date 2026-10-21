@@ -128,6 +128,46 @@ need to touch them; see `defaults.toml` for the full key list.
 input. Negative values attenuate; useful when a hot CODEC saturates the
 ADC even with the rig's audio output turned all the way down.
 
+### `[audio.recording]` — save decode windows as WAV (off by default)
+
+Pancetta can save every live decode window it hands the decoder as a WAV
+file, for offline decoder validation and corpus building. Recording is off
+unless you turn it on:
+
+```toml
+[audio.recording]
+auto_record = true
+directory = "~/.pancetta/recordings"
+```
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `auto_record` | bool | `false` | `true` writes one WAV per live decode window. |
+| `directory` | string | `"~/Documents/Pancetta/Recordings"` | Where recordings go; created if missing. A leading `~` is your home directory (`~user` is not expanded). Empty means `~/.pancetta/recordings`. |
+
+- Each file is a 12 kHz, mono, 16-bit WAV of one decode window (about
+  300 KB for FT8), named `ft8_<UTC date>_<time>[_<band>].wav`. Windows of
+  digital silence (rig off or unplugged) are skipped. A full day of FT8 is
+  about 1.7 GB.
+- The directory is capped at 10 GB of top-level `*.wav` files. Past that,
+  the oldest recording (by filename) is deleted for each new one.
+- With recording on, pancetta also saves the first 90 s of raw capture once
+  per start as `raw_48khz_diagnostic.wav` (about 17 MB) in the same directory.
+- `--replay` and `--no-audio` runs never record, whatever this says.
+- The other keys in this table (`format`, `bit_depth`, `sample_rate`,
+  `max_length_minutes`, `filename_pattern`, `compression_level`) are not
+  read. Recordings always use the format above.
+- Changes take effect after a restart.
+- The startup log says which way it went: `WAV recording enabled: dir=…`
+  or `WAV recording disabled -- set audio.recording.auto_record = true …`.
+
+**Station decoder corpus.** The corpus offload job (magazzino
+`clients/pancetta-wav-offload.sh`) and the decoder research tools
+(`curate --source-dir ~/.pancetta/recordings`, see docs/RUNBOOK.md) read
+`~/.pancetta/recordings`. A station that feeds them must set both keys as
+shown above. `auto_record = true` on its own records into the default
+`~/Documents/Pancetta/Recordings`, which nothing collects.
+
 ---
 
 ## `[rig]` — CAT control
@@ -173,7 +213,7 @@ edge_warnings = true  # master switch: the band-plan TX gate AND the TUI edge
 |---|---|---|---|
 | `region` | integer | `2` | Selects the IARU region tables (1, 2 or 3; they diverge on 40/60/80 m, 2 m, 70 cm). An invalid number falls back to the global table — never panics. |
 | `edge_warnings` | bool | `true` | Master switch for both the hard TX refusal and the TUI's manual-frequency-entry warning. `false` disables both: nothing is refused, nothing warns. |
-| `custom_bands."<band>"` | table | — | Overrides the region table for that band (in-band iff the RF falls within ANY of the entry's `ranges`, OR across ranges). Applies to frequencies the band table resolves to that band — the escape hatch for a national allocation narrower than your region's default. |
+| `custom_bands."<band>"` | table | — | Overrides the region table for that band (in-band iff the RF falls within ANY of the entry's `ranges`, OR across ranges). Applies to frequencies the band table resolves to that band — the escape hatch for a national allocation narrower than your region's default. The TUI's entry warning checks one frequency (OR across ranges); a transmission must fit entirely inside ONE of the entry's `ranges` (PAN-208), so a frame straddling the gap between two ranges is refused before PTT. |
 
 Since PAN-118 the band plan is enforced, not just displayed: every path that
 asserts PTT (scheduled FT8 transmissions and multi-TX bundle items, F4 tune,
@@ -184,8 +224,8 @@ offset — falls outside the plan, with a `TX blocked (TX frequency … Hz is
 outside the configured amateur band plan)` diagnostic. A multi-TX bundle
 drops only its out-of-privilege items; in-privilege siblings still key. The
 check is skipped while the dial is not yet known (mock rig / CAT-disabled
-modes). Edits take effect on restart — config is loaded once at startup, and
-the runtime hot-reload apply task is a documented no-op.
+modes). Edits take effect on restart (the band plan is not among the
+[live-applied settings](#hot-reload)).
 
 ---
 
@@ -549,6 +589,44 @@ entry, `enabled = false` — apply to a running station when you save;
 every other change to this table needs a restart. See
 [Hot reload](#hot-reload).
 
+#### The remote-access audit log (`audit_log_path`)
+
+`audit_log_path` defaults to `~/.pancetta/agent-audit.log`. Pancetta
+manages that exact file plus three archives beside it, `<path>.1`
+(newest), `<path>.2` and `<path>.3` (oldest); don't put other files at
+those names. Each file is at most 1 MiB (1,048,576 bytes), so normal
+operation keeps at most 4 MiB. When the active file is full it becomes
+`.1` and the oldest archive is deleted. These are size limits, not a
+fixed number of days.
+
+Each line is one JSON object with `ts_unix_ms`, `kind`,
+`operator_callsign` and `detail`. Operator callsigns are capped at 64
+bytes and details at 1,024 bytes (cut text ends in `...[truncated]`).
+Each event kind may write a burst of 20 records, then 10 per second.
+Events over that rate are counted rather than written, and a `Summary`
+record (operator `null`) reports them about every five seconds, for
+example `audit summary: TxRequested coalesced=80 failed=0 first_ts=1000
+last_ts=1000`. `coalesced` counts events summarized by the rate limit;
+`failed` counts events whose recording could not be confirmed (some of
+them may have reached the file). Treat the log as a bounded diagnostic
+history, not a complete ledger, and handle the `Summary` kind in any
+tool that reads it.
+
+On upgrade, a managed file already larger than 1 MiB is reset to zero
+bytes before anything else is written, and a `Summary` records
+`audit retention: reset oversized active file; discarded_bytes=N` (or
+`archive=1` … `archive=3`). Copy the old file elsewhere first if you need
+it. Counts not yet written are lost if pancetta crashes.
+
+When a write fails (disk full, permissions, missing directory), the
+readiness strip shows `⚠ DEGRADED: Remote audit unavailable; events may
+be missing`, and headless mode logs the same text at ERROR (first
+failure, then at most once a minute). Remote arming keeps working, and
+disarm and PTT-off never wait on the log. To recover, check free space
+and the permissions of the configured file and its directory. Pancetta
+retries about every five seconds, writes the missing counts, clears
+the warning and logs `Remote audit recording recovered`.
+
 ---
 
 ### `[network.remote_gateway]` — local read-only view (Panino)
@@ -748,10 +826,30 @@ All persistent state lives under `~/.pancetta/`.
 |---|---|---|
 | `~/.pancetta/qsos.adi` | Durable, append-only ADIF source of truth. Point WSJT-X / N1MM / LoTW / eQSL at this file directly. | No — back this up. |
 | `~/.pancetta/qso.db` | sqlx-backed query index. Rebuilt from ADIF on startup if missing or stale. | Yes — safe to delete; the next run will replay ADIF into a fresh index. |
+| `~/.pancetta/qsos.adi.bak`, `qsos.adi.bak.N` | Your logbook as it was before a `pancetta import` added contacts (one per import). | This *is* the recovery copy. |
+| `~/.pancetta/backups/qso_backup_YYYYMMDD_HHMMSS.db` | Automatic backups of `qso.db` (every 24 h, 7 kept), regardless of the directory Pancetta was launched from. Covers the query index only — the `qsos.adi` source of truth is not copied here. | Yes — same recovery path as `qso.db`. |
 
 **Migration note:** if you are upgrading from an earlier release that wrote only
 `qso.db`, the first startup will automatically export every row from the old database
 into a fresh `qsos.adi` before switching over. No manual action required.
+
+**Bringing in another logger's log:** run `pancetta import <file>` (add
+`--dry-run` to preview). It appends only the contacts you don't already have
+and backs up `qsos.adi` first. Do not copy another logger's file over
+`qsos.adi`: that replaces your own contacts.
+
+### Decode-window recordings
+
+Decode-window WAVs exist only on a station whose config sets
+`[audio.recording] auto_record = true`, and land in
+`audio.recording.directory` (see the `[audio.recording]` section above).
+The station decoder corpus — the magazzino offload job and the
+`pancetta-research` curation tools — reads `~/.pancetta/recordings`, so a
+corpus station sets `directory = "~/.pancetta/recordings"` explicitly.
+Releases before this setting existed recorded every window into
+`~/.pancetta/recordings` unconditionally; upgrading does not touch those
+files, and deleting them reclaims the space (the directory was capped at
+10 GB).
 
 ---
 

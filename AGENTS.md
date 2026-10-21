@@ -19,17 +19,19 @@ Pancetta is an autonomous FT8 ham radio station written in Rust. The goal is a f
 | `pancetta-ft8` | FT8 encoder/decoder/modulator/OSD | Bit-exact with ft8_lib/WSJT-X |
 | `pancetta-audio` | Real-time audio I/O (cpal + ringbuf) | Functional |
 | `pancetta-dsp` | DSP pipeline (FFT, filtering, resampling) | Functional |
-| `pancetta-config` | Configuration with hot-reload | Production-ready |
+| `pancetta-config` | Configuration loading, validation; file watch live-applies remote-access consent and revocations only | Production-ready |
 | `pancetta-qso` | QSO management, priority scoring, frequency allocation, autonomous operator | Core logic |
-| `pancetta-dx` | DX cluster + PSKReporter + per-QSO logbook upload (ClubLog/QRZ/cqdx/LoTW/eQSL) + QRZ XML lookup | Live + scaffolded |
-| `pancetta-hamlib` | Hamlib CAT control FFI | Bindings done, integration stub |
-| `pancetta-cqdx` | cqdx.io HTTP client, cache, types | Needs live API validation |
+| `pancetta-dx` | DX cluster + PSKReporter + per-QSO logbook upload (ClubLog/QRZ/cqdx/LoTW/eQSL) + QRZ XML lookup | Live; eQSL awaiting live-account check; LoTW web-scrape module is unused scaffolding |
+| `pancetta-hamlib` | Hamlib CAT/PTT via rigctld TCP client (native FFI removed) | Live; on-air validated (FTdx10) |
+| `pancetta-cqdx` | cqdx.io HTTP client, cache, types | Live; spots envelope unverified against live API |
 | `pancetta-tui` | Terminal UI | Default UI (`--headless` to disable) |
 | `pancetta-core` | Shared types, error handling | Stable |
 | `pancetta-agent` | Remote-TX security: arm gating, session binding | Live |
 | `pancetta-protocol` | Remote-operation wire protocol | Live |
 | `pancetta-research` | Local-only decoder-iteration harness | Excluded from CI; never builds in GitHub Actions |
 | `pancetta` | Main binary, coordinator, message bus, runtime | Integration point |
+
+Operator-facing capability state: README.md § Capability status — keep both consistent.
 
 ## Building and Testing
 
@@ -41,7 +43,7 @@ cargo build
 cargo test --workspace --features transmit
 
 # FT8 tests (encoder is feature-gated behind `transmit`)
-cargo test --features transmit -p pancetta-ft8    # all ~295 FT8 tests
+cargo test --features transmit -p pancetta-ft8    # all FT8 tests
 cargo test -p pancetta-ft8                         # LDPC/CRC tests only
 
 # Loopback integration tests (end-to-end QSO through encode→modulate→decode)
@@ -69,6 +71,8 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 - Drop-stale-TX: the worker re-checks QSO liveness and slot-timing headroom (`tx_late_max_ms`
   elapsed in the target slot) at the last instant before PTT; an over-cap frame is dropped,
   never keyed (PAN-117).
+- The TX worker revalidates its snapshotted relocation epoch after acquiring `ptt_sync_gate` and refuses, never keys, a frame whose QSO `apply_tx_offset_switch` moved between that snapshot and the gate (PAN-145).
+- The TX worker never sends into its own `Ft8Transmitter` bus channel: messages it took off the channel and has not handled go back on the front of its coordinator-owned `TxRequeue`, which it reads before the channel, so no concurrent producer can overtake them and a full channel cannot drop them (PAN-73).
 - The TX hard mute (`tx_hard_mute_reason`) also refuses while the rig CAT link is `PollingFailed` or the audio output has stopped calling back (PAN-115). Both clear on their own when the link/device recovers, and the Hamlib poll loop must keep redialling rigctld while disconnected.
 - Band-plan gate (PAN-118): every PTT-on path — single TX, bundle item, tune, manual PTT, any origin — also refuses, before PTT, when the absolute TX RF (effective split-aware dial + audio offset) falls outside the configured band plan (`edge_warnings` is the master switch; skipped while the dial is the unknown-0 sentinel); bundles drop only the offending items wherever items are still separable, and hold the whole bundle once the waveform is summed.
 - `mode=FT8` paths must remain byte-identical when FT4/FT2 features are untouched.

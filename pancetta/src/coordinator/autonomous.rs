@@ -1077,11 +1077,19 @@ async fn drain_pending_qso_offset_requests(
         let mut exclusions_hz = reserved_hz.clone();
         exclusions_hz.extend(other_live_tx_offsets(qso_id, active_tx_offsets));
         let resolved_hz = match action {
+            // PAN-130 (Codex round 12 on PR #350): avoid the offset the QSO is
+            // actually on (`current_hz`, read above), not the queued
+            // `avoid_hz`. An operator nudge's `avoid_hz` comes from the
+            // `active_tx_offsets` mirror, which lags a Hound QSY; excluding
+            // that stale value let the allocator pick our own live offset (a
+            // silent `OffsetActionNoOp`) or a spot a few Hz from it.
+            // `avoid_hz` remains the fallback when the QSO is gone — the same
+            // fallback `Revert` uses below.
             pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz } => op
                 .allocate_smart_frequency_in_range(
                     None,
                     target_parity,
-                    Some(avoid_hz),
+                    Some(current_hz.unwrap_or(avoid_hz)),
                     &exclusions_hz,
                     range_hz,
                 ),
@@ -1256,6 +1264,25 @@ async fn drain_pending_qso_offset_requests(
                         origin,
                     });
                 }
+            }
+            Err(pancetta_qso::QsoManagerError::OffsetActionNudgeSuperseded { .. }) => {
+                // PAN-131 (Codex round 13 on PR #350, P2): the DX moved the QSO
+                // past every state a nudge can retransmit from before this
+                // drain ran, so `apply_tx_offset_switch` refused rather than
+                // record an offset nothing would ever be sent on. `info!`, not
+                // the generic arm's `debug!`: the operator was already told
+                // "Nudging active QSO to a new offset", and this is where the
+                // log says it did not happen. Discarded, not requeued: with the
+                // QSO where it is, a retry would only refuse again, and if a
+                // regression ever brings it back to a nudge-eligible state the
+                // operator can press `u` again. Nothing was committed, so
+                // nothing is reserved.
+                info!(
+                    target: "tx.freq",
+                    qso_id = %qso_id,
+                    "PAN-131: operator nudge superseded — the QSO advanced past the \
+                     states a nudge can retransmit from; offset unchanged"
+                );
             }
             Err(err) if err.is_expected_offset_action_refusal() => {
                 // The QSO completed, went terminal, or advanced between the
@@ -2589,13 +2616,21 @@ impl super::ApplicationCoordinator {
                                                 );
                                             }
                                             // A band change invalidates any split TX freq.
-                                            if split_tx_hz.swap(0, Ordering::Relaxed) != 0 {
-                                                // Push authoritative split clear to the TUI chip
+                                            if split_tx_hz.load(Ordering::Relaxed) != 0 {
+                                                let store = super::forward_split_change(
+                                                    &message_bus,
+                                                    ComponentId::Autonomous,
+                                                    &split_tx_hz,
+                                                    false,
+                                                    0,
+                                                )
+                                                .await;
+                                                // Push authoritative split state to the TUI chip
                                                 // via the message bus (Autonomous → Tui relay).
                                                 let split_clr_tui = ComponentMessage::new(
                                                     ComponentId::Autonomous,
                                                     ComponentId::Tui,
-                                                    MessageType::SplitStatus { tx_hz: 0 },
+                                                    MessageType::SplitStatus { tx_hz: store },
                                                     Instant::now(),
                                                 );
                                                 let _ = message_bus.send_message(split_clr_tui).await;
@@ -2603,21 +2638,9 @@ impl super::ApplicationCoordinator {
                                                     &message_bus,
                                                     &display_feed_enabled,
                                                     ComponentId::Autonomous,
-                                                    MessageType::SplitStatus { tx_hz: 0 },
+                                                    MessageType::SplitStatus { tx_hz: store },
                                                 )
                                                 .await;
-                                                let clr = ComponentMessage::new(
-                                                    ComponentId::Autonomous,
-                                                    ComponentId::Hamlib,
-                                                    MessageType::RigControl(
-                                                        crate::message_bus::RigControlMessage::SetSplit {
-                                                            enabled: false,
-                                                            tx_frequency: 0,
-                                                        },
-                                                    ),
-                                                    Instant::now(),
-                                                );
-                                                let _ = message_bus.send_message(clr).await;
                                             }
                                         }
                                         let msg = ComponentMessage::new(
@@ -5874,6 +5897,261 @@ mod drain_pending_qso_offset_requests_tests {
             active_tx_offsets.read().unwrap().get(&key),
             Some(&1500.0),
             "the mirror keeps the offset the QSO never left"
+        );
+    }
+
+    /// PAN-130 (Codex round 12 on PR #350, P2): an operator `u` nudge carries
+    /// its `avoid_hz` from the `active_tx_offsets` mirror, which still holds
+    /// the Hound's low calling offset after the calling→response QSY (the QSY
+    /// moves `metadata.frequency` after its `StateChanged` already went out).
+    /// Excluding that stale value instead of the QSO's live offset let the
+    /// allocator pick the QSO's own post-QSY offset, or a spot a few Hz from
+    /// it, so the nudge did not really move it.
+    #[tokio::test]
+    async fn a_post_qsy_hound_nudge_avoids_the_live_offset_not_the_stale_mirror() {
+        let qso_manager = manager();
+        let fox_rx_hz = 300.0;
+        let qso_id = qso_manager
+            .engage_hound("D2UY", fox_rx_hz, None, None)
+            .await
+            .expect("engage_hound should succeed");
+        let calling_hz = qso_manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .frequency;
+        // The Fox answers: RespondingToCq -> SendingReport triggers the
+        // one-shot QSY up into the response region.
+        qso_manager
+            .process_message(
+                pancetta_qso::MessageType::SignalReport {
+                    to_station: "W1ABC".into(),
+                    from_station: "D2UY".into(),
+                    report: -12,
+                },
+                "W1ABC D2UY -12".to_string(),
+                fox_rx_hz,
+                Some(-12.0),
+            )
+            .await
+            .expect("the Fox's report must process");
+        let after = qso_manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            after.metadata.hound_qsyed,
+            "precondition: the Fox's report must trigger the Hound QSY"
+        );
+        let qsyed_hz = after.metadata.frequency;
+        let regions = &qso_manager.config().hound;
+        let response = (regions.response_min_hz, regions.response_max_hz);
+
+        // Quiet only right around the QSY'd offset, noisy everywhere else: the
+        // best candidate in the response region is the QSO's own live offset.
+        let mut op = operator_with_live_allocator();
+        let bins = 140usize;
+        let (fmin, fmax) = (200.0f64, 2800.0f64);
+        let width = (fmax - fmin) / bins as f64;
+        let power: Vec<f32> = (0..bins)
+            .map(|i| {
+                let f = fmin + (i as f64 + 0.5) * width;
+                if (f - qsyed_hz).abs() <= 30.0 {
+                    0.0
+                } else {
+                    1.0
+                }
+            })
+            .collect();
+        op.update_spectral(pancetta_qso::frequency::SpectralSnapshot {
+            power_bins: power,
+            freq_min_hz: fmin,
+            freq_max_hz: fmax,
+        });
+        let separation = op.min_own_separation_hz();
+        let stale_pick =
+            op.allocate_smart_frequency_in_range(None, None, Some(calling_hz), &[], Some(response));
+        assert!(
+            (stale_pick - qsyed_hz).abs() < separation,
+            "test premise broken: excluding only the stale {calling_hz} Hz calling \
+             offset must leave the QSO's live {qsyed_hz} Hz as the allocator's \
+             pick, got {stale_pick}"
+        );
+
+        // The mirror never saw the QSY: it still says the calling offset.
+        let key = crate::coordinator::active_tx_qso_key(&qso_id.to_string());
+        let active_tx_offsets =
+            std::sync::RwLock::new(std::collections::HashMap::from([(key, calling_hz)]));
+        let pending = std::sync::Mutex::new(vec![
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                qso_id,
+                pancetta_qso::qso_manager::OffsetAction::Switch {
+                    avoid_hz: calling_hz,
+                },
+            ),
+        ]);
+        drain_pending_qso_offset_requests(
+            &mut op,
+            &qso_manager,
+            &pending,
+            &active_tx_offsets,
+            &auto_mode(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await;
+
+        let moved_to = qso_manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .frequency;
+        assert!(
+            (moved_to - qsyed_hz).abs() >= separation,
+            "the nudge must move at least {separation} Hz off the QSO's real \
+             {qsyed_hz} Hz offset, got {moved_to}"
+        );
+        assert!(
+            moved_to >= response.0 && moved_to <= response.1,
+            "a post-QSY Hound nudge must stay inside the Hound response region \
+             ({}-{} Hz), got {moved_to}",
+            response.0,
+            response.1
+        );
+    }
+
+    /// PAN-130: when no valid candidate exists the allocator hands its avoid
+    /// argument back unchanged. Fed a stale `avoid_hz`, that "unchanged" value
+    /// was an offset the QSO had already left, so the drain committed a jump
+    /// nothing had ranked. Avoiding the live offset makes it a no-op instead.
+    #[tokio::test]
+    async fn a_no_candidate_switch_stays_put_instead_of_jumping_to_a_stale_avoid_hz() {
+        let mut op = operator_with_impossible_separation();
+        let qso_manager = manager();
+        let qso_id = qso_manager
+            .start_cq(1500.0, None, false, None)
+            .await
+            .expect("start_cq should succeed");
+        // A live move the coordinator's mirror has not caught up with.
+        qso_manager
+            .apply_tx_offset_switch(
+                qso_id,
+                2000.0,
+                pancetta_qso::qso_manager::OffsetRelocationOrigin::OperatorForced,
+            )
+            .await
+            .expect("the setup move must commit");
+
+        let key = crate::coordinator::active_tx_qso_key(&qso_id.to_string());
+        let active_tx_offsets =
+            std::sync::RwLock::new(std::collections::HashMap::from([(key.clone(), 1500.0)]));
+        let pending = std::sync::Mutex::new(vec![
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                qso_id,
+                pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: 1500.0 },
+            ),
+        ]);
+        drain_pending_qso_offset_requests(
+            &mut op,
+            &qso_manager,
+            &pending,
+            &active_tx_offsets,
+            &auto_mode(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await;
+
+        assert_eq!(
+            qso_manager
+                .get_qso(qso_id)
+                .await
+                .unwrap()
+                .metadata
+                .frequency,
+            2000.0,
+            "no valid relocation: the QSO stays where it really is"
+        );
+        assert_eq!(
+            active_tx_offsets.read().unwrap().get(&key),
+            Some(&1500.0),
+            "a no-op commits nothing, so the drain writes nothing to the mirror"
+        );
+    }
+
+    /// PAN-131 (Codex round 13 on PR #350, P2): an operator `u` nudge queued
+    /// while the QSO was rearm-eligible, drained after the DX's R-report moved
+    /// it to `WaitingForConfirmation`. Nothing retransmits from there, so
+    /// `apply_tx_offset_switch` refuses it (`OffsetActionNudgeSuperseded`),
+    /// and the drain must discard it — no move, no mirror update, no requeue.
+    #[tokio::test]
+    async fn an_operator_nudge_the_dx_superseded_is_discarded_not_committed() {
+        let mut op = operator_with_live_allocator();
+        let qso_manager = manager();
+        let qso_id = qso_manager
+            .respond_to_cq_manual("K9ZZ".to_string(), 1500.0, None)
+            .await
+            .unwrap();
+        // The DX's R-report lands between the keypress and the drain.
+        qso_manager
+            .process_message(
+                pancetta_qso::MessageType::ReportAck {
+                    to_station: "W1ABC".into(),
+                    from_station: "K9ZZ".into(),
+                    report: -7,
+                },
+                "W1ABC K9ZZ R-07".to_string(),
+                1500.0,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+        let before = qso_manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(
+                before.state,
+                pancetta_qso::states::QsoState::WaitingForConfirmation { .. }
+            ),
+            "test premise: the R-report must advance the QSO to \
+             WaitingForConfirmation, got {:?}",
+            before.state
+        );
+
+        let key = crate::coordinator::active_tx_qso_key(&qso_id.to_string());
+        let active_tx_offsets =
+            std::sync::RwLock::new(std::collections::HashMap::from([(key.clone(), 1500.0)]));
+        let pending = std::sync::Mutex::new(vec![
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                qso_id,
+                pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: 1500.0 },
+            ),
+        ]);
+
+        drain_pending_qso_offset_requests(
+            &mut op,
+            &qso_manager,
+            &pending,
+            &active_tx_offsets,
+            &auto_mode(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await;
+
+        assert_eq!(
+            qso_manager
+                .get_qso(qso_id)
+                .await
+                .unwrap()
+                .metadata
+                .frequency,
+            1500.0,
+            "a superseded nudge must not move the QSO off the offset it is on"
+        );
+        assert_eq!(
+            active_tx_offsets.read().unwrap().get(&key),
+            Some(&1500.0),
+            "the mirror keeps the offset the QSO never left"
+        );
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "a superseded nudge is discarded, never requeued"
         );
     }
 

@@ -729,6 +729,8 @@ async fn emit_status(message_bus: &MessageBus, text: impl Into<String>) {
 /// path the Callers/Space close uses; the resulting Completed QSO is handled
 /// by the drop-stale-TX grace window (the 73 frame goes out, then drops), so
 /// there is no runaway. After the cap/window the entry is dropped.
+/// A late permission denial or an engine error that emits no frame restores
+/// the resend budget and its pacing timestamp.
 #[allow(clippy::too_many_arguments)]
 async fn maybe_auto_resend_73(
     msg_type: &pancetta_qso::states::MessageType,
@@ -848,17 +850,9 @@ async fn maybe_auto_resend_73(
             Err(_) => (entry_remote_origin, entry_remote_client_key_id),
         };
 
-    // Round-14 review (Codex P1): `respond_to_caller`'s idempotent-resend
-    // branch silently SKIPS the resend (round-10 fix) when the bound
-    // client isn't currently TX-permitted, but still returns `Ok` — so
-    // this function can't tell "a frame went out" from "the resend was
-    // skipped" from that return value alone. Left unchecked, the counter
-    // commit above would still burn the auto-73 budget for a resend that
-    // never actually transmitted, exhausting it and leaving no automatic
-    // resend if the original controller (or a newly-authorized one)
-    // retakes control within the window. Roll the commit back to exactly
-    // what it was before, and skip calling `respond_to_caller` entirely,
-    // when the frame would be denied anyway.
+    // Round 14 / PAN-138: this early check is a fast path for an already
+    // denied client. The engine's re-check under its QSO write guard is
+    // authoritative; its ManualCallOutcome also triggers rollback below.
     if entry_remote_origin
         && !crate::coordinator::tx::remote_tx_permitted_for(
             remote_tx_arm,
@@ -866,11 +860,15 @@ async fn maybe_auto_resend_73(
             entry_remote_client_key_id.as_deref(),
         )
     {
-        let mut map = completions.lock().await;
-        if let Some(entry) = map.get_mut(&key) {
-            entry.resends = prev_resends;
-            entry.last_resend_at = prev_last_resend_at;
-        }
+        roll_back_auto_73_commit(
+            completions,
+            &key,
+            entry_qso_id,
+            now,
+            prev_resends,
+            prev_last_resend_at,
+        )
+        .await;
         return;
     }
 
@@ -908,8 +906,11 @@ async fn maybe_auto_resend_73(
         from_station, resend_n, AUTO_73_MAX_RESENDS
     );
 
-    match qso_manager
-        .respond_to_caller(
+    // PAN-138: the engine re-checks permission under its own `qsos` guard
+    // and reports whether a frame went out. Anything else (a late denial,
+    // nothing to resend, or an error) un-charges this resend.
+    let outcome = qso_manager
+        .respond_to_caller_with_outcome(
             from_station.clone(),
             frequency_hz,
             dx_parity,
@@ -920,9 +921,9 @@ async fn maybe_auto_resend_73(
             entry_remote_origin, // inherit the completed QSO's origin
             entry_remote_client_key_id,
         )
-        .await
-    {
-        Ok(_) => {
+        .await;
+    match outcome {
+        Ok((_, outcome)) if outcome.emitted_frame() => {
             emit_status(
                 message_bus,
                 format!(
@@ -932,11 +933,56 @@ async fn maybe_auto_resend_73(
             )
             .await;
         }
+        Ok((_, outcome)) => {
+            info!(
+                target: "qso",
+                "auto-73 re-send to {} not sent ({:?}); budget restored", from_station, outcome
+            );
+            roll_back_auto_73_commit(
+                completions,
+                &key,
+                entry_qso_id,
+                now,
+                prev_resends,
+                prev_last_resend_at,
+            )
+            .await;
+        }
         Err(e) => {
             warn!(
                 target: "qso",
                 "auto-73 re-send to {} failed: {}", from_station, e
             );
+            roll_back_auto_73_commit(
+                completions,
+                &key,
+                entry_qso_id,
+                now,
+                prev_resends,
+                prev_last_resend_at,
+            )
+            .await;
+        }
+    }
+}
+
+/// Undo `maybe_auto_resend_73`'s budget commit for a resend that emitted no
+/// frame. Only touches the entry this call committed (same completed QSO,
+/// `last_resend_at` still its own stamp), so a newer completion stashed for
+/// the same callsign meanwhile is left alone.
+async fn roll_back_auto_73_commit(
+    completions: &RecentManualCompletions,
+    key: &str,
+    qso_id: pancetta_qso::QsoId,
+    committed_at: chrono::DateTime<chrono::Utc>,
+    prev_resends: u8,
+    prev_last_resend_at: Option<chrono::DateTime<chrono::Utc>>,
+) {
+    let mut map = completions.lock().await;
+    if let Some(entry) = map.get_mut(key) {
+        if entry.qso_id == qso_id && entry.last_resend_at == Some(committed_at) {
+            entry.resends = prev_resends;
+            entry.last_resend_at = prev_last_resend_at;
         }
     }
 }
@@ -1712,6 +1758,7 @@ fn failure_reason_text(reason: &pancetta_qso::QsoFailureReason) -> String {
         // this QSO's outgoing message could never be transmitted at all, so
         // the watchdog retired it fast instead of waiting on the DX.
         R::MessageUnencodable(detail) => format!("cannot transmit this message: {detail}"),
+        R::ControlTransferred => "remote control passed to another client".to_string(),
     }
 }
 
@@ -2899,6 +2946,11 @@ impl super::ApplicationCoordinator {
         // setting (Task 6) actually reaches the QSO engine's Rust default
         // (Task 2) instead of being silently overridden by it.
         let qso_stall_switch_after = config.autonomous.qso_stall_switch_after;
+        // PAN-128 PR review: the stall ledger's current-slot acceptance must
+        // mirror the TX scheduler's own late-start window, so the operator's
+        // `[station] tx_late_max_ms` reaches `keep_call_tx_slot` — the same
+        // value the TX worker snapshots for `schedule_tx`.
+        let station_tx_late_max_ms = config.station.tx_late_max_ms;
         drop(config);
 
         // cqdx.io logbook upload is opt-in just like ClubLog/QRZ: it requires
@@ -2956,6 +3008,7 @@ impl super::ApplicationCoordinator {
         // worker's/TUI-relay task's writes, not just narrowly raced against
         // them.
         let ptt_sync_gate = self.ptt_sync_gate.clone();
+        let relocation_epochs = self.relocation_epochs.clone();
         // T3 will read this to apply the operator's held TX audio offset when
         // starting a manual QSO (Hold mode). Captured here so both atomics
         // are in scope in the StartQso/RespondToCaller handlers below.
@@ -3060,6 +3113,7 @@ impl super::ApplicationCoordinator {
         // PAN-143: share the synchronization gate too — see the field's doc
         // comment in qso_manager.rs.
         qso_manager.set_ptt_sync_gate_source(ptt_sync_gate.clone());
+        qso_manager.set_relocation_epoch_source(relocation_epochs);
         // PAN-72 (Codex round 2 on PR #350, finding 5): share the global TX
         // policy too, so the same stall detector does not count a rearm cycle
         // whose re-send the `TxPolicy::Disabled` hard mute blocked outright —
@@ -3077,6 +3131,12 @@ impl super::ApplicationCoordinator {
         // atomic on every switch, so the running loop tracks it in both
         // directions.
         qso_manager.set_active_slot_ns_source(self.active_slot_ns());
+        // PAN-128 PR review: the stall ledger's slot attribution uses the
+        // scheduler's current-slot acceptance window — inject the operator's
+        // real `tx_late_max_ms` so `keep_call_tx_slot` and `schedule_tx`
+        // decide against the same cap. Snapshot semantics match the TX
+        // worker's own startup read of the same field.
+        qso_manager.set_tx_late_max_ms(station_tx_late_max_ms);
         // PAN-72 (Codex round 7 on PR #350, finding 3): the policy above is
         // only ONE of the two gates a rearmed frame must clear. A QSO with
         // `remote_origin` emits every frame as `TxOrigin::Remote`, and the TX
@@ -3212,6 +3272,29 @@ impl super::ApplicationCoordinator {
                 // ADIF source of truth at ~/.pancetta/qsos.adi.
                 let adif_path = pancetta_home.join(".pancetta").join("qsos.adi");
 
+                // Both LOCAL source-of-truth writers (ADIF appender + SQLite
+                // index) live behind one helper so the `--replay` suppression
+                // is a single gate, testable without a whole coordinator. On a
+                // live run it also brings the index in line with the ADIF log
+                // before either writer opens a file, and hands back that index
+                // for the worked-station seed below (PAN-127). Because the
+                // rebuild runs inside this call before the logger opens
+                // `qso.db`, the logger never holds a pooled connection on a
+                // file the rebuild deleted (#453). Nothing can complete a QSO
+                // before this point: the decode/command loops below have not
+                // started yet.
+                qso_lookup.reset_display_history();
+                let (_adif_writer, _async_logger, live_seed_db) = start_local_qso_log_writers(
+                    replay_mode,
+                    &adif_path,
+                    &db_path,
+                    station_power_watts,
+                    persist_qso_timeline,
+                    &qso_manager,
+                    shutdown.clone(),
+                )
+                .await;
+
                 // Per-QSO log-upload subscriber (ClubLog + QRZ Logbook + cqdx.io
                 // + eQSL + LoTW), with optional QRZ-XML grid enrichment applied
                 // first. Opt-in: only spawned when at least one upload target OR
@@ -3238,18 +3321,10 @@ impl super::ApplicationCoordinator {
                 // Seed worked-station history from the QSO database so that
                 // previously-worked stations are recognised as duplicates across restarts.
                 //
-                // Three-case startup decision (non-replay only):
-                //   1. Migration: ADIF missing but legacy DB exists → dump DB to ADIF first
-                //      so contacts are not lost; future runs use ADIF as source of truth.
-                //   2. Replay-rebuild: index missing or older than ADIF → drop + rebuild the
-                //      index so duplicate detection sees every prior contact.
-                //   3. Open as-is: normal startup; index is current.
-                //
-                // Every path above is a write against the *real* `~/.pancetta/qsos.adi` /
-                // `qso.db` (`QsoDatabase::open` itself runs `PRAGMA`s and `CREATE TABLE IF
-                // NOT EXISTS`, a write-mode connection even on an already-current DB) — not
-                // anything derived from `--replay`'s capture-dir argument, so it's gated on
-                // `!replay_mode` (PAN-41).
+                // Live runs seed from the index `start_local_qso_log_writers`
+                // brought in line with the ADIF log (migrate / rebuild / open
+                // as-is, see `prepare_local_qso_index`) before either writer
+                // opened a file.
                 //
                 // PAN-41 round 2: `--replay`'s own contract (coordinator/mod.rs,
                 // CHANGELOG.md) is "no writes to the real log, but still read history so
@@ -3258,12 +3333,12 @@ impl super::ApplicationCoordinator {
                 //
                 // PAN-41 round 3: a plain `mode=ro` connection against the real `db_path`
                 // (round 2's fix) still had two gaps -- it read stale/missing history
-                // instead of rebuilding like case 2 above, and SQLite's `mode=ro` can
-                // itself create `-wal`/`-shm` sidecar files against a WAL-mode db if
-                // they're missing, still a write under the real directory. The `else`
-                // branch below instead rebuilds fresh straight from the real ADIF (only
-                // ever read, never written) into a `:memory:` database — always current,
-                // and creates no file of any kind.
+                // instead of rebuilding like case 2 of `prepare_local_qso_index`, and
+                // SQLite's `mode=ro` can itself create `-wal`/`-shm` sidecar files against
+                // a WAL-mode db if they're missing, still a write under the real directory.
+                // The `else` branch below instead rebuilds fresh straight from the real ADIF
+                // (only ever read, never written) into a `:memory:` database — always
+                // current, and creates no file of any kind.
                 use pancetta_qso::async_database::QsoDatabase;
 
                 if !replay_mode {
@@ -3276,80 +3351,7 @@ impl super::ApplicationCoordinator {
                         .unwrap_or_else(|| "20m".to_string())
                         .to_uppercase();
 
-                    // Case 1: migration — ADIF missing but legacy DB exists.
-                    let adif_exists = tokio::fs::try_exists(&adif_path).await.unwrap_or(false);
-                    let db_exists = tokio::fs::try_exists(&db_path).await.unwrap_or(false);
-
-                    if !adif_exists && db_exists {
-                        info!(
-                            "ADIF missing but legacy DB present — migrating QSOs from {} to {}",
-                            db_path.display(),
-                            adif_path.display(),
-                        );
-                        match QsoDatabase::open(&db_path).await {
-                            Ok(db) => {
-                                if let Err(e) = db.export_to_adif(&adif_path).await {
-                                    warn!(
-                                        "DB→ADIF migration failed: {} — index continues to work, \
-                                         but ADIF source-of-truth will only contain QSOs logged \
-                                         from now on",
-                                        e,
-                                    );
-                                } else {
-                                    info!("DB→ADIF migration succeeded");
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Could not open legacy DB for migration: {} — skipping", e);
-                            }
-                        }
-                    }
-
-                    // Case 2: replay — index missing or older than ADIF.
-                    let needs_replay = match (
-                        tokio::fs::metadata(&db_path).await.ok(),
-                        tokio::fs::metadata(&adif_path).await.ok(),
-                    ) {
-                        (None, Some(_)) => {
-                            info!(
-                                "Index missing at {} — replaying from ADIF",
-                                db_path.display()
-                            );
-                            true
-                        }
-                        (Some(db_meta), Some(adif_meta)) => {
-                            match (db_meta.modified().ok(), adif_meta.modified().ok()) {
-                                (Some(d), Some(a)) if a > d => {
-                                    info!(
-                                        "Index at {} is older than ADIF at {} — replaying",
-                                        db_path.display(),
-                                        adif_path.display(),
-                                    );
-                                    true
-                                }
-                                _ => false,
-                            }
-                        }
-                        // No ADIF and no DB: fresh install; coordinator creates both later.
-                        _ => false,
-                    };
-
-                    let db_for_seed = if needs_replay {
-                        match QsoDatabase::replay_from_adif(&db_path, &adif_path).await {
-                            Ok(db) => Some(db),
-                            Err(e) => {
-                                warn!(
-                                    "ADIF replay failed: {} — falling back to existing index \
-                                     (may be stale)",
-                                    e,
-                                );
-                                QsoDatabase::open(&db_path).await.ok()
-                            }
-                        }
-                    } else {
-                        // Case 3: open as-is.
-                        QsoDatabase::open(&db_path).await.ok()
-                    };
+                    let db_for_seed = live_seed_db;
 
                     if let Some(db) = db_for_seed {
                         let callsigns = db.get_worked_callsigns(&band).await;
@@ -3371,13 +3373,7 @@ impl super::ApplicationCoordinator {
                             qso_lookup.seed_worked_dxcc_from_list(band_callsign_pairs);
                         }
 
-                        let band_grid_pairs = db.get_worked_bands_and_grids().await;
-                        qso_lookup.seed_worked_grids_from_list(band_grid_pairs);
-
-                        // PAN-85: seed the DX Hunter's US-state display from
-                        // any prior contact whose log record carries a state.
-                        qso_lookup
-                            .seed_states_from_list(db.get_worked_callsigns_and_states().await);
+                        qso_lookup.seed_display_history(&db).await;
                     } else {
                         warn!(
                             "Could not open QSO database for startup seed ({}) — \
@@ -3434,14 +3430,7 @@ impl super::ApplicationCoordinator {
                                 qso_lookup.seed_worked_dxcc_from_list(band_callsign_pairs);
                             }
 
-                            let band_grid_pairs = db.get_worked_bands_and_grids().await;
-                            qso_lookup.seed_worked_grids_from_list(band_grid_pairs);
-
-                            // PAN-85: seed the DX Hunter's US-state display
-                            // from any prior contact whose log record
-                            // carries a state.
-                            qso_lookup
-                                .seed_states_from_list(db.get_worked_callsigns_and_states().await);
+                            qso_lookup.seed_display_history(&db).await;
                         }
                         Err(e) => {
                             info!(
@@ -3453,29 +3442,6 @@ impl super::ApplicationCoordinator {
                         }
                     }
                 }
-
-                // Both LOCAL source-of-truth writers (ADIF appender + SQLite
-                // index) live behind one helper so the `--replay` suppression
-                // is a single gate, testable without a whole coordinator.
-                //
-                // Started only AFTER the startup seed above: its
-                // "index older than ADIF" case deletes and recreates
-                // `qso.db`, and a logger opened earlier kept its pooled
-                // connection on the deleted file — its first backup failed
-                // ("malformed" / "not a database") and the QSOs it logged
-                // never reached the live index. Nothing can complete a QSO
-                // before this point: the decode/command loops below have not
-                // started yet.
-                let (_adif_writer, _async_logger) = start_local_qso_log_writers(
-                    replay_mode,
-                    &adif_path,
-                    &db_path,
-                    station_power_watts,
-                    persist_qso_timeline,
-                    &qso_manager,
-                    shutdown.clone(),
-                )
-                .await;
 
                 info!(
                     "QSO component ready (callsign={}, grid={:?})",
@@ -4071,19 +4037,7 @@ impl super::ApplicationCoordinator {
                                     );
                                     let _ = snapshot_bus.send_message(recent_msg).await;
 
-                                    let band =
-                                        pancetta_qso::utils::frequency_to_band(metadata.frequency);
-                                    qso_lookup.record_worked(their_call, &band);
-                                    if let Some(grid) = metadata.grids.theirs.as_deref() {
-                                        qso_lookup.record_worked_grid(grid, &band);
-                                    }
-                                    // PAN-85: a completed QSO whose metadata carries
-                                    // a state (ADIF import, or QRZ enrichment on a
-                                    // prior QSO) makes it available to the DX Hunter
-                                    // display for the rest of the session.
-                                    if let Some(state) = metadata.their_state.as_deref() {
-                                        qso_lookup.record_state(their_call, state);
-                                    }
+                                    qso_lookup.record_completed_contact(&metadata);
 
                                     // item-2-auto-73: stash MANUAL completions so
                                     // that if this DX keeps re-sending RR73/RRR (they
@@ -5653,6 +5607,45 @@ impl super::ApplicationCoordinator {
                                                     ),
                                                 )
                                                 .await;
+                                            }
+                                        }
+                                        // PAN-137: purge displaced clients' queued calls before
+                                        // retirement can promote them into fresh stale QSOs.
+                                        // Admission and event-driven promotion share this lock.
+                                        crate::message_bus::QsoMessage::RemoteControllerChanged {
+                                            controller_key_id,
+                                        } => {
+                                            let _admission = qso_admission.lock().await;
+                                            let dropped = {
+                                                let mut queue = pending_manual_calls.lock().await;
+                                                let before = queue.len();
+                                                queue.retain(|p| {
+                                                    !pancetta_qso::qso_manager::bound_to_other_remote_client(
+                                                        p.remote_origin,
+                                                        p.remote_client_key_id.as_deref(),
+                                                        &controller_key_id,
+                                                    )
+                                                });
+                                                before - queue.len()
+                                            };
+                                            let retired = qso_manager
+                                                .retire_qsos_bound_to_other_remote_clients(&controller_key_id)
+                                                .await;
+                                            if !retired.is_empty() || dropped > 0 {
+                                                info!(target: "qso",
+                                                    "Remote control now held by {}: ended {} QSO(s) and dropped {} queued call(s) of other clients",
+                                                    controller_key_id, retired.len(), dropped);
+                                            }
+                                            // A queue-only change emits no QSO event to refresh
+                                            // the TUI and remote display, so push it here.
+                                            if dropped > 0 {
+                                                push_active_qso_snapshot(
+                                                    &qso_manager,
+                                                    &dx_activity,
+                                                    &pending_manual_calls,
+                                                    &display_feed_for_admission,
+                                                    &message_bus,
+                                                ).await;
                                             }
                                         }
                                         // Operator pressed `c`: start a manual
@@ -7989,6 +7982,10 @@ mod snapshot_tests {
     #[test]
     fn failure_reason_text_is_human_readable() {
         use pancetta_qso::QsoFailureReason as R;
+        assert_eq!(
+            super::failure_reason_text(&R::ControlTransferred),
+            "remote control passed to another client"
+        );
         assert_eq!(super::failure_reason_text(&R::Timeout), "watchdog timeout");
         assert_eq!(
             super::failure_reason_text(&R::Superseded),
@@ -8576,12 +8573,9 @@ mod auto_73_tests {
         assert_eq!(map.lock().await.get(DX).map(|e| e.resends), Some(1));
     }
 
-    /// Round-14 review (Codex P1): a remote-origin completion bound to
-    /// client-a, while a DIFFERENT client (client-b) holds the arm, must
-    /// not consume the auto-73 budget — `respond_to_caller`'s own resend
-    /// path silently skips the doomed resend (round-10 fix) but still
-    /// returns `Ok`, so this function must independently verify permission
-    /// and roll its own commit back rather than trusting that return value.
+    /// Round 14 / PAN-138: a completion bound to client-a must not consume
+    /// the auto-73 budget while client-b holds the arm. The early check is
+    /// a fast path; the engine outcome also reports a later denial.
     #[tokio::test]
     async fn denied_identity_rolls_back_the_resend_commit() {
         let mgr = manager().await;
@@ -8657,6 +8651,150 @@ mod auto_73_tests {
             "last_resend_at must also be rolled back, or a genuine later RR73 \
              could be wrongly suppressed by the per-slot guard"
         );
+    }
+
+    fn armed_for(client: &str) -> Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>> {
+        let mut st = pancetta_agent::arm::ArmState::new();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        st.set_channel_consent(
+            pancetta_agent::arm::ConsentChannel::StationAgent,
+            true,
+            now_ms,
+        );
+        st.set_channel_consent(pancetta_agent::arm::ConsentChannel::WsjtxUdp, true, now_ms);
+        st.arm(
+            pancetta_agent::arm::VerifiedArmGrant {
+                operator_callsign: "W1AW".to_string(),
+                ttl_ms: 120_000,
+                armed_until_ms: now_ms + 120_000,
+                heartbeat_interval_sec: 10,
+                scope_tx: true,
+                jti: "pan138-auto73-jti".to_string(),
+                client_key_id: client.to_string(),
+            },
+            pancetta_agent::arm::ArmTime::now(),
+        );
+        Arc::new(std::sync::Mutex::new(st))
+    }
+
+    /// PAN-138 (round 16 on PR #362): the coordinator's early check passes
+    /// (client-a holds the arm), but by the time the engine re-checks under
+    /// its `qsos` guard client-a has disarmed. The resend emits nothing, so
+    /// its budget commit must be undone and no "Re-sending 73" status shown.
+    async fn engine_denial_rolls_back(rekey_existing: bool) {
+        let engine_permits = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut mgr = QsoManager::new(QsoManagerConfig {
+            our_callsign: OUR.to_string(),
+            our_grid: Some("EM10".to_string()),
+            ..Default::default()
+        });
+        let permits = Arc::clone(&engine_permits);
+        mgr.set_remote_tx_permitted_source(Arc::new(move |_| {
+            permits.load(std::sync::atomic::Ordering::SeqCst)
+        }));
+        mgr.start().await.expect("manager start");
+        // FIX B re-keys a QSO completed inside the 45 s grace; without one
+        // the engine refuses a brand-new close-step open with an error.
+        let qso_id = if rekey_existing {
+            mgr.respond_to_caller(
+                DX.into(),
+                1500.0,
+                Some(SlotParity::Even),
+                pancetta_core::ResponseStep::SeventyThree,
+                None,
+                None,
+                None,
+                true,
+                Some("client-a".into()),
+            )
+            .await
+            .unwrap()
+        } else {
+            uuid::Uuid::new_v4()
+        };
+        let map = {
+            let mut m = HashMap::new();
+            m.insert(
+                DX.to_string(),
+                RecentManualCompletion {
+                    completed_at: chrono::Utc::now() - chrono::Duration::seconds(40),
+                    frequency_hz: 1500.0,
+                    dx_parity: Some(SlotParity::Even),
+                    resends: 0,
+                    last_resend_at: None,
+                    remote_origin: true,
+                    remote_client_key_id: Some("client-a".to_string()),
+                    qso_id,
+                },
+            );
+            Arc::new(Mutex::new(m))
+        };
+        let policy = AtomicU8::new(TxPolicy::Full.as_u8());
+        let bus = bus();
+        let (_tui_s, tui) = bus
+            .create_channel(crate::message_bus::ComponentId::Tui)
+            .await
+            .unwrap();
+        let mut rx = mgr.subscribe();
+        engine_permits.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        maybe_auto_resend_73(
+            &rr73_to_us(),
+            OUR,
+            1500.0,
+            Some(SlotParity::Even),
+            &mgr,
+            &map,
+            &policy,
+            &bus,
+            &armed_for("client-a"),
+        )
+        .await;
+
+        assert_eq!(drain_sends(&mut rx), 0);
+        let entry = map.lock().await.get(DX).cloned().expect("entry retained");
+        assert_eq!(entry.resends, 0, "the resend commit must be rolled back");
+        assert_eq!(entry.last_resend_at, None);
+        while let Ok(msg) = tui.try_recv() {
+            if let crate::message_bus::MessageType::StatusUpdate(text) = &msg.message_type {
+                assert!(
+                    !text.contains("Re-sending 73"),
+                    "status claimed a resend: {text}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_denial_of_a_completed_qso_rekey_rolls_back_the_commit() {
+        engine_denial_rolls_back(true).await;
+    }
+
+    #[tokio::test]
+    async fn engine_refusal_of_a_new_close_step_open_rolls_back_the_commit() {
+        engine_denial_rolls_back(false).await;
+    }
+
+    /// The rollback only undoes the commit it made: a newer completion
+    /// stashed for the same callsign in the meantime is left alone.
+    #[tokio::test]
+    async fn rollback_leaves_a_replaced_entry_alone() {
+        let map = map_with_dx();
+        let newer = map.lock().await.get(DX).cloned().unwrap();
+        let committed_at = chrono::Utc::now();
+        super::roll_back_auto_73_commit(&map, DX, uuid::Uuid::new_v4(), committed_at, 0, None)
+            .await;
+        let after = map.lock().await.get(DX).cloned().unwrap();
+        assert_eq!(after.qso_id, newer.qso_id);
+        assert_eq!(after.resends, newer.resends);
+
+        if let Some(e) = map.lock().await.get_mut(DX) {
+            e.resends = 2;
+            e.last_resend_at = Some(committed_at);
+        }
+        super::roll_back_auto_73_commit(&map, DX, newer.qso_id, committed_at, 1, None).await;
+        let after = map.lock().await.get(DX).cloned().unwrap();
+        assert_eq!((after.resends, after.last_resend_at), (1, None));
     }
 
     /// Guard for the [duplicate_checking] wiring: the pancetta-config defaults
@@ -9154,12 +9292,7 @@ fn start_qso_upload_subscriber(
                     // PAN-85: session-scoped only — the ADIF writer and the
                     // SQLite logger already consumed their own copies of this
                     // event, so this value is not persisted (see D6).
-                    if let (Some(call), Some(state)) = (
-                        metadata.their_callsign.as_deref(),
-                        metadata.their_state.as_deref(),
-                    ) {
-                        station_lookup.record_state(call, state);
-                    }
+                    station_lookup.record_completed_state(&metadata);
 
                     // Render the single ADIF record the same way the
                     // source-of-truth writer does.
@@ -9351,6 +9484,7 @@ async fn start_local_qso_log_writers(
 ) -> (
     Option<std::sync::Arc<pancetta_qso::AdifLogWriter>>,
     Option<std::sync::Arc<pancetta_qso::async_logger::QsoLogger>>,
+    Option<pancetta_qso::async_database::QsoDatabase>,
 ) {
     if replay {
         info!(
@@ -9359,8 +9493,18 @@ async fn start_local_qso_log_writers(
             adif_path.display(),
             db_path.display(),
         );
-        return (None, None);
+        return (None, None, None);
     }
+
+    // Subscribe before the index work below: a QSO that completes while a
+    // large log replays waits in this receiver and is appended once the
+    // writer opens, instead of missing the logbook of record.
+    let adif_events = qso_manager.subscribe();
+
+    // Before either writer below creates a file: opening the writers first
+    // made a legacy-only `qso.db` look stale (wiped by the rebuild) and a
+    // missing index look current (never rebuilt) — PAN-127.
+    let seed_db = prepare_local_qso_index(adif_path, db_path).await;
 
     // ADIF source-of-truth writer. Subscribes to QsoEvent::QsoCompleted and
     // appends one ADIF record per completed QSO. Fail-soft: if open fails, we
@@ -9371,7 +9515,7 @@ async fn start_local_qso_log_writers(
             info!("ADIF log open at {}", adif_path.display());
             w.set_station_power_watts(station_power_watts);
             let w = std::sync::Arc::new(w);
-            start_adif_subscriber(w.clone(), qso_manager.subscribe(), shutdown);
+            start_adif_subscriber(w.clone(), adif_events, shutdown);
             Some(w)
         }
         Err(e) => {
@@ -9423,7 +9567,130 @@ async fn start_local_qso_log_writers(
         }
     };
 
-    (adif_writer, async_logger)
+    (adif_writer, async_logger, seed_db)
+}
+
+/// Bring the rebuildable SQLite index in line with the ADIF source of truth
+/// BEFORE either local log writer opens a file (PAN-127), and return it for
+/// the worked-station seed (`None` when it cannot be opened).
+///
+/// Three-case startup decision (non-replay only):
+///   1. Migration: ADIF missing but legacy DB exists → dump DB to ADIF first
+///      so contacts are not lost; future runs use ADIF as source of truth.
+///   2. Replay-rebuild: index missing or older than ADIF → drop + rebuild the
+///      index so duplicate detection sees every prior contact.
+///   3. Open as-is: normal startup; index is current.
+///
+/// The order matters: `AdifLogWriter::open` creates an empty `qsos.adi` and
+/// `QsoLogger::new` an empty `qso.db`. When the writers opened first, the new
+/// empty ADIF made a legacy-only `qso.db` look stale, so the rebuild wiped
+/// every legacy contact, and a freshly created `qso.db` made a missing index
+/// look current, so it was never rebuilt.
+///
+/// Every path here is a write against the *real* `~/.pancetta/qsos.adi` /
+/// `qso.db` (`QsoDatabase::open` itself runs `PRAGMA`s and `CREATE TABLE IF
+/// NOT EXISTS`, a write-mode connection even on an already-current DB) — not
+/// anything derived from `--replay`'s capture-dir argument, so it only runs
+/// from the live branch of [`start_local_qso_log_writers`] (PAN-41).
+async fn prepare_local_qso_index(
+    adif_path: &std::path::Path,
+    db_path: &std::path::Path,
+) -> Option<pancetta_qso::async_database::QsoDatabase> {
+    use pancetta_qso::async_database::QsoDatabase;
+
+    // Case 1: migration — ADIF missing but legacy DB exists.
+    let adif_exists = tokio::fs::try_exists(&adif_path).await.unwrap_or(false);
+    let db_exists = tokio::fs::try_exists(&db_path).await.unwrap_or(false);
+
+    if !adif_exists && db_exists {
+        info!(
+            "ADIF missing but legacy DB present — migrating QSOs from {} to {}",
+            db_path.display(),
+            adif_path.display(),
+        );
+        match QsoDatabase::open(&db_path).await {
+            Ok(db) => {
+                if let Err(e) = db.export_to_adif(&adif_path).await {
+                    warn!(
+                        "DB→ADIF migration failed: {} — index continues to work, \
+                         but ADIF source-of-truth will only contain QSOs logged \
+                         from now on",
+                        e,
+                    );
+                } else {
+                    info!("DB→ADIF migration succeeded");
+                }
+            }
+            Err(e) => {
+                warn!("Could not open legacy DB for migration: {} — skipping", e);
+            }
+        }
+    }
+
+    // Case 2: replay — index missing or older than ADIF, or marked by a
+    // `pancetta import` that stopped before it finished indexing (PAN-127).
+    let marker = QsoDatabase::rebuild_marker(db_path);
+    let marked = tokio::fs::try_exists(&marker).await.unwrap_or(false);
+    let needs_replay = match (
+        tokio::fs::metadata(&db_path).await.ok(),
+        tokio::fs::metadata(&adif_path).await.ok(),
+    ) {
+        (None, Some(_)) => {
+            info!(
+                "Index missing at {} — replaying from ADIF",
+                db_path.display()
+            );
+            true
+        }
+        (Some(_), Some(_)) if marked => {
+            info!(
+                "Index at {} is missing contacts an interrupted import added to {} — replaying",
+                db_path.display(),
+                adif_path.display(),
+            );
+            true
+        }
+        (Some(db_meta), Some(adif_meta)) => {
+            match (db_meta.modified().ok(), adif_meta.modified().ok()) {
+                (Some(d), Some(a)) if a > d => {
+                    info!(
+                        "Index at {} is older than ADIF at {} — replaying",
+                        db_path.display(),
+                        adif_path.display(),
+                    );
+                    true
+                }
+                _ => false,
+            }
+        }
+        // No ADIF and no DB: fresh install; coordinator creates both later.
+        _ => false,
+    };
+
+    if needs_replay {
+        let replayed = QsoDatabase::replay_from_adif(&db_path, &adif_path).await;
+        // The marker stays until a replay succeeds, so a failed one (bad
+        // record, transient disk error) is retried at the next start instead
+        // of a stale or partial index being trusted from then on. Retrying
+        // loses nothing: `qsos.adi` holds every QSO the station logged.
+        if marked && replayed.is_ok() {
+            let _ = tokio::fs::remove_file(&marker).await;
+        }
+        match replayed {
+            Ok(db) => Some(db),
+            Err(e) => {
+                warn!(
+                    "ADIF replay failed: {} — falling back to existing index \
+                     (may be stale)",
+                    e,
+                );
+                QsoDatabase::open(&db_path).await.ok()
+            }
+        }
+    } else {
+        // Case 3: open as-is.
+        QsoDatabase::open(&db_path).await.ok()
+    }
 }
 
 fn start_adif_subscriber(
@@ -9768,6 +10035,62 @@ mod qrz_enrichment_tests {
         let mut m = metadata(their_grid, None);
         m.their_callsign = Some("W5ABC".to_string());
         m
+    }
+
+    #[test]
+    fn completed_state_history_includes_metadata_and_late_qrz_only_after_completion() {
+        let cache = crate::priority_evaluator::CachedStationLookup::new();
+        let mut m = us_metadata(Some("EM34"));
+        cache.record_state("W5ABC", "AR");
+        cache.record_completed_contact(&m);
+        assert!(
+            cache.is_state_needed("AR"),
+            "missing completion state is not invented"
+        );
+        m.their_state = Some("TX".into());
+        cache.record_completed_contact(&m);
+        assert!(!cache.is_state_needed("TX"));
+        m.their_state = None;
+        merge_qrz_lookup(
+            &mut m,
+            &QrzLookup {
+                state: Some("AR".into()),
+                ..lookup(None, None)
+            },
+        );
+        cache.record_completed_state(&m);
+        assert!(!cache.is_state_needed("AR"));
+        assert_eq!(cache.state_for("W5ABC").as_deref(), Some("AR"));
+    }
+
+    #[tokio::test]
+    async fn live_and_replay_display_history_seeds_agree() {
+        use pancetta_qso::async_database::QsoDatabase;
+        use pancetta_qso::priority::WorkedStationLookup;
+        let dir = tempfile::tempdir().unwrap();
+        let adif_path = dir.path().join("history.adi");
+        let fixture = "<EOH>\n<CALL:5>W5ABC <QSO_DATE:8>20250102 <TIME_ON:6>120000 <MODE:3>FT8 <FREQ:9>14.074000 <GRIDSQUARE:4>EM34 <STATE:2>CA <EOR>\n<CALL:5>W5ABC <QSO_DATE:8>20250101 <TIME_ON:6>120000 <MODE:3>FT8 <FREQ:9>14.074000 <GRIDSQUARE:4>EM34 <STATE:2>AR <EOR>";
+        tokio::fs::write(&adif_path, fixture).await.unwrap();
+        let live = QsoDatabase::new_in_memory().await.unwrap();
+        let processor = pancetta_qso::AdifProcessor::new();
+        live.insert_adif_records(
+            &processor,
+            &processor.parse_string(fixture).unwrap().records,
+        )
+        .await
+        .unwrap();
+        let replay = QsoDatabase::replay_from_adif(":memory:", &adif_path)
+            .await
+            .unwrap();
+        for db in [&live, &replay] {
+            let cache = crate::priority_evaluator::CachedStationLookup::new();
+            cache.seed_display_history(db).await;
+            assert!(!cache.is_state_needed("AR"));
+            assert!(!cache.is_state_needed("CA"));
+            assert_eq!(cache.state_for("W5ABC").as_deref(), Some("CA"));
+            assert!(!cache.is_grid_needed_on_band("em34ab", 14_074_000.0));
+            assert!(cache.is_grid_needed_on_band("EM34", 7_074_000.0));
+        }
     }
 
     #[test]
@@ -10177,6 +10500,225 @@ mod replay_local_log_tests {
         adif_record_count(path)
     }
 
+    /// Two pancetta-style 20 m records; FREQ is what history seeding bands by.
+    const TWO_RECORDS: &str = "pancetta test log <ADIF_VER:5>3.1.0 <EOH>\n\
+        <CALL:4>W1AW <QSO_DATE:8>20240101 <TIME_ON:6>120000 <MODE:3>FT8 \
+        <FREQ:9>14.074000 <BAND:3>20M <EOR>\n\
+        <CALL:5>K1ABC <QSO_DATE:8>20240101 <TIME_ON:6>121500 <MODE:3>FT8 \
+        <FREQ:9>14.074000 <BAND:3>20M <EOR>\n";
+
+    /// Build a 2-row `qso.db` at `db_path` from an ADIF kept somewhere else,
+    /// so the directory under test holds the index alone.
+    async fn index_with_two_rows(db_path: &std::path::Path) {
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let source = elsewhere.path().join("source.adi");
+        std::fs::write(&source, TWO_RECORDS).expect("write source ADIF");
+        let db = pancetta_qso::async_database::QsoDatabase::replay_from_adif(db_path, &source)
+            .await
+            .expect("build legacy index");
+        assert_eq!(db.count_qsos().await.expect("count"), 2, "precondition");
+        db.close().await;
+    }
+
+    /// PAN-127: a legacy install (`qso.db`, no `qsos.adi`) used to be wiped,
+    /// because the ADIF writer created an empty `qsos.adi` first, which made
+    /// the index look stale and replayed it from zero records.
+    #[tokio::test]
+    async fn live_start_migrates_a_legacy_index_instead_of_wiping_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let adif_path = dir.path().join("qsos.adi");
+        let db_path = dir.path().join("qso.db");
+        index_with_two_rows(&db_path).await;
+        assert!(!adif_path.exists(), "precondition: no ADIF log yet");
+        let manager = manager();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let (_adif_writer, _async_logger, seed_db) = start_local_qso_log_writers(
+            false,
+            &adif_path,
+            &db_path,
+            100,
+            false,
+            &manager,
+            shutdown.clone(),
+        )
+        .await;
+
+        let seed_db = seed_db.expect("a live start returns the seed index");
+        assert_eq!(
+            seed_db.count_qsos().await.expect("count"),
+            2,
+            "the legacy contacts must survive startup"
+        );
+        let adif = std::fs::read_to_string(&adif_path).expect("qsos.adi was written");
+        let parsed = pancetta_qso::AdifProcessor::new()
+            .parse_string(&adif)
+            .expect("migrated ADIF parses");
+        assert_eq!(parsed.records.len(), 2, "both contacts migrated to ADIF");
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// PAN-127: a `qsos.adi` with no `qso.db` (dropped in, or the index
+    /// deleted to force a rebuild) used to be left unindexed, because the
+    /// SQLite logger created an empty `qso.db` that then looked current.
+    #[tokio::test]
+    async fn live_start_rebuilds_a_missing_index_from_the_adif_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let adif_path = dir.path().join("qsos.adi");
+        let db_path = dir.path().join("qso.db");
+        std::fs::write(&adif_path, TWO_RECORDS).expect("write qsos.adi");
+        let manager = manager();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let (_adif_writer, _async_logger, seed_db) = start_local_qso_log_writers(
+            false,
+            &adif_path,
+            &db_path,
+            100,
+            false,
+            &manager,
+            shutdown.clone(),
+        )
+        .await;
+
+        let seed_db = seed_db.expect("a live start returns the seed index");
+        let mut calls = seed_db.get_worked_callsigns("20M").await;
+        calls.sort();
+        assert_eq!(calls, vec!["K1ABC".to_string(), "W1AW".to_string()]);
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// An index newer than the ADIF log is opened as it is, not rebuilt.
+    #[tokio::test]
+    async fn live_start_opens_a_current_index_as_is() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let adif_path = dir.path().join("qsos.adi");
+        let db_path = dir.path().join("qso.db");
+        // The ADIF holds one contact; the (newer) index holds two, so a
+        // rebuild would be visible as a count of 1.
+        let one_record = TWO_RECORDS
+            .split_once("<CALL:5>K1ABC")
+            .map(|(head, _)| head)
+            .expect("fixture has two records");
+        std::fs::write(&adif_path, one_record).expect("write qsos.adi");
+        let an_hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&adif_path)
+            .and_then(|f| f.set_modified(an_hour_ago))
+            .expect("backdate qsos.adi");
+        index_with_two_rows(&db_path).await;
+        let manager = manager();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let (_adif_writer, _async_logger, seed_db) = start_local_qso_log_writers(
+            false,
+            &adif_path,
+            &db_path,
+            100,
+            false,
+            &manager,
+            shutdown.clone(),
+        )
+        .await;
+
+        let seed_db = seed_db.expect("a live start returns the seed index");
+        assert_eq!(
+            seed_db.count_qsos().await.expect("count"),
+            2,
+            "a current index must not be rebuilt"
+        );
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// PAN-127: an import stopped part-way leaves a partial index that is
+    /// newer than the ADIF log, plus the rebuild marker. The marker, not the
+    /// mtimes, decides: the index is rebuilt and the marker cleared.
+    #[tokio::test]
+    async fn live_start_rebuilds_an_index_an_interrupted_import_marked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let adif_path = dir.path().join("qsos.adi");
+        let db_path = dir.path().join("qso.db");
+        std::fs::write(&adif_path, TWO_RECORDS).expect("write qsos.adi");
+        let an_hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&adif_path)
+            .and_then(|f| f.set_modified(an_hour_ago))
+            .expect("backdate qsos.adi");
+        // The partial index: the first contact only.
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let first = elsewhere.path().join("first.adi");
+        let one_record = TWO_RECORDS
+            .split_once("<CALL:5>K1ABC")
+            .map(|(head, _)| head)
+            .expect("fixture has two records");
+        std::fs::write(&first, one_record).expect("write first.adi");
+        pancetta_qso::async_database::QsoDatabase::replay_from_adif(&db_path, &first)
+            .await
+            .expect("build partial index")
+            .close()
+            .await;
+        let marker = pancetta_qso::async_database::QsoDatabase::rebuild_marker(&db_path);
+        std::fs::write(&marker, b"").expect("write marker");
+        let manager = manager();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let (_adif_writer, _async_logger, seed_db) = start_local_qso_log_writers(
+            false,
+            &adif_path,
+            &db_path,
+            100,
+            false,
+            &manager,
+            shutdown.clone(),
+        )
+        .await;
+
+        let seed_db = seed_db.expect("a live start returns the seed index");
+        assert_eq!(
+            seed_db.count_qsos().await.expect("count"),
+            2,
+            "a marked index must be rebuilt from the ADIF log"
+        );
+        assert!(!marker.exists(), "the rebuild clears the marker");
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// PR #451 review (Codex P2): a replay that fails (here, on an
+    /// unreadable record) keeps the marker, so the rebuild is retried at the
+    /// next start once the cause is fixed, instead of the stale index being
+    /// trusted from then on. The failed replay leaves the old index in place.
+    #[tokio::test]
+    async fn live_start_keeps_the_marker_when_the_rebuild_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let adif_path = dir.path().join("qsos.adi");
+        let db_path = dir.path().join("qso.db");
+        index_with_two_rows(&db_path).await;
+        std::fs::write(&adif_path, "<CALL:4>W1AW <TIME_ON:x>120000 <EOR>\n")
+            .expect("write qsos.adi");
+        let marker = pancetta_qso::async_database::QsoDatabase::rebuild_marker(&db_path);
+        std::fs::write(&marker, b"").expect("write marker");
+        let manager = manager();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let (_adif_writer, _async_logger, seed_db) = start_local_qso_log_writers(
+            false,
+            &adif_path,
+            &db_path,
+            100,
+            false,
+            &manager,
+            shutdown.clone(),
+        )
+        .await;
+
+        assert!(marker.exists(), "a failed rebuild keeps the marker");
+        let seed_db = seed_db.expect("falls back to the existing index");
+        assert_eq!(seed_db.count_qsos().await.expect("count"), 2);
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+    }
+
     /// CONTROL (makes the replay assertion below non-vacuous): on a live run
     /// the very same exchange DOES reach both local writers — the ADIF file
     /// gains a record and the SQLite index is created.
@@ -10188,7 +10730,7 @@ mod replay_local_log_tests {
         let manager = manager();
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        let (adif_writer, async_logger) = start_local_qso_log_writers(
+        let (adif_writer, async_logger, _seed_db) = start_local_qso_log_writers(
             false, // NOT replay
             &adif_path,
             &db_path,
@@ -10233,7 +10775,7 @@ mod replay_local_log_tests {
         let manager = manager();
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        let (_adif_writer, async_logger) = start_local_qso_log_writers(
+        let (_adif_writer, async_logger, _seed_db) = start_local_qso_log_writers(
             false,
             &dir.path().join("qsos.adi"),
             &db_path,
@@ -10265,7 +10807,7 @@ mod replay_local_log_tests {
         let manager = manager();
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        let (adif_writer, async_logger) = start_local_qso_log_writers(
+        let (adif_writer, async_logger, seed_db) = start_local_qso_log_writers(
             true, // --replay
             &adif_path,
             &db_path,
@@ -10282,6 +10824,10 @@ mod replay_local_log_tests {
         assert!(
             async_logger.is_none(),
             "the SQLite QSO logger must not be constructed under --replay"
+        );
+        assert!(
+            seed_db.is_none(),
+            "the real index must not be opened (or rebuilt) under --replay"
         );
 
         complete_one_qso(&manager).await;
@@ -11172,11 +11718,14 @@ mod respond_to_caller_admission_tests {
             .metadata
             .last_call_at
             .unwrap();
+        // PAN-128: the two rearms are two slots apart so each feeds a
+        // distinct own-parity TX slot — the stall counter counts own TX
+        // slots, not protocol slots.
         manager
             .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(15))
             .await;
         manager
-            .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(30))
+            .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(45))
             .await;
 
         let mut found = false;
@@ -11908,9 +12457,11 @@ mod respond_to_caller_admission_tests {
             uuid::Uuid::new_v4()
         )));
         let display_feed_enabled = Arc::new(AtomicBool::new(false));
+        let backlog_inbox =
+            crate::coordinator::tx::TxInbox::new(backlog_rx.clone(), Default::default());
         crate::coordinator::tx::coalesce_backlog_into(
             head,
-            &backlog_rx,
+            &backlog_inbox,
             &coordinator.message_bus,
             &coordinator.active_tx_qsos,
             &coordinator.fox_admitted_qsos,
@@ -13283,5 +13834,330 @@ mod manual_capacity_admission_tests {
         );
         assert!(has_capacity_diagnostic(&tui, Some("K2BBB")), "{tui:?}");
         assert_eq!(h.manager.active_qso_count().await, 1);
+    }
+}
+
+#[cfg(test)]
+mod remote_controller_change_tests {
+    //! PAN-137: exercise the real QSO component and its deferred-call queue.
+    use super::super::ApplicationCoordinator;
+    use crate::message_bus::{ComponentId, ComponentMessage, MessageType, QsoMessage};
+    use pancetta_config::Config;
+    use pancetta_core::slot::SlotParity;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    type Rx = crossbeam_channel::Receiver<ComponentMessage>;
+
+    async fn test_coordinator() -> ApplicationCoordinator {
+        let config = Config::default();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut coordinator = ApplicationCoordinator::new(
+            config,
+            None,
+            true,  // no_audio
+            true,  // headless
+            false, // metrics
+            9090,
+            None,                                                // no WAV
+            Some(std::path::PathBuf::from("/some/capture/dir")), // --replay: never touch the real logbook
+            None,                                                // no test-tx
+            1500.0,
+            shutdown,
+            Vec::new(),                                             // no config warnings
+            std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
+            true,                                                   // test-only: assume TOML
+        )
+        .await
+        .expect("coordinator creation should succeed");
+
+        coordinator.pancetta_home_override = Some(std::env::temp_dir().join(format!(
+            "pancetta-test-home-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        )));
+
+        coordinator
+    }
+
+    /// A started QSO component with `max_concurrent_qsos = cap`, plus the
+    /// Tui, Ft8Transmitter and RemoteGateway receivers.
+    struct Harness {
+        coordinator: ApplicationCoordinator,
+        manager: pancetta_qso::QsoManager,
+        tui: Rx,
+        tx: Rx,
+        gateway: Rx,
+        // Keep the senders alive so the channels stay registered.
+        _senders: Vec<crossbeam_channel::Sender<ComponentMessage>>,
+    }
+
+    async fn harness(cap: u32, display_feed: bool) -> Harness {
+        let mut coordinator = test_coordinator().await;
+        {
+            let mut cfg = coordinator.config.write().await;
+            cfg.station.callsign = "K1TEST".to_string();
+            cfg.station.grid_square = "FN42".to_string();
+            cfg.autonomous.max_concurrent_qsos = cap;
+        }
+        coordinator
+            .display_feed_enabled
+            .store(display_feed, Ordering::Relaxed);
+        let bus = &coordinator.message_bus;
+        let (tui_s, tui) = bus.create_channel(ComponentId::Tui).await.unwrap();
+        let (tx_s, tx) = bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        let (gw_s, gateway) = bus
+            .create_channel(ComponentId::RemoteGateway)
+            .await
+            .unwrap();
+        coordinator.start_qso_component().await.unwrap();
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        Harness {
+            coordinator,
+            manager,
+            tui,
+            tx,
+            gateway,
+            _senders: vec![tui_s, tx_s, gw_s],
+        }
+    }
+
+    impl Harness {
+        async fn send(&self, msg: QsoMessage) {
+            self.coordinator
+                .message_bus
+                .send_message(ComponentMessage::new(
+                    ComponentId::Tui,
+                    ComponentId::Qso,
+                    MessageType::QsoMessage(msg),
+                    Instant::now(),
+                ))
+                .await
+                .unwrap();
+        }
+
+        async fn start_qso(&self, call: &str, frequency: u64) {
+            self.send(QsoMessage::StartQso {
+                callsign: call.to_string(),
+                frequency,
+                dx_parity: Some(SlotParity::Even),
+                remote_origin: false,
+                remote_client_key_id: None,
+            })
+            .await;
+        }
+    }
+
+    /// Collect EVERY message until one satisfies `pred` (or ~5 s pass), then
+    /// keep collecting until the channel has been quiet for 100 ms.
+    async fn collect_until(
+        rx: &Rx,
+        pred: impl Fn(&ComponentMessage) -> bool,
+    ) -> Vec<ComponentMessage> {
+        let mut out = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(m) => {
+                    let hit = pred(&m);
+                    out.push(m);
+                    if hit {
+                        out.extend(collect_quiet(rx, 100).await);
+                        return out;
+                    }
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+        out
+    }
+
+    /// Collect every message until the channel has been quiet for `quiet_ms`.
+    async fn collect_quiet(rx: &Rx, quiet_ms: u64) -> Vec<ComponentMessage> {
+        let mut out = Vec::new();
+        let mut idle_since = Instant::now();
+        loop {
+            match rx.try_recv() {
+                Ok(m) => {
+                    out.push(m);
+                    idle_since = Instant::now();
+                }
+                Err(_) => {
+                    if idle_since.elapsed() >= Duration::from_millis(quiet_ms) {
+                        return out;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+    }
+
+    fn tx_text(m: &ComponentMessage) -> Option<&str> {
+        match &m.message_type {
+            MessageType::TransmitRequest { message_text, .. } => Some(message_text.as_str()),
+            _ => None,
+        }
+    }
+
+    fn status(m: &ComponentMessage) -> Option<&str> {
+        match &m.message_type {
+            MessageType::StatusUpdate(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    fn statuses(msgs: &[ComponentMessage]) -> Vec<&str> {
+        msgs.iter().filter_map(status).collect()
+    }
+
+    fn any_tx_containing(msgs: &[ComponentMessage], needle: &str) -> bool {
+        msgs.iter().filter_map(tx_text).any(|t| t.contains(needle))
+    }
+
+    async fn remote_call(h: &Harness, call: &str, freq: u64, dx: SlotParity, client: &str) {
+        h.send(QsoMessage::StartQso {
+            callsign: call.to_string(),
+            frequency: freq,
+            dx_parity: Some(dx),
+            remote_origin: true,
+            remote_client_key_id: Some(client.to_string()),
+        })
+        .await;
+    }
+
+    async fn change_controller(h: &Harness, client: &str) {
+        h.send(QsoMessage::RemoteControllerChanged {
+            controller_key_id: client.to_string(),
+        })
+        .await;
+    }
+
+    async fn open_a_and_queue_b(h: &Harness) {
+        remote_call(h, "K1AAA", 1500, SlotParity::Even, "client-a").await;
+        let tx = collect_until(&h.tx, |m| tx_text(m).is_some_and(|t| t.contains("K1AAA"))).await;
+        assert!(any_tx_containing(&tx, "K1AAA"));
+        remote_call(h, "K2BBB", 2000, SlotParity::Odd, "client-b").await;
+        let tui = collect_until(&h.tui, |m| {
+            status(m).is_some_and(|s| s.starts_with("Queued K2BBB"))
+        })
+        .await;
+        assert!(statuses(&tui).iter().any(|s| s.starts_with("Queued K2BBB")));
+        assert!(!h.manager.has_active_qso_with("K2BBB").await);
+    }
+
+    #[tokio::test]
+    async fn controller_change_starts_the_new_controllers_queued_opposite_parity_call() {
+        let h = harness(4, false).await;
+        open_a_and_queue_b(&h).await;
+        change_controller(&h, "client-b").await;
+        let tx = collect_until(&h.tx, |m| tx_text(m).is_some_and(|t| t.contains("K2BBB"))).await;
+        let tui = collect_quiet(&h.tui, 300).await;
+        assert!(any_tx_containing(&tx, "K2BBB"));
+        assert!(!h.manager.has_active_qso_with("K1AAA").await);
+        assert_eq!(h.manager.current_tx_side().await, Some(SlotParity::Even));
+        assert!(statuses(&tui)
+            .contains(&"QSO with K1AAA failed: remote control passed to another client"));
+        assert!(statuses(&tui).contains(&"Now calling K2BBB (was queued)"));
+    }
+
+    #[tokio::test]
+    async fn controller_change_drops_the_previous_controllers_queued_calls() {
+        let h = harness(4, true).await;
+        remote_call(&h, "K1AAA", 1500, SlotParity::Even, "client-a").await;
+        let tx = collect_until(&h.tx, |m| tx_text(m).is_some_and(|t| t.contains("K1AAA"))).await;
+        assert!(any_tx_containing(&tx, "K1AAA"));
+        for (call, client, freq) in [("K3CCC", "client-a", 1800), ("K2BBB", "client-b", 2000)] {
+            remote_call(&h, call, freq, SlotParity::Odd, client).await;
+            let queued = format!("Queued {call}");
+            let tui = collect_until(&h.tui, |m| {
+                status(m).is_some_and(|s| s.starts_with(&queued))
+            })
+            .await;
+            assert!(statuses(&tui).iter().any(|s| s.starts_with(&queued)));
+        }
+        let _ = collect_quiet(&h.gateway, 100).await;
+        change_controller(&h, "client-b").await;
+        let mut tx =
+            collect_until(&h.tx, |m| tx_text(m).is_some_and(|t| t.contains("K2BBB"))).await;
+        tx.extend(collect_quiet(&h.tx, 500).await);
+        assert!(any_tx_containing(&tx, "K2BBB"));
+        assert!(!any_tx_containing(&tx, "K3CCC"));
+        assert!(!h.manager.has_active_qso_with("K1AAA").await);
+        assert!(!h.manager.has_active_qso_with("K3CCC").await);
+        let gateway = collect_quiet(&h.gateway, 100).await;
+        assert!(gateway.iter().any(|m| matches!(&m.message_type,
+            MessageType::ActiveQsosSnapshot { pending, .. } if pending.iter().all(|p| p.callsign != "K3CCC")
+        )), "queue purge must reach the display feed: {gateway:?}");
+    }
+
+    #[tokio::test]
+    async fn controller_change_leaves_local_and_same_controller_qsos_running() {
+        let h = harness(4, false).await;
+        h.start_qso("K4LOC", 1300).await;
+        let tx = collect_until(&h.tx, |m| tx_text(m).is_some_and(|t| t.contains("K4LOC"))).await;
+        assert!(any_tx_containing(&tx, "K4LOC"));
+        remote_call(&h, "K1AAA", 1500, SlotParity::Even, "client-a").await;
+        let tx = collect_until(&h.tx, |m| tx_text(m).is_some_and(|t| t.contains("K1AAA"))).await;
+        assert!(any_tx_containing(&tx, "K1AAA"));
+        let _ = collect_quiet(&h.tui, 100).await;
+        change_controller(&h, "client-a").await;
+        let tui = collect_quiet(&h.tui, 300).await;
+        assert!(!statuses(&tui).iter().any(|s| s.contains("failed:")));
+        assert!(h.manager.has_active_qso_with("K4LOC").await);
+        assert!(h.manager.has_active_qso_with("K1AAA").await);
+        change_controller(&h, "client-b").await;
+        let tui = collect_until(&h.tui, |m| {
+            status(m).is_some_and(|s| s.starts_with("QSO with K1AAA failed:"))
+        })
+        .await;
+        assert!(statuses(&tui)
+            .iter()
+            .any(|s| s.starts_with("QSO with K1AAA failed:")));
+        assert!(h.manager.has_active_qso_with("K4LOC").await);
+        assert!(!h.manager.has_active_qso_with("K1AAA").await);
+    }
+
+    #[tokio::test]
+    async fn without_a_controller_change_the_opposite_parity_call_stays_queued() {
+        let h = harness(4, false).await;
+        open_a_and_queue_b(&h).await;
+        let tx = collect_quiet(&h.tx, 1000).await;
+        assert!(!any_tx_containing(&tx, "K2BBB"));
+        assert!(h.manager.has_active_qso_with("K1AAA").await);
+        assert!(!h.manager.has_active_qso_with("K2BBB").await);
+    }
+
+    #[tokio::test]
+    async fn controller_change_refreshes_snapshot_when_only_queued_calls_are_dropped() {
+        let h = harness(4, true).await;
+        h.start_qso("K4LOC", 1300).await;
+        let tx = collect_until(&h.tx, |m| tx_text(m).is_some_and(|t| t.contains("K4LOC"))).await;
+        assert!(any_tx_containing(&tx, "K4LOC"));
+        remote_call(&h, "K3CCC", 1800, SlotParity::Odd, "client-a").await;
+        let tui = collect_until(&h.tui, |m| {
+            status(m).is_some_and(|s| s.starts_with("Queued K3CCC"))
+        })
+        .await;
+        assert!(statuses(&tui).iter().any(|s| s.starts_with("Queued K3CCC")));
+        let _ = collect_quiet(&h.gateway, 100).await;
+        let _ = collect_quiet(&h.tui, 100).await;
+        change_controller(&h, "client-b").await;
+        for rx in [&h.tui, &h.gateway] {
+            let messages = collect_until(rx, |m| {
+                matches!(&m.message_type,
+                    MessageType::ActiveQsosSnapshot { pending, .. } if pending.is_empty()
+                )
+            })
+            .await;
+            assert!(messages.iter().any(|m| matches!(&m.message_type,
+                MessageType::ActiveQsosSnapshot { qsos, pending } if pending.is_empty() && qsos.len() == 1
+            )), "queue-only purge must push a snapshot: {messages:?}");
+        }
+        assert!(h.manager.has_active_qso_with("K4LOC").await);
+        assert!(!h.manager.has_active_qso_with("K3CCC").await);
     }
 }

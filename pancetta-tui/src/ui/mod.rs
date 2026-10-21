@@ -1663,7 +1663,7 @@ fn recent_qso_failure_color(reason: &pancetta_qso::QsoFailureReason) -> Color {
         | R::FrequencyConflict
         | R::ProtocolError(_)
         | R::MessageUnencodable(_) => Color::Red,
-        R::Duplicate | R::UserCancelled | R::Superseded => Color::Gray,
+        R::Duplicate | R::UserCancelled | R::Superseded | R::ControlTransferred => Color::Gray,
     }
 }
 
@@ -2525,6 +2525,31 @@ mod view_render_tests {
         assert!(buffer_contains(&buf, "QSOs completed"));
     }
 
+    /// PAN-104: the audit warning stays reachable in Shift+S at 80×24, also
+    /// once acknowledged.
+    #[tokio::test]
+    async fn health_panel_shows_audit_warning_at_80x24() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.station_readiness = Some(crate::readiness::StationReadiness {
+            degraded: Some("Remote audit unavailable; events may be missing".to_string()),
+            ..Default::default()
+        });
+        let buf = render_health_80x24(&app);
+        assert!(buffer_contains(
+            &buf,
+            "Degraded — Remote audit unavailable; events may be missing"
+        ));
+        assert_eq!(app.acknowledge_readiness(), 1);
+        let buf = render_health_80x24(&app);
+        assert!(buffer_contains(&buf, "Degraded (ack'd)"));
+        assert!(buffer_contains(
+            &buf,
+            "Remote audit unavailable; events may be missing"
+        ));
+    }
+
     #[tokio::test]
     async fn health_panel_readiness_header_before_first_snapshot() {
         let app = crate::app::App::new(crate::config::Config::default(), None)
@@ -2964,6 +2989,11 @@ mod view_render_tests {
     /// for Completed, red/yellow/gray by failure reason for Failed.
     #[tokio::test]
     async fn render_recent_qsos_panel_smoke_test() {
+        assert_eq!(
+            recent_qso_failure_color(&pancetta_qso::QsoFailureReason::ControlTransferred),
+            Color::Gray
+        );
+
         let mut app = crate::app::App::new(crate::config::Config::default(), None)
             .await
             .unwrap();
@@ -3352,6 +3382,55 @@ mod view_render_tests {
     }
 
     const SUPPORTED_SIZES: [(u16, u16); 3] = [(80, 24), (100, 30), (132, 40)];
+
+    #[tokio::test]
+    async fn marked_grids_fit_supported_operate_and_hunt_layouts() {
+        struct Needed;
+        impl crate::dx_need::DxNeedLookup for Needed {
+            fn lookup_need(
+                &self,
+                _: &str,
+                _: Option<&str>,
+                _: Option<&str>,
+                _: f64,
+            ) -> crate::dx_need::DxNeedStatus {
+                crate::dx_need::DxNeedStatus {
+                    grid_needed: Some(true),
+                    ..Default::default()
+                }
+            }
+        }
+        let mut app = default_app().await;
+        app.dx_stations
+            .insert("ZL1ABC".into(), fixture_dx_station("ZL1ABC"));
+        app.refresh_dx_need(Some(&Needed));
+        app.active_panel = ActivePanel::DxHunter;
+        for (w, h) in SUPPORTED_SIZES {
+            for view in [
+                crate::view::ActiveView::Operate,
+                crate::view::ActiveView::Hunt,
+            ] {
+                app.active_view = view;
+                let buf = render_app(&app, w, h);
+                let output: String = buf.content.iter().map(|cell| cell.symbol()).collect();
+                let content = content_area(Rect::new(0, 0, w, h));
+                let panel = if view == crate::view::ActiveView::Hunt {
+                    compute_hunt_rects(content).dx_hunter
+                } else {
+                    compute_operate_rects(content).dx_hunter
+                };
+                // The existing 80x24 Hunt layout has a header but no data row.
+                if panel.height >= 4
+                    && dx_hunter::visible_columns(panel.width)
+                        .contains(&dx_hunter::DxHunterColumn::Grid)
+                {
+                    assert!(output.contains("+RE78"), "{w}x{h}: {output}");
+                } else {
+                    assert!(!output.contains("+RE7"), "no clipped marked locator");
+                }
+            }
+        }
+    }
 
     /// Gherkin 2: DX Hunter column headings stay whole words at 80 columns
     /// (and the other supported sizes), focused or not, in Operate and Hunt.

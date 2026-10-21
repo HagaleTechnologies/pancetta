@@ -3,7 +3,7 @@
 //! This module provides async-safe persistent storage for QSO data using SQLite
 //! through the sqlx library, enabling proper Send/Sync support for tokio spawns.
 
-use crate::adif::{AdifProcessor, AdifQso};
+use crate::adif::{AdifProcessor, AdifQso, AdifRecord};
 use crate::states::*;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -402,6 +402,22 @@ impl QsoDatabase {
 
     /// Insert a new QSO record
     pub async fn insert_qso(&self, progress: &QsoProgress) -> Result<i64, AsyncDatabaseError> {
+        self.insert_qso_with(&self.pool, progress, Utc::now()).await
+    }
+
+    /// [`Self::insert_qso`] on any executor, so a batch can share one
+    /// transaction. `created_at` is the row's searchable timestamp (the
+    /// date-range filters and ordering use it): the moment of logging for a
+    /// live QSO, the QSO's own start time for one read from ADIF.
+    async fn insert_qso_with<'e, E>(
+        &self,
+        executor: E,
+        progress: &QsoProgress,
+        created_at: DateTime<Utc>,
+    ) -> Result<i64, AsyncDatabaseError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
         let qso_id = progress.metadata.qso_id.to_string();
         let metadata_json = serde_json::to_string(&progress.metadata)?;
         let state_json = serde_json::to_string(&progress.state)?;
@@ -413,6 +429,7 @@ impl QsoDatabase {
         let adif_json = serde_json::to_string(&adif_qso)?;
 
         let now = Utc::now().to_rfc3339();
+        let created_at = created_at.to_rfc3339();
         let checksum = Self::calculate_checksum(&metadata_json, &state_json, &adif_json);
 
         let result = sqlx::query(
@@ -425,10 +442,10 @@ impl QsoDatabase {
         .bind(&state_json)
         .bind(&progress_json)
         .bind(&adif_json)
-        .bind(&now)
+        .bind(&created_at)
         .bind(&now)
         .bind(&checksum)
-        .execute(&self.pool)
+        .execute(executor)
         .await?;
 
         let id = result.last_insert_rowid();
@@ -931,8 +948,11 @@ impl QsoDatabase {
     /// for #164's per-band-grid-new tier. Rows with no grid on the QSO are
     /// simply absent (`json_extract` on a missing/null field filters them via
     /// the `IS NOT NULL` clause), not an error.
-    pub async fn get_worked_bands_and_grids(&self) -> Vec<(String, String)> {
-        let result: Result<Vec<(String, String)>, sqlx::Error> = sqlx::query_as(
+    /// Fallible history read: a successful empty log differs from unavailable history.
+    pub async fn try_get_worked_bands_and_grids(
+        &self,
+    ) -> Result<Vec<(String, String)>, sqlx::Error> {
+        sqlx::query_as(
             "SELECT DISTINCT json_extract(adif_data, '$.band'), \
                              json_extract(metadata, '$.grids.theirs') \
              FROM qsos \
@@ -940,7 +960,11 @@ impl QsoDatabase {
                AND json_extract(metadata, '$.grids.theirs') IS NOT NULL",
         )
         .fetch_all(&self.pool)
-        .await;
+        .await
+    }
+
+    pub async fn get_worked_bands_and_grids(&self) -> Vec<(String, String)> {
+        let result = self.try_get_worked_bands_and_grids().await;
 
         match result {
             Ok(pairs) => pairs,
@@ -964,8 +988,11 @@ impl QsoDatabase {
     /// carries, and de-duplicating (callsign, state) pairs would keep the
     /// stale rows of a station that later moved. The cost is one redundant
     /// `record_state` per repeat contact at startup — a map insert, paid once.
-    pub async fn get_worked_callsigns_and_states(&self) -> Vec<(String, String)> {
-        let result: Result<Vec<(String, String)>, sqlx::Error> = sqlx::query_as(
+    /// Fallible history read: a successful empty log differs from unavailable history.
+    pub async fn try_get_worked_callsigns_and_states(
+        &self,
+    ) -> Result<Vec<(String, String)>, sqlx::Error> {
+        sqlx::query_as(
             "SELECT json_extract(metadata, '$.their_callsign'), \
                     json_extract(metadata, '$.their_state') \
              FROM qsos \
@@ -974,7 +1001,11 @@ impl QsoDatabase {
              ORDER BY json_extract(metadata, '$.start_time') ASC",
         )
         .fetch_all(&self.pool)
-        .await;
+        .await
+    }
+
+    pub async fn get_worked_callsigns_and_states(&self) -> Vec<(String, String)> {
+        let result = self.try_get_worked_callsigns_and_states().await;
 
         match result {
             Ok(pairs) => pairs,
@@ -1025,13 +1056,9 @@ impl QsoDatabase {
             .parse_string(&raw)
             .map_err(|e| AsyncDatabaseError::Replay(format!("ADIF parse failed: {e}")))?;
 
-        let mut converted = Vec::with_capacity(adif_file.records.len());
-        for adif_record in &adif_file.records {
-            let adif_qso = processor
-                .record_to_qso(adif_record)
-                .map_err(|e| AsyncDatabaseError::Replay(format!("record→AdifQso failed: {e}")))?;
-            converted.push(processor.adif_to_qso(&adif_qso));
-        }
+        // Convert every record before touching the existing index: a record
+        // `record_to_qso` rejects must leave the old `qso.db` in place.
+        let converted = Self::convert_adif_records(&processor, &adif_file.records)?;
 
         // Drop any existing index so the rebuild is from scratch.
         if !is_in_memory && tokio::fs::try_exists(db_path).await.unwrap_or(false) {
@@ -1044,9 +1071,68 @@ impl QsoDatabase {
         }
 
         let db = Self::open(db_path).await?;
+        let (inserted, skipped) = db.insert_converted(converted).await?;
 
+        if skipped > 0 {
+            warn!(
+                "Skipped {} ADIF records with no CALL field during replay",
+                skipped
+            );
+        }
+        info!(
+            "Replayed {} records from {} into {} ({} skipped)",
+            inserted,
+            adif_path.display(),
+            db_path.display(),
+            skipped,
+        );
+        Ok(db)
+    }
+
+    /// Index `records` exactly as [`Self::replay_from_adif`] does: the same
+    /// record→row conversion, the same −15 dB report default, and the same
+    /// skip (with a `warn!`) for a record with no CALL. Returns (inserted,
+    /// skipped for having no CALL). Fails, inserting nothing, if
+    /// `record_to_qso` rejects any record or any insert fails: the rows
+    /// commit in one transaction.
+    pub async fn insert_adif_records(
+        &self,
+        processor: &AdifProcessor,
+        records: &[AdifRecord],
+    ) -> Result<(u64, u64), AsyncDatabaseError> {
+        let converted = Self::convert_adif_records(processor, records)?;
+        self.insert_converted(converted).await
+    }
+
+    /// `record_to_qso` + `adif_to_qso` for every record, failing on the first
+    /// record that cannot be converted.
+    fn convert_adif_records(
+        processor: &AdifProcessor,
+        records: &[AdifRecord],
+    ) -> Result<Vec<QsoMetadata>, AsyncDatabaseError> {
+        records
+            .iter()
+            .map(|adif_record| {
+                processor
+                    .record_to_qso(adif_record)
+                    .map(|adif_qso| processor.adif_to_qso(&adif_qso))
+                    .map_err(|e| AsyncDatabaseError::Replay(format!("record→AdifQso failed: {e}")))
+            })
+            .collect()
+    }
+
+    /// Insert converted records as completed QSOs, all in one transaction.
+    /// Records with no CALL are skipped. Returns (inserted, skipped).
+    async fn insert_converted(
+        &self,
+        converted: Vec<QsoMetadata>,
+    ) -> Result<(u64, u64), AsyncDatabaseError> {
         let mut inserted: u64 = 0;
         let mut skipped: u64 = 0;
+        // One transaction: an import stopped part-way (error, kill, power
+        // loss) leaves none of its rows, never a partial index that looks
+        // current (PAN-127).
+        let mut tx = self.pool.begin().await?;
         for metadata in converted {
             // ADIF records with no <CALL:N> field are semantically broken — skip
             // them rather than inserting a record with no callsign.
@@ -1092,24 +1178,55 @@ impl QsoDatabase {
                 metadata,
             };
 
-            db.insert_qso(&progress).await?;
+            // A historical record lands in its own date range, not the day
+            // it was imported or replayed (PR #451 review).
+            let created_at = progress.metadata.start_time;
+            self.insert_qso_with(&mut *tx, &progress, created_at)
+                .await?;
             inserted += 1;
         }
+        tx.commit().await?;
+        Ok((inserted, skipped))
+    }
 
-        if skipped > 0 {
-            warn!(
-                "Skipped {} ADIF records with no CALL field during replay",
-                skipped
-            );
+    /// The file beside the index at `db_path` that marks it as missing rows
+    /// the ADIF log holds. `pancetta import` creates it before writing and
+    /// removes it once the new rows are indexed; startup rebuilds an index it
+    /// finds marked. The new rows commit together, but an import stopped
+    /// between appending to the ADIF log and committing them (Ctrl-C, power
+    /// loss) leaves an index missing rows the log holds, which the mtime
+    /// check alone may trust (PAN-127).
+    pub fn rebuild_marker(db_path: &Path) -> std::path::PathBuf {
+        let mut name = db_path.as_os_str().to_owned();
+        name.push(".rebuild");
+        name.into()
+    }
+
+    /// Checkpoint the WAL into the database file, then close the pool, so a
+    /// short-lived process (e.g. `pancetta import`) leaves a quiescent
+    /// `qso.db` when this returns: every committed frame is in the main file,
+    /// and no pooled connection still owes it a write (PAN-127). The pool's
+    /// own close is not enough on its own — a connection can outlive the
+    /// `Pool::close` future's completion, and its later checkpoint would
+    /// change `qso.db`'s bytes and mtime after the caller had already read
+    /// them.
+    pub async fn close(&self) {
+        // TRUNCATE writes every committed frame into the main database file
+        // and resets the WAL to zero bytes, so whatever the pooled
+        // connections do afterwards cannot touch the file again.
+        if let Ok(row) = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(&self.pool)
+            .await
+        {
+            // (busy, log_frames, checkpointed_frames); busy means a reader
+            // blocked the truncation — the frames that did get checkpointed
+            // are still durable in the main file.
+            let (busy, log, checkpointed): (i64, i64, i64) = (row.get(0), row.get(1), row.get(2));
+            if busy != 0 {
+                warn!("WAL checkpoint on close was busy: {checkpointed}/{log} frames checkpointed");
+            }
         }
-        info!(
-            "Replayed {} records from {} into {} ({} skipped)",
-            inserted,
-            adif_path.display(),
-            db_path.display(),
-            skipped,
-        );
-        Ok(db)
+        self.pool.close().await
     }
 
     /// Export all QSOs in the index to an ADIF file at `path`.
@@ -1312,6 +1429,42 @@ mod tests {
         // Normal paths are returned unchanged.
         let p = "/home/op/.pancetta/backups/qso-2026.db";
         assert_eq!(escape_sqlite_string_literal(p), p);
+    }
+
+    #[tokio::test]
+    async fn state_history_is_chronological_not_insertion_order() {
+        let db = QsoDatabase::new_in_memory().await.unwrap();
+        let processor = AdifProcessor::new();
+        let file = processor.parse_string("<EOH>\n\
+            <CALL:5>W5ABC <QSO_DATE:8>20250102 <TIME_ON:6>120000 <MODE:3>FT8 <FREQ:9>14.074000 <STATE:2>CA <EOR>\n\
+            <CALL:5>W5ABC <QSO_DATE:8>20250101 <TIME_ON:6>120000 <MODE:3>FT8 <FREQ:9>14.074000 <STATE:2>AR <EOR>").unwrap();
+        db.insert_adif_records(&processor, &file.records)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.try_get_worked_callsigns_and_states().await.unwrap(),
+            vec![("W5ABC".into(), "AR".into()), ("W5ABC".into(), "CA".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn fallible_display_history_distinguishes_empty_from_failure() {
+        let db = QsoDatabase::open(":memory:").await.unwrap();
+        assert!(db
+            .try_get_worked_bands_and_grids()
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .try_get_worked_callsigns_and_states()
+            .await
+            .unwrap()
+            .is_empty());
+        db.pool.close().await;
+        assert!(db.try_get_worked_bands_and_grids().await.is_err());
+        assert!(db.try_get_worked_callsigns_and_states().await.is_err());
+        assert!(db.get_worked_bands_and_grids().await.is_empty());
+        assert!(db.get_worked_callsigns_and_states().await.is_empty());
     }
 
     #[tokio::test]
@@ -1779,6 +1932,327 @@ mod tests {
             "missing K9DEF in {:?}",
             calls
         );
+    }
+
+    /// PAN-127: `close()` must leave a file-backed index quiescent — every
+    /// committed frame checkpointed into `qso.db`, the WAL sidecar empty or
+    /// gone — before it returns. Before the fix the pool's close left a
+    /// connection alive with the whole log still in the WAL, so a caller
+    /// that snapshotted `qso.db`'s bytes or mtime right after `close()`
+    /// raced the connection's late checkpoint (`tests/import_cli.rs` failed
+    /// 24/40 parallel runs).
+    #[tokio::test]
+    async fn close_leaves_a_file_index_quiescent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let adif_path = tmp.path().join("qsos.adi");
+        let db_path = tmp.path().join("qso.db");
+        tokio::fs::write(&adif_path, INSERT_FIXTURE).await.unwrap();
+
+        QsoDatabase::replay_from_adif(&db_path, &adif_path)
+            .await
+            .unwrap()
+            .close()
+            .await;
+
+        let wal_len = std::fs::metadata(tmp.path().join("qso.db-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert_eq!(
+            wal_len, 0,
+            "close() must checkpoint the WAL into qso.db before returning"
+        );
+
+        // The checkpointed file must be complete on its own: reopening it
+        // (no WAL to recover from) sees every record.
+        let reopened = QsoDatabase::open(&db_path).await.unwrap();
+        assert_eq!(reopened.count_qsos().await.unwrap(), 3);
+        reopened.close().await;
+    }
+
+    /// PAN-127: three records exercising band, grid and state seeding.
+    const INSERT_FIXTURE: &str = "<ADIF_VER:5>3.1.4 <EOH>\n\
+        <CALL:5>W1ABC <QSO_DATE:8>20250101 <TIME_ON:6>120000 <MODE:3>FT8 \
+        <FREQ:9>14.074000 <BAND:3>20m <GRIDSQUARE:4>FN42 <STATE:2>MA <EOR>\n\
+        <CALL:5>K9DEF <QSO_DATE:8>20250102 <TIME_ON:4>1215 <MODE:4>MFSK \
+        <SUBMODE:3>FT4 <FREQ:8>7.047500 <RST_SENT:3>-07 <RST_RCVD:3>+02 <EOR>\n\
+        <CALL:5>N0XYZ <QSO_DATE:8>20250103 <TIME_ON:6>130000 <MODE:3>FT8 \
+        <FREQ:9>21.074000 <GRIDSQUARE:6>EM10ab <STATE:2>TX <EOR>\n";
+
+    fn sorted(mut pairs: Vec<(String, String)>) -> Vec<(String, String)> {
+        pairs.sort();
+        pairs
+    }
+
+    #[tokio::test]
+    async fn insert_adif_records_indexes_like_replay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let adif_path = tmp.path().join("qsos.adi");
+        tokio::fs::write(&adif_path, INSERT_FIXTURE).await.unwrap();
+        let replayed = QsoDatabase::replay_from_adif(":memory:", &adif_path)
+            .await
+            .unwrap();
+
+        let processor = AdifProcessor::new();
+        let file = processor.parse_string(INSERT_FIXTURE).unwrap();
+        let inserted = QsoDatabase::new_in_memory().await.unwrap();
+        let counts = inserted
+            .insert_adif_records(&processor, &file.records)
+            .await
+            .unwrap();
+
+        assert_eq!(counts, (3, 0));
+        assert_eq!(inserted.count_qsos().await.unwrap(), 3);
+        assert_eq!(
+            inserted.count_qsos().await.unwrap(),
+            replayed.count_qsos().await.unwrap()
+        );
+        let bands_and_calls = sorted(inserted.get_worked_bands_and_callsigns().await);
+        assert_eq!(bands_and_calls.len(), 3, "{bands_and_calls:?}");
+        assert_eq!(
+            bands_and_calls,
+            sorted(replayed.get_worked_bands_and_callsigns().await)
+        );
+        assert_eq!(
+            sorted(inserted.get_worked_bands_and_grids().await),
+            sorted(replayed.get_worked_bands_and_grids().await)
+        );
+        let states = inserted.get_worked_callsigns_and_states().await;
+        assert_eq!(states.len(), 2, "{states:?}");
+        assert_eq!(states, replayed.get_worked_callsigns_and_states().await);
+        inserted.close().await;
+        replayed.close().await;
+    }
+
+    /// PR #451 review (Codex P2): an import's rows must commit together. A
+    /// failure part-way (here a trigger rejecting the second row; in the
+    /// field, a kill or power loss) must leave none of them behind, or the
+    /// partial index can look current and never be rebuilt.
+    #[tokio::test]
+    async fn insert_adif_records_commits_all_rows_or_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = QsoDatabase::open(tmp.path().join("qso.db")).await.unwrap();
+        sqlx::query(
+            "CREATE TRIGGER reject_k9def BEFORE INSERT ON qsos \
+             WHEN json_extract(NEW.metadata, '$.their_callsign') = 'K9DEF' \
+             BEGIN SELECT RAISE(ABORT, 'rejected'); END",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let processor = AdifProcessor::new();
+        let file = processor.parse_string(INSERT_FIXTURE).unwrap();
+
+        let result = db.insert_adif_records(&processor, &file.records).await;
+
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(
+            db.count_qsos().await.unwrap(),
+            0,
+            "a failed import must not leave part of its rows indexed"
+        );
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn insert_adif_records_skips_a_record_with_no_call() {
+        let adif = "<CALL:5>W1ABC <QSO_DATE:8>20250101 <TIME_ON:6>120000 <MODE:3>FT8 <EOR>\n\
+                    <CALL:0> <QSO_DATE:8>20250101 <TIME_ON:6>121000 <MODE:3>FT8 <EOR>\n\
+                    <CALL:5>K9DEF <QSO_DATE:8>20250101 <TIME_ON:6>122000 <MODE:3>FT8 <EOR>\n";
+        let processor = AdifProcessor::new();
+        let file = processor.parse_string(adif).unwrap();
+        let db = QsoDatabase::new_in_memory().await.unwrap();
+
+        let counts = db.insert_adif_records(&processor, &file.records).await;
+
+        assert_eq!(counts.unwrap(), (2, 1));
+        assert_eq!(db.count_qsos().await.unwrap(), 2);
+    }
+
+    /// PR #451 review (Codex P2): an imported LoTW/QRZ record keeps its QSL
+    /// state through the index, so `pancetta export` (which regenerates ADIF
+    /// from the indexed metadata) does not reset a confirmed contact to
+    /// `QSL_RCVD=N`.
+    #[tokio::test]
+    async fn imported_qsl_state_survives_index_and_export() {
+        let adif = "<CALL:5>W1ABC <QSO_DATE:8>20250101 <TIME_ON:6>120000 <MODE:3>FT8 \
+                    <FREQ:9>14.074000 <QSL_SENT:1>Y <QSL_RCVD:1>Y <QSLSDATE:8>20250102 \
+                    <QSLRDATE:8>20250110 <QSL_SENT_VIA:1>E <QSL_RCVD_VIA:1>E \
+                    <QSLMSG:6>TNX 73 <LOTW_QSL_SENT:1>Y <LOTW_QSL_RCVD:1>Y \
+                    <LOTW_QSLSDATE:8>20250102 <LOTW_QSLRDATE:8>20250110 \
+                    <EQSL_QSL_RCVD:1>Y <QRZCOM_QSO_UPLOAD_STATUS:1>Y <EOR>\n\
+                    <CALL:5>K9DEF <QSO_DATE:8>20250101 <TIME_ON:6>121000 <MODE:3>FT8 \
+                    <FREQ:9>14.074000 <QSL_SENT:1>R <QSL_RCVD:1>I <EOR>\n";
+        let processor = AdifProcessor::new();
+        let file = processor.parse_string(adif).unwrap();
+        let db = QsoDatabase::new_in_memory().await.unwrap();
+        db.insert_adif_records(&processor, &file.records)
+            .await
+            .unwrap();
+
+        // The same conversion `pancetta export` applies to each indexed row.
+        let progresses = db
+            .search_qsos(&QsoFilter::default(), &QueryOptions::default())
+            .await
+            .unwrap();
+        let exported: HashMap<String, HashMap<String, String>> = progresses
+            .iter()
+            .map(|progress| {
+                let adif_qso = processor
+                    .qso_to_adif(&progress.metadata, progress.metadata.contest_info.as_ref());
+                let record = processor.qso_to_record(&adif_qso);
+                let fields: HashMap<String, String> = record
+                    .fields
+                    .into_iter()
+                    .map(|(name, field)| (name, field.value))
+                    .collect();
+                (fields["CALL"].clone(), fields)
+            })
+            .collect();
+
+        let confirmed = &exported["W1ABC"];
+        for (name, value) in [
+            ("QSL_SENT", "Y"),
+            ("QSL_RCVD", "Y"),
+            ("QSLSDATE", "20250102"),
+            ("QSLRDATE", "20250110"),
+            ("QSL_SENT_VIA", "E"),
+            ("QSL_RCVD_VIA", "E"),
+            ("QSLMSG", "TNX 73"),
+            ("LOTW_QSL_SENT", "Y"),
+            ("LOTW_QSL_RCVD", "Y"),
+            ("LOTW_QSLSDATE", "20250102"),
+            ("LOTW_QSLRDATE", "20250110"),
+            ("EQSL_QSL_RCVD", "Y"),
+            ("QRZCOM_QSO_UPLOAD_STATUS", "Y"),
+        ] {
+            assert_eq!(
+                confirmed.get(name).map(String::as_str),
+                Some(value),
+                "{name} lost through import → export: {confirmed:?}"
+            );
+        }
+        let requested = &exported["K9DEF"];
+        assert_eq!(requested["QSL_SENT"], "R", "{requested:?}");
+        assert_eq!(requested["QSL_RCVD"], "I", "{requested:?}");
+        db.close().await;
+    }
+
+    /// PR #451 review (Codex P2): standard ADIF fields the index has no column
+    /// or metadata field for (OPERATOR, TX_PWR, COUNTRY, DXCC, CQZ, ITUZ,
+    /// NOTES, the serial strings, serials with no CONTEST_ID, a TIME_OFF
+    /// with no QSO_DATE_OFF, a CW report, the BAND of a record with no FREQ,
+    /// the MODE behind a SUBMODE) survive import → index → export.
+    #[tokio::test]
+    async fn imported_standard_fields_survive_index_and_export() {
+        let adif = "<CALL:5>W1ABC <QSO_DATE:8>20250101 <TIME_ON:6>120000 <MODE:4>MFSK \
+                    <SUBMODE:3>FT4 <BAND:3>40M <OPERATOR:4>W5AU <TX_PWR:3>100 \
+                    <COUNTRY:13>United States <DXCC:3>291 <CQZ:1>5 <ITUZ:1>8 \
+                    <NOTES:13>first contact <STX_STRING:3>001 <SRX_STRING:5>123AB \
+                    <RST_SENT:3>599 <RST_RCVD:3>5NN <STX:2>17 <SRX:3>342 \
+                    <TIME_OFF:6>120130 <COMMENT:15>Worked portable <EOR>\n";
+        let processor = AdifProcessor::new();
+        let file = processor.parse_string(adif).unwrap();
+        let db = QsoDatabase::new_in_memory().await.unwrap();
+        db.insert_adif_records(&processor, &file.records)
+            .await
+            .unwrap();
+
+        // The same conversion `pancetta export` applies to each indexed row.
+        let progresses = db
+            .search_qsos(&QsoFilter::default(), &QueryOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(progresses.len(), 1);
+        let metadata = &progresses[0].metadata;
+        let adif_qso = processor.qso_to_adif(metadata, metadata.contest_info.as_ref());
+        let exported: HashMap<String, String> = processor
+            .qso_to_record(&adif_qso)
+            .fields
+            .into_iter()
+            .map(|(name, field)| (name, field.value))
+            .collect();
+
+        for (name, value) in [
+            ("MODE", "MFSK"),
+            ("SUBMODE", "FT4"),
+            ("BAND", "40M"),
+            ("OPERATOR", "W5AU"),
+            ("TX_PWR", "100"),
+            ("COUNTRY", "United States"),
+            ("DXCC", "291"),
+            ("CQZ", "5"),
+            ("ITUZ", "8"),
+            ("NOTES", "first contact"),
+            ("STX_STRING", "001"),
+            ("SRX_STRING", "123AB"),
+            ("RST_SENT", "599"),
+            ("RST_RCVD", "5NN"),
+            ("STX", "17"),
+            ("SRX", "342"),
+            ("TIME_OFF", "120130"),
+            // A third-party comment exports as read, with no Pancetta
+            // attribution appended.
+            ("COMMENT", "Worked portable"),
+        ] {
+            assert_eq!(
+                exported.get(name).map(String::as_str),
+                Some(value),
+                "{name} lost through import → export: {exported:?}"
+            );
+        }
+        db.close().await;
+    }
+
+    /// PR #451 review (Codex P2): an imported (or replayed) row lands in its
+    /// QSO's date range, not the day it was imported; a live-logged row still
+    /// lands at the moment it was logged.
+    #[tokio::test]
+    async fn imported_rows_are_searchable_by_their_qso_date() {
+        use chrono::TimeZone;
+        let adif = "<CALL:5>W1ABC <QSO_DATE:8>20200315 <TIME_ON:6>120000 <MODE:3>FT8 \
+                    <FREQ:9>14.074000 <EOR>\n";
+        let processor = AdifProcessor::new();
+        let file = processor.parse_string(adif).unwrap();
+        let db = QsoDatabase::new_in_memory().await.unwrap();
+        db.insert_adif_records(&processor, &file.records)
+            .await
+            .unwrap();
+        let live = duplicate_check_test_progress("K9DEF", 14_074_000.0);
+        db.insert_qso(&live).await.unwrap();
+
+        let in_range = |start: DateTime<Utc>, end: DateTime<Utc>| QsoFilter {
+            date_range: Some(DateRange { start, end }),
+            ..Default::default()
+        };
+        let calls = |progresses: Vec<QsoProgress>| -> Vec<String> {
+            let mut calls: Vec<String> = progresses
+                .into_iter()
+                .filter_map(|p| p.metadata.their_callsign)
+                .collect();
+            calls.sort();
+            calls
+        };
+        let year_2020 = in_range(
+            Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2020, 12, 31, 23, 59, 59).unwrap(),
+        );
+        let today = in_range(
+            Utc::now() - chrono::Duration::hours(1),
+            Utc::now() + chrono::Duration::hours(1),
+        );
+        let options = QueryOptions::default();
+
+        assert_eq!(
+            calls(db.search_qsos(&year_2020, &options).await.unwrap()),
+            vec!["W1ABC".to_string()]
+        );
+        assert_eq!(
+            calls(db.search_qsos(&today, &options).await.unwrap()),
+            vec!["K9DEF".to_string()]
+        );
+        let records = db.search_qsos_records(&year_2020, &options).await.unwrap();
+        assert_eq!(records.len(), 1, "{records:?}");
+        db.close().await;
     }
 
     /// PR #453 review (Codex P2): a newer-but-unreadable `qsos.adi` must not

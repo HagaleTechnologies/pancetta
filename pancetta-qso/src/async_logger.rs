@@ -167,9 +167,6 @@ pub struct BackupConfig {
 
     /// Compress backups
     pub compress: bool,
-
-    /// Include ADIF exports in backups
-    pub include_exports: bool,
 }
 
 /// Integration configuration
@@ -275,31 +272,6 @@ pub struct ExportResult {
     pub duration_ms: u64,
 }
 
-/// Import result
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ImportResult {
-    /// Input file path
-    pub file_path: PathBuf,
-
-    /// Number of QSOs imported
-    pub imported_count: usize,
-
-    /// Number of QSOs skipped (duplicates)
-    pub skipped_count: usize,
-
-    /// Number of QSOs with errors
-    pub error_count: usize,
-
-    /// Import timestamp
-    pub timestamp: DateTime<Utc>,
-
-    /// Import duration in milliseconds
-    pub duration_ms: u64,
-
-    /// Validation errors
-    pub errors: Vec<String>,
-}
-
 // ---------------------------------------------------------------------------
 // Default impls for config types
 // ---------------------------------------------------------------------------
@@ -353,7 +325,6 @@ impl Default for BackupConfig {
             backup_interval: 24,
             retain_count: 7,
             compress: false,
-            include_exports: true,
         }
     }
 }
@@ -412,17 +383,22 @@ fn first_backup_delay(period: Duration) -> Duration {
     STARTUP_BACKUP_DELAY.min(period)
 }
 
-/// A relative `backup_directory` is anchored next to the database file
-/// (`~/.pancetta/backups` for `~/.pancetta/qso.db`), not the process cwd.
-/// An absolute directory, or a database with no parent directory
-/// (`:memory:`), is used as-is.
+/// A relative `backup_directory` is anchored next to an absolute database
+/// path (`~/.pancetta/backups` for `~/.pancetta/qso.db`), or at the fixed
+/// state directory `~/.pancetta` when the database path is relative or has
+/// no directory (`:memory:`) — never relative to the process cwd (PAN-126).
+/// An absolute directory is used as-is. Only a home-less environment keeps
+/// the relative path.
 fn resolve_backup_directory(dir: &Path, database_path: &Path) -> PathBuf {
     if dir.is_absolute() {
         return dir.to_path_buf();
     }
     match database_path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.join(dir),
-        _ => dir.to_path_buf(),
+        Some(parent) if !parent.as_os_str().is_empty() && parent.is_absolute() => parent.join(dir),
+        _ => match dirs::home_dir() {
+            Some(home) => home.join(".pancetta").join(dir),
+            None => dir.to_path_buf(),
+        },
     }
 }
 
@@ -446,9 +422,6 @@ pub struct QsoLogger {
 
     /// Export history
     export_history: Arc<RwLock<Vec<ExportResult>>>,
-
-    /// Import history
-    import_history: Arc<RwLock<Vec<ImportResult>>>,
 }
 
 impl QsoLogger {
@@ -466,7 +439,6 @@ impl QsoLogger {
             qso_manager: Arc::new(qso_manager),
             event_receiver: Arc::new(RwLock::new(None)),
             export_history: Arc::new(RwLock::new(Vec::new())),
-            import_history: Arc::new(RwLock::new(Vec::new())),
         })
     }
 
@@ -575,72 +547,6 @@ impl QsoLogger {
         );
 
         Ok(export_result)
-    }
-
-    /// Import QSOs from ADIF format
-    pub async fn import_adif<P: AsRef<Path>>(
-        &self,
-        input_path: P,
-    ) -> Result<ImportResult, AsyncLoggerError> {
-        let start_time = Utc::now();
-
-        // Read ADIF file
-        let adif_content = tokio::fs::read_to_string(&input_path).await?;
-        let adif_file = self.adif_processor.parse_string(&adif_content)?;
-
-        let _total_count = adif_file.records.len();
-        let mut imported_count = 0;
-        let mut duplicate_count = 0;
-        let mut error_count = 0;
-
-        // Import each QSO
-        for record in &adif_file.records {
-            match self.adif_processor.record_to_qso(record) {
-                Ok(adif_qso) => {
-                    // Convert to QsoProgress
-                    let progress = self.adif_qso_to_progress(&adif_qso);
-
-                    // Try to insert
-                    match self.database.insert_qso(&progress).await {
-                        Ok(_) => imported_count += 1,
-                        Err(AsyncDatabaseError::DuplicateQso { .. }) => duplicate_count += 1,
-                        Err(e) => {
-                            error!("Error importing QSO: {}", e);
-                            error_count += 1;
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Error parsing ADIF record: {}", e);
-                    error_count += 1;
-                }
-            }
-        }
-
-        let duration_ms = (Utc::now() - start_time).num_milliseconds() as u64;
-
-        let import_result = ImportResult {
-            file_path: input_path.as_ref().to_path_buf(),
-            imported_count,
-            skipped_count: duplicate_count,
-            error_count,
-            timestamp: start_time,
-            duration_ms,
-            errors: Vec::new(), // TODO: Collect actual error messages
-        };
-
-        // Record import history
-        self.import_history
-            .write()
-            .await
-            .push(import_result.clone());
-
-        info!(
-            "Imported {} QSOs from ADIF ({} duplicates, {} errors) in {}ms",
-            imported_count, duplicate_count, error_count, duration_ms
-        );
-
-        Ok(import_result)
     }
 
     /// Get database statistics
@@ -938,92 +844,6 @@ impl QsoLogger {
 
         Ok(())
     }
-
-    fn adif_qso_to_progress(&self, adif_qso: &crate::adif::AdifQso) -> QsoProgress {
-        QsoProgress {
-            state: QsoState::Completed {
-                their_callsign: adif_qso.call.clone(),
-                their_report: adif_qso
-                    .rst_rcvd
-                    .as_ref()
-                    .and_then(|r| r.parse().ok())
-                    .unwrap_or(0),
-                our_report: adif_qso
-                    .rst_sent
-                    .as_ref()
-                    .and_then(|r| r.parse().ok())
-                    .unwrap_or(0),
-                frequency: adif_qso.freq * 1_000_000.0,
-                grid_square: adif_qso.gridsquare.clone(),
-                completed_at: adif_qso.qso_date_off.unwrap_or(adif_qso.qso_date),
-                duration_seconds: 0,
-            },
-            state_history: vec![],
-            messages: vec![],
-            metadata: QsoMetadata {
-                qso_id: uuid::Uuid::new_v4(),
-                our_callsign: if adif_qso.station_callsign.is_empty() {
-                    "UNKNOWN".to_string()
-                } else {
-                    adif_qso.station_callsign.clone()
-                },
-                their_callsign: Some(adif_qso.call.clone()),
-                frequency: adif_qso.freq * 1_000_000.0,
-                // Already the true RF frequency read back from ADIF (a
-                // historical, already-completed record) — the
-                // `completed_rf_frequency_hz.unwrap_or(frequency)` fallback
-                // resolves correctly without this set; see the matching
-                // comment in `adif.rs`'s `adif_to_qso`.
-                completed_rf_frequency_hz: None,
-                mode: adif_qso.mode.clone(),
-                start_time: adif_qso.qso_date,
-                end_time: adif_qso.qso_date_off,
-                reports: SignalReports {
-                    sent: adif_qso.rst_sent.as_ref().and_then(|r| r.parse().ok()),
-                    received: adif_qso.rst_rcvd.as_ref().and_then(|r| r.parse().ok()),
-                },
-                grids: GridSquares {
-                    ours: adif_qso.my_gridsquare.clone(),
-                    theirs: adif_qso.gridsquare.clone(),
-                },
-                their_state: adif_qso.state.clone(),
-                contest_info: if adif_qso.contest_id.is_some() {
-                    Some(ContestInfo {
-                        contest_name: adif_qso.contest_id.clone().unwrap_or_default(),
-                        category: String::new(),
-                        serials: ContestSerials {
-                            sent: adif_qso.stx,
-                            received: adif_qso.srx,
-                        },
-                        points: 0,
-                        multiplier: None,
-                    })
-                } else {
-                    None
-                },
-                tags: std::collections::HashMap::new(),
-                notes: adif_qso.notes.clone(),
-                tx_parity: None,
-                initiated_by: Default::default(),
-                role: Default::default(),
-                call_count: 0,
-                first_call_at: None,
-                last_call_at: None,
-                progressed_this_cycle: false,
-                stall_cycles: 0,
-                last_known_good_offset_hz: None,
-                advance_generation: 0,
-                pre_switch_offset: None,
-                hound: false,
-                partner_freq: None,
-                pending_freq_drift: None,
-                hound_qsyed: false,
-                remote_origin: false,
-                remote_client_key_id: None,
-                tx_parity_provisional: false,
-            },
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1069,19 +889,30 @@ mod tests {
 
     #[test]
     fn test_resolve_backup_directory() {
-        let db = Path::new("/home/op/.pancetta/qso.db");
+        // A platform-native absolute root: on Windows `/home/...` has no
+        // drive prefix, so it is not absolute.
+        let root = if cfg!(windows) {
+            Path::new(r"C:\")
+        } else {
+            Path::new("/")
+        };
+        let db = root.join("home/op/.pancetta/qso.db");
         assert_eq!(
-            resolve_backup_directory(Path::new("backups"), db),
-            PathBuf::from("/home/op/.pancetta/backups")
+            resolve_backup_directory(Path::new("backups"), &db),
+            root.join("home/op/.pancetta/backups")
         );
-        assert_eq!(
-            resolve_backup_directory(Path::new("/srv/bk"), db),
-            PathBuf::from("/srv/bk")
-        );
-        // `:memory:` has no directory to anchor to.
+        let abs_dir = root.join("srv/bk");
+        assert_eq!(resolve_backup_directory(&abs_dir, &db), abs_dir);
+        // No absolute database directory (`:memory:`, or a relative database
+        // path): anchor at the fixed state directory, never the cwd (PAN-126).
+        let state_backups = dirs::home_dir().unwrap().join(".pancetta").join("backups");
         assert_eq!(
             resolve_backup_directory(Path::new("backups"), Path::new(":memory:")),
-            PathBuf::from("backups")
+            state_backups.clone()
+        );
+        assert_eq!(
+            resolve_backup_directory(Path::new("backups"), Path::new("qso.db")),
+            state_backups
         );
     }
 

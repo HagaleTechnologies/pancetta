@@ -448,28 +448,33 @@ pub enum SidetoneShape {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RecordingConfig {
-    /// Enable automatic recording
+    /// Write every live decode window to `directory` as a 12 kHz mono WAV
+    /// (10 GB cap, oldest evicted first). Off by default; `--replay` and
+    /// `--no-audio` runs never record, whatever this says (PAN-125).
     pub auto_record: bool,
 
-    /// Recording format
+    /// Recording format. Not read yet.
     pub format: RecordingFormat,
 
-    /// Recording bit depth
+    /// Recording bit depth. Not read yet (recordings are always 16-bit).
     pub bit_depth: BitDepth,
 
-    /// Recording sample rate
+    /// Recording sample rate. Not read yet (recordings are always 12 kHz).
     pub sample_rate: u32,
 
-    /// Maximum recording length in minutes
+    /// Maximum recording length in minutes. Not read yet.
     pub max_length_minutes: u32,
 
-    /// Recording directory
+    /// Where recordings go; created if missing. A leading `~` is expanded
+    /// by pancetta itself (the loader never expands values); `~user` is not.
+    /// Empty means `~/.pancetta/recordings`.
     pub directory: String,
 
-    /// File naming pattern
+    /// File naming pattern. Not read yet (recordings are always named
+    /// `ft8_<UTC date>_<time>[_<band>].wav`).
     pub filename_pattern: String,
 
-    /// Compression level (0-9 for lossless formats)
+    /// Compression level (0-9 for lossless formats). Not read yet.
     pub compression_level: u8,
 }
 

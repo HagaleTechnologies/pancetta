@@ -1,28 +1,8 @@
-//! # Pancetta - High-Performance Amateur Radio FT8 Processing Application
+//! # Pancetta - an FT8 station in one binary
 //!
-//! The main entry point for the Pancetta application, which integrates:
-//! - Real-time audio processing (pancetta-audio)
-//! - Digital signal processing pipeline (pancetta-dsp)
-//! - FT8 decoder with >95% accuracy (pancetta-ft8)
-//! - Interactive terminal user interface (pancetta-tui)
-//! - Comprehensive configuration management (pancetta-config)
-//!
-//! ## Architecture
-//!
-//! Pancetta uses a message-driven architecture with dedicated components:
-//! - **Audio Coordinator**: Manages audio input and real-time processing
-//! - **DSP Pipeline**: Processes audio with <1ms latency
-//! - **FT8 Decoder**: Decodes 50+ simultaneous FT8 signals
-//! - **TUI Manager**: Provides real-time user interface
-//! - **Message Bus**: High-performance inter-component communication
-//!
-//! ## Performance Goals
-//!
-//! - Audio processing latency: <1ms
-//! - FT8 decode accuracy: >95% at -20dB SNR
-//! - Simultaneous decodes: 50+
-//! - Memory usage: <100MB
-//! - CPU usage: <25% on modern hardware
+//! The main entry point: decoder, priority scoring, the QSO state machine,
+//! rig control through rigctld, and per-QSO logbook upload in one process.
+//! What each capability has been proven to do: README.md § Capability status.
 
 #![allow(dead_code, unused_imports)]
 
@@ -45,29 +25,24 @@ mod doctor;
 #[derive(Clone, Parser)]
 #[command(name = "pancetta")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
-#[command(about = "High-performance amateur radio FT8 processing")]
+#[command(about = "A full FT8 station in one binary — decode, score, work, log")]
 #[command(long_about = r#"
-Pancetta is a high-performance amateur radio application optimized for FT8 digital mode processing.
+Pancetta is an FT8 station in one binary: decoder, priority scoring, the
+QSO state machine, rig control through rigctld, and per-QSO logbook upload.
+FT4 is supported too.
 
-Features:
-- Real-time audio processing with <1ms latency
-- FT8 decoder with >95% accuracy at -20dB SNR
-- Support for 50+ simultaneous decodes
-- Interactive terminal user interface
-- Comprehensive configuration management
-- Hot-reload configuration support
+Run it with no command to start the station in the terminal UI
+(--headless logs instead). The first run starts the setup wizard;
+`pancetta doctor` checks config, clock, audio, decoder and rig.
 
-The application integrates multiple specialized components:
-- Audio input and real-time streaming
-- Digital signal processing pipeline
-- FT8 signal decoding and analysis
-- User interface with band activity monitoring
-- Configuration management with validation
+Configuration is read at startup. While Pancetta runs, only remote-access
+consent switches and revocations apply live (remote-TX consent on or off,
+allow-list removals, disabling the station agent); any other change needs
+a restart.
 
-Performance targets:
-- Audio latency: <1ms
-- Memory usage: <100MB
-- CPU usage: <25% on modern hardware
+What works, how it was tested, and on which radio: the "Capability status"
+section of README.md, shipped with every release. Measured decoder
+performance: docs/decoder-comparison.md in the source repository.
 "#)]
 struct Cli {
     #[command(subcommand)]
@@ -182,6 +157,18 @@ enum Commands {
     TestRig(TestRigArgs),
     /// Export logged QSOs to ADIF
     Export(ExportArgs),
+    /// Import contacts from another logger's ADIF (.adi) file into your logbook
+    ///
+    /// Contacts are appended to ~/.pancetta/qsos.adi with every field kept as
+    /// written. A contact already in your logbook (same callsign, band and
+    /// mode, starting within 30 minutes) is skipped, as is one repeated in the
+    /// file. Before anything is written, the logbook is copied to
+    /// ~/.pancetta/qsos.adi.bak (or the next free .bak.N). Use --dry-run to
+    /// see the result first; it changes nothing.
+    //
+    // "30 minutes" is `pancetta_qso::adif_import::DUPLICATE_WINDOW_MINUTES`;
+    // `import_duplicate_window_is_thirty_minutes` keeps the two in step.
+    Import(ImportArgs),
     /// Pair this station's agent with cqdx (remote-rig-control device enrollment)
     Pair(PairArgs),
     /// Show this station's agent identity and fingerprint words, for TOFU
@@ -243,6 +230,17 @@ struct ExportArgs {
     /// Filter by callsign substring (case-insensitive)
     #[arg(long)]
     callsign: Option<String>,
+}
+
+#[derive(Clone, Args)]
+struct ImportArgs {
+    /// ADIF file to import (.adi), e.g. an export from WSJT-X, N1MM, LoTW or QRZ
+    file: PathBuf,
+
+    /// Show what would be added, skipped as duplicates, or rejected, without
+    /// changing your logbook
+    #[arg(short = 'n', long)]
+    dry_run: bool,
 }
 
 #[derive(Clone, Args)]
@@ -501,6 +499,7 @@ async fn handle_command(command: Commands, cli: &Cli) -> Result<()> {
         Commands::Doctor => doctor_command(cli).await,
         Commands::TestRig(args) => test_rig_command(args, cli).await,
         Commands::Export(args) => export_command(args).await,
+        Commands::Import(args) => import_command(args).await,
         Commands::Pair(args) => pair_command(args, cli).await,
         Commands::Identity(args) => identity_command(args, cli).await,
     }
@@ -688,16 +687,21 @@ async fn pair_command(args: PairArgs, cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+/// `~/.pancetta`: where the logbook (`qsos.adi`) and its search index
+/// (`qso.db`) live, the same directory the coordinator logs into.
+fn pancetta_data_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".pancetta")
+}
+
 async fn export_command(args: ExportArgs) -> Result<()> {
     use pancetta_qso::adif::AdifProcessor;
     use pancetta_qso::async_database::{QsoDatabase, QsoFilter, QueryOptions};
 
-    let db_path = args.database.unwrap_or_else(|| {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".pancetta")
-            .join("qso.db")
-    });
+    let db_path = args
+        .database
+        .unwrap_or_else(|| pancetta_data_dir().join("qso.db"));
 
     if !db_path.exists() {
         eprintln!("QSO database not found at {}", db_path.display());
@@ -751,6 +755,427 @@ async fn export_command(args: ExportArgs) -> Result<()> {
         content.len()
     );
     Ok(())
+}
+
+/// How `pancetta import` ended, which decides the closing lines of
+/// [`format_import_report`].
+enum ImportOutcome<'a> {
+    /// `--dry-run`: nothing was written.
+    DryRun,
+    /// No new contacts: no backup was made and nothing was written.
+    NothingAdded,
+    /// The new contacts were appended to `adif` and indexed into `db`.
+    /// `backup` is the copy made first, or `None` for a new logbook.
+    Added {
+        backup: Option<&'a Path>,
+        adif: &'a Path,
+        db: &'a Path,
+    },
+}
+
+/// At most this many unreadable records are listed one by one.
+const IMPORT_UNREADABLE_LISTED: usize = 20;
+
+/// `pancetta import <FILE> [--dry-run]` (PAN-127): append the new contacts
+/// from another logger's ADIF file to `~/.pancetta/qsos.adi`, verbatim, and
+/// index them into `~/.pancetta/qso.db`. Duplicates and unreadable records
+/// are decided by [`pancetta_qso::adif_import::plan_import`]; the logbook is
+/// backed up (and the backup verified) before the first write.
+async fn import_command(args: ImportArgs) -> Result<()> {
+    use pancetta_qso::adif::AdifProcessor;
+    use pancetta_qso::adif_import::plan_import;
+    use pancetta_qso::adif_log_writer::AdifLogWriter;
+    use pancetta_qso::async_database::QsoDatabase;
+
+    let data_dir = pancetta_data_dir();
+    let adif = data_dir.join("qsos.adi");
+    let db = data_dir.join("qso.db");
+    let processor = AdifProcessor::new();
+
+    let bytes = std::fs::read(&args.file)
+        .with_context(|| format!("Cannot read import file {}", args.file.display()))?;
+    let incoming = processor.parse_bytes(&bytes);
+    if incoming.records.is_empty() {
+        anyhow::bail!(
+            "No ADIF records found in {} — is it an ADIF (.adi) file?",
+            args.file.display()
+        );
+    }
+
+    let adif_exists = adif.exists();
+    let db_existed = db.exists();
+    if !adif_exists && db_existed {
+        anyhow::bail!(
+            "Pancetta has not yet moved your log from {} into {}. Start Pancetta once so it \
+             can do that, then run this import again.",
+            db.display(),
+            adif.display()
+        );
+    }
+
+    let logbook_bytes = if adif_exists {
+        Some(
+            std::fs::read(&adif)
+                .with_context(|| format!("Cannot read your logbook {}", adif.display()))?,
+        )
+    } else {
+        None
+    };
+    let logbook = logbook_bytes.as_deref().map(|b| processor.parse_bytes(b));
+    let mut plan = plan_import(&processor, &incoming, logbook.as_ref());
+    print!(
+        "{}",
+        format_import_header(&args.file, &adif, &plan, adif_exists)
+    );
+
+    if args.dry_run {
+        print!("{}", format_import_report(&plan, ImportOutcome::DryRun));
+        return Ok(());
+    }
+    if plan.to_add.is_empty() {
+        print!(
+            "{}",
+            format_import_report(&plan, ImportOutcome::NothingAdded)
+        );
+        return Ok(());
+    }
+
+    // Startup rebuilds the index when qsos.adi is newer than qso.db. If the
+    // index was already behind before this import, adding the new rows would
+    // make it look current and hide that, so it is kept looking behind below.
+    // An indexing that fails part-way leaves a partial index that also looks
+    // current (some rows were committed after the logbook was written), so
+    // the same marking applies: the logbook must stay newer than the index,
+    // or the next start never repairs the missing rows (PAN-127).
+    let index_was_behind = matches!(
+        (file_modified(&db), file_modified(&adif)),
+        (Some(d), Some(a)) if a > d
+    );
+
+    // Back up before the first write, and check the copy really holds the
+    // logbook the plan was built from. A QSO the running station appends in
+    // the meantime only makes the copy longer, never different.
+    let backup = match &logbook_bytes {
+        Some(before) => {
+            let bak = create_backup(&adif)?;
+            let copied = std::fs::read(&bak)
+                .with_context(|| format!("Cannot read the backup {}", bak.display()))?;
+            if !copied.starts_with(before) {
+                anyhow::bail!(
+                    "The backup {} does not match your logbook; nothing was imported.",
+                    bak.display()
+                );
+            }
+            // A longer copy holds contacts the plan never checked for
+            // duplicates; replan against it before writing (PAN-127).
+            plan = replan_after_logbook_growth(&processor, &incoming, &copied, before, plan);
+            println!("{}", import_header_line("Backup:", bak.display()));
+            Some(bak)
+        }
+        None => {
+            println!("{}", import_header_line("Backup:", "none (new logbook)"));
+            None
+        }
+    };
+
+    // Marked before the first write and cleared only once every new row is
+    // indexed (and the index was current to begin with), so an import
+    // stopped part-way still gets its index rebuilt at the next start. A marker left by an earlier interrupted import is not
+    // ours to clear: its missing rows are not among the ones added here.
+    let marker = QsoDatabase::rebuild_marker(&db);
+    let marked_here = mark_index_incomplete(&marker)
+        .with_context(|| format!("Cannot write {}", marker.display()))?;
+
+    let writer = AdifLogWriter::open(&adif)
+        .await
+        .with_context(|| format!("Cannot open your logbook {}", adif.display()))?;
+    for record in &plan.to_add {
+        writer
+            .append_record(record)
+            .await
+            .with_context(|| format!("Failed to add contacts to {}", adif.display()))?;
+    }
+    writer
+        .sync_all()
+        .await
+        .with_context(|| format!("Failed to save {}", adif.display()))?;
+    drop(writer);
+
+    let indexed = index_imported_contacts(&processor, &plan.to_add, &adif, &db, db_existed).await;
+    if index_was_behind || indexed.is_err() {
+        mark_newer_than(&adif, &db);
+    }
+    // An index that was already behind is still missing rows after the new
+    // ones are added: keep it marked, since a later live write can make
+    // qso.db look newer than qsos.adi again (PAN-127).
+    if marked_here && indexed.is_ok() && !index_was_behind {
+        let _ = std::fs::remove_file(&marker);
+    }
+    print!(
+        "{}",
+        format_import_report(
+            &plan,
+            ImportOutcome::Added {
+                backup: backup.as_deref(),
+                adif: &adif,
+                db: &db,
+            },
+        )
+    );
+    if let Err(e) = indexed {
+        anyhow::bail!(
+            "Your contacts were added to {adif}, but Pancetta's search index {db} could not be \
+             updated ({e}). With Pancetta stopped, delete {db}; Pancetta rebuilds it from {adif} \
+             at its next start.",
+            adif = adif.display(),
+            db = db.display(),
+        );
+    }
+    Ok(())
+}
+
+/// The verified backup `copied` is the logbook as it stood at backup time.
+/// When it is longer than `before` — the bytes [`import_command`] planned
+/// against — the running station completed a QSO in between that was never
+/// checked for duplicates, so the plan is rebuilt against the copy: an
+/// incoming record matching that contact must be skipped, not appended a
+/// second time. An unchanged logbook returns the plan as it came (PAN-127).
+fn replan_after_logbook_growth(
+    processor: &pancetta_qso::adif::AdifProcessor,
+    incoming: &pancetta_qso::adif::AdifParse,
+    copied: &[u8],
+    before: &[u8],
+    plan: pancetta_qso::adif_import::ImportPlan,
+) -> pancetta_qso::adif_import::ImportPlan {
+    if copied.len() <= before.len() {
+        return plan;
+    }
+    let grown = processor.parse_bytes(copied);
+    pancetta_qso::adif_import::plan_import(processor, incoming, Some(&grown))
+}
+
+/// Index the contacts `import_command` just appended. An existing index only
+/// gets the new rows: a running Pancetta may hold it open, and rebuilding
+/// deletes the file. A missing one is built from the whole logbook, the same
+/// way startup rebuilds it.
+async fn index_imported_contacts(
+    processor: &pancetta_qso::adif::AdifProcessor,
+    records: &[pancetta_qso::adif::AdifRecord],
+    adif: &Path,
+    db: &Path,
+    db_existed: bool,
+) -> std::result::Result<(), pancetta_qso::async_database::AsyncDatabaseError> {
+    use pancetta_qso::async_database::QsoDatabase;
+    if db_existed {
+        let index = QsoDatabase::open(db).await?;
+        let inserted = index.insert_adif_records(processor, records).await;
+        index.close().await;
+        inserted?;
+    } else {
+        QsoDatabase::replay_from_adif(db, adif).await?.close().await;
+    }
+    Ok(())
+}
+
+/// Create the index's rebuild marker and flush it to disk. Returns whether
+/// this call created it; `false` means one was already there.
+fn mark_index_incomplete(marker: &Path) -> std::io::Result<bool> {
+    // A new logbook's directory may not exist yet.
+    let dir = marker.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker)
+    {
+        Ok(file) => {
+            file.sync_all()?;
+            // On Unix a new file's name is durable only once its directory
+            // is flushed; best effort, as Windows cannot open a directory.
+            #[cfg(unix)]
+            let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn file_modified(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Best effort: give `path` a modification time later than `than`'s, so the
+/// startup check still sees `path` as the newer file.
+fn mark_newer_than(path: &Path, than: &Path) {
+    let Some(than) = file_modified(than) else {
+        return;
+    };
+    let at = std::time::SystemTime::now().max(than + std::time::Duration::from_secs(1));
+    let _ = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .and_then(|f| f.set_modified(at));
+}
+
+/// One `Import file:` / `Logbook:` / `Backup:` line, values aligned.
+fn import_header_line(label: &str, value: impl std::fmt::Display) -> String {
+    format!("{:<13}{}", label, value)
+}
+
+/// `1 record`, `2 records`.
+fn count_of(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// Text from the import file (a CALL, a parser message quoting a field spec)
+/// with control characters escaped, so a crafted file cannot drive the
+/// terminal.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
+/// The `Import file:` and `Logbook:` lines, plus a warning when logbook
+/// records could not be read (and so were not used to find duplicates).
+fn format_import_header(
+    file: &Path,
+    adif: &Path,
+    plan: &pancetta_qso::adif_import::ImportPlan,
+    logbook_exists: bool,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let records = count_of(plan.records_in_file, "record", "records");
+    let _ = writeln!(
+        out,
+        "{}",
+        import_header_line("Import file:", format!("{} ({records})", file.display()))
+    );
+    let logbook = if logbook_exists {
+        count_of(plan.logbook_contacts, "contact", "contacts")
+    } else {
+        "new".to_string()
+    };
+    let _ = writeln!(
+        out,
+        "{}",
+        import_header_line("Logbook:", format!("{} ({logbook})", adif.display()))
+    );
+    if plan.logbook_unreadable > 0 {
+        let _ = writeln!(
+            out,
+            "Warning: {} record(s) in your logbook could not be read and were not used to \
+             find duplicates.",
+            plan.logbook_unreadable
+        );
+    }
+    out
+}
+
+/// The counts, the records that could not be read (the first
+/// [`IMPORT_UNREADABLE_LISTED`]) and the closing lines, starting with the
+/// blank line that separates them from the header.
+fn format_import_report(
+    plan: &pancetta_qso::adif_import::ImportPlan,
+    outcome: ImportOutcome<'_>,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from("\n");
+    let added_label = if matches!(outcome, ImportOutcome::DryRun) {
+        out.push_str("Dry run: nothing was changed.\n");
+        "Would add:"
+    } else {
+        "Added:"
+    };
+    let _ = writeln!(out, "  {:<20}{}", added_label, plan.to_add.len());
+
+    let duplicates = plan.duplicates_in_logbook + plan.duplicates_in_file;
+    let _ = write!(out, "  {:<20}{}", "Duplicates skipped:", duplicates);
+    let mut detail = Vec::new();
+    if plan.duplicates_in_logbook > 0 {
+        detail.push(format!(
+            "{} already in your logbook",
+            plan.duplicates_in_logbook
+        ));
+    }
+    if plan.duplicates_in_file > 0 {
+        detail.push(format!("{} repeated in the file", plan.duplicates_in_file));
+    }
+    if !detail.is_empty() {
+        let _ = write!(out, "  ({})", detail.join(", "));
+    }
+    out.push('\n');
+    let _ = writeln!(out, "  {:<20}{}", "Could not read:", plan.unreadable.len());
+
+    if !plan.unreadable.is_empty() {
+        out.push_str("\nRecords that could not be read:\n");
+        for record in plan.unreadable.iter().take(IMPORT_UNREADABLE_LISTED) {
+            let reason = printable(&record.reason);
+            let _ = match &record.call {
+                Some(call) => writeln!(
+                    out,
+                    "  record {} ({}): {reason}",
+                    record.record_number,
+                    printable(call)
+                ),
+                None => writeln!(out, "  record {}: {reason}", record.record_number),
+            };
+        }
+        if plan.unreadable.len() > IMPORT_UNREADABLE_LISTED {
+            let _ = writeln!(
+                out,
+                "  ...and {} more",
+                plan.unreadable.len() - IMPORT_UNREADABLE_LISTED
+            );
+        }
+    }
+
+    out.push('\n');
+    match outcome {
+        ImportOutcome::DryRun => {
+            let _ = match plan.to_add.len() {
+                0 => writeln!(out, "Nothing to add."),
+                1 => writeln!(out, "Run again without --dry-run to add this contact."),
+                n => writeln!(
+                    out,
+                    "Run again without --dry-run to add these {n} contacts."
+                ),
+            };
+        }
+        ImportOutcome::NothingAdded => {
+            out.push_str("Nothing to add; your logbook was not changed.\n");
+        }
+        ImportOutcome::Added { backup, adif, db } => {
+            out.push_str(
+                "Pancetta loads the imported contacts into its worked-station history the \
+                 next time it starts.\n",
+            );
+            let _ = match backup {
+                Some(bak) => writeln!(
+                    out,
+                    "To undo this import: stop Pancetta, copy {} over {}, then delete {}.",
+                    bak.display(),
+                    adif.display(),
+                    db.display()
+                ),
+                None => writeln!(
+                    out,
+                    "To undo this import: stop Pancetta, then delete {} and {}.",
+                    adif.display(),
+                    db.display()
+                ),
+            };
+        }
+    }
+    out
 }
 
 async fn test_audio_command(args: TestAudioArgs) -> Result<()> {
@@ -2515,9 +2940,14 @@ mod tests {
     fn test_cli_help() {
         let mut cmd = Command::cargo_bin("pancetta").unwrap();
         cmd.arg("--help");
+        // PAN-124: the help points at the capability matrix, states the
+        // live-apply scope, and makes none of the removed unmeasured claims.
         cmd.assert()
             .success()
-            .stdout(predicate::str::contains("high-performance amateur radio"));
+            .stdout(predicate::str::contains("Capability status"))
+            .stdout(predicate::str::contains("only remote-access"))
+            .stdout(predicate::str::contains("Hot-reload configuration support").not())
+            .stdout(predicate::str::contains(">95%").not());
     }
 
     /// `test-audio --list` enumerates devices and exits 0 (the previous stub
@@ -2646,6 +3076,357 @@ mod tests {
             "format must be detected from the symlink's own .toml name, matching \
              what load_configuration_with_warnings actually parsed it as"
         );
+    }
+
+    // ---- PAN-127: `pancetta import` output wording ----
+
+    use pancetta_qso::adif::{AdifProcessor, AdifRecord};
+    use pancetta_qso::adif_import::{ImportPlan, UnreadableRecord};
+
+    const IMPORT_FILE: &str = "/home/op/wsjtx_log.adi";
+    const LOGBOOK: &str = "/home/op/.pancetta/qsos.adi";
+    const INDEX: &str = "/home/op/.pancetta/qso.db";
+    const BACKUP: &str = "/home/op/.pancetta/qsos.adi.bak";
+
+    fn records(n: usize) -> Vec<AdifRecord> {
+        vec![
+            AdifRecord {
+                fields: std::collections::HashMap::new(),
+            };
+            n
+        ]
+    }
+
+    fn missing_date(record_number: usize) -> UnreadableRecord {
+        UnreadableRecord {
+            record_number,
+            call: Some("K1ABC".to_string()),
+            reason: "Missing required field: QSO_DATE".to_string(),
+        }
+    }
+
+    /// The example in the plan's "Design for review": 5 records, 2 new, 1
+    /// already logged, 1 repeated in the file, 1 without QSO_DATE.
+    fn design_plan() -> ImportPlan {
+        ImportPlan {
+            records_in_file: 5,
+            to_add: records(2),
+            duplicates_in_logbook: 1,
+            duplicates_in_file: 1,
+            unreadable: vec![missing_date(4)],
+            logbook_contacts: 2,
+            logbook_unreadable: 0,
+        }
+    }
+
+    fn header(plan: &ImportPlan, logbook_exists: bool) -> String {
+        format_import_header(
+            Path::new(IMPORT_FILE),
+            Path::new(LOGBOOK),
+            plan,
+            logbook_exists,
+        )
+    }
+
+    fn added(backup: Option<&'static str>) -> ImportOutcome<'static> {
+        ImportOutcome::Added {
+            backup: backup.map(Path::new),
+            adif: Path::new(LOGBOOK),
+            db: Path::new(INDEX),
+        }
+    }
+
+    /// A backup longer than the bytes the plan was built from means the
+    /// running station completed a QSO between the read and the copy: the
+    /// replan must check incoming records against those contacts too, or a
+    /// matching one is appended a second time (PAN-127).
+    #[test]
+    fn replan_after_logbook_growth_skips_a_contact_logged_meanwhile() {
+        let processor = AdifProcessor::new();
+        let before: &[u8] = b"pancetta log\n<EOH>\n<CALL:5>KA1AA <QSO_DATE:8>20231201 \
+             <TIME_ON:6>090000 <MODE:3>FT8 <BAND:3>20M <EOR>\n";
+        let logged_meanwhile: &[u8] =
+            b"<CALL:4>W1AW <QSO_DATE:8>20240101 <TIME_ON:6>120000 <MODE:3>FT8 <BAND:3>20M <EOR>\n";
+        let grown = [before, logged_meanwhile].concat();
+        let incoming = processor.parse_bytes(
+            b"WSJT-X export<EOH>\n<call:4>W1AW <qso_date:8>20240101 <time_on:4>1205 \
+              <mode:3>FT8 <band:3>20m <eor>\n<call:5>K1ABC <qso_date:8>20240101 \
+              <time_on:6>121500 <mode:3>FT8 <band:3>20m <eor>\n",
+        );
+        let plan_against = |logbook: &[u8]| {
+            let parsed = processor.parse_bytes(logbook);
+            pancetta_qso::adif_import::plan_import(&processor, &incoming, Some(&parsed))
+        };
+
+        let stale = plan_against(before);
+        assert_eq!(stale.to_add.len(), 2);
+        assert_eq!(stale.duplicates_in_logbook, 0);
+
+        // An unchanged logbook returns the plan as it came.
+        let unchanged = replan_after_logbook_growth(
+            &processor,
+            &incoming,
+            before,
+            before,
+            plan_against(before),
+        );
+        assert_eq!(unchanged.to_add.len(), 2);
+        assert_eq!(unchanged.duplicates_in_logbook, 0);
+
+        // The W1AW the station logged meanwhile is now a duplicate of the
+        // incoming W1AW, so only K1ABC is added.
+        let replanned = replan_after_logbook_growth(
+            &processor,
+            &incoming,
+            &grown,
+            before,
+            plan_against(before),
+        );
+        assert_eq!(replanned.to_add.len(), 1);
+        assert_eq!(replanned.to_add[0].fields["CALL"].value, "K1ABC");
+        assert_eq!(replanned.duplicates_in_logbook, 1);
+    }
+
+    #[test]
+    fn import_report_dry_run_matches_the_design() {
+        let plan = design_plan();
+        let text = header(&plan, true) + &format_import_report(&plan, ImportOutcome::DryRun);
+        assert_eq!(
+            text,
+            concat!(
+                "Import file: /home/op/wsjtx_log.adi (5 records)\n",
+                "Logbook:     /home/op/.pancetta/qsos.adi (2 contacts)\n",
+                "\n",
+                "Dry run: nothing was changed.\n",
+                "  Would add:          2\n",
+                "  Duplicates skipped: 2  (1 already in your logbook, 1 repeated in the file)\n",
+                "  Could not read:     1\n",
+                "\n",
+                "Records that could not be read:\n",
+                "  record 4 (K1ABC): Missing required field: QSO_DATE\n",
+                "\n",
+                "Run again without --dry-run to add these 2 contacts.\n",
+            )
+        );
+    }
+
+    #[test]
+    fn import_report_added_matches_the_design() {
+        let plan = design_plan();
+        let text = header(&plan, true)
+            + &import_header_line("Backup:", BACKUP)
+            + "\n"
+            + &format_import_report(&plan, added(Some(BACKUP)));
+        assert_eq!(
+            text,
+            concat!(
+                "Import file: /home/op/wsjtx_log.adi (5 records)\n",
+                "Logbook:     /home/op/.pancetta/qsos.adi (2 contacts)\n",
+                "Backup:      /home/op/.pancetta/qsos.adi.bak\n",
+                "\n",
+                "  Added:              2\n",
+                "  Duplicates skipped: 2  (1 already in your logbook, 1 repeated in the file)\n",
+                "  Could not read:     1\n",
+                "\n",
+                "Records that could not be read:\n",
+                "  record 4 (K1ABC): Missing required field: QSO_DATE\n",
+                "\n",
+                "Pancetta loads the imported contacts into its worked-station history the next \
+                 time it starts.\n",
+                "To undo this import: stop Pancetta, copy /home/op/.pancetta/qsos.adi.bak over \
+                 /home/op/.pancetta/qsos.adi, then delete /home/op/.pancetta/qso.db.\n",
+            )
+        );
+    }
+
+    #[test]
+    fn import_report_new_logbook_undo_deletes_both_files() {
+        let plan = ImportPlan {
+            logbook_contacts: 0,
+            ..design_plan()
+        };
+        let text = header(&plan, false)
+            + &import_header_line("Backup:", "none (new logbook)")
+            + "\n"
+            + &format_import_report(&plan, added(None));
+        assert!(
+            text.contains("Logbook:     /home/op/.pancetta/qsos.adi (new)\n"),
+            "{text}"
+        );
+        assert!(text.contains("Backup:      none (new logbook)\n"), "{text}");
+        assert!(
+            text.ends_with(
+                "To undo this import: stop Pancetta, then delete /home/op/.pancetta/qsos.adi \
+                 and /home/op/.pancetta/qso.db.\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains(" copy "), "{text}");
+    }
+
+    #[test]
+    fn import_report_nothing_to_add() {
+        let plan = ImportPlan {
+            records_in_file: 5,
+            to_add: Vec::new(),
+            duplicates_in_logbook: 4,
+            duplicates_in_file: 0,
+            unreadable: vec![missing_date(4)],
+            logbook_contacts: 6,
+            logbook_unreadable: 0,
+        };
+        let text = header(&plan, true) + &format_import_report(&plan, ImportOutcome::NothingAdded);
+        assert_eq!(
+            text,
+            concat!(
+                "Import file: /home/op/wsjtx_log.adi (5 records)\n",
+                "Logbook:     /home/op/.pancetta/qsos.adi (6 contacts)\n",
+                "\n",
+                "  Added:              0\n",
+                "  Duplicates skipped: 4  (4 already in your logbook)\n",
+                "  Could not read:     1\n",
+                "\n",
+                "Records that could not be read:\n",
+                "  record 4 (K1ABC): Missing required field: QSO_DATE\n",
+                "\n",
+                "Nothing to add; your logbook was not changed.\n",
+            )
+        );
+        // An empty preview ends the same way, without the "not changed" part.
+        let preview = format_import_report(&plan, ImportOutcome::DryRun);
+        assert!(preview.ends_with("\n\nNothing to add.\n"), "{preview}");
+    }
+
+    #[test]
+    fn import_report_omits_duplicate_detail_when_zero() {
+        let none = ImportPlan {
+            to_add: records(3),
+            records_in_file: 3,
+            ..ImportPlan::default()
+        };
+        let text = format_import_report(&none, ImportOutcome::DryRun);
+        assert!(text.contains("  Duplicates skipped: 0\n"), "{text}");
+        assert!(!text.contains('('), "{text}");
+        assert!(text.contains("  Could not read:     0\n"), "{text}");
+        assert!(!text.contains("Records that could not be read"), "{text}");
+
+        let in_file_only = ImportPlan {
+            duplicates_in_file: 1,
+            ..ImportPlan::default()
+        };
+        let text = format_import_report(&in_file_only, ImportOutcome::DryRun);
+        assert!(
+            text.contains("  Duplicates skipped: 1  (1 repeated in the file)\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn import_report_caps_the_unreadable_list_at_20() {
+        let plan = ImportPlan {
+            records_in_file: 23,
+            unreadable: (1..=23)
+                .map(|n| UnreadableRecord {
+                    record_number: n,
+                    call: None,
+                    reason: "Invalid field format: CALL:x".to_string(),
+                })
+                .collect(),
+            ..ImportPlan::default()
+        };
+        let text = format_import_report(&plan, ImportOutcome::DryRun);
+        assert!(text.contains("  Could not read:     23\n"), "{text}");
+        assert_eq!(text.matches("  record ").count(), 20, "{text}");
+        assert!(
+            text.contains("  record 20: Invalid field format: CALL:x\n  ...and 3 more\n"),
+            "{text}"
+        );
+        assert!(!text.contains("record 21"), "{text}");
+    }
+
+    #[test]
+    fn import_report_pluralises() {
+        let plan = ImportPlan {
+            records_in_file: 1,
+            to_add: records(1),
+            logbook_contacts: 1,
+            ..ImportPlan::default()
+        };
+        let text = header(&plan, true) + &format_import_report(&plan, ImportOutcome::DryRun);
+        assert!(
+            text.contains("Import file: /home/op/wsjtx_log.adi (1 record)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Logbook:     /home/op/.pancetta/qsos.adi (1 contact)\n"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("\nRun again without --dry-run to add this contact.\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn import_header_warns_about_unreadable_logbook_records() {
+        let plan = ImportPlan {
+            logbook_unreadable: 3,
+            ..design_plan()
+        };
+        assert!(header(&plan, true).ends_with(concat!(
+            "Logbook:     /home/op/.pancetta/qsos.adi (2 contacts)\n",
+            "Warning: 3 record(s) in your logbook could not be read and were not used to \
+             find duplicates.\n",
+        )));
+        assert!(!header(&design_plan(), true).contains("Warning"));
+    }
+
+    /// The import file is untrusted text: a CALL or field spec holding an
+    /// escape sequence must not reach the terminal raw.
+    #[test]
+    fn import_report_escapes_control_characters_from_the_file() {
+        let plan = ImportPlan {
+            unreadable: vec![UnreadableRecord {
+                record_number: 2,
+                call: Some("K1\u{1b}[2J".to_string()),
+                reason: "Invalid field format: CALL:\nx".to_string(),
+            }],
+            ..ImportPlan::default()
+        };
+        let text = format_import_report(&plan, ImportOutcome::DryRun);
+        assert!(!text.contains('\u{1b}'), "{text}");
+        assert!(
+            text.contains("  record 2 (K1\\u{1b}[2J): Invalid field format: CALL:\\nx\n"),
+            "{text}"
+        );
+    }
+
+    /// The help text promises the duplicate window in words; it must name
+    /// the planner's real value.
+    #[test]
+    fn import_help_states_the_duplicate_window() {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        let help = cli
+            .find_subcommand_mut("import")
+            .expect("import subcommand")
+            .render_long_help()
+            .to_string();
+        let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            help.contains(&format!(
+                "within {} minutes",
+                pancetta_qso::adif_import::DUPLICATE_WINDOW_MINUTES
+            )),
+            "{help}"
+        );
+        assert!(help.contains("~/.pancetta/qsos.adi.bak"), "{help}");
+        assert!(help.contains("-n, --dry-run"), "{help}");
+    }
+
+    #[test]
+    fn import_duplicate_window_is_thirty_minutes() {
+        assert_eq!(pancetta_qso::adif_import::DUPLICATE_WINDOW_MINUTES, 30);
     }
 }
 

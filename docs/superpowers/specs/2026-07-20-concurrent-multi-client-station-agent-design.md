@@ -98,6 +98,17 @@ Rules, in order of precedence:
 7. `Hello`/scope verification runs per-peer exactly as today (each peer presents its own
    capability token; scopes gate that peer's `qsy`/`tx` actions).
 
+8. **A controller change ends the previous controller's QSOs (PAN-137).** Whenever
+   `controller` becomes `Some(P)` and did not already name P, through rule 1 or 3,
+   the station agent sends `RemoteControllerChanged { controller_key_id: P }`
+   to the QSO component. Enqueue is confirmed and retried each tick, before P's
+   next QSO intent. If cleanup cannot enqueue, that intent is refused with a
+   retry error. The QSO component drops queued calls and ends active QSOs bound
+   to other station-agent clients on every band with `Failed(ControlTransferred)`.
+   Local and unbound WSJT-X UDP QSOs stay. Arm loss without a controller change,
+   including rules 2, 5 and 6, heartbeat/TTL expiry, capability expiry and eviction,
+   ends nothing.
+
 ## Component 3: read stream over the relay (new work)
 
 Ground truth: the relay leg is **control-only today** — the module doc's "read stream (minimal

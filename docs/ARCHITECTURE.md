@@ -1,6 +1,7 @@
 # Pancetta Architecture
 
-Pancetta is an autonomous FT8 ham radio station written as an 11-crate Cargo workspace.
+Pancetta is an autonomous FT8 ham radio station written as a 14-crate Cargo workspace.
+What each capability has been proven to do: [README › Capability status](../README.md#capability-status).
 The coordinator orchestrates a real-time pipeline from audio input through FT8 decode,
 autonomous decision-making, and transmission — completing full CQ-to-73 QSO exchanges
 without operator intervention.
@@ -13,26 +14,33 @@ without operator intervention.
 Layer 0 — no internal deps:
   pancetta-core    — shared types, error handling
   pancetta-audio   — real-time audio I/O (cpal + ringbuf)
-  pancetta-ft8     — FT8 encoder/decoder/modulator/OSD
   pancetta-dsp     — DSP pipeline (FFT, filtering, resampling)
-  pancetta-config  — configuration with hot-reload
+  pancetta-config  — configuration loading and validation; the file watch
+                      live-applies remote-access consent and revocations only
+  pancetta-agent   — remote-TX security: arm gating, session binding
 
 Layer 1 — depends on core/ft8:
+  pancetta-ft8     — FT8 encoder/decoder/modulator/OSD (depends on core)
+  pancetta-protocol — remote-operation wire protocol (depends on core)
   pancetta-qso     — QSO management, priority scoring, autonomous operator
-  pancetta-hamlib  — Hamlib CAT control FFI
-  pancetta-dx      — DX cluster + PSKReporter + scaffolded LoTW
+  pancetta-hamlib  — Hamlib CAT/PTT via a rigctld TCP client (native FFI removed)
+  pancetta-dx      — DX cluster + PSKReporter + per-QSO logbook upload
+                      (ClubLog/QRZ/LoTW via TQSL/eQSL); the LoTW web-scrape
+                      module is unused scaffolding
   pancetta-cqdx    — cqdx.io HTTP client, cache, types
-  pancetta-tui     — terminal UI (ratatui); depends on pancetta-core and, as of
-                      #164, also pancetta-qso (read-only use of PriorityScorer/
-                      WorkedStationLookup to score DX Hunter rows — confirmed
-                      non-cyclic, pancetta-qso has no dependency back on
-                      pancetta-tui)
+  pancetta-tui     — terminal UI (ratatui); depends on pancetta-core,
+                      pancetta-config and, as of #164, pancetta-qso (read-only
+                      use of PriorityScorer/WorkedStationLookup to score DX
+                      Hunter rows — confirmed non-cyclic, pancetta-qso has no
+                      dependency back on pancetta-tui)
+  pancetta-research — local-only decoder harness (depends on ft8 + qso);
+                      excluded from CI
 
 Layer 2 — orchestrator:
   pancetta         — coordinator, message bus, runtime (depends on all above)
 ```
 
-All crates are pure Rust. There is no REST API, Web UI, or mobile layer.
+All Rust except the vendored C ft8_lib decoder; no REST API. Remote access is the opt-in WebSocket gateway, the station agent, and WSJT-X UDP.
 
 ---
 
@@ -80,7 +88,6 @@ The coordinator lives in `pancetta/src/coordinator/` and is decomposed into subm
 |------------------|--------------------------------------------------------------|
 | `mod.rs`         | `ApplicationCoordinator` struct, startup sequencing          |
 | `pipeline.rs`    | audio/DSP/FT8 pipeline setup, crossbeam channel wiring       |
-| `components.rs`  | QSO engine, hamlib, cqdx.io component startup                |
 | `hamlib.rs`      | rigctld process management and TCP connection                 |
 | `health.rs`      | health checks and performance stats                          |
 | `shutdown.rs`    | graceful shutdown, task join                                 |
@@ -186,7 +193,8 @@ periodically by the coordinator from cqdx.io and the QSO log.
 Writes completed QSO records to `~/.pancetta/qsos.adi` in ADIF format. The file is
 append-only and vendor-neutral — it can be imported directly into WSJT-X, N1MM+, LoTW,
 eQSL, or any logging application that accepts ADIF. This file is the durable
-source of truth; back it up.
+source of truth; back it up. `pancetta import` also appends other loggers' records
+through it, verbatim (`append_record`).
 
 ### `AsyncQsoLogger` (pancetta)
 
@@ -198,7 +206,8 @@ async-only via sqlx.
 
 **Migration**: on the first startup after upgrade, if `qso.db` exists but `qsos.adi`
 does not, the coordinator auto-exports all rows from the old database into a fresh ADIF
-file before opening the new logging path.
+file before opening the new logging path. This runs before either writer opens a
+file (PAN-127).
 
 ---
 
@@ -211,7 +220,7 @@ file before opening the new logging path.
 - Message types: CQ, directed (call/grid/report/RR73/73), ARRL contest, free-text
 - OSD (Ordered Statistics Decoding) extends decode depth beyond standard LDPC
 
-`pancetta-ft8` is bit-exact with ft8_lib and WSJT-X (~200 tests).
+`pancetta-ft8` is bit-exact with ft8_lib and WSJT-X.
 
 ---
 
@@ -280,11 +289,6 @@ rewrites (`apply_tier` no longer touches `Ft8Config` directly).
   `entities/needed-grids` endpoint yet; `is_needed_grid` returns
   `false` when the local set is empty so the priority weight doesn't
   inflate.
-- `is_duplicate` checks callsign + audio frequency proximity within a
-  configurable time window, but doesn't yet partition by band — a
-  station worked on 20m won't be flagged as a duplicate when worked
-  again on 40m. Set `[duplicate_checking].check_frequency = true` for
-  band-aware dedup until this is fixed natively.
 - cqdx.io `GET /api/v1/spots?live=true` response envelope key (`groups`)
   is unverified against the live API. A gated live test exists:
   `CQDX_TOKEN=pat_xxx cargo test -p pancetta-cqdx test_live_spots_envelope -- --ignored --nocapture`.
@@ -294,7 +298,7 @@ rewrites (`apply_tier` no longer touches `Ft8Config` directly).
 - **Phase 1** — Loopback QSO. Full CQ-to-73 exchange through the
   encode → modulate → decode pipeline, with state-machine tests.
 - **Phase 2** — Autonomous operator + priority engine. Configurable
-  weighted scoring, POTA/SOTA detection, hunt/CQ/hybrid modes.
+  weighted scoring, POTA/SOTA detection.
 - **Phase 3** — Multi-stream TX. `SmartFrequencyAllocator` selects
   audio frequencies; up to N parallel QSOs in one slot.
 - **Phase 4** — Hardware integration (complete, 2026-04-26). hamlib

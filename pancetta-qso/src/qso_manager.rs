@@ -306,18 +306,27 @@ pub const COMPLETED_QSO_REWORK_GRACE: chrono::Duration = chrono::Duration::secon
 /// [`QsoManager::set_active_slot_ns_source`].
 pub const DEFAULT_SLOT_NS: i64 = 15_000_000_000;
 
+/// The late-start TX window used when no station config was injected:
+/// `[station] tx_late_max_ms`'s documented default (3000 ms, see
+/// `pancetta-config`'s `default_tx_late_max_ms`). The coordinator injects
+/// the operator's real value via [`QsoManager::set_tx_late_max_ms`].
+pub const DEFAULT_TX_LATE_MAX_MS: u64 = 3000;
+
 /// One transmit slot in milliseconds, converted from the coordinator's
 /// `active_slot_ns` atomic (PAN-72; Codex round 7 on PR #350, finding 5, plus
 /// the round-7 re-review's staleness fix).
 ///
 /// [`QsoManager::rearm_manual_calls_at`] re-emits at most one frame per slot
-/// and — since PAN-72 — counts each such re-send as one silent cycle against
-/// [`crate::states::QsoMetadata::stall_cycles`]. Both are *slot* quantities:
-/// `TimeoutConfig::qso_stall_switch_after` is documented in slots, and the
-/// keep-calling cadence is "one call per transmit period". The gate was a
-/// hardcoded 15 s, which is only FT8's period — under FT4 a threshold of 4
-/// took ~60 s (8 real slots) instead of 4, and under FT2 far worse, delaying
-/// adaptive recovery until the ordinary QSO watchdog had already won.
+/// and — since PAN-72 — counts silent cycles against
+/// [`crate::states::QsoMetadata::stall_cycles`]. The re-send cadence is a
+/// *slot* quantity, but the stall count is not (PAN-128): a QSO transmits
+/// only on its own parity, so only the first emission feeding each
+/// own-parity TX slot counts — one count per real TX opportunity, every
+/// other slot. `TimeoutConfig::qso_stall_switch_after` is documented in
+/// those own TX slots. The gate was a hardcoded 15 s, which is only FT8's
+/// period — under FT4 a threshold of 4 took ~60 s (8 real slots) instead
+/// of 4, and under FT2 far worse, delaying adaptive recovery until the
+/// ordinary QSO watchdog had already won.
 ///
 /// The input is the LIVE slot length the coordinator derives from the active
 /// protocol (`pancetta_ft8::Protocol::slot_ns()`, i.e. `cycle_duration * 1e9`:
@@ -335,6 +344,115 @@ pub fn rearm_slot_millis_from_ns(slot_ns: i64) -> i64 {
         DEFAULT_SLOT_NS / 1_000_000
     } else {
         millis
+    }
+}
+
+/// The own-parity TX slot a keep-call rearm emission at `now` feeds
+/// (PAN-128), derived with the TX scheduler's own current-slot
+/// acceptance rule (`pancetta::coordinator::tx::schedule_tx`): the
+/// CURRENT slot when its parity matches the QSO's latched
+/// `QsoMetadata::tx_parity` and `now` is still inside the worker's
+/// queue-time acceptance window ([`keep_call_acceptance_cap_ms`]);
+/// otherwise the first own-parity slot STRICTLY after `now`.
+///
+/// A QSO is parity-constrained and only keys on slots matching its latched
+/// `QsoMetadata::tx_parity` — every OTHER protocol slot (every 30 s under
+/// FT8) — while `rearm_manual_calls_at` re-emits once per protocol slot.
+/// The stall counter therefore cannot count emissions (it would run at
+/// twice the real on-air cadence and trip
+/// `TimeoutConfig::qso_stall_switch_after` after roughly half the
+/// unanswered transmissions the operator configured); it counts the TX
+/// slots those emissions feed, via this anchor:
+///
+/// - `tx_parity = Some(p)`, current slot viable (parity match + inside the
+///   late window): the current slot's start — the same slot
+///   `schedule_tx` would key the frame in.
+/// - `tx_parity = Some(p)`, otherwise:
+///   `pancetta_core::slot::next_slot_with_parity_with_period(now, p, slot_ns)`
+///   — the period-aware form the parity latch and the TX scheduler's
+///   `resolve_required_parity` already use.
+/// - `tx_parity = None` (never left unresolved by `QsoManager`'s own
+///   creation paths — a defensive fallback): every slot is its own TX slot,
+///   so the next slot of either parity, matching per-slot counting.
+///
+/// The current-slot acceptance is what keeps one real TX opportunity at one
+/// count (PAN-128 PR review): a rearm in the off-parity slot before own
+/// slot S and a rearm inside S's late-start window are BOTH scheduled into
+/// S — the scheduler keys the in-window request in the current slot — so
+/// they must share S as their ledger key. Attributing the in-window emission
+/// to S's successor instead gave the two emissions different keys and both
+/// incremented, booking a slot's count a full TX period before it could air
+/// and firing the switch one transmission before the configured threshold.
+/// Past the window the worker defers the frame to the next own slot, so the
+/// strictly-after anchor applies there — an own-slot emission too late to
+/// key shares its successor's slot with that successor's own off-parity
+/// predecessor. The window is the TX worker's QUEUE-TIME acceptance cap
+/// (PAN-117's `current_slot_acceptance_cap_ms`: the mode-scaled
+/// `tx_late_max_ms` minus the mode-scaled base coalesce window minus the
+/// fixed safety margin — 1700 ms for FT8 at the 3000 ms default), which is
+/// what `schedule_tx` is actually called with for a keep-call
+/// `TransmitRequest`. It must match exactly, in both directions: a WIDER
+/// ledger window tags an emission the worker defers (say 2.0 s into own
+/// slot S) with S, while its off-parity successor feeding the same deferred
+/// slot gets S's successor, so the first emission after a reset or advance
+/// double-counts one TX opportunity (Codex round 2 on PR #477); a NARROWER
+/// one splits the in-window pair the same way.
+///
+/// Known approximation (documented in the PAN-128 plan): a runtime mode
+/// switch or the one-time `tx_parity_provisional` correction changes the
+/// values this returns, which can add at most one extra count at the
+/// boundary.
+/// The TX worker's base coalesce-collection window at FT8 (its
+/// `COALESCE_COLLECT_WINDOW_MS`), mode-scaled like there. Mirrored for
+/// [`keep_call_acceptance_cap_ms`]; `pancetta-qso` cannot depend on the
+/// `pancetta` crate that owns the original.
+const TX_WORKER_COALESCE_COLLECT_WINDOW_MS: u64 = 800;
+
+/// The TX worker's fixed (unscaled) coalesce safety margin (its
+/// `COALESCE_CAP_SAFETY_MARGIN_MS`). Mirrored for
+/// [`keep_call_acceptance_cap_ms`].
+const TX_WORKER_COALESCE_CAP_SAFETY_MARGIN_MS: u64 = 500;
+
+/// Mirror of the TX worker's `current_slot_acceptance_cap_ms` (PAN-117),
+/// the cap `schedule_tx` decides current-slot acceptance against for a
+/// single `TransmitRequest` — which every keep-call re-send is: the
+/// mode-scaled `tx_late_max_ms`, minus the mode-scaled base coalesce
+/// window, minus the fixed safety margin, saturating at 0. Each term is
+/// scaled and rounded separately, exactly as the worker's
+/// `tx_late_max_ms_effective` / `coalesce_collect_window_ms` do, from the
+/// live slot length (FT8 15 s → ratio 1, FT4 1/2, FT2 ~0.213) instead of a
+/// second protocol source. FT8 at the 3000 ms default → 1700 ms; FT4 →
+/// 600 ms; FT2 → 0 ms.
+fn keep_call_acceptance_cap_ms(slot_millis: i64, tx_late_max_ms: u64) -> i64 {
+    let ratio = slot_millis as f64 / 15_000.0;
+    let scale = |ms: u64| ((ms as f64) * ratio).round() as u64;
+    scale(tx_late_max_ms)
+        .saturating_sub(scale(TX_WORKER_COALESCE_COLLECT_WINDOW_MS))
+        .saturating_sub(TX_WORKER_COALESCE_CAP_SAFETY_MARGIN_MS) as i64
+}
+
+fn keep_call_tx_slot(
+    now: DateTime<Utc>,
+    slot_millis: i64,
+    tx_late_max_ms: u64,
+    tx_parity: Option<pancetta_core::slot::SlotParity>,
+) -> DateTime<Utc> {
+    let slot_ns = slot_millis * 1_000_000;
+    match tx_parity {
+        Some(p) => {
+            // `schedule_tx`'s rule: the current slot is the target iff its
+            // parity matches AND we haven't burned past the queue-time
+            // acceptance cap the worker passes it.
+            let cur_start = pancetta_core::slot::current_slot_start_with_period(now, slot_ns);
+            if pancetta_core::slot::SlotParity::of_with_period(cur_start, slot_ns) == p {
+                let mstr_in_cur_slot = (now - cur_start).num_milliseconds().max(0);
+                if mstr_in_cur_slot <= keep_call_acceptance_cap_ms(slot_millis, tx_late_max_ms) {
+                    return cur_start;
+                }
+            }
+            pancetta_core::slot::next_slot_with_parity_with_period(now, p, slot_ns)
+        }
+        None => pancetta_core::slot::next_slot_start_with_period(now, Duration::zero(), slot_ns),
     }
 }
 
@@ -499,6 +617,20 @@ pub enum QsoManagerError {
          raised it was rolled back as unsent"
     )]
     OffsetActionStallRolledBack { qso_id: QsoId },
+
+    /// PAN-131 (Codex round 13 on PR #350, P2): an operator `u` nudge was
+    /// queued while its QSO sat in a nudge-eligible state, but the DX moved
+    /// the QSO on before the once-per-slot drain committed it — into a state
+    /// neither `rearm_manual_calls_at`'s cadence nor the commit's own one-shot
+    /// retransmission sends anything from (see [`operator_nudge_retransmits`]).
+    /// Committing would move the offset with nothing ever sent on it. Expected,
+    /// not a fault — the DX's progress supersedes the nudge, exactly as a DX
+    /// advance supersedes a stall action through `OffsetActionStale`.
+    #[error(
+        "operator TX-offset nudge for QSO {qso_id} superseded — the QSO \
+         advanced to a state no retransmission covers"
+    )]
+    OffsetActionNudgeSuperseded { qso_id: QsoId },
 }
 
 impl QsoManagerError {
@@ -518,6 +650,7 @@ impl QsoManagerError {
                 | QsoManagerError::OffsetActionHeld { .. }
                 | QsoManagerError::OffsetActionPttInFlight { .. }
                 | QsoManagerError::OffsetActionStallRolledBack { .. }
+                | QsoManagerError::OffsetActionNudgeSuperseded { .. }
         )
     }
 }
@@ -664,12 +797,14 @@ pub struct TimeoutConfig {
     /// Consecutive stalled cycles (see [`crate::states::QsoMetadata::
     /// stall_cycles`]) before an in-progress QSO's TX offset is switched (or
     /// reverted to its last known-good offset) — Auto TX-freq mode only.
-    /// Default 4 (PAN-72). Distinct from `AutonomousConfig::
-    /// cq_no_response_switch_after` (a different struct, governs the
-    /// self-CQ-hunting case before any QSO exists), though the two are
-    /// exposed under the same `[autonomous]` TOML section by the coordinator
-    /// (see `pancetta-config`) since they're one logical "adaptive TX
-    /// behavior" knob from the operator's point of view.
+    /// Counted in the QSO's own-parity transmit slots — one every other
+    /// protocol slot (every 30 s under FT8, every 15 s under FT4), i.e. one
+    /// per real transmit opportunity (PAN-128). Default 4 (PAN-72). Distinct
+    /// from `AutonomousConfig::cq_no_response_switch_after` (a different
+    /// struct, governs the self-CQ-hunting case before any QSO exists),
+    /// though the two are exposed under the same `[autonomous]` TOML section
+    /// by the coordinator (see `pancetta-config`) since they're one logical
+    /// "adaptive TX behavior" knob from the operator's point of view.
     #[serde(default = "default_qso_stall_switch_after")]
     pub qso_stall_switch_after: u32,
 }
@@ -743,7 +878,9 @@ pub struct DuplicateCheckConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum OffsetAction {
     /// We're on the last known-good offset (or none is recorded yet) — find
-    /// a new one, avoiding this one.
+    /// a new one, avoiding this one. The coordinator's drain avoids the QSO's
+    /// live `metadata.frequency` whenever the QSO still exists; this value is
+    /// only the fallback (PAN-130).
     Switch { avoid_hz: f64 },
     /// We stalled again on a previously-switched offset — go back to the one
     /// that was last confirmed working, no allocator call needed.
@@ -759,8 +896,9 @@ pub enum OffsetAction {
 /// - [`QsoManager::apply_tx_offset_switch`]'s staleness guard (round 1, finding
 ///   8) discards a `StallDetected` request whose
 ///   [`crate::states::QsoMetadata::advance_generation`] has moved since it was
-///   raised. An `OperatorForced` nudge is current by definition and carries no
-///   token, so nothing can supersede it;
+///   raised. An `OperatorForced` nudge carries no token and is never
+///   generation-checked, but a DX advance out of the nudge-eligible states
+///   still supersedes it at commit time (guard 2a, PAN-131);
 /// - the known-good crediting site in `process_message_for_qso` (round 6,
 ///   finding 2) needs to know whether anything actually indicted the offset we
 ///   left. A stall switch happens BECAUSE the old offset stopped working; an
@@ -821,13 +959,52 @@ impl OffsetActionRequest {
         }
     }
 
-    /// An operator-forced action (the `u` nudge) — never stale.
+    /// An operator-forced action (the `u` nudge) — never generation-checked;
+    /// see [`QsoManager::apply_tx_offset_switch`]'s guard 2a.
     pub fn operator_forced(qso_id: QsoId, action: OffsetAction) -> Self {
         Self {
             qso_id,
             action,
             origin: OffsetRelocationOrigin::OperatorForced,
         }
+    }
+}
+
+/// PAN-131 (Codex round 13 on PR #350, P2): does `progress`'s CURRENT state
+/// still get a frame sent at a new offset if an operator `u` nudge commits
+/// against it now?
+///
+/// [`QsoManager::apply_tx_offset_switch`]'s guard 2a reads this at commit time,
+/// because an `OperatorForced` origin carries no generation token and guard 2
+/// cannot see a DX advance that happened after the keypress. Each `true` arm
+/// names the mechanism that retransmits after the commit:
+///
+/// - `CallingCq` (any initiation): `rearm_manual_calls_at`'s keep-calling
+///   cadence for a Manual CQ; the commit's own one-shot `cq_retransmit` for an
+///   Auto self-CQ (round 10, Fix A), which that cadence never re-sends.
+/// - `WaitingForReport` (Manual only): `rearm_manual_calls_at` re-sends the
+///   latched report (SM-F4). An Auto self-CQ that a caller answered also sits
+///   here, but neither mechanism sends anything for it, so it is `false`.
+/// - `RespondingToCq` / `SendingReport` (any initiation):
+///   `rearm_manual_calls_at` below its call cap, and `cq_retransmit` for an
+///   Auto QSO at or past `AUTO_RESEND_MAX_CALLS` (round 14).
+///
+/// No cap logic, matching keypress-time selection: a Manual QSO past
+/// `manual_call_max_calls` is watchdog-retirement territory. Every later state
+/// (`WaitingForConfirmation`, `SendingConfirmation`, contest exchange, …) falls
+/// to both mechanisms' `_` arm.
+///
+/// Must stay equal to the selection-time union in
+/// `pancetta/src/coordinator/tui_relay.rs` (`qso_state_is_rearm_eligible` ∪
+/// `auto_calling_cq_ids`). If the two drift, the commit refuses a nudge the
+/// TUI accepted — the safe direction.
+pub fn operator_nudge_retransmits(progress: &QsoProgress) -> bool {
+    let is_manual = progress.metadata.initiated_by == CallInitiation::Manual;
+    match &progress.state {
+        QsoState::CallingCq { .. } => true,
+        QsoState::WaitingForReport { .. } => is_manual,
+        QsoState::RespondingToCq { .. } | QsoState::SendingReport { .. } => true,
+        _ => false,
     }
 }
 
@@ -1013,7 +1190,16 @@ struct KeepCallAttempt {
     emitted_at: DateTime<Utc>,
     raw_text: String,
     prev_last_call_at: Option<DateTime<Utc>>,
+    // This attempt holds its `tx_slot`'s stall increment (PAN-128): exactly
+    // one surviving attempt per own-parity TX slot carries `true`, so
+    // `stall_cycles` rises once per own TX slot, not once per emission.
     bumped_stall: bool,
+    // The own-parity TX slot this emission feeds (`keep_call_tx_slot`);
+    // `None` for attempts that never count toward the stall streak and
+    // never inherit one either (`resend_last_tx`, the offset-switch
+    // retransmit, and anything a stall reset cleared — the reset retires
+    // the slot key with the increment).
+    tx_slot: Option<DateTime<Utc>>,
     recorded_sent: bool,
     // What the emission carried besides its text. A TX pivot can replace a
     // frame with one that differs only in offset or remote binding.
@@ -1056,6 +1242,30 @@ pub enum UnsentAttemptRollback {
     QsoNotActive,
 }
 
+/// What a manual open or re-call actually did (PAN-138).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualCallOutcome {
+    /// A new QSO was created and its first frame emitted.
+    Opened,
+    /// An existing QSO's latest outbound frame was re-emitted and charged.
+    Resent,
+    /// An existing QSO moved to a later step and that step's frame was emitted.
+    Advanced,
+    /// Nothing emitted: the remote client was not TX-permitted when re-checked
+    /// under the `qsos` write guard.
+    NotPermitted,
+    /// Nothing emitted: the existing QSO had no prior `Sent` frame, or was
+    /// gone by the time the guard was taken.
+    NothingToResend,
+}
+
+impl ManualCallOutcome {
+    /// Whether a `MessageToSend` was emitted.
+    pub fn emitted_frame(self) -> bool {
+        matches!(self, Self::Opened | Self::Resent | Self::Advanced)
+    }
+}
+
 /// The payload of a frame a TX pivot replaced (PAN-75). Text alone cannot
 /// tell that frame apart from the fresher same-text frame that aired in its
 /// place when the pivot changed only the offset or the remote binding.
@@ -1066,6 +1276,40 @@ pub struct UnsentAttemptPayload {
     /// does not supply the frame's binding (a multi-TX supersede that kept
     /// the bundle's authorization).
     pub remote_binding: Option<(bool, Option<String>)>,
+}
+
+/// Per-QSO relocation counters shared with the TX worker (PAN-145).
+///
+/// `apply_tx_offset_switch` bumps its raw QsoId key under `ptt_sync_gate`,
+/// before committing the offset. The worker snapshots before reading intent
+/// and compares after acquiring that gate. This detects the PAN-143 round-4
+/// race even while the coordinator's asynchronous intent mirror lags.
+/// Other paths that move a QSO's TX offset without the gate (for example the
+/// drift relatch and the Hound QSY) do not bump it.
+/// The map lock is never held across an await.
+#[derive(Default)]
+pub struct TxRelocationEpochs {
+    counter: AtomicU64,
+    per_qso: std::sync::Mutex<HashMap<String, u64>>,
+}
+
+impl TxRelocationEpochs {
+    /// Invalidate this QSO's earlier TX snapshots while holding `ptt_sync_gate`.
+    pub fn bump(&self, qso_id: &str) {
+        let mut epochs = self.per_qso.lock().expect("TX relocation epochs poisoned");
+        let next = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
+        epochs.insert(qso_id.to_owned(), next);
+    }
+
+    /// An untouched QSO starts at zero; raw QsoId strings are never normalized.
+    pub fn epoch(&self, qso_id: &str) -> u64 {
+        self.per_qso
+            .lock()
+            .expect("TX relocation epochs poisoned")
+            .get(qso_id)
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 /// QSO manager implementation
@@ -1159,6 +1403,9 @@ pub struct QsoManager {
     /// as before this field existed). See `docs/superpowers/specs/
     /// 2026-09-12-pan-143-ptt-shared-synchronization-design.md`.
     ptt_sync_gate: Arc<tokio::sync::Mutex<()>>,
+
+    /// PAN-145: shared with the worker; private until explicitly injected.
+    relocation_epochs: Arc<TxRelocationEpochs>,
 
     /// Global operator TX policy (`pancetta_core::TxPolicy` as `u8`), shared
     /// from the coordinator.
@@ -1268,6 +1515,24 @@ pub struct QsoManager {
     /// and any caller that never injects a source keep exactly the historical
     /// 15 s cadence.
     active_slot_ns: Arc<std::sync::atomic::AtomicI64>,
+
+    /// The station's configured late-start TX window in milliseconds
+    /// (`[station] tx_late_max_ms`, default 3000), injected by the
+    /// coordinator via [`QsoManager::set_tx_late_max_ms`].
+    ///
+    /// PAN-128 PR review: `keep_call_tx_slot` needs the SAME current-slot
+    /// acceptance window the TX scheduler (`schedule_tx`) decides against,
+    /// so that a rearm inside own slot S's late window and the off-parity
+    /// rearm before S — both scheduled into S — share one ledger key and
+    /// one stall count. A plain value, not an `Arc` atomic: the TX worker
+    /// itself snapshots `tx_late_max_ms` once at startup (config is loaded
+    /// once; the hot-reload apply task is a documented no-op), so a
+    /// construction-time copy has the same fidelity, and `Clone`'s by-value
+    /// copy is exactly what the rearm loop's clone should see.
+    ///
+    /// Defaults to [`DEFAULT_TX_LATE_MAX_MS`], so unit tests and any caller
+    /// that never injects a value keep the documented operator default.
+    tx_late_max_ms: u64,
 }
 
 /// Outcome of the half-duplex parity-admission check for a *new* QSO.
@@ -1341,6 +1606,16 @@ pub fn admit_within_capacity(active: usize, cap: usize) -> CapacityAdmission {
     } else {
         CapacityAdmission::AtCapacity { active, cap }
     }
+}
+
+/// PAN-137: whether a QSO or queued call belongs to a station-agent client
+/// other than the current controller. Local and unbound WSJT-X QSOs stay.
+pub fn bound_to_other_remote_client(
+    remote_origin: bool,
+    remote_client_key_id: Option<&str>,
+    controller_key_id: &str,
+) -> bool {
+    remote_origin && remote_client_key_id.is_some_and(|k| k != controller_key_id)
 }
 
 impl QsoManager {
@@ -1597,6 +1872,7 @@ impl QsoManager {
             // source, behave exactly as this method did before PAN-143
             // existed (see the field's doc comment).
             ptt_sync_gate: Arc::new(tokio::sync::Mutex::new(())),
+            relocation_epochs: Arc::new(TxRelocationEpochs::default()),
             // Default Full: with no injected source, assume TX is live — the
             // pre-existing behavior (see the field's doc comment).
             tx_policy: Arc::new(std::sync::atomic::AtomicU8::new(
@@ -1613,6 +1889,9 @@ impl QsoManager {
             // Default FT8 slot: with no injected source the rearm/stall
             // cadence is the historical 15 s (see the field's doc comment).
             active_slot_ns: Arc::new(std::sync::atomic::AtomicI64::new(DEFAULT_SLOT_NS)),
+            // Default late-start window: the documented operator default
+            // (see the field's doc comment).
+            tx_late_max_ms: DEFAULT_TX_LATE_MAX_MS,
         }
     }
 
@@ -1664,6 +1943,12 @@ impl QsoManager {
     /// to).
     pub fn set_ptt_sync_gate_source(&mut self, source: Arc<tokio::sync::Mutex<()>>) {
         self.ptt_sync_gate = source;
+    }
+
+    /// Share the coordinator's relocation counters with its TX worker so a
+    /// gate wait cannot hide an offset change behind the async intent mirror.
+    pub fn set_relocation_epoch_source(&mut self, source: Arc<TxRelocationEpochs>) {
+        self.relocation_epochs = source;
     }
 
     /// Share the coordinator's global TX-policy atomic (encoded via
@@ -1727,6 +2012,19 @@ impl QsoManager {
     /// [`DEFAULT_SLOT_NS`] (FT8) atomic and behaves exactly as before.
     pub fn set_active_slot_ns_source(&mut self, source: Arc<std::sync::atomic::AtomicI64>) {
         self.active_slot_ns = source;
+    }
+
+    /// Set the station's late-start TX window (`[station] tx_late_max_ms`,
+    /// in milliseconds) that `keep_call_tx_slot`'s current-slot acceptance
+    /// mirrors from the TX scheduler (`schedule_tx`).
+    ///
+    /// PAN-128 PR review — see the `tx_late_max_ms` field's doc comment for
+    /// why the stall ledger needs the scheduler's own window. Pass the same
+    /// `cfg.station.tx_late_max_ms` the TX worker snapshots at startup; if
+    /// never called, the manager keeps [`DEFAULT_TX_LATE_MAX_MS`] (3000, the
+    /// documented default).
+    pub fn set_tx_late_max_ms(&mut self, tx_late_max_ms: u64) {
+        self.tx_late_max_ms = tx_late_max_ms;
     }
 
     /// One transmit slot in milliseconds for the live active protocol — the
@@ -2364,6 +2662,30 @@ impl QsoManager {
         remote_origin: bool,
         remote_client_key_id: Option<String>,
     ) -> Result<QsoId, QsoManagerError> {
+        self.respond_to_cq_with_outcome(
+            target_callsign,
+            frequency,
+            dx_parity,
+            initiated_by,
+            partner_freq,
+            remote_origin,
+            remote_client_key_id,
+        )
+        .await
+        .map(|(qso_id, _)| qso_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn respond_to_cq_with_outcome(
+        &self,
+        target_callsign: String,
+        frequency: f64,
+        dx_parity: Option<pancetta_core::slot::SlotParity>,
+        initiated_by: CallInitiation,
+        partner_freq: Option<f64>,
+        remote_origin: bool,
+        remote_client_key_id: Option<String>,
+    ) -> Result<(QsoId, ManualCallOutcome), QsoManagerError> {
         if self.config.our_callsign == "NOCALL" || self.config.our_callsign == "N0CALL" {
             return Err(QsoManagerError::Configuration {
                 message: format!(
@@ -2419,39 +2741,10 @@ impl QsoManager {
                     "Re-call of {} on {:.1} Hz — continuing existing QSO {} (idempotent keep-call, no new QSO)",
                     target_callsign, frequency, existing_id
                 );
-                // Round-10 review (Codex P2): decide whether this resend
-                // would even be attempted BEFORE rebinding/resending —
-                // checked here, not after, so a resend the TX layer would
-                // reject anyway never charges the manual-call budget.
-                // Mirrors the periodic rearm loop's `frame_reaches_the_air`
-                // gate (`rearm_manual_calls_at`) for the identical reason.
-                let should_resend =
-                    !remote_origin || (self.remote_tx_permitted)(remote_client_key_id.as_deref());
-                if should_resend {
-                    // Codex P1, round 20: only rebind when the action is
-                    // actually permitted — rebinding unconditionally left the
-                    // QSO's metadata claiming a DENIED client's identity even
-                    // though no fresh `MessageToSend` was emitted to publish
-                    // that change, so the coordinator's `latest_tx_intent`
-                    // stayed stale (still the prior owner's) and a later
-                    // key-time comparison could see matching stale
-                    // authorization without ever checking the new client's
-                    // arm. Deferring the rebind here (rather than publishing
-                    // the change on the denied path) keeps the QSO's identity
-                    // metadata meaning what every other call site already
-                    // assumes: "the last ACCEPTED client's action."
-                    //
-                    // Round-3 review (Codex P2): rebind to whichever client's
-                    // action was just accepted, BEFORE resending — see
-                    // `rebind_remote_identity`'s doc.
-                    self.rebind_remote_identity(existing_id, remote_origin, remote_client_key_id)
-                        .await;
-                    // Re-emit the QSO's most-recent outbound as a keep-call.
-                    // This is a benign no-op if it somehow has no prior Sent
-                    // message.
-                    let _ = self.resend_last_tx(existing_id).await;
-                }
-                return Ok(existing_id);
+                let outcome = self
+                    .resend_existing_if_permitted(existing_id, remote_origin, remote_client_key_id)
+                    .await;
+                return Ok((existing_id, outcome));
             }
         }
 
@@ -2591,7 +2884,7 @@ impl QsoManager {
             target_callsign, frequency, qso_id
         );
 
-        Ok(qso_id)
+        Ok((qso_id, ManualCallOutcome::Opened))
     }
 
     /// Respond to a station **calling us**, opening the exchange at an
@@ -2642,6 +2935,35 @@ impl QsoManager {
         remote_origin: bool,
         remote_client_key_id: Option<String>,
     ) -> Result<QsoId, QsoManagerError> {
+        self.respond_to_caller_with_outcome(
+            target,
+            frequency,
+            dx_parity,
+            step,
+            our_snr_of_them,
+            their_report,
+            partner_freq,
+            remote_origin,
+            remote_client_key_id,
+        )
+        .await
+        .map(|(qso_id, _)| qso_id)
+    }
+
+    /// [`Self::respond_to_caller`], also reporting whether a frame was emitted (PAN-138).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn respond_to_caller_with_outcome(
+        &self,
+        target: String,
+        frequency: f64,
+        dx_parity: Option<pancetta_core::slot::SlotParity>,
+        step: pancetta_core::ResponseStep,
+        our_snr_of_them: Option<f32>,
+        their_report: Option<i8>,
+        partner_freq: Option<f64>,
+        remote_origin: bool,
+        remote_client_key_id: Option<String>,
+    ) -> Result<(QsoId, ManualCallOutcome), QsoManagerError> {
         use pancetta_core::ResponseStep;
 
         // PAN-23: refuse FT8's literal unresolved-hash placeholder "<...>"
@@ -2667,7 +2989,7 @@ impl QsoManager {
         // the existing path so there is a single source of truth for it.
         if step == ResponseStep::Grid {
             return self
-                .respond_to_cq_with(
+                .respond_to_cq_with_outcome(
                     target,
                     frequency,
                     dx_parity,
@@ -2722,46 +3044,22 @@ impl QsoManager {
                          (ahead of its current stage)",
                         target, step, existing_id
                     );
-                    // Round-13 review (Codex P1): unlike the resend
-                    // branches, advancing MUTATES the QSO's ladder state —
-                    // records a `Sent` message, changes state, and at
-                    // `SeventyThree` completes the QSO and logs the ADIF
-                    // contact. Doing that unconditionally for a client the
-                    // TX layer will deny anyway would leave a permanently
-                    // wrong exchange state (or a false log entry) even
-                    // though nothing ever transmitted — worse than the
-                    // resend branches' merely-wasted budget charge. Decide
-                    // BEFORE rebinding/advancing, same as those branches.
-                    let should_advance = !remote_origin
-                        || (self.remote_tx_permitted)(remote_client_key_id.as_deref());
-                    if should_advance {
-                        // Codex P1, round 20: only rebind once the action is
-                        // permitted — see the identical fix in the
-                        // idempotent keep-call branch above for the full
-                        // rationale (an unconditional rebind on a DENIED
-                        // action leaves stale-looking-legitimate identity
-                        // metadata behind with no fresh intent published to
-                        // correct it).
-                        //
-                        // Round-3 review (Codex P2): rebind before advancing
-                        // — see `rebind_remote_identity`'s doc.
-                        self.rebind_remote_identity(
-                            existing_id,
-                            remote_origin,
-                            remote_client_key_id,
-                        )
-                        .await;
-                        self.advance_existing_qso_to_step(
+                    // Round 13 / PAN-138: advancing can complete and log a
+                    // contact. Check permission inside the advance's write
+                    // guard before changing identity or exchange state.
+                    let outcome = self
+                        .advance_existing_qso_to_step(
                             existing_id,
                             &target,
                             frequency,
                             step,
                             our_report,
                             their_report_val,
+                            remote_origin,
+                            remote_client_key_id,
                         )
                         .await?;
-                    }
-                    return Ok(existing_id);
+                    return Ok((existing_id, outcome));
                 }
                 _ => {
                     info!(
@@ -2769,27 +3067,14 @@ impl QsoManager {
                          current outbound (idempotent keep-call)",
                         target, step, existing_id
                     );
-                    // Round-10 review (Codex P2): decide before
-                    // rebinding/resending — see the analogous fix in
-                    // `respond_to_cq_with`'s idempotent keep-call branch.
-                    let should_resend = !remote_origin
-                        || (self.remote_tx_permitted)(remote_client_key_id.as_deref());
-                    if should_resend {
-                        // Codex P1, round 20: only rebind once permitted —
-                        // see the identical fix above for the full
-                        // rationale.
-                        //
-                        // Round-3 review (Codex P2): rebind before resending
-                        // — see `rebind_remote_identity`'s doc.
-                        self.rebind_remote_identity(
+                    let outcome = self
+                        .resend_existing_if_permitted(
                             existing_id,
                             remote_origin,
                             remote_client_key_id,
                         )
                         .await;
-                        let _ = self.resend_last_tx(existing_id).await;
-                    }
-                    return Ok(existing_id);
+                    return Ok((existing_id, outcome));
                 }
             }
         }
@@ -2822,22 +3107,10 @@ impl QsoManager {
                      grace window, re-sending existing QSO {}'s last frame",
                     target, step, existing_id
                 );
-                // Round-10 review (Codex P2): decide before
-                // rebinding/resending — see the analogous fix in
-                // `respond_to_cq_with`'s idempotent keep-call branch.
-                let should_resend =
-                    !remote_origin || (self.remote_tx_permitted)(remote_client_key_id.as_deref());
-                if should_resend {
-                    // Codex P1, round 20: only rebind once permitted — see
-                    // the identical fix above for the full rationale.
-                    //
-                    // Round-3 review (Codex P2): rebind before resending —
-                    // see `rebind_remote_identity`'s doc.
-                    self.rebind_remote_identity(existing_id, remote_origin, remote_client_key_id)
-                        .await;
-                    let _ = self.resend_last_tx(existing_id).await;
-                }
-                return Ok(existing_id);
+                let outcome = self
+                    .resend_existing_if_permitted(existing_id, remote_origin, remote_client_key_id)
+                    .await;
+                return Ok((existing_id, outcome));
             }
         }
 
@@ -3102,7 +3375,7 @@ impl QsoManager {
             .await;
         }
 
-        Ok(qso_id)
+        Ok((qso_id, ManualCallOutcome::Opened))
     }
 
     /// Two-strike confirm-before-relatch at the current time. See
@@ -3612,6 +3885,61 @@ impl QsoManager {
         Ok(())
     }
 
+    /// PAN-137: end active QSOs bound to another station-agent client, freeing
+    /// their TX window and capacity slots. Selection and removal share one
+    /// write lock so a QSO already rebound to the new controller is kept.
+    /// Emit the normal failure events after releasing that lock.
+    pub async fn retire_qsos_bound_to_other_remote_clients(
+        &self,
+        controller_key_id: &str,
+    ) -> Vec<QsoId> {
+        let removed: Vec<(QsoId, QsoProgress)> = {
+            let mut qsos = self.qsos.write().await;
+            let ids: Vec<QsoId> = qsos
+                .iter()
+                .filter(|(_, p)| {
+                    p.state.is_active()
+                        && bound_to_other_remote_client(
+                            p.metadata.remote_origin,
+                            p.metadata.remote_client_key_id.as_deref(),
+                            controller_key_id,
+                        )
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| qsos.remove(&id).map(|p| (id, p)))
+                .collect()
+        };
+        let mut retired = Vec::with_capacity(removed.len());
+        for (qso_id, mut progress) in removed {
+            let old_state = progress.state.clone();
+            let reason = QsoFailureReason::ControlTransferred;
+            progress.state = QsoState::Failed {
+                reason: reason.clone(),
+                failed_at: Utc::now(),
+                last_state: Box::new(old_state.clone()),
+            };
+            self.emit_state_change(qso_id, old_state.clone(), progress.state.clone())
+                .await;
+            self.emit_event(QsoEvent::QsoFailed {
+                qso_id,
+                reason,
+                last_state: old_state,
+                metadata: progress.metadata.clone(),
+                state_history: progress.state_history.clone(),
+                messages: progress.messages.clone(),
+            })
+            .await;
+            if let Some(callsign) = progress.metadata.their_callsign.as_ref() {
+                self.remove_callsign_mapping(callsign, qso_id).await;
+            }
+            info!("Retired QSO {qso_id}: remote control passed to {controller_key_id}");
+            retired.push(qso_id);
+        }
+        retired
+    }
+
     /// Emit a MessageToSend event for a QSO.
     ///
     /// Reads `tx_parity` from the QSO metadata so that every emission
@@ -3644,41 +3972,41 @@ impl QsoManager {
         .await;
     }
 
-    /// Rebind an existing QSO's remote-origin identity to whoever's action
-    /// was just accepted for it (round-3 review, Codex P2).
-    ///
-    /// `respond_to_cq_with`/`respond_to_caller`'s idempotent-keep-call and
-    /// advance-existing-QSO branches resend or advance an ALREADY-EXISTING
-    /// QSO object rather than creating a new one — but until this fix they
-    /// left that QSO's `metadata.remote_client_key_id` bound to whichever
-    /// client originally created it. If client A created the QSO and client
-    /// B later takes control (arms) and repeats the same accepted action
-    /// (e.g. `callStation` for the same callsign/band), the resend/advance
-    /// still carries A's stale identity, so B's own valid arm rejects it —
-    /// every repeated action from the new controller keeps resolving to the
-    /// same still-A-bound QSO until it terminates. `send_message` (used by
-    /// both `resend_last_tx` and `advance_existing_qso_to_step`) reads
-    /// `metadata.remote_client_key_id`/`remote_origin` fresh at call time,
-    /// so rebinding here before either of those runs is sufficient — no
-    /// change needed to how the actual `MessageToSend` is emitted.
-    ///
-    /// A no-op if the QSO no longer exists (defensive; the caller always
-    /// just looked it up).
-    async fn rebind_remote_identity(
+    /// PAN-138: re-key an EXISTING QSO on behalf of a (possibly remote)
+    /// caller. The permission check, the identity rebind (round 3) and the
+    /// attempt's bookkeeping share ONE `qsos` write guard with no await
+    /// between them, like `rearm_manual_calls_at`'s `frame_reaches_the_air`.
+    /// A denied caller rebinds nothing (round 20) and charges nothing
+    /// (round 10). `send_message` re-reads the binding when emitting.
+    async fn resend_existing_if_permitted(
         &self,
         qso_id: QsoId,
         remote_origin: bool,
         remote_client_key_id: Option<String>,
-    ) {
-        if let Some(progress) = self.qsos.write().await.get_mut(&qso_id) {
+    ) -> ManualCallOutcome {
+        let now = Utc::now();
+        let (message, frequency) = {
+            let mut qsos = self.qsos.write().await;
+            let Some(progress) = qsos.get_mut(&qso_id) else {
+                return ManualCallOutcome::NothingToResend;
+            };
+            if remote_origin && !(self.remote_tx_permitted)(remote_client_key_id.as_deref()) {
+                return ManualCallOutcome::NotPermitted;
+            }
             progress.metadata.remote_origin = remote_origin;
             progress.metadata.remote_client_key_id = remote_client_key_id;
-        }
+            match self.charge_resend_locked(qso_id, progress, now) {
+                Some(emit) => emit,
+                None => return ManualCallOutcome::NothingToResend,
+            }
+        };
+        self.send_message(qso_id, message, frequency).await;
+        ManualCallOutcome::Resent
     }
 
     /// Read `qso_id`'s CURRENT remote-identity binding rather than trusting a
     /// value captured before the caller released the `qsos` write lock — a
-    /// concurrent [`Self::rebind_remote_identity`] can change it in that
+    /// concurrent [`Self::resend_existing_if_permitted`] can change it in that
     /// window, and acting on a stale snapshot afterward can misattribute a
     /// reply's origin/client to the wrong controller (Codex P1, PR #362
     /// round 17). Falls back to `snapshot` only if the QSO itself is gone by
@@ -3703,7 +4031,12 @@ impl QsoManager {
 
     // Called under the qsos write lock at either stall-reset site. Those
     // contributions are already gone; delayed failure must not subtract
-    // them from a later streak. Call-count and timeline eligibility remain.
+    // them from a later streak. `tx_slot` is cleared too: a reset must
+    // also retire the slot key, or the PAN-128 heir rule in
+    // `roll_back_replaced_attempt_at` could hand a post-reset count to a
+    // pre-reset attempt that feeds the same slot (its increment was
+    // deliberately cleared here). Call-count and timeline eligibility
+    // remain.
     fn clear_recorded_stall_increments(&self, qso_id: QsoId) {
         let mut ledger = self
             .keep_call_ledger
@@ -3712,6 +4045,7 @@ impl QsoManager {
         if let Some(entry) = ledger.get_mut(&qso_id) {
             for attempt in &mut entry.attempts {
                 attempt.bumped_stall = false;
+                attempt.tx_slot = None;
             }
             entry.stall_action_revoked = false;
         }
@@ -3811,11 +4145,28 @@ impl QsoManager {
             progress.metadata.last_call_at = attempt.prev_last_call_at;
         }
         if attempt.bumped_stall {
-            let threshold = self.config.timeouts.qso_stall_switch_after;
-            let was_at_threshold = progress.metadata.stall_cycles >= threshold;
-            progress.metadata.stall_cycles = progress.metadata.stall_cycles.saturating_sub(1);
-            if was_at_threshold && progress.metadata.stall_cycles < threshold {
-                entry.stall_action_revoked = true;
+            // PAN-128 (the "heir" rule): a counted attempt and an uncounted
+            // twin can feed the SAME own-parity TX slot (two rearms one
+            // protocol slot apart). If the counted one is rolled back while
+            // a same-slot sibling survives, the sibling inherits the slot's
+            // increment and nothing is decremented — the slot still has a
+            // frame that can air, so it keeps its count. Only with no
+            // surviving sibling does the existing decrement (and the
+            // `stall_action_revoked` path below) run.
+            let heir = attempt
+                .tx_slot
+                .and_then(|slot| entry.attempts.iter().rposition(|a| a.tx_slot == Some(slot)));
+            match heir {
+                Some(index) => entry.attempts[index].bumped_stall = true,
+                None => {
+                    let threshold = self.config.timeouts.qso_stall_switch_after;
+                    let was_at_threshold = progress.metadata.stall_cycles >= threshold;
+                    progress.metadata.stall_cycles =
+                        progress.metadata.stall_cycles.saturating_sub(1);
+                    if was_at_threshold && progress.metadata.stall_cycles < threshold {
+                        entry.stall_action_revoked = true;
+                    }
+                }
             }
         }
         if attempt.recorded_sent {
@@ -3857,50 +4208,60 @@ impl QsoManager {
     /// same-text emission the rearm/coalescer machinery doesn't know about.
     pub async fn resend_last_tx(&self, qso_id: QsoId) -> Result<(), QsoManagerError> {
         let now = Utc::now();
-        let (message, frequency) = {
+        let emit = {
             let mut qsos = self.qsos.write().await;
             let progress = qsos
                 .get_mut(&qso_id)
                 .ok_or(QsoManagerError::QsoNotFound { qso_id })?;
-            match progress
-                .messages
-                .iter()
-                .rev()
-                .find(|m| m.direction == MessageDirection::Sent)
-            {
-                Some(m) => {
-                    let message = m.message_type.clone();
-                    let frequency = progress.metadata.frequency;
-                    let prev_last_call_at = progress.metadata.last_call_at;
-                    progress.metadata.call_count += 1;
-                    progress.metadata.last_call_at = Some(now);
-                    self.record_keep_call_attempt(
-                        &mut self
-                            .keep_call_ledger
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner()),
-                        qso_id,
-                        KeepCallAttempt {
-                            emitted_at: now,
-                            raw_text: self.render_sent_text(&message),
-                            prev_last_call_at,
-                            bumped_stall: false,
-                            recorded_sent: false,
-                            frequency_hz: frequency,
-                            remote_origin: progress.metadata.remote_origin,
-                            remote_client_key_id: progress.metadata.remote_client_key_id.clone(),
-                        },
-                    );
-                    (message, frequency)
-                }
-                None => {
-                    info!("resend_last_tx: no prior Sent message for QSO {}", qso_id);
-                    return Ok(());
-                }
-            }
+            self.charge_resend_locked(qso_id, progress, now)
         };
-        self.send_message(qso_id, message, frequency).await;
+        match emit {
+            Some((message, frequency)) => self.send_message(qso_id, message, frequency).await,
+            None => info!("resend_last_tx: no prior Sent message for QSO {}", qso_id),
+        }
         Ok(())
+    }
+
+    /// The bookkeeping half of a re-send, run under the caller's `qsos` write
+    /// guard: bump `call_count`, stamp `last_call_at` and record the PAN-75
+    /// ledger attempt. Returns what to emit once the guard is dropped, or
+    /// `None` when the QSO has no prior `Sent` message (nothing charged).
+    fn charge_resend_locked(
+        &self,
+        qso_id: QsoId,
+        progress: &mut QsoProgress,
+        now: DateTime<Utc>,
+    ) -> Option<(MessageType, f64)> {
+        let message = progress
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.direction == MessageDirection::Sent)?
+            .message_type
+            .clone();
+        let frequency = progress.metadata.frequency;
+        let prev_last_call_at = progress.metadata.last_call_at;
+        progress.metadata.call_count += 1;
+        progress.metadata.last_call_at = Some(now);
+        self.record_keep_call_attempt(
+            &mut self
+                .keep_call_ledger
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+            qso_id,
+            KeepCallAttempt {
+                emitted_at: now,
+                raw_text: self.render_sent_text(&message),
+                prev_last_call_at,
+                bumped_stall: false,
+                tx_slot: None,
+                recorded_sent: false,
+                frequency_hz: frequency,
+                remote_origin: progress.metadata.remote_origin,
+                remote_client_key_id: progress.metadata.remote_client_key_id.clone(),
+            },
+        );
+        Some((message, frequency))
     }
 
     /// External commit point for PAN-72's stall-switch/revert and the manual
@@ -3934,10 +4295,10 @@ impl QsoManager {
     /// coordinator can mirror it into its own `active_tx_offsets` snapshot
     /// without re-deriving the clamp.
     ///
-    /// Four guards run BEFORE anything is mutated. The first three are
-    /// staleness guards, all because the coordinator only drains its request
-    /// mailbox once per 15-second slot, so a lot can happen between an action
-    /// being raised and committed; the fourth rejects a move that isn't one:
+    /// These guards run BEFORE anything is mutated. Guards 1–3 are staleness
+    /// guards, all because the coordinator only drains its request mailbox
+    /// once per 15-second slot, so a lot can happen between an action being
+    /// raised and committed; guard 4 rejects a move that isn't one:
     ///
     /// 1. **Terminal QSO** (Codex round 1 on PR #350, finding 3). Completed
     ///    entries are retained in the map, and completion deliberately keeps
@@ -3955,8 +4316,18 @@ impl QsoManager {
     ///    is already recorded known-good, so applying the queued action would
     ///    move us off the offset that just demonstrably worked.
     ///    [`OffsetRelocationOrigin::OperatorForced`] carries no generation —
-    ///    the nudge is current by construction and must never be discarded this
-    ///    way.
+    ///    an ordinary advance must never discard the nudge this way; guard 2a
+    ///    covers the advances that do supersede it.
+    ///
+    ///    **2a. Operator nudge superseded by DX progress** (PAN-131, Codex
+    ///    round 13 on PR #350, P2). An `OperatorForced` commit is refused when
+    ///    the QSO's current state fails [`operator_nudge_retransmits`]: the DX
+    ///    moved it, after the keypress, into a state neither
+    ///    `rearm_manual_calls_at` nor this method's one-shot retransmission
+    ///    sends anything from, so committing would move the offset with no
+    ///    frame ever sent on it. An advance that stays inside the
+    ///    nudge-eligible states (`RespondingToCq` → `SendingReport`) still
+    ///    commits — a generation token would have refused that too.
     /// 3. **Outside the live Hound region** (Codex round 4, finding 2). A
     ///    Hound's TX offset is procedurally pinned to the calling region before
     ///    the Fox answers and to the response region after the QSY, and the
@@ -3986,7 +4357,7 @@ impl QsoManager {
     ///    the caller's last check but before this commit — re-reading
     ///    `tx_freq_mode` here, inside the same locked section, closes it.
     ///
-    /// All five refusals are expected outcomes, not faults — see
+    /// All these refusals are expected outcomes, not faults — see
     /// [`QsoManagerError::is_expected_offset_action_refusal`].
     ///
     /// `origin` is also what the known-good crediting site reads back off
@@ -4030,6 +4401,21 @@ impl QsoManager {
             {
                 return Err(QsoManagerError::OffsetActionStallRolledBack { qso_id });
             }
+        }
+        // 2a. **Operator nudge superseded by DX progress** (PAN-131, Codex
+        //    round 13 on PR #350, P2). The `u` nudge was queued while its QSO
+        //    was nudge-eligible, but it carries no `raised_at_generation`, so
+        //    guard 2 cannot see the DX moving the QSO on before this drain. If
+        //    the QSO now sits in a state nothing retransmits from
+        //    (`WaitingForConfirmation`, an answered Auto self-CQ's
+        //    `WaitingForReport`, …), committing would move the offset with no
+        //    frame ever sent on it. Revalidating the STATE rather than adding
+        //    a token keeps the nudge alive across an advance that stays
+        //    retransmittable (`RespondingToCq` → `SendingReport` bumps the
+        //    generation too). Ahead of guard 6, so the drain discards this
+        //    refusal instead of requeuing it.
+        if origin.is_operator_forced() && !operator_nudge_retransmits(progress) {
+            return Err(QsoManagerError::OffsetActionNudgeSuperseded { qso_id });
         }
         // 3. **Outside the live Hound region** (Codex round 4 on PR #350,
         //    finding 2). The coordinator picks the window from a `get_qso`
@@ -4119,6 +4505,8 @@ impl QsoManager {
         if self.ptt_active.load(std::sync::atomic::Ordering::Acquire) {
             return Err(QsoManagerError::OffsetActionPttInFlight { qso_id });
         }
+        // PAN-145: invalidate snapshots before committing, under the PTT gate.
+        self.relocation_epochs.bump(&qso_id.to_string());
         progress.metadata.frequency = applied_hz;
         progress.metadata.pending_freq_drift = None;
         progress.metadata.stall_cycles = 0;
@@ -4133,10 +4521,11 @@ impl QsoManager {
         // (`is_message_relevant`) and stays a CANDIDATE for the offset a
         // forward advance credits as known-good (`process_message_for_qso`).
         //
-        // Round 6, finding 2: the provenance travels with it. On a pre-existing
-        // split the DX's reply frequency cannot discriminate our two offsets,
-        // and the right fallback there depends entirely on whether the stall
-        // detector or the operator moved us. See
+        // Round 6, finding 2: the provenance travels with it. On any split —
+        // including the one the latch below creates for an established simplex
+        // QSO (PAN-132) — the DX's reply frequency cannot discriminate our two
+        // offsets, and the right fallback there depends entirely on whether the
+        // stall detector or the operator moved us. See
         // `QsoMetadata::pre_switch_offset` and
         // `PreSwitchOffset::operator_forced`.
         progress.metadata.pre_switch_offset = Some(crate::states::PreSwitchOffset {
@@ -4175,7 +4564,9 @@ impl QsoManager {
         // An already-`Some` `partner_freq` (Hound, an offset hold, a collision
         // nudge, a passband clamp) is deliberately left alone: it is already
         // the correct "where we hear the DX", and this is purely a TX-side
-        // move.
+        // move. The crediting block in `process_message_for_qso` treats the
+        // split this latch creates exactly like an already-`Some` one, so its
+        // provenance rule decides the known-good offset (PAN-132).
         //
         // The latch also requires an ESTABLISHED DX identity
         // (`their_callsign().is_some()` — the same discriminator
@@ -4326,6 +4717,7 @@ impl QsoManager {
                         raw_text,
                         prev_last_call_at,
                         bumped_stall: false,
+                        tx_slot: None,
                         recorded_sent: true,
                         frequency_hz: progress.metadata.frequency,
                         remote_origin: progress.metadata.remote_origin,
@@ -4575,9 +4967,11 @@ impl QsoManager {
         // Detect a manual state regression: the DX sent an EARLIER-stage
         // message and `determine_state_transition` either backed us up the
         // ladder (rank decreased) or kept us in SendingReport on a repeated
-        // report. Used to (a) count the re-send against the manual watchdog cap
-        // and (b) gate the per-slot rearm so it does not double-send in the
-        // same slot.
+        // report. When the regression queues a re-send (`reply_to_emit`), used
+        // to (a) count that re-send against the manual watchdog cap and (b)
+        // gate the per-slot rearm so it does not double-send in the same slot;
+        // a repeated report in SendingReport queues none, so neither applies
+        // (PAN-129). Every regression cancels the C3 reprieve.
         let is_manual_regression = qso_initiated_by == CallInitiation::Manual
             && (Self::ladder_rank(&new_state) < Self::ladder_rank(&old_state)
                 || (matches!(old_state, QsoState::SendingReport { .. })
@@ -4744,7 +5138,7 @@ impl QsoManager {
             }
 
             // Rearm-coordination fix: a genuine forward advance stamps
-            // `last_call_at` exactly like the manual-regression re-send does
+            // `last_call_at` like a manual regression that re-sends does
             // (below). Without this, the per-slot keep-call rearm
             // (`rearm_manual_calls_at`) has no way to know a response arrived
             // THIS slot — if the DX's decode lands late in the slot, the 5s
@@ -4780,18 +5174,27 @@ impl QsoManager {
             }
         }
 
-        // Count a manual regression re-send against the keep-calling watchdog
+        // Count a manual regression RE-SEND against the keep-calling watchdog
         // so a DX that keeps repeating an earlier message cannot drive an
-        // unbounded ping-pong. We bump `call_count` and stamp `last_call_at`
-        // to `message.timestamp`; the latter also gates `rearm_manual_calls_at`
-        // (which only re-emits when ≥1 slot has elapsed since `last_call_at`),
-        // so the in-slot transition re-send and the per-slot rearm never both
-        // fire in the same slot. `first_call_at` is left untouched — a
-        // regression must not reset the watchdog clock.
+        // unbounded ping-pong. Only a regression that queued a reply this
+        // decode (REGRESSION 1/3) re-sends: it bumps `call_count` and stamps
+        // `last_call_at` to `message.timestamp`; the latter also gates
+        // `rearm_manual_calls_at` (which only re-emits when ≥1 slot has
+        // elapsed since `last_call_at`), so that re-send and the per-slot
+        // rearm never both fire in the same slot. A repeated report in
+        // SendingReport (REGRESSION 2) sends nothing — the rearm owns that
+        // re-send — so it leaves both fields alone, and the rearm keeps its
+        // silence cadence and counts the stall (PAN-129). Its old restamp
+        // held the rearm back a full slot from every decode, which on FT2
+        // (3.2 s slot, 5 s poll) skipped re-sends and delayed the stall
+        // switch. `first_call_at` is left untouched — a regression must not
+        // reset the watchdog clock.
         if is_manual_regression {
             if let Some(progress) = qsos.get_mut(&qso_id) {
-                progress.metadata.call_count += 1;
-                progress.metadata.last_call_at = Some(message.timestamp);
+                if reply_to_emit.is_some() {
+                    progress.metadata.call_count += 1;
+                    progress.metadata.last_call_at = Some(message.timestamp);
+                }
                 // A regression is the opposite of forward progress (the DX
                 // repeated an earlier message), so it cancels any pending C3
                 // reprieve from an earlier advance — a stuck DX repeating must
@@ -4855,18 +5258,33 @@ impl QsoManager {
                 // a reason that says nothing about which frame was answered, and
                 // crediting the never-transmitted new offset off the back of it
                 // is strictly worse than round 4's behaviour. So the check is
-                // applied only when the QSO is Tx=Rx: no split at all, or a
-                // split this very switch created (`partner_freq` still equal to
-                // the offset we just vacated, compared with the same
-                // [`TX_OFFSET_NOOP_TOLERANCE_HZ`] float-noise bound that latch
-                // site uses).
+                // applied only when the QSO is Tx=Rx: no `partner_freq` at all.
                 //
-                // Round 6, finding 2: on a PRE-EXISTING split the fallback is
-                // not one answer but two, and the provenance of the relocation
-                // picks between them (`PreSwitchOffset::operator_forced`). The
-                // DX transmits at `partner_freq` no matter where we key, so its
-                // reply frequency is silent about which of our offsets it
-                // answered — but the two provenances carry different priors:
+                // PAN-132 (Codex round 15 on PR #350, P2): that includes a split
+                // this switch itself created. `apply_tx_offset_switch`'s
+                // established-QSO latch sets `partner_freq` to exactly the
+                // offset it vacated, so round 5's re-review counted that QSO as
+                // Tx=Rx. But the latch exists because the DX is still
+                // transmitting there, whatever moved us, so its reply decodes at
+                // the vacated offset whichever of our frames it answered. The
+                // relevance gate has already admitted it against that same
+                // baseline with the same tolerance, so the check could not fail:
+                // an operator nudge credited the offset it had just left, and
+                // the next stall `Revert`ed the nudge. A `partner_freq` that
+                // merely coincides with the vacated offset (an earlier move
+                // landed back on it) is the same case. Within the grace,
+                // `partner_freq` is therefore `None` only after a switch on an
+                // unanswered `CallingCq`, where the latch deliberately does not
+                // fire — the only case where the reply frequency is evidence.
+                //
+                // Round 6, finding 2: on ANY split — one that predates the
+                // switch, or the one its own latch just created (PAN-132) — the
+                // fallback is not one answer but two, and the provenance of the
+                // relocation picks between them
+                // (`PreSwitchOffset::operator_forced`). The DX transmits at
+                // `partner_freq` no matter where we key, so its reply frequency
+                // is silent about which of our offsets it answered — but the two
+                // provenances carry different priors:
                 //
                 // - a STALL-triggered switch only fires BECAUSE the old offset
                 //   demonstrably stopped working, and the triggering resend went
@@ -4893,10 +5311,7 @@ impl QsoManager {
                 progress.metadata.last_known_good_offset_hz = Some(match vacated {
                     None => current_hz,
                     Some(pre) => {
-                        let tx_equals_rx =
-                            progress.metadata.partner_freq.is_none_or(|partner_hz| {
-                                (partner_hz - pre.offset_hz).abs() <= TX_OFFSET_NOOP_TOLERANCE_HZ
-                            });
+                        let tx_equals_rx = progress.metadata.partner_freq.is_none();
                         if tx_equals_rx {
                             // The decode frequency IS evidence here: it is the
                             // same number as our own TX offset.
@@ -4919,14 +5334,12 @@ impl QsoManager {
                                 // bigger than the decoder's narrow window
                                 // stalls the exchange right after rescuing it.
                                 //
-                                // Gated on `partner_freq` still being `None`
-                                // here — an already-established QSO (Hound, an
-                                // `o` hold, a de-conflict nudge, a passband
-                                // clamp) reaches this same sub-case with
-                                // `partner_freq` already latched to
-                                // `pre.offset_hz` by `apply_tx_offset_switch`
-                                // itself, and must come out of this block
-                                // exactly as that switch left it.
+                                // Since PAN-132 `tx_equals_rx` is exactly
+                                // `partner_freq.is_none()`, so this guard always
+                                // holds here. It stays so that a future
+                                // widening of `tx_equals_rx` can never let this
+                                // latch overwrite a split an established QSO
+                                // already carries.
                                 if progress.metadata.partner_freq.is_none() {
                                     progress.metadata.partner_freq = Some(pre.offset_hz);
                                 }
@@ -5062,7 +5475,7 @@ impl QsoManager {
         if let Some(reply) = reply_to_emit {
             // Re-read the remote binding here rather than trusting the
             // pre-drop snapshot: a concurrent takeover can rebind this QSO's
-            // remote identity (`rebind_remote_identity`) and publish its own
+            // remote identity (`resend_existing_if_permitted`) and publish its own
             // Remote resend in the window since the write lock was released
             // above. Emitting the stale origin/client-id would misattribute
             // this reply (e.g. advertise it as Local) and could let a later
@@ -6800,6 +7213,7 @@ impl QsoManager {
     /// The QSO's latched `tx_parity` and `initiated_by` are preserved (we reuse
     /// what was latched at QSO start). Used when an operator context-replies at
     /// a step ahead of where the QSO currently is.
+    #[allow(clippy::too_many_arguments)]
     async fn advance_existing_qso_to_step(
         &self,
         qso_id: QsoId,
@@ -6808,7 +7222,9 @@ impl QsoManager {
         step: pancetta_core::ResponseStep,
         our_report: SignalReport,
         their_report_val: SignalReport,
-    ) -> Result<(), QsoManagerError> {
+        remote_origin: bool,
+        remote_client_key_id: Option<String>,
+    ) -> Result<ManualCallOutcome, QsoManagerError> {
         use pancetta_core::ResponseStep;
         let now = Utc::now();
 
@@ -6816,7 +7232,9 @@ impl QsoManager {
             ResponseStep::Grid => {
                 // Grid never ranks ahead of an active QSO, so the caller never
                 // routes here; re-send current as a safe fallback.
-                return self.resend_last_tx(qso_id).await;
+                return Ok(self
+                    .resend_existing_if_permitted(qso_id, remote_origin, remote_client_key_id)
+                    .await);
             }
             ResponseStep::Report => (
                 QsoState::SendingReport {
@@ -6887,6 +7305,19 @@ impl QsoManager {
             let Some(progress) = qsos.get_mut(&qso_id) else {
                 return Err(QsoManagerError::QsoNotFound { qso_id });
             };
+            // PAN-138 / round 13: check, rebind and advance under this one
+            // guard, so no other `qsos` holder (QSO processing, a PAN-137
+            // retire) runs between the check and the mutation. The check is
+            // still a point-in-time read of `ArmState`, not a TX gate: a
+            // disarm or expiry after it is caught only by the TX worker at
+            // key time. The advance is not undone then (advances record no
+            // PAN-75 attempt), and a completion it records stays logged
+            // (known gap, 2026-07-development-phases-and-gaps.md).
+            if remote_origin && !(self.remote_tx_permitted)(remote_client_key_id.as_deref()) {
+                return Ok(ManualCallOutcome::NotPermitted);
+            }
+            progress.metadata.remote_origin = remote_origin;
+            progress.metadata.remote_client_key_id = remote_client_key_id;
             let old_state = progress.state.clone();
             progress.state = new_state.clone();
             progress.state_history.push(StateTransition {
@@ -6977,7 +7408,7 @@ impl QsoManager {
             })
             .await;
         }
-        Ok(())
+        Ok(ManualCallOutcome::Advanced)
     }
 
     /// FIX 3: retire every active (non-terminal) QSO with `callsign` on the
@@ -7197,7 +7628,9 @@ impl QsoManager {
     /// Re-arming increments `call_count` and updates `last_call_at`; the
     /// watchdog ([`Self::check_timeouts_at`]) reads `call_count` and
     /// `first_call_at` (Manual) or the per-state `report_timeout` (Auto) to
-    /// decide when to stop.
+    /// decide when to stop. The stall streak (`stall_cycles`) counts once
+    /// per own-parity TX slot these re-sends feed, not once per emission
+    /// (PAN-128).
     /// Failed TX outcomes can reverse accounting via [`Self::roll_back_unsent_attempt_at`].
     /// The ledger emission anchor preserves cadence even when accounting is restored.
     pub async fn rearm_manual_calls_at(&self, now: DateTime<Utc>) {
@@ -7443,11 +7876,39 @@ impl QsoManager {
                 // the DX did not advance the QSO since the last slot, so we
                 // count it against the stall streak. A forward advance
                 // (`process_message_for_qso`) resets this to 0 elsewhere;
-                // this is now the sole increment site (see
+                // this is the sole increment site (see
                 // `QsoMetadata::stall_cycles`'s doc comment). Reached only
                 // when `frame_reaches_the_air` (above), so the existing
                 // count-intact-on-mute behavior is preserved by construction.
-                progress.metadata.stall_cycles = progress.metadata.stall_cycles.saturating_add(1);
+                //
+                // PAN-128: the QSO only transmits on its own parity — every
+                // OTHER slot — so an emission counts once per own-parity TX
+                // slot it feeds, not once per emission. The first emission
+                // feeding a slot no surviving attempt has claimed holds the
+                // slot's count (`bumped_stall`); its same-slot successors
+                // keep pre-arming the TX worker without inflating the
+                // streak, so `qso_stall_switch_after` measures real
+                // unanswered TX opportunities. The slot an emission feeds is
+                // derived with the TX scheduler's current-slot acceptance
+                // rule (see `keep_call_tx_slot`), so an in-window rearm and
+                // the off-parity rearm before it — both scheduled into the
+                // same real TX slot — share one key (PR review follow-up).
+                let tx_slot = keep_call_tx_slot(
+                    now,
+                    slot_millis,
+                    self.tx_late_max_ms,
+                    progress.metadata.tx_parity,
+                );
+                let counts_toward_stall = !ledger.get(&qso_id).is_some_and(|entry| {
+                    entry
+                        .attempts
+                        .iter()
+                        .any(|a| a.bumped_stall && a.tx_slot == Some(tx_slot))
+                });
+                if counts_toward_stall {
+                    progress.metadata.stall_cycles =
+                        progress.metadata.stall_cycles.saturating_add(1);
+                }
 
                 let tx_auto = pancetta_core::TxFreqMode::from_u8(
                     self.tx_freq_mode.load(std::sync::atomic::Ordering::Relaxed),
@@ -7520,7 +7981,8 @@ impl QsoManager {
                         emitted_at: now,
                         raw_text,
                         prev_last_call_at,
-                        bumped_stall: true,
+                        bumped_stall: counts_toward_stall,
+                        tx_slot: Some(tx_slot),
                         recorded_sent: true,
                         frequency_hz: progress.metadata.frequency,
                         remote_origin: progress.metadata.remote_origin,
@@ -7967,6 +8429,7 @@ impl Clone for QsoManager {
             tx_freq_mode: Arc::clone(&self.tx_freq_mode),
             ptt_active: Arc::clone(&self.ptt_active),
             ptt_sync_gate: Arc::clone(&self.ptt_sync_gate),
+            relocation_epochs: Arc::clone(&self.relocation_epochs),
             tx_policy: Arc::clone(&self.tx_policy),
             remote_tx_permitted: Arc::clone(&self.remote_tx_permitted),
             hamlib_hard_muted: Arc::clone(&self.hamlib_hard_muted),
@@ -7974,6 +8437,9 @@ impl Clone for QsoManager {
             // this clone and must observe runtime mode switches (see the
             // field's doc comment).
             active_slot_ns: Arc::clone(&self.active_slot_ns),
+            // Copied by value, matching the TX worker's own startup
+            // snapshot of the same knob (see the field's doc comment).
+            tx_late_max_ms: self.tx_late_max_ms,
         }
     }
 }
@@ -7984,6 +8450,14 @@ impl Clone for QsoManager {
 mod tests {
     use super::*;
     use tokio_test;
+
+    #[test]
+    fn bound_to_other_remote_client_preserves_local_and_unbound_qsos() {
+        assert!(bound_to_other_remote_client(true, Some("a"), "b"));
+        assert!(!bound_to_other_remote_client(true, Some("b"), "b"));
+        assert!(!bound_to_other_remote_client(true, None, "b"));
+        assert!(!bound_to_other_remote_client(false, Some("a"), "b"));
+    }
 
     async fn rollback_fixture() -> (QsoManager, QsoId, DateTime<Utc>, String) {
         let manager = QsoManager::new(test_config());
@@ -11103,6 +11577,96 @@ mod tests {
             after.metadata.frequency, before.metadata.frequency,
             "frequency must be completely unchanged"
         );
+    }
+
+    #[tokio::test]
+    async fn apply_tx_offset_switch_bumps_the_relocation_epoch_under_the_sync_gate() {
+        let mut manager = auto_manager(test_config());
+        let epochs = Arc::new(TxRelocationEpochs::default());
+        manager.set_relocation_epoch_source(Arc::clone(&epochs));
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        manager.set_ptt_sync_gate_source(Arc::clone(&gate));
+        let qso_id = manager.start_cq(1500.0, None, false, None).await.unwrap();
+        let key = qso_id.to_string();
+        assert_eq!(epochs.epoch(&key), 0);
+        manager
+            .apply_tx_offset_switch(qso_id, 1800.0, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .unwrap();
+        let first = epochs.epoch(&key);
+        assert!(first >= 1);
+
+        let held = gate.lock().await;
+        // Poll the real switch to Pending while the gate is held. With no
+        // other contended locks, this reaches the gate deterministically.
+        let mut switching = Box::pin(manager.apply_tx_offset_switch(
+            qso_id,
+            2100.0,
+            OffsetRelocationOrigin::OperatorForced,
+        ));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                switching.as_mut(),
+                cx
+            )))
+            .await
+            .is_pending()
+        );
+        assert_eq!(epochs.epoch(&key), first);
+        drop(held);
+        switching.await.unwrap();
+        assert!(epochs.epoch(&key) > first);
+        assert_eq!(epochs.epoch("another-qso"), 0);
+        // QsoManager has a manual Clone implementation; it must share epochs.
+        assert_eq!(
+            manager.clone().relocation_epochs.epoch(&key),
+            epochs.epoch(&key)
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_tx_offset_switch_does_not_bump_the_epoch_on_hold_mode_refusal() {
+        let manager = QsoManager::new(test_config());
+        let qso_id = manager.start_cq(1500.0, None, false, None).await.unwrap();
+        let result = manager
+            .apply_tx_offset_switch(qso_id, 1800.0, OffsetRelocationOrigin::OperatorForced)
+            .await;
+        assert!(matches!(
+            result,
+            Err(QsoManagerError::OffsetActionHeld { .. })
+        ));
+        assert_eq!(manager.relocation_epochs.epoch(&qso_id.to_string()), 0);
+    }
+
+    #[tokio::test]
+    async fn apply_tx_offset_switch_does_not_bump_the_epoch_on_ptt_in_flight_refusal() {
+        let manager = auto_manager(test_config());
+        let qso_id = manager.start_cq(1500.0, None, false, None).await.unwrap();
+        manager.ptt_active.store(true, Ordering::Release);
+        let result = manager
+            .apply_tx_offset_switch(qso_id, 1800.0, OffsetRelocationOrigin::OperatorForced)
+            .await;
+        assert!(matches!(
+            result,
+            Err(QsoManagerError::OffsetActionPttInFlight { .. })
+        ));
+        assert_eq!(manager.relocation_epochs.epoch(&qso_id.to_string()), 0);
+    }
+
+    #[tokio::test]
+    async fn relocation_epoch_is_private_and_functional_when_no_source_is_injected() {
+        let manager = auto_manager(test_config());
+        let other = QsoManager::new(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual("K1ABC".into(), 1500.0, None)
+            .await
+            .unwrap();
+        manager
+            .apply_tx_offset_switch(qso_id, 1800.0, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .unwrap();
+        assert!(manager.relocation_epochs.epoch(&qso_id.to_string()) >= 1);
+        assert_eq!(other.relocation_epochs.epoch(&qso_id.to_string()), 0);
     }
 
     /// PAN-143: the actual regression test for the race PAN-140 round 2
@@ -16548,8 +17112,9 @@ mod state_regression_tests {
     //! - REGRESSION 2 (SendingReport + repeated report → stays SendingReport):
     //!   the transition does NOT emit (exchange has no (SendingReport,
     //!   SignalReport) arm); `rearm_manual_calls_at` (FIX 4) owns the R re-send.
-    //!   The transition only updates the latched reports. Stamping `last_call_at`
-    //!   on the regression gates rearm so the two never double-send in one slot.
+    //!   The transition only updates the latched reports. The repeat leaves
+    //!   `last_call_at` and `call_count` alone: the rearm paces and counts its
+    //!   own re-sends, exactly as it does while the DX is silent (PAN-129).
     use super::*;
 
     const OUR: &str = "K5ARH";
@@ -16642,6 +17207,7 @@ mod state_regression_tests {
         let mut rx = manager.subscribe();
         let qso_id = manual_to_waiting_confirmation(&manager).await;
         let _ = drain(&mut rx);
+        let calls_before = manager.get_qso(qso_id).await.unwrap().metadata.call_count;
 
         // DX re-sends their report — with a NEW value — having never copied
         // our RR73. snr -9 → our report -9.
@@ -16672,6 +17238,13 @@ mod state_regression_tests {
             }
             other => panic!("expected SendingReport, got {:?}", other),
         }
+        // The regression's in-slot R re-send counts against the keep-calling
+        // budget exactly once.
+        assert_eq!(
+            progress.metadata.call_count,
+            calls_before + 1,
+            "REGRESSION 1's re-send must count as one call"
+        );
 
         // R-report re-emitted this slot.
         let emitted = sends(&drain(&mut rx));
@@ -16750,6 +17323,7 @@ mod state_regression_tests {
 
         // Now exercise the full path: it must NOT emit from the transition (no
         // exchange arm); the per-slot rearm owns the R re-send.
+        let last_before = manager.get_qso(qso_id).await.unwrap().metadata.last_call_at;
         manager
             .process_message(
                 MessageType::SignalReport {
@@ -16769,16 +17343,17 @@ mod state_regression_tests {
             "transition must not re-send (rearm owns it), got {:?}",
             from_transition
         );
+        // PAN-129: the repeat sends nothing, so it must not hold the rearm
+        // back either — `last_call_at` is left where our last call put it.
+        let last = manager.get_qso(qso_id).await.unwrap().metadata.last_call_at;
+        assert_eq!(
+            last, last_before,
+            "a repeated report must leave last_call_at unchanged"
+        );
+        let last = last.unwrap();
 
-        // A slot later, rearm re-sends our R-report (and not before — the
-        // regression stamped last_call_at, so no double-send in this slot).
-        let last = manager
-            .get_qso(qso_id)
-            .await
-            .unwrap()
-            .metadata
-            .last_call_at
-            .unwrap();
+        // A slot after our last call, rearm re-sends our R-report: it paces
+        // from its own last call, exactly as it does while the DX is silent.
         manager
             .rearm_manual_calls_at(last + Duration::seconds(15))
             .await;
@@ -16788,6 +17363,100 @@ mod state_regression_tests {
             matches!(rearmed[0], MessageType::ReportAck { .. }),
             "rearm must re-send ReportAck, got {:?}",
             rearmed[0]
+        );
+    }
+
+    /// PAN-129: a repeated report in SendingReport queues no reply, so it
+    /// spends no call and does not restamp `last_call_at` — the rearm, which
+    /// owns that re-send, paces and counts it exactly as it does for silence.
+    /// It still cancels a pending C3 reprieve (the DX is not progressing).
+    #[tokio::test]
+    async fn repeated_report_leaves_call_count_and_last_call_at_alone() {
+        let manager = manager();
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                format!("{} {} -07", OUR, DX),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+        // Pin `last_call_at` well away from "now" so a restamp to the decode
+        // time cannot coincide with it, and arm a C3 reprieve to cancel.
+        let pinned_last_call_at = Utc::now() - Duration::seconds(20);
+        {
+            let mut qsos = manager.qsos.write().await;
+            let progress = qsos.get_mut(&qso_id).unwrap();
+            assert!(
+                matches!(
+                    progress.state,
+                    QsoState::SendingReport {
+                        their_report: Some(_),
+                        ..
+                    }
+                ),
+                "precondition: SendingReport with the DX's report, got {:?}",
+                progress.state
+            );
+            progress.metadata.last_call_at = Some(pinned_last_call_at);
+            progress.metadata.progressed_this_cycle = true;
+        }
+        let calls_before = manager.get_qso(qso_id).await.unwrap().metadata.call_count;
+        let mut rx = manager.subscribe();
+
+        // The DX repeats the identical report (it did not copy our R).
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                format!("{} {} -07", OUR, DX),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(
+                progress.state,
+                QsoState::SendingReport {
+                    their_report: Some(-7),
+                    ..
+                }
+            ),
+            "must stay in SendingReport, got {:?}",
+            progress.state
+        );
+        assert_eq!(
+            progress.metadata.call_count, calls_before,
+            "a repeat that sends nothing must not spend a call"
+        );
+        assert_eq!(
+            progress.metadata.last_call_at,
+            Some(pinned_last_call_at),
+            "a repeat that sends nothing must not hold the rearm back"
+        );
+        assert!(
+            !progress.metadata.progressed_this_cycle,
+            "a repeat is not progress: it must cancel the C3 reprieve"
+        );
+        let emitted = sends(&drain(&mut rx));
+        assert!(
+            emitted.is_empty(),
+            "the repeat itself must not emit (the rearm owns the re-send), got {emitted:?}"
         );
     }
 
@@ -16804,8 +17473,12 @@ mod state_regression_tests {
         let manager = manager_with(3, 60); // cap 3, generous 60-min time window
         let qso_id = manual_to_waiting_confirmation(&manager).await;
 
-        // DX re-requests its report many times → regress to SendingReport and
-        // blow well past the call cap.
+        // DX re-requests its report many times → regress to SendingReport, and
+        // keep-calling re-sends our R after each repeat until the call cap is
+        // reached. A repeated report itself spends no call (PAN-129), so the
+        // cap is reached through the rearm's real re-sends, one own TX slot
+        // (30 s) apart, starting a slot after the regression's re-send.
+        let mut rearm_at: Option<DateTime<Utc>> = None;
         for _ in 0..6 {
             manager
                 .process_message(
@@ -16820,6 +17493,21 @@ mod state_regression_tests {
                 )
                 .await
                 .unwrap();
+            let at = match rearm_at {
+                Some(previous) => previous + Duration::seconds(30),
+                None => {
+                    manager
+                        .get_qso(qso_id)
+                        .await
+                        .unwrap()
+                        .metadata
+                        .last_call_at
+                        .unwrap()
+                        + Duration::seconds(15)
+                }
+            };
+            manager.rearm_manual_calls_at(at).await;
+            rearm_at = Some(at);
         }
         let prog = manager.get_qso(qso_id).await.unwrap();
         assert!(
@@ -17932,10 +18620,12 @@ mod pan72_stall_detection_tests {
     //! Replaces the old identical/differing-frame `DX_STUCK_REPEAT_THRESHOLD`
     //! hop (see the deleted `stuck_dx_tests` cases) with a single counter
     //! (`QsoMetadata::stall_cycles`) incremented solely by
-    //! `QsoManager::rearm_manual_calls_at` on each real per-slot re-send —
-    //! i.e. driven by *silence* (the DX not responding this slot), not by
-    //! inspecting incoming frame content. A genuine forward advance resets
-    //! the counter and records the current offset as
+    //! `QsoManager::rearm_manual_calls_at` on each real re-send that feeds a
+    //! not-yet-counted own-parity TX slot — i.e. driven by *silence* (the DX
+    //! not responding on our transmit slots), not by inspecting incoming
+    //! frame content, and once per real TX opportunity rather than once per
+    //! protocol slot (PAN-128). A genuine forward advance resets the counter
+    //! and records the current offset as
     //! `QsoMetadata::last_known_good_offset_hz`. When the counter trips
     //! `TimeoutConfig::qso_stall_switch_after` (Auto TX-freq mode only), the
     //! manager emits `QsoEvent::TxOffsetActionNeeded`: `Switch` if we're
@@ -18058,9 +18748,11 @@ mod pan72_stall_detection_tests {
             "no action expected before the threshold, got {events:?}"
         );
 
-        // Second rearm tick: threshold (2) hit -> Switch.
+        // Second rearm tick, two slots after the first so it feeds a
+        // DISTINCT own-parity TX slot (PAN-128): threshold (2) hit ->
+        // Switch.
         manager
-            .rearm_manual_calls_at(opened_at + Duration::seconds(30))
+            .rearm_manual_calls_at(opened_at + Duration::seconds(45))
             .await;
 
         let mut saw_switch = false;
@@ -18124,7 +18816,7 @@ mod pan72_stall_detection_tests {
             .last_call_at
             .unwrap();
 
-        for slot in 1..=2i64 {
+        for slot in [1i64, 3] {
             manager
                 .rearm_manual_calls_at(opened_at + Duration::seconds(15 * slot))
                 .await;
@@ -18647,8 +19339,9 @@ mod pan72_stall_detection_tests {
             .last_call_at
             .unwrap();
 
-        // Two REAL FT4 slots (7.5 s each).
-        for slot in 1..=2i64 {
+        // Two rearms two FT4 slots (2 × 7.5 s) apart, each feeding a
+        // distinct own-parity FT4 TX slot (PAN-128).
+        for slot in [1i64, 3] {
             manager
                 .rearm_manual_calls_at(opened_at + Duration::milliseconds(7_500 * slot))
                 .await;
@@ -18793,7 +19486,7 @@ mod pan72_stall_detection_tests {
             .last_call_at
             .unwrap();
 
-        for slot in 1..=2i64 {
+        for slot in [1i64, 3] {
             manager
                 .rearm_manual_calls_at(opened_at + Duration::milliseconds(7_500 * slot))
                 .await;
@@ -18856,8 +19549,13 @@ mod pan72_stall_detection_tests {
         );
 
         // A full FT8 slot after the last counted call does count again.
+        // 37.5 s (not one FT8 slot sharp) so the own-parity FT8 slot this
+        // keys can never collide with the slot the FT4 rearm booked: a
+        // mode switch changes the slot grid, and PAN-128's ledger dedups
+        // by slot key, so an exactly-one-slot rearm can land on the same
+        // key across the switch for some wall-clock phases.
         rearm_loop
-            .rearm_manual_calls_at(opened_at + Duration::milliseconds(22_500))
+            .rearm_manual_calls_at(opened_at + Duration::milliseconds(37_500))
             .await;
         assert_eq!(
             manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
@@ -19048,12 +19746,14 @@ mod pan72_stall_detection_tests {
         let entered_at = after_advance.metadata.last_call_at.unwrap();
         let _ = drain(&mut rx);
 
-        // Two silent rearm cycles on the (still known-good) offset -> Switch.
+        // Two silent rearm cycles (two slots apart, so each feeds a
+        // distinct own-parity TX slot — PAN-128) on the (still known-good)
+        // offset -> Switch.
         manager
             .rearm_manual_calls_at(entered_at + Duration::seconds(15))
             .await;
         manager
-            .rearm_manual_calls_at(entered_at + Duration::seconds(30))
+            .rearm_manual_calls_at(entered_at + Duration::seconds(45))
             .await;
         let first_action = drain(&mut rx).into_iter().find_map(|e| match e {
             QsoEvent::TxOffsetActionNeeded { action, .. } => Some(action),
@@ -19078,13 +19778,14 @@ mod pan72_stall_detection_tests {
             .expect("committing the resolved Switch");
         assert_eq!(applied, new_freq);
 
-        // Two more silent rearm cycles on the NEW (non-known-good) offset ->
-        // Revert back to the known-good offset, not another Switch.
+        // Two more silent rearm cycles (again two slots apart) on the NEW
+        // (non-known-good) offset -> Revert back to the known-good offset,
+        // not another Switch.
         manager
-            .rearm_manual_calls_at(entered_at + Duration::seconds(45))
+            .rearm_manual_calls_at(entered_at + Duration::seconds(75))
             .await;
         manager
-            .rearm_manual_calls_at(entered_at + Duration::seconds(60))
+            .rearm_manual_calls_at(entered_at + Duration::seconds(105))
             .await;
         let second_action = drain(&mut rx).into_iter().find_map(|e| match e {
             QsoEvent::TxOffsetActionNeeded { action, .. } => Some(action),
@@ -19124,9 +19825,10 @@ mod pan72_stall_detection_tests {
             .last_call_at
             .unwrap();
 
-        // Three unanswered CQ slots: stall_cycles -> 3 (still below the
-        // default-shaped threshold of 4).
-        for i in 1..=3i64 {
+        // Three unanswered CQ slots (rearms two slots apart, so each feeds
+        // a distinct own-parity TX slot — PAN-128): stall_cycles -> 3
+        // (still below the default-shaped threshold of 4).
+        for i in [1i64, 3, 5] {
             manager
                 .rearm_manual_calls_at(opened_at + Duration::seconds(15 * i))
                 .await;
@@ -19235,15 +19937,16 @@ mod pan72_stall_detection_tests {
         );
 
         // Now the Fox goes silent. Two stalled `SendingReport` rearm cycles
-        // must produce a Switch (we're still on our known-good offset), NOT a
-        // Revert to the abandoned low calling offset.
+        // (two slots apart, feeding distinct own-parity TX slots — PAN-128)
+        // must produce a Switch (we're still on our known-good offset), NOT
+        // a Revert to the abandoned low calling offset.
         let entered_at = after.metadata.last_call_at.unwrap();
         let _ = drain(&mut rx);
         manager
             .rearm_manual_calls_at(entered_at + Duration::seconds(15))
             .await;
         manager
-            .rearm_manual_calls_at(entered_at + Duration::seconds(30))
+            .rearm_manual_calls_at(entered_at + Duration::seconds(45))
             .await;
         let action = drain(&mut rx).into_iter().find_map(|e| match e {
             QsoEvent::TxOffsetActionNeeded { action, .. } => Some(action),
@@ -19522,6 +20225,172 @@ mod pan72_stall_detection_tests {
             .await
             .expect("an operator-forced nudge is never stale");
         assert_eq!(forced, FREQ + 500.0);
+    }
+
+    /// PAN-131 (Codex round 13 on PR #350, P2): the operator pressed `u` while
+    /// the QSO was rearm-eligible, then the DX's R-report moved it to
+    /// `WaitingForConfirmation` before the once-per-slot drain committed the
+    /// nudge. Nothing retransmits from that state, so committing would move
+    /// the offset with no frame ever sent on it. The nudge carries no
+    /// generation, so guard 2 cannot see the advance; guard 2a must refuse it.
+    #[tokio::test]
+    async fn an_operator_nudge_is_superseded_when_the_dx_advances_to_waiting_for_confirmation() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        // The DX skips its plain report and sends R-07 before the drain runs.
+        manager
+            .process_message(
+                MessageType::ReportAck {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                format!("{OUR} {DX} R-07"),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+        let before = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(before.state, QsoState::WaitingForConfirmation { .. }),
+            "precondition: the R-report must advance the QSO to \
+             WaitingForConfirmation, got {:?}",
+            before.state
+        );
+        let mut rx = manager.subscribe();
+        let _ = drain(&mut rx);
+
+        let err = manager
+            .apply_tx_offset_switch(qso_id, FREQ + 400.0, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .expect_err("a nudge the DX's progress superseded must not commit");
+        assert!(
+            matches!(err, QsoManagerError::OffsetActionNudgeSuperseded { qso_id: id } if id == qso_id),
+            "expected OffsetActionNudgeSuperseded, got {err:?}"
+        );
+        assert!(
+            err.is_expected_offset_action_refusal(),
+            "DX progress overtaking a queued nudge is an expected race, not a fault"
+        );
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.frequency, before.metadata.frequency,
+            "the QSO must stay on the offset it is actually transmitting on"
+        );
+        assert_eq!(after.state.frequency(), before.state.frequency());
+        assert_eq!(after.metadata.partner_freq, before.metadata.partner_freq);
+        let events = drain(&mut rx);
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                QsoEvent::TxOffsetApplied { .. } | QsoEvent::MessageToSend { .. }
+            )),
+            "a refused nudge must neither announce a move nor send a frame, got {events:?}"
+        );
+    }
+
+    /// PAN-131: the second path into the same gap. An autonomous self-CQ is
+    /// nudge-selectable while it is `CallingCq` (`auto_calling_cq_ids`), and
+    /// a caller answering moves it to `WaitingForReport` with
+    /// `CallInitiation::Auto` kept. `cq_retransmit` only re-sends `CallingCq`,
+    /// and `rearm_manual_calls_at` only re-sends a Manual `WaitingForReport`,
+    /// so a nudge committed here would send nothing at the new offset.
+    #[tokio::test]
+    async fn an_operator_nudge_is_superseded_when_an_auto_self_cq_is_answered() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager.start_cq(FREQ, None, false, None).await.unwrap();
+        manager
+            .process_message(
+                MessageType::CqResponse {
+                    calling_station: OUR.into(),
+                    responding_station: DX.into(),
+                    grid: Some("FN42".into()),
+                },
+                format!("{OUR} {DX} FN42"),
+                FREQ,
+                Some(-9.0),
+            )
+            .await
+            .unwrap();
+        let before = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(before.state, QsoState::WaitingForReport { .. }),
+            "precondition: the answer must advance the self-CQ to \
+             WaitingForReport, got {:?}",
+            before.state
+        );
+        assert_eq!(
+            before.metadata.initiated_by,
+            CallInitiation::Auto,
+            "precondition: the answered self-CQ stays autonomous"
+        );
+
+        let err = manager
+            .apply_tx_offset_switch(qso_id, FREQ + 400.0, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .expect_err(
+                "nothing retransmits an Auto WaitingForReport, so the nudge must not commit",
+            );
+        assert!(
+            matches!(err, QsoManagerError::OffsetActionNudgeSuperseded { qso_id: id } if id == qso_id),
+            "expected OffsetActionNudgeSuperseded, got {err:?}"
+        );
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(after.metadata.frequency, before.metadata.frequency);
+        assert_eq!(after.state.frequency(), before.state.frequency());
+    }
+
+    /// PAN-131, the control case: an advance that keeps the QSO inside the
+    /// nudge-eligible states must NOT supersede the nudge. `RespondingToCq` →
+    /// `SendingReport` bumps `advance_generation` exactly like the advance
+    /// above, which is why the fix revalidates the state at commit time rather
+    /// than giving the nudge a generation token — a token would refuse this
+    /// nudge too, though the next rearm sends at the new offset.
+    #[tokio::test]
+    async fn an_operator_nudge_survives_an_advance_that_stays_retransmittable() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        send_report(&manager, -7, &format!("{OUR} {DX} -07")).await;
+        let advanced = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(advanced.state, QsoState::SendingReport { .. }),
+            "precondition: the DX's report must advance the QSO to SendingReport, got {:?}",
+            advanced.state
+        );
+
+        let applied = manager
+            .apply_tx_offset_switch(qso_id, FREQ + 400.0, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .expect("a nudge on a still-retransmittable QSO must commit");
+        assert_eq!(applied, FREQ + 400.0);
+
+        let mut rx = manager.subscribe();
+        manager
+            .rearm_manual_calls_at(Utc::now() + Duration::seconds(60))
+            .await;
+        let sent_at: Vec<f64> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|e| match e {
+                QsoEvent::MessageToSend {
+                    qso_id: id,
+                    frequency,
+                    ..
+                } if id == qso_id => Some(frequency),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            sent_at.contains(&(FREQ + 400.0)),
+            "the next rearm must send at the nudged offset, got {sent_at:?}"
+        );
     }
 
     /// PAN-79 / PAN-72 (Codex round 3 on PR #350, finding 2): a resolution that
@@ -19863,13 +20732,15 @@ mod pan72_stall_detection_tests {
             .unwrap();
         let _ = drain(&mut rx);
 
-        // Two silent rearm cycles: nobody has come back to our CQ, so the
-        // stall detector trips and asks for a Switch off this offset.
+        // Two silent rearm cycles (two slots apart, feeding distinct
+        // own-parity TX slots — PAN-128): nobody has come back to our CQ,
+        // so the stall detector trips and asks for a Switch off this
+        // offset.
         manager
             .rearm_manual_calls_at(opened_at + Duration::seconds(15))
             .await;
         manager
-            .rearm_manual_calls_at(opened_at + Duration::seconds(30))
+            .rearm_manual_calls_at(opened_at + Duration::seconds(45))
             .await;
         let action = drain(&mut rx).into_iter().find_map(|e| match e {
             QsoEvent::TxOffsetActionNeeded { action, .. } => Some(action),
@@ -19958,13 +20829,15 @@ mod pan72_stall_detection_tests {
             .unwrap();
         let _ = drain(&mut rx);
 
-        // Two silent rearm cycles. The SECOND one both re-emits our CQ at FREQ
-        // (the frame a caller can answer) and trips the stall threshold.
+        // Two silent rearm cycles, two slots apart so the second feeds a
+        // distinct own-parity TX slot (PAN-128). The SECOND one both
+        // re-emits our CQ at FREQ (the frame a caller can answer) and trips
+        // the stall threshold.
         manager
             .rearm_manual_calls_at(opened_at + Duration::seconds(15))
             .await;
         manager
-            .rearm_manual_calls_at(opened_at + Duration::seconds(30))
+            .rearm_manual_calls_at(opened_at + Duration::seconds(45))
             .await;
         let events = drain(&mut rx);
         assert!(
@@ -20185,7 +21058,10 @@ mod pan72_stall_detection_tests {
     /// vacated offset), but the advance it drives must NOT record the brand-new
     /// offset — which has never been transmitted on — as `last_known_good`.
     /// Doing so poisons the Revert target: a later stall would "revert" to the
-    /// offset it is already on, and the genuinely-proven one is lost.
+    /// offset it is already on, and the genuinely-proven one is lost. Since
+    /// PAN-132 this QSO's latched split routes through the round-6 provenance
+    /// rule instead of the decode-frequency check; this test pins that the
+    /// stall-triggered outcome is unchanged.
     #[tokio::test]
     async fn an_advance_answering_the_pre_switch_frame_credits_the_old_offset() {
         let mut config = test_config();
@@ -20480,6 +21356,158 @@ mod pan72_stall_detection_tests {
         );
     }
 
+    /// PAN-132 (Codex round 15 on PR #350, P2): the test above without a
+    /// pre-existing split. A simplex QSO has `partner_freq: None` until a switch
+    /// moves it; `apply_tx_offset_switch`'s established-QSO latch then sets
+    /// `partner_freq` to exactly the offset it vacated — for an operator nudge
+    /// as much as for a stall switch. The DX keeps transmitting there whatever
+    /// we do, so its reply says nothing about which of our offsets it answered,
+    /// and provenance must decide, exactly as on a pre-existing split. The
+    /// crediting block used to count that latch as Tx=Rx; its decode-frequency
+    /// check then always matched, and the nudge credited the offset the operator
+    /// had just left.
+    #[tokio::test]
+    async fn an_operator_nudge_on_an_established_simplex_qso_credits_the_new_offset() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.partner_freq,
+            None,
+            "precondition: a simplex QSO — no split before the nudge"
+        );
+
+        let new_offset = FREQ + 400.0;
+        assert_eq!(
+            manager
+                .apply_tx_offset_switch(qso_id, new_offset, OffsetRelocationOrigin::OperatorForced)
+                .await
+                .unwrap(),
+            new_offset
+        );
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.partner_freq,
+            Some(FREQ),
+            "precondition: the established-QSO latch created the split"
+        );
+
+        // The DX answers where it has always transmitted — the vacated offset,
+        // now latched as `partner_freq`. Well inside `PRE_SWITCH_OFFSET_GRACE`.
+        send_report(&manager, -7, &format!("{OUR} {DX} -07")).await;
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.frequency, new_offset,
+            "precondition: the advance routed and the QSO is on the nudged offset"
+        );
+        assert_eq!(
+            after.metadata.last_known_good_offset_hz,
+            Some(new_offset),
+            "the operator moved us to {new_offset} Hz — crediting the vacated \
+             {FREQ} Hz would aim a later Revert at the offset the nudge left"
+        );
+        assert_eq!(
+            after.metadata.partner_freq,
+            Some(FREQ),
+            "crediting must leave the latch exactly as the switch set it"
+        );
+        assert_eq!(
+            after.metadata.pre_switch_offset, None,
+            "the first advance after a relocation consumes the grace either way"
+        );
+    }
+
+    /// PAN-132: the same rule when `partner_freq` equals the vacated offset
+    /// for a reason other than this switch's latch — an earlier move put us
+    /// back onto the DX's frequency, and the operator now nudges off it again.
+    /// Who created the split is irrelevant: the DX transmits at `partner_freq`
+    /// regardless, so provenance decides.
+    #[tokio::test]
+    async fn an_operator_nudge_off_a_coincident_partner_offset_credits_the_new_offset() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        // Out (the latch sets `partner_freq = FREQ`), back onto FREQ, out again.
+        let final_offset = FREQ + 250.0;
+        for hz in [FREQ + 400.0, FREQ, final_offset] {
+            manager
+                .apply_tx_offset_switch(qso_id, hz, OffsetRelocationOrigin::OperatorForced)
+                .await
+                .unwrap();
+        }
+        let switched = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(switched.metadata.partner_freq, Some(FREQ));
+        assert_eq!(
+            switched.metadata.pre_switch_offset.map(|pre| pre.offset_hz),
+            Some(FREQ),
+            "precondition: the last switch vacated the DX's own frequency"
+        );
+
+        send_report(&manager, -7, &format!("{OUR} {DX} -07")).await;
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(after.metadata.frequency, final_offset);
+        assert_eq!(
+            after.metadata.last_known_good_offset_hz,
+            Some(final_offset),
+            "an operator nudge credits where it moved us, however the split arose"
+        );
+    }
+
+    /// PAN-132: the harm the ticket names, end to end. After a nudge on a
+    /// simplex QSO and the DX's advancing reply, the next stall must look for a
+    /// new offset — not `Revert` onto the offset the operator deliberately left.
+    #[tokio::test]
+    async fn a_stall_after_an_operator_nudge_on_a_simplex_qso_switches_instead_of_reverting() {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        let manager = manager_auto(config);
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let new_offset = FREQ + 400.0;
+        manager
+            .apply_tx_offset_switch(qso_id, new_offset, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .unwrap();
+        send_report(&manager, -7, &format!("{OUR} {DX} -07")).await;
+        let entered_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        let _ = drain(&mut rx);
+
+        // Two silent rearms, two slots apart, so each feeds a distinct
+        // own-parity TX slot (PAN-128) and the second trips the threshold.
+        manager
+            .rearm_manual_calls_at(entered_at + Duration::seconds(15))
+            .await;
+        manager
+            .rearm_manual_calls_at(entered_at + Duration::seconds(45))
+            .await;
+        let action = drain(&mut rx).into_iter().find_map(|e| match e {
+            QsoEvent::TxOffsetActionNeeded { action, .. } => Some(action),
+            _ => None,
+        });
+        assert_eq!(
+            action,
+            Some(OffsetAction::Switch {
+                avoid_hz: new_offset
+            }),
+            "the nudged offset is the known-good one, so a stall Switches away \
+             from it rather than Reverting onto the {FREQ} Hz the operator left"
+        );
+    }
+
     /// PAN-72 (Codex round 6 on PR #350, finding 1): `SendingReport` is two
     /// rungs, not one. `RespondingToCq + CqResponse` (the DX returned our call
     /// with no report) lands in `SendingReport { their_report: None }`; the
@@ -20616,6 +21644,884 @@ mod pan72_stall_detection_tests {
             after.metadata.stall_cycles, 1,
             "the stall evidence must survive a repeated report"
         );
+    }
+
+    // ── PAN-128: one stall count per own-parity TX slot ──────────────────
+    //
+    // A QSO transmits only on its own parity — every OTHER protocol slot —
+    // so the stall counter counts the own-parity TX slots the rearm
+    // emissions FEED, not the emissions. Rearm times below are anchored to
+    // the QSO's own-parity slot grid (`next_slot_with_parity_with_period`)
+    // so the results never depend on the wall-clock slot phase at test
+    // start.
+
+    /// The first own-parity FT8 slot start strictly after `opened_at + one
+    /// slot` — the anchor the PAN-128 cadence tests rearm relative to.
+    fn next_own_ft8_slot(
+        after: DateTime<Utc>,
+        tx_parity: pancetta_core::slot::SlotParity,
+    ) -> DateTime<Utc> {
+        pancetta_core::slot::next_slot_with_parity_with_period(after, tx_parity, 15_000_000_000)
+    }
+
+    #[test]
+    fn keep_call_tx_slot_uses_the_scheduler_current_slot_acceptance() {
+        use chrono::TimeZone;
+        use pancetta_core::slot::SlotParity;
+
+        // 2026-01-01T00:00:00Z is timestamp 1767225600 = 15 * 117815040 —
+        // an Even slot start under both the FT8 (15 s) and FT4 (7.5 s)
+        // grids, so every expectation below is grid-aligned.
+        let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let s = Duration::seconds;
+
+        // The FT8 acceptance cap at the 3000 ms default is
+        // 3000 - 800 - 500 = 1700 ms; FT4's is 1500 - 400 - 500 = 600 ms;
+        // FT2's saturates to 0 ms.
+        assert_eq!(keep_call_acceptance_cap_ms(15_000, 3000), 1700);
+        assert_eq!(keep_call_acceptance_cap_ms(7_500, 3000), 600);
+        assert_eq!(keep_call_acceptance_cap_ms(3_200, 3000), 0);
+        assert_eq!(keep_call_acceptance_cap_ms(15_000, 1000), 0);
+
+        // FT8, off-parity or past the window: strictly the next own slot.
+        assert_eq!(
+            keep_call_tx_slot(base + s(5), 15_000, 3000, Some(SlotParity::Odd)),
+            base + s(15)
+        );
+        assert_eq!(
+            keep_call_tx_slot(base + s(5), 15_000, 3000, Some(SlotParity::Even)),
+            base + s(30),
+        );
+        assert_eq!(
+            keep_call_tx_slot(base + s(2), 15_000, 3000, Some(SlotParity::Even)),
+            base + s(30),
+            "2 s into our own slot is inside the raw 3 s late window but past \
+             the 1.7 s queue-time acceptance cap — the worker defers, so must we"
+        );
+        // FT8, inside our own slot's acceptance window (1.7 s at the
+        // 3000 ms default): the CURRENT slot, exactly where `schedule_tx`
+        // keys the frame — never the next own slot.
+        assert_eq!(
+            keep_call_tx_slot(base, 15_000, 3000, Some(SlotParity::Even)),
+            base,
+            "mstr 0 is inside the window — the current own slot itself"
+        );
+        assert_eq!(
+            keep_call_tx_slot(
+                base + Duration::milliseconds(1_700),
+                15_000,
+                3000,
+                Some(SlotParity::Even)
+            ),
+            base,
+            "mstr exactly at the cap is still accepted (`<=`, like schedule_tx)"
+        );
+        assert_eq!(
+            keep_call_tx_slot(base + s(1), 15_000, 3000, Some(SlotParity::Even)),
+            base
+        );
+        // Exactly on a boundary of the OTHER parity: current slot not
+        // viable, next own slot.
+        assert_eq!(
+            keep_call_tx_slot(base, 15_000, 3000, Some(SlotParity::Odd)),
+            base + s(15)
+        );
+        // FT4's 7.5 s period: the acceptance cap scales to 600 ms. Odd
+        // slots at +7.5 s/+22.5 s, Even at +15 s.
+        assert_eq!(
+            keep_call_tx_slot(base + s(1), 7_500, 3000, Some(SlotParity::Odd)),
+            base + Duration::milliseconds(7_500)
+        );
+        assert_eq!(
+            keep_call_tx_slot(
+                base + Duration::milliseconds(500),
+                7_500,
+                3000,
+                Some(SlotParity::Even)
+            ),
+            base,
+            "0.5 s into an FT4 own slot is inside the scaled 600 ms cap"
+        );
+        assert_eq!(
+            keep_call_tx_slot(base + s(1), 7_500, 3000, Some(SlotParity::Even)),
+            base + s(15),
+            "1 s into an FT4 own slot is past the scaled cap — defer"
+        );
+        // No latched parity: the next slot of either parity, still strictly
+        // after `now`.
+        assert_eq!(
+            keep_call_tx_slot(base + s(5), 15_000, 3000, None),
+            base + s(15)
+        );
+        assert_eq!(keep_call_tx_slot(base, 15_000, 3000, None), base + s(15));
+    }
+
+    /// Rearms every protocol slot starting INSIDE our own slot: the
+    /// in-window emission feeds the own slot it keys, and the off-parity
+    /// emission after it feeds the NEXT one, so the streak climbs once per
+    /// own TX slot ([1,2,2,...]) while `call_count` rises on every
+    /// emission, and the threshold trips on the emission feeding the N-th
+    /// distinct slot.
+    #[tokio::test]
+    async fn stall_counts_once_per_own_parity_tx_slot_when_rearms_start_in_our_slot() {
+        use pancetta_core::slot::SlotParity;
+
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 4;
+        let manager = manager_auto(config);
+        let mut rx = manager.subscribe();
+        // The DX was heard on Odd, so we latch and hold tx_parity = Even.
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, Some(SlotParity::Odd))
+            .await
+            .unwrap();
+        let opened = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(opened.metadata.tx_parity, Some(SlotParity::Even));
+        let opened_at = opened.metadata.last_call_at.unwrap();
+        let _ = drain(&mut rx);
+
+        let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+        let mut first_action_on_rearm = None;
+        for k in 0..8i64 {
+            manager
+                .rearm_manual_calls_at(x + Duration::seconds(1 + 15 * k))
+                .await;
+            assert_eq!(
+                manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles as i64,
+                [1, 2, 2, 3, 3, 4, 4, 5][k as usize],
+                "rearm {} must count once per own-parity TX slot it feeds",
+                k + 1
+            );
+            assert_eq!(
+                manager.get_qso(qso_id).await.unwrap().metadata.call_count,
+                2 + k as u32,
+                "the keep-call still goes out on every protocol slot"
+            );
+            if first_action_on_rearm.is_none()
+                && drain(&mut rx)
+                    .iter()
+                    .any(|e| matches!(e, QsoEvent::TxOffsetActionNeeded { .. }))
+            {
+                first_action_on_rearm = Some(k + 1);
+            }
+        }
+        assert_eq!(
+            first_action_on_rearm,
+            Some(6),
+            "threshold 4 must trip on the emission feeding the 4th distinct \
+             own-parity TX slot — the 6th rearm, not the 4th"
+        );
+    }
+
+    /// The mirror start: the first rearm lands in the DX's (off-parity)
+    /// slot, and the in-window emission after it feeds the SAME own slot —
+    /// every own slot in the window still counts exactly once.
+    #[tokio::test]
+    async fn stall_counts_once_per_own_parity_tx_slot_when_rearms_start_in_their_slot() {
+        use pancetta_core::slot::SlotParity;
+
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 4;
+        let manager = manager_auto(config);
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, Some(SlotParity::Odd))
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        let _ = drain(&mut rx);
+
+        let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+        // x+16 s lands in the off-parity slot before the own slot x+30 —
+        // and is always past the one-slot rearm gate relative to opened_at.
+        let mut first_action_on_rearm = None;
+        for k in 0..8i64 {
+            manager
+                .rearm_manual_calls_at(x + Duration::seconds(16 + 15 * k))
+                .await;
+            assert_eq!(
+                manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles as i64,
+                [1, 1, 2, 2, 3, 3, 4, 4][k as usize],
+                "rearm {} must count once per own-parity TX slot it feeds",
+                k + 1
+            );
+            if first_action_on_rearm.is_none()
+                && drain(&mut rx)
+                    .iter()
+                    .any(|e| matches!(e, QsoEvent::TxOffsetActionNeeded { .. }))
+            {
+                first_action_on_rearm = Some(k + 1);
+            }
+        }
+        assert_eq!(
+            first_action_on_rearm,
+            Some(7),
+            "threshold 4 must trip on the 7th rearm — the one feeding the \
+             4th distinct own-parity TX slot"
+        );
+    }
+
+    /// PAN-128 PR review follow-up: the ledger slot must use the TX
+    /// scheduler's own current-slot acceptance rule (`schedule_tx` picks
+    /// the current slot when its parity matches and the request is still
+    /// inside the `tx_late_max_ms` window), not an unconditional
+    /// "strictly next own slot". A rearm in the off-parity slot before
+    /// own slot S and a rearm inside S's late-start window target the
+    /// SAME real TX opportunity, so they must share one ledger key and
+    /// count once — otherwise the switch fires one transmission before
+    /// the configured threshold.
+    #[tokio::test]
+    async fn in_window_rearm_shares_its_slot_key_with_the_off_parity_predecessor() {
+        use pancetta_core::slot::SlotParity;
+
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        let manager = manager_auto(config);
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, Some(SlotParity::Odd))
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+        // A, one second into the off-parity slot before the own slot
+        // x+30: deferred by the scheduler, so it feeds x+30.
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(16))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1,
+            "precondition: the off-parity predecessor counts the own slot \
+             it feeds"
+        );
+        // B, one second INTO x+30 — inside the default 3 s
+        // `tx_late_max_ms` window, exactly where `schedule_tx` targets
+        // the CURRENT slot. Same real TX opportunity as A.
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(31))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1,
+            "an in-window rearm targets the same real TX slot as its \
+             off-parity predecessor and must share its ledger key"
+        );
+    }
+
+    /// Codex round 2 on PR #477: the ledger must use the worker's
+    /// QUEUE-TIME acceptance cap (1.7 s for FT8 at the 3000 ms default),
+    /// not the raw 3 s late window. A rearm 2 s into own slot S is deferred
+    /// by the worker to S's successor, which its off-parity successor also
+    /// feeds — so the pair is one real TX opportunity and must count once,
+    /// even as the first emission after the QSO opened.
+    #[tokio::test]
+    async fn rearm_past_the_acceptance_cap_shares_its_deferred_slot_with_the_next_rearm() {
+        use pancetta_core::slot::SlotParity;
+
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        let manager = manager_auto(config);
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, Some(SlotParity::Odd))
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+        // A, 2 s into own slot x: inside the raw 3 s window but past the
+        // 1.7 s acceptance cap, so the worker defers it to x+30.
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(2))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1,
+            "precondition: the first silent rearm counts the slot it feeds"
+        );
+        // B, in the off-parity slot before x+30: the same deferred slot.
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(17))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1,
+            "a deferred own-slot rearm and its off-parity successor feed one \
+             real TX slot and must share its ledger key"
+        );
+    }
+
+    /// FT4's 7.5 s slot: own-parity TX slots come every 15 s, so two
+    /// protocol-slot-apart rearms can share one, and the counter must
+    /// still climb once per own FT4 slot.
+    #[tokio::test]
+    async fn ft4_stall_counts_once_per_own_parity_ft4_slot() {
+        use pancetta_core::slot::{next_slot_with_parity_with_period, SlotParity};
+
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        config.active_mode = "FT4".to_string();
+        let mut manager = manager_auto(config);
+        manager
+            .set_active_slot_ns_source(Arc::new(std::sync::atomic::AtomicI64::new(7_500_000_000)));
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, Some(SlotParity::Odd))
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        let _ = drain(&mut rx);
+
+        let x = next_slot_with_parity_with_period(
+            opened_at + Duration::milliseconds(7_500),
+            SlotParity::Even,
+            7_500_000_000,
+        );
+        // 1 s into an own FT4 slot is past FT4's 600 ms acceptance cap, so
+        // the own-slot rearm and the off-parity one after it both feed the
+        // NEXT own slot.
+        let mut switched = false;
+        for k in 0..3i64 {
+            manager
+                .rearm_manual_calls_at(x + Duration::milliseconds(1_000 + 7_500 * k))
+                .await;
+            assert_eq!(
+                manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles as i64,
+                [1, 1, 2][k as usize],
+                "FT4 rearm {} must count once per own-parity FT4 TX slot",
+                k + 1
+            );
+            switched |= drain(&mut rx)
+                .iter()
+                .any(|e| matches!(e, QsoEvent::TxOffsetActionNeeded { .. }));
+        }
+        assert!(
+            switched,
+            "threshold 2 must trip on the rearm feeding the 2nd distinct \
+             own-parity FT4 slot"
+        );
+    }
+
+    /// Two rearms feeding ONE own-parity TX slot: rolling back the
+    /// uncounted twin (the newest, which newest-first matching picks) must
+    /// leave the slot's count with the counted attempt; only rolling back
+    /// the counted one takes the slot's count away.
+    #[tokio::test]
+    async fn rolling_back_the_uncounted_twin_keeps_the_stall_count() {
+        use pancetta_core::slot::SlotParity;
+
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, Some(SlotParity::Odd))
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+        // Both emissions feed the own-parity slot at x+30: A from the
+        // off-parity slot before it, B from inside its late-start window.
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(16))
+            .await;
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(31))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1,
+            "two rearms feeding one own-parity TX slot count once"
+        );
+        let text = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .messages
+            .last()
+            .unwrap()
+            .raw_text
+            .clone();
+
+        // Newest-first matching removes the uncounted twin.
+        assert!(matches!(
+            manager
+                .roll_back_unsent_attempt_at(qso_id, &text, x + Duration::seconds(35))
+                .await,
+            UnsentAttemptRollback::RolledBack { .. }
+        ));
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1,
+            "the slot keeps its count while its counted attempt survives"
+        );
+
+        // Now the counted attempt itself: no same-slot sibling survives.
+        assert!(matches!(
+            manager
+                .roll_back_unsent_attempt_at(qso_id, &text, x + Duration::seconds(36))
+                .await,
+            UnsentAttemptRollback::RolledBack { .. }
+        ));
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            0,
+            "with no surviving attempt for the slot, the count goes too"
+        );
+    }
+
+    /// PAN-128 D2 (the heir rule): a payload-scoped rollback that removes
+    /// the COUNTED attempt while an uncounted same-slot twin survives hands
+    /// the slot's count to that twin instead of decrementing.
+    #[tokio::test]
+    async fn rolling_back_the_counted_attempt_hands_its_count_to_a_surviving_twin() {
+        use pancetta_core::slot::SlotParity;
+
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, Some(SlotParity::Odd))
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+        // Emission A (at FREQ, from the off-parity slot before x+30) is
+        // counted; then a TX pivot changes only the offset (no commit, so
+        // no streak reset); emission B (at FREQ+100, inside x+30's
+        // late-start window) feeds the SAME own-parity slot and stays
+        // uncounted.
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(16))
+            .await;
+        manager
+            .qsos
+            .write()
+            .await
+            .get_mut(&qso_id)
+            .unwrap()
+            .metadata
+            .frequency = FREQ + 100.0;
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(31))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1
+        );
+        let text = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .messages
+            .last()
+            .unwrap()
+            .raw_text
+            .clone();
+
+        // The replaced frame is the one carrying FREQ — attempt A, the
+        // counted one. Its count moves to twin B, not to zero.
+        let replaced = UnsentAttemptPayload {
+            frequency_hz: FREQ,
+            remote_binding: Some((false, None)),
+        };
+        assert!(matches!(
+            manager
+                .roll_back_replaced_attempt_at(
+                    qso_id,
+                    &text,
+                    Some(&replaced),
+                    x + Duration::seconds(35)
+                )
+                .await,
+            UnsentAttemptRollback::RolledBack { .. }
+        ));
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1,
+            "a surviving same-slot twin inherits the slot's stall count"
+        );
+
+        // Rolling back the twin too (it carried FREQ+100) finally drops it.
+        let aired = UnsentAttemptPayload {
+            frequency_hz: FREQ + 100.0,
+            remote_binding: Some((false, None)),
+        };
+        assert!(matches!(
+            manager
+                .roll_back_replaced_attempt_at(
+                    qso_id,
+                    &text,
+                    Some(&aired),
+                    x + Duration::seconds(36)
+                )
+                .await,
+            UnsentAttemptRollback::RolledBack { .. }
+        ));
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            0
+        );
+    }
+
+    /// A slot whose only attempt was rolled back counts again when a later
+    /// rearm feeds it — the count belongs to the slot, held by whatever
+    /// surviving attempt feeds it.
+    #[tokio::test]
+    async fn a_rolled_back_slot_counts_again_when_a_later_rearm_feeds_it() {
+        use pancetta_core::slot::SlotParity;
+
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, Some(SlotParity::Odd))
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(16))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1
+        );
+        let text = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .messages
+            .last()
+            .unwrap()
+            .raw_text
+            .clone();
+        assert!(matches!(
+            manager
+                .roll_back_unsent_attempt_at(qso_id, &text, x + Duration::seconds(20))
+                .await,
+            UnsentAttemptRollback::RolledBack { .. }
+        ));
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            0
+        );
+
+        // One protocol slot later, inside the late-start window of the
+        // same own-parity slot at x+30 the rolled-back attempt fed.
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(31))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1,
+            "a slot whose attempt was fully rolled back counts again when a \
+             later rearm feeds it"
+        );
+    }
+
+    /// PAN-128: a stall reset must clear each attempt's slot key along
+    /// with its increment, so the heir rule can never hand a post-reset
+    /// count to a pre-reset attempt. The first post-reset rearm, rolled
+    /// back unsent, must DECREMENT — not park its count on a cleared
+    /// attempt that happens to feed the same own-parity TX slot.
+    #[tokio::test]
+    async fn heir_does_not_cross_a_committed_switch_reset() {
+        use pancetta_core::slot::SlotParity;
+
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        let manager = manager_auto(config);
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, Some(SlotParity::Odd))
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+        // Feeds the own-parity slot at x (inside its late-start window) …
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(1))
+            .await;
+        // … and P, in the off-parity slot before x+60, feeds x+60 and
+        // trips threshold 2.
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(46))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            2
+        );
+        // The commit resets the streak AND must retire P's slot key.
+        manager
+            .apply_tx_offset_switch(qso_id, FREQ + 300.0, stall_origin(&manager, qso_id).await)
+            .await
+            .expect("commit");
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            0
+        );
+        // R, inside x+60's late-start window, feeds the same slot P fed
+        // and is the only COUNTED attempt since the reset.
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(61))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1
+        );
+        let text = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .messages
+            .last()
+            .unwrap()
+            .raw_text
+            .clone();
+        assert!(matches!(
+            manager
+                .roll_back_unsent_attempt_at(qso_id, &text, x + Duration::seconds(62))
+                .await,
+            UnsentAttemptRollback::RolledBack { .. }
+        ));
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            0,
+            "a pre-reset attempt must not inherit a post-reset count"
+        );
+    }
+
+    // PAN-129: a DX stuck repeating its report.
+    //
+    // While a manual QSO sits in `SendingReport` and the DX keeps repeating
+    // its report, the R re-send — and with it the stall count — comes from
+    // the rearm, which `timeout_check_loop` runs every 5 s at a phase that
+    // has nothing to do with the slot grid. A repeat queues no reply, so it
+    // must leave that rearm running exactly as it does while the DX is
+    // silent. The helper below drives the real manager through both
+    // schedules — the DX's decodes and the rearm ticks — merged in time
+    // order on a synthetic timeline anchored to the slot grid, so the result
+    // never depends on the wall-clock phase at test start.
+
+    /// The DX repeats (or silent DX-parity slots) each schedule covers.
+    const PAN129_REPEATS: i64 = 12;
+    /// `timeout_check_loop`'s rearm interval.
+    const PAN129_TICK_MS: i64 = 5_000;
+
+    /// What one keep-call schedule produced.
+    struct KeepCallSchedule {
+        stall_cycles: u32,
+        /// `MessageToSend` emissions for the QSO.
+        emissions: usize,
+        /// The own-parity TX slots those emissions feed.
+        fed_tx_slots: std::collections::BTreeSet<DateTime<Utc>>,
+        /// DX repeats decoded before the first `TxOffsetActionNeeded`.
+        repeats_before_first_action: Option<usize>,
+    }
+
+    /// Run a manual `SendingReport { their_report: Some }` QSO in Auto TX-freq
+    /// mode through [`PAN129_REPEATS`] DX slot pairs. With `dx_repeats`, the
+    /// DX repeats its identical report in each of its own slots, decoded
+    /// `decode_offset_ms` after that slot ends; otherwise it stays silent.
+    /// The rearm ticks every [`PAN129_TICK_MS`], starting `tick_phase_ms`
+    /// into the first DX slot. A decode due at the same instant as a tick is
+    /// processed first.
+    async fn run_keep_call_schedule(
+        slot_ns: i64,
+        decode_offset_ms: i64,
+        tick_phase_ms: i64,
+        dx_repeats: bool,
+    ) -> KeepCallSchedule {
+        use pancetta_core::slot::{next_slot_with_parity_with_period, SlotParity};
+
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 4;
+        config.timeouts.manual_call_max_calls = 1_000;
+        let mut manager = manager_auto(config);
+        manager.set_active_slot_ns_source(Arc::new(std::sync::atomic::AtomicI64::new(slot_ns)));
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        send_report(&manager, -7, "K5ARH K9ZZ -07").await;
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(
+                progress.state,
+                QsoState::SendingReport {
+                    their_report: Some(_),
+                    ..
+                }
+            ),
+            "precondition: SendingReport with the DX's report, got {:?}",
+            progress.state
+        );
+        let tx_parity = progress.metadata.tx_parity.expect("tx_parity latched");
+        let dx_parity = tx_parity.opposite();
+
+        let slot_ms = slot_ns / 1_000_000;
+        let anchor = next_slot_with_parity_with_period(
+            Utc::now() + Duration::seconds(120),
+            dx_parity,
+            slot_ns,
+        );
+        // Repeat k goes out in the DX slot starting 2k slots after the
+        // anchor and decodes `decode_offset_ms` after that slot ends.
+        let decodes: Vec<DateTime<Utc>> = (0..PAN129_REPEATS)
+            .map(|k| anchor + Duration::milliseconds((2 * k + 1) * slot_ms + decode_offset_ms))
+            .collect();
+        let end = anchor + Duration::milliseconds(2 * PAN129_REPEATS * slot_ms);
+
+        let mut rx = manager.subscribe();
+        let mut outcome = KeepCallSchedule {
+            stall_cycles: 0,
+            emissions: 0,
+            fed_tx_slots: std::collections::BTreeSet::new(),
+            repeats_before_first_action: None,
+        };
+        let mut decoded = 0usize;
+        let mut next_tick = anchor + Duration::milliseconds(tick_phase_ms);
+        loop {
+            let next_decode = decodes.get(decoded).copied().filter(|_| dx_repeats);
+            let tick_due = next_tick < end;
+            let at = match next_decode {
+                Some(decode_at) if !tick_due || decode_at <= next_tick => {
+                    let before = manager.get_qso(qso_id).await.unwrap().metadata.last_call_at;
+                    send_report(&manager, -7, "K5ARH K9ZZ -07").await;
+                    // `process_message` stamps the wall clock. Move any stamp
+                    // it made onto the synthetic timeline (the decode
+                    // instant), where it holds the rearm back exactly as it
+                    // would on the air.
+                    if let Some(progress) = manager.qsos.write().await.get_mut(&qso_id) {
+                        if progress.metadata.last_call_at != before {
+                            progress.metadata.last_call_at = Some(decode_at);
+                        }
+                    }
+                    decoded += 1;
+                    decode_at
+                }
+                _ if tick_due => {
+                    let tick_at = next_tick;
+                    manager.rearm_manual_calls_at(tick_at).await;
+                    next_tick += Duration::milliseconds(PAN129_TICK_MS);
+                    tick_at
+                }
+                _ => break,
+            };
+            for event in drain(&mut rx) {
+                match event {
+                    QsoEvent::MessageToSend { qso_id: id, .. } if id == qso_id => {
+                        outcome.emissions += 1;
+                        outcome
+                            .fed_tx_slots
+                            .insert(next_slot_with_parity_with_period(at, tx_parity, slot_ns));
+                    }
+                    QsoEvent::TxOffsetActionNeeded { qso_id: id, .. } if id == qso_id => {
+                        outcome.repeats_before_first_action.get_or_insert(decoded);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        outcome.stall_cycles = manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles;
+        outcome
+    }
+
+    /// PAN-129: a DX repeating its report must leave keep-calling exactly as
+    /// a silent DX does — same stall count, same own-parity TX slots fed,
+    /// same number of re-sends — and the stall switch must fire by the 4th
+    /// repeat (threshold 4). Swept over FT8/FT4/FT2, an early and a late
+    /// decode, and every 250 ms rearm phase. Before the fix each repeat
+    /// restamped `last_call_at` at its decode instant, holding the rearm back
+    /// a full slot: FT8/FT4 lost half their re-sends, and FT2 skipped TX
+    /// slots and switched as late as the 11th repeat.
+    #[tokio::test]
+    async fn repeating_dx_trips_the_stall_switch_on_the_silence_cadence() {
+        for (mode, slot_ns) in [
+            ("FT8", 15_000_000_000i64),
+            ("FT4", 7_500_000_000),
+            ("FT2", 3_200_000_000),
+        ] {
+            for decode_offset_ms in [-1_000i64, 500] {
+                for tick_phase_ms in (0..PAN129_TICK_MS).step_by(250) {
+                    let case = format!(
+                        "{mode}, decode {decode_offset_ms:+} ms from slot end, \
+                         rearm phase {tick_phase_ms} ms"
+                    );
+                    let silent =
+                        run_keep_call_schedule(slot_ns, decode_offset_ms, tick_phase_ms, false)
+                            .await;
+                    let repeating =
+                        run_keep_call_schedule(slot_ns, decode_offset_ms, tick_phase_ms, true)
+                            .await;
+                    assert_eq!(
+                        repeating.stall_cycles, silent.stall_cycles,
+                        "{case}: a repeating DX must count stalls like a silent one"
+                    );
+                    assert_eq!(
+                        repeating.fed_tx_slots, silent.fed_tx_slots,
+                        "{case}: a repeating DX must feed the same own TX slots as a silent one"
+                    );
+                    assert_eq!(
+                        repeating.emissions, silent.emissions,
+                        "{case}: a repeating DX must keep the silence re-send cadence"
+                    );
+                    let first_action = repeating
+                        .repeats_before_first_action
+                        .unwrap_or_else(|| panic!("{case}: the stall switch never fired"));
+                    assert!(
+                        first_action <= 4,
+                        "{case}: the stall switch must fire by the 4th repeat, \
+                         fired after {first_action}"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -21637,9 +23543,10 @@ mod current_remote_binding_tests {
 
         // A concurrent takeover rebinds it to a new remote controller —
         // simulating exactly the race the round-17 finding described.
-        manager
-            .rebind_remote_identity(qso_id, true, Some("newclient".to_string()))
-            .await;
+        if let Some(progress) = manager.qsos.write().await.get_mut(&qso_id) {
+            progress.metadata.remote_origin = true;
+            progress.metadata.remote_client_key_id = Some("newclient".to_string());
+        }
 
         // Reading with the OLD (pre-rebind) snapshot must still return the
         // LIVE binding, not the stale value passed in.
@@ -21661,5 +23568,373 @@ mod current_remote_binding_tests {
                 .await,
             snapshot
         );
+    }
+}
+
+#[cfg(test)]
+mod pan138_recheck_tests {
+    //! PAN-138: re-keying an EXISTING QSO for a (possibly remote) caller
+    //! re-checks TX permission under the same `qsos` write guard that rebinds
+    //! the QSO and charges the resend (or advances it). The permission source
+    //! doubles as a probe: when primed, its next evaluation tries to take the
+    //! `qsos` write lock itself, standing in for concurrent QSO processing
+    //! that grabs the lock right after the check. If it gets the lock, the
+    //! check ran outside the critical section and a disarm could land between
+    //! the check and the charge.
+    use super::*;
+    use pancetta_core::slot::SlotParity;
+    use pancetta_core::ResponseStep;
+    use std::future::Future;
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+
+    const DX: &str = "K9ZZ";
+    const FREQ: f64 = 1500.0;
+
+    type ParkedGuard = tokio::sync::OwnedRwLockWriteGuard<HashMap<QsoId, QsoProgress>>;
+
+    #[derive(Default)]
+    struct Probe {
+        permitted: AtomicBool,
+        primed: AtomicBool,
+        interposed: AtomicBool,
+        checked_under_lock: AtomicBool,
+        parked: std::sync::Mutex<Option<ParkedGuard>>,
+    }
+
+    fn manager_with_probe() -> (Arc<QsoManager>, Arc<Probe>) {
+        let mut manager = QsoManager::new(QsoManagerConfig {
+            our_callsign: "K5ARH".into(),
+            our_grid: Some("EM12".into()),
+            ..QsoManagerConfig::default()
+        });
+        let probe = Arc::new(Probe::default());
+        probe.permitted.store(true, SeqCst);
+        let qsos = Arc::clone(&manager.qsos);
+        let p = Arc::clone(&probe);
+        manager.set_remote_tx_permitted_source(Arc::new(move |_| {
+            let permitted = p.permitted.load(SeqCst);
+            if p.primed.swap(false, SeqCst) {
+                match Arc::clone(&qsos).try_write_owned() {
+                    Ok(guard) => {
+                        *p.parked.lock().unwrap() = Some(guard);
+                        p.interposed.store(true, SeqCst);
+                    }
+                    Err(_) => p.checked_under_lock.store(true, SeqCst),
+                }
+            }
+            permitted
+        }));
+        (Arc::new(manager), probe)
+    }
+
+    /// Run `action` with the probe primed. The client disarms as soon as the
+    /// probe has interposed (or once `action` is done), then the parked guard
+    /// is released so `action` can finish.
+    async fn race<T: Send + 'static>(
+        probe: &Probe,
+        action: impl Future<Output = T> + Send + 'static,
+    ) -> T {
+        probe.primed.store(true, SeqCst);
+        let task = tokio::spawn(action);
+        while !probe.interposed.load(SeqCst) && !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        probe.permitted.store(false, SeqCst);
+        drop(probe.parked.lock().unwrap().take());
+        task.await.unwrap()
+    }
+
+    fn assert_check_shares_the_guard(probe: &Probe) {
+        assert!(
+            !probe.interposed.load(SeqCst),
+            "another task took the qsos write lock between the permission \
+             check and the charge, so a disarm there would still be charged"
+        );
+        assert!(
+            probe.checked_under_lock.load(SeqCst),
+            "the permission check must run under the qsos write guard"
+        );
+    }
+
+    async fn open(manager: &QsoManager, step: ResponseStep, client: &str) -> QsoId {
+        manager
+            .respond_to_caller(
+                DX.into(),
+                FREQ,
+                Some(SlotParity::Even),
+                step,
+                None,
+                None,
+                None,
+                true,
+                Some(client.into()),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn reply(
+        manager: &Arc<QsoManager>,
+        step: ResponseStep,
+        client: &str,
+    ) -> impl Future<Output = Result<QsoId, QsoManagerError>> + Send + 'static {
+        let manager = Arc::clone(manager);
+        let client = client.to_string();
+        async move {
+            manager
+                .respond_to_caller(
+                    DX.into(),
+                    FREQ,
+                    Some(SlotParity::Even),
+                    step,
+                    None,
+                    None,
+                    None,
+                    true,
+                    Some(client),
+                )
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn keep_call_recheck_shares_the_charge_guard() {
+        let (manager, probe) = manager_with_probe();
+        let id = manager
+            .respond_to_cq_with(
+                DX.into(),
+                FREQ,
+                Some(SlotParity::Even),
+                CallInitiation::Manual,
+                None,
+                true,
+                Some("client-a".into()),
+            )
+            .await
+            .unwrap();
+        let m = Arc::clone(&manager);
+        let again = race(&probe, async move {
+            m.respond_to_cq_with(
+                DX.into(),
+                FREQ,
+                Some(SlotParity::Even),
+                CallInitiation::Manual,
+                None,
+                true,
+                Some("client-b".into()),
+            )
+            .await
+        })
+        .await
+        .unwrap();
+        assert_eq!(again, id);
+        assert_check_shares_the_guard(&probe);
+        let after = manager.get_qso(id).await.unwrap();
+        assert_eq!(after.metadata.call_count, 2);
+        assert_eq!(
+            after.metadata.remote_client_key_id.as_deref(),
+            Some("client-b")
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotent_reply_recheck_shares_the_charge_guard() {
+        let (manager, probe) = manager_with_probe();
+        let id = open(&manager, ResponseStep::Report, "client-a").await;
+        let again = race(&probe, reply(&manager, ResponseStep::Report, "client-b"))
+            .await
+            .unwrap();
+        assert_eq!(again, id);
+        assert_check_shares_the_guard(&probe);
+        assert_eq!(manager.get_qso(id).await.unwrap().metadata.call_count, 2);
+    }
+
+    #[tokio::test]
+    async fn completed_qso_rekey_recheck_shares_the_charge_guard() {
+        let (manager, probe) = manager_with_probe();
+        let id = open(&manager, ResponseStep::SeventyThree, "client-a").await;
+        let again = race(
+            &probe,
+            reply(&manager, ResponseStep::SeventyThree, "client-a"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(again, id);
+        assert_check_shares_the_guard(&probe);
+        assert_eq!(manager.get_qso(id).await.unwrap().metadata.call_count, 2);
+    }
+
+    #[tokio::test]
+    async fn advance_recheck_shares_the_mutation_guard() {
+        let (manager, probe) = manager_with_probe();
+        let id = open(&manager, ResponseStep::Report, "client-a").await;
+        let again = race(
+            &probe,
+            reply(&manager, ResponseStep::SeventyThree, "client-b"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(again, id);
+        assert_check_shares_the_guard(&probe);
+        assert!(matches!(
+            manager.get_qso(id).await.unwrap().state,
+            QsoState::Completed { .. }
+        ));
+    }
+}
+
+#[cfg(test)]
+mod pan138_outcome_tests {
+    //! PAN-138: `respond_to_caller_with_outcome` reports whether a frame was
+    //! emitted, so a caller that charged its own budget first (auto-73) can
+    //! roll that charge back.
+    use super::*;
+    use pancetta_core::slot::SlotParity;
+    use pancetta_core::ResponseStep;
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+
+    const DX: &str = "K9ZZ";
+    const FREQ: f64 = 1500.0;
+
+    fn manager(permitted: Arc<AtomicBool>) -> QsoManager {
+        let mut manager = QsoManager::new(QsoManagerConfig {
+            our_callsign: "K5ARH".into(),
+            our_grid: Some("EM12".into()),
+            ..QsoManagerConfig::default()
+        });
+        manager.set_remote_tx_permitted_source(Arc::new(move |_| permitted.load(SeqCst)));
+        manager
+    }
+
+    async fn reply(
+        manager: &QsoManager,
+        step: ResponseStep,
+        remote: Option<&str>,
+    ) -> (QsoId, ManualCallOutcome) {
+        manager
+            .respond_to_caller_with_outcome(
+                DX.into(),
+                FREQ,
+                Some(SlotParity::Even),
+                step,
+                None,
+                None,
+                None,
+                remote.is_some(),
+                remote.map(str::to_string),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn sends(rx: &mut broadcast::Receiver<QsoEvent>) -> usize {
+        let mut n = 0;
+        while let Ok(ev) = rx.try_recv() {
+            n += usize::from(matches!(ev, QsoEvent::MessageToSend { .. }));
+        }
+        n
+    }
+
+    #[tokio::test]
+    async fn outcome_names_what_each_branch_did() {
+        let permitted = Arc::new(AtomicBool::new(true));
+        let manager = manager(Arc::clone(&permitted));
+        let (id, opened) = reply(&manager, ResponseStep::Report, Some("client-a")).await;
+        assert_eq!(opened, ManualCallOutcome::Opened);
+        assert_eq!(
+            reply(&manager, ResponseStep::Report, Some("client-a")).await,
+            (id, ManualCallOutcome::Resent)
+        );
+        assert_eq!(
+            reply(&manager, ResponseStep::SeventyThree, Some("client-a")).await,
+            (id, ManualCallOutcome::Advanced)
+        );
+        assert_eq!(
+            reply(&manager, ResponseStep::SeventyThree, Some("client-a")).await,
+            (id, ManualCallOutcome::Resent),
+            "FIX B re-keys the completed QSO"
+        );
+        assert!(ManualCallOutcome::Resent.emitted_frame());
+        assert!(!ManualCallOutcome::NotPermitted.emitted_frame());
+        assert!(!ManualCallOutcome::NothingToResend.emitted_frame());
+    }
+
+    #[tokio::test]
+    async fn a_denied_rekey_reports_not_permitted_and_changes_nothing() {
+        for step in [ResponseStep::Report, ResponseStep::SeventyThree] {
+            let permitted = Arc::new(AtomicBool::new(true));
+            let manager = manager(Arc::clone(&permitted));
+            // Report: idempotent re-send of an active QSO; SeventyThree: FIX B
+            // re-key of the QSO this open just completed.
+            let (id, _) = reply(&manager, step, Some("client-a")).await;
+            let before = manager.get_qso(id).await.unwrap();
+            let mut rx = manager.subscribe();
+            permitted.store(false, SeqCst);
+            assert_eq!(
+                reply(&manager, step, Some("client-b")).await,
+                (id, ManualCallOutcome::NotPermitted)
+            );
+            let after = manager.get_qso(id).await.unwrap();
+            assert_eq!(after.metadata.call_count, before.metadata.call_count);
+            assert_eq!(after.metadata.last_call_at, before.metadata.last_call_at);
+            assert_eq!(
+                after.metadata.remote_client_key_id.as_deref(),
+                Some("client-a")
+            );
+            assert_eq!(sends(&mut rx), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_disarm_while_waiting_for_the_qsos_lock_is_honoured() {
+        let permitted = Arc::new(AtomicBool::new(true));
+        let manager = Arc::new(manager(Arc::clone(&permitted)));
+        let (id, _) = reply(&manager, ResponseStep::Report, Some("client-a")).await;
+        let mut rx = manager.subscribe();
+        // Concurrent QSO processing holds the lock; the client disarms
+        // before it lets go.
+        let busy = Arc::clone(&manager.qsos).write_owned().await;
+        let m = Arc::clone(&manager);
+        let task =
+            tokio::spawn(
+                async move { reply(&m, ResponseStep::SeventyThree, Some("client-a")).await },
+            );
+        tokio::task::yield_now().await;
+        permitted.store(false, SeqCst);
+        drop(busy);
+        assert_eq!(task.await.unwrap(), (id, ManualCallOutcome::NotPermitted));
+        let after = manager.get_qso(id).await.unwrap();
+        assert!(matches!(after.state, QsoState::SendingReport { .. }));
+        assert_eq!(sends(&mut rx), 0);
+    }
+
+    #[tokio::test]
+    async fn a_local_rekey_ignores_the_remote_predicate() {
+        let permitted = Arc::new(AtomicBool::new(false));
+        let manager = manager(permitted);
+        let (id, _) = reply(&manager, ResponseStep::Report, None).await;
+        assert_eq!(
+            reply(&manager, ResponseStep::Report, None).await,
+            (id, ManualCallOutcome::Resent)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_qso_with_nothing_sent_reports_nothing_to_resend() {
+        let manager = manager(Arc::new(AtomicBool::new(true)));
+        let (id, _) = reply(&manager, ResponseStep::Report, Some("client-a")).await;
+        manager
+            .qsos
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .messages
+            .clear();
+        assert_eq!(
+            reply(&manager, ResponseStep::Report, Some("client-a")).await,
+            (id, ManualCallOutcome::NothingToResend)
+        );
+        assert_eq!(manager.get_qso(id).await.unwrap().metadata.call_count, 1);
     }
 }

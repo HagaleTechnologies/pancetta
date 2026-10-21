@@ -8,6 +8,43 @@
 
 # Known gaps and TODOs
 
+- **Auto-73 after the 45-second rework grace can reset the resend cap.**
+  Without a QSO inside `COMPLETED_QSO_REWORK_GRACE`, an auto-73 opens a new
+  completed QSO and emits `QsoCompleted`. The completion handler then
+  replaces the callsign's cache entry with `resends: 0`, although
+  `AUTO_73_WINDOW` lasts three minutes. The engine event was reproduced
+  during planning; the resulting reset and any duplicate ADIF write still
+  need an end-to-end test. (Surfaced by PAN-138, 2026-10-20.)
+
+- **Completed-QSO resends denied at key time are not compensated.** A
+  disarm after the engine's in-lock check makes the TX worker report
+  `TxFrameNotSent`, but `roll_back_unsent_attempt` returns `QsoNotActive`
+  for a completed QSO and the auto-73 counter stays charged. Compensation
+  needs a per-entry pending-attempt marker to distinguish an auto-73 from
+  an operator's same-text FIX B re-key. (Surfaced by PAN-138, 2026-10-20.)
+
+- **A completion stays logged when the TX worker drops its closing 73.**
+  The engine records `Completed` and emits `QsoCompleted` (ADIF write,
+  uploads) when it queues the 73, not when the 73 keys. A remote client that
+  disarms, loses control or whose arm expires after the in-lock permission
+  check of a ladder advance to 73 still gets the contact logged while the
+  TX worker drops the frame. The auto-sequenced completion in
+  `process_message_for_qso` that answers the DX's RR73 with a 73 is recorded
+  the same way, and that path does not consult the permission predicate.
+  Holding the arm mutex across the engine mutation would not close this:
+  expiry is clock-based and the frame keys seconds later, in its own slot.
+  Closing it needs a completion confirmed at key time, or compensation on
+  `TxFrameNotSent` for a completed QSO. A non-completing ladder advance whose
+  frame is dropped also keeps its advanced state, because advances record no
+  PAN-75 attempt. (Surfaced by PAN-138 review on PR #483, 2026-10-20.)
+
+- **Brand-new close-step opens still have an authorization await gap.**
+  `respond_to_caller_with_outcome` checks remote permission before
+  `supersede_active_qsos_for(...).await` and the subsequent insert. A disarm
+  between those operations can still create a completed QSO and emit
+  `QsoCompleted` for a frame the TX worker rejects. Closing this window
+  requires supersede and insert under one guard. (Surfaced by PAN-138, 2026-10-20.)
+
 - **Supervisor coverage:** the restartable set includes Dsp/Ft8Decoder (PAN-4, using retained
   `DecodePipelineHandles`), Hamlib/StationAgent (PAN-5, with pre-restart teardown) and
   Ft8Transmitter (PAN-119, cheap restart relying on `PttGuard`'s `Drop` for PTT release). Audio

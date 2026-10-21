@@ -792,7 +792,7 @@ impl super::ApplicationCoordinator {
             let audit = self.audit_log();
             for effect in &effects {
                 if let pancetta_agent::arm::ArmEffect::Audit(ev) = effect {
-                    audit.append(ev);
+                    audit.record(ev);
                 }
             }
             if enabled {
@@ -933,7 +933,7 @@ impl super::ApplicationCoordinator {
         let audit = self.audit_log();
         for effect in &effects {
             if let pancetta_agent::arm::ArmEffect::Audit(ev) = effect {
-                audit.append(ev);
+                audit.record(ev);
             }
         }
         self.remote_tx_arm.clear_poison();
@@ -1880,6 +1880,49 @@ mod tests {
             coordinator.config.read().await.station.callsign,
             running_call
         );
+    }
+
+    /// PAN-104: consent removal and `enabled = false` still disarm when the
+    /// audit sink fails, and the failure is surfaced.
+    #[tokio::test]
+    async fn revocation_reloads_disarm_despite_a_failing_audit_sink() {
+        let mut running = base();
+        running.network.station_agent.enabled = true;
+        let mut coordinator = test_coordinator(running).await;
+        coordinator.audit_log = pancetta_agent::audit::AuditLog::new(
+            temp_path("missing-audit-dir")
+                .join("nope")
+                .join("audit.log"),
+        );
+        coordinator
+            .remote_tx_arm
+            .lock()
+            .unwrap()
+            .set_channel_consent(ConsentChannel::StationAgent, true, 0);
+        arm_client(&coordinator, "A");
+        assert!(permitted(&coordinator, "A"), "setup: armed");
+
+        let mut off = coordinator.config.read().await.clone();
+        off.network.station_agent.remote_tx_enabled = false;
+        coordinator
+            .handle_config_reload(Ok((off.clone(), Vec::new())))
+            .await;
+        assert!(!permitted(&coordinator, "A"), "consent removal disarms");
+        assert!(coordinator.audit_log().health().unavailable);
+
+        let mut on = off;
+        on.network.station_agent.remote_tx_enabled = true;
+        coordinator
+            .handle_config_reload(Ok((on.clone(), Vec::new())))
+            .await;
+        arm_client(&coordinator, "A");
+        assert!(permitted(&coordinator, "A"), "re-armed after consent on");
+        let mut disabled = on;
+        disabled.network.station_agent.enabled = false;
+        coordinator
+            .handle_config_reload(Ok((disabled, Vec::new())))
+            .await;
+        assert!(!permitted(&coordinator, "A"), "enabled = false disarms");
     }
 
     #[tokio::test]
