@@ -3404,6 +3404,7 @@ mod decode_window_refresh_tests {
                     g.publish_effort(DecodeEffort::Max, HardwareTier::Fast, 0);
                 }
                 barrier.wait(); // B: publish done
+                barrier.wait(); // B2: reader finished window N+1
 
                 // Round 2: hold the guard across the reader's window.
                 let mut g = shared.blocking_write();
@@ -3432,6 +3433,7 @@ mod decode_window_refresh_tests {
         barrier.wait(); // B
         assert_eq!(window(&mut applied), DecodeWindowRefresh::Rebuilt);
         assert_eq!(pair(&applied), NEW);
+        barrier.wait(); // B2
 
         barrier.wait(); // C
         assert_eq!(window(&mut applied), DecodeWindowRefresh::Busy);
