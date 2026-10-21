@@ -498,7 +498,8 @@ impl Ft8Decoder {
     /// `coherent_subtract_full_frame_reference_enabled` is ALSO `true`. See
     /// `Ft8Config::coherent_subtract_full_frame_time_varying_enabled`.
     pub fn with_coherent_subtract_full_frame_time_varying_enabled(mut self, on: bool) -> Self {
-        self.config.coherent_subtract_full_frame_time_varying_enabled = on;
+        self.config
+            .coherent_subtract_full_frame_time_varying_enabled = on;
         self
     }
 

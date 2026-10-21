@@ -8508,7 +8508,8 @@ impl Ft8Decoder {
                     tone_spacing,
                     audio_anchor_frequency,
                     audio_anchor_start_sample,
-                    self.config.coherent_subtract_full_frame_time_varying_enabled,
+                    self.config
+                        .coherent_subtract_full_frame_time_varying_enabled,
                 );
             }
             subtracted_candidates.push(candidate);
@@ -22342,7 +22343,11 @@ mod pan168_full_frame_time_varying_tests {
         let syms = symbols();
         // Frame begins before the buffer; tail clipped; and an overlap of
         // only 1000 samples, shorter than one 2-symbol (3840-sample) window.
-        for start in [-5000isize, (BUF_LEN - 20_000) as isize, (BUF_LEN - 1000) as isize] {
+        for start in [
+            -5000isize,
+            (BUF_LEN - 20_000) as isize,
+            (BUF_LEN - 1000) as isize,
+        ] {
             let signal = signal_at(&syms, 0.116, start);
             let mut after = signal.clone();
             cancel(&mut after, &syms, start as f64, true);
