@@ -158,8 +158,8 @@ Columns: DX Hunter and Callers follow Band Activity's column-enum pattern. `visi
 walks a priority list, adding each column's minimum width plus 1 of spacing, and stops at the first
 that doesn't fit (prefix rule: monotonic, so widening never removes a column). The budget is
 `width − 2` borders `−` the 2-column `▶ ` highlight, reserved even when unfocused so the set doesn't
-jump on Tab. DX Hunter priority: Call, Entity, SNR, Pri, Last, Rarity, Grid, Rpt, Src (Operate panel
-32 → Call/Entity/SNR; 40 → +Pri; 48 → +Last; 53 → +Rarity; 64 and up, and Hunt view, → all nine).
+jump on Tab. DX Hunter priority: Call, Entity, SNR, Pri, Last, Rarity, Grid, Rpt, Src, Why (Operate panel
+32 → Call/Entity/SNR; 40 → +Pri; 48 → +Last; 53 → +Rarity; 64 → the original nine; 89 → +Why).
 Callers priority: Call, Msg, SNR, Flags, Age, Freq (32 → Call/Msg/SNR; 40 → +Flags; 48 → +Age;
 53 → all six). Callers `Flags` narrowed 12 → 9 (`BUSY WKD` fits; the rare three-flag case reads
 `BUSY MINE`). Empty states read `No DX` / `stations` and `No one` / `calling`.
@@ -347,3 +347,31 @@ status after restart. State learned by the upload subscriber's QRZ enrichment
 updates knowledge and worked state for this session only; it does not rewrite the
 already-delivered local log events. This feature adds no pre-contact lookup,
 state priority bonus, configuration, or remote-protocol field.
+
+## DX Hunter explains its ranking (PAN-94, 2026-10-18)
+
+The Station card adds a `Why:` line, wide DX Hunter panels add a `Why` column,
+and `w` opens the focused station's score breakdown. The card lists the tier's
+reason, cautions, a portable-suffix hint, rarity, and when the station was heard.
+The table omits rarity and heard-time clauses because those have separate columns.
+Cautions include an already-worked contact, a failed QSO this session, and limited
+or old network reports. They combine both score sources even when the other source
+wins the displayed rank.
+
+Portable suffixes are guesses. Every portable hint begins with `maybe` before
+POTA/SOTA; activation language appears only in the detail paragraph, which says
+it is not a confirmed park or summit activation and that bare callsigns are missed.
+There is no new glyph and no activation badge. A grid reason stays hedged unless
+PAN-86's prepared history status confirms it. Missing scores and stale rows have
+explicit explanations instead of fabricated factors.
+
+The Why column joins last at panel width 89. Narrower panels keep their existing
+columns. Hunt reserves six rows for the Station card; Operate retains its existing
+share. The card fits whole clauses, ending with an ellipsis when clauses are omitted.
+The overlay wraps long lines and scrolls with Up/Down. `w` or Escape closes it;
+bare `k` still aborts the selected QSO and Shift+Q still stops transmission.
+
+The detail view lists every input with its source, the actual weights and
+within-tier arithmetic, and whether the station relay or TUI scored the row.
+The existing Pri column remains available; raw arithmetic lives in the overlay.
+Callsign-pinned focus remains stable when a fresh score moves a station in the list.

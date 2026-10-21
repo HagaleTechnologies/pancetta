@@ -43,7 +43,7 @@ impl Default for PriorityWeights {
 /// Declaration order below is ascending priority — Rust's derived `Ord` on
 /// a fieldless enum ranks by declaration order, so `Atno > PerBandDxccNew >
 /// SpecialStation > PerBandGridNew > Standard > Suspect` falls out for free.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum PriorityTier {
     /// Tier 6 (lowest): callsign failed `is_plausible_callsign` — decoder
     /// noise, an unresolved AP-hash placeholder (`<...>`), or a token that
@@ -65,7 +65,7 @@ pub enum PriorityTier {
 /// A tier plus a continuous tiebreaker within that tier. `secondary` is
 /// deliberately NOT the full `score_cq_detailed` total — it excludes the
 /// `needed_dxcc`/`atno_bonus`/`notable_bonus` terms, since those signals
-/// now drive tier classification instead (see `PriorityScorer::secondary_score`).
+/// now drive tier classification instead (see `PriorityScorer::score_tiered_explained`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TieredScore {
     pub tier: PriorityTier,
@@ -107,6 +107,108 @@ impl Ord for TieredScore {
                 .partial_cmp(&other.secondary)
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
+    }
+}
+
+/// Portable callsign evidence only; this does not confirm an activation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PortableSuffix {
+    P,
+    Pota,
+    S,
+    Sota,
+    Port,
+}
+
+impl PortableSuffix {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::P => "/P",
+            Self::Pota => "/POTA",
+            Self::S => "/S",
+            Self::Sota => "/SOTA",
+            Self::Port => "/PORT",
+        }
+    }
+}
+
+/// One input and the weight actually used when scoring it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WeightedTerm {
+    pub input: f64,
+    pub weight: f64,
+}
+impl WeightedTerm {
+    pub fn contribution(&self) -> f64 {
+        self.input * self.weight
+    }
+}
+
+/// Arithmetic behind the within-tier score, in its original operation order.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SecondaryTerms {
+    pub rarity: WeightedTerm,
+    pub portable: WeightedTerm,
+    pub signal: WeightedTerm,
+    pub worked: WeightedTerm,
+    pub recent_failure: WeightedTerm,
+    pub network_bonus: f64,
+    pub ceiling: f64,
+    pub freshness: f64,
+}
+impl SecondaryTerms {
+    pub fn raw(&self) -> f64 {
+        self.rarity.contribution()
+            + self.portable.contribution()
+            + self.signal.contribution()
+            + self.worked.contribution()
+            + self.recent_failure.contribution()
+            + self.network_bonus
+    }
+    pub fn secondary(&self) -> f64 {
+        if self.ceiling <= 0.0 {
+            0.0
+        } else {
+            ((self.raw() / self.ceiling) * self.freshness).clamp(0.0, 1.0)
+        }
+    }
+}
+
+/// Inputs gathered by the same invocation that produced a tiered score.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PriorityFactors {
+    pub plausible_callsign: bool,
+    pub needed_dxcc: bool,
+    pub dxcc_new_on_band: bool,
+    pub atno: bool,
+    pub notable: bool,
+    pub special_event_callsign: bool,
+    pub grid_new_on_band: bool,
+    pub portable_suffix: Option<PortableSuffix>,
+    pub snr_db: i8,
+    pub worked_on_band: bool,
+    pub recent_failure: bool,
+    pub network_reports: Option<(u32, i32)>,
+    pub network_age_secs: Option<i64>,
+    pub terms: SecondaryTerms,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExplainedScore {
+    pub score: TieredScore,
+    pub factors: PriorityFactors,
+}
+
+impl PriorityTier {
+    pub fn from_display_u32(display: u32) -> Self {
+        match display / TIER_BAND_WIDTH {
+            0 => Self::Suspect,
+            1 => Self::Standard,
+            2 => Self::PerBandGridNew,
+            3 => Self::SpecialStation,
+            4 => Self::PerBandDxccNew,
+            _ => Self::Atno,
+        }
     }
 }
 
@@ -211,7 +313,7 @@ impl WorkedStationLookup for NullLookup {
     }
 }
 
-/// Detect POTA/SOTA activators from callsign patterns.
+/// Guess portable activity from callsign patterns via [`portable_suffix`].
 ///
 /// Recognized suffixes (case-insensitive):
 /// - `/P`   — generic portable, commonly used by POTA activators
@@ -233,19 +335,24 @@ impl WorkedStationLookup for NullLookup {
 // TODO: thread pota_flag from cqdx spot enrichment through DecodedMessageInfo
 // so genuine activators without a /P or /POTA suffix are detected.
 pub fn is_pota_sota_candidate(callsign: &str) -> bool {
+    portable_suffix(callsign).is_some()
+}
+
+/// Identify a portable suffix after resolving a hash-rendered callsign.
+/// This is a guess, not confirmation of a park or summit activation.
+pub fn portable_suffix(callsign: &str) -> Option<PortableSuffix> {
     let upper = callsign.trim().to_uppercase();
-    // PAN-58 round 1 (Codex P2): resolve a hash-render first, matching
-    // `is_plausible_callsign`'s own pattern — otherwise a resolved compound
-    // form like "<K1ABC/P>" never matches any suffix below (it ends with
-    // '>', not "/P") and silently loses its portable bonus.
-    let Some(resolved) = pancetta_core::callsign::resolve_hash_render(&upper) else {
-        return false;
-    };
-    resolved.ends_with("/P")
-        || resolved.ends_with("/POTA")
-        || resolved.ends_with("/S")
-        || resolved.ends_with("/SOTA")
-        || resolved.ends_with("/PORT")
+    // PAN-58: hash renders end in `>`, so resolve before checking suffixes.
+    let resolved = pancetta_core::callsign::resolve_hash_render(&upper)?;
+    [
+        PortableSuffix::P,
+        PortableSuffix::Pota,
+        PortableSuffix::S,
+        PortableSuffix::Sota,
+        PortableSuffix::Port,
+    ]
+    .into_iter()
+    .find(|suffix| resolved.ends_with(suffix.as_str()))
 }
 
 /// US 1x1 format (letter-digit-letter, e.g. `W1A`, `N4B`, `K9Z`) is FCC's
@@ -414,122 +521,117 @@ impl PriorityScorer {
         }
     }
 
-    /// Classify into one of the 6 lexicographic tiers (#164, `Suspect`
-    /// added PAN-54). ATNO always wins when the entity is also needed
-    /// (mirrors `score_cq_detailed`'s existing "ATNO premium only
-    /// meaningful when needed" rule); needed
-    /// alone (not ATNO) is tier 2; special-station patterns/cqdx-notable is
-    /// tier 3; per-band grid-new is tier 4; everything else is Standard.
-    fn classify_tier(&self, callsign: &str, grid: Option<&str>, freq_hz: f64) -> PriorityTier {
-        if !is_plausible_callsign(callsign) {
-            return PriorityTier::Suspect;
-        }
-        let needed = self.lookup.is_needed_dxcc(callsign)
-            || self.lookup.is_dxcc_needed_on_band(callsign, freq_hz);
-        if needed && self.lookup.is_atno(callsign) {
-            return PriorityTier::Atno;
-        }
-        if needed {
-            return PriorityTier::PerBandDxccNew;
-        }
-        if self.lookup.is_notable(callsign) || is_special_event_callsign(callsign) {
-            return PriorityTier::SpecialStation;
-        }
-        if let Some(g) = grid {
-            if self.lookup.is_grid_needed_on_band(g, freq_hz) {
-                return PriorityTier::PerBandGridNew;
-            }
-        }
-        PriorityTier::Standard
-    }
-
-    /// Continuous tiebreaker within a tier. Deliberately excludes
-    /// `needed_dxcc`/`atno_bonus`/`notable_bonus` — those signals now drive
-    /// `classify_tier` instead, and re-including them here would be a
-    /// redundant (if harmless, since they're constant within a tier) false
-    /// economy. Reuses the `rarity`/`pota_sota`/`signal_strength`/penalty/
-    /// staleness weights from `score_cq_detailed`'s formula.
-    ///
-    /// The raw weighted sum is rescaled by its actual achievable positive
-    /// ceiling (not just clamped to `[0,1]`) before returning: those
-    /// remaining weights are small fractions of 1.0 — calibrated for a
-    /// formula where `needed_dxcc`/`atno_bonus`/`notable_bonus` dominated
-    /// the total — so left unscaled, real rarity/signal variation only
-    /// ever moves the raw sum within a narrow low sub-band, making
-    /// `TieredScore::as_display_u32` cluster near the bottom of each
-    /// tier's 999-wide display band regardless of how rare or strong a
-    /// station actually is (the 2026-07-25 "no gradient" report).
-    fn secondary_score(&self, callsign: &str, snr: i8, freq_hz: f64) -> f64 {
+    /// Score and explain using a single snapshot of every lookup input.
+    pub fn score_tiered_explained(
+        &self,
+        callsign: &str,
+        grid: Option<&str>,
+        snr: i8,
+        freq_hz: f64,
+    ) -> ExplainedScore {
         const NETWORK_SNR_BONUS: f64 = 0.1;
-        let pota_sota = if is_pota_sota_candidate(callsign) {
-            1.0
-        } else {
-            0.0
-        };
+        let now = chrono::Utc::now().timestamp();
+        let plausible_callsign = is_plausible_callsign(callsign);
+        let needed_dxcc = self.lookup.is_needed_dxcc(callsign);
+        let dxcc_new_on_band = self.lookup.is_dxcc_needed_on_band(callsign, freq_hz);
+        let atno = self.lookup.is_atno(callsign);
+        let notable = self.lookup.is_notable(callsign);
+        let special_event_callsign = is_special_event_callsign(callsign);
+        let grid_new_on_band = grid.is_some_and(|g| self.lookup.is_grid_needed_on_band(g, freq_hz));
+        let portable_suffix = portable_suffix(callsign);
         let rarity = self.lookup.rarity(callsign);
-        let signal_strength = normalize_snr(snr);
-        let duplicate_penalty = if self.lookup.is_duplicate(callsign, freq_hz) {
-            1.0
-        } else {
-            0.0
+        let worked_on_band = self.lookup.is_duplicate(callsign, freq_hz);
+        let recent_failure = self.lookup.is_recent_failure(callsign);
+        let network_reports = self.lookup.network_snr(callsign);
+        let network_age_secs = self
+            .lookup
+            .network_last_seen(callsign)
+            .map(|last_seen| (now - last_seen).max(0));
+        let freshness = match network_age_secs {
+            None | Some(0..=300) => 1.0,
+            Some(301..=600) => 0.7,
+            Some(601..=900) => 0.4,
+            _ => 0.2,
         };
-        let recent_failure_penalty = if self.lookup.is_recent_failure(callsign) {
-            1.0
-        } else {
-            0.0
+        let network_bonus = match network_reports {
+            Some((count, snr)) if count >= 5 && snr >= -20 => NETWORK_SNR_BONUS,
+            Some((1, snr)) if snr < -25 => -NETWORK_SNR_BONUS,
+            _ => 0.0,
         };
-        let staleness = if let Some(last_seen) = self.lookup.network_last_seen(callsign) {
-            let now = chrono::Utc::now().timestamp();
-            let age_secs = (now - last_seen).max(0);
-            match age_secs {
-                0..=300 => 1.0,
-                301..=600 => 0.7,
-                601..=900 => 0.4,
-                _ => 0.2,
-            }
-        } else {
-            1.0
+        let terms = SecondaryTerms {
+            rarity: WeightedTerm {
+                input: rarity,
+                weight: self.weights.rarity,
+            },
+            portable: WeightedTerm {
+                input: u8::from(portable_suffix.is_some()) as f64,
+                weight: self.weights.pota_sota,
+            },
+            signal: WeightedTerm {
+                input: normalize_snr(snr),
+                weight: self.weights.signal_strength,
+            },
+            worked: WeightedTerm {
+                input: u8::from(worked_on_band) as f64,
+                weight: self.weights.duplicate_penalty,
+            },
+            recent_failure: WeightedTerm {
+                input: u8::from(recent_failure) as f64,
+                weight: self.weights.recent_failure_penalty,
+            },
+            network_bonus,
+            ceiling: self.weights.rarity.max(0.0)
+                + self.weights.pota_sota.max(0.0)
+                + self.weights.signal_strength.max(0.0)
+                + NETWORK_SNR_BONUS,
+            freshness,
         };
-        let snr_bonus = if let Some((reporter_count, best_snr)) = self.lookup.network_snr(callsign)
-        {
-            if reporter_count >= 5 && best_snr >= -20 {
-                NETWORK_SNR_BONUS
-            } else if reporter_count == 1 && best_snr < -25 {
-                -NETWORK_SNR_BONUS
-            } else {
-                0.0
-            }
-        } else {
-            0.0
+        let factors = PriorityFactors {
+            plausible_callsign,
+            needed_dxcc,
+            dxcc_new_on_band,
+            atno,
+            notable,
+            special_event_callsign,
+            grid_new_on_band,
+            portable_suffix,
+            snr_db: snr,
+            worked_on_band,
+            recent_failure,
+            network_reports,
+            network_age_secs,
+            terms,
         };
-        let raw = rarity * self.weights.rarity
-            + pota_sota * self.weights.pota_sota
-            + signal_strength * self.weights.signal_strength
-            + duplicate_penalty * self.weights.duplicate_penalty
-            + recent_failure_penalty * self.weights.recent_failure_penalty
-            + snr_bonus;
-
-        // Rescale by the max achievable positive contribution so genuine
-        // variation spans close to the full [0,1] range `as_display_u32`
-        // expects, instead of clamping the raw (small-magnitude) sum
-        // directly and wasting most of the tier's display band.
-        let max_positive = self.weights.rarity.max(0.0)
-            + self.weights.pota_sota.max(0.0)
-            + self.weights.signal_strength.max(0.0)
-            + NETWORK_SNR_BONUS;
-        let normalized = if max_positive > 0.0 {
-            raw / max_positive
+        // Classify into one of the 6 lexicographic tiers (#164, `Suspect`
+        // added PAN-54). ATNO always wins when the entity is also needed
+        // (mirrors `score_cq_detailed`'s existing "ATNO premium only
+        // meaningful when needed" rule); needed alone (not ATNO) is tier 2;
+        // special-station patterns/cqdx-notable is tier 3; per-band grid-new
+        // is tier 4; everything else is Standard.
+        let needed = factors.needed_dxcc || factors.dxcc_new_on_band;
+        let tier = if !factors.plausible_callsign {
+            PriorityTier::Suspect
+        } else if needed && factors.atno {
+            PriorityTier::Atno
+        } else if needed {
+            PriorityTier::PerBandDxccNew
+        } else if factors.notable || factors.special_event_callsign {
+            PriorityTier::SpecialStation
+        } else if factors.grid_new_on_band {
+            PriorityTier::PerBandGridNew
         } else {
-            0.0
+            PriorityTier::Standard
         };
-        (normalized * staleness).clamp(0.0, 1.0)
+        ExplainedScore {
+            score: TieredScore {
+                tier,
+                secondary: terms.secondary(),
+            },
+            factors,
+        }
     }
 
-    /// Tiered score (#164): combines `classify_tier` (dominant) with
-    /// `secondary_score` (tiebreak within a tier). This is what the DX
-    /// Hunter display should use; `evaluate_cq`/`score_cq_detailed` stay
-    /// unchanged for the autonomous operator's continuous-threshold
-    /// decision logic, which this redesign doesn't touch.
+    /// Tiered display score; continuous autonomous scoring is unchanged.
     pub fn score_tiered(
         &self,
         callsign: &str,
@@ -537,10 +639,8 @@ impl PriorityScorer {
         snr: i8,
         freq_hz: f64,
     ) -> TieredScore {
-        TieredScore {
-            tier: self.classify_tier(callsign, grid, freq_hz),
-            secondary: self.secondary_score(callsign, snr, freq_hz),
-        }
+        self.score_tiered_explained(callsign, grid, snr, freq_hz)
+            .score
     }
 }
 
@@ -1249,5 +1349,292 @@ mod tests {
             "DxEvaluator::evaluate_cq_tiered must delegate to score_tiered exactly \
              (single-scorer invariant) — no second, divergent tier computation"
         );
+    }
+    #[derive(Clone, Copy)]
+    struct FactorLookup {
+        flags: u8,
+        rarity: f64,
+        network: Option<(u32, i32)>,
+        last_seen: Option<i64>,
+    }
+    impl WorkedStationLookup for FactorLookup {
+        fn is_needed_dxcc(&self, _: &str) -> bool {
+            self.flags & 1 != 0
+        }
+        fn is_dxcc_needed_on_band(&self, _: &str, _: f64) -> bool {
+            self.flags & 2 != 0
+        }
+        fn is_atno(&self, _: &str) -> bool {
+            self.flags & 4 != 0
+        }
+        fn is_notable(&self, _: &str) -> bool {
+            self.flags & 8 != 0
+        }
+        fn is_grid_needed_on_band(&self, _: &str, _: f64) -> bool {
+            self.flags & 16 != 0
+        }
+        fn is_duplicate(&self, _: &str, _: f64) -> bool {
+            self.flags & 32 != 0
+        }
+        fn is_recent_failure(&self, _: &str) -> bool {
+            self.flags & 64 != 0
+        }
+        fn is_needed_grid(&self, _: &str) -> bool {
+            false
+        }
+        fn rarity(&self, _: &str) -> f64 {
+            self.rarity
+        }
+        fn network_snr(&self, _: &str) -> Option<(u32, i32)> {
+            self.network
+        }
+        fn network_last_seen(&self, _: &str) -> Option<i64> {
+            self.last_seen
+        }
+    }
+
+    fn every_input(mut check: impl FnMut(&PriorityScorer, &str, Option<&str>, i8)) {
+        for flags in 0..128 {
+            for rarity in [0.5, 0.85] {
+                for network in [None, Some((5, -10)), Some((1, -27))] {
+                    let scorer = PriorityScorer::new(
+                        PriorityWeights::default(),
+                        Box::new(FactorLookup {
+                            flags,
+                            rarity,
+                            network,
+                            last_seen: None,
+                        }),
+                    );
+                    for call in ["K1ABC", "K1ABC/P", "W1A", "<...>"] {
+                        for snr in [-24, -7, 10] {
+                            for grid in [None, Some("FN42")] {
+                                check(&scorer, call, grid, snr);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn score_tiered_legacy_combination_fingerprint() {
+        // Captured against the original scorer before the explanation refactor.
+        let mut fingerprint = 14695981039346656037_u64;
+        every_input(|scorer, call, grid, snr| {
+            let score = scorer.score_tiered(call, grid, snr, 14_074_000.0);
+            for value in [
+                score.tier as u64,
+                score.secondary.to_bits(),
+                score.as_display_u32() as u64,
+            ] {
+                fingerprint = (fingerprint ^ value).wrapping_mul(1099511628211);
+            }
+        });
+        assert_eq!(fingerprint, 11_564_908_623_758_373_373);
+    }
+
+    #[test]
+    fn score_tiered_matches_explained_score_for_every_input_combination() {
+        every_input(|scorer, call, grid, snr| {
+            let plain = scorer.score_tiered(call, grid, snr, 14_074_000.0);
+            let explained = scorer
+                .score_tiered_explained(call, grid, snr, 14_074_000.0)
+                .score;
+            assert_eq!(plain.tier, explained.tier);
+            assert_eq!(plain.secondary.to_bits(), explained.secondary.to_bits());
+            assert_eq!(plain.as_display_u32(), explained.as_display_u32());
+        });
+    }
+
+    #[test]
+    fn explained_factors_record_each_lookup() {
+        for bit in 0..7 {
+            let scorer = PriorityScorer::new(
+                PriorityWeights::default(),
+                Box::new(FactorLookup {
+                    flags: 1 << bit,
+                    rarity: 0.85,
+                    network: Some((5, -10)),
+                    last_seen: Some(chrono::Utc::now().timestamp() + 60),
+                }),
+            );
+            let factors = scorer
+                .score_tiered_explained("K1ABC/P", Some("FN42"), -7, 14_074_000.0)
+                .factors;
+            let values = [
+                factors.needed_dxcc,
+                factors.dxcc_new_on_band,
+                factors.atno,
+                factors.notable,
+                factors.grid_new_on_band,
+                factors.worked_on_band,
+                factors.recent_failure,
+            ];
+            for (index, value) in values.into_iter().enumerate() {
+                assert_eq!(value, bit == index);
+            }
+            assert!(factors.plausible_callsign);
+            assert!(!factors.special_event_callsign);
+            assert_eq!(factors.portable_suffix, Some(PortableSuffix::P));
+            assert_eq!(factors.snr_db, -7);
+            assert_eq!(factors.terms.rarity.input, 0.85);
+            assert_eq!(factors.network_reports, Some((5, -10)));
+            assert_eq!(factors.network_age_secs, Some(0));
+        }
+    }
+
+    #[test]
+    fn explained_factors_evaluate_every_lookup_even_when_tier_short_circuits() {
+        let scorer = PriorityScorer::new(
+            PriorityWeights::default(),
+            Box::new(FactorLookup {
+                flags: 127,
+                rarity: 0.5,
+                network: None,
+                last_seen: None,
+            }),
+        );
+        let explained = scorer.score_tiered_explained("K1ABC", Some("FN42"), -7, 14_074_000.0);
+        assert_eq!(explained.score.tier, PriorityTier::Atno);
+        assert!(explained.factors.notable);
+        assert!(explained.factors.grid_new_on_band);
+    }
+
+    #[test]
+    fn portable_suffix_maps_each_recognised_suffix() {
+        for (suffix, expected) in [
+            ("/P", PortableSuffix::P),
+            ("/POTA", PortableSuffix::Pota),
+            ("/S", PortableSuffix::S),
+            ("/SOTA", PortableSuffix::Sota),
+            ("/PORT", PortableSuffix::Port),
+        ] {
+            assert_eq!(portable_suffix(&format!("K1ABC{suffix}")), Some(expected));
+            assert_eq!(
+                portable_suffix(&format!("k1abc{}", suffix.to_lowercase())),
+                Some(expected)
+            );
+            assert_eq!(expected.as_str(), suffix);
+        }
+        assert_eq!(portable_suffix("<K1ABC/P>"), Some(PortableSuffix::P));
+        for call in ["K1ABC/QRP", "K1ABC/M", "VE3/W1ABC", "<...>"] {
+            assert_eq!(portable_suffix(call), None);
+        }
+    }
+
+    #[test]
+    fn is_pota_sota_candidate_equals_portable_suffix_is_some() {
+        for call in [
+            "K1ABC/P",
+            "K1ABC/POTA",
+            "K1ABC/S",
+            "K1ABC/SOTA",
+            "K1ABC/PORT",
+            "<K1ABC/P>",
+            "K1ABC/QRP",
+            "K1ABC/M",
+            "VE3/W1ABC",
+            "<...>",
+            "w1abc/p",
+            "W1ABC",
+            "",
+            "JA1ABC",
+            "W1ABC/7",
+            "W1ABC/P",
+            "KK4MTC/POTA",
+            "w1abc/pota",
+            "W1ABC/S",
+            "W1ABC/SOTA",
+            "k1abc/sota",
+            "W1ABC/PORT",
+            "K2DEF/QRP",
+            "DL/K1ABC",
+            "F/W1ABC",
+            "PP5XX",
+            "PS7AB",
+            "W1ABC/M",
+            "W1ABC/MM",
+            "W1ABC/LGT",
+            "K2DEF",
+        ] {
+            assert_eq!(
+                is_pota_sota_candidate(call),
+                portable_suffix(call).is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn secondary_terms_reproduce_secondary_bit_for_bit() {
+        every_input(|scorer, call, grid, snr| {
+            let explained = scorer.score_tiered_explained(call, grid, snr, 14_074_000.0);
+            assert_eq!(
+                explained.factors.terms.secondary().to_bits(),
+                explained.score.secondary.to_bits()
+            );
+        });
+        let scorer = PriorityScorer::new(
+            PriorityWeights {
+                rarity: 0.0,
+                ..PriorityWeights::default()
+            },
+            Box::new(NullLookup),
+        );
+        let explained = scorer.score_tiered_explained("K1ABC/P", None, -7, 14_074_000.0);
+        assert_eq!(
+            explained.factors.terms.secondary().to_bits(),
+            explained.score.secondary.to_bits()
+        );
+        // The scorer always reserves a 0.1 network ceiling, so test the
+        // zero-ceiling arithmetic directly rather than inventing weights.
+        let terms = SecondaryTerms {
+            ceiling: 0.0,
+            ..explained.factors.terms
+        };
+        assert_eq!(terms.secondary(), 0.0);
+    }
+
+    #[test]
+    fn secondary_terms_show_operator_weights() {
+        let weights = PriorityWeights {
+            rarity: 0.23,
+            pota_sota: 0.31,
+            signal_strength: 0.17,
+            duplicate_penalty: -0.8,
+            recent_failure_penalty: -0.2,
+            ..PriorityWeights::default()
+        };
+        let scorer = PriorityScorer::new(weights.clone(), Box::new(NullLookup));
+        let terms = scorer
+            .score_tiered_explained("K1ABC/P", None, -7, 14_074_000.0)
+            .factors
+            .terms;
+        assert_eq!(terms.rarity.weight, weights.rarity);
+        assert_eq!(terms.portable.weight, weights.pota_sota);
+        assert_eq!(terms.signal.weight, weights.signal_strength);
+        assert_eq!(terms.worked.weight, weights.duplicate_penalty);
+        assert_eq!(terms.recent_failure.weight, weights.recent_failure_penalty);
+    }
+
+    #[test]
+    fn tier_from_display_round_trips_every_band() {
+        for tier in [
+            PriorityTier::Suspect,
+            PriorityTier::Standard,
+            PriorityTier::PerBandGridNew,
+            PriorityTier::SpecialStation,
+            PriorityTier::PerBandDxccNew,
+            PriorityTier::Atno,
+        ] {
+            for offset in [0, 999] {
+                assert_eq!(
+                    PriorityTier::from_display_u32(tier as u32 * TIER_BAND_WIDTH + offset),
+                    tier
+                );
+            }
+        }
+        assert_eq!(PriorityTier::from_display_u32(6500), PriorityTier::Atno);
     }
 }

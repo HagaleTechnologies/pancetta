@@ -249,6 +249,12 @@ pub const KEYBINDINGS: &[KeyBinding] = &[
         false,
     ),
     kb(
+        "w",
+        "Why this station? Reason and score breakdown for the focused station",
+        Category::Diagnostics,
+        false,
+    ),
+    kb(
         "m",
         "Toggle audio monitoring",
         Category::AudioDevices,

@@ -4065,6 +4065,10 @@ impl super::ApplicationCoordinator {
                                     );
                                     let _ = snapshot_bus.send_message(diag_msg).await;
 
+                                    // PAN-94: record before the outcome below, so
+                                    // the TUI relay's rescore on it sees this contact.
+                                    qso_lookup.record_completed_contact(&metadata);
+
                                     // observability-diagnostics-plan.md Layer 2
                                     // (2026-07-25 plan, Task 1): sibling
                                     // structured Recent-QSOs outcome, additive
@@ -4080,8 +4084,6 @@ impl super::ApplicationCoordinator {
                                         Instant::now(),
                                     );
                                     let _ = snapshot_bus.send_message(recent_msg).await;
-
-                                    qso_lookup.record_completed_contact(&metadata);
 
                                     // item-2-auto-73: stash MANUAL completions so
                                     // that if this DX keeps re-sending RR73/RRR (they
@@ -4231,6 +4233,18 @@ impl super::ApplicationCoordinator {
                                 );
                                 let _ = snapshot_bus.send_message(diag_msg).await;
 
+                                // PAN-94: record before the outcome below, so
+                                // the TUI relay's rescore on it sees this failure.
+                                if let Some(ref their_call) = metadata.their_callsign {
+                                    info!(
+                                        "QSO failed with {}: {} (adding backoff)",
+                                        their_call, reason_text
+                                    );
+                                    qso_lookup.record_failure(their_call);
+                                } else {
+                                    info!("QSO failed: {}", reason_text);
+                                }
+
                                 // observability-diagnostics-plan.md Layer 2
                                 // (2026-07-25 plan, Task 1): sibling
                                 // structured Recent-QSOs outcome, additive
@@ -4249,16 +4263,6 @@ impl super::ApplicationCoordinator {
                                         Instant::now(),
                                     );
                                     let _ = snapshot_bus.send_message(recent_msg).await;
-                                }
-
-                                if let Some(ref their_call) = metadata.their_callsign {
-                                    info!(
-                                        "QSO failed with {}: {} (adding backoff)",
-                                        their_call, reason_text
-                                    );
-                                    qso_lookup.record_failure(their_call);
-                                } else {
-                                    info!("QSO failed: {}", reason_text);
                                 }
                             }
                             Ok(pancetta_qso::QsoEvent::MessageRejected {
