@@ -26,7 +26,9 @@ pub const AUDIO_PASSBAND_MAX_HZ: u64 = 3000;
 
 // Test-only thread-local backing `App::set_test_tui_state_path` /
 // `App::tui_state_path`. See those for why this is a thread-local rather
-// than a process-global env var. Never compiled into production builds.
+// than a process-global env var. Unset (`None`) means "no state file" in
+// test builds — never the real `~/.pancetta/tui_state.json` (PAN-194).
+// Never compiled into production builds.
 #[cfg(test)]
 thread_local! {
     static TEST_TUI_STATE_PATH_OVERRIDE: std::cell::RefCell<Option<std::path::PathBuf>> =
@@ -1896,23 +1898,33 @@ impl App {
     /// Path to the persisted TUI state file (`~/.pancetta/tui_state.json`).
     /// `None` if the home directory can't be resolved.
     ///
-    /// Test-only seam: honors a thread-local override (see
-    /// [`Self::set_test_tui_state_path`]) so the unit test suite never reads
-    /// or writes the operator's real state file — compiled out of
-    /// production builds entirely (`#[cfg(test)]`), so this is a no-op for
-    /// the real TUI.
+    /// Test builds (`#[cfg(test)]`) never resolve the real file: they return
+    /// only the thread-local override (see [`Self::set_test_tui_state_path`]),
+    /// and an unset override means `None` — no state file, so loads fall back
+    /// to their defaults and `persist_tui_state` skips the write (PAN-194). A
+    /// test that needs persistence opts in with `set_test_tui_state_path`.
+    /// Production builds always use [`Self::home_tui_state_path`].
     fn tui_state_path() -> Option<std::path::PathBuf> {
         #[cfg(test)]
         {
-            if let Some(p) = TEST_TUI_STATE_PATH_OVERRIDE.with(|cell| cell.borrow().clone()) {
-                return Some(p);
-            }
+            TEST_TUI_STATE_PATH_OVERRIDE.with(|cell| cell.borrow().clone())
         }
+        #[cfg(not(test))]
+        {
+            Self::home_tui_state_path()
+        }
+    }
+
+    /// The real `~/.pancetta/tui_state.json`; `None` if the home directory can't be resolved.
+    fn home_tui_state_path() -> Option<std::path::PathBuf> {
         dirs::home_dir().map(|h| h.join(".pancetta").join("tui_state.json"))
     }
 
     /// Test-only: point [`Self::tui_state_path`] at `path` for the calling
-    /// thread only, so tests never touch `~/.pancetta/tui_state.json`.
+    /// thread only. Leaving it unset means "no state file" in test builds
+    /// (defaults load, writes are skipped) — never the real
+    /// `~/.pancetta/tui_state.json`, so only a test that needs persistence
+    /// calls this.
     /// `#[tokio::test]` defaults to a current-thread runtime, so a value set
     /// here is visible for the rest of the test body (including any tasks
     /// it spawns) — unlike a process-global env var, a thread-local can't
@@ -5329,18 +5341,25 @@ mod tests {
         assert!(m.rx_buffer.is_empty() && m.tx_buffer.is_empty());
     }
 
-    /// With the test-only override unset, `tui_state_path()` must resolve
-    /// to exactly `~/.pancetta/tui_state.json` — the real production path.
-    /// This is a computation-only check (it never reads/writes the file
-    /// itself), so it's safe to run without touching the operator's real
-    /// state file.
+    /// `home_tui_state_path()` — what production builds' `tui_state_path()`
+    /// resolves to — must be exactly `~/.pancetta/tui_state.json`. This is a
+    /// computation-only check (it never reads/writes the file itself), so
+    /// it's safe to run without touching the operator's real state file.
     #[test]
-    fn tui_state_path_default_is_real_home_pancetta_path() {
-        // Explicitly clear any override a prior test on this thread may
-        // have left behind, so this test is order-independent.
-        TEST_TUI_STATE_PATH_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+    fn home_tui_state_path_is_real_home_pancetta_path() {
         let expected = dirs::home_dir().map(|h| h.join(".pancetta").join("tui_state.json"));
-        assert_eq!(App::tui_state_path(), expected);
+        assert_eq!(App::home_tui_state_path(), expected);
+    }
+
+    /// PAN-194: with no override, test builds resolve no state file, so `App::new`
+    /// seeds the defaults whatever the developer saved in ~/.pancetta/tui_state.json.
+    #[tokio::test]
+    async fn tui_state_path_without_override_is_none_and_app_seeds_defaults() {
+        TEST_TUI_STATE_PATH_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+        assert_eq!(App::tui_state_path(), None);
+        let app = fixture_app().await;
+        assert_eq!(app.decode_effort, "AUTO");
+        assert_eq!(app.active_view, crate::view::ActiveView::Operate);
     }
 
     /// `set_decode_effort` (decoder-speed-overhaul Task 15) persists the
