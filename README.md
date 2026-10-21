@@ -59,8 +59,7 @@ runs as happily over SSH on a headless box behind the radio as on a desktop.
   failure.
 
 On-air TX has been validated end-to-end against a Yaesu FTdx10 (clean ALC,
-PSKReporter spots across North America and Europe). ~295 FT8 tests cover
-encode, decode, LDPC, CRC, and OSD.
+PSKReporter spots across North America and Europe).
 
 <!-- TODO (maintainer): drop a PSKReporter map capture at assets/pskreporter.png
      and reference it here as on-air proof. Requires a real pskreporter.info
@@ -269,16 +268,50 @@ One binary, several subcommands (`pancetta <cmd> --help` for details):
 | `pancetta --replay <wav-dir>` | Feed a directory of WAVs through the full TUI pipeline. |
 | `pancetta --headless` | No TUI; logs to `~/.pancetta/logs/`. |
 
+## Capability status
+
+What each part of Pancetta has been proven to do. This describes `main`
+after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
+[CHANGELOG.md](CHANGELOG.md). Each row shows the highest state reached:
+
+- **Experimental**: off by default or behind a build feature, or its
+  exchange with the outside service is not confirmed yet. Expect changes.
+- **Implemented**: runs in the default build and has unit tests. Not yet
+  tested against a simulated peer or a real station.
+- **Integration-tested**: tested in CI against a simulated peer:
+  loopback audio, the mock rig, a fake `rigctld`, or a local mock server.
+- **Radio-qualified**: used on a real station (a rig on air, or the live
+  service), in the environment listed.
+
+| Capability | State | Environment and limits | Evidence |
+|---|---|---|---|
+| FT8 decode | Radio-qualified | On air at the maintainer's station. Measured sensitivity vs WSJT-X: [decoder comparison](docs/decoder-comparison.md) | [FT8 tests](pancetta-ft8/tests/) |
+| FT8 transmit, manual QSOs | Radio-qualified | Yaesu FTdx10 via `rigctld`: TX validated 2026-04-26 (clean ALC, PSKReporter spots across NA + EU); manual on-air QSOs since 2026-09 | [loopback QSO](pancetta/tests/loopback_qso.rs), [PTT](pancetta/tests/tx_ptt_integration.rs) |
+| Autonomous QSO loop | Integration-tested | Simulated band only; no on-air autonomous run recorded yet | [coordinator sim](pancetta/tests/coord_sim.rs) |
+| Several QSOs per slot (multi-stream TX) | Integration-tested | Simulated only | [loopback QSO](pancetta/tests/loopback_qso.rs) |
+| FT4 | Integration-tested | Chosen at startup or with Shift+M; FT8 and FT4 are never decoded at the same time | [coordinator sim](pancetta/tests/coord_sim.rs) |
+| FT2 | Experimental | Only in builds with the `ft2` cargo feature (release binaries leave it off); two incompatible FT2 specs exist | [modes](docs/DECISIONS/modes.md) |
+| Rig control (CAT + PTT via `rigctld`) | Radio-qualified (FTdx10 only) | Frequency, split, PTT; Pancetta does not set the rig mode. Other Hamlib rigs are mapped but unproven | [rigctld redial test](pancetta-hamlib/tests/rigctld_redial.rs) |
+| Config changes while running | Implemented, *Unreleased* | Only remote-access consent switches and revocations apply live; every other change needs a restart ([details](docs/CONFIG.md#hot-reload)) | [config reload](pancetta/src/coordinator/config_reload.rs) |
+| ClubLog, QRZ Logbook upload | Integration-tested | Opt-in. Local mock server only; no live-account run recorded. Best-effort: a failed upload is logged, not retried; `~/.pancetta/qsos.adi` stays complete | [upload clients](pancetta-dx/src/qso_upload.rs) |
+| cqdx.io QSO upload and spots | Integration-tested | Upload matches the cqdx API contract (2026-06-27). The live-spots response shape is unverified against the live API | [cqdx client](pancetta-cqdx/src/client.rs) |
+| LoTW upload (through TQSL) | Implemented | Needs your installed `tqsl`, certificate and station location. Tests check the `tqsl` command line only; no end-to-end LoTW upload recorded | [upload clients](pancetta-dx/src/qso_upload.rs) |
+| eQSL upload | Experimental | Field mapping and request form still need a live-account check | [upload clients](pancetta-dx/src/qso_upload.rs) |
+| PSKReporter reporting | Implemented | Opt-in; not checked against pskreporter.info | [PSKReporter client](pancetta-dx/src/pskreporter.rs) |
+| DX cluster | Integration-tested | Local mock server only | [cluster client](pancetta-dx/src/cluster.rs) |
+| WSJT-X UDP interop | Integration-tested | Local sockets only | [WSJT-X UDP](pancetta/src/coordinator/wsjtx_udp/mod.rs) |
+| Remote operation (station agent, local gateway) | Integration-tested | Off by default; station-agent remote TX also needs local consent (`remote_tx_enabled`) and a signed arm from an allow-listed client | [remote-operation decisions](docs/DECISIONS/remote-operation.md) |
+| ADIF export / import | Integration-tested; import *Unreleased* | Imported contacts are never uploaded | [import test](pancetta/tests/import_cli.rs) |
+| Platforms | — | macOS (development), Linux (CI), Windows 11 (the maintainer's station). Linux aarch64 release builds are smoke-tested on a cloud ARM64 runner, never on a Raspberry Pi | [release workflow](.github/workflows/release.yml) |
+
 ## Why not (yet)
 
 Honest gaps, so you can judge whether it fits your station:
 
 - **Pre-1.0.** Config keys, CLI surface, and on-disk formats can still change
   between releases.
-- **Some integrations are scaffolded, not live.** `pancetta-hamlib`'s FFI
-  bindings are done, but the project's own status table still calls the
-  crate an integration stub; `pancetta-cqdx` awaits live API validation;
-  LoTW/eQSL upload is scaffolded where ClubLog/QRZ/cqdx paths are live.
+- **Uploads are best-effort.** A failed upload is logged and not retried;
+  see [Capability status](#capability-status).
 - **Platform coverage is narrow.** Developed on macOS (Apple Silicon), CI on
   Linux, deployed on a Windows 11 MiniPC. Prebuilt Linux aarch64 binaries are
   published for Pi-class ARM, but real-hardware validation (the
@@ -301,8 +334,11 @@ cargo clippy --workspace --features transmit
 cargo fmt --all -- --check
 ```
 
-CI runs all of this per PR plus a macOS `cargo check` lane; `cargo deny check`
-guards advisories and license drift. The 14-crate strictly layered workspace
+CI runs the workspace tests and clippy with `--exclude pancetta-research`
+(the local-only harness), checks formatting, builds the examples, and adds a
+macOS `cargo check` lane; it has no separate single-threaded hamlib run.
+`cargo deny check` guards advisories and license drift. The exact CI commands
+are in [`.github/workflows/ci.yml`](.github/workflows/ci.yml). The 14-crate strictly layered workspace
 is mapped in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Documentation
@@ -315,7 +351,7 @@ is mapped in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 - [`docs/RUNBOOK.md`](docs/RUNBOOK.md) — operating procedures, including the autonomous QSO loop.
 - [`docs/decoder-comparison.md`](docs/decoder-comparison.md) — native decoder vs. ft8_lib, measured.
 - [`docs/PROVENANCE.md`](docs/PROVENANCE.md) — licensing provenance and the clean-room firewall.
-- [`FEATURES.md`](FEATURES.md) — capabilities and feature status.
+- [`FEATURES.md`](FEATURES.md) — how each feature works (status: [Capability status](#capability-status)).
 - [`SECURITY.md`](SECURITY.md) — vulnerability reporting and known trade-offs.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — coding standards and contribution flow.
 - [`CHANGELOG.md`](CHANGELOG.md) — release notes.

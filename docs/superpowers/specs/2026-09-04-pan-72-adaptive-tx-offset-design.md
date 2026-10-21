@@ -501,6 +501,23 @@ tested.
     lookup table redundant: it is already the authoritative live slot length (it also correctly
     reports 15 s for a `mode=FT2` config on a build without the `ft2` feature, where the decoder
     really is running FT8 timing — the table said 3.2 s there).
+- **Amended by PAN-130 (Codex round 12 on PR #350, P2).** A `Switch` now resolves against the
+  drain's own `get_qso` read of `metadata.frequency` (`current_hz`) instead of the queued
+  `avoid_hz`, which is used only as a fallback when the QSO is gone — the same fallback the
+  `Revert` arm's occupied-target path already used. An operator nudge reads `avoid_hz` from the
+  `active_tx_offsets` mirror, and the Hound calling→response QSY moves `metadata.frequency` after
+  its `StateChanged` event already put the calling offset there; excluding that stale value let
+  the allocator pick the QSO's own live offset (refused as `OffsetActionNoOp`) or a spot a few Hz
+  from it, and with no valid candidate it returned the stale value itself as a jump.
+- **Amended by PAN-132 (Codex round 15 on PR #350, P2).** Round 6's provenance rule now decides
+  the known-good credit for every QSO with a `partner_freq`, not only one whose split predates
+  the switch. `apply_tx_offset_switch`'s established-QSO latch sets `partner_freq` to exactly the
+  offset it vacates, and round 5's re-review had counted that as Tx=Rx. Because the DX keeps
+  transmitting at the vacated offset, the decode-frequency check always matched there, so an
+  operator `u` nudge on a simplex QSO credited the offset it left and the next stall emitted
+  `Revert` back onto it. `tx_equals_rx` is now `partner_freq.is_none()`: the decode frequency
+  decides only after a switch on an unanswered `CallingCq`. Stall-triggered outcomes are
+  unchanged.
 
 ## Manual "nudge" keystroke — `pancetta-tui`
 
@@ -539,6 +556,13 @@ tested.
     preserves the pre-filter behavior. This is a SELECTION-time filter complementing round 1's
     commit-time refusal: the commit check keeps the engine correct, this one keeps the status
     line honest.
+  - **Amended by PAN-131 (Codex round 13 on PR #350, P2):** the nudge still carries no
+    generation token, but `apply_tx_offset_switch` now refuses an operator nudge with
+    `OffsetActionNudgeSuperseded` when the DX has moved the QSO out of the selection-time
+    eligible set before the drain commits it (guard 2a, `operator_nudge_retransmits`), so the
+    offset no longer moves with nothing sent on it. This is the commit-time counterpart of round
+    9's selection-time filter. An advance that stays inside the set (`RespondingToCq` →
+    `SendingReport`) still commits, and the next rearm sends at the new offset.
   - Else, if the Autonomous task's current state is `CallingCq` (hunting), trigger today's
     CQ-switch immediately: a new `pending_cq_offset_nudge: Arc<AtomicBool>` flag, set here and
     checked by the tick loop alongside its existing `should_switch` computation — same

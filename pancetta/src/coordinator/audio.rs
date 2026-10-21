@@ -144,6 +144,82 @@ impl TxAudioCommand {
     }
 }
 
+/// Filename of the one-shot raw-capture diagnostic, written beside the
+/// decode-window recordings.
+const RAW_DIAGNOSTIC_WAV: &str = "raw_48khz_diagnostic.wav";
+
+/// First `target` raw interleaved capture samples, written once as a 2-ch
+/// 48 kHz 16-bit WAV for comparing against the decimated windows. Exists
+/// only while WAV recording is enabled (PAN-125): `new(None, ..)` is no
+/// capture at all, so a default install buffers and writes nothing.
+struct RawDiagnosticCapture {
+    path: std::path::PathBuf,
+    buf: Vec<f32>,
+    target: usize,
+}
+
+impl RawDiagnosticCapture {
+    fn new(dir: Option<&std::path::Path>, target: usize) -> Option<Self> {
+        Some(Self {
+            path: dir?.join(RAW_DIAGNOSTIC_WAV),
+            buf: Vec::with_capacity(target),
+            target,
+        })
+    }
+
+    /// Append raw interleaved samples; once `target` is reached, create the
+    /// parent directory, write the whole buffered WAV (same spec and info!
+    /// line as the pre-PAN-125 inline writer) and return `true` so the
+    /// caller drops the capture — only once per process.
+    fn push(&mut self, samples: &[f32]) -> bool {
+        self.buf.extend_from_slice(samples);
+        if self.buf.len() < self.target {
+            return false;
+        }
+        if let Some(parent) = self.path.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    warn!(
+                        "Raw 48kHz diagnostic WAV not saved: cannot create {}: {}",
+                        parent.display(),
+                        e
+                    );
+                    return true;
+                }
+            }
+        }
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 48000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        match hound::WavWriter::create(&self.path, spec) {
+            Ok(mut w) => {
+                for &s in &self.buf {
+                    let _ = w.write_sample((s * i16::MAX as f32) as i16);
+                }
+                if let Err(e) = w.finalize() {
+                    warn!("Raw 48kHz diagnostic WAV finalize error: {}", e);
+                } else {
+                    info!(
+                        "Raw 48kHz diagnostic WAV saved: {} ({} samples, {:.0}s stereo)",
+                        self.path.display(),
+                        self.buf.len() / 2,
+                        self.buf.len() as f64 / (48000.0 * 2.0)
+                    );
+                }
+            }
+            Err(e) => warn!(
+                "Raw 48kHz diagnostic WAV not saved: {}: {}",
+                self.path.display(),
+                e
+            ),
+        }
+        true
+    }
+}
+
 impl super::ApplicationCoordinator {
     pub(crate) async fn start_audio_pipeline(
         &mut self,
@@ -254,6 +330,13 @@ impl super::ApplicationCoordinator {
                 target_latency_ms: 1.0,
                 input_gain_db: config.audio.levels.input_gain_db,
             };
+            // PAN-125: the raw 48 kHz diagnostic capture obeys the same
+            // recording decision as the DSP decode-window recorder. No log
+            // line here — the DSP start already logged the decision.
+            let raw_diagnostic_dir = self
+                .wav_recording(&config.audio.recording)
+                .dir()
+                .map(std::path::Path::to_path_buf);
             drop(config);
 
             let shutdown = self.shutdown_signal.clone();
@@ -632,10 +715,11 @@ impl super::ApplicationCoordinator {
                 let mut relay_count: u64 = 0;
                 let mut stale_watchdog = crate::coordinator::audio_recovery::StaleWatchdog::new();
                 // Record 90 seconds of raw 48kHz stereo audio for diagnostics
-                // (covers ~6 FT8 windows regardless of boundary alignment)
+                // (covers ~6 FT8 windows regardless of boundary alignment);
+                // only while WAV recording is enabled (PAN-125).
                 let raw_capture_samples = 48000 * 2 * 90; // 90s stereo
-                let mut raw_recorder: Option<Vec<f32>> =
-                    Some(Vec::with_capacity(raw_capture_samples));
+                let mut raw_recorder =
+                    RawDiagnosticCapture::new(raw_diagnostic_dir.as_deref(), raw_capture_samples);
                 // docs/audio-robustness-plan.md item 3: `health_audio_alive`
                 // was write-once-true — set on the first batch and NEVER
                 // reset, so once ANY audio flowed the health log/TUI reported
@@ -710,27 +794,9 @@ impl super::ApplicationCoordinator {
                     // RwLock write on every audio batch — the hottest lock).
                     last_timestamp.store(super::now_epoch_ms(), Ordering::Relaxed);
 
-                    // Capture raw 48kHz for diagnostic comparison
-                    if let Some(ref mut buf) = raw_recorder {
-                        buf.extend_from_slice(&samples);
-                        if buf.len() >= raw_capture_samples {
-                            let raw_path = dirs::home_dir()
-                                .unwrap_or_default()
-                                .join(".pancetta/recordings/raw_48khz_diagnostic.wav");
-                            let spec = hound::WavSpec {
-                                channels: 2,
-                                sample_rate: 48000,
-                                bits_per_sample: 16,
-                                sample_format: hound::SampleFormat::Int,
-                            };
-                            if let Ok(mut w) = hound::WavWriter::create(&raw_path, spec) {
-                                for &s in buf.iter() {
-                                    let _ = w.write_sample((s * i16::MAX as f32) as i16);
-                                }
-                                let _ = w.finalize();
-                                info!("Raw 48kHz diagnostic WAV saved: {} ({} samples, {:.0}s stereo)",
-                                    raw_path.display(), buf.len() / 2, buf.len() as f64 / (48000.0 * 2.0));
-                            }
+                    // Capture raw 48kHz for diagnostic comparison.
+                    if let Some(capture) = raw_recorder.as_mut() {
+                        if capture.push(&samples) {
                             raw_recorder = None; // only once
                         }
                     }
@@ -878,6 +944,72 @@ mod pan135_tx_audio_command_tests {
         assert_eq!(
             waiter.wait_for(Duration::from_millis(100)).await,
             AckState::Dropped
+        );
+    }
+}
+
+#[cfg(test)]
+mod raw_diagnostic_capture_tests {
+    use super::*;
+
+    #[test]
+    fn no_directory_means_no_capture() {
+        // PAN-125: recording off (or replay/no-audio) resolves to no
+        // directory, so nothing is buffered and nothing can be written.
+        assert!(RawDiagnosticCapture::new(None, 8).is_none());
+    }
+
+    #[test]
+    fn writes_once_when_the_target_is_reached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cap = RawDiagnosticCapture::new(Some(tmp.path()), 8).unwrap();
+
+        assert!(!cap.push(&[0.1; 4]), "target not reached yet");
+        assert!(!tmp.path().join(RAW_DIAGNOSTIC_WAV).exists());
+
+        assert!(
+            cap.push(&[0.1; 4]),
+            "target reached: the caller must drop it"
+        );
+
+        let path = tmp.path().join(RAW_DIAGNOSTIC_WAV);
+        let reader = hound::WavReader::open(&path).unwrap();
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 2);
+        assert_eq!(spec.sample_rate, 48000);
+        assert_eq!(spec.bits_per_sample, 16);
+        assert_eq!(spec.sample_format, hound::SampleFormat::Int);
+        // hound's `len()` counts interleaved samples across both channels.
+        assert_eq!(reader.len(), 8, "the full 90 s target worth of samples");
+    }
+
+    #[test]
+    fn creates_a_missing_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("nested").join("rec");
+        let mut cap = RawDiagnosticCapture::new(Some(&nested), 2).unwrap();
+
+        assert!(cap.push(&[0.1; 2]));
+
+        assert!(nested.join(RAW_DIAGNOSTIC_WAV).exists());
+    }
+
+    #[test]
+    fn overshoot_writes_everything_buffered() {
+        // Today's behavior: the batch that crosses the target is appended
+        // whole and everything buffered is written (not truncated at the
+        // target). Keep it — splitting a cpal batch mid-flight buys nothing.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cap = RawDiagnosticCapture::new(Some(tmp.path()), 4).unwrap();
+
+        assert!(cap.push(&[0.1; 6]));
+
+        let reader = hound::WavReader::open(tmp.path().join(RAW_DIAGNOSTIC_WAV)).unwrap();
+        // hound's `len()` counts interleaved samples across both channels.
+        assert_eq!(
+            reader.len(),
+            6,
+            "the whole batch was buffered, not truncated"
         );
     }
 }

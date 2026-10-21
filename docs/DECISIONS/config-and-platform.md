@@ -454,6 +454,34 @@ caveat above (Mergify's `author = thagale` condition needing revisiting once a s
 collaborator exists) carries over unchanged to `auto-merge-trigger.yml`'s own allowlist -- same
 mechanism, same limitation, different admission path.
 
+### Interrupted native queue recovery (PAN-150, 2026-10-20)
+
+Admission stands down successfully when the native `merge_queue` rule is absent.
+Its probe captures the status explicitly, so that behavior does not depend on an
+outer Bash conditional suppressing `errexit`. A ruleset read failure still fails
+admission, and only a confirmed queue rule permits arming.
+
+A failed merge-group attempt has a different recovery requirement. If the rule
+is absent, `queue-retry-handler.yml` fails without arming, consuming the retry
+budget, or attaching the handled label. Restore the rule, then rerun the workflow
+or redeliver the event. Restoring the rule alone does not schedule recovery.
+
+On second failure, handoff determines pause ownership from the latest label
+attachment event after the idempotent label POST. A confirmed human or other
+external owner keeps the pause without a handler marker. Unknown ownership
+preserves the pause and fails after the disarm checks. For a confirmed
+`github-actions[bot]` attachment, handoff preserves any valid bot marker at or
+after that attachment, including its original SHA. If readable comment history
+contains no such marker, it posts and verifies a new marker before success.
+Unreadable provenance or failed publication/readback leaves the event eligible
+for rerun. This repairs interrupted handler-owned handoffs without changing the
+admission staleness consumer, marker format, or one-retry limit.
+
+Existing orphaned pauses are repaired when an eligible handoff reruns. Historical
+attempts already marked handled are not swept automatically. Offline regressions
+in `scripts/ci/test-ci-queue-recovery.sh` execute the workflow Bash and jq through
+the existing CI test discovery.
+
 ## Partial tables, fatal file-load errors, and an honest `config --validate` (PAN-90, 2026-10-10)
 
 Every documented "just add this block" recipe failed to parse on its own (README's
@@ -619,3 +647,24 @@ remote-gateway acceptor does not follow this rule yet (PAN-99).
 - Deferred: provisioning `SEMGREP_APP_TOKEN` as a Dependabot secret (CAT-307
   follow-up; after that, Dependabot PRs get platform scans automatically), and
   the same PAN-107 fix in the sibling repos (cqdx/panino/widdershins/coppa).
+
+## WAV recording is opt-in (PAN-125, 2026-10-19)
+
+- `[audio.recording] auto_record` (default `false`) gates both WAV writers:
+  the DSP decode-window recorder (`dsp.rs`, `WavRecorder`) and the one-shot
+  `raw_48khz_diagnostic.wav` capture in the audio relay (`audio.rs`). One
+  function, `resolve_wav_recording`, decides for both. `--replay` and
+  `--no-audio` refuse even when enabled (replay joins the `replay_mode()`
+  list; closes GH #265).
+- `directory` is honored, and pancetta expands a leading `~` itself: the
+  config loader never expands `~` inside values (`loader.rs` tests). Empty
+  means `~/.pancetta/recordings`.
+- The `directory` default stays `~/Documents/Pancetta/Recordings`, and
+  `defaults.toml` is unchanged. The station corpus offload (magazzino
+  `clients/pancetta-wav-offload.sh`) reads `~/.pancetta/recordings`, so a
+  corpus station sets `directory` explicitly. sophon did so on 2026-10-16,
+  before this shipped.
+- The cap stays a hardcoded 10 GB. The other `[audio.recording]` keys stay
+  unread. Restart-required like every non-live key — including across DSP
+  supervisor restarts, because the running config snapshot is patched only
+  for security fields.

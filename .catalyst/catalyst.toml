@@ -31,6 +31,17 @@ name = "libssl-dev"
 [[environment.system_packages]]
 name = "pkg-config"
 
+# Catalyst's runner exports GIT_CONFIG_KEY_n overrides (remote.origin.url and
+# remote.origin.fetch = this ticket's branch) to every git process, so the
+# submodule clone behind `submodules = true` fetches pancetta instead of
+# ft8_lib and leaves the directory empty: 13 pancetta-ft8 tests then fail on
+# every branch. Re-run the init with those overrides cleared. ft8_lib is
+# public, so no credential is needed. Remove once Catalyst scopes the
+# override to the superproject.
+[[environment.setup]]
+name = "init-ft8lib-submodule"
+run = ["sh", "-c", "unset GIT_CONFIG_COUNT GIT_ASKPASS && git submodule sync -- pancetta-ft8/vendor/ft8_lib && git submodule update --init --force -- pancetta-ft8/vendor/ft8_lib && test -f pancetta-ft8/vendor/ft8_lib/ft8/constants.c"]
+
 [[environment.setup]]
 name = "fetch-dependencies"
 run = ["cargo", "fetch", "--locked"]

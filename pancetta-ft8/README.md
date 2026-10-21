@@ -42,7 +42,7 @@ described in [`docs/PROVENANCE.md`](../docs/PROVENANCE.md). The split:
   decoding (`src/ap.rs`), the multi-stream TX modulator
   (`modulate_multi_tx` in `src/modulator.rs`), and the integration
   surface (`Ft8Encoder` / `Ft8Decoder` Rust API, configuration types,
-  error model, and ~295 tests including cross-validation against
+  error model, and tests including cross-validation against
   `ft8_lib` audio).
 
 The protocol itself — Costas sync arrays, LDPC code, CRC polynomial,

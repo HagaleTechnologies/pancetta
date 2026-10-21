@@ -709,3 +709,163 @@ Scope: `Report`/`ReportAck` opens are deliberately not covered — their states
 are rearm-eligible and `frame_reaches_the_air` already refuses to compound a
 denial (no further false `Sent`, no stall accounting), so they self-correct
 under the manual keep-call watchdog.
+
+## The remote-access audit log is bounded and its failures are visible (PAN-104), 2026-10-18
+
+**Decision.** `pancetta-agent/src/audit.rs` keeps the synchronous writer but
+bounds it: the active file and three archives (`.1` newest) are each at most
+1 MiB; operator/detail fields are capped at 64/1,024 UTF-8 bytes and each
+record at 8,192 bytes; each of the six event kinds has a token bucket (burst
+20, refill 10/s), so any T-second window admits at most `120 + 60*T`
+ordinary-record attempts. Over-limit events are counted in fixed per-kind
+counters and written as `Summary` records (operator `null`) by
+`AuditLog::maintain`, which the five-second health monitor runs on the
+blocking pool with at most one pass in flight (it skips a busy writer rather
+than waiting). Clones share one writer mutex, the buckets, the counters and
+the health. Oversized pre-existing files are reset to zero bytes, with a
+`discarded_bytes` notice; an incomplete trailing record is trimmed.
+
+`append` returns `Result<AuditAppendOutcome, AuditError>`. Every failure
+marks the shared health before returning; the readiness snapshot appends
+`Remote audit unavailable; events may be missing` to the degraded summary
+(composed per snapshot, never written into `degraded_summary`), and headless
+logs it at ERROR, then at most once per 60 s. A failure episode clears only
+after maintenance has repaired storage and written every pending count, and
+no sooner than five seconds after it began; an ordinary successful append
+does not clear it.
+
+**Availability, not an audit gate.** A valid remote arm proceeds while
+auditing is failing. `verify_and_arm` publishes the arm before it writes the
+record, so refusing on a failed write would briefly expose a live arm and
+then retract it; a transactionally audited arm needs its own prepare/commit
+design. Audit health is not a `TxMuteCause`, not part of `TxPolicy`, and not
+an input to `ArmState::tx_permitted`. Every identity, scope, consent, expiry
+and heartbeat check is unchanged.
+
+**Lock and PTT ordering.** Audit I/O never runs under the arm mutex, the
+eligibility locks or the PTT path. The eviction, static-revocation and
+authorization-poll disarms collect their `ArmEffect`s under the lock, publish
+the disarm and eligibility change (and bump the generation), then write the
+audit records. TX-worker interrupts release PTT before
+`emit_disarm_interrupt_signals` writes its `TxDenied` record. Control paths
+use `AuditLog::record`, which ignores the outcome because the sink has
+already recorded the failure.
+
+**Limits.** There is no hard deadline on a hung filesystem syscall, no
+multi-process writer coordination, and no immutable retention. `sync_data`
+confirms the record write, not directory renames across power loss.
+In-memory counts are lost on a crash.
+
+
+## PAN-137: a controller change ends the previous controller's QSOs
+
+PR #362's round-7 review found an availability issue. A QSO bound to a
+previous controller could no longer pass the identity-bound arm gate, but
+still held the station's TX parity and a capacity slot until its watchdog
+expired. A new opposite-parity call therefore stayed queued for minutes.
+
+Whenever the station agent's controller becomes `Some(P)` and was not
+already P, it owes cleanup for P. This covers explicit `takeControl` and
+implicit grabs after release, disconnect or expiry. A same-peer takeover
+owes nothing. Arm loss alone, including disarm, heartbeat/TTL expiry,
+release, disconnect, authorization eviction and local kill, ends no QSO.
+The client can return and resume. Retiring on a denied frame would confuse
+these pauses with displacement; waiting for a blocked call would leave
+stale QSOs consuming capacity and require fixes in every admission path.
+
+Cleanup covers every band and only QSOs or queued calls with
+`remote_origin == true` and `remote_client_key_id == Some(k)` where k differs
+from P. Local QSOs, unbound WSJT-X UDP QSOs and P's QSOs stay. The manager
+and pending-call queue use the same `bound_to_other_remote_client` predicate.
+The parity and capacity gates still count every active QSO regardless of
+arm state. A temporarily unarmed QSO must keep its window.
+
+The station agent sends `QsoMessage::RemoteControllerChanged` to the QSO
+component. Under the admission lock, the handler first purges other clients'
+queued calls, then calls `retire_qsos_bound_to_other_remote_clients`.
+Purging first prevents retirement's failure events from promoting an old
+client's queued call into a fresh stale QSO. Selection and removal share
+one manager write lock, and normal `StateChanged` and `QsoFailed` events
+follow after unlocking. Those events purge TX state and promote waiting
+calls. A queue-only change also pushes a fresh display snapshot.
+
+Cleanup stays owed until `send_message_checked` confirms enqueue. A newer
+controller change replaces an undelivered cleanup. The session loop retries
+every tick, and `TxRequest` flushes before forwarding an intent. If that
+flush fails, the request receives the existing station-agent error event
+asking the client to retry. A full inbox could otherwise drain between the
+failed cleanup and the intent send, allowing the intent to overtake it.
+One sender and FIFO delivery preserve the order once enqueue succeeds.
+The retry does not sleep in the session loop; heartbeats remain serviceable.
+Teardown does not erase cleanup already owed by a displacement.
+
+Retirement uses `ControlTransferred`, displayed as "remote control passed
+to another client" in the status line and Recent-QSOs panel, in gray. It
+uses the existing failure-backoff behavior. TX authorization gates stay
+unchanged and continue to deny displaced clients while cleanup is pending.
+
+Taking over and repeating the previous client's exact call now starts a
+fresh QSO after retirement. The new client can use `answerCaller` with a
+`step` to select the exchange rung. Automatically inheriting the old QSO
+would let its arm authorize transmissions it never requested. A QSO already
+rebound to P before retirement is kept; other repeat/rebind paths still work.
+
+This changes no wire schema, config key, CLI or persisted schema, and needs
+no dispensa proposal. Remote clients observe removal through the existing
+active-QSO snapshot. The retry error uses an existing event type.
+
+## PAN-138: re-check remote TX permission under the lock that charges the resend
+
+The existing-QSO keep-call path in `respond_to_cq_with` and the idempotent
+reply, recently completed re-key (FIX B), and ladder-advance paths in
+`respond_to_caller` now check remote permission under the same `qsos` write
+guard that rebinds identity and charges or advances the QSO. There is no
+`.await` between the check and the mutation. This follows
+`rearm_manual_calls_at`'s existing pattern. A denial leaves identity, call
+count, pacing timestamp and exchange state unchanged and emits no frame or
+completion event.
+
+`resend_existing_if_permitted` owns the guarded resend. Its bookkeeping
+helper, `charge_resend_locked`, is also used by the local TUI's
+`resend_last_tx`; that API keeps its behavior. The permission predicate
+remains `!remote_origin || remote_tx_permitted(key)`, so local actions do not
+depend on a remote arm. The TX worker remains the final authority at key
+time.
+
+`respond_to_caller_with_outcome` returns a `ManualCallOutcome` alongside the
+QSO id. The original `respond_to_caller` and `respond_to_cq_with` signatures
+remain wrappers, so existing callers need no changes. The Grid route uses
+the private `respond_to_cq_with_outcome` to preserve the outcome.
+`emitted_frame()` means a `MessageToSend` event was emitted, not that RF
+transmission succeeded.
+
+`maybe_auto_resend_73` retains its early permission check as a fast path and
+uses the engine outcome for the authoritative result. Every non-emitting
+result, including an engine error, restores the previous `resends` and
+`last_resend_at` and shows no "Re-sending 73" status. Both refusal paths use
+`roll_back_auto_73_commit`, which only restores the entry with the same
+`qso_id` and this attempt's `last_resend_at` stamp. A replacement completion
+or a newer commit is left alone. The existing active-QSO skip still keeps
+its charge to bound retries while the live exchange handles the station.
+
+Two authorization windows remain outside this change. The guard orders the
+check against other `qsos` holders, not against `ArmState`: the predicate
+releases the arm mutex before the mutation, and a grant can also expire on
+the clock, so the check is a point-in-time read. A disarm after the
+engine's guarded check but before key time still makes the TX worker drop
+the frame. Holding the arm mutex across the mutation would not change that,
+because the frame keys seconds later, in its own slot. PAN-75 compensates
+charged resends on active QSOs, but completed-QSO auto-73 attempts need a
+separate pending-attempt marker to distinguish them from an operator's
+same-text re-key before compensation can be extended. A ladder advance that
+passed the check records no PAN-75 attempt, so a dropped frame leaves the
+advanced state in place. An advance to 73 records the completion and emits
+`QsoCompleted` before key time, so the contact stays logged even if the TX
+worker then drops the 73. A brand-new close-step open still checks
+permission before awaited supersede and insert operations. Closing that
+window requires supersede and insert under one guard. These limits, plus the auto-73 grace-window budget reset,
+are recorded in [known gaps](2026-07-development-phases-and-gaps.md).
+
+No wire, config or persisted-schema changes are involved. The outcome type
+is internal to the unpublished workspace crates, so no dispensa proposal is
+needed.

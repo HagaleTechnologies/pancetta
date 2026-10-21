@@ -5254,7 +5254,7 @@ async fn emit_disarm_interrupt_signals(
         qso_id,
     )
     .await;
-    audit_log.append(&pancetta_agent::audit::AuditEvent {
+    audit_log.record(&pancetta_agent::audit::AuditEvent {
         ts_unix_ms: chrono::Utc::now().timestamp_millis(),
         kind: pancetta_agent::audit::AuditKind::TxDenied,
         operator_callsign,
@@ -6133,7 +6133,7 @@ pub(crate) async fn coalesce_backlog_into(
                     entry.qso_id.as_deref(),
                 )
                 .await;
-                audit_log.append(&pancetta_agent::audit::AuditEvent {
+                audit_log.record(&pancetta_agent::audit::AuditEvent {
                     // Round-11 review (Codex P2): the denial-time instant
                     // (the SAME `now_ms` `arm_snapshot` was taken under),
                     // not a fresh timestamp read whenever this detached
@@ -7826,7 +7826,7 @@ impl super::ApplicationCoordinator {
                                         let denial_reason = format!(
                                             "not armed/permitted: '{message_text}' at {frequency_offset:.0} Hz"
                                         );
-                                        audit_log.append(&pancetta_agent::audit::AuditEvent {
+                                        audit_log.record(&pancetta_agent::audit::AuditEvent {
                                             ts_unix_ms: chrono::Utc::now().timestamp_millis(),
                                             kind: pancetta_agent::audit::AuditKind::TxDenied,
                                             operator_callsign: tx_denied_operator_attribution(
@@ -10199,7 +10199,7 @@ impl super::ApplicationCoordinator {
                                             "not armed/permitted: multi-TX bundle of {} items",
                                             items.len()
                                         );
-                                        audit_log.append(&pancetta_agent::audit::AuditEvent {
+                                        audit_log.record(&pancetta_agent::audit::AuditEvent {
                                             ts_unix_ms: chrono::Utc::now().timestamp_millis(),
                                             kind: pancetta_agent::audit::AuditKind::TxDenied,
                                             operator_callsign: tx_denied_operator_attribution(
@@ -21787,7 +21787,9 @@ mod pan135_disarm_flush_tests {
 }
 #[cfg(test)]
 mod pan135_worker_disarm_tests {
-    use super::pan115_worker_gate_tests::{await_ptt_on, worker_harness, Harness};
+    use super::pan115_worker_gate_tests::{
+        await_ptt_on, worker_harness, worker_harness_with_config, Harness,
+    };
     use super::*;
     use crate::message_bus::{RigControlMessage, TxOrigin};
     use crossbeam_channel::Receiver;
@@ -21796,7 +21798,10 @@ mod pan135_worker_disarm_tests {
     const TEXT: &str = "CQ N0CALL FN20";
 
     async fn remote_playback() -> (Harness, Receiver<ComponentMessage>) {
-        let h = worker_harness().await;
+        remote_playback_with(worker_harness().await).await
+    }
+
+    async fn remote_playback_with(h: Harness) -> (Harness, Receiver<ComponentMessage>) {
         let (_, audio_rx) = h
             .coordinator
             .message_bus
@@ -21944,9 +21949,56 @@ mod pan135_worker_disarm_tests {
         assert!(!h.coordinator.ptt_active.load(Ordering::Acquire));
     }
 
+    /// PAN-104: a failing audit sink never prevents or reorders the unkey;
+    /// the interrupt's audit record is attempted after PTT-off and its
+    /// failure is surfaced through the shared audit health.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_mid_playback_disarm_unkeys_with_a_failing_audit_sink() {
+        let (h, audio_rx) =
+            remote_playback_with(worker_harness_with_config(failing_audit_config()).await).await;
+        disarm(&h);
+        let ack = flush_ack(&audio_rx).await;
+        assert_eq!(ptt_offs(&h), 1, "PTT-off precedes the flush");
+        ack.complete(true);
+        await_failed_completion(&h).await;
+        assert!(!h.coordinator.ptt_active.load(Ordering::Acquire));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !h.coordinator.audit_log().health().unavailable {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the failed audit write is surfaced");
+    }
+
+    fn failing_audit_config() -> pancetta_config::Config {
+        let mut cfg = pancetta_config::Config::default();
+        cfg.network.station_agent.audit_log_path = Some(
+            std::env::temp_dir()
+                .join(format!("pancetta-pan104-missing-{}", uuid::Uuid::new_v4()))
+                .join("audit.log")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        cfg
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remote_mid_playback_disarm_with_hamlib_backlogged_still_unkeys() {
         let (h, audio_rx) = remote_playback().await;
+        backlogged_disarm_still_unkeys(h, audio_rx).await;
+    }
+
+    /// PAN-104: the backlogged-Hamlib unkey and its flush-ack ordering hold
+    /// with a failing audit sink too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backlogged_disarm_unkeys_with_a_failing_audit_sink() {
+        let (h, audio_rx) =
+            remote_playback_with(worker_harness_with_config(failing_audit_config()).await).await;
+        backlogged_disarm_still_unkeys(h, audio_rx).await;
+    }
+
+    async fn backlogged_disarm_still_unkeys(h: Harness, audio_rx: Receiver<ComponentMessage>) {
         let bus = &h.coordinator.message_bus;
         let mut filled = 0;
         while bus
