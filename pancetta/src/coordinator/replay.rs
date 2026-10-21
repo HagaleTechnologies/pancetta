@@ -170,6 +170,79 @@ pub(crate) fn replay_preroll_wait(now: chrono::DateTime<chrono::Utc>) -> Duratio
     pancetta_core::slot::duration_until(next_boundary, now)
 }
 
+/// How often [`wait_for_qso_consumer`] re-checks the shutdown flag while the
+/// QSO component is still seeding (the flag is a plain `AtomicBool`).
+const QSO_CONSUMER_SHUTDOWN_POLL: Duration = Duration::from_millis(100);
+
+/// Why [`wait_for_qso_consumer`] returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QsoConsumerGate {
+    /// The QSO task reached its receiver loop (or exited without reaching
+    /// it): feed.
+    Released,
+    /// Shutdown was requested first: feed nothing.
+    Shutdown,
+}
+
+/// PAN-42: hold the replay feed until the QSO component's task has finished
+/// its worked-history seed and is about to drain `ComponentId::Qso`.
+///
+/// `run()` starts this feeder in `start_pipeline()` before it starts the QSO
+/// component, and under `--replay` that task rebuilds an in-memory index from
+/// the whole `qsos.adi` before its receiver loop starts. Without this wait a
+/// large logbook let decoded frames queue unread behind the seed -- processed
+/// late, or never if `REPLAY_GRACE_PERIOD` shutdown aborted the task first --
+/// so replay results depended on logbook size.
+pub(crate) async fn wait_for_qso_consumer(
+    ready: &mut tokio::sync::watch::Receiver<bool>,
+    shutdown: &std::sync::atomic::AtomicBool,
+) -> QsoConsumerGate {
+    if *ready.borrow_and_update() {
+        return QsoConsumerGate::Released;
+    }
+    info!("Replay: waiting for the QSO component to finish seeding logbook history before starting feed");
+    let started = tokio::time::Instant::now();
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return QsoConsumerGate::Shutdown;
+        }
+        match tokio::time::timeout(QSO_CONSUMER_SHUTDOWN_POLL, ready.wait_for(|r| *r)).await {
+            Ok(Ok(_)) => {
+                info!(
+                    "Replay: QSO component ready after {:.1?}; starting feed",
+                    started.elapsed()
+                );
+                return QsoConsumerGate::Released;
+            }
+            // Every sender is gone: nothing can ever release us, and a feed
+            // that never starts would hang the run instead of ending it.
+            Ok(Err(_)) => return QsoConsumerGate::Released,
+            Err(_) => continue,
+        }
+    }
+}
+
+/// PAN-42: the QSO task's half of [`wait_for_qso_consumer`]. Stores `true`
+/// on [`release`](Self::release) or on drop, whichever comes first, so an
+/// early return, panic or abort before the receiver loop still releases the
+/// feed (exactly today's behaviour on those paths) rather than hanging it.
+pub(crate) struct QsoConsumerReadyGuard(tokio::sync::watch::Sender<bool>);
+
+impl QsoConsumerReadyGuard {
+    pub(crate) fn new(ready: tokio::sync::watch::Sender<bool>) -> Self {
+        Self(ready)
+    }
+
+    /// Call immediately before the QSO task's receiver loop.
+    pub(crate) fn release(self) {}
+}
+
+impl Drop for QsoConsumerReadyGuard {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
+    }
+}
+
 impl super::ApplicationCoordinator {
     /// Feed every `.wav` file in `replay_dir` (in filename order) into the
     /// pipeline as if it were live audio: resampled to the configured audio
@@ -182,7 +255,11 @@ impl super::ApplicationCoordinator {
     /// wall-clock-keyed 15s windows. Once the directory is exhausted,
     /// waits [`REPLAY_GRACE_PERIOD`] then triggers the same graceful
     /// shutdown Ctrl+C uses, so `--replay` is a finite, self-terminating
-    /// mode suitable for scripted demos and automated tests.
+    /// mode suitable for scripted demos and automated tests. Before the
+    /// pre-roll it also waits for the QSO component to finish seeding
+    /// logbook history (see [`wait_for_qso_consumer`]), so no audio reaches
+    /// the decoder while the QSO engine is still rebuilding a large
+    /// `qsos.adi`.
     ///
     /// `health_audio_alive` is the same flag the real-device relay sets (see
     /// `audio.rs`); the replay feeder sets it too, so a `--replay` session
@@ -244,8 +321,17 @@ impl super::ApplicationCoordinator {
 
         let shutdown = self.shutdown_signal.clone();
         let last_timestamp = self.last_audio_timestamp.clone();
+        let mut qso_consumer_ready = self.qso_consumer_ready.subscribe();
 
         let handle = tokio::spawn(async move {
+            // PAN-42: seed first, then pre-roll, so the slot-boundary
+            // alignment below is computed from when the feed can really start.
+            if wait_for_qso_consumer(&mut qso_consumer_ready, &shutdown).await
+                == QsoConsumerGate::Shutdown
+            {
+                info!("Replay: shutdown requested before the QSO component was ready; nothing fed");
+                return Ok(());
+            }
             let preroll_wait = replay_preroll_wait(chrono::Utc::now());
             if preroll_wait > Duration::ZERO {
                 info!(
@@ -602,5 +688,112 @@ mod tests {
         let now = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let wait = replay_preroll_wait(now);
         assert_eq!(wait, Duration::from_secs(15));
+    }
+
+    // ---- PAN-42: QSO-consumer gate ----
+
+    #[tokio::test]
+    async fn pan42_gate_holds_the_feed_until_the_qso_consumer_is_ready() {
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sd = shutdown.clone();
+        let gate = tokio::spawn(async move { wait_for_qso_consumer(&mut rx, &sd).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !gate.is_finished(),
+            "the feed must wait while the QSO task is seeding"
+        );
+        tx.send_replace(true);
+        let out = tokio::time::timeout(Duration::from_secs(2), gate)
+            .await
+            .expect("gate must open promptly once the QSO consumer is ready")
+            .unwrap();
+        assert_eq!(out, QsoConsumerGate::Released);
+    }
+
+    #[tokio::test]
+    async fn pan42_gate_returns_shutdown_while_waiting() {
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sd = shutdown.clone();
+        let gate = tokio::spawn(async move { wait_for_qso_consumer(&mut rx, &sd).await });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        shutdown.store(true, Ordering::Release);
+        let out = tokio::time::timeout(Duration::from_secs(2), gate)
+            .await
+            .expect("Ctrl-C during the seed must not hang the feeder")
+            .unwrap();
+        assert_eq!(out, QsoConsumerGate::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn pan42_gate_passes_straight_through_once_already_ready() {
+        let (tx, mut rx) = tokio::sync::watch::channel(true);
+        let shutdown = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(
+            wait_for_qso_consumer(&mut rx, &shutdown).await,
+            QsoConsumerGate::Released
+        );
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn pan42_guard_releases_on_drop_without_explicit_release() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        {
+            let _guard = QsoConsumerReadyGuard::new(tx.clone());
+            assert!(!*rx.borrow());
+        }
+        assert!(*rx.borrow(), "an early exit must still release the feed");
+        let guard = QsoConsumerReadyGuard::new(tx);
+        guard.release();
+        assert!(*rx.borrow());
+    }
+
+    /// PAN-42: with the QSO consumer never becoming ready, the real feeder
+    /// must feed nothing and exit promptly on shutdown instead of sleeping
+    /// through the pre-roll and grace period.
+    #[tokio::test]
+    async fn pan42_feeder_feeds_nothing_while_the_qso_consumer_is_not_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_wav(&dir.path().join("a.wav"), 12000, 12000);
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut coordinator = super::super::ApplicationCoordinator::new(
+            pancetta_config::Config::default(),
+            None,
+            true,  // no_audio (start_replay_pipeline is called directly below)
+            true,  // headless
+            false, // metrics
+            9090,
+            None,                           // no WAV
+            Some(dir.path().to_path_buf()), // --replay
+            None,                           // no test-tx
+            1500.0,
+            shutdown.clone(),
+            Vec::new(),
+            std::env::temp_dir().join("pancetta-test-config.toml"),
+            true,
+        )
+        .await
+        .unwrap();
+        let (audio_tx, audio_rx) = crossbeam_channel::bounded::<Vec<f32>>(1024);
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        coordinator
+            .start_replay_pipeline(dir.path().to_path_buf(), audio_tx, alive.clone())
+            .await
+            .unwrap();
+        let (_, handle) = coordinator.named_task_handles.pop().unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        shutdown.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(3), handle)
+            .await
+            .expect("feeder must exit promptly when shut down before the QSO consumer is ready")
+            .unwrap()
+            .unwrap();
+        assert!(
+            audio_rx.try_recv().is_err(),
+            "no audio may be fed before the QSO consumer is ready"
+        );
+        assert!(!alive.load(Ordering::Relaxed));
     }
 }

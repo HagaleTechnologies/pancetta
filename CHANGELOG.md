@@ -133,6 +133,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `--replay` no longer starts feeding audio while pancetta is still loading
+  your logbook history. With a large `~/.pancetta/qsos.adi`, decodes from the
+  first slots could sit unprocessed behind that load, or be lost when the
+  replay ended, so the results of a replay depended on how big your logbook
+  was. The replay now waits until the QSO engine has its history and is
+  listening, then starts at the next slot boundary (PAN-42).
+
 - TX no longer keys late while another component is registering on the
   internal message bus (PAN-202). The key-down used to wait for that
   registration after every pre-PTT check had already passed, so a frame

@@ -3251,6 +3251,13 @@ impl super::ApplicationCoordinator {
             // — see the call site and that function's doc for why.
             let remote_tx_arm_for_auto73 = self.remote_tx_arm();
 
+            // PAN-42: released immediately before the receiver loop below,
+            // and by `Drop` on every earlier exit (startup error, panic,
+            // abort), so the `--replay` feeder never starts while this task
+            // is still seeding history -- and never waits forever either.
+            let consumer_ready =
+                super::replay::QsoConsumerReadyGuard::new(self.qso_consumer_ready.clone());
+
             tokio::spawn(async move {
                 if let Err(e) = qso_manager.start().await {
                     error!("Failed to start QSO manager: {}", e);
@@ -4361,6 +4368,11 @@ impl super::ApplicationCoordinator {
                 // is O(1) amortised and requires no locking (loop is single-task).
                 let mut caller_dedup: (u64, std::collections::HashSet<String>) =
                     (0, std::collections::HashSet::new());
+
+                // PAN-42: the receiver loop starts here, so the replay
+                // feeder may start feeding now (the history seed above has
+                // fully completed by this point).
+                consumer_ready.release();
 
                 while !shutdown.load(Ordering::Acquire) {
                     match qso_rx.try_recv() {
@@ -11090,6 +11102,54 @@ mod replay_history_seed_tests {
             wait_for_duplicate(&coordinator.cached_lookup, "K2DEF", FREQ_20M_HZ).await,
             "a replay run must seed duplicate detection from the (isolated) real ADIF"
         );
+    }
+
+    /// PAN-42: the `--replay` feeder waits on `qso_consumer_ready`, so it
+    /// must only flip once the history seed is fully applied.
+    #[tokio::test]
+    async fn pan42_qso_consumer_ready_fires_only_after_the_replay_history_seed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pancetta_dir = tmp.path().join(".pancetta");
+        tokio::fs::create_dir_all(&pancetta_dir).await.unwrap();
+        let mut adif = String::from("<ADIF_VER:5>3.1.4 <PROGRAMID:8>pancetta\n<EOH>\n");
+        for i in 0..5_000u32 {
+            let call = format!("W{}X{:04}", i % 10, i);
+            adif.push_str(&format!(
+                "<CALL:{}>{} <QSO_DATE:8>20250101 <TIME_ON:6>120000 <MODE:3>FT8 \
+                 <FREQ:9>14.074000 <BAND:3>20m <EOR>\n",
+                call.len(),
+                call
+            ));
+        }
+        adif.push_str(
+            "<CALL:5>K2DEF <QSO_DATE:8>20250101 <TIME_ON:6>120000 <MODE:3>FT8 \
+             <FREQ:9>14.074000 <BAND:3>20m <EOR>\n",
+        );
+        tokio::fs::write(pancetta_dir.join("qsos.adi"), adif)
+            .await
+            .unwrap();
+
+        let mut coordinator = test_coordinator_with_home(tmp.path()).await;
+        let mut ready = coordinator.qso_consumer_ready.subscribe();
+        assert!(!*ready.borrow());
+        coordinator.start_qso_component().await.unwrap();
+        // Current-thread test runtime + no `.await` after the spawn: the task
+        // has not been polled yet.
+        assert!(
+            !*ready.borrow(),
+            "start_qso_component returns before the seed runs"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(30), ready.wait_for(|r| *r))
+            .await
+            .expect("QSO consumer never became ready")
+            .unwrap();
+        assert!(
+            coordinator.cached_lookup.is_duplicate("K2DEF", FREQ_20M_HZ),
+            "ready must imply the history seed is already applied (no polling)"
+        );
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Rounds 4-6 tried a "snapshot the legacy `qso.db` to a temp file and
