@@ -364,6 +364,21 @@ pub fn classify_incoming_during_tx(
                                  cand_client: Option<&str>| {
         cand_origin != in_flight_origin || cand_client != in_flight_remote_client_key_id
     };
+    // PAN-136 (Codex P2 on PR #456): since PAN-136 every in-flight item
+    // carries its own binding, and a bundle's scalars are only the fold of
+    // its items (`fold_bundle_identity` keeps the first remote channel).
+    // Two bundles can therefore fold to the same binding while one matching
+    // item's binding changed — e.g. a local takeover of one of two Remote-A
+    // QSOs. Comparing only the folded scalars treats that refresh as an
+    // unchanged repeat; if A is then disarmed the old bundle aborts and the
+    // entitled refresh is gone. Every content match below must also match
+    // the in-flight item's own binding.
+    let item_binding_differs = |in_flight_item: &crate::message_bus::TransmitRequestItem,
+                                cand_origin: crate::message_bus::TxOrigin,
+                                cand_client: Option<&str>| {
+        in_flight_item.origin != cand_origin
+            || in_flight_item.remote_client_key_id.as_deref() != cand_client
+    };
 
     match candidate {
         MessageType::TransmitRequest {
@@ -382,12 +397,17 @@ pub fn classify_incoming_during_tx(
             // authorized request that happens to render the pivoted text.
             // Fall through to the normal per-QSO comparison below rather
             // than trusting the tombstone.
+            // PAN-136: also the matching in-flight item's own binding (the
+            // pivot swapped it in with the payload).
             if super::is_pivot_duplicate(
                 qso_id.as_deref(),
                 message_text,
                 *frequency_offset,
                 pivoted_once,
             ) && !authorization_differs(*origin, remote_client_key_id.as_deref())
+                && !find_in_flight(qso_id.as_deref()).is_some_and(|item| {
+                    item_binding_differs(item, *origin, remote_client_key_id.as_deref())
+                })
             {
                 return IncomingDuringTx::Drop;
             }
@@ -407,6 +427,7 @@ pub fn classify_incoming_during_tx(
                         it.qso_id.is_none()
                             && it.message_text == *message_text
                             && it.frequency_offset == *frequency_offset
+                            && !item_binding_differs(it, *origin, remote_client_key_id.as_deref())
                     }) && !authorization_differs(*origin, remote_client_key_id.as_deref());
                 if is_untracked_duplicate {
                     return IncomingDuringTx::Drop;
@@ -431,7 +452,12 @@ pub fn classify_incoming_during_tx(
                 Some(item)
                     if item.message_text == *message_text
                         && item.frequency_offset == *frequency_offset
-                        && !authorization_differs(*origin, remote_client_key_id.as_deref()) =>
+                        && !authorization_differs(*origin, remote_client_key_id.as_deref())
+                        && !item_binding_differs(
+                            item,
+                            *origin,
+                            remote_client_key_id.as_deref(),
+                        ) =>
                 {
                     IncomingDuringTx::Drop
                 }
@@ -482,6 +508,11 @@ pub fn classify_incoming_during_tx(
                             in_flight_item.message_text != it.message_text
                                 || in_flight_item.frequency_offset != it.frequency_offset
                                 || authorization_changed
+                                || item_binding_differs(
+                                    in_flight_item,
+                                    it.origin,
+                                    it.remote_client_key_id.as_deref(),
+                                )
                         }
                         None => false,
                     });
@@ -1080,6 +1111,11 @@ async fn interruptible_sleep_or_supersede(
                         fi.qso_id.as_deref().map(super::active_tx_qso_key) == key
                             && fi.message_text == it.message_text
                             && fi.frequency_offset == it.frequency_offset
+                            // PAN-136 (Codex P2 on PR #456): a same-content item
+                            // re-bound to a different authority was never sent
+                            // under that authority — not "already sent".
+                            && fi.origin == it.origin
+                            && fi.remote_client_key_id == it.remote_client_key_id
                     })
                 })
                 .collect();
@@ -1267,6 +1303,8 @@ mod interruptible_sleep_tests {
                 message_text: "in flight text".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             &pivoted_once,
             None,
@@ -1345,6 +1383,8 @@ mod interruptible_sleep_tests {
                 message_text: "in flight text".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             &pivoted_once,
             Some((&arm, Some("client-a"))),
@@ -1455,6 +1495,8 @@ mod interruptible_sleep_tests {
                 message_text: "in flight text".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             &pivoted_once,
             Some((&arm, Some("client-a"))),
@@ -1531,6 +1573,8 @@ mod interruptible_sleep_tests {
                 message_text: "in flight text".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             &pivoted_once,
             Some((&arm, Some("client-a"))),
@@ -1565,6 +1609,8 @@ mod interruptible_sleep_tests {
                 message_text: "in flight text".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             &pivoted_once,
             None, // Local frame: no arm to check
@@ -1606,6 +1652,8 @@ mod interruptible_sleep_tests {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             &pivoted_once,
             None,
@@ -1666,6 +1714,8 @@ mod interruptible_sleep_tests {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             &pivoted_once,
             None,
@@ -1692,6 +1742,8 @@ mod interruptible_sleep_tests {
                 message_text: "in flight text".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             &pivoted_once,
             None,
@@ -1746,6 +1798,8 @@ mod interruptible_sleep_tests {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             &pivoted_once,
             None,
@@ -1833,6 +1887,8 @@ mod interruptible_sleep_tests {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             &pivoted_once,
             None,
@@ -1919,6 +1975,8 @@ mod interruptible_sleep_tests {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             &pivoted_once,
             None,
@@ -1968,11 +2026,15 @@ mod interruptible_sleep_tests {
                     message_text: "KA1ABC K5ARH R-15".to_string(),
                     frequency_offset: 1500.0,
                     qso_id: Some("qso-1".to_string()),
+                    origin: crate::message_bus::TxOrigin::Local,
+                    remote_client_key_id: None,
                 },
                 crate::message_bus::TransmitRequestItem {
                     message_text: "OTHER W5AU RR73".to_string(),
                     frequency_offset: 900.0,
                     qso_id: Some("qso-other".to_string()),
+                    origin: crate::message_bus::TxOrigin::Local,
+                    remote_client_key_id: None,
                 },
             ],
             tx_parity: None,
@@ -1998,6 +2060,8 @@ mod interruptible_sleep_tests {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             &pivoted_once,
             None,
@@ -2041,6 +2105,8 @@ mod interruptible_sleep_tests {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
@@ -2065,6 +2131,8 @@ mod interruptible_sleep_tests {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             &pivoted_once,
             None,
@@ -2076,6 +2144,119 @@ mod interruptible_sleep_tests {
             inbox.try_recv().is_err(),
             "a bundle with nothing left after stripping must be dropped entirely, not requeued"
         );
+    }
+
+    /// PAN-136 (Codex P2 on PR #456): an in-flight Remote-A bundle of two
+    /// Remote-A QSOs, then a refresh where the operator has taken over one of
+    /// them locally with identical text. Both bundles fold to Remote/client-a,
+    /// so a bundle-level comparison saw nothing new: the refresh was requeued,
+    /// stripped item by item as "already sent", and dropped. Client A's disarm
+    /// then aborted the old bundle and the locally entitled refresh was gone.
+    /// The refresh must instead supersede, carrying the local item's binding.
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_sleep_keeps_a_refresh_whose_item_binding_changed_under_the_same_fold() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let bus = crate::message_bus::MessageBus::new(16).unwrap();
+        let (tx_sender, tx_rx) = bus
+            .create_channel(crate::message_bus::ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        let pivoted_once = std::collections::HashMap::new();
+        let item = |text: &str, qso: &str, origin, client: Option<&str>| {
+            crate::message_bus::TransmitRequestItem {
+                message_text: text.to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some(qso.to_string()),
+                origin,
+                remote_client_key_id: client.map(str::to_string),
+            }
+        };
+        let remote = crate::message_bus::TxOrigin::Remote;
+        let local = crate::message_bus::TxOrigin::Local;
+        let in_flight = [
+            item("SM2LIY K5ARH R-14", "qso-1", remote, Some("client-a")),
+            item("C6AVD K5ARH EM10", "qso-2", remote, Some("client-a")),
+        ];
+        let refresh_items = vec![
+            item("SM2LIY K5ARH R-14", "qso-1", remote, Some("client-a")),
+            item("C6AVD K5ARH EM10", "qso-2", local, None),
+        ];
+        assert_eq!(
+            crate::coordinator::fold_bundle_identity(&refresh_items),
+            (remote, Some("client-a".to_string())),
+            "precondition: the refresh folds to the in-flight bundle's binding"
+        );
+        tx_sender
+            .send(crate::message_bus::ComponentMessage::new(
+                crate::message_bus::ComponentId::Autonomous,
+                crate::message_bus::ComponentId::Ft8Transmitter,
+                MessageType::MultiTransmitRequest {
+                    items: refresh_items,
+                    tx_parity: None,
+                    origin: remote,
+                    remote_client_key_id: Some("client-a".to_string()),
+                },
+                std::time::Instant::now(),
+            ))
+            .unwrap();
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut st = pancetta_agent::arm::ArmState::new();
+        st.set_channel_consent(
+            pancetta_agent::arm::ConsentChannel::StationAgent,
+            true,
+            now_ms,
+        );
+        st.arm(
+            pancetta_agent::arm::VerifiedArmGrant {
+                operator_callsign: "K5ARH".to_string(),
+                ttl_ms: 120_000,
+                armed_until_ms: now_ms + 120_000,
+                heartbeat_interval_sec: 10,
+                scope_tx: true,
+                jti: "pan136-item-binding-refresh".to_string(),
+                client_key_id: "client-a".to_string(),
+            },
+            pancetta_agent::arm::ArmTime::now(),
+        );
+        let arm = Arc::new(std::sync::Mutex::new(st));
+        let arm_clone = arm.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            arm_clone
+                .lock()
+                .unwrap()
+                .disarm(chrono::Utc::now().timestamp_millis());
+        });
+
+        let inbox = super::TxInbox::new(tx_rx.clone(), Default::default());
+        let outcome = super::interruptible_sleep_or_supersede(
+            Duration::from_secs(5),
+            &shutdown,
+            &abort,
+            &inbox,
+            &in_flight,
+            &pivoted_once,
+            Some((&arm, Some("client-a"))),
+        )
+        .await;
+
+        let super::SleepOutcome::Superseded(MessageType::MultiTransmitRequest { items, .. }) =
+            outcome
+        else {
+            panic!(
+                "the re-bound refresh must supersede, not be dropped as already sent \
+                 (then lost to client A's disarm); got {outcome:?}, inbox next: {:?}",
+                inbox.try_recv().ok().map(|m| m.message_type)
+            );
+        };
+        let qso2 = items
+            .iter()
+            .find(|it| it.qso_id.as_deref() == Some("qso-2"))
+            .expect("the locally taken-over item survives");
+        assert_eq!(qso2.origin, local);
+        assert_eq!(qso2.remote_client_key_id, None);
     }
 
     /// Codex round 3 (PR #346): what a `Superseded` wait siphoned must
@@ -2139,6 +2320,8 @@ mod interruptible_sleep_tests {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             &pivoted_once,
             None,
@@ -2198,6 +2381,8 @@ mod interruptible_sleep_tests {
             message_text: "KA1ABC K5ARH R-15".to_string(),
             frequency_offset: 1500.0,
             qso_id: Some("qso-1".to_string()),
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         }]
     }
 
@@ -2323,6 +2508,8 @@ mod interruptible_sleep_tests {
                         message_text: "WINNER".into(),
                         frequency_offset: 1500.0,
                         qso_id: Some("qso-1".into()),
+                        origin: crate::message_bus::TxOrigin::Local,
+                        remote_client_key_id: None,
                     }],
                     tx_parity: None,
                     origin: crate::message_bus::TxOrigin::Local,
@@ -6337,35 +6524,27 @@ pub(crate) async fn coalesce_backlog_into(
     // every remaining entry's `tx_parity` is either `None` or equal to this
     // value.
     let bundle_parity = outcome.retained[0].tx_parity;
-    // Fail-safe origin fold: if ANY folded stream is Remote, the whole bundle is
-    // Remote so the arm gate applies. (In practice a coalesced backlog is one
-    // origin; this is defense-in-depth for a future mixed-origin backlog.)
-    let bundle_origin = if outcome
-        .retained
-        .iter()
-        .any(|e| e.origin == crate::message_bus::TxOrigin::Remote)
-    {
-        crate::message_bus::TxOrigin::Remote
-    } else {
-        crate::message_bus::TxOrigin::Local
-    };
-    // All retained remote entries now share one consent channel, and the
-    // snapshot already checked every bound identity against the armed client.
-    // Folding that identity preserves the channel for the final key-time gate.
-    let bundle_remote_client_key_id = outcome
-        .retained
-        .iter()
-        .filter(|e| e.origin == crate::message_bus::TxOrigin::Remote)
-        .find_map(|e| e.remote_client_key_id.clone());
-    let items = outcome
+    // PAN-136: each item keeps the binding of the entry it came from, so a
+    // later key-time pivot can compare and swap it per item.
+    let items: Vec<crate::message_bus::TransmitRequestItem> = outcome
         .retained
         .into_iter()
         .map(|e| crate::message_bus::TransmitRequestItem {
             message_text: e.message_text,
             frequency_offset: e.frequency_offset,
             qso_id: e.qso_id,
+            origin: e.origin,
+            remote_client_key_id: e.remote_client_key_id,
         })
         .collect();
+    // Fail-safe origin fold: if ANY folded stream is Remote, the whole bundle is
+    // Remote so the arm gate applies. (In practice a coalesced backlog is one
+    // origin; this is defense-in-depth for a future mixed-origin backlog.)
+    // All retained remote entries now share one consent channel, and the
+    // snapshot already checked every bound identity against the armed client.
+    // Folding that identity preserves the channel for the final key-time gate.
+    // PAN-136: the fold is shared with the TX worker's post-pivot re-fold.
+    let (bundle_origin, bundle_remote_client_key_id) = super::fold_bundle_identity(items.iter());
     MessageType::MultiTransmitRequest {
         items,
         tx_parity: bundle_parity,
@@ -6666,6 +6845,8 @@ async fn supersede_and_rekey_or_bundle(
             message_text: new_text,
             frequency_offset: new_freq,
             qso_id: new_qso_id.clone(),
+            origin: new_origin,
+            remote_client_key_id: new_remote_client_key_id.clone(),
         });
 
         // Enforce the configured concurrent-QSO ceiling on the QSO-KEYED
@@ -6701,13 +6882,10 @@ async fn supersede_and_rekey_or_bundle(
         // replaces it with just the new request; the retry loop's own
         // key-time gate re-verifies the new request's channel and identity
         // independently before it actually keys.
-        let identity_conflict = in_flight_origin == crate::message_bus::TxOrigin::Remote
-            && new_origin == crate::message_bus::TxOrigin::Remote
-            && match (&in_flight_remote_client_key_id, &new_remote_client_key_id) {
-                (Some(a), Some(b)) => a != b,
-                (None, Some(_)) | (Some(_), None) => true,
-                (None, None) => false,
-            };
+        let identity_conflict = super::remote_identities_conflict(
+            (in_flight_origin, in_flight_remote_client_key_id.as_deref()),
+            (new_origin, new_remote_client_key_id.as_deref()),
+        );
         if identity_conflict {
             warn!(
                 target: "pancetta::tx.policy",
@@ -6796,7 +6974,9 @@ async fn supersede_and_rekey_or_bundle(
 /// every item, except those `reenqueued` (the incoming bundle put back on the
 /// queue) carries unchanged for the same QSO under the same authorization,
 /// which will still air (PAN-75). An authorization change (origin or bound
-/// client) carries nothing: the old-authority attempt is abandoned.
+/// client) carries nothing: the old-authority attempt is abandoned. Since
+/// PAN-136 that holds per item too: a same-content item re-bound to another
+/// authority under an unchanged fold is not carried (Codex P2 on PR #456).
 fn items_abandoned_by_supersede<'a>(
     in_flight_items: &'a [crate::message_bus::TransmitRequestItem],
     in_flight_auth: (crate::message_bus::TxOrigin, Option<&str>),
@@ -6819,9 +6999,30 @@ fn items_abandoned_by_supersede<'a>(
                     && c.message_text == item.message_text
                     && (c.frequency_offset - item.frequency_offset).abs()
                         < super::PIVOT_OFFSET_EPSILON_HZ
+                    && c.origin == item.origin
+                    && c.remote_client_key_id == item.remote_client_key_id
             })
         })
         .collect()
+}
+
+/// PAN-136 (Codex P2 on PR #456): whether `reenqueued` carries `item`'s exact
+/// content for the same QSO under a different per-item binding. Such an item
+/// is abandoned under its own (old) binding, which is what tells its attempt
+/// apart from the re-bound same-text one in the PAN-75 rollback.
+fn item_rebound_by_supersede(
+    item: &crate::message_bus::TransmitRequestItem,
+    reenqueued: Option<&MessageType>,
+) -> bool {
+    let Some(MessageType::MultiTransmitRequest { items, .. }) = reenqueued else {
+        return false;
+    };
+    items.iter().any(|c| {
+        c.qso_id == item.qso_id
+            && c.message_text == item.message_text
+            && (c.frequency_offset - item.frequency_offset).abs() < super::PIVOT_OFFSET_EPSILON_HZ
+            && (c.origin != item.origin || c.remote_client_key_id != item.remote_client_key_id)
+    })
 }
 
 /// Report an in-flight bundle item a supersede abandoned. The QSO engine gets
@@ -6971,7 +7172,16 @@ async fn supersede_multi_reenqueue(
                 (origin, remote_client_key_id.as_deref()),
                 reenqueued.as_ref(),
             ) {
-                report_abandoned_bundle_item(message_bus, item, binding.clone()).await;
+                let item_binding =
+                    if binding.is_none() && item_rebound_by_supersede(item, reenqueued.as_ref()) {
+                        Some((
+                            item.origin == crate::message_bus::TxOrigin::Remote,
+                            item.remote_client_key_id.clone(),
+                        ))
+                    } else {
+                        binding.clone()
+                    };
+                report_abandoned_bundle_item(message_bus, item, item_binding).await;
             }
         }
         SupersedeOutcome::Bundle {
@@ -9101,6 +9311,9 @@ impl super::ApplicationCoordinator {
                                                     message_text: message_text.clone(),
                                                     frequency_offset,
                                                     qso_id: qso_id.clone(),
+                                                    origin,
+                                                    remote_client_key_id: remote_client_key_id
+                                                        .clone(),
                                                 },
                                             ),
                                             &pivoted_once,
@@ -9201,6 +9414,9 @@ impl super::ApplicationCoordinator {
                                                         message_text: message_text.clone(),
                                                         frequency_offset,
                                                         qso_id: qso_id.clone(),
+                                                        origin,
+                                                        remote_client_key_id: remote_client_key_id
+                                                            .clone(),
                                                     }];
                                                 match supersede_and_rekey_or_bundle(
                                                     new_request,
@@ -9571,6 +9787,9 @@ impl super::ApplicationCoordinator {
                                                     message_text: message_text.clone(),
                                                     frequency_offset,
                                                     qso_id: qso_id.clone(),
+                                                    origin,
+                                                    remote_client_key_id: remote_client_key_id
+                                                        .clone(),
                                                 },
                                             ),
                                             &pivoted_once,
@@ -9671,6 +9890,9 @@ impl super::ApplicationCoordinator {
                                                         message_text: message_text.clone(),
                                                         frequency_offset,
                                                         qso_id: qso_id.clone(),
+                                                        origin,
+                                                        remote_client_key_id: remote_client_key_id
+                                                            .clone(),
                                                     }];
                                                 match supersede_and_rekey_or_bundle(
                                                     new_request,
@@ -10911,6 +11133,9 @@ impl super::ApplicationCoordinator {
                                     // (even with every item otherwise still live) must
                                     // force the rebuild path below, since the item list
                                     // now holds different text than what Step 1 encoded.
+                                    // PAN-136: a pivot also swaps each item's binding, so
+                                    // Step 4b-rebind below re-folds the bundle's gate
+                                    // binding before any gate reads it.
                                     // PAN-145: capture each live QSO before the intent
                                     // mirror. The authoritative bump can precede its event's
                                     // delivery to that map while we build or wait for PTT.
@@ -10944,8 +11169,10 @@ impl super::ApplicationCoordinator {
                                         .filter(|(_, &live)| live)
                                         .map(|(item, _)| item.clone())
                                         .collect();
-                                    // Bundle items carry no remote binding, and bundle
-                                    // pivots compare only text and offset.
+                                    // PAN-136: each item carries its own binding, recorded
+                                    // on the replaced frame exactly as single-TX Step 4c
+                                    // does, so the PAN-75 rollback can tell it apart from
+                                    // a fresher same-text frame re-bound by the pivot.
                                     let pre_pivot_frames: std::collections::HashMap<
                                         String,
                                         (String, pancetta_qso::UnsentAttemptPayload),
@@ -10959,14 +11186,18 @@ impl super::ApplicationCoordinator {
                                                         item.message_text.clone(),
                                                         pancetta_qso::UnsentAttemptPayload {
                                                             frequency_hz: item.frequency_offset,
-                                                            remote_binding: None,
+                                                            remote_binding: Some((
+                                                                item.origin
+                                                                    == crate::message_bus::TxOrigin::Remote,
+                                                                item.remote_client_key_id.clone(),
+                                                            )),
                                                         },
                                                     ),
                                                 )
                                             })
                                         })
                                         .collect();
-                                    let (pivoted_live_items, pivots) =
+                                    let (pivoted_live_items, mut pivots) =
                                         super::pivot_bundle_items(live_items_pre, &latest_snapshot);
                                     for (qso_key, new_text, new_freq) in &pivots {
                                         info!(
@@ -11004,6 +11235,74 @@ impl super::ApplicationCoordinator {
                                         })
                                         .collect();
 
+                                    // --- Step 4b-rebind (PAN-136): re-fold the bundle's gate binding ---
+                                    // A pivot now swaps each item's binding with its payload. The bundle's
+                                    // `origin`/`remote_client_key_id` were folded at coalesce time, so after a
+                                    // pivot they can be stale in BOTH directions: a Local bundle carrying a
+                                    // newly Remote-bound frame (no arm gate at all), or client A's bundle
+                                    // carrying a frame now bound to client B (B authorized under A's gate).
+                                    // Hold any item whose new binding conflicts with the bundle's anchor (the
+                                    // existing per-item drop + re-encode below; items are still separable
+                                    // here), drop the held items' pivots so their queued requests are not
+                                    // tombstoned, and re-fold the binding every later gate, poll, supersede and
+                                    // denial attribution in this arm reads. Nothing pivoted → byte-identical.
+                                    let pivoted_any = !pivots.is_empty();
+                                    let identity_hold_mask = if pivoted_any {
+                                        super::bundle_identity_conflict_mask(
+                                            &items,
+                                            &live_mask,
+                                            (origin, remote_client_key_id.as_deref()),
+                                        )
+                                    } else {
+                                        vec![false; items.len()]
+                                    };
+                                    let mut held_keys: Vec<String> = Vec::new();
+                                    for ((item, live), &held) in items
+                                        .iter()
+                                        .zip(live_mask.iter_mut())
+                                        .zip(identity_hold_mask.iter())
+                                    {
+                                        if held {
+                                            *live = false;
+                                            if let Some(id) = item.qso_id.as_deref() {
+                                                held_keys.push(super::active_tx_qso_key(id));
+                                            }
+                                            emit_diagnostic(
+                                                &message_bus,
+                                                "tx.policy",
+                                                pancetta_core::DiagnosticLevel::Info,
+                                                format!(
+                                                    "holding multi-TX item: its remote binding changed during the pre-PTT wait and conflicts with the rest of the bundle: '{}'",
+                                                    item.message_text
+                                                ),
+                                                item.qso_id.as_deref(),
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                    pivots.retain(|(key, _, _)| !held_keys.contains(key));
+                                    let (origin, remote_client_key_id) = if pivoted_any {
+                                        let refolded = super::fold_bundle_identity(
+                                            items
+                                                .iter()
+                                                .zip(live_mask.iter())
+                                                .filter(|(_, &live)| live)
+                                                .map(|(item, _)| item),
+                                        );
+                                        if (refolded.0, refolded.1.as_deref())
+                                            != (origin, remote_client_key_id.as_deref())
+                                        {
+                                            info!(
+                                                target: "agent.tx",
+                                                "multi-TX bundle re-bound at key-time after a pivot: {:?}/{:?} -> {:?}/{:?}",
+                                                origin, remote_client_key_id, refolded.0, refolded.1
+                                            );
+                                        }
+                                        refolded
+                                    } else {
+                                        (origin, remote_client_key_id)
+                                    };
+
                                     // `encoded_qso_ids` is rebound alongside the rest as
                                     // `encoded_qso_ids_final`; it IS consulted again — the
                                     // final trim's defensive "cursor exceeded waveform"
@@ -11020,8 +11319,14 @@ impl super::ApplicationCoordinator {
                                         } else {
                                             // Partial staleness: report the dropped item(s), then
                                             // re-encode just the still-live subset.
-                                            for ((item, &live), (&parity_held, &band_dropped)) in
-                                                items.iter().zip(live_mask.iter()).zip(
+                                            for (
+                                                ((item, &live), &held_for_binding),
+                                                (&parity_held, &band_dropped),
+                                            ) in items
+                                                .iter()
+                                                .zip(live_mask.iter())
+                                                .zip(identity_hold_mask.iter())
+                                                .zip(
                                                     parity_hold_mask
                                                         .iter()
                                                         .zip(band_drop_mask.iter()),
@@ -11039,7 +11344,15 @@ impl super::ApplicationCoordinator {
                                                     // already emitted when the mask
                                                     // was folded, so this branch only
                                                     // logs.
-                                                    if band_dropped {
+                                                    if held_for_binding {
+                                                        // PAN-136: diagnostic already emitted when the hold mask was folded.
+                                                        info!(
+                                                            target: "pancetta::tx.policy",
+                                                            "holding multi-TX item at key-time for QSO {}: its remote binding changed during the pre-PTT wait and conflicts with the bundle's: '{}'",
+                                                            item.qso_id.as_deref().unwrap_or("?"),
+                                                            item.message_text
+                                                        );
+                                                    } else if band_dropped {
                                                         info!(
                                                             target: "pancetta::tx.policy",
                                                             "dropping out-of-band multi-TX item at key-time for QSO {}: '{}'",
@@ -14784,11 +15097,15 @@ mod disarm_interrupt_signal_tests {
                 message_text: "W1ABC K5ARH -10".into(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-a".into()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             },
             crate::message_bus::TransmitRequestItem {
                 message_text: "K2DEF K5ARH -15".into(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-b".into()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             },
         ];
         let outcome = bus
@@ -15274,6 +15591,8 @@ mod supersede_rekey_tests {
             message_text: "KA1ABC K5ARH R-15".to_string(),
             frequency_offset: 1000.0,
             qso_id: Some("qso-1".to_string()),
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         }];
 
         let new_request = MessageType::TransmitRequest {
@@ -15363,6 +15682,8 @@ mod supersede_rekey_tests {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Remote,
+                remote_client_key_id: in_flight_id.map(str::to_string),
             }];
 
             let new_request = MessageType::TransmitRequest {
@@ -15418,6 +15739,92 @@ mod supersede_rekey_tests {
         }
     }
 
+    /// PAN-136: a supersede bundle gives the newly added item the NEW
+    /// request's own binding (not a hard-coded `Local`), keeps the in-flight
+    /// item's binding, and still gates the bundle under the fold of both.
+    #[tokio::test]
+    async fn supersede_bundle_gives_the_new_item_the_new_requests_binding() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+
+        let now = chrono::Utc::now();
+        let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
+            pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
+            pancetta_core::slot::SLOT_NS,
+        );
+
+        let mut message_text = "OLD TEXT".to_string();
+        let mut frequency_offset = 1000.0;
+        let mut schedule = super::schedule_tx(
+            now,
+            cur_parity,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+        );
+        let ptt_active = Arc::new(AtomicBool::new(true));
+        let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+
+        let in_flight = [crate::message_bus::TransmitRequestItem {
+            message_text: "KA1ABC K5ARH R-15".to_string(),
+            frequency_offset: 1000.0,
+            qso_id: Some("qso-1".to_string()),
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
+        }];
+
+        let new_request = MessageType::TransmitRequest {
+            message_text: "CQ K5ARH EM12".to_string(),
+            frequency_offset: 1400.0,
+            qso_id: Some("qso-2".to_string()),
+            tx_parity: Some(cur_parity),
+            origin: crate::message_bus::TxOrigin::Remote,
+            remote_client_key_id: Some("client-a".to_string()),
+        };
+
+        let outcome = super::supersede_and_rekey_or_bundle(
+            new_request,
+            &mut message_text,
+            &mut frequency_offset,
+            &mut schedule,
+            &bus,
+            &ptt_active,
+            &last_ptt_on_ms,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+            pancetta_config::station::TxSelfParity::Auto,
+            now,
+            2,
+            crate::message_bus::TxOrigin::Local,
+            None,
+            &in_flight,
+        )
+        .await;
+
+        match outcome {
+            super::SupersedeOutcome::Bundle {
+                items,
+                bundle_origin,
+                bundle_remote_client_key_id,
+                ..
+            } => {
+                assert_eq!(items.len(), 2);
+                let new_item = items.last().unwrap();
+                assert_eq!(new_item.qso_id.as_deref(), Some("qso-2"));
+                assert_eq!(new_item.origin, crate::message_bus::TxOrigin::Remote);
+                assert_eq!(new_item.remote_client_key_id.as_deref(), Some("client-a"));
+                let kept = &items[0];
+                assert_eq!(kept.qso_id.as_deref(), Some("qso-1"));
+                assert_eq!(kept.origin, crate::message_bus::TxOrigin::Local);
+                assert_eq!(kept.remote_client_key_id, None);
+                assert_eq!(bundle_origin, crate::message_bus::TxOrigin::Remote);
+                assert_eq!(bundle_remote_client_key_id.as_deref(), Some("client-a"));
+            }
+            other => panic!("a Local in-flight + Remote new request must bundle, got {other:?}"),
+        }
+    }
+
     /// PAN-91 review follow-up: an in-flight stream bound to one remote
     /// client and a superseding request bound to a DIFFERENT remote client
     /// must NEVER fold into one bundle — a single bundle-level identity
@@ -15451,6 +15858,8 @@ mod supersede_rekey_tests {
             message_text: "KA1ABC K5ARH R-15".to_string(),
             frequency_offset: 1000.0,
             qso_id: Some("qso-1".to_string()),
+            origin: crate::message_bus::TxOrigin::Remote,
+            remote_client_key_id: Some("client-a".to_string()),
         }];
 
         let new_request = MessageType::TransmitRequest {
@@ -15557,11 +15966,15 @@ mod supersede_rekey_tests {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             },
             crate::message_bus::TransmitRequestItem {
                 message_text: "OTHER W5AU R-08".to_string(),
                 frequency_offset: 1400.0,
                 qso_id: Some("qso-other".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             },
         ];
 
@@ -15663,11 +16076,15 @@ mod supersede_rekey_tests {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             },
             crate::message_bus::TransmitRequestItem {
                 message_text: "OTHER W5AU R-08".to_string(),
                 frequency_offset: 1400.0,
                 qso_id: Some("qso-other".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             },
         ];
 
@@ -15762,11 +16179,15 @@ mod supersede_rekey_tests {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             },
             crate::message_bus::TransmitRequestItem {
                 message_text: "MANUAL TUNE".to_string(),
                 frequency_offset: 1400.0,
                 qso_id: None,
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             },
         ];
 
@@ -15992,6 +16413,8 @@ mod supersede_rekey_tests {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }];
 
             let new_request = MessageType::TransmitRequest {
@@ -16132,6 +16555,8 @@ mod supersede_rekey_tests {
             message_text: "KA1ABC K5ARH R-15".to_string(),
             frequency_offset: 1000.0,
             qso_id: Some("qso-1".to_string()),
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         }];
 
         // The superseding message is itself a MultiTransmitRequest — the routine
@@ -16142,11 +16567,15 @@ mod supersede_rekey_tests {
                     message_text: "JA1XYZ K5ARH 73".to_string(),
                     frequency_offset: 1300.0,
                     qso_id: Some("qso-2".to_string()),
+                    origin: crate::message_bus::TxOrigin::Local,
+                    remote_client_key_id: None,
                 },
                 crate::message_bus::TransmitRequestItem {
                     message_text: "CQ K5ARH EM12".to_string(),
                     frequency_offset: 1700.0,
                     qso_id: None,
+                    origin: crate::message_bus::TxOrigin::Local,
+                    remote_client_key_id: None,
                 },
             ],
             tx_parity: None,
@@ -16250,11 +16679,15 @@ mod supersede_rekey_tests {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             },
             crate::message_bus::TransmitRequestItem {
                 message_text: "OTHER W5AU R-08".to_string(),
                 frequency_offset: 1400.0,
                 qso_id: Some("qso-other".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             },
         ];
 
@@ -16381,11 +16814,15 @@ mod supersede_rekey_tests {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Remote,
+                remote_client_key_id: Some("client-a".to_string()),
             },
             crate::message_bus::TransmitRequestItem {
                 message_text: "OTHER W5AU R-08".to_string(),
                 frequency_offset: 1400.0,
                 qso_id: Some("qso-other".to_string()),
+                origin: crate::message_bus::TxOrigin::Remote,
+                remote_client_key_id: Some("client-a".to_string()),
             },
         ];
 
@@ -16522,6 +16959,8 @@ mod supersede_rekey_tests {
             message_text: "KA1ABC K5ARH R-15".to_string(),
             frequency_offset: 1000.0,
             qso_id: Some("qso-1".to_string()),
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         }];
 
         let now = chrono::Utc::now();
@@ -16594,11 +17033,15 @@ mod supersede_rekey_tests {
             message_text: "KA1ABC K5ARH R-15".to_string(),
             frequency_offset: 1000.0,
             qso_id: Some("qso-1".to_string()),
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         }];
         let new_item = crate::message_bus::TransmitRequestItem {
             message_text: "CQ K5ARH EM12".to_string(),
             frequency_offset: 1400.0, // 400 Hz away — well clear of the ~75 Hz minimum
             qso_id: None,
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
         let bundled: Vec<_> = in_flight
             .iter()
@@ -16630,11 +17073,15 @@ mod supersede_rekey_tests {
             message_text: "KA1ABC K5ARH R-15".to_string(),
             frequency_offset: 1000.0,
             qso_id: Some("qso-1".to_string()),
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         }];
         let new_item = crate::message_bus::TransmitRequestItem {
             message_text: "CQ K5ARH EM12".to_string(),
             frequency_offset: 1010.0, // 10 Hz away — well inside the ~75 Hz minimum, must collide
             qso_id: None,
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
         let bundled: Vec<_> = in_flight
             .iter()
@@ -16673,16 +17120,22 @@ mod supersede_rekey_tests {
                 message_text: "W1AAA K5ARH -10".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("hound-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             },
             crate::message_bus::TransmitRequestItem {
                 message_text: "W2BBB K5ARH -12".to_string(),
                 frequency_offset: 1300.0,
                 qso_id: Some("hound-2".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             },
             crate::message_bus::TransmitRequestItem {
                 message_text: "W3CCC K5ARH -08".to_string(),
                 frequency_offset: 1600.0,
                 qso_id: Some("hound-3".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             },
         ];
         let refresh = || MessageType::TransmitRequest {
@@ -16772,6 +17225,8 @@ mod supersede_rekey_tests {
             message_text: text.to_string(),
             frequency_offset: freq,
             qso_id: Some(id.to_string()),
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
         let in_flight = [
             item("W1AAA K5ARH -10", 1000.0, "hound-1"),
@@ -17844,6 +18299,103 @@ mod coalesce_tests {
         }
     }
 
+    /// PAN-136: a folded bundle's items keep the binding of the request each
+    /// came from, and the bundle-level binding is the fold of those items.
+    #[tokio::test(flavor = "current_thread")]
+    async fn backlog_bundle_items_carry_their_own_binding() {
+        use pancetta_agent::arm::{ArmState, ConsentChannel, VerifiedArmGrant};
+        use std::sync::{Arc, Mutex, RwLock};
+
+        let bus = MessageBus::new(16).unwrap();
+        let (_, _deferred_rx) = bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        let (backlog_tx, backlog_rx) = crossbeam_channel::unbounded();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut state = ArmState::new();
+        state.set_channel_consent(ConsentChannel::StationAgent, true, now_ms);
+        state.arm(
+            VerifiedArmGrant {
+                operator_callsign: "K5ARH".into(),
+                ttl_ms: 120_000,
+                armed_until_ms: now_ms + 120_000,
+                heartbeat_interval_sec: 10,
+                scope_tx: true,
+                jti: "pan136-item-binding".into(),
+                client_key_id: "client-a".into(),
+            },
+            pancetta_agent::arm::ArmTime::now(),
+        );
+        let arm = Arc::new(Mutex::new(state));
+
+        // Head: a Local manual send. Backlog: a Remote/client-a QSO frame.
+        let head = MessageType::TransmitRequest {
+            message_text: "CQ K5ARH EM10".into(),
+            frequency_offset: 900.0,
+            qso_id: None,
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
+        };
+        backlog_tx
+            .send(ComponentMessage::new(
+                ComponentId::Ft8Transmitter,
+                ComponentId::Ft8Transmitter,
+                MessageType::TransmitRequest {
+                    message_text: "SM2LIY K5ARH R-14".into(),
+                    frequency_offset: 1500.0,
+                    qso_id: Some("agent-qso".into()),
+                    tx_parity: None,
+                    origin: crate::message_bus::TxOrigin::Remote,
+                    remote_client_key_id: Some("client-a".into()),
+                },
+                Instant::now(),
+            ))
+            .unwrap();
+
+        let backlog_inbox = super::TxInbox::new(backlog_rx, Default::default());
+        let result = coalesce_backlog_into(
+            head,
+            &backlog_inbox,
+            &bus,
+            &Arc::new(RwLock::new(liveset(&["agent-qso"]))),
+            &Arc::new(RwLock::new(HashSet::new())),
+            2,
+            &arm,
+            &pancetta_agent::audit::AuditLog::new(audit_tmp()),
+            &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
+        )
+        .await;
+
+        let MessageType::MultiTransmitRequest {
+            items,
+            origin,
+            remote_client_key_id,
+            ..
+        } = result
+        else {
+            panic!("a Local manual send + an armed Remote QSO frame must fold: {result:?}");
+        };
+        assert_eq!(items.len(), 2);
+        let manual = items.iter().find(|it| it.qso_id.is_none()).unwrap();
+        assert_eq!(manual.origin, crate::message_bus::TxOrigin::Local);
+        assert_eq!(manual.remote_client_key_id, None);
+        let remote = items
+            .iter()
+            .find(|it| it.qso_id.as_deref() == Some("agent-qso"))
+            .unwrap();
+        assert_eq!(remote.origin, crate::message_bus::TxOrigin::Remote);
+        assert_eq!(remote.remote_client_key_id.as_deref(), Some("client-a"));
+        assert_eq!(origin, crate::message_bus::TxOrigin::Remote);
+        assert_eq!(remote_client_key_id.as_deref(), Some("client-a"));
+        assert_eq!(
+            (origin, remote_client_key_id),
+            super::super::fold_bundle_identity(items.iter())
+        );
+    }
+
     /// PAN-91 review follow-up: a backlog containing entries bound to TWO
     /// different remote clients must never fold into one bundle authorized
     /// under a single client's identity — the entry bound to whichever
@@ -18511,6 +19063,8 @@ mod protocol_tx_tests {
             message_text: text.to_string(),
             frequency_offset: freq,
             qso_id: qso_id.map(|s| s.to_string()),
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         }
     }
 
@@ -19336,6 +19890,8 @@ mod classifier_tests {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             &pivoted_once,
             crate::message_bus::TxOrigin::Local,
@@ -19363,6 +19919,8 @@ mod classifier_tests {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             &pivoted_once,
             crate::message_bus::TxOrigin::Local,
@@ -19386,6 +19944,8 @@ mod classifier_tests {
                 message_text: "CQ K5ARH EM12".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: None,
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             &pivoted_once,
             crate::message_bus::TxOrigin::Local,
@@ -19409,6 +19969,8 @@ mod classifier_tests {
                 message_text: "TEST TEST TEST".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: None,
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             &pivoted_once,
             crate::message_bus::TxOrigin::Local,
@@ -19439,6 +20001,8 @@ mod classifier_tests {
                 message_text: "VP2MAA W5AU EM10".to_string(),
                 frequency_offset: 1450.0,
                 qso_id: Some("qso-vp2maa".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             &pivoted_once,
             crate::message_bus::TxOrigin::Local,
@@ -19465,11 +20029,15 @@ mod classifier_tests {
                 message_text: "FIRST W5AU R-10".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-first".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             },
             crate::message_bus::TransmitRequestItem {
                 message_text: "SECOND W5AU R-08".to_string(),
                 frequency_offset: 1400.0,
                 qso_id: Some("qso-second".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             },
         ];
         let outcome = super::classify_incoming_during_tx(
@@ -19500,6 +20068,8 @@ mod classifier_tests {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             &pivoted_once,
             crate::message_bus::TxOrigin::Local,
@@ -19532,6 +20102,8 @@ mod classifier_tests {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Remote,
+                remote_client_key_id: Some("client-a".to_string()),
             }],
             &pivoted_once,
             // In-flight side is bound to a Remote client — candidate above
@@ -19559,6 +20131,8 @@ mod classifier_tests {
                 message_text: "IN-FLIGHT W5AU R-01".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-in-flight".to_string()),
+                origin: crate::message_bus::TxOrigin::Remote,
+                remote_client_key_id: Some("client-b".to_string()),
             }],
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Remote,
@@ -19570,6 +20144,8 @@ mod classifier_tests {
                 message_text: "IN-FLIGHT W5AU R-01".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-in-flight".to_string()),
+                origin: crate::message_bus::TxOrigin::Remote,
+                remote_client_key_id: Some("client-a".to_string()),
             }],
             &pivoted_once,
             crate::message_bus::TxOrigin::Remote,
@@ -19580,6 +20156,111 @@ mod classifier_tests {
             "an unchanged overlap under DIFFERENT authorization must supersede, not Requeue \
              — got {outcome:?}"
         );
+    }
+
+    fn bound_item(
+        text: &str,
+        qso: &str,
+        origin: crate::message_bus::TxOrigin,
+        client: Option<&str>,
+    ) -> crate::message_bus::TransmitRequestItem {
+        crate::message_bus::TransmitRequestItem {
+            message_text: text.to_string(),
+            frequency_offset: 1000.0,
+            qso_id: Some(qso.to_string()),
+            origin,
+            remote_client_key_id: client.map(str::to_string),
+        }
+    }
+
+    /// PAN-136 (Codex P2 on PR #456): same folded bundle binding, same text,
+    /// but one overlapping item's own binding changed (local takeover of one
+    /// of two Remote-A QSOs). That is a changed overlap, not a repeat.
+    #[test]
+    fn classify_supersedes_bundle_when_one_items_binding_changed_under_the_same_fold() {
+        use crate::message_bus::TxOrigin::{Local, Remote};
+        let pivoted_once = std::collections::HashMap::new();
+        let candidate = MessageType::MultiTransmitRequest {
+            items: vec![
+                bound_item("A W5AU R-01", "qso-1", Remote, Some("client-a")),
+                bound_item("B W5AU R-02", "qso-2", Local, None),
+            ],
+            tx_parity: None,
+            origin: Remote,
+            remote_client_key_id: Some("client-a".to_string()),
+        };
+        let outcome = super::classify_incoming_during_tx(
+            &candidate,
+            &[
+                bound_item("A W5AU R-01", "qso-1", Remote, Some("client-a")),
+                bound_item("B W5AU R-02", "qso-2", Remote, Some("client-a")),
+            ],
+            &pivoted_once,
+            Remote,
+            Some("client-a"),
+        );
+        assert!(
+            matches!(outcome, super::IncomingDuringTx::Supersede { .. }),
+            "a per-item binding change must supersede, got {outcome:?}"
+        );
+    }
+
+    /// PAN-136 (Codex P2 on PR #456): the single-request arm compares the
+    /// matching in-flight item's own binding too. In a Remote-A bundle that
+    /// carries a Local item, a client-A request for that QSO with identical
+    /// content re-binds it; it is not an exact duplicate.
+    #[test]
+    fn classify_supersedes_request_rebinding_an_in_flight_item_under_the_same_fold() {
+        use crate::message_bus::TxOrigin::{Local, Remote};
+        let pivoted_once = std::collections::HashMap::new();
+        let candidate = MessageType::TransmitRequest {
+            message_text: "B W5AU R-02".to_string(),
+            frequency_offset: 1000.0,
+            qso_id: Some("qso-2".to_string()),
+            tx_parity: None,
+            origin: Remote,
+            remote_client_key_id: Some("client-a".to_string()),
+        };
+        let outcome = super::classify_incoming_during_tx(
+            &candidate,
+            &[
+                bound_item("A W5AU R-01", "qso-1", Remote, Some("client-a")),
+                bound_item("B W5AU R-02", "qso-2", Local, None),
+            ],
+            &pivoted_once,
+            Remote,
+            Some("client-a"),
+        );
+        assert!(
+            matches!(outcome, super::IncomingDuringTx::Supersede { .. }),
+            "a re-bound same-content request must supersede, got {outcome:?}"
+        );
+    }
+
+    /// Control: identical content AND identical per-item bindings under the
+    /// same fold is still the unchanged repeat PAN-73 round 6 filters out.
+    #[test]
+    fn classify_requeues_bundle_with_unchanged_items_and_bindings() {
+        use crate::message_bus::TxOrigin::Remote;
+        let pivoted_once = std::collections::HashMap::new();
+        let items = vec![
+            bound_item("A W5AU R-01", "qso-1", Remote, Some("client-a")),
+            bound_item("B W5AU R-02", "qso-2", Remote, Some("client-a")),
+        ];
+        let candidate = MessageType::MultiTransmitRequest {
+            items: items.clone(),
+            tx_parity: None,
+            origin: Remote,
+            remote_client_key_id: Some("client-a".to_string()),
+        };
+        let outcome = super::classify_incoming_during_tx(
+            &candidate,
+            &items,
+            &pivoted_once,
+            Remote,
+            Some("client-a"),
+        );
+        assert_eq!(outcome, super::IncomingDuringTx::Requeue);
     }
 
     /// Codex round 3 (PR #346): a stuck-DX QSO can re-render the SAME text
@@ -19604,6 +20285,8 @@ mod classifier_tests {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             &pivoted_once,
             crate::message_bus::TxOrigin::Local,
@@ -19631,6 +20314,8 @@ mod classifier_tests {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             &pivoted_once,
             crate::message_bus::TxOrigin::Local,
@@ -19666,6 +20351,8 @@ mod classifier_tests {
                 message_text: "KA1ABC K5ARH RR73".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Remote,
+                remote_client_key_id: Some("client-a".to_string()),
             }],
             &pivoted_once,
             // In-flight side is bound to client-a — candidate above is
@@ -19709,6 +20396,8 @@ mod classifier_tests {
                 message_text: "KA1ABC K5ARH RR73".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             &pivoted_once,
             crate::message_bus::TxOrigin::Local,
@@ -19734,6 +20423,8 @@ mod classifier_tests {
                 message_text: "OTHER1 W5AU R-05".to_string(),
                 frequency_offset: 900.0,
                 qso_id: Some("qso-other1".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
@@ -19745,6 +20436,8 @@ mod classifier_tests {
                 message_text: "IN-FLIGHT W5AU R-01".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-in-flight".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             &pivoted_once,
             crate::message_bus::TxOrigin::Local,
@@ -19769,11 +20462,15 @@ mod classifier_tests {
                     message_text: "OTHER1 W5AU R-05".to_string(),
                     frequency_offset: 900.0,
                     qso_id: Some("qso-other1".to_string()),
+                    origin: crate::message_bus::TxOrigin::Local,
+                    remote_client_key_id: None,
                 },
                 crate::message_bus::TransmitRequestItem {
                     message_text: "IN-FLIGHT W5AU RR73".to_string(),
                     frequency_offset: 1000.0,
                     qso_id: Some("qso-in-flight".to_string()),
+                    origin: crate::message_bus::TxOrigin::Local,
+                    remote_client_key_id: None,
                 },
             ],
             tx_parity: None,
@@ -19786,6 +20483,8 @@ mod classifier_tests {
                 message_text: "IN-FLIGHT W5AU R-01".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-in-flight".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             &pivoted_once,
             crate::message_bus::TxOrigin::Local,
@@ -19815,6 +20514,8 @@ mod classifier_tests {
                     message_text: "OTHER1 W5AU R-05".to_string(),
                     frequency_offset: 900.0,
                     qso_id: Some("qso-other1".to_string()),
+                    origin: crate::message_bus::TxOrigin::Local,
+                    remote_client_key_id: None,
                 },
                 // Byte-identical to the in-flight item below — no fresher
                 // content for the currently-keyed QSO.
@@ -19822,6 +20523,8 @@ mod classifier_tests {
                     message_text: "IN-FLIGHT W5AU R-01".to_string(),
                     frequency_offset: 1000.0,
                     qso_id: Some("qso-in-flight".to_string()),
+                    origin: crate::message_bus::TxOrigin::Local,
+                    remote_client_key_id: None,
                 },
             ],
             tx_parity: None,
@@ -19834,6 +20537,8 @@ mod classifier_tests {
                 message_text: "IN-FLIGHT W5AU R-01".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-in-flight".to_string()),
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
             }],
             &pivoted_once,
             crate::message_bus::TxOrigin::Local,
@@ -19865,14 +20570,15 @@ mod pan115_worker_gate_tests {
 
     // `pub(crate)` fields/helpers: shared with the sibling PAN-118 worker-gate
     // test module (`pan118_worker_band_plan_tests`), which reuses this harness
-    // exactly as the PAN-115 plan's shape intends.
+    // exactly as the PAN-115 plan's shape intends, and with the PAN-136
+    // bundle-binding module (`pan136_bundle_binding_worker_tests`).
     pub(crate) struct Harness {
         pub(crate) coordinator: ApplicationCoordinator,
         shutdown: Arc<AtomicBool>,
         pub(crate) hamlib_rx: Receiver<ComponentMessage>,
         pub(crate) autonomous_rx: Receiver<ComponentMessage>,
         pub(crate) tui_rx: Receiver<ComponentMessage>,
-        qso_rx: Receiver<ComponentMessage>,
+        pub(crate) qso_rx: Receiver<ComponentMessage>,
     }
 
     impl Drop for Harness {
@@ -20307,6 +21013,8 @@ mod pan115_worker_gate_tests {
                     message_text: text.into(),
                     frequency_offset,
                     qso_id: Some(id.clone()),
+                    origin: crate::message_bus::TxOrigin::Local,
+                    remote_client_key_id: None,
                 },
             )
             .collect();
@@ -20645,6 +21353,8 @@ mod pan115_worker_gate_tests {
                         message_text: "K1ABC N0CALL -10".into(),
                         frequency_offset: 1500.0,
                         qso_id: Some("qso-sv".into()),
+                        origin: crate::message_bus::TxOrigin::Local,
+                        remote_client_key_id: None,
                     }],
                     tx_parity: None,
                     origin: TxOrigin::Local,
@@ -20853,6 +21563,8 @@ mod report_transmit_complete_tests {
             message_text: text.to_string(),
             frequency_offset: 1500.0,
             qso_id: Some(q.to_string()),
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
         let in_flight = vec![item("qa", "K1A N0CALL -07"), item("qb", "K2B N0CALL R-10")];
         let reenqueued = MessageType::MultiTransmitRequest {
@@ -20884,6 +21596,18 @@ mod report_transmit_complete_tests {
             items_abandoned_by_supersede(&in_flight, remote, Some(&reenqueued)).len(),
             2
         );
+        // PAN-136 (Codex P2 on PR #456): nor does a per-item re-bind under an
+        // unchanged fold — qb's same-text frame now bound to client-a.
+        let mut rebound = reenqueued.clone();
+        if let MessageType::MultiTransmitRequest { items, .. } = &mut rebound {
+            items[1].origin = crate::message_bus::TxOrigin::Remote;
+            items[1].remote_client_key_id = Some("client-a".to_string());
+        }
+        let abandoned = items_abandoned_by_supersede(&in_flight, local, Some(&rebound));
+        assert_eq!(abandoned.len(), 2);
+        assert!(item_rebound_by_supersede(&in_flight[1], Some(&rebound)));
+        assert!(!item_rebound_by_supersede(&in_flight[0], Some(&rebound)));
+        assert!(!item_rebound_by_supersede(&in_flight[1], Some(&reenqueued)));
     }
 
     /// An abandoned bundle item is rolled back by its own offset, so a newer
@@ -20897,6 +21621,8 @@ mod report_transmit_complete_tests {
             message_text: "K1A N0CALL -07".to_string(),
             frequency_offset: 1250.0,
             qso_id: Some("qa".to_string()),
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         };
         report_abandoned_bundle_item(&bus, &item, Some((true, Some("client-a".into())))).await;
         assert!(matches!(
@@ -21286,11 +22012,15 @@ mod pan118_worker_band_plan_tests {
                             message_text: "CQ N0CALL FN20".to_string(),
                             frequency_offset: a_offset,
                             qso_id: None,
+                            origin: crate::message_bus::TxOrigin::Local,
+                            remote_client_key_id: None,
                         },
                         TransmitRequestItem {
                             message_text: "CQ N0CALL EN27".to_string(),
                             frequency_offset: b_offset,
                             qso_id: None,
+                            origin: crate::message_bus::TxOrigin::Local,
+                            remote_client_key_id: None,
                         },
                     ],
                     tx_parity: None,
@@ -21438,6 +22168,291 @@ mod pan118_worker_band_plan_tests {
         assert_eq!(done[0], Some(false), "item A must complete as failed");
         assert_eq!(done[1], Some(false), "item B must complete as failed");
         assert!(!ptt_on, "no SetPtt(true) for a fully out-of-band bundle");
+    }
+}
+
+/// PAN-136: a multi-TX bundle whose item is re-bound during the pre-PTT wait
+/// (Step 4b-pivot swaps the item's binding with its payload) is gated under
+/// the RE-FOLDED binding, through the real TX worker over a real `MessageBus`.
+/// Before PAN-136 the bundle kept its coalesce-time binding: a `Local` bundle
+/// keyed a frame now bound to an unarmed remote client, and client A's bundle
+/// aired client B's frame under A's gate.
+#[cfg(test)]
+mod pan136_bundle_binding_worker_tests {
+    use super::pan115_worker_gate_tests::{worker_harness, Harness};
+    use crate::message_bus::{
+        ComponentId, ComponentMessage, MessageType, QsoMessage, RigControlMessage,
+        TransmitRequestItem, TxOrigin,
+    };
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    const QA_TEXT: &str = "SM2LIY K5ARH R-14";
+    const QB_TEXT: &str = "C6AVD K5ARH EM10";
+
+    /// Dial on 20m, `qa` and `qb` live, and (optionally) a fresher intent for
+    /// `qa` at its own 1000 Hz offset carrying `(text, origin, client key)`.
+    fn setup(h: &Harness, intent: Option<(&str, TxOrigin, Option<&str>)>) {
+        h.coordinator
+            .operating_frequency_hz
+            .store(14_074_000, Ordering::Relaxed);
+        {
+            let mut live = h.coordinator.active_tx_qsos.write().unwrap();
+            live.insert(super::super::active_tx_qso_key("qa"));
+            live.insert(super::super::active_tx_qso_key("qb"));
+        }
+        if let Some((text, origin, key)) = intent {
+            h.coordinator.latest_tx_intent.write().unwrap().insert(
+                super::super::active_tx_qso_key("qa"),
+                super::super::LatestTxIntent {
+                    message_text: text.to_string(),
+                    frequency_offset: 1000.0,
+                    tx_parity: None,
+                    origin,
+                    remote_client_key_id: key.map(str::to_string),
+                },
+            );
+        }
+    }
+
+    /// A two-item bundle whose items carry the bundle's own binding, sent
+    /// straight to the worker (no coalescing), so the pivot fires at Step
+    /// 4b-pivot after the slot wait.
+    async fn send_bundle(h: &Harness, origin: TxOrigin, key: Option<&str>) {
+        let item = |text: &str, offset: f64, qso: &str| TransmitRequestItem {
+            message_text: text.to_string(),
+            frequency_offset: offset,
+            qso_id: Some(qso.to_string()),
+            origin,
+            remote_client_key_id: key.map(str::to_string),
+        };
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Autonomous,
+                ComponentId::Ft8Transmitter,
+                MessageType::MultiTransmitRequest {
+                    items: vec![item(QA_TEXT, 1000.0, "qa"), item(QB_TEXT, 1600.0, "qb")],
+                    tx_parity: None,
+                    origin,
+                    remote_client_key_id: key.map(str::to_string),
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    struct Collected {
+        completions: Vec<Option<bool>>,
+        ptt_on: bool,
+        diagnostics: Vec<String>,
+        frames_not_sent: Vec<QsoMessage>,
+    }
+
+    /// Drain every receiver until a `TransmitComplete` has arrived for each
+    /// of `texts` (or `within` elapses).
+    async fn collect(h: &Harness, texts: &[&str], within: Duration) -> Collected {
+        let mut c = Collected {
+            completions: vec![None; texts.len()],
+            ptt_on: false,
+            diagnostics: Vec::new(),
+            frames_not_sent: Vec::new(),
+        };
+        let deadline = Instant::now() + within;
+        let drain = |c: &mut Collected| {
+            while let Ok(msg) = h.hamlib_rx.try_recv() {
+                c.ptt_on |= matches!(
+                    msg.message_type,
+                    MessageType::RigControl(RigControlMessage::SetPtt { state: true })
+                );
+            }
+            while let Ok(msg) = h.tui_rx.try_recv() {
+                if let MessageType::DiagnosticEvent { text, .. } = msg.message_type {
+                    c.diagnostics.push(text);
+                }
+            }
+            while let Ok(msg) = h.qso_rx.try_recv() {
+                if let MessageType::QsoMessage(q @ QsoMessage::TxFrameNotSent { .. }) =
+                    msg.message_type
+                {
+                    c.frames_not_sent.push(q);
+                }
+            }
+            while let Ok(msg) = h.autonomous_rx.try_recv() {
+                if let MessageType::TransmitComplete {
+                    success,
+                    message_text,
+                    ..
+                } = msg.message_type
+                {
+                    if let Some(slot) = texts.iter().position(|t| *t == message_text) {
+                        if c.completions[slot].is_none() {
+                            c.completions[slot] = Some(success);
+                        }
+                    }
+                }
+            }
+        };
+        while Instant::now() < deadline && c.completions.iter().any(|d| d.is_none()) {
+            drain(&mut c);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Anything the worker emitted alongside the last completion.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drain(&mut c);
+        c
+    }
+
+    /// Arm `client_key` over the station-agent channel, as a verified
+    /// `txArm` would, and keep the dead-man window open with a heartbeat
+    /// every 3 s (`HEARTBEAT_TIMEOUT_MS` is 30 s; a bundle waits up to one
+    /// slot pair). Abort the returned task when the test ends.
+    fn arm_client(h: &Harness, client_key: &str) -> tokio::task::JoinHandle<()> {
+        use pancetta_agent::arm::{ArmTime, ConsentChannel, VerifiedArmGrant};
+        let jti = format!("pan136-{client_key}");
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        {
+            let mut arm = h.coordinator.remote_tx_arm.lock().unwrap();
+            arm.set_channel_consent(ConsentChannel::StationAgent, true, now_ms);
+            arm.arm(
+                VerifiedArmGrant {
+                    operator_callsign: "K5ARH".to_string(),
+                    ttl_ms: 120_000,
+                    armed_until_ms: now_ms + 120_000,
+                    heartbeat_interval_sec: 5,
+                    scope_tx: true,
+                    jti: jti.clone(),
+                    client_key_id: client_key.to_string(),
+                },
+                ArmTime::now(),
+            );
+        }
+        let arm = h.coordinator.remote_tx_arm.clone();
+        tokio::spawn(async move {
+            let mut seq = 0u64;
+            loop {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                seq += 1;
+                arm.lock().unwrap().heartbeat(&jti, seq, ArmTime::now());
+            }
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_bundle_item_rebound_to_unarmed_client_is_denied() {
+        let h = worker_harness().await;
+        setup(&h, Some((QA_TEXT, TxOrigin::Remote, Some("client-B"))));
+        send_bundle(&h, TxOrigin::Local, None).await;
+        let c = collect(&h, &[QA_TEXT, QB_TEXT], Duration::from_secs(50)).await;
+        assert!(
+            !c.ptt_on,
+            "a bundle carrying a frame re-bound to an unarmed client must not key"
+        );
+        assert_eq!(c.completions, vec![Some(false), Some(false)]);
+        assert!(
+            c.diagnostics.iter().any(|d| {
+                d.contains(
+                "Remote TX denied (arm went stale during slot wait: 'SM2LIY K5ARH R-14' at 1000 Hz)"
+            )
+            }),
+            "the re-folded bundle must be denied by the key-time arm gate: {:?}",
+            c.diagnostics
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_bundle_item_pivoting_to_unarmed_remote_text_is_denied() {
+        let h = worker_harness().await;
+        setup(
+            &h,
+            Some(("SM2LIY K5ARH 73", TxOrigin::Remote, Some("client-B"))),
+        );
+        send_bundle(&h, TxOrigin::Local, None).await;
+        let c = collect(&h, &["SM2LIY K5ARH 73", QB_TEXT], Duration::from_secs(50)).await;
+        assert!(
+            !c.ptt_on,
+            "a bundle whose item pivoted to an unarmed client's text must not key"
+        );
+        assert_eq!(c.completions, vec![Some(false), Some(false)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn armed_clients_bundle_holds_item_rebound_to_another_client() {
+        let h = worker_harness().await;
+        let heartbeat = arm_client(&h, "client-A");
+        setup(&h, Some((QA_TEXT, TxOrigin::Remote, Some("client-B"))));
+        send_bundle(&h, TxOrigin::Remote, Some("client-A")).await;
+        let c = collect(&h, &[QA_TEXT, QB_TEXT], Duration::from_secs(50)).await;
+        heartbeat.abort();
+        assert!(c.ptt_on, "client A's own frame must still key");
+        assert_eq!(
+            c.completions,
+            vec![Some(false), Some(true)],
+            "client B's re-bound frame is held; client A's sibling airs"
+        );
+        assert!(
+            c.diagnostics.iter().any(|d| d
+                == "holding multi-TX item: its remote binding changed during the pre-PTT wait and conflicts with the rest of the bundle: 'SM2LIY K5ARH R-14'"),
+            "the held item must be named: {:?}",
+            c.diagnostics
+        );
+        assert!(
+            !c.diagnostics.iter().any(|d| d.contains("for ended QSO")),
+            "a held item must not be mislabelled as an ended QSO: {:?}",
+            c.diagnostics
+        );
+        let replaced = c.frames_not_sent.iter().find_map(|q| match q {
+            QsoMessage::TxFrameNotSent {
+                qso_id,
+                message_text,
+                replaced: Some(p),
+            } if qso_id == "qa" && message_text == QA_TEXT => Some(p.clone()),
+            _ => None,
+        });
+        let replaced = replaced.unwrap_or_else(|| {
+            panic!(
+                "qa's replaced frame must be rolled back: {:?}",
+                c.frames_not_sent
+            )
+        });
+        assert_eq!(replaced.frequency_hz, 1000.0);
+        assert_eq!(
+            replaced.remote_binding,
+            Some((true, Some("client-A".to_string()))),
+            "the replaced frame carries its own pre-pivot binding"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_bundle_item_rebound_to_armed_client_keys_under_it() {
+        let h = worker_harness().await;
+        let heartbeat = arm_client(&h, "client-B");
+        setup(&h, Some((QA_TEXT, TxOrigin::Remote, Some("client-B"))));
+        send_bundle(&h, TxOrigin::Local, None).await;
+        let c = collect(&h, &[QA_TEXT, QB_TEXT], Duration::from_secs(50)).await;
+        heartbeat.abort();
+        assert!(
+            c.ptt_on,
+            "the re-folded bundle passes client B's gate: {:?}",
+            c.diagnostics
+        );
+        assert_eq!(c.completions, vec![Some(true), Some(true)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_bundle_without_pivot_is_still_denied_unarmed() {
+        let h = worker_harness().await;
+        setup(&h, None);
+        send_bundle(&h, TxOrigin::Remote, Some("client-B")).await;
+        let c = collect(&h, &[QA_TEXT, QB_TEXT], Duration::from_secs(50)).await;
+        assert!(!c.ptt_on, "an unarmed Remote bundle must not key");
+        assert!(
+            c.diagnostics.iter().any(|d| d
+                .contains("Remote TX denied (not armed/permitted): multi-TX bundle of 2 items")),
+            "{:?}",
+            c.diagnostics
+        );
     }
 }
 
