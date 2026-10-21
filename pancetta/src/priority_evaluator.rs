@@ -171,6 +171,10 @@ pub struct CachedStationLookup {
     /// priority scoring. Values are pre-validated to a canonical 2-letter
     /// code; an unvalidatable value is dropped, never stored.
     station_states: Arc<RwLock<HashMap<String, String>>>,
+    /// Local contacts across all bands and modes; independent of state knowledge.
+    worked_states: Arc<RwLock<HashSet<String>>>,
+    grid_history_available: Arc<RwLock<bool>>,
+    state_history_available: Arc<RwLock<bool>>,
 }
 
 impl Default for CachedStationLookup {
@@ -196,6 +200,9 @@ impl CachedStationLookup {
             network_last_seen: Arc::new(RwLock::new(HashMap::new())),
             excluded_dxcc_prefixes: Arc::new(RwLock::new(HashSet::new())),
             station_states: Arc::new(RwLock::new(HashMap::new())),
+            worked_states: Arc::new(RwLock::new(HashSet::new())),
+            grid_history_available: Arc::new(RwLock::new(false)),
+            state_history_available: Arc::new(RwLock::new(false)),
         }
     }
 
@@ -308,14 +315,89 @@ impl CachedStationLookup {
     /// Seed from `(callsign, state)` pairs loaded at startup, oldest first —
     /// later rows overwrite earlier ones so the most recent log entry wins.
     pub fn seed_states_from_list(&self, pairs: Vec<(String, String)>) {
-        let before = self.station_states.read().len();
+        let mut latest = HashMap::new();
         for (call, state) in pairs {
-            self.record_state(&call, &state);
+            self.record_worked_state(&call, &state);
+            if let (Some(key), Some(code)) = (
+                resolved_identity(&call),
+                pancetta_tui::dxcc::normalize_us_state(&state),
+            ) {
+                latest.insert(key, code.to_string());
+            }
         }
-        tracing::info!(
-            "CachedStationLookup: seeded {} station state(s) from the QSO log",
-            self.station_states.read().len().saturating_sub(before)
-        );
+        // History is chronological, but must not overwrite a live observation
+        // received while the startup query was in flight.
+        let mut states = self.station_states.write();
+        for (call, state) in latest {
+            states.entry(call).or_insert(state);
+        }
+    }
+
+    /// Record a completed contact's validated US subdivision, not an observation.
+    pub fn record_worked_state(&self, callsign: &str, state: &str) {
+        if !pancetta_tui::dxcc::entity_for_callsign(callsign)
+            .is_some_and(pancetta_tui::dxcc::is_us_related_entity)
+        {
+            return;
+        }
+        if let Some(code) = pancetta_tui::dxcc::normalize_us_state(state) {
+            self.worked_states.write().insert(code.to_string());
+        }
+    }
+
+    /// Local all-time worked status. Display callers must also check availability.
+    pub fn is_state_needed(&self, state: &str) -> bool {
+        pancetta_tui::dxcc::normalize_us_state(state)
+            .is_some_and(|code| !self.worked_states.read().contains(code))
+    }
+
+    /// Suppress display claims before opening history, including supervisor restarts.
+    pub fn reset_display_history(&self) {
+        *self.grid_history_available.write() = false;
+        *self.state_history_available.write() = false;
+    }
+
+    /// Shared by live and replay startup. Seed additively, then publish availability.
+    pub async fn seed_display_history(&self, db: &pancetta_qso::async_database::QsoDatabase) {
+        self.reset_display_history();
+        match db.try_get_worked_bands_and_grids().await {
+            Ok(pairs) => {
+                self.seed_worked_grids_from_list(pairs);
+                *self.grid_history_available.write() = true;
+            }
+            Err(error) => tracing::warn!(%error, "DX Hunter grid history unavailable"),
+        }
+        match db.try_get_worked_callsigns_and_states().await {
+            Ok(pairs) => {
+                self.seed_states_from_list(pairs);
+                *self.state_history_available.write() = true;
+            }
+            Err(error) => tracing::warn!(%error, "DX Hunter state history unavailable"),
+        }
+    }
+
+    /// The completion event's local worked-history update, also used by headless tests.
+    pub fn record_completed_contact(&self, metadata: &pancetta_qso::QsoMetadata) {
+        let Some(call) = metadata.their_callsign.as_deref() else {
+            return;
+        };
+        let band = pancetta_qso::utils::frequency_to_band(metadata.frequency);
+        self.record_worked(call, &band);
+        if let Some(grid) = metadata.grids.theirs.as_deref() {
+            self.record_worked_grid(grid, &band);
+        }
+        self.record_completed_state(metadata);
+    }
+
+    /// Also called after QRZ enriches an already-completed contact (session only).
+    pub fn record_completed_state(&self, metadata: &pancetta_qso::QsoMetadata) {
+        if let (Some(call), Some(state)) = (
+            metadata.their_callsign.as_deref(),
+            metadata.their_state.as_deref(),
+        ) {
+            self.record_state(call, state);
+            self.record_worked_state(call, state);
+        }
     }
 
     /// The station's known US state, if any. `None` when unknown — the
@@ -445,6 +527,48 @@ impl CachedStationLookup {
             .entry(band.to_uppercase())
             .or_default()
             .insert(field);
+    }
+}
+
+impl pancetta_tui::dx_need::DxNeedLookup for CachedStationLookup {
+    fn lookup_need(
+        &self,
+        callsign: &str,
+        grid: Option<&str>,
+        known_state: Option<&str>,
+        current_frequency_hz: f64,
+    ) -> pancetta_tui::dx_need::DxNeedStatus {
+        use pancetta_tui::{
+            dx_need::{canonical_grid_square, DxNeedStatus},
+            dxcc,
+        };
+        let Some(call) = resolved_identity(callsign) else {
+            return DxNeedStatus::default();
+        };
+        let grid_available = *self.grid_history_available.read();
+        let state_available = *self.state_history_available.read();
+        let known_band = current_frequency_hz.is_finite()
+            && current_frequency_hz > 0.0
+            && !pancetta_qso::utils::frequency_to_band(current_frequency_hz).ends_with("MHZ");
+        let grid_needed = grid
+            .filter(|_| grid_available && known_band)
+            .and_then(canonical_grid_square)
+            .map(|square| self.is_grid_needed_on_band(&square, current_frequency_hz));
+        let state = self.state_for(&call).or_else(|| {
+            known_state
+                .and_then(dxcc::normalize_us_state)
+                .map(str::to_string)
+        });
+        let eligible = dxcc::entity_for_callsign(&call).is_some_and(dxcc::is_us_related_entity);
+        let state_needed = state
+            .as_deref()
+            .filter(|_| state_available && eligible)
+            .map(|code| self.is_state_needed(code));
+        DxNeedStatus {
+            grid_needed,
+            state,
+            state_needed,
+        }
     }
 }
 
@@ -658,6 +782,147 @@ impl WorkedStationLookup for CachedStationLookup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn display_adapter_gates_availability_and_reuses_grid_predicate() {
+        use pancetta_tui::dx_need::DxNeedLookup;
+        let l = CachedStationLookup::new();
+        assert!(l.is_grid_needed_on_band("EM34", 14_074_000.0));
+        assert_eq!(
+            l.lookup_need("W5ABC", Some("EM34"), Some("AR"), 14_074_000.0)
+                .grid_needed,
+            None
+        );
+        let db = pancetta_qso::async_database::QsoDatabase::new_in_memory()
+            .await
+            .unwrap();
+        l.seed_display_history(&db).await;
+        l.record_worked_grid("em34cd", "20m");
+        for grid in ["EM34", "em34ab", "FN42", "PM95"] {
+            for hz in [14_074_000.0, 7_074_000.0] {
+                assert_eq!(
+                    l.lookup_need("W5ABC", Some(grid), None, hz).grid_needed,
+                    Some(l.is_grid_needed_on_band(grid, hz))
+                );
+            }
+        }
+        for grid in [
+            "",
+            "EM",
+            "EM3",
+            "ZZ99",
+            "ééé",
+            "EM3é",
+            "EM34☃",
+            "EM34garbage",
+        ] {
+            assert_eq!(
+                l.lookup_need("W5ABC", Some(grid), None, 14_074_000.0)
+                    .grid_needed,
+                None,
+                "{grid}"
+            );
+        }
+        for hz in [0.0, -1.0, f64::NAN, f64::INFINITY, 123_000_000.0] {
+            assert_eq!(
+                l.lookup_need("W5ABC", Some("EM34"), None, hz).grid_needed,
+                None
+            );
+        }
+        assert_eq!(
+            l.lookup_need("<...>", Some("EM34"), Some("AR"), 14_074_000.0),
+            Default::default()
+        );
+        assert_eq!(
+            l.lookup_need("JA1ABC", None, Some("CA"), 14_074_000.0)
+                .state_needed,
+            None
+        );
+        l.record_state("W5ABC", "AR");
+        let need = l.lookup_need("<W5ABC>", None, Some("CA"), 14_074_000.0);
+        assert_eq!(need.state.as_deref(), Some("AR"));
+        assert_eq!(need.state_needed, Some(true));
+        l.record_worked_state("W1AW", "AR");
+        assert_eq!(
+            l.lookup_need("W5ABC", None, None, 7_074_000.0).state_needed,
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn display_history_availability_requires_successful_seeds() {
+        let l = CachedStationLookup::new();
+        assert!(!*l.grid_history_available.read());
+        assert!(!*l.state_history_available.read());
+        let db = pancetta_qso::async_database::QsoDatabase::new_in_memory()
+            .await
+            .unwrap();
+        l.seed_display_history(&db).await;
+        assert!(*l.grid_history_available.read());
+        assert!(*l.state_history_available.read());
+        l.record_worked_state("W1AW", "AR");
+        l.record_worked_grid("EM34", "20m");
+        db.close().await;
+        l.seed_display_history(&db).await;
+        assert!(!*l.grid_history_available.read());
+        assert!(!*l.state_history_available.read());
+        assert!(!l.is_state_needed("AR"));
+        assert!(!l.is_grid_needed_on_band("EM34", 14_074_000.0));
+        let reopened = pancetta_qso::async_database::QsoDatabase::new_in_memory()
+            .await
+            .unwrap();
+        l.seed_display_history(&reopened).await;
+        assert!(*l.grid_history_available.read());
+        assert!(*l.state_history_available.read());
+        assert!(
+            !l.is_state_needed("AR"),
+            "empty seed preserves live additions"
+        );
+    }
+
+    #[test]
+    fn worked_states_are_contacts_not_observations() {
+        let l = CachedStationLookup::new();
+        l.record_state("W5ABC", " ar ");
+        assert!(l.is_state_needed("AR"));
+        l.record_worked_state("<W5ABC>", " ar ");
+        l.record_worked_state("W5ABC", "AR");
+        assert!(!l.is_state_needed("ar"));
+        assert_eq!(l.worked_states.read().len(), 1);
+        for (call, state) in [
+            ("JA1ABC", "CA"),
+            ("<...>", "CA"),
+            ("???", "CA"),
+            ("W1AW", "XX"),
+        ] {
+            l.record_worked_state(call, state);
+        }
+        assert!(l.is_state_needed("CA"));
+        for code in ["AK", "HI", "AS", "GU", "MP", "PR", "VI", "DC"] {
+            l.record_worked_state("W1AW", code);
+            assert!(!l.is_state_needed(code));
+        }
+        assert!(l.is_state_needed("MD"), "DC remains distinct from MD");
+        assert!(!l.is_state_needed("invalid"));
+    }
+
+    #[test]
+    fn historical_states_accumulate_and_seeding_preserves_live_contacts() {
+        let l = CachedStationLookup::new();
+        l.record_worked_state("W1AW", "TX");
+        l.record_worked_grid("EM34", "20m");
+        l.seed_states_from_list(vec![
+            ("W5ABC".into(), "AR".into()),
+            ("W5ABC".into(), "CA".into()),
+        ]);
+        l.seed_worked_grids_from_list(vec![("40m".into(), "CM87".into())]);
+        for code in ["AR", "CA", "TX"] {
+            assert!(!l.is_state_needed(code));
+        }
+        assert_eq!(l.state_for("W5ABC").as_deref(), Some("CA"));
+        assert!(!l.is_grid_needed_on_band("em34ab", 14_074_000.0));
+        assert!(l.is_grid_needed_on_band("EM34", 7_074_000.0));
+    }
 
     #[test]
     fn test_band_aware_duplicate() {

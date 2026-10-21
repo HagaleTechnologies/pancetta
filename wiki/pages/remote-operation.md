@@ -8,6 +8,7 @@ sources:
   - pancetta/src/coordinator/remote_gateway/mod.rs
   - pancetta/src/coordinator/station_agent/mod.rs
   - pancetta-agent/src/arm.rs
+  - pancetta-agent/src/audit.rs
   - pancetta-config/src/network.rs
   - docs/DECISIONS/remote-operation.md
 verified:
@@ -40,6 +41,13 @@ cited, not restated. Spec:
   a pure AND of armed ∧ scope ∧ TTL ∧ heartbeat-fresh ∧ consent ∧ ¬kill; the
   coordinator gate [[fail-closed-arm-gate]] fails CLOSED and ANDs under
   `TxPolicy`.
+- **Gotcha: a remote QSO's identity outlives its controller (PAN-137).**
+  `current_tx_side()` and `active_qso_count()` count every active QSO regardless
+  of arm state, so a displaced client's QSO still holds the TX window and a
+  slot. The station agent ends these QSOs only on a controller identity change
+  via `RemoteControllerChanged`. A disarm, heartbeat lapse, release or disconnect
+  leaves them for the same client to resume. Keep parity admission independent
+  of arm state: a momentarily unarmed QSO must keep its window.
 - **Gotcha: relay IO must stay bounded (PAN-102).** Never add an untimed
   `block_in_place` wait to `RealWsConn`: code inside `block_in_place` cannot
   be cancelled, so an unbounded wait can hold the session task past
@@ -47,9 +55,32 @@ cited, not restated. Spec:
   transport failure must end the whole session (the socket is shared by every
   peer), which then disarms and reconnects.
 
+- **Gotcha: check and charge under one guard (PAN-138).** An engine path
+  that charges a budget or mutates an existing QSO on a remote caller's
+  behalf must evaluate `remote_tx_permitted` inside the same `qsos` write
+  guard as the mutation, with no `.await` between them. See
+  `resend_existing_if_permitted`, `advance_existing_qso_to_step` and
+  `rearm_manual_calls_at`. A caller that charges its own budget before
+  calling the engine must use `respond_to_caller_with_outcome` and roll
+  back when `!emitted_frame()` or the call returns an error.
+
 ## Why it is shaped this way
 
 Read and TX are split so the low-risk view can ship freely while the TX path
 carries the full Part-97 safety burden: fail-closed, dead-man heartbeat,
 local-consent, and no autonomous-over-remote. The agent remains the final TX
 authority; no remote QSO frame is ever emitted as `TxOrigin::Local`.
+
+## Gotcha: the audit log is shared, bounded, and never on the safety path (PAN-104)
+
+Every `AuditLog` clone shares one writer mutex, rate buckets, counters and
+health, so rotation stays bounded across the station agent, the TX worker and
+config reload. Never write audit records while holding the arm mutex or an
+eligibility lock: collect the `ArmEffect`s under the lock, publish the disarm
+and the list change, then call `apply_arm_effects`. The two revocation paths
+(`revoke_static_allow_list_entries` and the authorization poll) used to audit
+under the arm lock, so a slow disk delayed both the revocation and every TX
+re-check queued behind it. TX-worker interrupts release PTT before the audit
+write. Audit failure is a readiness warning only, never a TX mute cause, and a
+valid arm proceeds. The normative text is in
+`docs/DECISIONS/remote-operation.md` (PAN-104) and `docs/CONFIG.md`.

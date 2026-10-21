@@ -196,3 +196,10 @@ retrigger against an already-in-flight Atno-tier preemption.
 2. On-air validation of Phase 1 (meatspace-pending item).
 3. PR 2 (Phase 2): autonomous Atno/PerBandDxccNew trigger, resume-after marker, config flag
    (default off). Enabled only after operator review of PR 1's on-air behavior.
+
+## Amendment (PAN-73 follow-up, 2026-10-17)
+
+Messages the worker takes off its channel during a mid-TX wait, and the
+supersede content it produces, go back on the front of its inbox
+(`TxInbox::requeue_front`), never back through the bus. The front is read
+before the channel. See `docs/DECISIONS/tx-scheduling.md`.

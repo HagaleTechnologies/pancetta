@@ -267,9 +267,9 @@ pub enum IncomingDuringTx {
     /// apart from another QSO's own routine autonomous message — both are a
     /// `TransmitRequest`/`MultiTransmitRequest` with `qso_id: Some(..)` and
     /// no other provenance. Siphon it (same mechanism as a non-candidate
-    /// message, e.g. a `TuneRequest`) so it's re-enqueued in arrival order
-    /// once this wait ends and picked up on the worker's very next dequeue
-    /// — not lost, just not instant.
+    /// message, e.g. a `TuneRequest`) so it's put back at the front of the
+    /// worker's inbox in arrival order once this wait ends and picked up on
+    /// the worker's very next dequeue — not lost, just not instant.
     Requeue,
     /// A genuinely different request. Abort the in-flight transmission and
     /// attempt to re-key with this content.
@@ -798,6 +798,168 @@ async fn drop_frames_for_clock_jump(
     }
 }
 
+/// Messages the TX worker took out of its own `Ft8Transmitter` channel and
+/// has not handled yet (PAN-73 follow-up, PR #346 round-4 finding). Held
+/// here instead of being sent back through the bus: a re-send queued behind
+/// any producer that sent in the meantime, and dropped silently when the
+/// channel was full. Only the worker reads or writes it. The coordinator
+/// owns it so a supervised worker restart (PAN-119) keeps it.
+#[derive(Clone, Default)]
+pub(crate) struct TxRequeue(
+    std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<ComponentMessage>>>,
+);
+
+/// Above this many held messages the worker logs a warning. Nothing is
+/// dropped; real traffic holds a handful.
+const TX_REQUEUE_HIGH_WATER: usize = 1024;
+
+/// The TX worker's inbox: its [`TxRequeue`] front, then its channel.
+/// Everything in the front was received before anything still in the
+/// channel, so reading the front first keeps arrival order without any
+/// synchronization with producers.
+pub(crate) struct TxInbox {
+    rx: crossbeam_channel::Receiver<ComponentMessage>,
+    requeue: TxRequeue,
+}
+
+impl TxInbox {
+    pub(crate) fn new(
+        rx: crossbeam_channel::Receiver<ComponentMessage>,
+        requeue: TxRequeue,
+    ) -> Self {
+        Self { rx, requeue }
+    }
+
+    fn front(&self) -> std::sync::MutexGuard<'_, std::collections::VecDeque<ComponentMessage>> {
+        // Only the worker locks this and it never panics while holding it;
+        // the queue is still valid if a panic elsewhere poisoned it.
+        self.requeue
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The oldest unhandled message: the front first, then the channel.
+    pub(crate) fn try_recv(&self) -> Result<ComponentMessage, crossbeam_channel::TryRecvError> {
+        let held = self.front().pop_front();
+        match held {
+            Some(message) => Ok(message),
+            None => self.rx.try_recv(),
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.front().len() + self.rx.len()
+    }
+
+    /// Put `messages` back ahead of everything else, in the given order.
+    /// Synchronous and infallible: no await, no bus, no capacity.
+    pub(crate) fn requeue_front(&self, messages: Vec<ComponentMessage>) {
+        if messages.is_empty() {
+            return;
+        }
+        let mut front = self.front();
+        let before = front.len();
+        let mut restored = std::collections::VecDeque::from(messages);
+        restored.append(&mut front);
+        *front = restored;
+        if before <= TX_REQUEUE_HIGH_WATER && front.len() > TX_REQUEUE_HIGH_WATER {
+            warn!(
+                target: "pancetta::tx.policy",
+                "TX worker is holding {} unhandled messages",
+                front.len()
+            );
+        }
+    }
+}
+
+/// A message from the TX worker to itself, for [`TxInbox::requeue_front`].
+fn self_message(message_type: MessageType) -> ComponentMessage {
+    ComponentMessage::new(
+        ComponentId::Ft8Transmitter,
+        ComponentId::Ft8Transmitter,
+        message_type,
+        Instant::now(),
+    )
+}
+
+#[cfg(test)]
+mod tx_inbox_tests {
+    use super::*;
+
+    fn tune(hz: f64) -> ComponentMessage {
+        self_message(MessageType::TuneRequest {
+            duration_secs: 5,
+            tone_offset_hz: hz,
+        })
+    }
+    fn hz(m: ComponentMessage) -> f64 {
+        match m.message_type {
+            MessageType::TuneRequest { tone_offset_hz, .. } => tone_offset_hz,
+            other => panic!("expected TuneRequest, got {other:?}"),
+        }
+    }
+
+    /// The front is read before the channel and keeps the order it was given.
+    #[test]
+    fn requeue_front_is_read_before_the_channel_in_order() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(tune(3000.0)).unwrap();
+        let inbox = TxInbox::new(rx, TxRequeue::default());
+        inbox.requeue_front(vec![tune(1000.0), tune(2000.0)]);
+        inbox.requeue_front(vec![tune(500.0)]);
+        assert_eq!(inbox.len(), 4);
+        let got: Vec<f64> = std::iter::from_fn(|| inbox.try_recv().ok())
+            .map(hz)
+            .collect();
+        assert_eq!(got, vec![500.0, 1000.0, 2000.0, 3000.0]);
+    }
+
+    /// AC2 for the structure itself: nothing is dropped past the warning mark.
+    #[test]
+    fn requeue_front_keeps_every_message_past_the_high_water_mark() {
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let inbox = TxInbox::new(rx, TxRequeue::default());
+        let n = 2 * TX_REQUEUE_HIGH_WATER + 1;
+        inbox.requeue_front((0..n).map(|i| tune(i as f64)).collect());
+        assert_eq!(inbox.len(), n);
+        let got: Vec<f64> = std::iter::from_fn(|| inbox.try_recv().ok())
+            .map(hz)
+            .collect();
+        assert_eq!(got, (0..n).map(|i| i as f64).collect::<Vec<_>>());
+    }
+
+    /// The worker's `Disconnected => break` must not strand held messages.
+    #[test]
+    fn held_messages_come_out_before_a_disconnected_channel_reports_it() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let inbox = TxInbox::new(rx, TxRequeue::default());
+        inbox.requeue_front(vec![tune(1000.0)]);
+        drop(tx);
+        assert!(matches!(inbox.try_recv().map(hz), Ok(v) if v == 1000.0));
+        assert!(matches!(
+            inbox.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn a_poisoned_requeue_lock_still_yields_its_messages() {
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let requeue = TxRequeue::default();
+        let inbox = TxInbox::new(rx, requeue.clone());
+        inbox.requeue_front(vec![tune(1000.0)]);
+        let poisoner = requeue.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.0.lock().unwrap();
+            panic!("poison the requeue lock");
+        })
+        .join();
+        assert!(requeue.0.is_poisoned());
+        assert!(matches!(inbox.try_recv().map(hz), Ok(v) if v == 1000.0));
+    }
+}
+
 /// Outcome of `interruptible_sleep_or_supersede`.
 ///
 /// Deliberately does NOT derive `PartialEq`/`Eq`: `Superseded` carries the
@@ -806,7 +968,7 @@ async fn drop_frames_for_clock_jump(
 /// docs/superpowers/sdd/task-5-report.md) derive `PartialEq`. Tests that
 /// need to assert on a `Superseded` payload pattern-match and compare
 /// individual fields instead of using `assert_eq!` on the whole enum.
-// `Superseded(MessageType, _)` is intentionally not boxed: this keeps the
+// `Superseded(MessageType)` is intentionally not boxed: this keeps the
 // public shape exactly as specified (a later task's re-key consumer wants
 // the full `MessageType`, including `MultiTransmitRequest`'s `items` list —
 // see task-5-report.md), at the cost of a size-difference lint between
@@ -823,39 +985,21 @@ pub enum SleepOutcome {
     /// PAN-92: a Remote in-flight frame's arm gate stopped permitting TX
     /// mid-transmission (explicit disarm, dead-man/heartbeat loss, TTL
     /// expiry, or local-kill) — the caller must stop keying, never re-key.
-    ///
-    /// The contained `Vec<ComponentMessage>` (round-3 review, Codex P2) is
-    /// whatever this wait had already siphoned before the disarm was
-    /// detected — an unrelated local/autonomous `TransmitRequest` or a TUI
-    /// `TuneRequest`, say. It is NOT drained from `tx_rx` further (that
-    /// would cost an extra channel operation on the safety-critical path)
-    /// and it is NOT re-enqueued by this function — the caller MUST
-    /// re-enqueue it itself via [`reenqueue_pending`], but only AFTER
-    /// sending PTT off and disarming its `PttGuard`, mirroring
-    /// `Superseded`'s ordering rule. Silently dropping it (this function's
-    /// round-2 behavior) could lose a local QSO frame or operator command
-    /// for no reason other than an unrelated remote transmission being
-    /// disarmed.
-    AbortedByDisarm(Vec<ComponentMessage>),
+    /// Whatever the wait had already siphoned is back in the inbox front
+    /// (a local splice, no await before the caller's PTT-off).
+    AbortedByDisarm,
     /// A qualifying request arrived; abort_current_tx was set by this
     /// function itself. Caller should attempt to re-key with the contained
     /// message.
     ///
-    /// The second field (PAN-73 round 4, Codex) carries every message this
-    /// wait siphoned or found left over in `tx_rx` — deliberately NOT
-    /// re-enqueued by this function for this outcome. The caller MUST
-    /// re-enqueue them itself, and only AFTER it finishes enqueuing its own
-    /// supersede-derived content (the re-keyed frame, or a folded bundle):
-    /// re-enqueuing them first would let lower-priority siphoned/leftover
-    /// traffic (e.g. a different QSO's routine message) jump the queue
-    /// ahead of the thing that actually won this supersede — an operator's
-    /// deliberate abort+re-key, delayed by an entire extra transmission.
-    /// Every other outcome has no competing caller-side enqueue to lose a
-    /// race against, so this function reenqueues immediately for those.
-    Superseded(MessageType, Vec<ComponentMessage>),
+    /// Everything the wait siphoned is already back in the inbox front. A
+    /// caller that enqueues supersede-derived content (a folded bundle)
+    /// puts it at the front with [`TxInbox::requeue_front`], ahead of that
+    /// leftover traffic (PAN-73 round 4).
+    Superseded(MessageType),
 }
 
-/// Like `interruptible_sleep`, but also polls `tx_rx` for a qualifying
+/// Like `interruptible_sleep`, but also polls `inbox` for a qualifying
 /// incoming request (Task 4's `classify_incoming_during_tx`) on every 50ms
 /// tick. A qualifying request sets `abort` itself (mirroring the operator
 /// F8 path) and is returned via `SleepOutcome::Superseded` for the caller to
@@ -863,7 +1007,7 @@ pub enum SleepOutcome {
 /// duplicate or pivot tombstone) is silently consumed — same as it would have
 /// been had it reached the main dequeue loop naturally — and the sleep keeps
 /// waiting. One for a QSO that isn't any of `in_flight_items` (PAN-73 round
-/// 2) is siphoned and re-enqueued exactly like a non-candidate message
+/// 2) is siphoned and put back exactly like a non-candidate message
 /// below, rather than either superseding or being discarded.
 ///
 /// I1: a message that is NEITHER a `TransmitRequest` NOR a
@@ -872,8 +1016,8 @@ pub enum SleepOutcome {
 /// the channel until the worker's next dequeue and be handled by its own
 /// top-level arm. `crossbeam_channel::Receiver` has no peek, so we must consume
 /// such a message to inspect its type; it is then SIPHONED aside and
-/// re-enqueued (in arrival order) to the worker's own channel when the sleep
-/// ends, so the main loop processes it after the current TX arm returns.
+/// put back (in arrival order) at the front of the worker's inbox when the
+/// sleep ends, so the main loop processes it after the current TX arm returns.
 ///
 /// See docs/superpowers/specs/2026-07-22-mid-tx-abort-restart-design.md,
 /// "Abort + re-key mechanics."
@@ -882,8 +1026,7 @@ async fn interruptible_sleep_or_supersede(
     total: Duration,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     abort: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    tx_rx: &crossbeam_channel::Receiver<ComponentMessage>,
-    message_bus: &MessageBus,
+    inbox: &TxInbox,
     in_flight_items: &[crate::message_bus::TransmitRequestItem],
     pivoted_once: &std::collections::HashMap<String, (String, f64)>,
     // PAN-92: the in-flight frame's own origin/identity, re-checked against
@@ -900,8 +1043,8 @@ async fn interruptible_sleep_or_supersede(
 
     // Non-supersede-candidate messages pulled off the channel during a poll
     // (I1). Held here rather than bounced straight back so a single try_recv
-    // per tick can't keep re-reading the same one; flushed to the worker's own
-    // channel, in order, once the sleep concludes.
+    // per tick can't keep re-reading the same one; put back at the inbox
+    // front, in order, once the sleep concludes.
     let mut siphoned: Vec<ComponentMessage> = Vec::new();
 
     // PAN-73 round 7 (Codex): a requeued bundle can carry an item that's
@@ -959,7 +1102,7 @@ async fn interruptible_sleep_or_supersede(
     // keying the stale in-flight frame for the whole slot. Draining
     // everything currently available before going back to the caller (and
     // ultimately to `sleep()`) closes that window.
-    let check_once = |tx_rx: &crossbeam_channel::Receiver<ComponentMessage>,
+    let check_once = |inbox: &TxInbox,
                       siphoned: &mut Vec<ComponentMessage>|
      -> Option<SleepOutcome> {
         loop {
@@ -975,10 +1118,10 @@ async fn interruptible_sleep_or_supersede(
             // transmission ALREADY keyed, not just block the next one.
             if let Some((arm, client_key_id)) = remote_tx_arm {
                 if !remote_tx_permitted_for(arm, pancetta_agent::arm::ArmTime::now, client_key_id) {
-                    return Some(SleepOutcome::AbortedByDisarm(std::mem::take(siphoned)));
+                    return Some(SleepOutcome::AbortedByDisarm);
                 }
             }
-            let Ok(message) = tx_rx.try_recv() else {
+            let Ok(message) = inbox.try_recv() else {
                 return None;
             };
             let is_supersede_candidate = matches!(
@@ -1018,29 +1161,26 @@ async fn interruptible_sleep_or_supersede(
                     }
                     IncomingDuringTx::Supersede { .. } => {
                         abort.store(true, Ordering::Release);
-                        // `pending` is filled in by the caller of `check_once`
-                        // once the full siphoned+remainder list is known —
-                        // see the post-loop handling below.
-                        return Some(SleepOutcome::Superseded(message.message_type, Vec::new()));
+                        return Some(SleepOutcome::Superseded(message.message_type));
                     }
                 }
             } else {
                 // Not a supersede candidate (e.g. TuneRequest). Siphon it so
-                // it is re-enqueued after the sleep instead of being lost.
+                // it is put back after the sleep instead of being lost.
                 siphoned.push(message);
             }
         }
     };
 
     let outcome = 'sleep: {
-        if let Some(outcome) = check_once(tx_rx, &mut siphoned) {
+        if let Some(outcome) = check_once(inbox, &mut siphoned) {
             break 'sleep outcome;
         }
 
         let chunk = Duration::from_millis(50);
         let deadline = tokio::time::Instant::now() + total;
         while tokio::time::Instant::now() < deadline {
-            if let Some(outcome) = check_once(tx_rx, &mut siphoned) {
+            if let Some(outcome) = check_once(inbox, &mut siphoned) {
                 break 'sleep outcome;
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1049,124 +1189,16 @@ async fn interruptible_sleep_or_supersede(
         SleepOutcome::Completed
     };
 
-    // PAN-92 review round 2 (Codex P1): return to the caller IMMEDIATELY on
-    // a detected disarm, WITHOUT the AWAITED reenqueue loop further down —
-    // the caller's very first action is sending PTT off, and no awaited
-    // work in this function may delay that. Round-3 review (Codex P2): the
-    // already-siphoned messages travel WITH this outcome (see the
-    // variant's doc) rather than being dropped — the caller re-enqueues
-    // them itself once PTT is safely off.
-    //
-    // Round-8 review found that skipping the remainder drain broke FIFO
-    // order (a later `tx_rx` arrival left untouched would be observed
-    // before the earlier, already-siphoned one). Round-9 review then found
-    // that draining it HERE, before returning, reintroduced the round-2
-    // problem: with concurrent producers continually refilling the
-    // channel, this `while let Ok(...) = tx_rx.try_recv()` loop has no
-    // iteration bound, so the caller's first PTT-off send could be
-    // delayed indefinitely under sustained traffic. Squaring both means
-    // draining CANNOT happen here — it happens in the caller, AFTER PTT
-    // is already off, using the exact same `drain_and_merge_pending`
-    // helper this match arm no longer calls.
-    if matches!(outcome, SleepOutcome::AbortedByDisarm(_)) {
-        return outcome;
-    }
-
-    // PAN-73 round 3 (Codex): whatever the loop stopped for (shutdown,
-    // operator abort, or a same-QSO supersede that returns immediately
-    // without draining further) can leave later-arrived messages sitting
-    // UNTOUCHED in `tx_rx` — still in their true relative order, since
-    // crossbeam's FIFO guarantees anything left in the channel was queued
-    // at or after anything already drained into `siphoned`. Draining that
-    // remainder HERE, before re-enqueuing, and re-enqueuing `siphoned`
-    // (strictly earlier) ahead of it preserves true arrival order.
-    // Re-appending only `siphoned` to an already-nonempty live tail (the
-    // previous approach) could otherwise put an earlier-drained message
-    // behind a later message that was never touched, inverting the order
-    // `coalesce_backlog_into` and the bundle arms rely on.
-    let mut remainder: Vec<ComponentMessage> = Vec::new();
-    while let Ok(message) = tx_rx.try_recv() {
-        remainder.push(message);
-    }
-    let pending: Vec<ComponentMessage> = siphoned.into_iter().chain(remainder).collect();
-
-    // PAN-73 round 4 (Codex): a `Superseded` outcome hands `pending` to the
-    // CALLER instead of re-enqueuing here — the caller's own supersede-
-    // derived content (a re-keyed frame or a folded bundle) must reach the
-    // channel FIRST, ahead of this lower-priority leftover traffic, or an
-    // operator's deliberate abort+re-key gets delayed behind it. Every
-    // other outcome has no such competing enqueue, so reenqueue immediately
-    // as before.
-    if let SleepOutcome::Superseded(msg, _) = outcome {
-        return SleepOutcome::Superseded(msg, pending);
-    }
-    for msg in pending {
-        let reenqueue = ComponentMessage::new(
-            ComponentId::Ft8Transmitter,
-            ComponentId::Ft8Transmitter,
-            msg.message_type,
-            Instant::now(),
-        );
-        if let Err(e) = message_bus.send_message(reenqueue).await {
-            warn!(
-                "supersede sleep: failed to re-enqueue non-candidate message: {}",
-                e
-            );
-        }
-    }
-
+    // Put the siphoned messages back at the inbox front for every outcome.
+    // They were received before anything still in the channel, so the front
+    // keeps true arrival order without draining the channel (PAN-73 round 3)
+    // and without a bus re-send that a concurrent producer could overtake or
+    // a full channel could drop (PAN-73 follow-up). The splice is
+    // synchronous and bounded by what this wait already holds, so it adds
+    // no await and no channel drain ahead of a disarm's PTT-off (rounds 2
+    // and 9). A `Superseded` caller puts its own content in front of these.
+    inbox.requeue_front(siphoned);
     outcome
-}
-
-/// Re-enqueue a `SleepOutcome::Superseded` pending list to the worker's own
-/// channel, in the arrival order `interruptible_sleep_or_supersede` already
-/// established. The CALLER invokes this only AFTER it finishes enqueuing
-/// its own supersede-derived content (a re-keyed frame or a folded bundle)
-/// — see that outcome variant's doc comment for why the ordering matters
-/// (PAN-73 round 4, Codex).
-async fn reenqueue_pending(message_bus: &MessageBus, pending: Vec<ComponentMessage>) {
-    for msg in pending {
-        let reenqueue = ComponentMessage::new(
-            ComponentId::Ft8Transmitter,
-            ComponentId::Ft8Transmitter,
-            msg.message_type,
-            Instant::now(),
-        );
-        if let Err(e) = message_bus.send_message(reenqueue).await {
-            warn!(
-                "supersede sleep: failed to re-enqueue non-candidate message: {}",
-                e
-            );
-        }
-    }
-}
-
-/// Drain whatever is CURRENTLY sitting in `tx_rx` (a bounded, synchronous
-/// scan — never awaits) and append it after `already_siphoned`, preserving
-/// true arrival order (round-8 review, Codex P2): anything still in the
-/// channel was queued at or after anything already siphoned, so appending
-/// it after — never re-ordering — keeps `coalesce_backlog_into` and the
-/// bundle arms seeing requests in the order they actually arrived.
-///
-/// The CALLER invokes this only AFTER attempting confirmed PTT-off on a detected disarm
-/// and, during playback, after the confirmed flush or playback wait-out (PAN-135)
-/// (round-9 review, Codex P1): draining *before* returning from
-/// `interruptible_sleep_or_supersede` reintroduced round-2's original
-/// problem — with concurrent producers continually refilling the channel,
-/// an unbounded `try_recv()` loop there could delay the caller's first
-/// (safety-critical) PTT-off send indefinitely. Calling it here instead,
-/// after attempting PTT release, keeps the drain's unboundedness from ever
-/// touching PTT-release latency — it can only delay the lower-priority
-/// reenqueue/audit/completion bookkeeping that follows.
-fn drain_and_merge_pending(
-    tx_rx: &crossbeam_channel::Receiver<ComponentMessage>,
-    already_siphoned: Vec<ComponentMessage>,
-) -> Vec<ComponentMessage> {
-    let mut remainder: Vec<ComponentMessage> = Vec::new();
-    while let Ok(message) = tx_rx.try_recv() {
-        remainder.push(message);
-    }
-    already_siphoned.into_iter().chain(remainder).collect()
 }
 
 #[cfg(test)]
@@ -1222,14 +1254,13 @@ mod interruptible_sleep_tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let abort = Arc::new(AtomicBool::new(false));
         let (_tx, rx) = crossbeam_channel::unbounded();
-        let bus = crate::message_bus::MessageBus::new(16).unwrap();
         let pivoted_once = std::collections::HashMap::new();
+        let inbox = super::TxInbox::new(rx.clone(), Default::default());
         let outcome = super::interruptible_sleep_or_supersede(
             Duration::from_millis(80),
             &shutdown,
             &abort,
-            &rx,
-            &bus,
+            &inbox,
             &[crate::message_bus::TransmitRequestItem {
                 message_text: "in flight text".to_string(),
                 frequency_offset: 1500.0,
@@ -1244,9 +1275,9 @@ mod interruptible_sleep_tests {
 
     /// Round-3 review (Codex P2): a message already siphoned into this
     /// wait's local queue (an unrelated local `TuneRequest`, here) before a
-    /// later-arriving disarm is detected must travel WITH the
-    /// `AbortedByDisarm` outcome, not be silently dropped. The disarm's own
-    /// caller-side reenqueue-after-PTT-off is exercised in
+    /// later-arriving disarm is detected must be back in the inbox when the
+    /// `AbortedByDisarm` outcome returns, not be silently dropped. The
+    /// disarm's own caller-side PTT-off ordering is exercised in
     /// `pancetta/tests/coord_sim.rs`'s end-to-end tests; this pins the
     /// lower-level contract this function itself is now responsible for.
     #[tokio::test(flavor = "current_thread")]
@@ -1254,7 +1285,6 @@ mod interruptible_sleep_tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let abort = Arc::new(AtomicBool::new(false));
         let (tx, rx) = crossbeam_channel::unbounded();
-        let bus = crate::message_bus::MessageBus::new(16).unwrap();
         let pivoted_once = std::collections::HashMap::new();
 
         // An unrelated, non-supersede-candidate message (a TUI TuneRequest)
@@ -1303,12 +1333,12 @@ mod interruptible_sleep_tests {
                 .disarm(chrono::Utc::now().timestamp_millis());
         });
 
+        let inbox = super::TxInbox::new(rx.clone(), Default::default());
         let outcome = super::interruptible_sleep_or_supersede(
             Duration::from_secs(5),
             &shutdown,
             &abort,
-            &rx,
-            &bus,
+            &inbox,
             &[crate::message_bus::TransmitRequestItem {
                 message_text: "in flight text".to_string(),
                 frequency_offset: 1500.0,
@@ -1318,46 +1348,36 @@ mod interruptible_sleep_tests {
             Some((&arm, Some("client-a"))),
         )
         .await;
-        match outcome {
-            super::SleepOutcome::AbortedByDisarm(pending) => {
-                assert_eq!(
-                    pending.len(),
-                    1,
-                    "the already-siphoned TuneRequest must travel with the outcome, not be dropped"
-                );
-                assert!(matches!(
-                    pending[0].message_type,
-                    MessageType::TuneRequest { .. }
-                ));
-            }
-            other => panic!("expected AbortedByDisarm, got {other:?}"),
-        }
+        assert!(
+            matches!(outcome, super::SleepOutcome::AbortedByDisarm),
+            "expected AbortedByDisarm, got {outcome:?}"
+        );
+        let restored = inbox
+            .try_recv()
+            .expect("the already-siphoned TuneRequest must be back in the inbox, not dropped");
+        assert!(matches!(
+            restored.message_type,
+            MessageType::TuneRequest { .. }
+        ));
+        assert!(inbox.try_recv().is_err(), "restored exactly once");
     }
 
-    /// Round-8 review (Codex P2): a message that arrives in `tx_rx` AFTER
-    /// an earlier message was already siphoned, but BEFORE the disarm is
-    /// detected, is left untouched in the channel — `check_once` checks
+    /// Round-8 review (Codex P2): a message that arrives in the channel
+    /// AFTER an earlier message was already siphoned, but BEFORE the disarm
+    /// is detected, is left untouched in the channel — `check_once` checks
     /// disarm before it ever calls `try_recv()` again, so it returns
     /// immediately without draining that later arrival.
     ///
-    /// Round-9 review (Codex P1) moved the remainder-drain-and-merge OUT of
-    /// this function and into the CALLER (see `drain_and_merge_pending`,
-    /// exercised directly in `drain_and_merge_pending_preserves_arrival_order`
-    /// below) — draining here, before returning, reintroduced round-2's
-    /// original problem: under concurrent producers continually refilling
-    /// the channel, an unbounded `try_recv()` loop here could delay the
-    /// caller's first (safety-critical) PTT-off send indefinitely. So this
-    /// function's OWN contract is now narrower: `AbortedByDisarm` carries
-    /// only what was ALREADY siphoned before the disarm was detected —
-    /// nothing more — and this test pins exactly that (a later,
-    /// untouched-in-`tx_rx` arrival is correctly NOT included here; the
-    /// caller's own drain is responsible for merging it in afterward).
+    /// Round-9 review (Codex P1): draining the channel here, before
+    /// returning, would let concurrent producers delay the caller's first
+    /// (safety-critical) PTT-off send indefinitely. No drain is needed: the
+    /// already-siphoned message goes back on the inbox front, which is read
+    /// before the channel, so the inbox yields both in arrival order.
     #[tokio::test(flavor = "current_thread")]
     async fn supersede_sleep_returns_only_already_siphoned_messages_on_abort_by_disarm() {
         let shutdown = Arc::new(AtomicBool::new(false));
         let abort = Arc::new(AtomicBool::new(false));
         let (tx, rx) = crossbeam_channel::unbounded();
-        let bus = crate::message_bus::MessageBus::new(16).unwrap();
         let pivoted_once = std::collections::HashMap::new();
 
         // Older message: siphoned on the very first (pre-sleep) poll tick.
@@ -1423,12 +1443,12 @@ mod interruptible_sleep_tests {
                 .disarm(chrono::Utc::now().timestamp_millis());
         });
 
+        let inbox = super::TxInbox::new(rx.clone(), Default::default());
         let outcome = super::interruptible_sleep_or_supersede(
             Duration::from_secs(5),
             &shutdown,
             &abort,
-            &rx,
-            &bus,
+            &inbox,
             &[crate::message_bus::TransmitRequestItem {
                 message_text: "in flight text".to_string(),
                 frequency_offset: 1500.0,
@@ -1438,78 +1458,21 @@ mod interruptible_sleep_tests {
             Some((&arm, Some("client-a"))),
         )
         .await;
-        match outcome {
-            super::SleepOutcome::AbortedByDisarm(pending) => {
-                assert_eq!(
-                    pending.len(),
-                    1,
-                    "only the already-siphoned message travels with this function's own \
-                     outcome — the untouched remainder is the caller's responsibility \
-                     (drain_and_merge_pending), not this function's"
-                );
-                match &pending[0].message_type {
-                    MessageType::TuneRequest { tone_offset_hz, .. } => {
-                        assert_eq!(*tone_offset_hz, 1000.0)
-                    }
-                    other => panic!("expected TuneRequest, got {other:?}"),
-                }
-            }
-            other => panic!("expected AbortedByDisarm, got {other:?}"),
-        }
-    }
-
-    /// Round-9 review (Codex P1/P2): pins `drain_and_merge_pending`'s own
-    /// ordering contract directly — a pure, synchronous function, so no
-    /// timing games are needed. The caller invokes this AFTER sending
-    /// PTT off, appending whatever is currently sitting in `tx_rx` after
-    /// the already-siphoned prefix, preserving true arrival order.
-    #[test]
-    fn drain_and_merge_pending_preserves_arrival_order() {
-        let (tx, rx) = crossbeam_channel::unbounded();
-        tx.send(crate::message_bus::ComponentMessage::new(
-            crate::message_bus::ComponentId::Tui,
-            crate::message_bus::ComponentId::Ft8Transmitter,
-            MessageType::TuneRequest {
-                duration_secs: 5,
-                tone_offset_hz: 2000.0,
-            },
-            Instant::now(),
-        ))
-        .unwrap();
-        tx.send(crate::message_bus::ComponentMessage::new(
-            crate::message_bus::ComponentId::Tui,
-            crate::message_bus::ComponentId::Ft8Transmitter,
-            MessageType::TuneRequest {
-                duration_secs: 5,
-                tone_offset_hz: 3000.0,
-            },
-            Instant::now(),
-        ))
-        .unwrap();
-
-        let already_siphoned = vec![ComponentMessage::new(
-            crate::message_bus::ComponentId::Tui,
-            crate::message_bus::ComponentId::Ft8Transmitter,
-            MessageType::TuneRequest {
-                duration_secs: 5,
-                tone_offset_hz: 1000.0,
-            },
-            Instant::now(),
-        )];
-
-        let pending = super::drain_and_merge_pending(&rx, already_siphoned);
-        let freqs: Vec<f64> = pending
-            .iter()
-            .map(|m| match &m.message_type {
-                MessageType::TuneRequest { tone_offset_hz, .. } => *tone_offset_hz,
+        assert!(
+            matches!(outcome, super::SleepOutcome::AbortedByDisarm),
+            "expected AbortedByDisarm, got {outcome:?}"
+        );
+        let freqs: Vec<f64> = std::iter::from_fn(|| inbox.try_recv().ok())
+            .map(|m| match m.message_type {
+                MessageType::TuneRequest { tone_offset_hz, .. } => tone_offset_hz,
                 other => panic!("expected TuneRequest, got {other:?}"),
             })
             .collect();
         assert_eq!(
             freqs,
-            vec![1000.0, 2000.0, 3000.0],
-            "already-siphoned content must precede whatever was still in tx_rx, \
-             in the channel's own FIFO order"
+            vec![1000.0, 2000.0],
+            "the siphoned message (on the front) must precede the later arrival \
+             still in the channel"
         );
     }
 
@@ -1522,7 +1485,6 @@ mod interruptible_sleep_tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let abort = Arc::new(AtomicBool::new(false));
         let (_tx, rx) = crossbeam_channel::unbounded();
-        let bus = crate::message_bus::MessageBus::new(16).unwrap();
         let pivoted_once = std::collections::HashMap::new();
 
         let now_ms = chrono::Utc::now().timestamp_millis();
@@ -1556,13 +1518,13 @@ mod interruptible_sleep_tests {
                 .disarm(chrono::Utc::now().timestamp_millis());
         });
 
+        let inbox = super::TxInbox::new(rx.clone(), Default::default());
         let start = tokio::time::Instant::now();
         let outcome = super::interruptible_sleep_or_supersede(
             Duration::from_secs(5),
             &shutdown,
             &abort,
-            &rx,
-            &bus,
+            &inbox,
             &[crate::message_bus::TransmitRequestItem {
                 message_text: "in flight text".to_string(),
                 frequency_offset: 1500.0,
@@ -1573,7 +1535,7 @@ mod interruptible_sleep_tests {
         )
         .await;
         assert!(
-            matches!(outcome, super::SleepOutcome::AbortedByDisarm(_)),
+            matches!(outcome, super::SleepOutcome::AbortedByDisarm),
             "expected AbortedByDisarm, got {outcome:?}"
         );
         // Should wake within the ~50ms poll granularity of the disarm (fired
@@ -1589,15 +1551,14 @@ mod interruptible_sleep_tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let abort = Arc::new(AtomicBool::new(false));
         let (_tx, rx) = crossbeam_channel::unbounded();
-        let bus = crate::message_bus::MessageBus::new(16).unwrap();
         let pivoted_once = std::collections::HashMap::new();
 
+        let inbox = super::TxInbox::new(rx.clone(), Default::default());
         let outcome = super::interruptible_sleep_or_supersede(
             Duration::from_millis(80),
             &shutdown,
             &abort,
-            &rx,
-            &bus,
+            &inbox,
             &[crate::message_bus::TransmitRequestItem {
                 message_text: "in flight text".to_string(),
                 frequency_offset: 1500.0,
@@ -1615,7 +1576,6 @@ mod interruptible_sleep_tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let abort = Arc::new(AtomicBool::new(false));
         let (tx, rx) = crossbeam_channel::unbounded();
-        let bus = crate::message_bus::MessageBus::new(16).unwrap();
         let pivoted_once = std::collections::HashMap::new();
 
         let new_request = MessageType::TransmitRequest {
@@ -1634,12 +1594,12 @@ mod interruptible_sleep_tests {
         ))
         .unwrap();
 
+        let inbox = super::TxInbox::new(rx.clone(), Default::default());
         let outcome = super::interruptible_sleep_or_supersede(
             Duration::from_millis(500),
             &shutdown,
             &abort,
-            &rx,
-            &bus,
+            &inbox,
             &[crate::message_bus::TransmitRequestItem {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
@@ -1651,15 +1611,12 @@ mod interruptible_sleep_tests {
         .await;
 
         match outcome {
-            super::SleepOutcome::Superseded(
-                MessageType::TransmitRequest {
-                    message_text,
-                    qso_id,
-                    frequency_offset,
-                    ..
-                },
-                _pending,
-            ) => {
+            super::SleepOutcome::Superseded(MessageType::TransmitRequest {
+                message_text,
+                qso_id,
+                frequency_offset,
+                ..
+            }) => {
                 assert_eq!(message_text, "KA1ABC K5ARH RR73");
                 assert_eq!(qso_id.as_deref(), Some("qso-1"));
                 assert_eq!(frequency_offset, 1500.0);
@@ -1677,7 +1634,6 @@ mod interruptible_sleep_tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let abort = Arc::new(AtomicBool::new(false));
         let (tx, rx) = crossbeam_channel::unbounded();
-        let bus = crate::message_bus::MessageBus::new(16).unwrap();
         let pivoted_once = std::collections::HashMap::new();
 
         // Identical content to what's in flight — should be Dropped, not treated
@@ -1698,12 +1654,12 @@ mod interruptible_sleep_tests {
         ))
         .unwrap();
 
+        let inbox = super::TxInbox::new(rx.clone(), Default::default());
         let outcome = super::interruptible_sleep_or_supersede(
             Duration::from_millis(80),
             &shutdown,
             &abort,
-            &rx,
-            &bus,
+            &inbox,
             &[crate::message_bus::TransmitRequestItem {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
@@ -1723,14 +1679,13 @@ mod interruptible_sleep_tests {
         let shutdown = Arc::new(AtomicBool::new(true));
         let abort = Arc::new(AtomicBool::new(false));
         let (_tx, rx) = crossbeam_channel::unbounded();
-        let bus = crate::message_bus::MessageBus::new(16).unwrap();
         let pivoted_once = std::collections::HashMap::new();
+        let inbox = super::TxInbox::new(rx.clone(), Default::default());
         let outcome = super::interruptible_sleep_or_supersede(
             Duration::from_secs(60),
             &shutdown,
             &abort,
-            &rx,
-            &bus,
+            &inbox,
             &[crate::message_bus::TransmitRequestItem {
                 message_text: "in flight text".to_string(),
                 frequency_offset: 1500.0,
@@ -1779,12 +1734,12 @@ mod interruptible_sleep_tests {
             ))
             .unwrap();
 
+        let inbox = super::TxInbox::new(tx_rx.clone(), Default::default());
         let outcome = super::interruptible_sleep_or_supersede(
             Duration::from_millis(120),
             &shutdown,
             &abort,
-            &tx_rx,
-            &bus,
+            &inbox,
             &[crate::message_bus::TransmitRequestItem {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
@@ -1808,7 +1763,7 @@ mod interruptible_sleep_tests {
 
         // The TuneRequest was re-enqueued (siphoned during the sleep, flushed
         // back after) — NOT lost.
-        let reenqueued = tx_rx
+        let reenqueued = inbox
             .try_recv()
             .expect("the TuneRequest must be re-enqueued, not swallowed");
         assert!(
@@ -1824,7 +1779,7 @@ mod interruptible_sleep_tests {
         );
         // Exactly one — no duplication.
         assert!(
-            tx_rx.try_recv().is_err(),
+            inbox.try_recv().is_err(),
             "the TuneRequest is re-enqueued exactly once"
         );
     }
@@ -1866,12 +1821,12 @@ mod interruptible_sleep_tests {
             ))
             .unwrap();
 
+        let inbox = super::TxInbox::new(tx_rx.clone(), Default::default());
         let outcome = super::interruptible_sleep_or_supersede(
             Duration::from_millis(120),
             &shutdown,
             &abort,
-            &tx_rx,
-            &bus,
+            &inbox,
             &[crate::message_bus::TransmitRequestItem {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
@@ -1891,7 +1846,7 @@ mod interruptible_sleep_tests {
             "a different QSO's request must not set abort_current_tx"
         );
 
-        let reenqueued = tx_rx
+        let reenqueued = inbox
             .try_recv()
             .expect("the different QSO's request must be re-enqueued, not dropped");
         match reenqueued.message_type {
@@ -1901,7 +1856,7 @@ mod interruptible_sleep_tests {
             other => panic!("expected the re-enqueued TransmitRequest, got {other:?}"),
         }
         assert!(
-            tx_rx.try_recv().is_err(),
+            inbox.try_recv().is_err(),
             "the request is re-enqueued exactly once"
         );
     }
@@ -1952,12 +1907,12 @@ mod interruptible_sleep_tests {
         send("qso-b1", "B1 W5AU RR73");
         send("qso-1", "KA1ABC K5ARH RR73");
 
+        let inbox = super::TxInbox::new(tx_rx.clone(), Default::default());
         let outcome = super::interruptible_sleep_or_supersede(
             Duration::from_nanos(1), // effectively zero budget
             &shutdown,
             &abort,
-            &tx_rx,
-            &bus,
+            &inbox,
             &[crate::message_bus::TransmitRequestItem {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
@@ -1969,7 +1924,7 @@ mod interruptible_sleep_tests {
         .await;
 
         match outcome {
-            super::SleepOutcome::Superseded(MessageType::TransmitRequest { qso_id, .. }, _) => {
+            super::SleepOutcome::Superseded(MessageType::TransmitRequest { qso_id, .. }) => {
                 assert_eq!(
                     qso_id.as_deref(),
                     Some("qso-1"),
@@ -2031,12 +1986,12 @@ mod interruptible_sleep_tests {
             ))
             .unwrap();
 
+        let inbox = super::TxInbox::new(tx_rx.clone(), Default::default());
         let outcome = super::interruptible_sleep_or_supersede(
             Duration::from_millis(120),
             &shutdown,
             &abort,
-            &tx_rx,
-            &bus,
+            &inbox,
             &[crate::message_bus::TransmitRequestItem {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
@@ -2049,7 +2004,7 @@ mod interruptible_sleep_tests {
 
         assert!(matches!(outcome, super::SleepOutcome::Completed));
 
-        let reenqueued = tx_rx
+        let reenqueued = inbox
             .try_recv()
             .expect("the unrelated item must still be re-enqueued");
         match reenqueued.message_type {
@@ -2063,7 +2018,7 @@ mod interruptible_sleep_tests {
             }
             other => panic!("expected the stripped MultiTransmitRequest, got {other:?}"),
         }
-        assert!(tx_rx.try_recv().is_err(), "re-enqueued exactly once");
+        assert!(inbox.try_recv().is_err(), "re-enqueued exactly once");
     }
 
     /// The all-items-already-sent case: the whole bundle must be DROPPED,
@@ -2098,12 +2053,12 @@ mod interruptible_sleep_tests {
             ))
             .unwrap();
 
+        let inbox = super::TxInbox::new(tx_rx.clone(), Default::default());
         let outcome = super::interruptible_sleep_or_supersede(
             Duration::from_millis(120),
             &shutdown,
             &abort,
-            &tx_rx,
-            &bus,
+            &inbox,
             &[crate::message_bus::TransmitRequestItem {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
@@ -2116,15 +2071,14 @@ mod interruptible_sleep_tests {
 
         assert!(matches!(outcome, super::SleepOutcome::Completed));
         assert!(
-            tx_rx.try_recv().is_err(),
+            inbox.try_recv().is_err(),
             "a bundle with nothing left after stripping must be dropped entirely, not requeued"
         );
     }
 
-    /// Codex round 3 (PR #346): the pending list carried alongside a
-    /// `Superseded` outcome must preserve TRUE arrival order relative to
-    /// anything left untouched in the live channel when the loop exits
-    /// early on a supersede. Sequence queued (in this order) BEFORE the
+    /// Codex round 3 (PR #346): what a `Superseded` wait siphoned must
+    /// preserve TRUE arrival order relative to anything left untouched in
+    /// the live channel when the loop exits early on a supersede. Sequence queued (in this order) BEFORE the
     /// function is even called: B1 (a different QSO — gets siphoned by the
     /// very first `check_once` poll), A (a fresher message for the SAME
     /// in-flight QSO — drained by the second `check_once` poll, classified
@@ -2132,15 +2086,13 @@ mod interruptible_sleep_tests {
     /// B2 (a different QSO again — never drained by this function at all,
     /// since the loop already returned). Before the fix, only `siphoned`
     /// (containing B1) was appended to the live channel's tail, landing
-    /// AFTER the untouched B2 and inverting their true arrival order. The
-    /// fix drains that leftover remainder and orders it after `siphoned`.
+    /// AFTER the untouched B2 and inverting their true arrival order. Now
+    /// B1 goes back on the inbox front, which is read before the channel,
+    /// so the inbox yields B1 then B2 with no drain (see
+    /// `tx_inbox_tests::requeue_front_is_read_before_the_channel_in_order`).
     ///
-    /// Round 4 (Codex): for a `Superseded` outcome, this pending list is
-    /// NOT reenqueued by this function at all — it's returned to the caller,
-    /// which must reenqueue it only after enqueuing its own supersede-
-    /// derived content (`reenqueue_pending`, called from the four worker
-    /// call sites). This test therefore asserts on the outcome's carried
-    /// `pending` field directly, not on `tx_rx`.
+    /// Round 4 (Codex): a caller's own supersede-derived content goes on the
+    /// front after this returns, so it lands ahead of B1.
     #[tokio::test(flavor = "current_thread")]
     async fn supersede_sleep_preserves_arrival_order_between_siphoned_and_untouched_messages() {
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -2175,12 +2127,12 @@ mod interruptible_sleep_tests {
         send("qso-1", "KA1ABC K5ARH RR73"); // A: fresher text for the in-flight QSO
         send("qso-b2", "B2 W5AU RR73");
 
+        let inbox = super::TxInbox::new(tx_rx.clone(), Default::default());
         let outcome = super::interruptible_sleep_or_supersede(
             Duration::from_millis(500),
             &shutdown,
             &abort,
-            &tx_rx,
-            &bus,
+            &inbox,
             &[crate::message_bus::TransmitRequestItem {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
@@ -2191,53 +2143,251 @@ mod interruptible_sleep_tests {
         )
         .await;
 
-        let pending = match outcome {
-            super::SleepOutcome::Superseded(
-                MessageType::TransmitRequest { qso_id, .. },
-                pending,
-            ) => {
+        match outcome {
+            super::SleepOutcome::Superseded(MessageType::TransmitRequest { qso_id, .. }) => {
                 assert_eq!(qso_id.as_deref(), Some("qso-1"), "A must win the supersede");
-                pending
             }
             other => panic!("expected Superseded(A), got {other:?}"),
-        };
+        }
 
-        // Nothing reenqueued to tx_rx yet — the caller owns that, after its
-        // own supersede-derived enqueue (round 4).
-        assert!(
-            tx_rx.try_recv().is_err(),
-            "a Superseded outcome must not reenqueue anything itself"
+        // True arrival order preserved in the inbox: B1 first, then B2 —
+        // never B2 before B1.
+        let order: Vec<Option<String>> = std::iter::from_fn(|| inbox.try_recv().ok())
+            .map(|m| match m.message_type {
+                MessageType::TransmitRequest { qso_id, .. } => qso_id,
+                other => panic!("expected a TransmitRequest, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![Some("qso-b1".to_string()), Some("qso-b2".to_string())],
+            "B1 must come out FIRST, then B2"
         );
+    }
 
-        // True arrival order preserved in the returned pending list: B1
-        // first, then B2 — never B2 before B1.
-        assert_eq!(pending.len(), 2, "expected exactly B1 and B2 pending");
-        match &pending[0].message_type {
-            MessageType::TransmitRequest { qso_id, .. } => {
-                assert_eq!(
-                    qso_id.as_deref(),
-                    Some("qso-b1"),
-                    "B1 must be pending FIRST"
-                );
+    fn pan73_request(text: String, qso: String) -> ComponentMessage {
+        ComponentMessage::new(
+            crate::message_bus::ComponentId::Qso,
+            crate::message_bus::ComponentId::Ft8Transmitter,
+            MessageType::TransmitRequest {
+                message_text: text,
+                frequency_offset: 900.0,
+                qso_id: Some(qso),
+                tx_parity: None,
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
+            },
+            Instant::now(),
+        )
+    }
+
+    fn pan73_text(m: &ComponentMessage) -> String {
+        match &m.message_type {
+            MessageType::TransmitRequest { message_text, .. } => message_text.clone(),
+            MessageType::MultiTransmitRequest { items, .. } => {
+                format!("bundle:{}", items[0].message_text)
             }
-            other => panic!("expected B1, got {other:?}"),
+            other => format!("{other:?}"),
         }
-        match &pending[1].message_type {
-            MessageType::TransmitRequest { qso_id, .. } => {
-                assert_eq!(
-                    qso_id.as_deref(),
-                    Some("qso-b2"),
-                    "B2 must be pending SECOND"
-                );
+    }
+
+    fn pan73_in_flight() -> [crate::message_bus::TransmitRequestItem; 1] {
+        [crate::message_bus::TransmitRequestItem {
+            message_text: "KA1ABC K5ARH R-15".to_string(),
+            frequency_offset: 1500.0,
+            qso_id: Some("qso-1".to_string()),
+        }]
+    }
+
+    /// PAN-73 follow-up (PR #346 round-4 finding): a producer sending into
+    /// the worker's channel while a wait ends must never land ahead of what
+    /// the wait siphoned. The producer starts just before the wait's end and
+    /// keeps sending after it returns, so its sends straddle the point where
+    /// siphoned messages used to be re-sent through the bus (100/100 trials
+    /// out of order before the fix).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_producer_never_overtakes_messages_the_wait_siphoned() {
+        for trial in 0..100 {
+            let bus = crate::message_bus::MessageBus::new(8192).unwrap();
+            let (sender, rx) = bus
+                .get_or_create_channel(crate::message_bus::ComponentId::Ft8Transmitter)
+                .await
+                .unwrap();
+            for i in 0..64 {
+                sender
+                    .send(pan73_request(format!("old-{i:04}"), format!("qso-old-{i}")))
+                    .unwrap();
             }
-            other => panic!("expected B2, got {other:?}"),
+            let stop = Arc::new(AtomicBool::new(false));
+            let producer = {
+                let bus = bus.clone();
+                let stop = stop.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(29)).await;
+                    let mut j = 0usize;
+                    while !stop.load(Ordering::Acquire) && j < 6000 {
+                        bus.send_message(pan73_request(
+                            format!("new-{j:04}"),
+                            format!("qso-new-{j}"),
+                        ))
+                        .await
+                        .unwrap();
+                        j += 1;
+                        tokio::task::yield_now().await;
+                    }
+                })
+            };
+            let inbox = super::TxInbox::new(rx, Default::default());
+            let outcome = super::interruptible_sleep_or_supersede(
+                Duration::from_millis(30),
+                &Arc::new(AtomicBool::new(false)),
+                &Arc::new(AtomicBool::new(false)),
+                &inbox,
+                &pan73_in_flight(),
+                &std::collections::HashMap::new(),
+                None,
+            )
+            .await;
+            assert!(matches!(outcome, super::SleepOutcome::Completed));
+            // Keep producing after the wait returned.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            stop.store(true, Ordering::Release);
+            producer.await.unwrap();
+
+            let order: Vec<String> = std::iter::from_fn(|| inbox.try_recv().ok())
+                .map(|m| pan73_text(&m))
+                .collect();
+            // Arrival order: every old-* (queued before the wait), then the
+            // producer's new-* in send order.
+            let mut expected: Vec<String> = order.clone();
+            expected.sort_by_key(|t| (t.starts_with("new-"), t.clone()));
+            assert_eq!(order, expected, "trial {trial}: inbox out of arrival order");
+            assert!(order.iter().take(64).all(|t| t.starts_with("old-")));
         }
+    }
+
+    /// PAN-73 round 4 under concurrency: the supersede winner's own content
+    /// goes ahead of the siphoned traffic, which goes ahead of everything a
+    /// concurrent producer sent, no matter how the sends interleave.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn supersede_winner_then_siphoned_then_concurrent_producer() {
+        for trial in 0..50 {
+            let bus = crate::message_bus::MessageBus::new(8192).unwrap();
+            let (sender, rx) = bus
+                .get_or_create_channel(crate::message_bus::ComponentId::Ft8Transmitter)
+                .await
+                .unwrap();
+            sender
+                .send(pan73_request("B1".into(), "qso-b1".into()))
+                .unwrap();
+            sender
+                .send(pan73_request("KA1ABC K5ARH RR73".into(), "qso-1".into()))
+                .unwrap();
+            sender
+                .send(pan73_request("B2".into(), "qso-b2".into()))
+                .unwrap();
+            let producer = {
+                let bus = bus.clone();
+                tokio::spawn(async move {
+                    for j in 0..200 {
+                        bus.send_message(pan73_request(
+                            format!("new-{j:04}"),
+                            format!("qso-new-{j}"),
+                        ))
+                        .await
+                        .unwrap();
+                        tokio::task::yield_now().await;
+                    }
+                })
+            };
+            let inbox = super::TxInbox::new(rx, Default::default());
+            let outcome = super::interruptible_sleep_or_supersede(
+                Duration::from_millis(500),
+                &Arc::new(AtomicBool::new(false)),
+                &Arc::new(AtomicBool::new(false)),
+                &inbox,
+                &pan73_in_flight(),
+                &std::collections::HashMap::new(),
+                None,
+            )
+            .await;
+            assert!(matches!(outcome, super::SleepOutcome::Superseded(_)));
+            // The caller's supersede work awaits (PTT-off etc.) while the
+            // producer keeps sending; then it requeues the winner.
+            tokio::task::yield_now().await;
+            inbox.requeue_front(vec![super::self_message(
+                MessageType::MultiTransmitRequest {
+                    items: vec![crate::message_bus::TransmitRequestItem {
+                        message_text: "WINNER".into(),
+                        frequency_offset: 1500.0,
+                        qso_id: Some("qso-1".into()),
+                    }],
+                    tx_parity: None,
+                    origin: crate::message_bus::TxOrigin::Local,
+                    remote_client_key_id: None,
+                },
+            )]);
+            producer.await.unwrap();
+            let order: Vec<String> = std::iter::from_fn(|| inbox.try_recv().ok())
+                .map(|m| pan73_text(&m))
+                .collect();
+            assert_eq!(&order[..3], ["bundle:WINNER", "B1", "B2"], "trial {trial}");
+            let news: Vec<String> = (0..200).map(|j| format!("new-{j:04}")).collect();
+            assert_eq!(&order[3..], &news[..], "trial {trial}");
+        }
+    }
+
+    /// PAN-73 follow-up, acceptance criterion 2: with the channel full, the
+    /// siphoned messages still come back, all of them, in order. Before the
+    /// fix the bus re-send dropped them and reported nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn full_channel_cannot_lose_siphoned_messages() {
+        let bus = crate::message_bus::MessageBus::new(2).unwrap();
+        let (sender, rx) = bus
+            .get_or_create_channel(crate::message_bus::ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        sender
+            .send(pan73_request("old-0".into(), "qso-a".into()))
+            .unwrap();
+        sender
+            .send(pan73_request("old-1".into(), "qso-b".into()))
+            .unwrap();
+        let refill = {
+            let bus = bus.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                for j in 0..2 {
+                    bus.send_message(pan73_request(format!("new-{j}"), format!("qso-n{j}")))
+                        .await
+                        .unwrap();
+                }
+            })
+        };
+        let inbox = super::TxInbox::new(rx, Default::default());
+        let outcome = super::interruptible_sleep_or_supersede(
+            Duration::from_millis(40),
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(AtomicBool::new(false)),
+            &inbox,
+            &pan73_in_flight(),
+            &std::collections::HashMap::new(),
+            None,
+        )
+        .await;
+        assert!(matches!(outcome, super::SleepOutcome::Completed));
+        refill.await.unwrap();
+        assert_eq!(inbox.len(), 4);
+        let order: Vec<String> = std::iter::from_fn(|| inbox.try_recv().ok())
+            .map(|m| pan73_text(&m))
+            .collect();
+        assert_eq!(order, ["old-0", "old-1", "new-0", "new-1"]);
     }
 }
 
 /// PAN-135: bounded retry for a safety send that must not be silently
 /// dropped. Uses the PAN-43/45 schedule: 4 attempts over about 75 ms.
-const SAFETY_SEND_RETRY_DELAYS: [Duration; 3] = [
+pub(super) const SAFETY_SEND_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(5),
     Duration::from_millis(20),
     Duration::from_millis(50),
@@ -2279,7 +2429,7 @@ enum DisarmFlush {
 }
 
 /// PAN-135 (PR #362 rounds 4/6, Codex P1): flush the revoked remote
-/// waveform before the caller drains or re-enqueues work that may key
+/// waveform before the worker resumes held or queued work that may key
 /// again. Wait for the audio thread to confirm the flush, the revoked
 /// playback window to elapse, or shutdown. The playback bound applies
 /// when confirmation cannot arrive, including `--no-audio` and a stalled
@@ -2329,7 +2479,7 @@ async fn flush_disarmed_audio_confirmed(
     }
     error!(
         target: "pancetta::tx.ptt",
-        "Remote disarm: audio flush not confirmed by the audio thread; holding re-enqueue for {:?} until the revoked waveform has played out",
+        "Remote disarm: audio flush not confirmed by the audio thread; holding the next request for {:?} until the revoked waveform has played out",
         deadline.saturating_duration_since(tokio::time::Instant::now())
     );
     while tokio::time::Instant::now() < deadline {
@@ -5091,7 +5241,7 @@ async fn emit_disarm_interrupt_signals(
         qso_id,
     )
     .await;
-    audit_log.append(&pancetta_agent::audit::AuditEvent {
+    audit_log.record(&pancetta_agent::audit::AuditEvent {
         ts_unix_ms: chrono::Utc::now().timestamp_millis(),
         kind: pancetta_agent::audit::AuditKind::TxDenied,
         operator_callsign,
@@ -5760,7 +5910,7 @@ pub fn coalesce_transmit_requests_with_fox_priority(
 /// channel is drained non-blockingly: every additional `TransmitRequest` is
 /// folded into the coalesce buffer; the FIRST non-`TransmitRequest`
 /// (`MultiTransmitRequest` / `TuneRequest` / anything else) stops the drain and
-/// is re-enqueued to the transmitter's own channel so it is never reordered
+/// is put back at the front of the worker's inbox so it is never reordered
 /// relative to other non-TX messages, coalesced, or dropped.
 ///
 /// Returns:
@@ -5776,7 +5926,7 @@ pub fn coalesce_transmit_requests_with_fox_priority(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn coalesce_backlog_into(
     head: MessageType,
-    tx_rx: &crossbeam_channel::Receiver<ComponentMessage>,
+    inbox: &TxInbox,
     message_bus: &MessageBus,
     active_tx_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
     fox_admitted_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
@@ -5811,9 +5961,9 @@ pub(crate) async fn coalesce_backlog_into(
     };
 
     // Drain queued TransmitRequests behind the head; stop at the first
-    // non-TransmitRequest and re-enqueue it so it is processed next cycle.
+    // non-TransmitRequest and put it back so it is processed next cycle.
     let mut drained = vec![head_entry];
-    while let Ok(msg) = tx_rx.try_recv() {
+    while let Ok(msg) = inbox.try_recv() {
         match msg.message_type {
             MessageType::TransmitRequest {
                 message_text,
@@ -5833,23 +5983,10 @@ pub(crate) async fn coalesce_backlog_into(
                 });
             }
             _ => {
-                // Non-TX message: re-enqueue verbatim and stop draining so we
-                // never reorder Tune/Multi ahead of, or behind, TX intent.
-                if let Err(e) = message_bus.send_message(msg).await {
-                    warn!(
-                        target: "pancetta::tx.policy",
-                        "failed to re-enqueue non-TX message during coalesce drain: {}",
-                        e
-                    );
-                    emit_diagnostic(
-                        message_bus,
-                        "tx.policy",
-                        pancetta_core::DiagnosticLevel::Warn,
-                        format!("failed to re-enqueue non-TX message during coalesce drain: {e}"),
-                        None,
-                    )
-                    .await;
-                }
+                // Non-TX message: put it back at the inbox front and stop
+                // draining, so Tune/Multi keeps its place relative to TX
+                // intent.
+                inbox.requeue_front(vec![msg]);
                 break;
             }
         }
@@ -5983,7 +6120,7 @@ pub(crate) async fn coalesce_backlog_into(
                     entry.qso_id.as_deref(),
                 )
                 .await;
-                audit_log.append(&pancetta_agent::audit::AuditEvent {
+                audit_log.record(&pancetta_agent::audit::AuditEvent {
                     // Round-11 review (Codex P2): the denial-time instant
                     // (the SAME `now_ms` `arm_snapshot` was taken under),
                     // not a fresh timestamp read whenever this detached
@@ -6133,30 +6270,22 @@ pub(crate) async fn coalesce_backlog_into(
             || Some(consent_channel_for(e.remote_client_key_id.as_deref())) == bundle_channel
     });
     outcome.retained = retained;
-    for entry in deferred {
-        let request = ComponentMessage::new(
-            ComponentId::Ft8Transmitter,
-            ComponentId::Ft8Transmitter,
-            MessageType::TransmitRequest {
-                message_text: entry.message_text.clone(),
-                frequency_offset: entry.frequency_offset,
-                qso_id: entry.qso_id.clone(),
-                tx_parity: entry.tx_parity,
-                origin: entry.origin,
-                remote_client_key_id: entry.remote_client_key_id,
-            },
-            Instant::now(),
-        );
-        if !matches!(message_bus.send_message_checked(request).await, Ok(true)) {
-            warn!(target: "pancetta::tx.policy", "failed to re-enqueue TX from a different consent channel");
-            if let Err(e) =
-                report_transmit_complete(message_bus, false, entry.message_text, 0, entry.qso_id)
-                    .await
-            {
-                warn!("Failed to report a dropped channel-deferred stream: {}", e);
-            }
-        }
-    }
+    // Ahead of the non-TX message the drain stopped at: these arrived first.
+    inbox.requeue_front(
+        deferred
+            .into_iter()
+            .map(|entry| {
+                self_message(MessageType::TransmitRequest {
+                    message_text: entry.message_text,
+                    frequency_offset: entry.frequency_offset,
+                    qso_id: entry.qso_id,
+                    tx_parity: entry.tx_parity,
+                    origin: entry.origin,
+                    remote_client_key_id: entry.remote_client_key_id,
+                })
+            })
+            .collect(),
+    );
 
     // Every drained request belonged to an ended QSO (rare: needs ≥2 queued
     // requests, all terminal). Hand back an empty MultiTransmitRequest; the
@@ -6734,6 +6863,7 @@ async fn supersede_multi_reenqueue(
     active_protocol: pancetta_ft8::Protocol,
     tx_params: &pancetta_ft8::ProtocolParams,
     message_bus: &crate::message_bus::MessageBus,
+    inbox: &TxInbox,
     ptt_active: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     last_ptt_on_ms: &std::sync::Arc<std::sync::atomic::AtomicU64>,
     tx_late_max_ms_eff: u64,
@@ -6744,7 +6874,7 @@ async fn supersede_multi_reenqueue(
     max_concurrent_qsos: u32,
 ) {
     // Scratch single-item working state: the multi-TX arm never reads it back
-    // (it re-enqueues rather than retrying in place), so these locals only
+    // (it requeues rather than retrying in place), so these locals only
     // exist to satisfy `supersede_and_rekey_or_bundle`'s `&mut` contract and
     // to recover the new item on the `Replace` edge case.
     let mut scratch_text = String::new();
@@ -6762,7 +6892,7 @@ async fn supersede_multi_reenqueue(
     // incoming message is a whole concurrent-QSO bundle the autonomous engine
     // enqueues every slot — silently dropping it (it was already consumed via
     // `try_recv`) would lose that slot's transmissions. So keep a copy to
-    // re-enqueue on `NotViable`; case (b) leaves this `None` and remains a
+    // put back on `NotViable`; case (b) leaves this `None` and remains a
     // (Task-6-accepted) drop. The message type is decided here BEFORE the call
     // moves `new_request`.
     let reenqueue_on_notviable = if matches!(new_request, MessageType::MultiTransmitRequest { .. })
@@ -6794,36 +6924,21 @@ async fn supersede_multi_reenqueue(
         SupersedeOutcome::NotViable => {
             // PTT already off; the in-flight bundle is abandoned by the caller.
             // If NotViable because the superseding message was itself a
-            // `MultiTransmitRequest`, re-enqueue that whole bundle back to the
-            // worker's own channel (mirroring the `Bundle` re-enqueue below) so
-            // the next dequeue transmits it via the unmodified Steps 1-10 — the
-            // newer bundle supersedes the abandoned in-flight one, so exactly
-            // one bundle stays pending (no duplicate). A `None` here is the
-            // too-late-for-slot case, which stays a drop. Delivery is checked:
-            // the reports below may lean on the re-enqueued bundle only once it
-            // is actually queued (Codex P2 on PR #419).
-            let mut reenqueued = None;
-            if let Some(bundle) = reenqueue_on_notviable {
-                let reenqueue = ComponentMessage::new(
-                    ComponentId::Ft8Transmitter,
-                    ComponentId::Ft8Transmitter,
-                    bundle.clone(),
-                    Instant::now(),
-                );
-                match message_bus.send_message_checked(reenqueue).await {
-                    Ok(true) => reenqueued = Some(bundle),
-                    Ok(false) => {
-                        warn!("supersede (multi-TX): superseding bundle was dropped on re-enqueue")
-                    }
-                    Err(e) => warn!(
-                        "supersede (multi-TX): failed to re-enqueue superseding bundle: {}",
-                        e
-                    ),
-                }
+            // `MultiTransmitRequest`, put that whole bundle at the front of the
+            // worker's inbox (mirroring the `Bundle` requeue below) so the next
+            // dequeue transmits it via the unmodified Steps 1-10 — the newer
+            // bundle supersedes the abandoned in-flight one, so exactly one
+            // bundle stays pending (no duplicate). A `None` here is the
+            // too-late-for-slot case, which stays a drop. The put-back cannot
+            // fail, so the reports below can always lean on the requeued
+            // bundle (Codex P2 on PR #419).
+            let reenqueued = reenqueue_on_notviable;
+            if let Some(bundle) = &reenqueued {
+                inbox.requeue_front(vec![self_message(bundle.clone())]);
             }
             // PAN-75 (Codex P2 on PR #418): report each abandoned item, as the
             // `Replace` arm does, so its keep-call accounting is reversed. Items
-            // the re-enqueued bundle carries over unchanged will still air, so
+            // the requeued bundle carries over unchanged will still air, so
             // they are not reported (Codex P1 on PR #419). Each is reported
             // with its own offset, and with the bundle's binding when the
             // supersede changed authorization (Codex on PR #419).
@@ -6856,29 +6971,24 @@ async fn supersede_multi_reenqueue(
             let bundle_outcome =
                 encode_and_modulate_multi_tx(encoder, active_protocol, tx_params, &items);
             let reenqueue = if bundle_outcome.samples.is_ok() {
-                ComponentMessage::new(
-                    ComponentId::Ft8Transmitter,
-                    ComponentId::Ft8Transmitter,
-                    MessageType::MultiTransmitRequest {
-                        items,
-                        // PR #348 review round 4 (Codex P1): carry the established
-                        // in-flight bundle's own parity forward, not `None` — the
-                        // same reasoning as the `Replace` arm's `bundle_tx_parity`
-                        // fix above applies here too (an "Auto" re-resolution on
-                        // the next dequeue can pick the wrong slot for an
-                        // explicit-parity bundle).
-                        tx_parity: bundle_tx_parity,
-                        // Fail-safe folded origin (Remote if either the in-flight
-                        // bundle or the new request was Remote), NOT the in-flight
-                        // bundle's origin — otherwise a Remote item folded onto a
-                        // Local in-flight bundle would re-enter ungated.
-                        origin: bundle_origin,
-                        remote_client_key_id: bundle_remote_client_key_id,
-                    },
-                    Instant::now(),
-                )
+                self_message(MessageType::MultiTransmitRequest {
+                    items,
+                    // PR #348 review round 4 (Codex P1): carry the established
+                    // in-flight bundle's own parity forward, not `None` — the
+                    // same reasoning as the `Replace` arm's `bundle_tx_parity`
+                    // fix above applies here too (an "Auto" re-resolution on
+                    // the next dequeue can pick the wrong slot for an
+                    // explicit-parity bundle).
+                    tx_parity: bundle_tx_parity,
+                    // Fail-safe folded origin (Remote if either the in-flight
+                    // bundle or the new request was Remote), NOT the in-flight
+                    // bundle's origin — otherwise a Remote item folded onto a
+                    // Local in-flight bundle would re-enter ungated.
+                    origin: bundle_origin,
+                    remote_client_key_id: bundle_remote_client_key_id,
+                })
             } else {
-                // Frequency collision: fall back to re-enqueueing only the new
+                // Frequency collision: fall back to requeueing only the new
                 // item (always the last element of the candidate bundle). This
                 // transmits ONLY the new stream, so it re-enters with the NEW
                 // request's own origin, not the in-flight bundle's.
@@ -6886,26 +6996,16 @@ async fn supersede_multi_reenqueue(
                     .last()
                     .cloned()
                     .expect("candidate bundle always contains the new item");
-                ComponentMessage::new(
-                    ComponentId::Ft8Transmitter,
-                    ComponentId::Ft8Transmitter,
-                    MessageType::TransmitRequest {
-                        message_text: new_item.message_text,
-                        frequency_offset: new_item.frequency_offset,
-                        qso_id: new_item.qso_id,
-                        tx_parity: None,
-                        origin: new_origin,
-                        remote_client_key_id: new_remote_client_key_id,
-                    },
-                    Instant::now(),
-                )
+                self_message(MessageType::TransmitRequest {
+                    message_text: new_item.message_text,
+                    frequency_offset: new_item.frequency_offset,
+                    qso_id: new_item.qso_id,
+                    tx_parity: None,
+                    origin: new_origin,
+                    remote_client_key_id: new_remote_client_key_id,
+                })
             };
-            if let Err(e) = message_bus.send_message(reenqueue).await {
-                warn!(
-                    "supersede (multi-TX): failed to re-enqueue bundle-add: {}",
-                    e
-                );
-            }
+            inbox.requeue_front(vec![reenqueue]);
         }
         SupersedeOutcome::Replace {
             origin: new_origin,
@@ -6942,26 +7042,14 @@ async fn supersede_multi_reenqueue(
                         warn!("Failed to send TransmitComplete: {}", e);
                     }
                 }
-                let reenqueue = ComponentMessage::new(
-                    ComponentId::Ft8Transmitter,
-                    ComponentId::Ft8Transmitter,
-                    MessageType::TransmitRequest {
-                        message_text: scratch_text,
-                        frequency_offset: scratch_freq,
-                        qso_id: new_qso_id,
-                        tx_parity: new_tx_parity,
-                        origin: new_origin,
-                        remote_client_key_id: new_remote_client_key_id,
-                    },
-                    Instant::now(),
-                );
-                if let Err(e) = message_bus.send_message(reenqueue).await {
-                    warn!(
-                        "supersede (multi-TX): failed to re-enqueue the identity-conflict \
-                         replacement request: {}",
-                        e
-                    );
-                }
+                inbox.requeue_front(vec![self_message(MessageType::TransmitRequest {
+                    message_text: scratch_text,
+                    frequency_offset: scratch_freq,
+                    qso_id: new_qso_id,
+                    tx_parity: new_tx_parity,
+                    origin: new_origin,
+                    remote_client_key_id: new_remote_client_key_id,
+                })]);
                 return;
             }
 
@@ -6978,23 +7066,12 @@ async fn supersede_multi_reenqueue(
             // unchanged (re-encoding happens fresh at pickup time, so
             // there's no staleness concern).
             if !in_flight_items.is_empty() {
-                let preserve = ComponentMessage::new(
-                    ComponentId::Ft8Transmitter,
-                    ComponentId::Ft8Transmitter,
-                    MessageType::MultiTransmitRequest {
-                        items: in_flight_items.to_vec(),
-                        tx_parity: bundle_tx_parity,
-                        origin,
-                        remote_client_key_id: remote_client_key_id.clone(),
-                    },
-                    Instant::now(),
-                );
-                if let Err(e) = message_bus.send_message(preserve).await {
-                    warn!(
-                        "supersede (multi-TX): failed to re-enqueue the preserved in-flight bundle: {}",
-                        e
-                    );
-                }
+                inbox.requeue_front(vec![self_message(MessageType::MultiTransmitRequest {
+                    items: in_flight_items.to_vec(),
+                    tx_parity: bundle_tx_parity,
+                    origin,
+                    remote_client_key_id: remote_client_key_id.clone(),
+                })]);
             }
             // PR #348 review round 6 (Codex P1): do NOT re-enqueue the
             // over-cap new request behind the just-preserved bundle — the
@@ -7139,6 +7216,9 @@ impl super::ApplicationCoordinator {
             // PttGuard::new's doc comment.
             let ptt_sync_gate = self.ptt_sync_gate.clone();
             let relocation_epochs = self.relocation_epochs.clone();
+            // PAN-73 follow-up: coordinator-owned so a restart keeps what the
+            // previous worker had taken off the channel but not handled.
+            let tx_requeue = self.tx_requeue.clone();
             #[cfg(test)]
             let tx_before_ptt_gate = self.tx_before_ptt_gate.clone();
             // Timestamp of the most recent PTT-on, read by the FT8 decode
@@ -7236,6 +7316,7 @@ impl super::ApplicationCoordinator {
                     (String, pancetta_qso::UnsentAttemptPayload),
                 > = std::collections::HashMap::new();
 
+                let inbox = TxInbox::new(tx_rx, tx_requeue);
                 'worker: while !shutdown.load(Ordering::Acquire) {
                     // Reset the per-message abort flag at the start of every
                     // try_recv cycle. Keeps a stale F8 from earlier (when no
@@ -7268,7 +7349,7 @@ impl super::ApplicationCoordinator {
                         };
                     }
 
-                    match tx_rx.try_recv() {
+                    match inbox.try_recv() {
                         Ok(mut message) => {
                             // 2026-07-18 operator finding: the emit_event(MessageToSend)
                             // trace added in pancetta-qso proved the QSO state machine
@@ -7362,7 +7443,7 @@ impl super::ApplicationCoordinator {
                                 // existing, unmodified drain runs once. See
                                 // docs/superpowers/specs/2026-07-21-symptom-c-adaptive-coalesce-window-design.md §1.
                                 let base_wait_ms = coalesce_collect_window_ms(active_protocol);
-                                let queue_len_before_base = tx_rx.len();
+                                let queue_len_before_base = inbox.len();
                                 if interruptible_sleep(
                                     Duration::from_millis(base_wait_ms),
                                     &shutdown,
@@ -7394,7 +7475,7 @@ impl super::ApplicationCoordinator {
                                     active_protocol,
                                 );
                                 let mut extended_ms: u64 = 0;
-                                let mut prev_len = tx_rx.len();
+                                let mut prev_len = inbox.len();
                                 // `aborted` is set instead of `continue`/`break`-ing
                                 // directly inside the loop: an unlabeled `continue`
                                 // here would target this `while`, not the outer
@@ -7421,7 +7502,7 @@ impl super::ApplicationCoordinator {
                                         break;
                                     }
                                     extended_ms += this_wait;
-                                    let new_len = tx_rx.len();
+                                    let new_len = inbox.len();
                                     if new_len <= prev_len {
                                         // Nothing new arrived this increment — stop
                                         // extending, nothing left to wait for.
@@ -7450,7 +7531,7 @@ impl super::ApplicationCoordinator {
 
                                 message.message_type = coalesce_backlog_into(
                                     message.message_type,
-                                    &tx_rx,
+                                    &inbox,
                                     &message_bus,
                                     &active_tx_qsos,
                                     &fox_admitted_qsos,
@@ -7706,7 +7787,7 @@ impl super::ApplicationCoordinator {
                                         let denial_reason = format!(
                                             "not armed/permitted: '{message_text}' at {frequency_offset:.0} Hz"
                                         );
-                                        audit_log.append(&pancetta_agent::audit::AuditEvent {
+                                        audit_log.record(&pancetta_agent::audit::AuditEvent {
                                             ts_unix_ms: chrono::Utc::now().timestamp_millis(),
                                             kind: pancetta_agent::audit::AuditKind::TxDenied,
                                             operator_callsign: tx_denied_operator_attribution(
@@ -8975,8 +9056,7 @@ impl super::ApplicationCoordinator {
                                             to_slot,
                                             &shutdown,
                                             &abort_current_tx,
-                                            &tx_rx,
-                                            &message_bus,
+                                            &inbox,
                                             std::slice::from_ref(
                                                 &crate::message_bus::TransmitRequestItem {
                                                     message_text: message_text.clone(),
@@ -9022,7 +9102,7 @@ impl super::ApplicationCoordinator {
                                                 }
                                                 continue 'worker;
                                             }
-                                            SleepOutcome::AbortedByDisarm(pending) => {
+                                            SleepOutcome::AbortedByDisarm => {
                                                 warn!(
                                                     "TX aborted between PTT and slot: remote arm no longer permits it"
                                                 );
@@ -9046,14 +9126,6 @@ impl super::ApplicationCoordinator {
                                                         pivoted_once.remove(&key);
                                                         pivoted_from.remove(&key)
                                                     });
-                                                // Round-9 review (Codex P1): drain HERE,
-                                                // after PTT is already off, not inside
-                                                // `interruptible_sleep_or_supersede` before
-                                                // returning — see `drain_and_merge_pending`'s
-                                                // doc for why.
-                                                let pending =
-                                                    drain_and_merge_pending(&tx_rx, pending);
-                                                reenqueue_pending(&message_bus, pending).await;
                                                 let operator_callsign =
                                                     tx_denied_operator_attribution(
                                                         &remote_tx_arm,
@@ -9081,7 +9153,7 @@ impl super::ApplicationCoordinator {
                                                 }
                                                 continue 'worker;
                                             }
-                                            SleepOutcome::Superseded(new_request, pending) => {
+                                            SleepOutcome::Superseded(new_request) => {
                                                 // The current in-flight single item — passed to the
                                                 // helper so a bundle-add (max_concurrent_qsos > 1)
                                                 // can fold the new request alongside it.
@@ -9130,9 +9202,7 @@ impl super::ApplicationCoordinator {
                                                         // leave the retry loop and fall through to
                                                         // the next dequeue. The armed PttGuard's
                                                         // drop is the PTT-off safety net if the
-                                                        // explicit send failed. No competing enqueue
-                                                        // here, so `pending` can go back immediately
-                                                        // (PAN-73 round 4).
+                                                        // explicit send failed.
                                                         // PAN-75: the abandoned frame gets the same
                                                         // failed completion as the `Replace` arm's
                                                         // below, so the QSO engine hands back its
@@ -9156,8 +9226,6 @@ impl super::ApplicationCoordinator {
                                                                 );
                                                             }
                                                         }
-                                                        reenqueue_pending(&message_bus, pending)
-                                                            .await;
                                                         break 'key_and_send;
                                                     }
                                                     SupersedeOutcome::Replace {
@@ -9221,12 +9289,6 @@ impl super::ApplicationCoordinator {
                                                         abort_current_tx
                                                             .store(false, Ordering::Release);
                                                         ptt_guard.disarm();
-                                                        // Re-key happens in-place on the next
-                                                        // 'key_and_send iteration, not via a channel
-                                                        // enqueue -- no competing content, so
-                                                        // `pending` goes back now (PAN-73 round 4).
-                                                        reenqueue_pending(&message_bus, pending)
-                                                            .await;
                                                         continue 'key_and_send;
                                                     }
                                                     SupersedeOutcome::Bundle {
@@ -9257,9 +9319,7 @@ impl super::ApplicationCoordinator {
                                                                 &items,
                                                             );
                                                         if bundle_outcome.samples.is_ok() {
-                                                            let bundle_msg = ComponentMessage::new(
-                                                                ComponentId::Ft8Transmitter,
-                                                                ComponentId::Ft8Transmitter,
+                                                            let bundle_msg = self_message(
                                                                 MessageType::MultiTransmitRequest {
                                                                     items,
                                                                     // PR #348 review round 6 (Codex
@@ -9276,24 +9336,10 @@ impl super::ApplicationCoordinator {
                                                                     remote_client_key_id:
                                                                         bundle_remote_client_key_id,
                                                                 },
-                                                                Instant::now(),
                                                             );
-                                                            if let Err(e) = message_bus
-                                                                .send_message(bundle_msg)
-                                                                .await
-                                                            {
-                                                                warn!("supersede: failed to re-enqueue multi-TX bundle: {}", e);
-                                                            }
+                                                            // The supersede winner goes ahead of the siphoned traffic already on the front (PAN-73 round 4).
+                                                            inbox.requeue_front(vec![bundle_msg]);
                                                             ptt_guard.disarm();
-                                                            // The bundle (the actual supersede
-                                                            // winner's content) is already enqueued
-                                                            // above -- `pending` goes back AFTER it,
-                                                            // never ahead (PAN-73 round 4).
-                                                            reenqueue_pending(
-                                                                &message_bus,
-                                                                pending,
-                                                            )
-                                                            .await;
                                                             break 'key_and_send;
                                                         }
                                                         // Frequency collision: single-item replace
@@ -9339,11 +9385,6 @@ impl super::ApplicationCoordinator {
                                                         abort_current_tx
                                                             .store(false, Ordering::Release);
                                                         ptt_guard.disarm();
-                                                        // Frequency-collision fallback re-keys
-                                                        // in-place, same as Replace -- no competing
-                                                        // enqueue (PAN-73 round 4).
-                                                        reenqueue_pending(&message_bus, pending)
-                                                            .await;
                                                         continue 'key_and_send;
                                                     }
                                                 }
@@ -9461,8 +9502,7 @@ impl super::ApplicationCoordinator {
                                             Duration::from_millis(audio_duration_ms),
                                             &shutdown,
                                             &abort_current_tx,
-                                            &tx_rx,
-                                            &message_bus,
+                                            &inbox,
                                             std::slice::from_ref(
                                                 &crate::message_bus::TransmitRequestItem {
                                                     message_text: message_text.clone(),
@@ -9507,7 +9547,7 @@ impl super::ApplicationCoordinator {
                                                 }
                                                 continue 'worker;
                                             }
-                                            SleepOutcome::AbortedByDisarm(pending) => {
+                                            SleepOutcome::AbortedByDisarm => {
                                                 warn!(
                                                     "TX aborted during playback: remote arm no longer permits it"
                                                 );
@@ -9518,8 +9558,8 @@ impl super::ApplicationCoordinator {
                                                 // PAN-135: stand the guard down only after Hamlib accepts PTT-off.
                                                 ptt_guard.release("Remote disarm mid-TX").await;
                                                 // Round-4 review (Codex P1): flush the
-                                                // already-queued remote waveform BEFORE
-                                                // reenqueuing pending work — a pending local
+                                                // already-queued remote waveform before the
+                                                // worker resumes pending work — a pending local
                                                 // TuneRequest or a fresh TX both queue with
                                                 // `flush_first: false`, so without this the
                                                 // disarmed client's remaining audio could
@@ -9533,12 +9573,6 @@ impl super::ApplicationCoordinator {
                                                     &shutdown,
                                                 )
                                                 .await;
-                                                // Round-9 review (Codex P1): drain HERE,
-                                                // after PTT is already off — see
-                                                // `drain_and_merge_pending`'s doc for why.
-                                                let pending =
-                                                    drain_and_merge_pending(&tx_rx, pending);
-                                                reenqueue_pending(&message_bus, pending).await;
                                                 let operator_callsign =
                                                     tx_denied_operator_attribution(
                                                         &remote_tx_arm,
@@ -9567,7 +9601,7 @@ impl super::ApplicationCoordinator {
                                                 }
                                                 continue 'worker;
                                             }
-                                            SleepOutcome::Superseded(new_request, pending) => {
+                                            SleepOutcome::Superseded(new_request) => {
                                                 // Same bundle-add-or-replace decision as Step 6.
                                                 let in_flight_items =
                                                     vec![crate::message_bus::TransmitRequestItem {
@@ -9612,8 +9646,7 @@ impl super::ApplicationCoordinator {
                                                         // Too late to re-key this slot — abandon
                                                         // THIS message (not the worker): leave the
                                                         // retry loop and fall through to next
-                                                        // dequeue. No competing enqueue, so
-                                                        // `pending` goes back now (PAN-73 round 4).
+                                                        // dequeue.
                                                         // PAN-75: report the abandoned frame as
                                                         // the Step 6 `NotViable` arm does.
                                                         if let Some(abandoned) =
@@ -9635,8 +9668,6 @@ impl super::ApplicationCoordinator {
                                                                 );
                                                             }
                                                         }
-                                                        reenqueue_pending(&message_bus, pending)
-                                                            .await;
                                                         break 'key_and_send;
                                                     }
                                                     SupersedeOutcome::Replace {
@@ -9690,12 +9721,6 @@ impl super::ApplicationCoordinator {
                                                         abort_current_tx
                                                             .store(false, Ordering::Release);
                                                         ptt_guard.disarm();
-                                                        // Re-key happens in-place on the next
-                                                        // 'key_and_send iteration, not via a channel
-                                                        // enqueue -- no competing content, so
-                                                        // `pending` goes back now (PAN-73 round 4).
-                                                        reenqueue_pending(&message_bus, pending)
-                                                            .await;
                                                         continue 'key_and_send;
                                                     }
                                                     SupersedeOutcome::Bundle {
@@ -9717,9 +9742,7 @@ impl super::ApplicationCoordinator {
                                                                 &items,
                                                             );
                                                         if bundle_outcome.samples.is_ok() {
-                                                            let bundle_msg = ComponentMessage::new(
-                                                                ComponentId::Ft8Transmitter,
-                                                                ComponentId::Ft8Transmitter,
+                                                            let bundle_msg = self_message(
                                                                 MessageType::MultiTransmitRequest {
                                                                     items,
                                                                     // PR #348 review round 6 (Codex
@@ -9732,24 +9755,10 @@ impl super::ApplicationCoordinator {
                                                                     remote_client_key_id:
                                                                         bundle_remote_client_key_id,
                                                                 },
-                                                                Instant::now(),
                                                             );
-                                                            if let Err(e) = message_bus
-                                                                .send_message(bundle_msg)
-                                                                .await
-                                                            {
-                                                                warn!("supersede: failed to re-enqueue multi-TX bundle: {}", e);
-                                                            }
+                                                            // The supersede winner goes ahead of the siphoned traffic already on the front (PAN-73 round 4).
+                                                            inbox.requeue_front(vec![bundle_msg]);
                                                             ptt_guard.disarm();
-                                                            // The bundle (the actual supersede
-                                                            // winner's content) is already enqueued
-                                                            // above -- `pending` goes back AFTER it,
-                                                            // never ahead (PAN-73 round 4).
-                                                            reenqueue_pending(
-                                                                &message_bus,
-                                                                pending,
-                                                            )
-                                                            .await;
                                                             break 'key_and_send;
                                                         }
                                                         // Frequency collision: single-item replace
@@ -9789,11 +9798,6 @@ impl super::ApplicationCoordinator {
                                                         abort_current_tx
                                                             .store(false, Ordering::Release);
                                                         ptt_guard.disarm();
-                                                        // Frequency-collision fallback re-keys
-                                                        // in-place, same as Replace -- no competing
-                                                        // enqueue (PAN-73 round 4).
-                                                        reenqueue_pending(&message_bus, pending)
-                                                            .await;
                                                         continue 'key_and_send;
                                                     }
                                                 }
@@ -10132,7 +10136,7 @@ impl super::ApplicationCoordinator {
                                             "not armed/permitted: multi-TX bundle of {} items",
                                             items.len()
                                         );
-                                        audit_log.append(&pancetta_agent::audit::AuditEvent {
+                                        audit_log.record(&pancetta_agent::audit::AuditEvent {
                                             ts_unix_ms: chrono::Utc::now().timestamp_millis(),
                                             kind: pancetta_agent::audit::AuditKind::TxDenied,
                                             operator_callsign: tx_denied_operator_attribution(
@@ -11872,8 +11876,7 @@ impl super::ApplicationCoordinator {
                                         to_slot,
                                         &shutdown,
                                         &abort_current_tx,
-                                        &tx_rx,
-                                        &message_bus,
+                                        &inbox,
                                         // PAN-73 round 2 (Codex): every in-flight bundle item,
                                         // not just the first -- a fresher message for the
                                         // bundle's 2nd+ QSO must match here too.
@@ -11915,7 +11918,7 @@ impl super::ApplicationCoordinator {
                                             }
                                             continue;
                                         }
-                                        SleepOutcome::AbortedByDisarm(pending) => {
+                                        SleepOutcome::AbortedByDisarm => {
                                             warn!(
                                                 "Multi-TX aborted between PTT and slot: remote arm no longer permits it"
                                             );
@@ -11931,11 +11934,6 @@ impl super::ApplicationCoordinator {
                                                 &mut pivoted_once,
                                                 &mut pivoted_from,
                                             );
-                                            // Round-9 review (Codex P1): drain HERE, after
-                                            // PTT is already off — see
-                                            // `drain_and_merge_pending`'s doc for why.
-                                            let pending = drain_and_merge_pending(&tx_rx, pending);
-                                            reenqueue_pending(&message_bus, pending).await;
                                             let operator_callsign = tx_denied_operator_attribution(
                                                 &remote_tx_arm,
                                                 remote_client_key_id.as_deref(),
@@ -11967,7 +11965,7 @@ impl super::ApplicationCoordinator {
                                             }
                                             continue;
                                         }
-                                        SleepOutcome::Superseded(new_request, pending) => {
+                                        SleepOutcome::Superseded(new_request) => {
                                             supersede_multi_reenqueue(
                                                 new_request,
                                                 &items,
@@ -11978,6 +11976,7 @@ impl super::ApplicationCoordinator {
                                                 active_protocol,
                                                 &tx_params,
                                                 &message_bus,
+                                                &inbox,
                                                 &ptt_active,
                                                 &last_ptt_on_ms,
                                                 tx_late_max_ms_effective(
@@ -12002,10 +12001,6 @@ impl super::ApplicationCoordinator {
                                             )
                                             .await;
                                             ptt_guard.disarm();
-                                            // supersede_multi_reenqueue already enqueued its own
-                                            // resolved content above -- `pending` goes back AFTER
-                                            // it (PAN-73 round 4).
-                                            reenqueue_pending(&message_bus, pending).await;
                                             continue;
                                         }
                                     }
@@ -12123,8 +12118,7 @@ impl super::ApplicationCoordinator {
                                         Duration::from_millis(audio_duration_ms),
                                         &shutdown,
                                         &abort_current_tx,
-                                        &tx_rx,
-                                        &message_bus,
+                                        &inbox,
                                         // PAN-73 round 2 (Codex): every in-flight bundle item,
                                         // not just the first -- a fresher message for the
                                         // bundle's 2nd+ QSO must match here too.
@@ -12166,7 +12160,7 @@ impl super::ApplicationCoordinator {
                                             }
                                             continue;
                                         }
-                                        SleepOutcome::AbortedByDisarm(pending) => {
+                                        SleepOutcome::AbortedByDisarm => {
                                             warn!(
                                                 "Multi-TX aborted during playback: remote arm no longer permits it"
                                             );
@@ -12175,8 +12169,8 @@ impl super::ApplicationCoordinator {
                                             // PAN-135: stand the guard down only after Hamlib accepts PTT-off.
                                             ptt_guard.release("Remote disarm mid-TX").await;
                                             // Round-4 review (Codex P1): flush the
-                                            // already-queued remote bundle waveform BEFORE
-                                            // reenqueuing pending work — see the single-TX
+                                            // already-queued remote bundle waveform before
+                                            // the worker resumes pending work — see the single-TX
                                             // arm's identical fix for why. PAN-135 confirms
                                             // the flush in the audio thread.
                                             flush_disarmed_audio_confirmed(
@@ -12186,11 +12180,6 @@ impl super::ApplicationCoordinator {
                                                 &shutdown,
                                             )
                                             .await;
-                                            // Round-9 review (Codex P1): drain HERE, after
-                                            // PTT is already off — see
-                                            // `drain_and_merge_pending`'s doc for why.
-                                            let pending = drain_and_merge_pending(&tx_rx, pending);
-                                            reenqueue_pending(&message_bus, pending).await;
                                             let operator_callsign = tx_denied_operator_attribution(
                                                 &remote_tx_arm,
                                                 remote_client_key_id.as_deref(),
@@ -12220,7 +12209,7 @@ impl super::ApplicationCoordinator {
                                             }
                                             continue;
                                         }
-                                        SleepOutcome::Superseded(new_request, pending) => {
+                                        SleepOutcome::Superseded(new_request) => {
                                             supersede_multi_reenqueue(
                                                 new_request,
                                                 &items,
@@ -12231,6 +12220,7 @@ impl super::ApplicationCoordinator {
                                                 active_protocol,
                                                 &tx_params,
                                                 &message_bus,
+                                                &inbox,
                                                 &ptt_active,
                                                 &last_ptt_on_ms,
                                                 tx_late_max_ms_effective(
@@ -12255,10 +12245,6 @@ impl super::ApplicationCoordinator {
                                             )
                                             .await;
                                             ptt_guard.disarm();
-                                            // supersede_multi_reenqueue already enqueued its own
-                                            // resolved content above -- `pending` goes back AFTER
-                                            // it (PAN-73 round 4).
-                                            reenqueue_pending(&message_bus, pending).await;
                                             continue;
                                         }
                                     }
@@ -16084,6 +16070,7 @@ mod supersede_rekey_tests {
         let ptt_active = Arc::new(AtomicBool::new(true));
         let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
 
+        let inbox = super::TxInbox::new(tx_rx.clone(), Default::default());
         super::supersede_multi_reenqueue(
             superseding,
             &in_flight,
@@ -16094,6 +16081,7 @@ mod supersede_rekey_tests {
             pancetta_ft8::Protocol::Ft8,
             &tx_params,
             &bus,
+            &inbox,
             &ptt_active,
             &last_ptt_on_ms,
             20_000,
@@ -16127,7 +16115,7 @@ mod supersede_rekey_tests {
         );
 
         // (2) The superseding bundle was re-enqueued to the worker, not dropped.
-        let reenqueued = tx_rx
+        let reenqueued = inbox
             .try_recv()
             .expect("the superseding MultiTransmitRequest must be re-enqueued");
         match reenqueued.message_type {
@@ -16140,7 +16128,7 @@ mod supersede_rekey_tests {
         }
         // Exactly one thing re-enqueued (no duplicate transmission).
         assert!(
-            tx_rx.try_recv().is_err(),
+            inbox.try_recv().is_err(),
             "no second re-enqueue — the in-flight bundle is abandoned, not duplicated"
         );
     }
@@ -16201,6 +16189,7 @@ mod supersede_rekey_tests {
         let ptt_active = Arc::new(AtomicBool::new(true));
         let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
 
+        let inbox = super::TxInbox::new(tx_rx.clone(), Default::default());
         super::supersede_multi_reenqueue(
             superseding,
             &in_flight,
@@ -16211,6 +16200,7 @@ mod supersede_rekey_tests {
             pancetta_ft8::Protocol::Ft8,
             &tx_params,
             &bus,
+            &inbox,
             &ptt_active,
             &last_ptt_on_ms,
             20_000,
@@ -16223,7 +16213,7 @@ mod supersede_rekey_tests {
         .await;
 
         // The preserved in-flight bundle is re-enqueued first, unchanged.
-        let preserved = tx_rx
+        let preserved = inbox
             .try_recv()
             .expect("the in-flight bundle must be preserved, not dropped");
         match preserved.message_type {
@@ -16252,7 +16242,7 @@ mod supersede_rekey_tests {
         // it as an immediate fresh supersede, re-entering this same arm
         // forever). Nothing else goes to the transmitter channel.
         assert!(
-            tx_rx.try_recv().is_err(),
+            inbox.try_recv().is_err(),
             "exactly one message re-enqueued to the transmitter: the preserved bundle — the \
              over-cap request must be dropped, not requeued behind it"
         );
@@ -16330,6 +16320,7 @@ mod supersede_rekey_tests {
         let ptt_active = Arc::new(AtomicBool::new(true));
         let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
 
+        let inbox = super::TxInbox::new(tx_rx.clone(), Default::default());
         super::supersede_multi_reenqueue(
             superseding,
             &in_flight,
@@ -16340,6 +16331,7 @@ mod supersede_rekey_tests {
             pancetta_ft8::Protocol::Ft8,
             &tx_params,
             &bus,
+            &inbox,
             &ptt_active,
             &last_ptt_on_ms,
             20_000,
@@ -16356,7 +16348,7 @@ mod supersede_rekey_tests {
         // The NEW client-b request must be the only thing sent to the
         // transmitter channel, as a single TransmitRequest carrying its OWN
         // identity.
-        let reenqueued = tx_rx
+        let reenqueued = inbox
             .try_recv()
             .expect("the new request must be enqueued, not silently dropped");
         match reenqueued.message_type {
@@ -16384,7 +16376,7 @@ mod supersede_rekey_tests {
             other => panic!("expected the new request as a single TransmitRequest, got {other:?}"),
         }
         assert!(
-            tx_rx.try_recv().is_err(),
+            inbox.try_recv().is_err(),
             "the stale in-flight bundle must not also be re-enqueued"
         );
 
@@ -16463,6 +16455,7 @@ mod supersede_rekey_tests {
         let ptt_active = Arc::new(AtomicBool::new(true));
         let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
 
+        let inbox = super::TxInbox::new(tx_rx.clone(), Default::default());
         super::supersede_multi_reenqueue(
             superseding,
             &in_flight,
@@ -16473,6 +16466,7 @@ mod supersede_rekey_tests {
             pancetta_ft8::Protocol::Ft8,
             &tx_params,
             &bus,
+            &inbox,
             &ptt_active,
             &last_ptt_on_ms,
             20_000,
@@ -16484,7 +16478,7 @@ mod supersede_rekey_tests {
         )
         .await;
 
-        let reenqueued = tx_rx
+        let reenqueued = inbox
             .try_recv()
             .expect("the folded bundle must be re-enqueued");
         match reenqueued.message_type {
@@ -16921,6 +16915,186 @@ mod coalesce_tests {
             None => true,
             Some(id) => set.contains(&super::super::active_tx_qso_key(id)),
         }
+    }
+
+    fn pan73_tx(text: &str, qso: &str, hz: f64) -> MessageType {
+        MessageType::TransmitRequest {
+            message_text: text.into(),
+            frequency_offset: hz,
+            qso_id: Some(qso.into()),
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
+        }
+    }
+
+    async fn pan73_coalesce(
+        head: MessageType,
+        inbox: &super::TxInbox,
+        live: &[&str],
+    ) -> MessageType {
+        let bus = MessageBus::new(16).unwrap();
+        coalesce_backlog_into(
+            head,
+            inbox,
+            &bus,
+            &std::sync::Arc::new(std::sync::RwLock::new(liveset(live))),
+            &std::sync::Arc::new(std::sync::RwLock::new(HashSet::new())),
+            4,
+            &std::sync::Arc::new(std::sync::Mutex::new(pancetta_agent::arm::ArmState::new())),
+            &pancetta_agent::audit::AuditLog::new(audit_tmp()),
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
+        )
+        .await
+    }
+
+    /// PAN-73 follow-up: the message the drain stops at goes back where it
+    /// was, ahead of later traffic. It used to be re-sent to the back of the
+    /// channel, behind requests that arrived after it (main left ["C", "Tune"]).
+    #[tokio::test(flavor = "current_thread")]
+    async fn coalesce_puts_the_stop_message_back_in_arrival_order() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        for m in [
+            pan73_tx("B", "qso-b", 1300.0),
+            MessageType::TuneRequest {
+                duration_secs: 5,
+                tone_offset_hz: 1500.0,
+            },
+            pan73_tx("C", "qso-c", 1600.0),
+        ] {
+            tx.send(ComponentMessage::new(
+                ComponentId::Qso,
+                ComponentId::Ft8Transmitter,
+                m,
+                Instant::now(),
+            ))
+            .unwrap();
+        }
+        let inbox = super::TxInbox::new(rx, Default::default());
+        let _ = pan73_coalesce(
+            pan73_tx("A", "qso-a", 1000.0),
+            &inbox,
+            &["qso-a", "qso-b", "qso-c"],
+        )
+        .await;
+        let left: Vec<String> = std::iter::from_fn(|| inbox.try_recv().ok())
+            .map(|m| match m.message_type {
+                MessageType::TransmitRequest { message_text, .. } => message_text,
+                MessageType::TuneRequest { .. } => "Tune".into(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(left, ["Tune", "C"]);
+    }
+
+    /// PAN-73 follow-up: held messages are older than the channel's, so the
+    /// coalescer folds them first and newest-per-QSO keeps the channel's.
+    #[tokio::test(flavor = "current_thread")]
+    async fn coalesce_folds_the_requeue_front_before_the_channel() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let inbox = super::TxInbox::new(rx, Default::default());
+        inbox.requeue_front(vec![super::self_message(pan73_tx(
+            "B -07", "qso-b", 1300.0,
+        ))]);
+        tx.send(ComponentMessage::new(
+            ComponentId::Qso,
+            ComponentId::Ft8Transmitter,
+            pan73_tx("B R-09", "qso-b", 1300.0),
+            Instant::now(),
+        ))
+        .unwrap();
+        let result =
+            pan73_coalesce(pan73_tx("A", "qso-a", 1000.0), &inbox, &["qso-a", "qso-b"]).await;
+        let MessageType::MultiTransmitRequest { items, .. } = result else {
+            panic!("expected a bundle, got {result:?}")
+        };
+        let b: Vec<&str> = items
+            .iter()
+            .filter(|i| i.qso_id.as_deref() == Some("qso-b"))
+            .map(|i| i.message_text.as_str())
+            .collect();
+        assert_eq!(b, ["B R-09"], "the newer request for qso-b must win");
+    }
+
+    /// PAN-73 follow-up: a request the coalescer defers to keep consent
+    /// channels apart arrived before the non-TX message the drain stopped
+    /// at, so it must come out of the inbox first. Arm setup as in
+    /// `backlog_preserves_consent_channels_until_key_time`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn consent_deferred_request_stays_ahead_of_the_stop_message() {
+        use pancetta_agent::arm::{ArmState, ConsentChannel, VerifiedArmGrant};
+        use std::sync::{Arc, Mutex, RwLock};
+
+        let bus = MessageBus::new(16).unwrap();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut state = ArmState::new();
+        state.set_channel_consent(ConsentChannel::StationAgent, true, now_ms);
+        state.set_channel_consent(ConsentChannel::WsjtxUdp, true, now_ms);
+        state.arm(
+            VerifiedArmGrant {
+                operator_callsign: "K5ARH".into(),
+                ttl_ms: 120_000,
+                armed_until_ms: now_ms + 120_000,
+                heartbeat_interval_sec: 10,
+                scope_tx: true,
+                jti: "channel-backlog-stop-order".into(),
+                client_key_id: "client-a".into(),
+            },
+            pancetta_agent::arm::ArmTime::now(),
+        );
+        let arm = Arc::new(Mutex::new(state));
+        let request = |udp: bool| MessageType::TransmitRequest {
+            message_text: if udp { "UDP" } else { "AGENT" }.into(),
+            frequency_offset: if udp { 1000.0 } else { 1300.0 },
+            qso_id: Some(if udp { "udp-qso" } else { "agent-qso" }.into()),
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Remote,
+            remote_client_key_id: if udp { None } else { Some("client-a".into()) },
+        };
+        let (backlog_tx, backlog_rx) = crossbeam_channel::unbounded();
+        for m in [
+            request(false),
+            MessageType::TuneRequest {
+                duration_secs: 5,
+                tone_offset_hz: 1500.0,
+            },
+        ] {
+            backlog_tx
+                .send(ComponentMessage::new(
+                    ComponentId::Ft8Transmitter,
+                    ComponentId::Ft8Transmitter,
+                    m,
+                    Instant::now(),
+                ))
+                .unwrap();
+        }
+        let backlog_inbox = super::TxInbox::new(backlog_rx, Default::default());
+        let result = coalesce_backlog_into(
+            request(true),
+            &backlog_inbox,
+            &bus,
+            &Arc::new(RwLock::new(liveset(&["udp-qso", "agent-qso"]))),
+            &Arc::new(RwLock::new(HashSet::new())),
+            2,
+            &arm,
+            &pancetta_agent::audit::AuditLog::new(audit_tmp()),
+            &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&result, MessageType::TransmitRequest { message_text, .. } if message_text == "UDP"),
+            "different consent channels must remain separate: {result:?}"
+        );
+        let left: Vec<String> = std::iter::from_fn(|| backlog_inbox.try_recv().ok())
+            .map(|m| match m.message_type {
+                MessageType::TransmitRequest { message_text, .. } => message_text,
+                MessageType::TuneRequest { .. } => "Tune".into(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(left, ["AGENT", "Tune"]);
     }
 
     fn liveset(ids: &[&str]) -> HashSet<String> {
@@ -17421,9 +17595,10 @@ mod coalesce_tests {
         let arm = Arc::new(std::sync::Mutex::new(pancetta_agent::arm::ArmState::new()));
         let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp());
         let display_feed_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let backlog_inbox = super::TxInbox::new(backlog_rx.clone(), Default::default());
         let _ = coalesce_backlog_into(
             head,
-            &backlog_rx,
+            &backlog_inbox,
             &bus,
             &active_tx_qsos,
             &Arc::new(std::sync::RwLock::new(HashSet::new())),
@@ -17525,9 +17700,10 @@ mod coalesce_tests {
                     Instant::now(),
                 ))
                 .unwrap();
+            let backlog_inbox = super::TxInbox::new(backlog_rx.clone(), Default::default());
             let result = coalesce_backlog_into(
                 request(udp_first),
-                &backlog_rx,
+                &backlog_inbox,
                 &bus,
                 &Arc::new(RwLock::new(liveset(&["udp-qso", "agent-qso"]))),
                 &Arc::new(RwLock::new(HashSet::new())),
@@ -17542,9 +17718,11 @@ mod coalesce_tests {
                 matches!(result, MessageType::TransmitRequest { .. }),
                 "different consent channels must remain separate: {result:?}"
             );
-            let deferred = deferred_rx
+            let deferred = backlog_inbox
                 .try_recv()
                 .expect("other channel must be requeued");
+            assert!(backlog_inbox.try_recv().is_err());
+            // Held by the worker, not sent back through the bus.
             assert!(deferred_rx.is_empty());
 
             // Revoke only UDP after the snapshot. The actual final gate must
@@ -17649,9 +17827,10 @@ mod coalesce_tests {
 
         let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp());
         let display_feed_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let backlog_inbox = super::TxInbox::new(backlog_rx.clone(), Default::default());
         let result = coalesce_backlog_into(
             head,
-            &backlog_rx,
+            &backlog_inbox,
             &bus,
             &active_tx_qsos,
             &Arc::new(std::sync::RwLock::new(HashSet::new())),
@@ -17768,9 +17947,10 @@ mod coalesce_tests {
 
         let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp());
         let display_feed_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let backlog_inbox = super::TxInbox::new(backlog_rx.clone(), Default::default());
         let result = coalesce_backlog_into(
             request("K1ABC N0CALL R-07"),
-            &backlog_rx,
+            &backlog_inbox,
             &bus,
             &active_tx_qsos,
             &Arc::new(std::sync::RwLock::new(HashSet::new())),
@@ -18042,9 +18222,10 @@ mod coalesce_tests {
         let arm = Arc::new(std::sync::Mutex::new(pancetta_agent::arm::ArmState::new()));
         let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp());
         let display_feed_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let backlog_inbox = super::TxInbox::new(backlog_rx.clone(), Default::default());
         let result = coalesce_backlog_into(
             head,
-            &backlog_rx,
+            &backlog_inbox,
             &bus,
             &active_tx_qsos,
             &fox_admitted_qsos,
@@ -20190,6 +20371,61 @@ mod pan115_worker_gate_tests {
         );
     }
 
+    /// PAN-73 follow-up: a message the dead worker had taken off its channel
+    /// but not handled (held in the coordinator-owned requeue front) is keyed
+    /// by the restarted worker, with no new request sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requeued_message_survives_a_tx_worker_restart() {
+        let mut h = worker_harness().await;
+        let real = h
+            .coordinator
+            .named_task_handles
+            .iter()
+            .position(|(id, _)| *id == ComponentId::Ft8Transmitter)
+            .map(|i| h.coordinator.named_task_handles.remove(i).1)
+            .expect("worker_harness registers the TX worker handle");
+        real.abort();
+        let _ = real.await;
+
+        let (_, rx) = h
+            .coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        super::TxInbox::new(rx, h.coordinator.tx_requeue.clone()).requeue_front(vec![
+            ComponentMessage::new(
+                ComponentId::Autonomous,
+                ComponentId::Ft8Transmitter,
+                MessageType::TransmitRequest {
+                    message_text: "CQ N0CALL FN20".into(),
+                    frequency_offset: 1500.0,
+                    qso_id: None,
+                    tx_parity: None,
+                    origin: TxOrigin::Local,
+                    remote_client_key_id: None,
+                },
+                Instant::now(),
+            ),
+        ]);
+
+        h.coordinator.named_task_handles.push((
+            ComponentId::Ft8Transmitter,
+            tokio::spawn(async {
+                panic!("injected TX-worker panic");
+                #[allow(unreachable_code)]
+                Ok(())
+            }),
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        h.coordinator.check_task_handles().await;
+
+        assert!(
+            await_ptt_on(&h, Duration::from_secs(40)).await,
+            "the restarted TX worker must key the request its predecessor was holding"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn operator_f8_abort_reports_frame_not_sent_to_qso() {
         let h = worker_harness().await;
@@ -21453,7 +21689,9 @@ mod pan135_disarm_flush_tests {
 }
 #[cfg(test)]
 mod pan135_worker_disarm_tests {
-    use super::pan115_worker_gate_tests::{await_ptt_on, worker_harness, Harness};
+    use super::pan115_worker_gate_tests::{
+        await_ptt_on, worker_harness, worker_harness_with_config, Harness,
+    };
     use super::*;
     use crate::message_bus::{RigControlMessage, TxOrigin};
     use crossbeam_channel::Receiver;
@@ -21462,7 +21700,10 @@ mod pan135_worker_disarm_tests {
     const TEXT: &str = "CQ N0CALL FN20";
 
     async fn remote_playback() -> (Harness, Receiver<ComponentMessage>) {
-        let h = worker_harness().await;
+        remote_playback_with(worker_harness().await).await
+    }
+
+    async fn remote_playback_with(h: Harness) -> (Harness, Receiver<ComponentMessage>) {
         let (_, audio_rx) = h
             .coordinator
             .message_bus
@@ -21610,9 +21851,56 @@ mod pan135_worker_disarm_tests {
         assert!(!h.coordinator.ptt_active.load(Ordering::Acquire));
     }
 
+    /// PAN-104: a failing audit sink never prevents or reorders the unkey;
+    /// the interrupt's audit record is attempted after PTT-off and its
+    /// failure is surfaced through the shared audit health.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_mid_playback_disarm_unkeys_with_a_failing_audit_sink() {
+        let (h, audio_rx) =
+            remote_playback_with(worker_harness_with_config(failing_audit_config()).await).await;
+        disarm(&h);
+        let ack = flush_ack(&audio_rx).await;
+        assert_eq!(ptt_offs(&h), 1, "PTT-off precedes the flush");
+        ack.complete(true);
+        await_failed_completion(&h).await;
+        assert!(!h.coordinator.ptt_active.load(Ordering::Acquire));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !h.coordinator.audit_log().health().unavailable {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the failed audit write is surfaced");
+    }
+
+    fn failing_audit_config() -> pancetta_config::Config {
+        let mut cfg = pancetta_config::Config::default();
+        cfg.network.station_agent.audit_log_path = Some(
+            std::env::temp_dir()
+                .join(format!("pancetta-pan104-missing-{}", uuid::Uuid::new_v4()))
+                .join("audit.log")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        cfg
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remote_mid_playback_disarm_with_hamlib_backlogged_still_unkeys() {
         let (h, audio_rx) = remote_playback().await;
+        backlogged_disarm_still_unkeys(h, audio_rx).await;
+    }
+
+    /// PAN-104: the backlogged-Hamlib unkey and its flush-ack ordering hold
+    /// with a failing audit sink too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backlogged_disarm_unkeys_with_a_failing_audit_sink() {
+        let (h, audio_rx) =
+            remote_playback_with(worker_harness_with_config(failing_audit_config()).await).await;
+        backlogged_disarm_still_unkeys(h, audio_rx).await;
+    }
+
+    async fn backlogged_disarm_still_unkeys(h: Harness, audio_rx: Receiver<ComponentMessage>) {
         let bus = &h.coordinator.message_bus;
         let mut filled = 0;
         while bus

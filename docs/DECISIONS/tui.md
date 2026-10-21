@@ -246,3 +246,104 @@ unchanged (`ui::view_render_tests::callers_shows_a_caller_row_at_80x24`). The su
 the contract lives in dispensa), the SIGTERM/quit shutdown PTT-off path (runs after the TUI exits),
 any change to the TX gate, per-command "saved / sent / confirmed / applied" tracking beyond rig
 frequency/split, and persisting acks.
+
+## Rig picker re-enumerates serial ports on open (2026-10-17, PAN-60)
+
+**Problem.** PAN-59's `i` rig picker got its serial-port list once: the coordinator called
+`serialport::available_ports()` in a one-shot startup block of the relay task, directly on the
+async runtime, and never again. A rig plugged in while pancetta ran never appeared, so switching
+rigs still needed a restart, the complaint PAN-59 was filed for. The `d` audio picker's startup-only
+push was the model, but audio devices are present at boot and a newly plugged-in rig is not.
+
+**Shape.** Opening the picker (`i`, closed→open only; `i` typed inside it is a Model character)
+sends `TuiCommand::RequestRigConfig`. The relay arm calls
+`pancetta/src/coordinator/tui_relay.rs::spawn_rig_config_refresh` and returns to `try_recv` at once.
+The helper spawns a detached task that runs `enumerate_serial_ports` (the only `available_ports()`
+call under `coordinator/`) through `spawn_blocking`, then takes the config read lock, builds the
+`TuiMessage::RigConfigUpdate` from `cfg.rig`, and `try_send`s it while still holding the guard. The
+startup push uses the same helper, so the runtime never blocks on enumeration and the command loop
+starts without waiting for it. Single-flight: an `AtomicBool` claimed with `swap(true)` and released
+by a `Drop` guard in the task (normal end, enumerator panic, or the runtime dropping the task at
+shutdown); a request made during a refresh spawns nothing and is answered by that refresh's reply.
+
+**Why this shape.** The relay loop also carries Shift+Q, StopTx, TogglePtt and AbortQso, and the
+PAN-59 I4 rule (on `SelectRig`'s arm) forbids awaiting slow work inline; awaiting `spawn_blocking`
+still suspends the loop. The two registered workers exist because queued disk writes must survive
+shutdown; a read-only enumeration has no such need, so it follows `SelectRig`'s unregistered
+`tokio::spawn`. Single-flight caps parked blocking-pool threads at one if a Windows serial driver
+stalls SetupAPI, and keeps replies in order. Reading config after enumerating means a switch made
+before a reopen is in the reply (the PAN-59 "no re-push after a switch" finding). Holding the read
+guard across the send orders the reply against the bookmark worker, which commits under the write
+lock and sends `RigBookmarksUpdate` after releasing it, so a stale bookmark list can never land
+last. `try_send` drops the reply on a full TUI channel instead of parking a runtime thread under a
+lock `SelectRig` needs to write.
+
+**Edit-preserving merge.** The reply lands a frame or two after the picker opens, and a full apply
+overwrites every field. `App::apply_rig_config_update` therefore merges when the picker is visible
+and `RigSelectionState::has_operator_edits()` (any field differs from the snapshot taken on open, or
+a bookmark sub-overlay is open): `merge_refreshed_ports` replaces the port list, re-finds the
+selected and committed ports by name (prepending either if it vanished, as I-2a and PAN-61's I-4
+do), replaces bookmarks with the overlay selection clamped, and touches nothing else. It also merges,
+open or closed, a reply read before the coordinator handled the operator's latest `SelectRig`: the
+relay counts handled `SelectRig`s (bumped under the config write lock when it applies one), the
+refresh stamps that count on the reply as `select_seq` under its read lock, and the TUI merges any
+reply whose `select_seq` is below `RigSelectionState::submits_sent`. Without it, a refresh read just
+before Enter and drained afterwards (after the picker closed, or behind a decode backlog after it
+reopened) put the old rig back in the form, and the next Enter re-applied it. Otherwise an untouched
+open picker, or a closed one, takes the full apply, so a reopen after a switch the coordinator
+refused shows the configured values. `active_field` is never touched.
+
+**Accepted trade-offs.** No "scanning…" marker, no in-picker rescan key and no on-screen error: the
+picker opens on the last-known list and is updated in place; Esc then `i` rescans; a failed
+enumeration is a warn log and an empty list (the configured port is still offered). If the operator
+closes, plugs in and reopens within one enumeration, the reopen is coalesced into the in-flight
+refresh and the port shows on the next open. A hung `available_ports()` cannot be cancelled: the
+flag stays set and the picker keeps the last-known list, which is the pre-PAN-60 behaviour. Tests:
+the six `tui_relay_tests::rig_config_refresh_*` tests, the `app::tests::apply_rig_config_update_*`
+merge tests, and `tui_runner::key_tests::rig_picker_reaches_a_port_plugged_in_after_startup` /
+`rig_config_refresh_landing_mid_edit_keeps_the_edit` /
+`rig_config_refresh_landing_after_{enter,reopen}_keeps_the_submitted_rig`.
+
+## Needed grids and states in DX Hunter (PAN-86, 2026-10-18)
+
+DX Hunter displays `+EM34` for a grid not worked on the **current operating
+band**, across modes. It displays `United States - +AR` for a known US
+state/territory not worked on **any band or mode**. Both tokens use `+` and the
+existing bold needed-DXCC highlight; the glyph also conveys need without color.
+Only the state token gets the new Entity-cell highlight. Stale indicators retain
+the glyph in muted color, and selection retains reversed/bold styling. Existing
+callsign markers and other panels keep their meanings.
+
+Grid display uses the validated, uppercase four-character square in a five-cell
+column, retaining the complete locator in the row data. Invalid or missing grids
+show `---`. Narrow layouts omit the whole column. Grid need uses the current
+operating band even for a network spot from another band; an unknown operating
+frequency suppresses the grid indicator.
+
+These are local **worked** indicators, not confirmed WAS credits or award
+eligibility. The existing 56 validated state/territory codes remain distinct,
+including DC and territories. State knowledge alone does not record a contact.
+Historical seeding accumulates every valid US-related contact's state, so a
+station moving from AR to CA leaves both worked. The most recent historical
+state supplies the station label when no live value is already cached.
+
+The coordinator injects its shared `CachedStationLookup` into the TUI. Before
+every frame, the runner scans retained DX rows but performs need lookups only for
+rows eligible for display: heard within 180 seconds and not our own callsign.
+The derived map uses the current band and memory-only cache lookups. No draw
+callback does I/O or retains a lookup lock. Existing rows lose their markers after
+a completed contact without another decode or spot; restored band snapshots are
+recalculated too.
+
+Grid and state history have independent availability flags. Opening/reopening
+history resets them, and each successful query publishes availability after its
+additive seed, including an empty log. Loading or failed reads show known values
+without claiming they are needed and log the failure through tracing. Unknown
+states still have no suffix. A runner without a provider keeps plain state values.
+
+Worked-cache updates retain the existing QSO-completion semantics: they do not
+wait for independent ADIF/SQLite writers to succeed. Persisted history determines
+status after restart. State learned by the upload subscriber's QRZ enrichment
+updates knowledge and worked state for this session only; it does not rewrite the
+already-delivered local log events. This feature adds no pre-contact lookup,
+state priority bonus, configuration, or remote-protocol field.

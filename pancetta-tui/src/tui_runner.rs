@@ -34,6 +34,7 @@ use crate::config::Config;
 pub struct TuiRunner {
     /// Application state
     app: Arc<RwLock<App>>,
+    dx_need_lookup: Option<Arc<dyn crate::dx_need::DxNeedLookup>>,
     /// TUI configuration
     config: Config,
     /// Terminal instance. `None` only in unit tests built via
@@ -272,20 +273,31 @@ pub enum TuiMessage {
         output: Vec<(String, bool)>,
         current_output: Option<String>,
     },
-    /// Current rig config + enumerated serial ports, pushed once at startup
-    /// (PAN-59) so the `i` rig-picker modal can pre-populate with live
-    /// values. The TUI is a passive renderer — it never enumerates serial
-    /// ports itself, mirroring `DeviceListUpdate` above.
+    /// Current rig config + enumerated serial ports (PAN-59) so the `i`
+    /// rig-picker modal can pre-populate with live values. Pushed at
+    /// startup and again in answer to every `TuiCommand::RequestRigConfig`
+    /// (PAN-60), so the `i` picker lists ports that appeared after startup;
+    /// while the open picker has edits, or when `select_seq` shows the reply
+    /// predates the operator's latest submit, the TUI merges only the port
+    /// and bookmark lists (`App::apply_rig_config_update`). The TUI is a
+    /// passive renderer — it never enumerates serial ports itself,
+    /// mirroring `DeviceListUpdate` above.
     RigConfigUpdate {
         available_ports: Vec<String>,
         current_model: String,
         current_port: String,
         current_baud_rate: u32,
         current_ptt_method: pancetta_config::rig::PttMethod,
-        /// Saved rig-config bookmarks (PAN-61), pushed once at startup
+        /// Saved rig-config bookmarks (PAN-61), pushed at startup and in
+        /// answer to every `TuiCommand::RequestRigConfig` (PAN-60)
         /// alongside the live values so the `b` load overlay has data from
         /// frame 1.
         bookmarks: Vec<pancetta_config::rig::RigBookmark>,
+        /// How many `TuiCommand::SelectRig` the coordinator had handled when
+        /// it read these values (PAN-60 review). Fewer than the TUI has sent
+        /// means the reply predates the operator's latest submit, so the TUI
+        /// takes only its port and bookmark lists.
+        select_seq: u64,
     },
     /// Saved rig-config bookmarks changed (PAN-61: after a `SaveRigBookmark`
     /// or `DeleteRigBookmark` command). Full resync, mirroring
@@ -432,6 +444,13 @@ pub enum TuiCommand {
     /// Delete a saved rig-config bookmark by name (PAN-61). No-op if the
     /// name doesn't match any saved bookmark.
     DeleteRigBookmark { name: String },
+    /// Ask the coordinator for a fresh `RigConfigUpdate` (PAN-60), sent
+    /// each time the `i` rig picker opens so a serial port that appeared
+    /// after startup (a newly plugged-in rig) is listed without a restart.
+    /// The coordinator enumerates off its relay loop and replies
+    /// asynchronously; until the reply lands the picker shows the
+    /// last-known list.
+    RequestRigConfig,
     /// User requested quit
     Quit,
     /// Operator pressed the emergency-stop key (`Q` / `q` with Shift).
@@ -576,6 +595,7 @@ impl TuiRunner {
 
         Ok(Self {
             app,
+            dx_need_lookup: None,
             config,
             terminal: Some(terminal),
             message_rx,
@@ -606,6 +626,7 @@ impl TuiRunner {
     ) -> Result<Self> {
         Ok(Self {
             app,
+            dx_need_lookup: None,
             config,
             terminal: None,
             message_rx,
@@ -919,6 +940,7 @@ impl TuiRunner {
                 current_baud_rate,
                 current_ptt_method,
                 bookmarks,
+                select_seq,
             } => {
                 app.apply_rig_config_update(
                     available_ports,
@@ -927,6 +949,7 @@ impl TuiRunner {
                     current_baud_rate,
                     current_ptt_method,
                     bookmarks,
+                    select_seq,
                 );
             }
             TuiMessage::RigBookmarksUpdate { bookmarks } => {
@@ -1343,6 +1366,9 @@ impl TuiRunner {
                         // snapshot to the just-applied values so a later
                         // open/cancel cycle doesn't revert past them.
                         app.rig_selection.snapshot_committed();
+                        // PAN-60 review: replies read before the coordinator
+                        // handles this SelectRig must not revert the form.
+                        app.rig_selection.submits_sent += 1;
                         app.status_message = "Applying rig config…".to_string();
                     }
                 }
@@ -1857,6 +1883,11 @@ impl TuiRunner {
                 app.status_message =
                     "Edit rig config (Tab: next, Up/Down: change, F2: load bookmark, F3: save bookmark, Enter: apply, Esc: cancel)"
                         .to_string();
+                // PAN-60: ask the coordinator to re-enumerate serial ports
+                // so a rig plugged in after startup is listed. The reply
+                // lands a frame or two later; `apply_rig_config_update`
+                // keeps any edit the operator has already made.
+                self.message_tx.send(TuiCommand::RequestRigConfig)?;
             }
             KeyCode::Char('?') => {
                 app.toggle_help();
@@ -2337,6 +2368,10 @@ impl TuiRunner {
 
     /// Render a frame
     async fn render_frame(&mut self) -> Result<()> {
+        self.app
+            .write()
+            .await
+            .refresh_dx_need(self.dx_need_lookup.as_deref());
         let app = self.app.read().await;
 
         let Some(terminal) = self.terminal.as_mut() else {
@@ -2998,11 +3033,29 @@ pub async fn run_tui_with_message_bus(
     shutdown: Arc<AtomicBool>,
     last_input_ms: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<()> {
-    // Create app state
-    let app = Arc::new(RwLock::new(App::new(config.clone(), None).await?));
+    run_tui_with_message_bus_and_need(
+        config,
+        message_rx,
+        message_tx,
+        shutdown,
+        last_input_ms,
+        None,
+    )
+    .await
+}
 
-    // Create and run TUI runner
-    let runner = TuiRunner::new(app, config, message_rx, message_tx, shutdown, last_input_ms)?;
+/// Run with the coordinator's shared, read-only worked-history provider.
+pub async fn run_tui_with_message_bus_and_need(
+    config: Config,
+    message_rx: Receiver<TuiMessage>,
+    message_tx: Sender<TuiCommand>,
+    shutdown: Arc<AtomicBool>,
+    last_input_ms: Arc<std::sync::atomic::AtomicU64>,
+    lookup: Option<Arc<dyn crate::dx_need::DxNeedLookup>>,
+) -> Result<()> {
+    let app = Arc::new(RwLock::new(App::new(config.clone(), None).await?));
+    let mut runner = TuiRunner::new(app, config, message_rx, message_tx, shutdown, last_input_ms)?;
+    runner.dx_need_lookup = lookup;
     runner.run().await
 }
 
@@ -3016,20 +3069,25 @@ pub(crate) struct HelpGeometry {
     pub modal: Rect,
     /// Rows available to the scrolling binding list.
     pub body_height: u16,
-    /// Rendered (wrapped) binding lines.
+    /// Rendered body lines: group headings plus wrapped binding lines.
     pub total_lines: u16,
     /// Largest useful scroll offset; 0 when everything fits.
     pub max_scroll: u16,
 }
 
-/// Modal sizing: as wide as the widest unwrapped "  <key:24><desc>" line,
-/// capped to the terminal; as tall as every line plus chrome (title, 2
-/// blank rows, footer, borders), capped likewise. Whatever doesn't fit
-/// scrolls.
+/// Modal sizing: as wide as the widest unwrapped "  <key:24><desc>" or
+/// "  <heading>" line, capped to the terminal; as tall as every line plus
+/// chrome (title, 2 blank rows, footer, borders), capped likewise. Whatever
+/// doesn't fit scrolls.
 pub(crate) fn help_overlay_geometry(area: Rect) -> HelpGeometry {
     let widest_line = crate::keymap::KEYBINDINGS
         .iter()
         .map(|b| 2 + HELP_KEY_COL + b.action.chars().count())
+        .chain(
+            crate::keymap::Category::ALL
+                .iter()
+                .map(|c| 2 + c.heading().chars().count()),
+        )
         .max()
         .unwrap_or(50);
     // +2 for the left/right borders.
@@ -3087,32 +3145,46 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// The `?` overlay's binding list for a modal `inner_width` columns wide:
-/// one line per binding, with a description that doesn't fit wrapped under
-/// its own column (a hanging indent of `2 + HELP_KEY_COL`), never back to
-/// column 0.
+/// The `?` overlay's binding list for a modal `inner_width` columns wide.
+/// PAN-111: grouped by task — a heading line per `Category::ALL` entry (the
+/// same headings and order as docs/KEYBINDINGS.md), then that group's
+/// bindings in table order. One line per binding, with a description that
+/// doesn't fit wrapped under its own column (a hanging indent of
+/// `2 + HELP_KEY_COL`), never back to column 0.
 fn help_body_lines(inner_width: u16) -> Vec<ratatui::text::Line<'static>> {
     use ratatui::text::{Line, Span};
     let desc_width = (inner_width as usize).saturating_sub(2 + HELP_KEY_COL);
+    let heading_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let key_style = Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
     let desc_style = Style::default().fg(Color::White);
     let mut out = Vec::new();
-    for b in crate::keymap::KEYBINDINGS {
-        let mut desc_lines = wrap_words(b.action, desc_width).into_iter();
-        out.push(Line::from(vec![
-            Span::styled(
-                format!("  {:<width$}", b.key, width = HELP_KEY_COL),
-                key_style,
-            ),
-            Span::styled(desc_lines.next().unwrap_or_default(), desc_style),
-        ]));
-        for cont in desc_lines {
+    for category in crate::keymap::Category::ALL {
+        out.push(Line::from(Span::styled(
+            format!("  {}", category.heading()),
+            heading_style,
+        )));
+        for b in crate::keymap::KEYBINDINGS
+            .iter()
+            .filter(|b| b.category == category)
+        {
+            let mut desc_lines = wrap_words(b.action, desc_width).into_iter();
             out.push(Line::from(vec![
-                Span::raw(" ".repeat(2 + HELP_KEY_COL)),
-                Span::styled(cont, desc_style),
+                Span::styled(
+                    format!("  {:<width$}", b.key, width = HELP_KEY_COL),
+                    key_style,
+                ),
+                Span::styled(desc_lines.next().unwrap_or_default(), desc_style),
             ]));
+            for cont in desc_lines {
+                out.push(Line::from(vec![
+                    Span::raw(" ".repeat(2 + HELP_KEY_COL)),
+                    Span::styled(cont, desc_style),
+                ]));
+            }
         }
     }
     out
@@ -3164,6 +3236,58 @@ mod key_tests {
         )
         .unwrap();
         (runner, cmd_rx, app)
+    }
+
+    #[tokio::test]
+    async fn idle_headless_render_refreshes_need_without_a_message() {
+        use crate::dx_need::{DxNeedLookup, DxNeedStatus};
+        struct Need(AtomicBool);
+        impl DxNeedLookup for Need {
+            fn lookup_need(
+                &self,
+                _: &str,
+                _: Option<&str>,
+                _: Option<&str>,
+                hz: f64,
+            ) -> DxNeedStatus {
+                assert_eq!(hz, 14_074_000.0);
+                let needed = self.0.load(Ordering::Relaxed);
+                DxNeedStatus {
+                    grid_needed: Some(needed),
+                    state: Some("AR".into()),
+                    state_needed: Some(needed),
+                }
+            }
+        }
+        let (mut runner, _, app) = make_runner().await;
+        let provider = Arc::new(Need(AtomicBool::new(true)));
+        runner.dx_need_lookup = Some(provider.clone());
+        {
+            let mut app = app.write().await;
+            app.station_info.operating_frequency = 14.074;
+            app.add_dx_spot(
+                "W5ABC".into(),
+                14.074,
+                "FT8".into(),
+                -10,
+                false,
+                false,
+                false,
+                false,
+            );
+        }
+        runner.render_frame().await.unwrap();
+        assert_eq!(
+            app.read().await.dx_need_for("W5ABC").unwrap().state_needed,
+            Some(true)
+        );
+        provider.0.store(false, Ordering::Relaxed);
+        runner.render_frame().await.unwrap();
+        let app = app.read().await;
+        let need = app.dx_need_for("W5ABC").unwrap();
+        assert_eq!(need.grid_needed, Some(false));
+        assert_eq!(need.state_needed, Some(false));
+        assert_eq!(need.state.as_deref(), Some("AR"));
     }
 
     fn key(c: char) -> KeyEvent {
@@ -3376,6 +3500,48 @@ mod key_tests {
         .unwrap();
         let row = pan89_strip_row(&app).await;
         assert!(!row.contains("PTT MAY STILL BE KEYED"), "row 1: {row}");
+    }
+
+    /// PAN-104: the audit-health warning is a degraded strip warning that
+    /// decodes and status updates cannot erase; `!` hides it for its
+    /// episode, recovery clears it, and a new failure shows it again.
+    #[tokio::test]
+    async fn pan104_audit_warning_survives_decodes_and_recurs_after_recovery() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        let audit_down = || {
+            TuiMessage::StationReadiness(crate::readiness::StationReadiness {
+                degraded: Some("Remote audit unavailable; events may be missing".to_string()),
+                ..Default::default()
+            })
+        };
+        let warning = "⚠ DEGRADED: Remote audit unavailable; events may be missing";
+        r.handle_message(audit_down()).await.unwrap();
+        pan89_decode_burst(&mut r, 50).await;
+        r.handle_message(TuiMessage::StatusUpdate {
+            component: "QSO".to_string(),
+            status: "Calling K1ABC".to_string(),
+        })
+        .await
+        .unwrap();
+        let row = pan89_strip_row(&app).await;
+        assert!(row.contains("✓ TX READY"), "row 1: {row}");
+        assert!(row.contains(warning), "row 1: {row}");
+
+        r.handle_key_event(key_shift('!')).await.unwrap();
+        r.handle_message(audit_down()).await.unwrap();
+        let row = pan89_strip_row(&app).await;
+        assert!(!row.contains("Remote audit unavailable"), "row 1: {row}");
+        assert!(row.contains("1 ack'd"), "row 1: {row}");
+
+        // Recovery clears it; a later failure is a new episode.
+        r.handle_message(TuiMessage::StationReadiness(Default::default()))
+            .await
+            .unwrap();
+        let row = pan89_strip_row(&app).await;
+        assert!(!row.contains("ack'd"), "row 1: {row}");
+        r.handle_message(audit_down()).await.unwrap();
+        let row = pan89_strip_row(&app).await;
+        assert!(row.contains(warning), "row 1: {row}");
     }
 
     #[tokio::test]
@@ -5409,17 +5575,81 @@ mod key_tests {
         );
     }
 
+    /// PAN-111: the 80×24 sweep again at the crate's minimum supported
+    /// terminal (`MIN_TERMINAL_HEIGHT` = 20 rows).
+    #[test]
+    fn help_overlay_reaches_every_binding_at_80x20() {
+        let geom = help_overlay_geometry(Rect::new(0, 0, 80, 20));
+        assert!(geom.max_scroll > 0, "80x20 can't fit every binding");
+        let inner = help_inner(80, 20);
+        let mut seen = std::collections::HashSet::new();
+        for scroll in 0..=geom.max_scroll {
+            let buf = render_help(80, 20, scroll);
+            for y in inner.y + 1..inner.y + 1 + geom.body_height {
+                let key = cells_text(&buf, y, inner.x + 2..inner.x + 2 + HELP_KEY_COL as u16);
+                seen.insert(key.trim().to_string());
+            }
+        }
+        for b in crate::keymap::KEYBINDINGS {
+            assert!(seen.contains(b.key), "binding {:?} never shown", b.key);
+        }
+        assert!(seen.contains("Shift+Q") && seen.contains("Esc"));
+    }
+
+    /// PAN-111: the body is grouped by task — one heading per
+    /// `Category::ALL` entry, in that order, each followed by exactly its
+    /// own bindings.
+    #[test]
+    fn help_overlay_groups_bindings_by_category() {
+        use crate::keymap::{Category, KEYBINDINGS};
+        let rows: Vec<String> = help_body_lines(200)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let headings: Vec<usize> = Category::ALL
+            .iter()
+            .map(|c| {
+                let want = format!("  {}", c.heading());
+                rows.iter()
+                    .position(|r| *r == want)
+                    .unwrap_or_else(|| panic!("heading {want:?} missing"))
+            })
+            .collect();
+        assert_eq!(headings[0], 0, "the body opens with a heading");
+        assert!(
+            headings.windows(2).all(|w| w[0] < w[1]),
+            "headings out of Category::ALL order: {headings:?}"
+        );
+        for b in KEYBINDINGS {
+            let idx = Category::ALL.iter().position(|c| *c == b.category).unwrap();
+            let start = headings[idx];
+            let end = headings.get(idx + 1).copied().unwrap_or(rows.len());
+            let want = format!("  {:<width$}", b.key, width = HELP_KEY_COL);
+            assert!(
+                rows[start + 1..end].iter().any(|r| r.starts_with(&want)),
+                "{:?} not under {:?}",
+                b.key,
+                b.category.heading()
+            );
+        }
+        assert_eq!(
+            rows.len(),
+            KEYBINDINGS.len() + Category::ALL.len(),
+            "one heading per group, nothing wraps at 200 cols"
+        );
+    }
+
     #[test]
     fn help_overlay_is_unchanged_when_everything_fits() {
-        let geom = help_overlay_geometry(Rect::new(0, 0, 160, 50));
+        let geom = help_overlay_geometry(Rect::new(0, 0, 160, 60));
         assert_eq!(geom.max_scroll, 0);
         assert_eq!(
             geom.total_lines as usize,
-            crate::keymap::KEYBINDINGS.len(),
-            "nothing wraps at full width"
+            crate::keymap::KEYBINDINGS.len() + crate::keymap::Category::ALL.len(),
+            "nothing wraps at full width; one heading per group"
         );
-        let buf = render_help(160, 50, 0);
-        let inner = help_inner(160, 50);
+        let buf = render_help(160, 60, 0);
+        let inner = help_inner(160, 60);
         let body: Vec<String> = (inner.y..inner.y + inner.height)
             .map(|y| cells_text(&buf, y, inner.x..inner.x + inner.width))
             .collect();
@@ -5431,7 +5661,7 @@ mod key_tests {
                 b.key
             );
         }
-        assert!(help_footer(160, 50, 0).contains("Press Escape or ? to close"));
+        assert!(help_footer(160, 60, 0).contains("Press Escape or ? to close"));
     }
 
     #[test]
@@ -6608,16 +6838,349 @@ mod key_tests {
         r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .await
             .unwrap();
-        match cmd_rx.try_recv() {
-            Ok(TuiCommand::SelectRig { model, .. }) => {
+        let cmds: Vec<TuiCommand> = cmd_rx.try_iter().collect();
+        match cmds.as_slice() {
+            [TuiCommand::RequestRigConfig, TuiCommand::RequestRigConfig, TuiCommand::SelectRig { model, .. }] =>
+            {
                 assert_eq!(
                     model, "FTdx10",
                     "a later, unrelated Enter must never apply an abandoned edit from a \
                      prior cancelled session"
                 );
             }
-            other => panic!("expected SelectRig, got {:?}", other),
+            other => panic!(
+                "expected two RequestRigConfig then SelectRig, got {:?}",
+                other
+            ),
         }
+    }
+
+    /// A `RigConfigUpdate` as the coordinator's refresh sends it (PAN-60):
+    /// 38400 baud, CAT PTT, no bookmarks, read before any `SelectRig`.
+    fn rig_config_update(ports: &[&str], model: &str, current_port: &str) -> TuiMessage {
+        rig_config_update_after(0, ports, model, current_port)
+    }
+
+    /// `rig_config_update`, read after the coordinator handled
+    /// `select_seq` `SelectRig` commands.
+    fn rig_config_update_after(
+        select_seq: u64,
+        ports: &[&str],
+        model: &str,
+        current_port: &str,
+    ) -> TuiMessage {
+        TuiMessage::RigConfigUpdate {
+            available_ports: ports.iter().map(|p| p.to_string()).collect(),
+            current_model: model.to_string(),
+            current_port: current_port.to_string(),
+            current_baud_rate: 38400,
+            current_ptt_method: pancetta_config::rig::PttMethod::Cat,
+            bookmarks: vec![],
+            select_seq,
+        }
+    }
+
+    /// PAN-60: opening the rig picker asks the coordinator to re-enumerate
+    /// serial ports, exactly once per open.
+    #[tokio::test]
+    async fn i_opens_rig_picker_and_requests_a_fresh_rig_config() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        r.handle_key_event(key('i')).await.unwrap();
+
+        assert!(app.read().await.rig_selection.visible);
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(TuiCommand::RequestRigConfig)),
+            "opening the rig picker must request a fresh rig config"
+        );
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "one open must send exactly one RequestRigConfig"
+        );
+    }
+
+    /// PAN-60: inside the open picker `i` is a Model character, not an
+    /// open, so it must not request again.
+    #[tokio::test]
+    async fn typing_i_into_the_open_rig_picker_does_not_request_again() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        app.write().await.rig_selection.model = "FTdx10".to_string();
+        r.handle_key_event(key('i')).await.unwrap();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::RequestRigConfig)
+        ));
+
+        r.handle_key_event(key('i')).await.unwrap();
+
+        assert_eq!(app.read().await.rig_selection.model, "FTdx10i");
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "typing `i` into the open picker must not request another refresh"
+        );
+    }
+
+    /// PAN-60, the ticket's scenario: a rig plugged in after startup is
+    /// unreachable until the refresh sent on open lands, then Down reaches
+    /// its port and Enter applies it.
+    #[tokio::test]
+    async fn rig_picker_reaches_a_port_plugged_in_after_startup() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        // Startup push: only the original rig's port exists.
+        r.handle_message(rig_config_update(
+            &["/dev/ttyUSB0"],
+            "FTdx10",
+            "/dev/ttyUSB0",
+        ))
+        .await
+        .unwrap();
+
+        r.handle_key_event(key('i')).await.unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.read().await.rig_selection.selected_port(),
+            "/dev/ttyUSB0",
+            "before the refresh lands, the new rig's port is not in the list"
+        );
+
+        // The refresh `i` asked for lands, listing the newly plugged-in rig.
+        r.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        r.handle_message(rig_config_update(
+            &["/dev/ttyUSB0", "/dev/ttyUSB1"],
+            "FTdx10",
+            "/dev/ttyUSB0",
+        ))
+        .await
+        .unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.read().await.rig_selection.selected_port(),
+            "/dev/ttyUSB1",
+            "after the refresh, Down must reach the newly plugged-in rig's port"
+        );
+
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let cmds: Vec<TuiCommand> = cmd_rx.try_iter().collect();
+        match cmds.as_slice() {
+            [TuiCommand::RequestRigConfig, TuiCommand::SelectRig { port, .. }] => {
+                assert_eq!(port, "/dev/ttyUSB1");
+            }
+            other => panic!("expected RequestRigConfig then SelectRig, got {:?}", other),
+        }
+    }
+
+    /// PAN-60: the refresh lands asynchronously, so an operator who starts
+    /// typing the moment the picker opens must not have the edit wiped by
+    /// it -- and Esc must still restore the values the picker opened with.
+    #[tokio::test]
+    async fn rig_config_refresh_landing_mid_edit_keeps_the_edit() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        r.handle_message(rig_config_update(
+            &["/dev/ttyUSB0", "/dev/ttyUSB1"],
+            "FTdx10",
+            "/dev/ttyUSB0",
+        ))
+        .await
+        .unwrap();
+
+        r.handle_key_event(key('i')).await.unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        r.handle_key_event(key('X')).await.unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        {
+            let app = app.read().await;
+            assert_eq!(app.rig_selection.model, "FTdx1X");
+            assert_eq!(app.rig_selection.selected_port(), "/dev/ttyUSB1");
+        }
+
+        r.handle_message(rig_config_update(
+            &["/dev/ttyACM0", "/dev/ttyUSB0", "/dev/ttyUSB1"],
+            "FTdx10",
+            "/dev/ttyUSB0",
+        ))
+        .await
+        .unwrap();
+        {
+            let app = app.read().await;
+            assert_eq!(
+                app.rig_selection.model, "FTdx1X",
+                "a refresh landing mid-edit must not wipe the typed model"
+            );
+            assert_eq!(
+                app.rig_selection.selected_port(),
+                "/dev/ttyUSB1",
+                "a refresh landing mid-edit must not move the chosen port"
+            );
+        }
+
+        r.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let app = app.read().await;
+        assert_eq!(app.rig_selection.model, "FTdx10");
+        assert_eq!(
+            app.rig_selection.selected_port(),
+            "/dev/ttyUSB0",
+            "Esc must restore the port the picker opened with, even after the refresh \
+             moved it to a new index"
+        );
+    }
+
+    /// PAN-60 review: the refresh `i` asked for can be read before Enter's
+    /// `SelectRig` reaches the coordinator, and drained after the picker has
+    /// closed or, behind a backlog of decodes, after it has reopened. It must
+    /// not overwrite the just-submitted rig, or Enter on the reopened picker
+    /// would re-apply the old one.
+    async fn stale_refresh_keeps_the_submitted_rig(land_after_reopen: bool) {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        r.handle_message(rig_config_update(
+            &["/dev/ttyUSB0", "/dev/ttyUSB1"],
+            "FTdx10",
+            "/dev/ttyUSB0",
+        ))
+        .await
+        .unwrap();
+
+        r.handle_key_event(key('i')).await.unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        r.handle_key_event(key('X')).await.unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        if land_after_reopen {
+            r.handle_key_event(key('i')).await.unwrap();
+        }
+
+        // Read before the coordinator handled the SelectRig.
+        r.handle_message(rig_config_update(
+            &["/dev/ttyACM0", "/dev/ttyUSB0", "/dev/ttyUSB1"],
+            "FTdx10",
+            "/dev/ttyUSB0",
+        ))
+        .await
+        .unwrap();
+        {
+            let app = app.read().await;
+            assert_eq!(
+                app.rig_selection.model, "FTdx1X",
+                "a refresh read before the submit must not revert the submitted model"
+            );
+            assert_eq!(
+                app.rig_selection.selected_port(),
+                "/dev/ttyUSB1",
+                "a refresh read before the submit must not revert the submitted port"
+            );
+            assert_eq!(
+                app.rig_selection.available_ports,
+                vec!["/dev/ttyACM0", "/dev/ttyUSB0", "/dev/ttyUSB1"],
+                "the refreshed port list is still taken"
+            );
+        }
+
+        if !land_after_reopen {
+            r.handle_key_event(key('i')).await.unwrap();
+        }
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let cmds: Vec<TuiCommand> = cmd_rx.try_iter().collect();
+        match cmds.as_slice() {
+            [TuiCommand::RequestRigConfig, TuiCommand::SelectRig {
+                model: m1,
+                port: p1,
+                ..
+            }, TuiCommand::RequestRigConfig, TuiCommand::SelectRig {
+                model: m2,
+                port: p2,
+                ..
+            }] => {
+                assert_eq!((m1.as_str(), p1.as_str()), ("FTdx1X", "/dev/ttyUSB1"));
+                assert_eq!(
+                    (m2.as_str(), p2.as_str()),
+                    ("FTdx1X", "/dev/ttyUSB1"),
+                    "Enter on the reopened picker must re-apply the submitted rig, not the stale one"
+                );
+            }
+            other => panic!(
+                "expected RequestRigConfig, SelectRig, RequestRigConfig, SelectRig; got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn rig_config_refresh_landing_after_enter_keeps_the_submitted_rig() {
+        stale_refresh_keeps_the_submitted_rig(false).await;
+    }
+
+    #[tokio::test]
+    async fn rig_config_refresh_landing_after_reopen_keeps_the_submitted_rig() {
+        stale_refresh_keeps_the_submitted_rig(true).await;
+    }
+
+    /// PAN-60 (folds in the PAN-59 "no re-push after a switch" finding):
+    /// Enter commits the form locally whether or not the coordinator
+    /// accepts it, so after a refused switch the reopened picker must take
+    /// the refresh's configured model rather than keep the refused one.
+    #[tokio::test]
+    async fn rig_picker_reopen_adopts_the_configured_model_after_a_refused_switch() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        r.handle_message(rig_config_update(
+            &["/dev/ttyUSB0"],
+            "FTdx10",
+            "/dev/ttyUSB0",
+        ))
+        .await
+        .unwrap();
+
+        r.handle_key_event(key('i')).await.unwrap();
+        r.handle_key_event(key('X')).await.unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        r.handle_key_event(key('i')).await.unwrap();
+        assert_eq!(app.read().await.rig_selection.model, "FTdx10X");
+
+        // The coordinator refused the unknown model, so config still holds
+        // FTdx10 and the refresh, read after it handled that SelectRig, says so.
+        r.handle_message(rig_config_update_after(
+            1,
+            &["/dev/ttyUSB0"],
+            "FTdx10",
+            "/dev/ttyUSB0",
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            app.read().await.rig_selection.model,
+            "FTdx10",
+            "an untouched reopened picker must show the model the coordinator holds"
+        );
     }
 
     #[tokio::test]
@@ -6856,6 +7419,7 @@ mod pan_59_command_tests {
             current_baud_rate: 38400,
             current_ptt_method: pancetta_config::rig::PttMethod::Serial,
             bookmarks: vec![],
+            select_seq: 0,
         };
         match msg {
             TuiMessage::RigConfigUpdate {
@@ -6885,6 +7449,7 @@ mod pan_59_command_tests {
                 baud_rate: 38400,
                 ptt_method: pancetta_config::rig::PttMethod::None,
             }],
+            select_seq: 0,
         };
         match msg {
             TuiMessage::RigConfigUpdate { bookmarks, .. } => {

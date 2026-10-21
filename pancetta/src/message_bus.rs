@@ -321,7 +321,9 @@ pub enum MessageType {
     /// Split-TX state echo for the TUI title-bar chip. Sent by the
     /// coordinator relay after every write to the split atomic: on
     /// `TuiCommand::SetSplit` (operator modal), on manual band-change
-    /// (clears split), and on autonomous band-hop (clears split).
+    /// (clears split), and on autonomous band-hop (clears split). When a
+    /// split change was not delivered to Hamlib, it carries the unchanged
+    /// value the band-plan gate still enforces (PAN-209).
     /// `tx_hz == 0` means simplex (chip hidden). Observation only.
     SplitStatus {
         /// Current split TX frequency in Hz, or 0 for simplex.
@@ -793,6 +795,10 @@ pub enum QsoMessage {
         /// New dial frequency in Hz.
         new_hz: u64,
     },
+    /// PAN-137: a station-agent client took control. Retire active QSOs and
+    /// queued calls bound to other clients, on all bands. Local and unbound
+    /// WSJT-X QSOs stay. Enqueued before the new controller's next QSO intent.
+    RemoteControllerChanged { controller_key_id: String },
     /// Open an **autonomous** QSO (`CallInitiation::Auto`) from the autonomous
     /// operator's decision (Phase 5). Routed to the QSO component so the
     /// `QsoManager` owns the exchange and auto-sequences it to completion,

@@ -817,6 +817,11 @@ pub struct RigSelectionState {
     pub naming_bookmark: bool,
     /// Text typed into the bookmark-name input.
     pub bookmark_name_input: String,
+    /// How many `SelectRig` commands Enter has sent (PAN-60 review). A
+    /// `RigConfigUpdate` whose `select_seq` is lower was read before the
+    /// coordinator handled the latest one, so it only refreshes the port
+    /// and bookmark lists.
+    pub submits_sent: u64,
 }
 
 impl Default for RigSelectionState {
@@ -840,6 +845,7 @@ impl Default for RigSelectionState {
             selected_bookmark_idx: 0,
             naming_bookmark: false,
             bookmark_name_input: String::new(),
+            submits_sent: 0,
         }
     }
 }
@@ -1083,6 +1089,49 @@ impl RigSelectionState {
         self.selected_port_idx = self.committed_port_idx;
         self.selected_baud_idx = self.committed_baud_idx;
         self.selected_ptt_idx = self.committed_ptt_idx;
+    }
+
+    /// Whether the operator has done anything in the open picker that a
+    /// refresh must not undo (PAN-60): any field differs from the snapshot
+    /// taken when the picker opened, or a bookmark sub-overlay is open.
+    pub fn has_operator_edits(&self) -> bool {
+        self.naming_bookmark
+            || self.bookmark_overlay_visible
+            || self.model != self.committed_model
+            || self.selected_port_idx != self.committed_port_idx
+            || self.selected_baud_idx != self.committed_baud_idx
+            || self.selected_ptt_idx != self.committed_ptt_idx
+    }
+
+    /// Take a refreshed port list and bookmark list without touching what
+    /// the operator chose (PAN-60). The selected and committed ports are
+    /// re-found by name; one that vanished from the new enumeration is
+    /// prepended so it stays selectable, as `apply_rig_config_update`'s
+    /// I-2a prepend and `load_bookmark`'s I-4 shift do. Model, baud, PTT and
+    /// their committed values are left alone.
+    pub fn merge_refreshed_ports(
+        &mut self,
+        mut ports: Vec<String>,
+        bookmarks: Vec<pancetta_config::rig::RigBookmark>,
+    ) {
+        let selected = self.selected_port();
+        let committed = self
+            .available_ports
+            .get(self.committed_port_idx)
+            .cloned()
+            .unwrap_or_default();
+        for name in [&committed, &selected] {
+            if !name.is_empty() && !ports.contains(name) {
+                ports.insert(0, name.clone());
+            }
+        }
+        self.selected_port_idx = ports.iter().position(|p| *p == selected).unwrap_or(0);
+        self.committed_port_idx = ports.iter().position(|p| *p == committed).unwrap_or(0);
+        self.available_ports = ports;
+        if self.selected_bookmark_idx >= bookmarks.len() {
+            self.selected_bookmark_idx = bookmarks.len().saturating_sub(1);
+        }
+        self.bookmarks = bookmarks;
     }
 }
 
@@ -1329,6 +1378,8 @@ pub struct App {
     /// a per-spot observation, and because it must survive a station
     /// re-appearing from a different source (PAN-85 / D5).
     pub dx_states: HashMap<String, String>,
+    /// Rebuilt before each frame; deliberately absent from band snapshots.
+    dx_need: HashMap<String, crate::dx_need::DxNeedStatus>,
     pub band_activity_scroll: usize,
     /// The callsign the Band Activity cursor is pinned to. The list reorders
     /// on EVERY decode window (directed-at-us pinned first, then newest-first),
@@ -1659,6 +1710,7 @@ impl App {
             station_info,
             dx_stations: HashMap::new(),
             dx_states: HashMap::new(),
+            dx_need: HashMap::new(),
             band_activity_scroll: 0,
             band_activity_pinned_call: None,
             dx_hunter_scroll: 0,
@@ -2537,6 +2589,40 @@ impl App {
     pub fn station_state_for(&self, callsign: &str) -> Option<&str> {
         let key = station_state_key(callsign)?;
         self.dx_states.get(&key).map(String::as_str)
+    }
+
+    /// Prepare owned display data, releasing every lookup lock before drawing.
+    pub fn refresh_dx_need(&mut self, lookup: Option<&dyn crate::dx_need::DxNeedLookup>) {
+        let current_hz = self.station_info.operating_frequency * 1_000_000.0;
+        // Match displayed_dx_stations eligibility before allocating or taking
+        // lookup locks. The backing station map can retain older, hidden rows.
+        let cutoff = Utc::now() - chrono::Duration::seconds(Self::DX_HUNTER_STALE_SECS);
+        let our_call = self.station_info.call_sign.trim();
+        self.dx_need = lookup
+            .map(|lookup| {
+                self.dx_stations
+                    .iter()
+                    .filter(|(_, row)| row.last_seen > cutoff)
+                    .filter(|(_, row)| {
+                        our_call.is_empty() || !row.call_sign.eq_ignore_ascii_case(our_call)
+                    })
+                    .map(|(key, row)| {
+                        let status = lookup.lookup_need(
+                            &row.call_sign,
+                            row.grid_square.as_deref(),
+                            self.station_state_for(&row.call_sign),
+                            current_hz,
+                        );
+                        (key.clone(), status)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+
+    /// The exact DX-row key, including its original case/hash rendering.
+    pub fn dx_need_for(&self, key: &str) -> Option<&crate::dx_need::DxNeedStatus> {
+        self.dx_need.get(key)
     }
 
     /// Called when the radio reports its actual frequency (via hamlib/rigctld).
@@ -4008,6 +4094,11 @@ impl App {
     /// Seed `rig_selection` from a `TuiMessage::RigConfigUpdate` (PAN-59).
     /// Pre-populates the modal with live values so it opens editable, not
     /// blank — mirrors `set_audio_devices`'s seeding of `device_selection`.
+    /// Called at startup and again each time the `i` picker opens (PAN-60);
+    /// when the open picker already has operator edits, or `select_seq` shows
+    /// the reply was read before the coordinator handled the operator's latest
+    /// `SelectRig`, it merges only the refreshed port and bookmark lists
+    /// instead of overwriting the form.
     pub fn apply_rig_config_update(
         &mut self,
         mut available_ports: Vec<String>,
@@ -4016,7 +4107,21 @@ impl App {
         current_baud_rate: u32,
         current_ptt_method: pancetta_config::rig::PttMethod,
         bookmarks: Vec<pancetta_config::rig::RigBookmark>,
+        select_seq: u64,
     ) {
+        // PAN-60: this arrives a frame or two after `i` opens the picker.
+        // If the operator already started editing, only take the new port
+        // and bookmark lists -- overwriting the form here would wipe an
+        // edit in progress. The same goes for a reply read before the
+        // coordinator handled the latest SelectRig, however late it is
+        // drained (PAN-60 review): it would put the old rig back.
+        if select_seq < self.rig_selection.submits_sent
+            || (self.rig_selection.visible && self.rig_selection.has_operator_edits())
+        {
+            self.rig_selection
+                .merge_refreshed_ports(available_ports, bookmarks);
+            return;
+        }
         // I-2a fix (PAN-59 final review): if the configured port isn't
         // among the enumerated ones (the rig is unplugged, or it's a
         // `host:port` network-rig spec -- `serialport::available_ports()`
@@ -4911,6 +5016,172 @@ mod tests {
         App::new(Config::default(), None)
             .await
             .expect("default Config should construct App")
+    }
+
+    struct MutableNeed(std::sync::atomic::AtomicBool);
+
+    impl crate::dx_need::DxNeedLookup for MutableNeed {
+        fn lookup_need(
+            &self,
+            _call: &str,
+            grid: Option<&str>,
+            state: Option<&str>,
+            hz: f64,
+        ) -> crate::dx_need::DxNeedStatus {
+            let worked = self.0.load(std::sync::atomic::Ordering::Relaxed);
+            crate::dx_need::DxNeedStatus {
+                grid_needed: grid.map(|_| !worked || hz != 14_074_000.0),
+                state: state.map(str::to_string),
+                state_needed: state.map(|_| !worked),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dx_need_refresh_looks_up_only_display_eligible_rows() {
+        #[derive(Default)]
+        struct CountingNeed(std::sync::Mutex<Vec<String>>);
+        impl crate::dx_need::DxNeedLookup for CountingNeed {
+            fn lookup_need(
+                &self,
+                call: &str,
+                _: Option<&str>,
+                _: Option<&str>,
+                _: f64,
+            ) -> crate::dx_need::DxNeedStatus {
+                self.0.lock().unwrap().push(call.to_string());
+                crate::dx_need::DxNeedStatus::default()
+            }
+        }
+
+        let mut app = fixture_app().await;
+        let provider = CountingNeed::default();
+        let old = Utc::now() - chrono::Duration::seconds(App::DX_HUNTER_STALE_SECS + 5);
+        for i in 0..1000 {
+            let call = format!("W{i}OLD");
+            let mut row = dx_fixture(&call, 50, 10, 14.074, false);
+            row.last_seen = old;
+            app.dx_stations.insert(call, row);
+        }
+        app.station_info.call_sign = " W5SELF ".into();
+        for call in ["w5self", "W5ABC"] {
+            app.dx_stations
+                .insert(call.into(), dx_fixture(call, 50, 10, 14.074, false));
+        }
+        app.refresh_dx_need(Some(&provider));
+        assert_eq!(*provider.0.lock().unwrap(), vec!["W5ABC"]);
+        assert!(app.dx_need_for("W5ABC").is_some());
+        assert_eq!(app.dx_need.len(), 1);
+        assert_eq!(app.dx_stations.len(), 1002, "retain the backing history");
+
+        // An expired row loses its derived status; a newly heard row gains it.
+        provider.0.lock().unwrap().clear();
+        app.dx_stations.get_mut("W5ABC").unwrap().last_seen = old;
+        app.dx_stations.get_mut("W0OLD").unwrap().last_seen = Utc::now();
+        app.refresh_dx_need(Some(&provider));
+        assert_eq!(*provider.0.lock().unwrap(), vec!["W0OLD"]);
+        assert!(app.dx_need_for("W5ABC").is_none());
+        assert!(app.dx_need_for("W0OLD").is_some());
+        assert_eq!(app.dx_need.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dx_need_refresh_updates_existing_rows_and_drops_removed_keys() {
+        let mut app = fixture_app().await;
+        app.station_info.operating_frequency = 14.074;
+        let provider = MutableNeed(std::sync::atomic::AtomicBool::new(false));
+        for call in ["w5abc", "<W1XYZ>"] {
+            let mut view = fixture_view(call, -10);
+            view.grid_square = Some("em34ab".into());
+            app.add_decoded_message(view).await.unwrap();
+            app.set_station_state(call, "AR");
+        }
+        app.refresh_dx_need(Some(&provider));
+        for call in ["w5abc", "<W1XYZ>"] {
+            let status = app.dx_need_for(call).unwrap();
+            assert_eq!(status.grid_needed, Some(true));
+            assert_eq!(status.state_needed, Some(true));
+        }
+        provider.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        app.refresh_dx_need(Some(&provider));
+        for call in ["w5abc", "<W1XYZ>"] {
+            let status = app.dx_need_for(call).unwrap();
+            assert_eq!(status.grid_needed, Some(false));
+            assert_eq!(status.state_needed, Some(false));
+        }
+        app.dx_stations.remove("w5abc");
+        app.refresh_dx_need(Some(&provider));
+        assert!(app.dx_need_for("w5abc").is_none());
+        app.refresh_dx_need(None);
+        assert!(app.dx_need_for("<W1XYZ>").is_none());
+        assert_eq!(app.station_state_for("<W1XYZ>"), Some("AR"));
+    }
+
+    #[tokio::test]
+    async fn dx_need_uses_retained_grids_for_all_sources_and_current_band() {
+        let mut app = fixture_app().await;
+        app.station_info.operating_frequency = 14.074;
+        let provider = MutableNeed(std::sync::atomic::AtomicBool::new(true));
+        app.add_dx_spot(
+            "W5ABC".into(),
+            7.074,
+            "FT8".into(),
+            -10,
+            false,
+            false,
+            false,
+            false,
+        );
+        app.refresh_dx_need(Some(&provider));
+        assert_eq!(app.dx_need_for("W5ABC").unwrap().grid_needed, None);
+        let mut view = fixture_view("W5ABC", -10);
+        view.grid_square = Some("EM34".into());
+        app.add_decoded_message(view).await.unwrap();
+        app.add_decoded_message(fixture_view("W5ABC", -8))
+            .await
+            .unwrap();
+        app.merge_spot_groups(&[crate::tui_runner::CqdxSpotInfo {
+            dx_call: "W1XYZ".into(),
+            band: "40m".into(),
+            mode: "FT8".into(),
+            frequency_hz: 7_074_000,
+            grid: Some("EM34".into()),
+            rarity_tier: "common".into(),
+            reporter_count: 2,
+            best_snr: Some(-10),
+            confidence: 0.9,
+            first_seen: Utc::now().timestamp(),
+            last_seen: Utc::now().timestamp(),
+            is_notable: false,
+            notable_type: None,
+            entity_name: "United States".into(),
+            needed: false,
+            atno: false,
+        }]);
+        for call in ["W5ABC", "W1XYZ"] {
+            app.set_station_state(call, "AR");
+        }
+        app.refresh_dx_need(Some(&provider));
+        for call in ["W5ABC", "W1XYZ"] {
+            assert_eq!(app.dx_stations[call].grid_square.as_deref(), Some("EM34"));
+            assert_eq!(
+                app.dx_need_for(call).unwrap().grid_needed,
+                Some(false),
+                "current 20m even for an off-band row"
+            );
+        }
+        app.station_info.operating_frequency = 7.074;
+        app.refresh_dx_need(Some(&provider));
+        assert_eq!(app.dx_need_for("W1XYZ").unwrap().grid_needed, Some(true));
+        assert_eq!(app.dx_need_for("W1XYZ").unwrap().state_needed, Some(false));
+        app.station_info.operating_frequency = 14.074;
+        app.band_up();
+        app.refresh_dx_need(Some(&provider));
+        assert!(app.dx_need_for("W1XYZ").is_none());
+        app.band_down();
+        app.refresh_dx_need(Some(&provider));
+        assert_eq!(app.dx_need_for("W1XYZ").unwrap().grid_needed, Some(false));
+        assert_eq!(app.dx_need_for("W1XYZ").unwrap().state_needed, Some(false));
     }
 
     // --- PAN-85: per-callsign US state store ---
@@ -7140,6 +7411,7 @@ mod tests {
                 baud_rate: 38400,
                 ptt_method: pancetta_config::rig::PttMethod::None,
             }],
+            0,
         );
         assert_eq!(app.rig_selection.bookmarks.len(), 1);
         assert_eq!(app.rig_selection.bookmarks[0].name, "Shack");
@@ -7155,6 +7427,7 @@ mod tests {
             38400,
             pancetta_config::rig::PttMethod::Serial,
             vec![],
+            0,
         );
         assert_eq!(app.rig_selection.model, "FTdx10");
         assert_eq!(app.rig_selection.selected_port_idx, 1);
@@ -7183,6 +7456,7 @@ mod tests {
             38400,
             pancetta_config::rig::PttMethod::Cat,
             vec![],
+            0,
         );
         assert_eq!(
             app.rig_selection.selected_port(),
@@ -7216,6 +7490,7 @@ mod tests {
             230_400, // not in RIG_BAUD_RATES
             pancetta_config::rig::PttMethod::None,
             vec![],
+            0,
         );
         assert_eq!(
             app.rig_selection.selected_baud(),
@@ -7238,6 +7513,7 @@ mod tests {
             9600,
             pancetta_config::rig::PttMethod::Parallel,
             vec![],
+            0,
         );
         assert!(
             matches!(
@@ -7262,10 +7538,247 @@ mod tests {
             230_400,
             pancetta_config::rig::PttMethod::None,
             vec![],
+            0,
         );
         app.rig_selection.active_field = RigField::Baud;
         app.rig_selection.move_down();
         assert_eq!(app.rig_selection.selected_baud(), RIG_BAUD_RATES[0]);
+    }
+
+    fn rig_ports(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn rig_bookmark(name: &str) -> pancetta_config::rig::RigBookmark {
+        pancetta_config::rig::RigBookmark {
+            name: name.to_string(),
+            model: "FTdx10".to_string(),
+            port: "/dev/ttyUSB0".to_string(),
+            baud_rate: 38400,
+            ptt_method: pancetta_config::rig::PttMethod::Cat,
+        }
+    }
+
+    /// Seed the picker as the startup push does, then open it as the `i`
+    /// arm does (visible + committed snapshot), ready for a PAN-60 refresh.
+    async fn opened_rig_picker(
+        ports: &[&str],
+        current_port: &str,
+        bookmarks: Vec<pancetta_config::rig::RigBookmark>,
+    ) -> App {
+        let mut app = fixture_app().await;
+        app.apply_rig_config_update(
+            rig_ports(ports),
+            "FTdx10".to_string(),
+            current_port.to_string(),
+            38400,
+            pancetta_config::rig::PttMethod::Cat,
+            bookmarks,
+            0,
+        );
+        app.rig_selection.visible = true;
+        app.rig_selection.snapshot_committed();
+        app
+    }
+
+    /// The operator's PAN-60 mid-edit edit: Model typed to `FTdx1X`, Port
+    /// moved to index 1, baud moved down by one.
+    fn edit_rig_picker(app: &mut App) {
+        app.rig_selection.model = "FTdx1X".to_string();
+        app.rig_selection.selected_port_idx = 1;
+        app.rig_selection.active_field = RigField::Baud;
+        app.rig_selection.move_down();
+    }
+
+    /// PAN-60: the refresh sent on `i` lands a frame or two later. If the
+    /// operator already started editing, it must take the new port list
+    /// without overwriting a single field they chose.
+    #[tokio::test]
+    async fn apply_rig_config_update_while_editing_keeps_the_form_and_adds_new_ports() {
+        let mut app =
+            opened_rig_picker(&["/dev/ttyUSB0", "/dev/ttyUSB1"], "/dev/ttyUSB0", vec![]).await;
+        edit_rig_picker(&mut app);
+        let before = app.rig_selection.clone();
+
+        app.apply_rig_config_update(
+            rig_ports(&["/dev/ttyACM0", "/dev/ttyUSB0", "/dev/ttyUSB1"]),
+            "FTdx10".to_string(),
+            "/dev/ttyUSB0".to_string(),
+            38400,
+            pancetta_config::rig::PttMethod::Cat,
+            vec![],
+            0,
+        );
+
+        let rs = &app.rig_selection;
+        assert_eq!(rs.model, "FTdx1X", "the typed model must survive a refresh");
+        assert_eq!(rs.selected_port(), "/dev/ttyUSB1");
+        assert_eq!(rs.selected_baud_idx, before.selected_baud_idx);
+        assert_eq!(rs.selected_ptt_idx, before.selected_ptt_idx);
+        assert_eq!(rs.live_baud_rate, before.live_baud_rate);
+        assert_eq!(
+            format!("{:?}", rs.live_ptt_method),
+            format!("{:?}", before.live_ptt_method)
+        );
+        assert_eq!(rs.active_field, RigField::Baud);
+        assert_eq!(
+            rs.available_ports,
+            rig_ports(&["/dev/ttyACM0", "/dev/ttyUSB0", "/dev/ttyUSB1"]),
+            "the refreshed port list must replace the old one"
+        );
+    }
+
+    /// PAN-60: the refresh can reorder ports, so the Esc baseline must be
+    /// re-found by name -- not left pointing at whatever now sits at the
+    /// old index.
+    #[tokio::test]
+    async fn apply_rig_config_update_while_editing_tracks_the_committed_port_by_name() {
+        let mut app =
+            opened_rig_picker(&["/dev/ttyUSB0", "/dev/ttyUSB1"], "/dev/ttyUSB0", vec![]).await;
+        edit_rig_picker(&mut app);
+
+        app.apply_rig_config_update(
+            rig_ports(&["/dev/ttyACM0", "/dev/ttyUSB0", "/dev/ttyUSB1"]),
+            "FTdx10".to_string(),
+            "/dev/ttyUSB0".to_string(),
+            38400,
+            pancetta_config::rig::PttMethod::Cat,
+            vec![],
+            0,
+        );
+        app.rig_selection.restore_committed(); // Esc
+
+        assert_eq!(
+            app.rig_selection.selected_port(),
+            "/dev/ttyUSB0",
+            "Esc must restore the port the picker opened with, now at a new index"
+        );
+        assert_eq!(app.rig_selection.selected_port_idx, 1);
+        assert_eq!(app.rig_selection.model, "FTdx10");
+    }
+
+    /// PAN-60: an operator who picked a port that then vanished from the
+    /// refresh (unplugged mid-edit) keeps it selected -- prepended, the way
+    /// the I-2a fix keeps an unenumerated configured port -- and the Esc
+    /// baseline still resolves by name.
+    #[tokio::test]
+    async fn apply_rig_config_update_while_editing_keeps_a_vanished_selected_port_selectable() {
+        let mut app =
+            opened_rig_picker(&["/dev/ttyUSB0", "/dev/ttyUSB1"], "/dev/ttyUSB0", vec![]).await;
+        edit_rig_picker(&mut app);
+
+        app.apply_rig_config_update(
+            rig_ports(&["/dev/ttyUSB0"]),
+            "FTdx10".to_string(),
+            "/dev/ttyUSB0".to_string(),
+            38400,
+            pancetta_config::rig::PttMethod::Cat,
+            vec![],
+            0,
+        );
+
+        assert_eq!(
+            app.rig_selection.selected_port(),
+            "/dev/ttyUSB1",
+            "a port that vanished mid-edit must stay selected, not silently become another"
+        );
+        assert!(app
+            .rig_selection
+            .available_ports
+            .contains(&"/dev/ttyUSB1".to_string()));
+        app.rig_selection.restore_committed();
+        assert_eq!(app.rig_selection.selected_port(), "/dev/ttyUSB0");
+    }
+
+    /// PAN-60: an open F2/F3 sub-overlay counts as editing even with no
+    /// field changed. The refresh replaces bookmarks (clamping the overlay
+    /// selection, as `RigBookmarksUpdate` does) and leaves the form alone.
+    #[tokio::test]
+    async fn apply_rig_config_update_with_bookmark_overlay_open_keeps_the_form_and_clamps_the_selection(
+    ) {
+        let mut app = opened_rig_picker(
+            &["/dev/ttyUSB0"],
+            "/dev/ttyUSB0",
+            vec![rig_bookmark("A"), rig_bookmark("B"), rig_bookmark("C")],
+        )
+        .await;
+        app.rig_selection.bookmark_overlay_visible = true;
+        app.rig_selection.selected_bookmark_idx = 2;
+
+        app.apply_rig_config_update(
+            rig_ports(&["/dev/ttyUSB0"]),
+            "IC-7300".to_string(),
+            "/dev/ttyUSB0".to_string(),
+            38400,
+            pancetta_config::rig::PttMethod::Cat,
+            vec![rig_bookmark("A")],
+            0,
+        );
+
+        assert_eq!(
+            app.rig_selection.model, "FTdx10",
+            "a refresh landing while a bookmark overlay is open must not touch the form"
+        );
+        assert_eq!(app.rig_selection.bookmarks.len(), 1);
+        assert_eq!(app.rig_selection.selected_bookmark_idx, 0);
+        assert!(app.rig_selection.bookmark_overlay_visible);
+    }
+
+    /// PAN-60: an open but untouched picker takes the refresh in full, so a
+    /// reopen shows what the coordinator really holds (e.g. after a switch
+    /// it refused, or one applied while the picker was closed).
+    #[tokio::test]
+    async fn apply_rig_config_update_on_an_untouched_open_form_adopts_fresh_values() {
+        let mut app =
+            opened_rig_picker(&["/dev/ttyUSB0", "/dev/ttyUSB1"], "/dev/ttyUSB0", vec![]).await;
+
+        app.apply_rig_config_update(
+            rig_ports(&["/dev/ttyUSB0", "/dev/ttyUSB1"]),
+            "IC-7300".to_string(),
+            "/dev/ttyUSB1".to_string(),
+            38400,
+            pancetta_config::rig::PttMethod::Cat,
+            vec![],
+            0,
+        );
+
+        let rs = &app.rig_selection;
+        assert_eq!(rs.model, "IC-7300");
+        assert_eq!(rs.selected_port(), "/dev/ttyUSB1");
+        assert_eq!(rs.committed_model, "IC-7300");
+        assert_eq!(rs.committed_port_idx, 1);
+    }
+
+    /// PAN-60: with the picker closed nothing is in progress, so the
+    /// update is applied in full exactly as before -- even if the fields
+    /// differ from the committed snapshot.
+    #[tokio::test]
+    async fn apply_rig_config_update_while_closed_replaces_everything() {
+        let mut app =
+            opened_rig_picker(&["/dev/ttyUSB0", "/dev/ttyUSB1"], "/dev/ttyUSB0", vec![]).await;
+        edit_rig_picker(&mut app);
+        app.rig_selection.visible = false;
+
+        app.apply_rig_config_update(
+            rig_ports(&["/dev/ttyUSB0", "/dev/ttyUSB1"]),
+            "IC-7300".to_string(),
+            "/dev/ttyUSB0".to_string(),
+            19200,
+            pancetta_config::rig::PttMethod::Serial,
+            vec![rig_bookmark("A")],
+            0,
+        );
+
+        let rs = &app.rig_selection;
+        assert_eq!(rs.model, "IC-7300");
+        assert_eq!(rs.selected_port(), "/dev/ttyUSB0");
+        assert_eq!(rs.selected_baud(), 19200);
+        assert!(matches!(
+            rs.selected_ptt(),
+            pancetta_config::rig::PttMethod::Serial
+        ));
+        assert_eq!(rs.committed_model, "IC-7300");
+        assert_eq!(rs.bookmarks.len(), 1);
     }
 
     /// I-3 fix (PAN-59 final review): pressing Esc after an abandoned edit

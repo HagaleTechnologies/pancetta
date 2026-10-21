@@ -193,6 +193,10 @@ pub enum QsoFailureReason {
     /// unencodable message for the full manual-call-watchdog window (see
     /// `QsoManager::check_timeouts_at`).
     MessageUnencodable(String),
+
+    /// PAN-137: another station-agent client took control. End this client's
+    /// QSO to free its TX window and capacity slot; arms never transfer.
+    ControlTransferred,
 }
 
 /// Why the QSO engine refused a decoded frame on sender-verification grounds.
@@ -398,10 +402,13 @@ pub struct PreSwitchOffset {
     /// silence-driven stall detector did.
     ///
     /// PAN-72 (Codex round 6 on PR #350, finding 2). This is the ONLY thing
-    /// that can separate the two cases on a pre-existing split, where the DX
-    /// transmits at `partner_freq` no matter where we key and its reply
-    /// frequency therefore cannot discriminate our vacated offset from our new
-    /// one. The two provenances warrant opposite conclusions there:
+    /// that can separate the two cases on any split — one that predates the
+    /// switch, or the one `QsoManager::apply_tx_offset_switch`'s
+    /// established-QSO latch creates by setting `partner_freq` to the vacated
+    /// offset (PAN-132) — where the DX transmits at `partner_freq` no matter
+    /// where we key and its reply frequency therefore cannot discriminate our
+    /// vacated offset from our new one. The two provenances warrant opposite
+    /// conclusions there:
     ///
     /// - a STALL-triggered switch only happens BECAUSE the old offset
     ///   demonstrably stopped working, and the frame that triggered it went out
@@ -553,17 +560,22 @@ pub struct QsoMetadata {
     #[serde(default)]
     pub progressed_this_cycle: bool,
 
-    /// Consecutive silent per-slot rearm cycles since this QSO last made
-    /// forward progress (a genuinely new/advancing DX message). Incremented
-    /// solely by `QsoManager::rearm_manual_calls_at` — each real per-slot
-    /// re-send (the DX did not respond that slot) counts once; incoming
-    /// frame content is no longer inspected for this (the old
-    /// identical/differing-frame counting in `process_message` was replaced
-    /// by PAN-72). Reset to 0 in exactly two places — `process_message_for_qso`
-    /// on any forward state advance, and `QsoManager::apply_tx_offset_switch`
-    /// when a relocation actually COMMITS. See
-    /// [`Self::last_known_good_offset_hz`] for what happens once this trips a
-    /// switch (PAN-72).
+    /// Silent rearms since this QSO last made forward progress (a genuinely
+    /// new/advancing DX message), counted once per own-parity TX slot the
+    /// re-sends feed (PAN-128) — not once per protocol slot. Incremented
+    /// solely by `QsoManager::rearm_manual_calls_at`: each real re-send (the
+    /// DX did not respond) counts only if no surviving attempt already
+    /// holds the count for the own-parity TX slot it feeds, so the streak
+    /// climbs once per real TX opportunity (every other protocol slot under
+    /// FT8); incoming frame content is no longer inspected for this (the
+    /// old identical/differing-frame counting in `process_message` was
+    /// replaced by PAN-72). Since the last reset the counter has gained one
+    /// per distinct TX slot among the counted rearm attempts, and a slot
+    /// keeps its count while any of its attempts survives. Reset to 0 in
+    /// exactly two places — `process_message_for_qso` on any forward state
+    /// advance, and `QsoManager::apply_tx_offset_switch` when a relocation
+    /// actually COMMITS. See [`Self::last_known_good_offset_hz`] for what
+    /// happens once this trips a switch (PAN-72).
     ///
     /// Raising `QsoEvent::TxOffsetActionNeeded` deliberately does NOT reset it
     /// (Codex round 7 on PR #350, finding 2). The coordinator drains that
@@ -689,10 +701,11 @@ pub struct QsoMetadata {
     /// known-good and aim a later `Revert` straight back at it.
     ///
     /// Round 6, finding 2: the decode-frequency comparison round 5 added is
-    /// evidence only on a Tx=Rx QSO. On a PRE-EXISTING split (Hound, an `o`
-    /// hold, a de-conflict nudge, a passband clamp) the DX's frequency does not
-    /// move when OUR TX offset moves, so it can never say which of our two
-    /// offsets was answered — which is exactly why
+    /// evidence only on a Tx=Rx QSO. On any split — a pre-existing one (Hound,
+    /// an `o` hold, a de-conflict nudge, a passband clamp), or the one the
+    /// switch's own established-QSO latch creates (PAN-132) — the DX's
+    /// frequency does not move when OUR TX offset moves, so it can never say
+    /// which of our two offsets was answered — which is exactly why
     /// [`PreSwitchOffset::operator_forced`] is carried alongside the offset. See
     /// its doc comment.
     #[serde(default)]

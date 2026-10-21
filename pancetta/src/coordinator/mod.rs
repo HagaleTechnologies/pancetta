@@ -466,16 +466,14 @@ pub(crate) fn resolve_window_lead_secs(decoder_cfg: &pancetta_config::DecoderCon
 /// derived sample counts (`DspTiming`) are expressed at this rate.
 pub(crate) const FT8_SAMPLE_RATE: usize = 12000;
 
-/// Record an operator-requested split change in the coordinator's shared
-/// split-TX dial atomic (0 = simplex) and return the stored value. The single
-/// writer rule for `SetSplit` requests: the local TUI relay and a verified
-/// station-agent peer both call this BEFORE forwarding the
-/// `RigControlMessage::SetSplit` to Hamlib, so the TX band-plan gate
+/// Record a split change in the coordinator's shared split-TX dial atomic
+/// (0 = simplex) and return the stored value. The TX band-plan gate
 /// (`tx::tx_rf_for_gate`, which resolves split-vs-RX-dial from this atomic)
-/// never checks a stale dial after a split change (PR #446 Codex review:
-/// the remote path used to bypass it). Clearing split (`enabled = false`)
-/// stores 0 regardless of `tx_frequency`.
-pub(crate) fn record_split_state(
+/// reads it. Called only by [`forward_split_change`], after Hamlib's channel
+/// has accepted the `RigControlMessage::SetSplit` (PAN-209), so the gate
+/// never checks a split the rig was never sent. Clearing split
+/// (`enabled = false`) stores 0 regardless of `tx_frequency`.
+fn record_split_state(
     split_tx_frequency_hz: &std::sync::atomic::AtomicU64,
     enabled: bool,
     tx_frequency: u64,
@@ -483,6 +481,73 @@ pub(crate) fn record_split_state(
     let store = if enabled { tx_frequency } else { 0 };
     split_tx_frequency_hz.store(store, std::sync::atomic::Ordering::Relaxed);
     store
+}
+
+/// PAN-209: forward a split change to Hamlib with checked, bounded-retry
+/// delivery and record it in the shared split atomic only once enqueued.
+/// Hamlib applies its channel in order, so a PTT-on that passes the band
+/// gate after the record lands behind this SetSplit. No await separates
+/// the enqueue from the record, but they are not atomic to the gate: a
+/// gate check in between reads the split the rig is about to leave. That
+/// check's PTT-on then queues behind this SetSplit (the TX worker's own
+/// check-to-enqueue window). If this thread stalls until Hamlib has
+/// applied the change and released its in-flight mute, the PTT-on keys
+/// right after the switch. Both are accepted (PAN-216). A change dropped on
+/// every attempt never reached the rig: the atomic keeps the split the rig
+/// still transmits on. Returns the value the atomic now holds, for the
+/// caller's split-chip echo.
+pub(crate) async fn forward_split_change(
+    bus: &MessageBus,
+    source: ComponentId,
+    split_tx_frequency_hz: &std::sync::atomic::AtomicU64,
+    enabled: bool,
+    tx_frequency: u64,
+) -> u64 {
+    let make = || {
+        ComponentMessage::new(
+            source,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled,
+                tx_frequency,
+            }),
+            Instant::now(),
+        )
+    };
+    match bus
+        .send_message_retrying(make, &tx::SAFETY_SEND_RETRY_DELAYS)
+        .await
+    {
+        Ok(true) => record_split_state(split_tx_frequency_hz, enabled, tx_frequency),
+        Ok(false) | Err(_) => {
+            let kept = split_tx_frequency_hz.load(std::sync::atomic::Ordering::Relaxed);
+            error!(
+                target: "rig.split",
+                "SetSplit enabled={enabled} tx={tx_frequency} Hz not delivered to Hamlib after {} attempts; TX band check keeps split TX {kept} Hz (0 = simplex)",
+                tx::SAFETY_SEND_RETRY_DELAYS.len() + 1
+            );
+            let text = if kept == 0 {
+                "Split change not delivered to the rig; TX band check still uses the RX dial (simplex)"
+                    .to_string()
+            } else {
+                format!(
+                    "Split change not delivered to the rig; TX band check still uses split TX {:.3} MHz",
+                    kept as f64 / 1e6
+                )
+            };
+            tx::emit_diagnostic_full(
+                bus,
+                source,
+                "rig.split",
+                pancetta_core::DiagnosticLevel::Error,
+                text,
+                None,
+                None,
+            )
+            .await;
+            kept
+        }
+    }
 }
 
 /// Map the config-local [`pancetta_config::OperatingMode`] to a concrete
@@ -1368,6 +1433,10 @@ pub struct ApplicationCoordinator {
     /// PAN-145: synchronous relocation evidence for post-gate TX revalidation.
     pub(crate) relocation_epochs: Arc<pancetta_qso::qso_manager::TxRelocationEpochs>,
 
+    /// PAN-73 follow-up: messages the TX worker took off its channel and has
+    /// not handled yet. Owned here so a supervised worker restart keeps them.
+    pub(crate) tx_requeue: tx::TxRequeue,
+
     /// Test handshake after waveform construction, immediately before the gate wait.
     #[cfg(test)]
     tx_before_ptt_gate: Arc<tokio::sync::Notify>,
@@ -2184,6 +2253,7 @@ impl ApplicationCoordinator {
             ptt_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ptt_sync_gate: Arc::new(tokio::sync::Mutex::new(())),
             relocation_epochs: Arc::new(pancetta_qso::qso_manager::TxRelocationEpochs::default()),
+            tx_requeue: tx::TxRequeue::default(),
             #[cfg(test)]
             tx_before_ptt_gate: Arc::new(tokio::sync::Notify::new()),
             last_ptt_on_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2657,6 +2727,11 @@ impl ApplicationCoordinator {
     ///   into a demo process.
     /// - Clock-skew monitor (`coordinator/clock_monitor.rs`) — not started, so
     ///   no SNTP query leaves a replay.
+    /// - WAV recording (`dsp.rs`'s `resolve_wav_recording`, which also gates
+    ///   `audio.rs`'s raw 48 kHz diagnostic capture) — never enabled, even
+    ///   with `[audio.recording] auto_record = true`, so a replayed window
+    ///   is never written back out as a fresh capture stamped with today's
+    ///   date and a `_20m` band (GH #265).
     ///
     /// Add new outbound integrations — and any new persistence of a
     /// "completed" contact — to that list rather than inventing a second
@@ -2758,6 +2833,107 @@ impl ApplicationCoordinator {
     /// re-reading config.
     pub(crate) fn fox_max_streams(&self) -> Arc<AtomicUsize> {
         self.fox_max_streams.clone()
+    }
+}
+
+#[cfg(test)]
+mod pan209_split_forward_tests {
+    use super::forward_split_change;
+    use crate::message_bus::{
+        ComponentId, ComponentMessage, MessageBus, MessageType, RigControlMessage,
+    };
+    use crossbeam_channel::Receiver;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// Fill Hamlib's single slot so the next send to it is dropped.
+    async fn backlog(bus: &MessageBus) -> bool {
+        bus.send_message_checked(ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::AudioData(Vec::new()),
+            Instant::now(),
+        ))
+        .await
+        .unwrap()
+    }
+
+    fn set_splits(rx: &Receiver<ComponentMessage>) -> Vec<(bool, u64)> {
+        rx.try_iter()
+            .filter_map(|m| match m.message_type {
+                MessageType::RigControl(RigControlMessage::SetSplit {
+                    enabled,
+                    tx_frequency,
+                }) => Some((enabled, tx_frequency)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delivered_split_change_is_recorded() {
+        let bus = MessageBus::new(1).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let split = AtomicU64::new(0);
+        let store = forward_split_change(&bus, ComponentId::Tui, &split, true, 15_000_000).await;
+        assert_eq!(store, 15_000_000);
+        assert_eq!(split.load(Ordering::Relaxed), 15_000_000);
+        assert_eq!(set_splits(&rx), vec![(true, 15_000_000)]);
+    }
+
+    /// The ticket's case: clearing an out-of-band split that never reaches
+    /// Hamlib must leave the gate on that split.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_split_clear_keeps_the_old_split() {
+        let bus = MessageBus::new(1).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        assert!(backlog(&bus).await);
+        let split = AtomicU64::new(15_000_000);
+        let store = forward_split_change(&bus, ComponentId::StationAgent, &split, false, 0).await;
+        assert_eq!(
+            store, 15_000_000,
+            "the echo carries the split still enforced"
+        );
+        assert_eq!(split.load(Ordering::Relaxed), 15_000_000);
+        assert!(set_splits(&rx).is_empty(), "no SetSplit was enqueued");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_split_enable_keeps_simplex() {
+        let bus = MessageBus::new(1).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        assert!(backlog(&bus).await);
+        let split = AtomicU64::new(0);
+        let store = forward_split_change(&bus, ComponentId::Tui, &split, true, 15_000_000).await;
+        assert_eq!(store, 0);
+        assert_eq!(split.load(Ordering::Relaxed), 0);
+        assert!(set_splits(&rx).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn split_change_without_a_hamlib_channel_is_not_recorded() {
+        let bus = MessageBus::new(1).unwrap();
+        let split = AtomicU64::new(15_000_000);
+        let store = forward_split_change(&bus, ComponentId::Autonomous, &split, false, 0).await;
+        assert_eq!(store, 15_000_000);
+        assert_eq!(split.load(Ordering::Relaxed), 15_000_000);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn split_change_recorded_once_hamlib_frees_room() {
+        let bus = MessageBus::new(1).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        assert!(backlog(&bus).await);
+        let rx2 = rx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = rx2.try_recv();
+        });
+        let split = AtomicU64::new(15_000_000);
+        let store = forward_split_change(&bus, ComponentId::Tui, &split, false, 0).await;
+        assert_eq!(store, 0, "delivered inside the retry window");
+        assert_eq!(split.load(Ordering::Relaxed), 0);
+        assert_eq!(set_splits(&rx), vec![(false, 0)]);
     }
 }
 
@@ -3342,6 +3518,34 @@ mod tests {
         assert!(
             replaying.replay_mode(),
             "--replay must be visible to every outbound gate"
+        );
+    }
+
+    /// PAN-125: the WAV-recording decision consults `replay_mode()` and
+    /// `no_audio`, so an operator who enabled `[audio.recording]
+    /// auto_record = true` still gets no recording in either mode.
+    #[tokio::test]
+    async fn wav_recording_is_refused_under_replay_and_no_audio_even_when_enabled() {
+        let enabled = pancetta_config::RecordingConfig {
+            auto_record: true,
+            directory: "/tmp/pan125-never".into(),
+            ..Default::default()
+        };
+        let replaying =
+            build_coordinator_with_replay(Some(PathBuf::from("/some/capture/dir"))).await;
+        assert_eq!(
+            replaying.wav_recording(&enabled),
+            dsp::WavRecording::SuppressedReplay
+        );
+        // The helper builds with no_audio = true and no replay.
+        let no_audio = build_coordinator(Config::default()).await;
+        assert_eq!(
+            no_audio.wav_recording(&enabled),
+            dsp::WavRecording::SuppressedNoAudio
+        );
+        assert_eq!(
+            no_audio.wav_recording(&Default::default()),
+            dsp::WavRecording::DisabledByConfig
         );
     }
 

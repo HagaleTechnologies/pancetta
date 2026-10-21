@@ -3,6 +3,31 @@
 
 # TX scheduling
 
+## The TX worker keeps what it takes off its channel (PAN-73 follow-up, 2026-10-17)
+
+During a keyed transmission the worker takes messages off its own
+`Ft8Transmitter` channel to look for a supersede. It used to send the ones it
+set aside back through the bus: a producer sending at the same time could
+land ahead of them (the coalescer then keyed the stale request and dropped
+the fresh one), and a full channel dropped them with no error. The same
+re-send pattern ran in the supersede callers, `supersede_multi_reenqueue` and
+`coalesce_backlog_into`, whose stop message also landed behind later traffic.
+
+The worker now reads a requeue front (`TxRequeue`, owned by the coordinator
+so a PAN-119 restart keeps it) before its channel, and everything it puts
+back goes on that front (`TxInbox::requeue_front`). Everything on the front
+was received before anything still in the channel, so arrival order holds
+with no lock against producers, and nothing can be dropped. A supersede
+winner goes on the front after the siphoned traffic, so it stays first
+(PR #346 round 4). Putting messages back is a synchronous splice, so it adds
+no await before a disarm's PTT-off, and nothing on the front runs before the
+playback-disarm flush finishes.
+
+Not done: a mutex-guarded intake for all producers (needed only for a
+cross-QSO priority scheduler), and checked sends for the re-sends (they
+still land behind concurrent producers). External producers still drop on
+a full channel (10000), the bus's general contract (review item H-49).
+
 ## Post-gate relocation revalidation (PAN-145, 2026-10-16)
 
 A successful QSO offset switch bumps a per-QSO epoch under `ptt_sync_gate`,
@@ -72,7 +97,7 @@ Bundles are **not** allowed to silently disagree on parity or collide in frequen
 
 `pancetta-qso/src/qso_manager.rs`, `states.rs`, `autonomous.rs`, `pancetta/src/coordinator/{qso.rs,autonomous.rs,tui_relay.rs}`: we hold a QSO's TX audio offset for the whole exchange. The offset is latched once at QSO open into `QsoMetadata.frequency` and reused for every reply/keep-call (the allocator runs only at open); the one mid-QSO mover is the adaptive stall escape (PAN-72, 2026-09-04).
 
-**Detection (`QsoMetadata.stall_cycles`).** The per-slot keep-call re-send in `rearm_manual_calls_at` *is* the stall signal — reaching it means the DX did not advance the QSO since the last slot — so that site is the sole incrementer of `stall_cycles`. This counts **silence** as well as a repeated/non-advancing frame, which the superseded mechanism never did. Any genuine forward advance (`process_message_for_qso`) resets it to 0 and latches the current offset into `QsoMetadata.last_known_good_offset_hz`.
+**Detection (`QsoMetadata.stall_cycles`).** The keep-call re-send in `rearm_manual_calls_at` *is* the stall signal — reaching it means the DX did not advance the QSO since the last slot — so that site is the sole incrementer of `stall_cycles`. Since PAN-128 the count is per own-parity TX slot, not per emission: a QSO only keys on its own parity (every OTHER protocol slot), so each rearm records the own-parity TX slot it feeds and only the first emission feeding a slot no surviving attempt holds counts; with `qso_stall_switch_after = N` the switch trips on the emission feeding the N-th distinct own TX slot. This counts **silence** as well as a repeated/non-advancing frame, which the superseded mechanism never did. A repeated report in `SendingReport` sends nothing and leaves `last_call_at`/`call_count` untouched, so the rearm treats it exactly like silence (PAN-129). Before, its restamp held the rearm back a full slot from every decode, so FT8/FT4 detection relied on the 5 s poll fitting the window, and FT2 skipped re-sends and switched late. Any genuine forward advance (`process_message_for_qso`) resets it to 0 and latches the current offset into `QsoMetadata.last_known_good_offset_hz`.
 
 **Action (`QsoEvent::TxOffsetActionNeeded`).** Once `stall_cycles >= TimeoutConfig::qso_stall_switch_after` (default 4, operator-facing as `[autonomous] qso_stall_switch_after`) and **only in `TxFreqMode::Auto`**, the manager emits `TxOffsetActionNeeded{qso_id, action}` and resets `stall_cycles` so one stall fires once. The Switch/Revert ping-pong is decided against `last_known_good_offset_hz`: none recorded, or we are currently *on* it → `Switch{avoid_hz: current}`; we are on a previously-switched offset → `Revert{target_hz: last_known_good}`. So a QSO switches away from known-good on the first stall, comes back on the second, switches away again on the third.
 
@@ -116,7 +141,7 @@ The `u` nudge picked up two of its own: the Hold gate is hoisted above the activ
 **Round-6 review hardening (Codex on PR #350, 2026-09-06).** Four findings — all labelled P2 by the reviewer, all real correctness bugs by substance, so fixed inline under the rounds-6-15 policy rather than ticketed:
 
 - *The DX's first report is forward progress.* `progress_rank` collapsed `SendingReport { their_report: None }` and `{ Some(_) }` into one rung, so the transition that turns our outbound from a plain report into an R-report read as "no progress". A switch queued by the preceding threshold-hitting rearm therefore left `advance_generation` unmoved and passed the commit-time stale-action guard, relocating the QSO at the moment the DX finally answered; below the threshold the partial stall streak carried forward. Split (with the analogous `Contest(ExchangingInfo)` `their_serial` split so the dormant contest wiring can't inherit it). `ladder_rank` deliberately unchanged — the manual regression predicate needs both `SendingReport` shapes equal — and a repeated report (`Some -> Some`) still reads as no progress.
-- *Credit the new offset when an operator nudge moved a SPLIT QSO.* Round 5's decode-frequency check is evidence only on a Tx=Rx QSO; on a pre-existing split (Hound, an `o` hold, a de-conflict nudge, a passband clamp) the DX transmits at `partner_freq` regardless of where we key, so its reply cannot discriminate our two offsets. The round-5 correction fell back to crediting the vacated offset unconditionally — right for a stall switch (which only fires because that offset stopped working, and whose triggering resend went out on it), wrong for a `u` nudge (which indicts nothing, and after which our very next frame goes out on the NEW offset). Provenance is now threaded rather than guessed: `OffsetRelocationOrigin` replaces the bare `Option<u32>` staleness token on `OffsetActionRequest` and in `apply_tx_offset_switch`'s signature (the token lives inside the `StallDetected` variant, so "no token" can no longer be conflated with "operator forced"), and `QsoMetadata::pre_switch_offset` becomes a `PreSwitchOffset` carrying `operator_forced`.
+- *Credit the new offset when an operator nudge moved a SPLIT QSO.* Round 5's decode-frequency check is evidence only on a Tx=Rx QSO; on a pre-existing split (Hound, an `o` hold, a de-conflict nudge, a passband clamp) the DX transmits at `partner_freq` regardless of where we key, so its reply cannot discriminate our two offsets. The round-5 correction fell back to crediting the vacated offset unconditionally — right for a stall switch (which only fires because that offset stopped working, and whose triggering resend went out on it), wrong for a `u` nudge (which indicts nothing, and after which our very next frame goes out on the NEW offset). Provenance is now threaded rather than guessed: `OffsetRelocationOrigin` replaces the bare `Option<u32>` staleness token on `OffsetActionRequest` and in `apply_tx_offset_switch`'s signature (the token lives inside the `StallDetected` variant, so "no token" can no longer be conflated with "operator forced"), and `QsoMetadata::pre_switch_offset` becomes a `PreSwitchOffset` carrying `operator_forced`. PAN-132 (round 15) extended this to the split the switch's own established-QSO latch creates: any QSO with a `partner_freq` is credited by provenance, and the decode-frequency check now applies only when `partner_freq` is `None` (a switch on an unanswered `CallingCq`).
 - *Search the full configured Hound window.* A `[hound]` response region above 2800 Hz was only ever used to FILTER candidates already generated from the allocator's fixed 200–2800 Hz range, so it emptied both the ranked list and the legacy fallback scan: every post-QSY Hound stall switch or `u` nudge resolved back to `avoid_hz` and was refused as a no-op with the configured region never searched. Both scans now take their bounds from one shared `frequency::sweep_bounds`, which only ever WIDENS the sweep and keeps the grid anchored at the configured floor, so an in-range window ranks exactly as before. Ceiling reconciled while there: `[hound]` validation capped at a round 3000 Hz, admitting a (2900, 3000] region no relocation could reach (`apply_tx_offset_switch` clamps to `ACTIVE_QSO_TX_OFFSET_MAX_HZ` = 2900, then its region guard refuses the clamped value) and that `hound_offset_for`'s QSY would write into `metadata.frequency` unclamped. Now 200–2900, the real transmittable envelope.
 - *Score switches against the QSO's own TX parity.* The drain passed `None` for `target_parity`, putting `rank_candidates_with_parity` on its slot-blind path — where a frequency quiet only in the opposite (listening) slot can outrank one genuinely clear in the slot we will actually key in, so adaptive recovery could move a colliding QSO straight into another collision. The `get_qso` snapshot the Hound/revert checks already take carries the latched parity; it now feeds both the ordinary `Switch` and the occupied-target `Revert` fallback. Parity only weights scoring — it never filters — so the search can never fail more often.
 
@@ -365,10 +390,30 @@ If a rollback takes `stall_cycles` from the switch threshold back below it
 before the coordinator's drain commits a stall offset action that attempt
 raised, the commit is refused (`OffsetActionStallRolledBack`) until the streak
 reaches the threshold again. A rollback that arrives after the commit cannot
-undo the move (follow-up: PAN-182).
+undo the move (follow-up: PAN-182). Since PAN-128 each attempt records the
+own-parity TX slot its emission feeds, derived with the TX scheduler's own
+current-slot acceptance rule (the CURRENT slot while inside the worker's
+PAN-117 queue-time acceptance cap — mode-scaled `tx_late_max_ms` minus the
+mode-scaled base coalesce window minus the safety margin, mirrored as
+`keep_call_acceptance_cap_ms` — else the first own slot strictly after —
+a PR-review follow-up; attributing an in-window emission to the next own
+slot instead split one real TX opportunity across two ledger keys and both
+incremented, firing the switch one transmission early); when a
+payload-scoped rollback removes the
+attempt holding a slot's count while a same-slot sibling survives, the
+count is handed to that sibling instead of being decremented (the slot still
+has a frame that can air), and `resend_last_tx`/offset-switch retransmit
+attempts (which record no slot) never count and never inherit one. Rejected
+alternatives: gating on the CURRENT slot's parity matching `tx_parity`
+undercounts (a 20 s emission gap can skip our slot entirely and the first
+rearm's count would depend on phase), and a single `last_counted_tx_slot`
+ledger field wedges when the counted attempt is rolled back (the field would
+still claim the slot was counted).
 Rearm, explicit resend and operator offset-switch retransmits record attempts.
 A forward advance or committed offset switch clears the remembered stall
-contributions too, so a delayed failure cannot subtract from a newer streak.
+contributions too — each attempt's increment AND its slot key, so the heir
+hand-off can never cross a reset — so a delayed failure cannot subtract from
+a newer streak.
 Relinking stamps preserves any intervening forward advance.
 
 The ledger keeps a separate `last_emitted_at` anchor. Rearm pacing uses the later

@@ -21,7 +21,7 @@ links:
 pancetta is an autonomous FT8/FT4 ham-radio station in Rust: it decodes,
 selects and calls stations by priority, completes QSOs on multiple TX streams,
 and logs them — with integration to the first-party cqdx.io service. It is a
-12-crate Cargo workspace targeting a Yaesu FTdx10; the authoritative record of
+14-crate Cargo workspace targeting a Yaesu FTdx10; the authoritative record of
 current behavior is the code plus `docs/superpowers/specs/`, with subsystem
 decision digests in `docs/DECISIONS/`. This wiki points at those; it never
 restates constants or thresholds.

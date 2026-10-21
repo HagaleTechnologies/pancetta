@@ -97,6 +97,7 @@ hound = "3.5"
 rustfft = "6.4"
 
 [dev-dependencies]
+ratatui = "0.30"
 tempfile = "3.27"
 criterion = { version = "0.8", features = ["html_reports"] }
 assert_cmd = "2.2"
@@ -106,6 +107,8 @@ tracing-test = "0.2"
 # and drive the real AgentSession through a scripted Noise IK handshake.
 base64 = { workspace = true }
 snow = "0.10"
+# Station-agent lock-order tests hold an audit write mid-transaction.
+pancetta-agent = { path = "../pancetta-agent", features = ["test-hooks"] }
 
 [features]
 default = ["metrics", "pancetta-hamlib"]
