@@ -239,33 +239,74 @@ impl OutboxStore {
         })
     }
 
-    /// Write `bytes` to `path` atomically: a `<file>.tmp` (owner-only on
-    /// Unix), flushed to disk, then renamed over `path`.
+    /// Write `bytes` to `path` atomically: a fresh `<file>.<uuid>.tmp`
+    /// (owner-only on Unix) created exclusively next to it, flushed to disk,
+    /// renamed over `path`, then the directory synced so the rename itself
+    /// survives a power loss.
+    ///
+    /// The temporary file is opened with `create_new`, so a pre-existing
+    /// path, including a symlink planted by another local user, is never
+    /// followed or truncated; the random name means a stale leftover from a
+    /// crash never blocks a write either. A failed write removes its own
+    /// temporary file.
     pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-        use std::io::Write;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        std::fs::create_dir_all(parent)?;
+        let tmp = Self::temp_path(path);
+        if let Err(e) = Self::write_new_file(&tmp, bytes) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
         }
-        let mut tmp_name = path.as_os_str().to_owned();
-        tmp_name.push(".tmp");
-        let tmp = PathBuf::from(tmp_name);
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        Self::sync_dir(parent)
+    }
+
+    /// A unique temporary path beside `path`: `<file>.<uuid>.tmp`.
+    fn temp_path(path: &Path) -> PathBuf {
+        let mut name = path.as_os_str().to_owned();
+        name.push(format!(".{}.tmp", Uuid::new_v4().simple()));
+        PathBuf::from(name)
+    }
+
+    /// Create `tmp` exclusively (never following an existing entry), write
+    /// `bytes`, and fsync it.
+    fn write_new_file(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
         let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let mut file = opts.open(&tmp)?;
+        let mut file = opts.open(tmp)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
         file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp, path)
+        file.sync_all()
+    }
+
+    /// Make a rename inside `dir` durable: fsync the directory on Unix.
+    /// Other platforms have no portable directory sync; there it is a no-op.
+    fn sync_dir(dir: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::fs::File::open(dir)?.sync_all()?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = dir;
+        }
+        Ok(())
     }
 
     /// The queue file path.
@@ -880,6 +921,71 @@ mod tests {
         let (store, q) = OutboxStore::open(path);
         assert!(q.is_none());
         assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn stale_temp_file_never_blocks_or_receives_a_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_in(&dir);
+        let stale = dir.path().join("upload_outbox.json.tmp");
+        std::fs::write(&stale, b"garbage").unwrap();
+        let (mut store, _) = OutboxStore::open(path.clone());
+        store.add(
+            vec![up(Uuid::new_v4(), UploadDestination::ClubLog, "A1A")],
+            Utc::now(),
+        );
+        OutboxStore::write_atomic(&path, &store.to_bytes().unwrap()).unwrap();
+        assert_eq!(std::fs::read(&stale).unwrap(), b"garbage");
+        let (reopened, q) = OutboxStore::open(path);
+        assert!(q.is_none());
+        assert_eq!(reopened.len(), 1);
+    }
+
+    #[test]
+    fn write_leaves_no_temp_files_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_in(&dir);
+        for _ in 0..3 {
+            OutboxStore::write_atomic(&path, b"{}").unwrap();
+        }
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, vec!["upload_outbox.json".to_string()]);
+    }
+
+    #[test]
+    fn temp_paths_are_unique_siblings_of_the_queue_file() {
+        let path = PathBuf::from("/q/upload_outbox.json");
+        let a = OutboxStore::temp_path(&path);
+        let b = OutboxStore::temp_path(&path);
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), path.parent());
+        let name = a.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with("upload_outbox.json.") && name.ends_with(".tmp"),
+            "{name}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_entry_at_the_temp_path_is_never_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"keep me").unwrap();
+        let tmp = dir.path().join("upload_outbox.json.planted.tmp");
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+        let err = OutboxStore::write_new_file(&tmp, b"overwrite").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn directory_sync_of_the_current_dir_succeeds() {
+        // `Path::parent` of a bare name is "", which must map to ".".
+        assert!(OutboxStore::sync_dir(Path::new(".")).is_ok());
     }
 
     #[test]
