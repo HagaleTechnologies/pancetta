@@ -133,6 +133,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Decode effort `Max` no longer delays a busy window's decodes by seconds on
+  slower computers. Before an extra decode pass, pancetta now checks that the
+  pass fits in the time left before the next slot, and skips it when it would
+  not (PAN-165).
+
 - A remote client that disarmed or lost control while pancetta was busy could
   still use up its manual-call budget. Repeating a call on an existing QSO
   charged the resend, and could advance or complete the QSO, after the

@@ -63,6 +63,131 @@ pub trait DecoderUnderTest: Send + Sync {
     fn chrono_replay_snapshot_len(&self) -> Option<usize> {
         None
     }
+    /// PAN-165: per-window timing of the most recent `decode_wav` call,
+    /// cleared on read. The default returns `None`; the research
+    /// `Ft8Decoder` records one only when built with
+    /// [`Ft8Decoder::with_budget_anchor`].
+    fn take_last_window_timing(&self) -> Option<WindowTiming> {
+        None
+    }
+}
+
+/// PAN-165: where a harness decode window's `DecodeBudget` deadline starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetAnchor {
+    /// The deadline starts right before the native decode call. This is the
+    /// timing model every pre-PAN-165 budgeted scorecard used.
+    Call,
+    /// The deadline starts at window receipt, then production's pre-native
+    /// sequence runs under it before the native call (waterfall, optional
+    /// scoped fast-path, ft8_lib), as `pancetta/src/coordinator/ft8.rs` does.
+    Receipt,
+}
+
+impl BudgetAnchor {
+    /// Lower-case name, as the eval `--budget-anchor` flag spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BudgetAnchor::Call => "call",
+            BudgetAnchor::Receipt => "receipt",
+        }
+    }
+}
+
+/// PAN-165: where one decode window's wall-clock time went, in milliseconds.
+/// Pre-native fields are zero under [`BudgetAnchor::Call`].
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct WindowTiming {
+    /// Waterfall generation, including the f32→f64 sample conversion.
+    pub waterfall_ms: f64,
+    /// Scoped fast-path decode around the QSO partner (0 when not run).
+    pub scoped_ms: f64,
+    /// ft8_lib FFI decode.
+    pub ft8lib_ms: f64,
+    /// Window receipt to the start of the native call.
+    pub pre_native_ms: f64,
+    /// Time left on the budget when the native call started (`None` =
+    /// unlimited budget).
+    pub headroom_at_native_ms: Option<f64>,
+    /// The native decode call.
+    pub native_ms: f64,
+    /// Window receipt (or call start) to the end of the native call.
+    pub window_total_ms: f64,
+    /// How far the native call ended past the deadline (0 when on time or
+    /// unlimited).
+    pub over_deadline_ms: f64,
+    /// Multipass-loop iterations the native call ran
+    /// (`DecodeBudgetReport::passes_run`).
+    pub passes_run: u32,
+    /// The native call's `DecodeBudgetReport::budget_exhausted`.
+    pub budget_exhausted: bool,
+}
+
+impl WindowTiming {
+    /// Timing of a call-anchored native decode that ran from `start` to `end`.
+    fn call_anchored(
+        start: Instant,
+        end: Instant,
+        budget: &pancetta_ft8::DecodeBudget,
+        report: &pancetta_ft8::DecodeBudgetReport,
+    ) -> Self {
+        let native_ms = duration_ms(end.saturating_duration_since(start));
+        Self {
+            headroom_at_native_ms: headroom_ms(budget, start),
+            native_ms,
+            window_total_ms: native_ms,
+            over_deadline_ms: over_deadline_ms(budget, end),
+            passes_run: report.passes_run,
+            budget_exhausted: report.budget_exhausted,
+            ..Self::default()
+        }
+    }
+}
+
+/// PAN-165: half-width, in 6.25 Hz bins, of production's scoped fast-path
+/// decode around the QSO partner. Duplicated from `SCOPED_HALF_WIDTH` in
+/// `pancetta/src/coordinator/ft8.rs`, because the harness cannot depend on
+/// the `pancetta` binary crate. KEEP IN SYNC.
+const SCOPED_HALF_WIDTH: usize = 5;
+
+/// PAN-165: half-window (Hz) production narrows the native decode to around
+/// the QSO partner. Duplicated from `DEFAULT_HALF_WINDOW_HZ` in
+/// `pancetta/src/coordinator/qso_filter.rs`. KEEP IN SYNC.
+const QSO_FILTER_DEFAULT_HALF_WINDOW_HZ: f64 = 60.0;
+
+/// PAN-165: the native-call bin range production uses during a QSO. Same
+/// formula as `partner_freq_to_bin_range` in
+/// `pancetta/src/coordinator/qso_filter.rs`, at `TONE_SPACING` and the
+/// default ±60 Hz half-window. `None` (full band) for a non-positive or
+/// non-finite partner frequency, as there.
+fn qso_filter_bin_range(partner_freq_hz: f64) -> Option<std::ops::RangeInclusive<usize>> {
+    let spacing = pancetta_ft8::TONE_SPACING;
+    if !partner_freq_hz.is_finite() || partner_freq_hz <= 0.0 {
+        return None;
+    }
+    let center_bin = (partner_freq_hz / spacing).round() as i64;
+    let half_bins = (QSO_FILTER_DEFAULT_HALF_WINDOW_HZ / spacing).ceil() as i64;
+    let lo = center_bin.saturating_sub(half_bins).max(0) as usize;
+    let hi = center_bin.saturating_add(half_bins).max(0) as usize;
+    Some(lo..=hi)
+}
+
+fn duration_ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
+}
+
+/// Milliseconds left on `budget` at `at` (`None` = unlimited).
+fn headroom_ms(budget: &pancetta_ft8::DecodeBudget, at: Instant) -> Option<f64> {
+    budget
+        .deadline()
+        .map(|d| duration_ms(d.saturating_duration_since(at)))
+}
+
+/// Milliseconds past `budget`'s deadline at `at` (0 when on time or unlimited).
+fn over_deadline_ms(budget: &pancetta_ft8::DecodeBudget, at: Instant) -> f64 {
+    budget
+        .deadline()
+        .map_or(0.0, |d| duration_ms(at.saturating_duration_since(d)))
 }
 
 /// Wraps the production pancetta-ft8 decoder for use by the harness.
@@ -116,7 +241,7 @@ pub struct Ft8Decoder {
     /// mirroring production's `decode_effort_budget_ms` atomic
     /// (`pancetta/src/coordinator/effort.rs`). `None` (the default — no
     /// flag, no builder call) means every existing behavior is preserved
-    /// byte-for-byte: `decode_budget()` maps `None` to
+    /// byte-for-byte: `decode_budget_from()` maps `None` to
     /// `pancetta_ft8::DecodeBudget::unlimited()`, exactly what
     /// `decode_window`/`decode_window_with_ap` already used internally
     /// before this task. `Some(0)` (the "unlimited" preset name) is
@@ -125,13 +250,26 @@ pub struct Ft8Decoder {
     /// == 0` convention. `Some(ms)` with `ms > 0` builds a FRESH deadline
     /// (`Instant::now() + ms`) on every `decode_wav` call, since a budget
     /// is a per-window wall-clock deadline, not a fixed instant computed
-    /// once at CLI-parse time (see `decode_budget`).
+    /// once at CLI-parse time (see `decode_budget_from`).
     budget_ms: Option<u64>,
     /// Task W5.4 [HARNESS]: fixed partner audio frequency (Hz) forwarded
     /// to every `decode_wav` call. `None` (default) reproduces the
     /// existing `partner_freq_hz = None` behavior byte-for-byte at every
     /// call site. See `with_partner_freq_hz`.
     partner_freq_hz: Option<f64>,
+    /// PAN-165: timing model for the budget deadline. `None` (the default)
+    /// records no timing and keeps every pre-existing behavior.
+    /// `Some(Call)` records the native call's timing. `Some(Receipt)` runs
+    /// production's pre-native sequence under a receipt-anchored deadline
+    /// (see `decode_receipt_anchored`).
+    budget_anchor: Option<BudgetAnchor>,
+    /// PAN-165: simulated active-QSO partner frequency (Hz) for
+    /// `BudgetAnchor::Receipt`: runs the scoped fast-path call and narrows
+    /// the native call to the partner, as production does during a QSO.
+    qso_partner_hz: Option<f64>,
+    /// PAN-165: timing of the last `decode_wav`, for
+    /// `take_last_window_timing`.
+    last_window_timing: Mutex<Option<WindowTiming>>,
     /// Used only so `config_snapshot` is stable across calls.
     _scratch: Mutex<()>,
 }
@@ -161,6 +299,9 @@ impl Ft8Decoder {
             chrono_replay_state: None,
             budget_ms: None,
             partner_freq_hz: None,
+            budget_anchor: None,
+            qso_partner_hz: None,
+            last_window_timing: Mutex::new(None),
             _scratch: Mutex::new(()),
         }
     }
@@ -524,17 +665,146 @@ impl Ft8Decoder {
         self
     }
 
-    /// Build the `DecodeBudget` to use for the next `decode_wav` call. A
-    /// budget is a wall-clock DEADLINE, so this must be called freshly
-    /// per WAV (not once at construction) — `Instant::now()` is read at
-    /// call time, right before decoding.
-    fn decode_budget(&self) -> pancetta_ft8::DecodeBudget {
+    /// PAN-165: choose the timing model for the budget deadline and start
+    /// recording per-window timing (read it with `take_last_window_timing`).
+    /// `BudgetAnchor::Receipt` works only on the plain decode path: no
+    /// chrono replay, rolling window, AP context or two-stage decoding.
+    pub fn with_budget_anchor(mut self, anchor: BudgetAnchor) -> Self {
+        self.budget_anchor = Some(anchor);
+        self
+    }
+
+    /// PAN-165: simulate an active QSO with a partner at `hz` under
+    /// `BudgetAnchor::Receipt`. Each window then runs production's scoped
+    /// fast-path call around the partner, and the native call is narrowed
+    /// to the partner ±60 Hz with `hz` as its relaxed-sync partner
+    /// frequency (superseding `with_partner_freq_hz` on that call).
+    pub fn with_qso_partner_hz(mut self, hz: f64) -> Self {
+        self.qso_partner_hz = Some(hz);
+        self
+    }
+
+    /// Build the `DecodeBudget` for a decode window whose deadline is
+    /// anchored at `anchor`. A budget is a wall-clock DEADLINE, so this
+    /// must be called freshly per WAV (not once at construction), with the
+    /// `Instant` the window's timing starts from.
+    fn decode_budget_from(&self, anchor: Instant) -> pancetta_ft8::DecodeBudget {
         match self.budget_ms {
             None | Some(0) => pancetta_ft8::DecodeBudget::unlimited(),
-            Some(ms) => {
-                pancetta_ft8::DecodeBudget::until(Instant::now() + Duration::from_millis(ms))
-            }
+            Some(ms) => pancetta_ft8::DecodeBudget::until(anchor + Duration::from_millis(ms)),
         }
+    }
+
+    fn store_window_timing(&self, timing: Option<WindowTiming>) {
+        *self
+            .last_window_timing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = timing;
+    }
+
+    /// Run one native decode call under a budget anchored right before it
+    /// (the harness's pre-PAN-165 timing model). Under
+    /// `BudgetAnchor::Call` the call's `WindowTiming` is recorded.
+    fn run_call_anchored<F>(
+        &self,
+        call: F,
+    ) -> pancetta_ft8::Ft8Result<Vec<pancetta_ft8::DecodedMessage>>
+    where
+        F: FnOnce(
+            pancetta_ft8::DecodeBudget,
+        ) -> pancetta_ft8::Ft8Result<(
+            Vec<pancetta_ft8::DecodedMessage>,
+            pancetta_ft8::DecodeBudgetReport,
+        )>,
+    {
+        let start = Instant::now();
+        let budget = self.decode_budget_from(start);
+        let (messages, report) = call(budget)?;
+        if self.budget_anchor == Some(BudgetAnchor::Call) {
+            self.store_window_timing(Some(WindowTiming::call_anchored(
+                start,
+                Instant::now(),
+                &budget,
+                &report,
+            )));
+        }
+        Ok(messages)
+    }
+
+    /// PAN-165: reproduce production's per-window sequence from
+    /// `pancetta/src/coordinator/ft8.rs` under one deadline anchored at
+    /// window receipt: waterfall generation, the scoped fast-path call
+    /// (only with a QSO partner), the ft8_lib FFI call, then the native
+    /// call. Only the native call's decodes are returned (PAN-165
+    /// Decision 6); the other calls run for their timing cost.
+    fn decode_receipt_anchored(
+        &self,
+        decoder: &mut pancetta_ft8::Ft8Decoder,
+        samples: &[f32],
+    ) -> anyhow::Result<(Vec<pancetta_ft8::DecodedMessage>, WindowTiming)> {
+        let anchor = Instant::now();
+        let budget = self.decode_budget_from(anchor);
+
+        let waterfall_start = Instant::now();
+        let samples_f64: Vec<f64> = samples.iter().map(|&s| s as f64).collect();
+        // Production logs and fans the waterfall out; a failure there only
+        // logs a warning, so the result is not needed here either.
+        let _ = decoder.generate_waterfall_data(&samples_f64);
+        let waterfall_ms = duration_ms(waterfall_start.elapsed());
+
+        let scoped_ms = match self.qso_partner_hz {
+            Some(hz) => {
+                let center = (hz / pancetta_ft8::TONE_SPACING).round() as usize;
+                let lo = center.saturating_sub(SCOPED_HALF_WIDTH);
+                let hi = center.saturating_add(SCOPED_HALF_WIDTH);
+                let scoped_start = Instant::now();
+                // Production discards a failed scoped call (`unwrap_or_default`).
+                let _ = decoder.decode_window_with_ap_scoped_partner_budgeted(
+                    samples,
+                    &pancetta_ft8::ApContext::default(),
+                    Some(lo..=hi),
+                    None,
+                    budget,
+                );
+                duration_ms(scoped_start.elapsed())
+            }
+            None => 0.0,
+        };
+
+        let ft8lib_start = Instant::now();
+        let _ =
+            pancetta_ft8::Ft8Decoder::decode_window_ft8lib_protocol(samples, self.config.protocol);
+        let ft8lib_ms = duration_ms(ft8lib_start.elapsed());
+
+        let (freq_bin_range, partner_freq_hz) = match self.qso_partner_hz {
+            Some(hz) => (qso_filter_bin_range(hz), Some(hz)),
+            None => (None, self.partner_freq_hz),
+        };
+        let native_start = Instant::now();
+        let (messages, report) = decoder
+            .decode_window_with_ap_scoped_partner_budgeted(
+                samples,
+                &pancetta_ft8::ApContext::default(),
+                freq_bin_range,
+                partner_freq_hz,
+                budget,
+            )
+            .map_err(|e| anyhow::anyhow!("receipt-anchored native decode failed: {e}"))?;
+        let end = Instant::now();
+
+        let timing = WindowTiming {
+            waterfall_ms,
+            scoped_ms,
+            ft8lib_ms,
+            pre_native_ms: duration_ms(native_start.saturating_duration_since(anchor)),
+            headroom_at_native_ms: headroom_ms(&budget, native_start),
+            native_ms: duration_ms(end.saturating_duration_since(native_start)),
+            window_total_ms: duration_ms(end.saturating_duration_since(anchor)),
+            over_deadline_ms: over_deadline_ms(&budget, end),
+            passes_run: report.passes_run,
+            budget_exhausted: report.budget_exhausted,
+        };
+        Ok((messages, timing))
     }
 
     /// Decoder-TP-sensitivity Task W1.4 [A/B]: master switch for the
@@ -863,6 +1133,19 @@ impl DecoderUnderTest for Ft8Decoder {
     }
 
     fn decode_wav(&self, path: &Path) -> anyhow::Result<Vec<Decode>> {
+        // PAN-165: never let a failed call leave the previous window's
+        // timing behind for `take_last_window_timing`.
+        self.store_window_timing(None);
+        let receipt_anchored = self.budget_anchor == Some(BudgetAnchor::Receipt);
+        anyhow::ensure!(
+            !receipt_anchored
+                || (self.chrono_replay_state.is_none()
+                    && self.rolling_window.is_none()
+                    && self.ap_context.is_none()
+                    && self.two_stage_first_config.is_none()),
+            "budget anchor `receipt` reproduces production's plain decode path and cannot be \
+             combined with chrono replay, a rolling window, an AP context or two-stage decoding"
+        );
         // Load WAV via hound; pancetta-ft8 expects mono f32 samples at 12 kHz
         // (FT8's canonical decode rate). The fixture and recording WAVs are
         // already at 12 kHz mono; assert and bail if not.
@@ -911,7 +1194,13 @@ impl DecoderUnderTest for Ft8Decoder {
             decoder = decoder
                 .with_dt_priors(h.clone() as std::sync::Arc<dyn pancetta_ft8::DtPriorLookup>);
         }
-        let raw = if let Some(state) = self.chrono_replay_state.clone() {
+        let raw = if receipt_anchored {
+            let (messages, timing) = self
+                .decode_receipt_anchored(&mut decoder, &samples)
+                .with_context(|| format!("decoding {}", path.display()))?;
+            self.store_window_timing(Some(timing));
+            messages
+        } else if let Some(state) = self.chrono_replay_state.clone() {
             // Chronological-replay tier (2026-06-01): build ApContext.recent_calls
             // from the persistent cross-WAV snapshot. The snapshot grows
             // monotonically across consecutive `decode_wav` calls — that is
@@ -931,15 +1220,16 @@ impl DecoderUnderTest for Ft8Decoder {
                 active_qso: None,
                 active_qsos: Vec::new(),
             };
-            let r = decoder
-                .decode_window_with_ap_scoped_partner_budgeted(
-                    &samples,
-                    &ctx,
-                    None,
-                    self.partner_freq_hz,
-                    self.decode_budget(),
-                )
-                .map(|(messages, _report)| messages)
+            let r = self
+                .run_call_anchored(|budget| {
+                    decoder.decode_window_with_ap_scoped_partner_budgeted(
+                        &samples,
+                        &ctx,
+                        None,
+                        self.partner_freq_hz,
+                        budget,
+                    )
+                })
                 .map_err(|e| {
                     anyhow::anyhow!(
                         "decode_window_with_ap (chrono-replay) failed for {}: {e}",
@@ -990,15 +1280,16 @@ impl DecoderUnderTest for Ft8Decoder {
                 active_qso: None,
                 active_qsos: Vec::new(),
             };
-            let r = decoder
-                .decode_window_with_ap_scoped_partner_budgeted(
-                    &samples,
-                    &ctx,
-                    None,
-                    self.partner_freq_hz,
-                    self.decode_budget(),
-                )
-                .map(|(messages, _report)| messages)
+            let r = self
+                .run_call_anchored(|budget| {
+                    decoder.decode_window_with_ap_scoped_partner_budgeted(
+                        &samples,
+                        &ctx,
+                        None,
+                        self.partner_freq_hz,
+                        budget,
+                    )
+                })
                 .map_err(|e| {
                     anyhow::anyhow!(
                         "decode_window_with_ap (rolling) failed for {}: {e}",
@@ -1031,15 +1322,16 @@ impl DecoderUnderTest for Ft8Decoder {
             r
         } else {
             match &self.ap_context {
-                Some(ctx) => decoder
-                    .decode_window_with_ap_scoped_partner_budgeted(
-                        &samples,
-                        ctx,
-                        None,
-                        self.partner_freq_hz,
-                        self.decode_budget(),
-                    )
-                    .map(|(messages, _report)| messages)
+                Some(ctx) => self
+                    .run_call_anchored(|budget| {
+                        decoder.decode_window_with_ap_scoped_partner_budgeted(
+                            &samples,
+                            ctx,
+                            None,
+                            self.partner_freq_hz,
+                            budget,
+                        )
+                    })
                     .map_err(|e| {
                         anyhow::anyhow!("decode_window_with_ap failed for {}: {e}", path.display())
                     })?,
@@ -1055,25 +1347,24 @@ impl DecoderUnderTest for Ft8Decoder {
                         active_qso: None,
                         active_qsos: Vec::new(),
                     };
-                    decoder
-                        .decode_window_with_ap_scoped_partner_budgeted(
+                    self.run_call_anchored(|budget| {
+                        decoder.decode_window_with_ap_scoped_partner_budgeted(
                             &samples,
                             &ctx,
                             None,
                             self.partner_freq_hz,
-                            self.decode_budget(),
+                            budget,
                         )
-                        .map(|(messages, _report)| messages)
-                        .map_err(|e| {
-                            anyhow::anyhow!(
-                                "decode_window_with_ap (partner-freq-only) failed for {}: {e}",
-                                path.display()
-                            )
-                        })?
+                    })
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "decode_window_with_ap (partner-freq-only) failed for {}: {e}",
+                            path.display()
+                        )
+                    })?
                 }
-                None => decoder
-                    .decode_window_budgeted(&samples, self.decode_budget())
-                    .map(|(messages, _report)| messages)
+                None => self
+                    .run_call_anchored(|budget| decoder.decode_window_budgeted(&samples, budget))
                     .map_err(|e| {
                         anyhow::anyhow!("decode_window failed for {}: {e}", path.display())
                     })?,
@@ -1159,6 +1450,13 @@ impl DecoderUnderTest for Ft8Decoder {
         self.chrono_replay_state
             .as_ref()
             .map(|s| s.calls.lock().map(|g| g.len()).unwrap_or(0))
+    }
+
+    fn take_last_window_timing(&self) -> Option<WindowTiming> {
+        self.last_window_timing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 }
 
@@ -1363,5 +1661,127 @@ mod jt9_tests {
         let disabled = Ft8Decoder::with_default_config().with_neural_osd(false);
         assert!(enabled.config.neural_osd_enabled);
         assert!(!disabled.config.neural_osd_enabled);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(rel: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crate dir has a parent")
+            .join("pancetta-ft8/tests/fixtures/wav")
+            .join(rel)
+    }
+
+    fn receipt_timing(decoder: &Ft8Decoder, rel: &str) -> WindowTiming {
+        decoder
+            .decode_wav(&fixture(rel))
+            .expect("receipt-anchored decode should not error");
+        decoder
+            .take_last_window_timing()
+            .expect("a receipt-anchored decode records its window timing")
+    }
+
+    #[test]
+    fn no_anchor_records_no_timing_and_snapshot_is_unchanged() {
+        let decoder = Ft8Decoder::with_default_config();
+        decoder
+            .decode_wav(&fixture("generated/ft8_cq.wav"))
+            .expect("decode should not error");
+        assert_eq!(decoder.take_last_window_timing(), None);
+
+        // The snapshot is the wrapped Ft8Config plus the neural-OSD weight
+        // hash, and nothing PAN-165 added.
+        let snapshot = decoder.config_snapshot();
+        let mut expected: Vec<String> =
+            match serde_json::to_value(pancetta_ft8::Ft8Config::default()).unwrap() {
+                serde_json::Value::Object(map) => map.keys().cloned().collect(),
+                other => panic!("Ft8Config should serialize to an object, got {other}"),
+            };
+        expected.push("neural_osd_weights_sha256".to_string());
+        expected.sort();
+        let mut actual: Vec<String> = snapshot
+            .as_object()
+            .expect("snapshot is a JSON object")
+            .keys()
+            .cloned()
+            .collect();
+        actual.sort();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn receipt_anchor_records_consistent_window_timing() {
+        let decoder = Ft8Decoder::with_default_config()
+            .with_effort_budget_ms(Some(2000))
+            .with_budget_anchor(BudgetAnchor::Receipt);
+        let t = receipt_timing(&decoder, "generated/ft8_cq.wav");
+        assert!(t.pre_native_ms >= t.waterfall_ms + t.ft8lib_ms, "{t:?}");
+        assert_eq!(t.scoped_ms, 0.0, "{t:?}");
+        assert!(t.headroom_at_native_ms.unwrap() <= 2000.0, "{t:?}");
+        assert!(
+            t.window_total_ms >= t.pre_native_ms + t.native_ms - 1.0,
+            "{t:?}"
+        );
+        assert!(t.passes_run >= 1, "{t:?}");
+        // The timing is taken, not peeked.
+        assert_eq!(decoder.take_last_window_timing(), None);
+    }
+
+    #[test]
+    fn receipt_anchor_with_qso_partner_runs_scoped_call() {
+        let decoder = Ft8Decoder::with_default_config()
+            .with_effort_budget_ms(Some(2000))
+            .with_budget_anchor(BudgetAnchor::Receipt)
+            .with_qso_partner_hz(1500.0);
+        let t = receipt_timing(&decoder, "generated/ft8_cq.wav");
+        assert!(t.scoped_ms > 0.0, "{t:?}");
+        assert!(
+            t.pre_native_ms >= t.waterfall_ms + t.scoped_ms + t.ft8lib_ms,
+            "{t:?}"
+        );
+    }
+
+    #[test]
+    fn receipt_anchor_without_partner_unlimited_matches_call_anchor_decodes() {
+        let path = fixture("generated/ft8_report.wav");
+        let messages = |d: &Ft8Decoder| -> std::collections::BTreeSet<String> {
+            d.decode_wav(&path)
+                .expect("decode should not error")
+                .into_iter()
+                .map(|d| d.message)
+                .collect()
+        };
+        let receipt = Ft8Decoder::with_default_config().with_budget_anchor(BudgetAnchor::Receipt);
+        let plain = Ft8Decoder::with_default_config();
+        let receipt_messages = messages(&receipt);
+        assert!(!receipt_messages.is_empty());
+        assert_eq!(receipt_messages, messages(&plain));
+        let t = receipt.take_last_window_timing().unwrap();
+        assert_eq!(t.headroom_at_native_ms, None);
+        assert_eq!(t.over_deadline_ms, 0.0);
+    }
+
+    #[test]
+    fn receipt_anchor_refuses_a_non_plain_decode_path() {
+        let decoder = Ft8Decoder::with_default_config()
+            .with_budget_anchor(BudgetAnchor::Receipt)
+            .with_rolling_window(8);
+        let err = decoder
+            .decode_wav(&fixture("generated/ft8_cq.wav"))
+            .unwrap_err();
+        assert!(err.to_string().contains("receipt"), "{err}");
+        assert_eq!(decoder.take_last_window_timing(), None);
+    }
+
+    #[test]
+    fn qso_filter_bin_range_matches_production_formula() {
+        // 1500 Hz / 6.25 = bin 240; ceil(60 / 6.25) = 10 bins either side.
+        assert_eq!(qso_filter_bin_range(1500.0), Some(230..=250));
+        assert_eq!(qso_filter_bin_range(0.0), None);
+        assert_eq!(qso_filter_bin_range(f64::NAN), None);
     }
 }
