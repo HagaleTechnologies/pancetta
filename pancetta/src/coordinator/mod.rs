@@ -1497,6 +1497,11 @@ pub struct ApplicationCoordinator {
     #[cfg(test)]
     tx_before_ptt_gate: Arc<tokio::sync::Notify>,
 
+    /// PAN-202 test seam: parks the TX worker between its last pre-PTT gate
+    /// and the key-down when armed.
+    #[cfg(test)]
+    pub(crate) key_down_probe: Arc<tx::KeyDownProbe>,
+
     /// Epoch-ms timestamp of the most recent PTT-on (updated alongside
     /// `ptt_active` going true). Unlike the boolean, this survives past
     /// unkey, so the FT8 decode loop can flag a "TX-adjacent" window —
@@ -2297,6 +2302,8 @@ impl ApplicationCoordinator {
             tx_requeue: tx::TxRequeue::default(),
             #[cfg(test)]
             tx_before_ptt_gate: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            key_down_probe: Arc::new(tx::KeyDownProbe::default()),
             last_ptt_on_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             // C9 dedup anchor — no pancetta-initiated frequency command yet.
             last_freq_command: Arc::new(std::sync::Mutex::new(None)),
