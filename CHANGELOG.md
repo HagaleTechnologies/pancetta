@@ -419,6 +419,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Responses from cqdx.io, QRZ, the online logbooks, the DX cluster and the station-agent relay are now read within fixed size limits (PAN-101).
 - Station agent: a relay connection that stops responding or stops accepting data is now closed within seconds, remote TX is disarmed, and the agent reconnects (PAN-102).
 - Release workflow: every GitHub Action is pinned to a full commit SHA, and only the job that creates the draft release can write to the repository (PAN-106).
+- Station agent: when a remote client takes over one QSO of a multi-QSO transmission while it waits for its slot, the transmission is now checked against that client's arm before it keys, and a frame bound to a different remote client than the rest of the transmission is held for the next slot (PAN-136).
 - Semgrep workflow: a run without `SEMGREP_APP_TOKEN` (fork PRs, Dependabot) no longer reports the same success as a completed scan — the platform check now shows as skipped and a separate secret-free scan of a vendored, pinned ruleset runs instead (PAN-107).
 
 ## [0.9.6] - 2026-09-02
