@@ -69,3 +69,24 @@ fn ft8lib_sync_seeds_builder_reaches_config_snapshot() {
         "the research builder must mutate the wrapped Ft8Config"
     );
 }
+
+/// PAN-168: the flag must be reachable from the research harness and land
+/// in every scorecard's `config.decoder` snapshot, or its A/B is
+/// unmeasurable.
+#[test]
+fn full_frame_time_varying_builder_reaches_config_snapshot() {
+    let off = Ft8Decoder::with_default_config();
+    assert_eq!(
+        off.config_snapshot()["coherent_subtract_full_frame_time_varying_enabled"].as_bool(),
+        Some(false),
+        "the PAN-168 flag must appear in the config snapshot and default false"
+    );
+
+    let on = Ft8Decoder::with_default_config()
+        .with_coherent_subtract_full_frame_time_varying_enabled(true);
+    assert_eq!(
+        on.config_snapshot()["coherent_subtract_full_frame_time_varying_enabled"].as_bool(),
+        Some(true),
+        "the research builder must mutate the wrapped Ft8Config"
+    );
+}

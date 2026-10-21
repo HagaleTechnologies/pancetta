@@ -493,6 +493,15 @@ impl Ft8Decoder {
         self
     }
 
+    /// PAN-168 [A/B]: per-block audio-domain cancellation on the
+    /// full-frame coherent-subtraction path. Only takes effect when
+    /// `coherent_subtract_full_frame_reference_enabled` is ALSO `true`. See
+    /// `Ft8Config::coherent_subtract_full_frame_time_varying_enabled`.
+    pub fn with_coherent_subtract_full_frame_time_varying_enabled(mut self, on: bool) -> Self {
+        self.config.coherent_subtract_full_frame_time_varying_enabled = on;
+        self
+    }
+
     /// Task W4.2 [A/B]: independent sub-flag controlling whether the
     /// time-varying path subtracts its fitted estimate at full scale
     /// (1.0) vs. the legacy path's conservative 0.9 hold-back. Only takes
