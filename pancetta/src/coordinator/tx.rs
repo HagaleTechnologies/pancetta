@@ -5233,6 +5233,50 @@ fn tx_send_authorized(
         || remote_tx_permitted_for(arm, pancetta_agent::arm::ArmTime::now, remote_client_key_id)
 }
 
+/// PAN-202: the one path every PTT command takes to the rig from the TX
+/// worker (single TX, bundle, tune) and the TUI's manual PTT. Synchronous:
+/// [`MessageBus::send_rig_command_if`] takes no lock and no await, so the
+/// last pre-PTT gate's verdict still holds when the command reaches Hamlib's
+/// queue, even while another component registers a bus channel.
+/// `authorize` follows `send_message_if`'s synchronous-leaf rule.
+pub(crate) fn send_ptt_command(
+    message_bus: &MessageBus,
+    source: ComponentId,
+    state: bool,
+    authorize: impl FnOnce() -> bool,
+) -> SendIfOutcome {
+    message_bus.send_rig_command_if(
+        ComponentMessage::new(
+            source,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt { state }),
+            Instant::now(),
+        ),
+        authorize,
+    )
+}
+
+/// PAN-202 test seam: when armed, parks the worker once between its last
+/// pre-PTT gate and the key-down, so a test can hold the bus table across
+/// that instant. Unarmed it returns without yielding.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct KeyDownProbe {
+    pub(crate) armed: std::sync::atomic::AtomicBool,
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl KeyDownProbe {
+    async fn pause_if_armed(&self) {
+        if self.armed.swap(false, Ordering::AcqRel) {
+            self.reached.notify_one();
+            self.release.notified().await;
+        }
+    }
+}
+
 /// One-time snapshot of the remote-TX arm's permission state, taken under a
 /// single lock acquisition, so a BATCH of entries (e.g. a coalesced
 /// backlog) can be evaluated against one consistent view instead of each
@@ -7431,6 +7475,8 @@ impl super::ApplicationCoordinator {
             let tx_requeue = self.tx_requeue.clone();
             #[cfg(test)]
             let tx_before_ptt_gate = self.tx_before_ptt_gate.clone();
+            #[cfg(test)]
+            let key_down_probe = self.key_down_probe.clone();
             // Timestamp of the most recent PTT-on, read by the FT8 decode
             // loop's TX-adjacent-desense diagnostic (see `ft8.rs`).
             let last_ptt_on_ms = self.last_ptt_on_ms.clone();
@@ -9064,9 +9110,9 @@ impl super::ApplicationCoordinator {
                                         // before the PTT-on send. A frame more than
                                         // `tx_late_max_ms` into its target slot is dropped
                                         // here instead of keyed (no receiver could decode
-                                        // the surviving fragment). SYNCHRONOUS up to
-                                        // `send_message_if` below, whose table-lock wait
-                                        // precedes its PAN-134 arm recheck and the enqueue.
+                                        // the surviving fragment). SYNCHRONOUS through the
+                                        // key-down enqueue below: `send_ptt_command` takes
+                                        // no lock and no await (PAN-202).
                                         if let Some(denial) = key_time_gate_denial(
                                             chrono::Utc::now(),
                                             schedule.target_slot,
@@ -9109,32 +9155,29 @@ impl super::ApplicationCoordinator {
                                             continue 'worker;
                                         }
 
+                                        #[cfg(test)]
+                                        key_down_probe.pause_if_armed().await;
+
                                         // --- Step 4d-arm: last-instant pre-PTT arm recheck (PAN-134)
-                                        // Authorization runs inside the bus read lock after its wait, with
-                                        // no suspension before enqueue. The mid-TX poll remains a backstop.
+                                        // Authorization runs immediately before the enqueue, with no lock
+                                        // or await between it, the gates above and the enqueue (PAN-134,
+                                        // PAN-202). The mid-TX poll remains a backstop.
                                         // PTT hardware is not asserted yet. Denial only unwinds the local
                                         // PTT flag, pivot tombstones, and the announced TX/queue status.
-                                        let ptt_msg = ComponentMessage::new(
+                                        let outcome = send_ptt_command(
+                                            &message_bus,
                                             ComponentId::Ft8Transmitter,
-                                            ComponentId::Hamlib,
-                                            MessageType::RigControl(
-                                                crate::message_bus::RigControlMessage::SetPtt {
-                                                    state: true,
-                                                },
-                                            ),
-                                            Instant::now(),
-                                        );
-                                        let outcome = message_bus
-                                            .send_message_if(ptt_msg, || {
+                                            true,
+                                            || {
                                                 tx_send_authorized(
                                                     origin,
                                                     &remote_tx_arm,
                                                     remote_client_key_id.as_deref(),
                                                 )
-                                            })
-                                            .await;
+                                            },
+                                        );
                                         match outcome {
-                                            Ok(SendIfOutcome::Enqueued) => {
+                                            SendIfOutcome::Enqueued => {
                                                 info!(
                                                     target: "pancetta::tx.ptt",
                                                     "PTT ON (scheduled TX) sent to rig: '{}' @{:.0}Hz qso={}",
@@ -9143,7 +9186,7 @@ impl super::ApplicationCoordinator {
                                                     qso_id.as_deref().unwrap_or("-")
                                                 );
                                             }
-                                            Ok(SendIfOutcome::Denied) => {
+                                            SendIfOutcome::Denied => {
                                                 ptt_active.store(false, Ordering::Release);
                                                 ptt_guard.disarm();
                                                 // Round-6 review (Codex P2): if Step 4c pivoted
@@ -9191,11 +9234,8 @@ impl super::ApplicationCoordinator {
                                                 .await;
                                                 continue 'worker;
                                             }
-                                            Ok(SendIfOutcome::Dropped) => {
+                                            SendIfOutcome::Dropped => {
                                                 warn!("PTT ON failed (rig not keyed): message dropped — if you are transmitting, TX audio may be going to the wrong device");
-                                            }
-                                            Err(e) => {
-                                                warn!("PTT ON failed (rig not keyed): {} — if you are transmitting, TX audio may be going to the wrong device", e);
                                             }
                                         }
 
@@ -11989,9 +12029,9 @@ impl super::ApplicationCoordinator {
                                     // queue-time `schedule_tx` decision never sees the
                                     // coalesce/encode/gate delays, so it is dropped HERE
                                     // through the same whole-bundle unwind as the liveness
-                                    // branch above. SYNCHRONOUS up to `send_message_if`
-                                    // below, whose table-lock wait precedes its PAN-134
-                                    // arm recheck and the enqueue.
+                                    // branch above. SYNCHRONOUS through the key-down
+                                    // enqueue below: `send_ptt_command` takes no lock and
+                                    // no await (PAN-202).
                                     let key_time_now = chrono::Utc::now();
                                     let key_time_late_max_ms =
                                         tx_late_max_ms_effective(active_protocol, tx_late_max_ms);
@@ -12042,38 +12082,35 @@ impl super::ApplicationCoordinator {
                                         continue;
                                     }
 
+                                    #[cfg(test)]
+                                    key_down_probe.pause_if_armed().await;
+
                                     // --- Step 4d-arm: last-instant pre-PTT arm recheck (PAN-134)
-                                    // Authorization runs inside the bus read lock after its wait, with
-                                    // no suspension before enqueue. The mid-TX poll remains a backstop.
+                                    // Authorization runs immediately before the enqueue, with no lock
+                                    // or await between it, the gates above and the enqueue (PAN-134,
+                                    // PAN-202). The mid-TX poll remains a backstop.
                                     // PTT hardware is not asserted yet. Denial only unwinds the local
                                     // PTT flag, pivot tombstones, and the announced TX/queue status.
-                                    let ptt_msg = ComponentMessage::new(
+                                    let outcome = send_ptt_command(
+                                        &message_bus,
                                         ComponentId::Ft8Transmitter,
-                                        ComponentId::Hamlib,
-                                        MessageType::RigControl(
-                                            crate::message_bus::RigControlMessage::SetPtt {
-                                                state: true,
-                                            },
-                                        ),
-                                        Instant::now(),
-                                    );
-                                    let outcome = message_bus
-                                        .send_message_if(ptt_msg, || {
+                                        true,
+                                        || {
                                             tx_send_authorized(
                                                 origin,
                                                 &remote_tx_arm,
                                                 remote_client_key_id.as_deref(),
                                             )
-                                        })
-                                        .await;
+                                        },
+                                    );
                                     match outcome {
-                                        Ok(SendIfOutcome::Enqueued) => {
+                                        SendIfOutcome::Enqueued => {
                                             info!(
                                                 target: "pancetta::tx.ptt",
                                                 "PTT ON (scheduled multi-TX) sent to rig"
                                             );
                                         }
-                                        Ok(SendIfOutcome::Denied) => {
+                                        SendIfOutcome::Denied => {
                                             ptt_active.store(false, Ordering::Release);
                                             ptt_guard.disarm();
                                             // Round-6 review (Codex P2): nothing reached the
@@ -12122,11 +12159,8 @@ impl super::ApplicationCoordinator {
                                             }
                                             continue;
                                         }
-                                        Ok(SendIfOutcome::Dropped) => {
+                                        SendIfOutcome::Dropped => {
                                             warn!("PTT ON failed (rig not keyed): message dropped — if you are transmitting, TX audio may be going to the wrong device");
-                                        }
-                                        Err(e) => {
-                                            warn!("PTT ON failed (rig not keyed): {} — if you are transmitting, TX audio may be going to the wrong device", e);
                                         }
                                     }
 
@@ -12777,18 +12811,16 @@ impl super::ApplicationCoordinator {
                                         continue;
                                     }
 
-                                    let ptt_msg = ComponentMessage::new(
+                                    #[cfg(test)]
+                                    key_down_probe.pause_if_armed().await;
+                                    if send_ptt_command(
+                                        &message_bus,
                                         ComponentId::Ft8Transmitter,
-                                        ComponentId::Hamlib,
-                                        MessageType::RigControl(
-                                            crate::message_bus::RigControlMessage::SetPtt {
-                                                state: true,
-                                            },
-                                        ),
-                                        Instant::now(),
-                                    );
-                                    if let Err(e) = message_bus.send_message(ptt_msg).await {
-                                        warn!("Tune: PTT ON failed (rig not keyed): {}", e);
+                                        true,
+                                        || true,
+                                    ) != SendIfOutcome::Enqueued
+                                    {
+                                        warn!("Tune: PTT ON failed (rig not keyed): message dropped");
                                     }
 
                                     // Emit the audio buffer.
@@ -22070,6 +22102,168 @@ mod pan118_worker_band_plan_tests {
         assert_eq!(done[0], Some(false), "item A must complete as failed");
         assert_eq!(done[1], Some(false), "item B must complete as failed");
         assert!(!ptt_on, "no SetPtt(true) for a fully out-of-band bundle");
+    }
+}
+
+/// PAN-202: key-down reaches Hamlib's queue while another component's
+/// channel registration holds the bus table, through the real TX worker over
+/// a real `MessageBus`, at every key-down site (single TX, bundle, tune), plus
+/// the shared helper the TUI's manual PTT uses.
+#[cfg(test)]
+mod pan202_key_down_worker_tests {
+    use super::pan115_worker_gate_tests::{
+        await_completion, await_ptt_on, request, worker_harness, Harness,
+    };
+    use crate::message_bus::{
+        ComponentId, ComponentMessage, MessageType, TransmitRequestItem, TxOrigin,
+    };
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    /// Below every mode's effective key-time cap (FT2 ≈ 640 ms, FT4 1500 ms,
+    /// FT8 3000 ms at the default `tx_late_max_ms`).
+    const KEY_DOWN_BOUND: Duration = Duration::from_millis(500);
+
+    /// 20m: in-band under the default region-2 plan.
+    const IN_BAND_DIAL_HZ: u64 = 14_074_000;
+
+    /// The worker has passed every final gate and is parked at key-down by
+    /// the armed probe. Hold the bus table the way an in-flight
+    /// `create_channel` does, let the worker key, and report whether PTT-on
+    /// reached Hamlib within the bound while the table was still held.
+    async fn keys_down_while_table_held(h: &Harness) -> bool {
+        tokio::time::timeout(
+            Duration::from_secs(40),
+            h.coordinator.key_down_probe.reached.notified(),
+        )
+        .await
+        .expect("worker must pass every final gate and reach key-down");
+        let hold = h.coordinator.message_bus.hold_channel_table().await;
+        h.coordinator.key_down_probe.release.notify_one();
+        let keyed = await_ptt_on(h, KEY_DOWN_BOUND).await; // try_recv only: no bus lock
+        drop(hold);
+        keyed
+    }
+
+    /// One two-item local bundle, built like
+    /// `pan118_worker_band_plan_tests::send_bundle`.
+    async fn send_bundle(h: &Harness, a_offset: f64, b_offset: f64) {
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Autonomous,
+                ComponentId::Ft8Transmitter,
+                MessageType::MultiTransmitRequest {
+                    items: vec![
+                        TransmitRequestItem {
+                            message_text: "CQ N0CALL FN20".to_string(),
+                            frequency_offset: a_offset,
+                            qso_id: None,
+                            origin: TxOrigin::Local,
+                            remote_client_key_id: None,
+                        },
+                        TransmitRequestItem {
+                            message_text: "CQ N0CALL EN27".to_string(),
+                            frequency_offset: b_offset,
+                            qso_id: None,
+                            origin: TxOrigin::Local,
+                            remote_client_key_id: None,
+                        },
+                    ],
+                    tx_parity: None,
+                    origin: TxOrigin::Local,
+                    remote_client_key_id: None,
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn single_tx_keys_down_while_a_registration_holds_the_bus_table() {
+        let h = worker_harness().await;
+        h.coordinator
+            .key_down_probe
+            .armed
+            .store(true, Ordering::Release);
+        request(&h, "CQ N0CALL FN20").await;
+        assert!(
+            keys_down_while_table_held(&h).await,
+            "single-TX key-down waited on the table"
+        );
+        let (completed, _, _) =
+            await_completion(&h, "CQ N0CALL FN20", Duration::from_secs(20)).await;
+        assert_eq!(completed, Some(true));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bundle_keys_down_while_a_registration_holds_the_bus_table() {
+        let h = worker_harness().await;
+        h.coordinator
+            .operating_frequency_hz
+            .store(IN_BAND_DIAL_HZ, Ordering::Relaxed);
+        h.coordinator
+            .key_down_probe
+            .armed
+            .store(true, Ordering::Release);
+        send_bundle(&h, 500.0, 2_500.0).await;
+        assert!(
+            keys_down_while_table_held(&h).await,
+            "bundle key-down waited on the table"
+        );
+        let (completed, _, _) =
+            await_completion(&h, "CQ N0CALL FN20", Duration::from_secs(50)).await;
+        assert_eq!(completed, Some(true));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tune_keys_down_while_a_registration_holds_the_bus_table() {
+        let h = worker_harness().await;
+        h.coordinator
+            .operating_frequency_hz
+            .store(IN_BAND_DIAL_HZ, Ordering::Relaxed);
+        h.coordinator
+            .key_down_probe
+            .armed
+            .store(true, Ordering::Release);
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Tui,
+                ComponentId::Ft8Transmitter,
+                MessageType::TuneRequest {
+                    duration_secs: 1,
+                    tone_offset_hz: 1500.0,
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            keys_down_while_table_held(&h).await,
+            "tune key-down waited on the table"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn manual_ptt_command_enqueues_both_states_while_the_table_is_held() {
+        let bus = crate::message_bus::MessageBus::new(16).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let _hold = bus.hold_channel_table().await;
+        for state in [true, false] {
+            assert_eq!(
+                super::send_ptt_command(&bus, ComponentId::Tui, state, || true),
+                crate::message_bus::SendIfOutcome::Enqueued
+            );
+            let msg = rx.try_recv().unwrap();
+            assert_eq!(msg.source, ComponentId::Tui);
+            assert!(matches!(
+                msg.message_type,
+                MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt { state: s })
+                    if s == state
+            ));
+        }
     }
 }
 
