@@ -12820,7 +12820,9 @@ impl super::ApplicationCoordinator {
                                         || true,
                                     ) != SendIfOutcome::Enqueued
                                     {
-                                        warn!("Tune: PTT ON failed (rig not keyed): message dropped");
+                                        warn!(
+                                            "Tune: PTT ON failed (rig not keyed): message dropped"
+                                        );
                                     }
 
                                     // Emit the audio buffer.

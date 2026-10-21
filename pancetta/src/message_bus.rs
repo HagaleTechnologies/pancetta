@@ -2105,14 +2105,23 @@ mod tests {
     async fn pan202_rig_route_is_the_registered_channel() {
         let bus = MessageBus::new(16).unwrap();
         let early = bus.clone();
-        let (_s, rx) = bus.get_or_create_channel(ComponentId::Hamlib).await.unwrap();
-        let (_s2, rx2) = bus.get_or_create_channel(ComponentId::Hamlib).await.unwrap();
+        let (_s, rx) = bus
+            .get_or_create_channel(ComponentId::Hamlib)
+            .await
+            .unwrap();
+        let (_s2, rx2) = bus
+            .get_or_create_channel(ComponentId::Hamlib)
+            .await
+            .unwrap();
         let _w = bus.channels.write().await;
         assert_eq!(
             early.send_rig_command_if(ptt_on_msg(), || true),
             SendIfOutcome::Enqueued
         );
-        assert!(rx2.try_recv().is_ok(), "re-registration returns the same queue");
+        assert!(
+            rx2.try_recv().is_ok(),
+            "re-registration returns the same queue"
+        );
         assert!(rx.try_recv().is_err(), "one message, one queue");
         assert_eq!(
             early.send_rig_command_if(ptt_on_msg(), || false),
