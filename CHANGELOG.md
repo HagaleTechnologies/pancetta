@@ -158,6 +158,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A manual call to a station you heard a few seconds earlier on another band
+  or in another mode is no longer held for a cycle (PAN-146). The check before
+  key-up that holds a call when the station was just heard transmitting on your
+  slot (PAN-141) now counts only sightings from the band you are on and the
+  mode you are keying in.
+
 - `--replay` no longer starts feeding audio while pancetta is still loading
   your logbook history. With a large `~/.pancetta/qsos.adi`, decodes from the
   first slots could sit unprocessed behind that load, or be lost when the
