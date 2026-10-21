@@ -710,10 +710,24 @@ an arm that goes stale mid-wait: the gate covers the whole summed waveform. The
 siblings retry next cycle through keep-call. Per-item arm filtering at Step 4b
 would add a second audited denial path inside the worker, and we chose not to.
 
-**Out of scope.** The supersede paths' rollback binding
+**Mid-TX refreshes compare per item (Codex P2 on PR #456).** Two bundles can
+fold to the same binding while one matching item's binding changed, e.g. a
+local takeover of one of two Remote-A QSOs with identical text. Comparing only
+the folded scalars, `classify_incoming_during_tx` saw an unchanged overlap and
+requeued the refresh, the requeue strip dropped every item as already sent,
+and client A's disarm then aborted the old bundle with the entitled local
+refresh gone. The classifier (both arms, including the pivot-tombstone and
+untracked-duplicate checks) and the requeue strip now also require each
+matching in-flight item's own `origin` and `remote_client_key_id` to match,
+on top of the bundle-level comparison, so such a refresh supersedes.
+`items_abandoned_by_supersede` no longer counts a re-bound same-content item
+as carried over, and reports it under its own (old) binding so the PAN-75
+rollback reverses the old-authority attempt, not the re-bound one.
+
+**Out of scope.** Otherwise the supersede paths' rollback binding
 (`items_abandoned_by_supersede`, `report_abandoned_bundle_item`) still passes
-the bundle's binding only when the authorization changed; per-item bindings
-make that easy to tighten later, but it is PAN-75 supersede code. There is no
+the bundle's binding only when the bundle-level authorization changed; it is
+PAN-75 supersede code. There is no
 re-pivot at Step 4d: an intent written between Step 4b-pivot and PTT is not
 picked up, as on the single-TX path, and the Step 4d-arm predicate re-checks
 the re-folded binding. The bundle-level scalars on `MultiTransmitRequest` stay

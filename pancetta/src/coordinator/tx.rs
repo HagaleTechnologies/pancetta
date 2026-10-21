@@ -362,6 +362,21 @@ pub fn classify_incoming_during_tx(
                                  cand_client: Option<&str>| {
         cand_origin != in_flight_origin || cand_client != in_flight_remote_client_key_id
     };
+    // PAN-136 (Codex P2 on PR #456): since PAN-136 every in-flight item
+    // carries its own binding, and a bundle's scalars are only the fold of
+    // its items (`fold_bundle_identity` keeps the first remote channel).
+    // Two bundles can therefore fold to the same binding while one matching
+    // item's binding changed — e.g. a local takeover of one of two Remote-A
+    // QSOs. Comparing only the folded scalars treats that refresh as an
+    // unchanged repeat; if A is then disarmed the old bundle aborts and the
+    // entitled refresh is gone. Every content match below must also match
+    // the in-flight item's own binding.
+    let item_binding_differs = |in_flight_item: &crate::message_bus::TransmitRequestItem,
+                                cand_origin: crate::message_bus::TxOrigin,
+                                cand_client: Option<&str>| {
+        in_flight_item.origin != cand_origin
+            || in_flight_item.remote_client_key_id.as_deref() != cand_client
+    };
 
     match candidate {
         MessageType::TransmitRequest {
@@ -380,12 +395,17 @@ pub fn classify_incoming_during_tx(
             // authorized request that happens to render the pivoted text.
             // Fall through to the normal per-QSO comparison below rather
             // than trusting the tombstone.
+            // PAN-136: also the matching in-flight item's own binding (the
+            // pivot swapped it in with the payload).
             if super::is_pivot_duplicate(
                 qso_id.as_deref(),
                 message_text,
                 *frequency_offset,
                 pivoted_once,
             ) && !authorization_differs(*origin, remote_client_key_id.as_deref())
+                && !find_in_flight(qso_id.as_deref()).is_some_and(|item| {
+                    item_binding_differs(item, *origin, remote_client_key_id.as_deref())
+                })
             {
                 return IncomingDuringTx::Drop;
             }
@@ -405,6 +425,7 @@ pub fn classify_incoming_during_tx(
                         it.qso_id.is_none()
                             && it.message_text == *message_text
                             && it.frequency_offset == *frequency_offset
+                            && !item_binding_differs(it, *origin, remote_client_key_id.as_deref())
                     }) && !authorization_differs(*origin, remote_client_key_id.as_deref());
                 if is_untracked_duplicate {
                     return IncomingDuringTx::Drop;
@@ -429,7 +450,12 @@ pub fn classify_incoming_during_tx(
                 Some(item)
                     if item.message_text == *message_text
                         && item.frequency_offset == *frequency_offset
-                        && !authorization_differs(*origin, remote_client_key_id.as_deref()) =>
+                        && !authorization_differs(*origin, remote_client_key_id.as_deref())
+                        && !item_binding_differs(
+                            item,
+                            *origin,
+                            remote_client_key_id.as_deref(),
+                        ) =>
                 {
                     IncomingDuringTx::Drop
                 }
@@ -480,6 +506,11 @@ pub fn classify_incoming_during_tx(
                             in_flight_item.message_text != it.message_text
                                 || in_flight_item.frequency_offset != it.frequency_offset
                                 || authorization_changed
+                                || item_binding_differs(
+                                    in_flight_item,
+                                    it.origin,
+                                    it.remote_client_key_id.as_deref(),
+                                )
                         }
                         None => false,
                     });
@@ -1078,6 +1109,11 @@ async fn interruptible_sleep_or_supersede(
                         fi.qso_id.as_deref().map(super::active_tx_qso_key) == key
                             && fi.message_text == it.message_text
                             && fi.frequency_offset == it.frequency_offset
+                            // PAN-136 (Codex P2 on PR #456): a same-content item
+                            // re-bound to a different authority was never sent
+                            // under that authority — not "already sent".
+                            && fi.origin == it.origin
+                            && fi.remote_client_key_id == it.remote_client_key_id
                     })
                 })
                 .collect();
@@ -2106,6 +2142,119 @@ mod interruptible_sleep_tests {
             inbox.try_recv().is_err(),
             "a bundle with nothing left after stripping must be dropped entirely, not requeued"
         );
+    }
+
+    /// PAN-136 (Codex P2 on PR #456): an in-flight Remote-A bundle of two
+    /// Remote-A QSOs, then a refresh where the operator has taken over one of
+    /// them locally with identical text. Both bundles fold to Remote/client-a,
+    /// so a bundle-level comparison saw nothing new: the refresh was requeued,
+    /// stripped item by item as "already sent", and dropped. Client A's disarm
+    /// then aborted the old bundle and the locally entitled refresh was gone.
+    /// The refresh must instead supersede, carrying the local item's binding.
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_sleep_keeps_a_refresh_whose_item_binding_changed_under_the_same_fold() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let bus = crate::message_bus::MessageBus::new(16).unwrap();
+        let (tx_sender, tx_rx) = bus
+            .create_channel(crate::message_bus::ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        let pivoted_once = std::collections::HashMap::new();
+        let item = |text: &str, qso: &str, origin, client: Option<&str>| {
+            crate::message_bus::TransmitRequestItem {
+                message_text: text.to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some(qso.to_string()),
+                origin,
+                remote_client_key_id: client.map(str::to_string),
+            }
+        };
+        let remote = crate::message_bus::TxOrigin::Remote;
+        let local = crate::message_bus::TxOrigin::Local;
+        let in_flight = [
+            item("SM2LIY K5ARH R-14", "qso-1", remote, Some("client-a")),
+            item("C6AVD K5ARH EM10", "qso-2", remote, Some("client-a")),
+        ];
+        let refresh_items = vec![
+            item("SM2LIY K5ARH R-14", "qso-1", remote, Some("client-a")),
+            item("C6AVD K5ARH EM10", "qso-2", local, None),
+        ];
+        assert_eq!(
+            crate::coordinator::fold_bundle_identity(&refresh_items),
+            (remote, Some("client-a".to_string())),
+            "precondition: the refresh folds to the in-flight bundle's binding"
+        );
+        tx_sender
+            .send(crate::message_bus::ComponentMessage::new(
+                crate::message_bus::ComponentId::Autonomous,
+                crate::message_bus::ComponentId::Ft8Transmitter,
+                MessageType::MultiTransmitRequest {
+                    items: refresh_items,
+                    tx_parity: None,
+                    origin: remote,
+                    remote_client_key_id: Some("client-a".to_string()),
+                },
+                std::time::Instant::now(),
+            ))
+            .unwrap();
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut st = pancetta_agent::arm::ArmState::new();
+        st.set_channel_consent(
+            pancetta_agent::arm::ConsentChannel::StationAgent,
+            true,
+            now_ms,
+        );
+        st.arm(
+            pancetta_agent::arm::VerifiedArmGrant {
+                operator_callsign: "K5ARH".to_string(),
+                ttl_ms: 120_000,
+                armed_until_ms: now_ms + 120_000,
+                heartbeat_interval_sec: 10,
+                scope_tx: true,
+                jti: "pan136-item-binding-refresh".to_string(),
+                client_key_id: "client-a".to_string(),
+            },
+            pancetta_agent::arm::ArmTime::now(),
+        );
+        let arm = Arc::new(std::sync::Mutex::new(st));
+        let arm_clone = arm.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            arm_clone
+                .lock()
+                .unwrap()
+                .disarm(chrono::Utc::now().timestamp_millis());
+        });
+
+        let inbox = super::TxInbox::new(tx_rx.clone(), Default::default());
+        let outcome = super::interruptible_sleep_or_supersede(
+            Duration::from_secs(5),
+            &shutdown,
+            &abort,
+            &inbox,
+            &in_flight,
+            &pivoted_once,
+            Some((&arm, Some("client-a"))),
+        )
+        .await;
+
+        let super::SleepOutcome::Superseded(MessageType::MultiTransmitRequest { items, .. }) =
+            outcome
+        else {
+            panic!(
+                "the re-bound refresh must supersede, not be dropped as already sent \
+                 (then lost to client A's disarm); got {outcome:?}, inbox next: {:?}",
+                inbox.try_recv().ok().map(|m| m.message_type)
+            );
+        };
+        let qso2 = items
+            .iter()
+            .find(|it| it.qso_id.as_deref() == Some("qso-2"))
+            .expect("the locally taken-over item survives");
+        assert_eq!(qso2.origin, local);
+        assert_eq!(qso2.remote_client_key_id, None);
     }
 
     /// Codex round 3 (PR #346): what a `Superseded` wait siphoned must
@@ -6812,7 +6961,9 @@ async fn supersede_and_rekey_or_bundle(
 /// every item, except those `reenqueued` (the incoming bundle put back on the
 /// queue) carries unchanged for the same QSO under the same authorization,
 /// which will still air (PAN-75). An authorization change (origin or bound
-/// client) carries nothing: the old-authority attempt is abandoned.
+/// client) carries nothing: the old-authority attempt is abandoned. Since
+/// PAN-136 that holds per item too: a same-content item re-bound to another
+/// authority under an unchanged fold is not carried (Codex P2 on PR #456).
 fn items_abandoned_by_supersede<'a>(
     in_flight_items: &'a [crate::message_bus::TransmitRequestItem],
     in_flight_auth: (crate::message_bus::TxOrigin, Option<&str>),
@@ -6835,9 +6986,30 @@ fn items_abandoned_by_supersede<'a>(
                     && c.message_text == item.message_text
                     && (c.frequency_offset - item.frequency_offset).abs()
                         < super::PIVOT_OFFSET_EPSILON_HZ
+                    && c.origin == item.origin
+                    && c.remote_client_key_id == item.remote_client_key_id
             })
         })
         .collect()
+}
+
+/// PAN-136 (Codex P2 on PR #456): whether `reenqueued` carries `item`'s exact
+/// content for the same QSO under a different per-item binding. Such an item
+/// is abandoned under its own (old) binding, which is what tells its attempt
+/// apart from the re-bound same-text one in the PAN-75 rollback.
+fn item_rebound_by_supersede(
+    item: &crate::message_bus::TransmitRequestItem,
+    reenqueued: Option<&MessageType>,
+) -> bool {
+    let Some(MessageType::MultiTransmitRequest { items, .. }) = reenqueued else {
+        return false;
+    };
+    items.iter().any(|c| {
+        c.qso_id == item.qso_id
+            && c.message_text == item.message_text
+            && (c.frequency_offset - item.frequency_offset).abs() < super::PIVOT_OFFSET_EPSILON_HZ
+            && (c.origin != item.origin || c.remote_client_key_id != item.remote_client_key_id)
+    })
 }
 
 /// Report an in-flight bundle item a supersede abandoned. The QSO engine gets
@@ -6987,7 +7159,16 @@ async fn supersede_multi_reenqueue(
                 (origin, remote_client_key_id.as_deref()),
                 reenqueued.as_ref(),
             ) {
-                report_abandoned_bundle_item(message_bus, item, binding.clone()).await;
+                let item_binding =
+                    if binding.is_none() && item_rebound_by_supersede(item, reenqueued.as_ref()) {
+                        Some((
+                            item.origin == crate::message_bus::TxOrigin::Remote,
+                            item.remote_client_key_id.clone(),
+                        ))
+                    } else {
+                        binding.clone()
+                    };
+                report_abandoned_bundle_item(message_bus, item, item_binding).await;
             }
         }
         SupersedeOutcome::Bundle {
@@ -19890,6 +20071,111 @@ mod classifier_tests {
         );
     }
 
+    fn bound_item(
+        text: &str,
+        qso: &str,
+        origin: crate::message_bus::TxOrigin,
+        client: Option<&str>,
+    ) -> crate::message_bus::TransmitRequestItem {
+        crate::message_bus::TransmitRequestItem {
+            message_text: text.to_string(),
+            frequency_offset: 1000.0,
+            qso_id: Some(qso.to_string()),
+            origin,
+            remote_client_key_id: client.map(str::to_string),
+        }
+    }
+
+    /// PAN-136 (Codex P2 on PR #456): same folded bundle binding, same text,
+    /// but one overlapping item's own binding changed (local takeover of one
+    /// of two Remote-A QSOs). That is a changed overlap, not a repeat.
+    #[test]
+    fn classify_supersedes_bundle_when_one_items_binding_changed_under_the_same_fold() {
+        use crate::message_bus::TxOrigin::{Local, Remote};
+        let pivoted_once = std::collections::HashMap::new();
+        let candidate = MessageType::MultiTransmitRequest {
+            items: vec![
+                bound_item("A W5AU R-01", "qso-1", Remote, Some("client-a")),
+                bound_item("B W5AU R-02", "qso-2", Local, None),
+            ],
+            tx_parity: None,
+            origin: Remote,
+            remote_client_key_id: Some("client-a".to_string()),
+        };
+        let outcome = super::classify_incoming_during_tx(
+            &candidate,
+            &[
+                bound_item("A W5AU R-01", "qso-1", Remote, Some("client-a")),
+                bound_item("B W5AU R-02", "qso-2", Remote, Some("client-a")),
+            ],
+            &pivoted_once,
+            Remote,
+            Some("client-a"),
+        );
+        assert!(
+            matches!(outcome, super::IncomingDuringTx::Supersede { .. }),
+            "a per-item binding change must supersede, got {outcome:?}"
+        );
+    }
+
+    /// PAN-136 (Codex P2 on PR #456): the single-request arm compares the
+    /// matching in-flight item's own binding too. In a Remote-A bundle that
+    /// carries a Local item, a client-A request for that QSO with identical
+    /// content re-binds it; it is not an exact duplicate.
+    #[test]
+    fn classify_supersedes_request_rebinding_an_in_flight_item_under_the_same_fold() {
+        use crate::message_bus::TxOrigin::{Local, Remote};
+        let pivoted_once = std::collections::HashMap::new();
+        let candidate = MessageType::TransmitRequest {
+            message_text: "B W5AU R-02".to_string(),
+            frequency_offset: 1000.0,
+            qso_id: Some("qso-2".to_string()),
+            tx_parity: None,
+            origin: Remote,
+            remote_client_key_id: Some("client-a".to_string()),
+        };
+        let outcome = super::classify_incoming_during_tx(
+            &candidate,
+            &[
+                bound_item("A W5AU R-01", "qso-1", Remote, Some("client-a")),
+                bound_item("B W5AU R-02", "qso-2", Local, None),
+            ],
+            &pivoted_once,
+            Remote,
+            Some("client-a"),
+        );
+        assert!(
+            matches!(outcome, super::IncomingDuringTx::Supersede { .. }),
+            "a re-bound same-content request must supersede, got {outcome:?}"
+        );
+    }
+
+    /// Control: identical content AND identical per-item bindings under the
+    /// same fold is still the unchanged repeat PAN-73 round 6 filters out.
+    #[test]
+    fn classify_requeues_bundle_with_unchanged_items_and_bindings() {
+        use crate::message_bus::TxOrigin::Remote;
+        let pivoted_once = std::collections::HashMap::new();
+        let items = vec![
+            bound_item("A W5AU R-01", "qso-1", Remote, Some("client-a")),
+            bound_item("B W5AU R-02", "qso-2", Remote, Some("client-a")),
+        ];
+        let candidate = MessageType::MultiTransmitRequest {
+            items: items.clone(),
+            tx_parity: None,
+            origin: Remote,
+            remote_client_key_id: Some("client-a".to_string()),
+        };
+        let outcome = super::classify_incoming_during_tx(
+            &candidate,
+            &items,
+            &pivoted_once,
+            Remote,
+            Some("client-a"),
+        );
+        assert_eq!(outcome, super::IncomingDuringTx::Requeue);
+    }
+
     /// Codex round 3 (PR #346): a stuck-DX QSO can re-render the SAME text
     /// at a deliberately hopped frequency to dodge a collision
     /// (`qso_manager.rs`'s stuck-DX offset hop). Matching a same-QSO
@@ -21212,6 +21498,18 @@ mod report_transmit_complete_tests {
             items_abandoned_by_supersede(&in_flight, remote, Some(&reenqueued)).len(),
             2
         );
+        // PAN-136 (Codex P2 on PR #456): nor does a per-item re-bind under an
+        // unchanged fold — qb's same-text frame now bound to client-a.
+        let mut rebound = reenqueued.clone();
+        if let MessageType::MultiTransmitRequest { items, .. } = &mut rebound {
+            items[1].origin = crate::message_bus::TxOrigin::Remote;
+            items[1].remote_client_key_id = Some("client-a".to_string());
+        }
+        let abandoned = items_abandoned_by_supersede(&in_flight, local, Some(&rebound));
+        assert_eq!(abandoned.len(), 2);
+        assert!(item_rebound_by_supersede(&in_flight[1], Some(&rebound)));
+        assert!(!item_rebound_by_supersede(&in_flight[0], Some(&rebound)));
+        assert!(!item_rebound_by_supersede(&in_flight[1], Some(&reenqueued)));
     }
 
     /// An abandoned bundle item is rolled back by its own offset, so a newer
