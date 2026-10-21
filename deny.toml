@@ -17,6 +17,14 @@ yanked = "deny"
 # Each ignore MUST come with a rationale comment so future-us can re-evaluate.
 # Re-check this list when bumping the affected crate's parent.
 ignore = [
+    # webpki-roots 0.26.11 is a compatibility shim: it depends on webpki-roots
+    # 1.x and re-exports its root list, and Cargo.lock resolves that to 1.0.10,
+    # which drops the distrusted emSign root. The advisory matches the shim on
+    # its version number alone. It comes in via sqlx-core 0.8.6
+    # (runtime-tokio-rustls); pancetta only uses sqlx for SQLite, so there is
+    # no TLS surface. Remove this once sqlx depends on webpki-roots 1.x directly.
+    { id = "RUSTSEC-2026-0381", reason = "0.26.11 shim re-exports webpki-roots 1.0.10 (fixed); sqlx SQLite-only, no TLS use" },
+
     # `instant` 0.1 is unmaintained. Replacement is `web-time`. We pull
     # instant transitively via tokio/cpal; both are working on migration.
     # Nothing actionable at our layer.
