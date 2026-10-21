@@ -273,8 +273,10 @@ telemetry) rather than run. **Tests, CI, and the research harness always use
 `DecodeBudget::unlimited()`** — no stage is ever skipped on the eval path, so
 recall measurements stay deterministic and comparable across runs.
 
-In production, the coordinator seeds a real wall-clock budget into a shared
-`decode_effort_budget_ms` atomic from the operator's **decode-effort preset**
+In production, the coordinator publishes a real wall-clock budget together
+with the decoder config it was derived with, as one `DecodeWindowConfig` behind
+one lock that the FT8 loop reads once per window (PAN-164), from the
+operator's **decode-effort preset**
 (`[decoder]` config section, or the live `e` TUI key): `Eco` (1ms, floor-only),
 `Standard` (250ms), `Deep` (1000ms), `Max` (0/unlimited), or `Auto` (derived
 from the probed hardware tier — see `pancetta/src/coordinator/effort.rs`).

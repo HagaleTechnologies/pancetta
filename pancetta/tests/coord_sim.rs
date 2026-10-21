@@ -72,7 +72,7 @@ use pancetta_hamlib::{MockRig, PttState, RigControl, Vfo};
 use pancetta_lib::coordinator::{
     active_tx_qso_key, coalesce_transmit_requests, compute_manual_tx_offset, protocol_from_mode,
     remote_tx_permitted_for, try_switch_operating_mode, tx_band_plan_mute_reason, tx_qso_is_live,
-    tx_rf_for_gate, tx_signal_span_hz, CoalesceEntry, ModeSwitchError,
+    tx_rf_for_gate, tx_signal_span_hz, CoalesceEntry, DecodeWindowConfig, ModeSwitchError,
 };
 use pancetta_lib::message_bus::{
     ComponentId, ComponentMessage, MessageBus, MessageType, RigControlMessage,
@@ -325,9 +325,10 @@ pub struct CoordSim {
     pub active_tx_offsets: Arc<RwLock<HashMap<String, f64>>>,
     /// Shared tri-state TX policy atomic, exactly as the coordinator holds it.
     pub tx_policy: Arc<AtomicU8>,
-    /// Shared FT8 decoder config, exactly as the coordinator holds it —
-    /// `try_switch_operating_mode` writes `.protocol` here.
-    pub ft8_config: Arc<tokio::sync::RwLock<pancetta_ft8::Ft8Config>>,
+    /// Shared decode window (budget + FT8 decoder config, PAN-164),
+    /// exactly as the coordinator holds it — `try_switch_operating_mode`
+    /// switches its protocol here and never changes its budget.
+    pub decode_window: Arc<tokio::sync::RwLock<DecodeWindowConfig>>,
     /// Active-mode atomic, exactly as the coordinator holds it.
     pub active_protocol_mode: Arc<AtomicU8>,
     /// Active slot-length atomic (ns), exactly as the coordinator holds it.
@@ -342,11 +343,6 @@ pub struct CoordSim {
     /// PAN-157: resolved hardware-tier atomic, exactly as the
     /// coordinator holds it.
     pub resolved_hardware_tier: Arc<std::sync::atomic::AtomicU8>,
-    /// PAN-157: decode-effort budget atomic (ms; `0` = unlimited/
-    /// ceiling), exactly as the coordinator holds it —
-    /// `try_switch_operating_mode` reads it fresh rather than
-    /// reseeding it (round-12 review finding).
-    pub decode_effort_budget_ms: Arc<std::sync::atomic::AtomicU64>,
     /// Shutdown flag for the spawned hamlib consumer.
     shutdown: Arc<AtomicBool>,
     /// Our callsign (for building expected message text).
@@ -411,7 +407,10 @@ impl CoordSim {
             active_tx_qsos: Arc::new(RwLock::new(HashSet::new())),
             active_tx_offsets: Arc::new(RwLock::new(HashMap::new())),
             tx_policy: Arc::new(AtomicU8::new(TxPolicy::Full.as_u8())),
-            ft8_config: Arc::new(tokio::sync::RwLock::new(pancetta_ft8::Ft8Config::default())),
+            decode_window: Arc::new(tokio::sync::RwLock::new(DecodeWindowConfig::new(
+                pancetta_ft8::Ft8Config::default(),
+                0,
+            ))),
             active_protocol_mode: Arc::new(AtomicU8::new(OperatingMode::Ft8.as_u8())),
             active_slot_ns,
             active_decode_phase_ns: Arc::new(std::sync::atomic::AtomicI64::new(13_000_000_000)),
@@ -421,7 +420,6 @@ impl CoordSim {
             resolved_hardware_tier: Arc::new(std::sync::atomic::AtomicU8::new(
                 pancetta_ft8::tier_probe::HardwareTier::Fast.as_u8(),
             )),
-            decode_effort_budget_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             shutdown,
             our_callsign: our_callsign.to_string(),
             timeline: Timeline::default(),
@@ -2820,13 +2818,12 @@ async fn mode_switch_refused_while_qso_active() {
     let result = try_switch_operating_mode(
         OperatingMode::Ft4,
         &sim.active_tx_qsos,
-        &sim.ft8_config,
+        &sim.decode_window,
         &sim.active_protocol_mode,
         &sim.active_slot_ns,
         &sim.active_decode_phase_ns,
         &sim.current_decode_effort,
         &sim.resolved_hardware_tier,
-        &sim.decode_effort_budget_ms,
     );
 
     assert!(
@@ -2852,13 +2849,12 @@ async fn mode_switch_succeeds_idle_and_next_qso_uses_new_mode() {
     let result = try_switch_operating_mode(
         OperatingMode::Ft4,
         &sim.active_tx_qsos,
-        &sim.ft8_config,
+        &sim.decode_window,
         &sim.active_protocol_mode,
         &sim.active_slot_ns,
         &sim.active_decode_phase_ns,
         &sim.current_decode_effort,
         &sim.resolved_hardware_tier,
-        &sim.decode_effort_budget_ms,
     );
     assert!(result.is_ok(), "expected Ok, got {:?}", result);
     assert_eq!(sim.active_slot_ns.load(Ordering::Relaxed), 7_500_000_000);
@@ -2937,13 +2933,12 @@ async fn mode_switch_retunes_the_qso_engines_rearm_cadence() {
     try_switch_operating_mode(
         OperatingMode::Ft4,
         &sim.active_tx_qsos,
-        &sim.ft8_config,
+        &sim.decode_window,
         &sim.active_protocol_mode,
         &sim.active_slot_ns,
         &sim.active_decode_phase_ns,
         &sim.current_decode_effort,
         &sim.resolved_hardware_tier,
-        &sim.decode_effort_budget_ms,
     )
     .expect("idle mode switch");
     assert_eq!(sim.active_slot_ns.load(Ordering::Relaxed), 7_500_000_000);

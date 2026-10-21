@@ -695,3 +695,54 @@ awaits was keyed anyway.
   deferring a bundle that can still key before the raw cap (review round 2). The key-time gate
   keeps the raw effective cap as its unconditional backstop, and single-TX mid-TX re-keys
   (which re-read the clock at the decision, with no coalesce wait in between) keep the raw cap.
+
+## Keying without waiting on the bus channel table (PAN-202, 2026-10-21)
+
+Deferred from PR #450 (Codex P2 thread `PRRT_kwDORcJovs6s0SAh`). Every PTT-on went through a
+`MessageBus` method whose first step was `self.channels.read().await` on the `tokio::sync::RwLock`
+covering the whole channel table. That ran after the TX worker's synchronous final gates (PAN-148
+liveness/DX parity, PAN-115 hard mute, PAN-118 band plan, PAN-117 key time) had already said "in
+time", and nothing re-checked them afterwards. A channel registration (`create_channel`, the
+table's only writer) holding the write lock at that instant delayed the key-down for the whole
+hold: a repro against the real `send_message_if` enqueued 151.3 ms after the simulated gate under
+a 150 ms writer hold, 101 ms past a 50 ms cap. The lock is fair, so a queued writer also stalls
+every later reader, and each `.await` on it is a cooperative-scheduling yield point.
+
+- **Mechanism.** `create_channel(ComponentId::Hamlib)` publishes Hamlib's channel handle
+  (`ChannelTx`: sender plus the entry's own message/error counters) into a private
+  `rig_route: Arc<OnceLock<_>>`, inside the same write-lock critical section that inserts the
+  table entry. `MessageBus::send_rig_command_if(message, authorize) -> SendIfOutcome` is a plain
+  `fn`: expiry check, `sent_at` stamp, the PAN-134 `authorize` predicate, then a crossbeam
+  `try_send` on that route, with no lock and no await. Counters and logs match the table path
+  (both call the shared `try_send_on`). A message not addressed to Hamlib is `Dropped` with an
+  `error!`; an unregistered Hamlib (replay mode, no-`pancetta-hamlib` builds) is `Dropped` with
+  the same "No channel found" warning as before.
+- **One key-down path.** `tx::send_ptt_command(bus, source, state, authorize)` builds the
+  `SetPtt` and calls `send_rig_command_if`. Single TX, multi-TX bundles, tune and the TUI's
+  manual `TogglePtt` all use it, so the fix holds after every final gate instead of per gate.
+  The compiler enforces "no await between the last gate and the enqueue" at each site because
+  the helper is synchronous.
+- **Alternatives rejected.** A TX-worker-held cached `Sender` depends on startup order (Hamlib
+  is absent in replay and no-Hamlib builds), would not cover the TUI relay task, must be
+  re-acquired on restart, and contradicts PAN-134's no-raw-`Sender` rule. A synchronous method
+  over the existing table (`std`/`parking_lot` lock, `blocking_read`, `try_read`) still waits
+  for the writer's hold, panics inside the runtime, or drops key-downs during a registration. A
+  lock-free copy-on-write table for every send changes ~210 send sites, adds a dependency and
+  breaks PAN-134's contention tests.
+- **Insert-once coupling.** Table entries are inserted once (a duplicate `create_channel`
+  errors; supervised restarts re-register through `get_or_create_channel`, which returns the
+  existing entry) and never removed or replaced, so the route is always the channel the table
+  holds. Any future removal or replacement of a channel must update `rig_route` in the same
+  critical section; `create_channel`'s doc comment says so and
+  `pan202_rig_route_is_the_registered_channel` pins it.
+- **Scope.** Only PTT commands use the route. PTT-off from `PttGuard` keeps its PAN-135
+  confirmed-enqueue path (`send_message_retrying`), audio output keeps `send_message_if`
+  (PAN-134's audio recheck), and every other send stays on the table path. The TUI's
+  `TogglePtt` builds one message for either state, so its PTT-off takes the helper too, with the
+  same best-effort semantics as its old `send_message`.
+- **Tests.** `message_bus.rs` holds the table's write lock and asserts the rig route enqueues
+  inside the hold within a 50 ms cap, with a hazard pin showing the table path still waits.
+  `pan202_key_down_worker_tests` parks the real TX worker between its last gate and the
+  key-down with a `#[cfg(test)]` `KeyDownProbe`, holds the table (`hold_channel_table`), and
+  requires PTT-on on Hamlib's receiver within 500 ms for single TX, bundle and tune; the TUI
+  helper is tested directly.

@@ -7,14 +7,14 @@ use anyhow::Context;
 use chrono::Utc;
 use pancetta_research::corpus::{load_ft8_fixtures, load_synth_corpus, load_synth_pair_corpus};
 use pancetta_research::curated::{load_curated_corpus, preflight_curated_corpus, CuratedEntry};
-use pancetta_research::decoder::{DecoderUnderTest, Ft8Decoder};
+use pancetta_research::decoder::{BudgetAnchor, DecoderUnderTest, Ft8Decoder, WindowTiming};
 use pancetta_research::metrics::{
     compute_regression_flags, default_weights, populate_composite, saturation_aware_composite,
     RefreshOffsetRegistry,
 };
 use pancetta_research::scorecard::{
-    BuildInfo, ConfigInfo, GitInfo, HarnessInfo, PerWavFailure, PerWavRecord, RegressionFlags,
-    Scorecard, SnrBin, TierResult, TtfdDistribution,
+    BuildInfo, ConfigInfo, GitInfo, HarnessInfo, PairRecovery, PerWavFailure, PerWavRecord,
+    RegressionFlags, Scorecard, SnrBin, TierResult, TtfdDistribution, WindowTimingSummary,
 };
 use pancetta_research::truth::{FixtureCategory, FixtureTruth};
 use pancetta_research::Mode;
@@ -276,12 +276,25 @@ struct Args {
     /// via `effort_preset_budget_ms` below (mirrors production's
     /// `pancetta/src/coordinator/effort.rs::preset_budget_ms`). `None`
     /// (flag omitted, the default) reproduces `DecodeBudget::unlimited()`
-    /// exactly — every existing eval invocation is unaffected.
+    /// exactly — every existing eval invocation is unaffected. `max`
+    /// resolves after every arg is parsed, because it depends on `--mode`.
     effort_budget_ms: Option<u64>,
+    /// PAN-165: `--budget-anchor <call|receipt>`. `None` (flag omitted)
+    /// records no window timing, and the scorecard has no `window_timing`
+    /// or `pair_recovery` key.
+    budget_anchor: Option<BudgetAnchor>,
+    /// PAN-165: `--qso-partner-hz <HZ>` (requires `--budget-anchor
+    /// receipt`): simulate an active QSO with a partner at HZ.
+    qso_partner_hz: Option<f64>,
 }
 
 impl Args {
     fn parse() -> anyhow::Result<Self> {
+        Self::parse_from(std::env::args().skip(1))
+    }
+
+    /// Parse eval's flags from `args` (without the program name).
+    fn parse_from(args: impl Iterator<Item = String>) -> anyhow::Result<Self> {
         let mut tiers: Option<Vec<String>> = None;
         let mut mode: Option<Mode> = None;
         let mut output: Option<PathBuf> = None;
@@ -367,8 +380,10 @@ impl Args {
         let mut max_concurrent_tiers_pool_dir: Option<PathBuf> = None;
         let mut noise_manifest: Option<PathBuf> = None;
         let mut synth_ft4_manifest: Option<PathBuf> = None;
-        let mut effort_budget_ms: Option<u64> = None;
-        let mut iter = std::env::args().skip(1);
+        let mut effort_name: Option<String> = None;
+        let mut budget_anchor: Option<BudgetAnchor> = None;
+        let mut qso_partner_hz: Option<f64> = None;
+        let mut iter = args;
         while let Some(arg) = iter.next() {
             match arg.as_str() {
                 "--tier" | "--tiers" => {
@@ -913,10 +928,32 @@ impl Args {
                     );
                 }
                 "--effort" => {
+                    effort_name = Some(iter.next().context(
+                        "--effort needs a value (eco|standard|deep|max|auto|unlimited)",
+                    )?);
+                }
+                "--budget-anchor" => {
                     let v = iter
                         .next()
-                        .context("--effort needs a value (eco|standard|deep|auto|unlimited)")?;
-                    effort_budget_ms = effort_preset_budget_ms(&v)?;
+                        .context("--budget-anchor needs a value (call|receipt)")?;
+                    budget_anchor = Some(match v.as_str() {
+                        "call" => BudgetAnchor::Call,
+                        "receipt" => BudgetAnchor::Receipt,
+                        other => anyhow::bail!(
+                            "--budget-anchor: unknown anchor {other:?} (expected call|receipt)"
+                        ),
+                    });
+                }
+                "--qso-partner-hz" => {
+                    let hz: f64 = iter
+                        .next()
+                        .context("--qso-partner-hz needs a value (Hz, e.g. 1500)")?
+                        .parse()?;
+                    anyhow::ensure!(
+                        hz.is_finite() && hz > 0.0,
+                        "--qso-partner-hz must be a positive frequency in Hz (got {hz})"
+                    );
+                    qso_partner_hz = Some(hz);
                 }
                 "-h" | "--help" => {
                     eprintln!(
@@ -971,15 +1008,55 @@ impl Args {
                     eprintln!("  --max-concurrent-tiers-pool-dir PATH: override the slot-pool directory (default /tmp/pancetta-eval-tier-slots).");
                     eprintln!("  --noise-manifest PATH: override the noise_1000 tier's manifest (default research/corpus/curated/noise/noise_1000.manifest.json).");
                     eprintln!("  --synth-ft4-manifest PATH: override the synth-ft4 tier's manifest (default research/corpus/synth/manifests/ft4_clean.manifest.json).");
-                    eprintln!("  --effort <eco|standard|deep|auto|unlimited>: Task W3.3b [HARNESS] — construct the decoder's DecodeBudget from a real production effort preset (eco=1ms, standard=250ms, deep=1000ms, auto=1000ms [Fast-tier assumption; no live hardware probe here], unlimited=DecodeBudget::unlimited()) instead of always using an unlimited budget. Default (flag omitted): unlimited, byte-identical to every prior eval invocation. Mirrors pancetta/src/coordinator/effort.rs::preset_budget_ms.");
+                    eprintln!("  --effort <eco|standard|deep|max|auto|unlimited>: Task W3.3b [HARNESS] — construct the decoder's DecodeBudget from a real production effort preset (eco=1ms, standard=250ms, deep=1000ms, max=the protocol ceiling production applies to Max [FT8 2000ms, FT4 800ms], auto=1000ms [Fast-tier assumption; no live hardware probe here], unlimited=DecodeBudget::unlimited()) instead of always using an unlimited budget. Default (flag omitted): unlimited, byte-identical to every prior eval invocation. Mirrors pancetta/src/coordinator/effort.rs::preset_budget_ms.");
+                    eprintln!("  --budget-anchor <call|receipt>: PAN-165 [HARNESS] — record per-window decode timing in the fixtures and synth-pair-200 tiers' `window_timing` (synth-pair-200 also records `pair_recovery`). call: the deadline starts right before the native decode call (the pre-PAN-165 model). receipt: the deadline starts at window receipt and production's pre-native sequence runs under it first (waterfall, ft8_lib, plus the scoped fast-path with --qso-partner-hz); only the native call's decodes are scored. receipt cannot be combined with --ap-my-call, --ap-recent-calls, --ap-rolling-window, --chrono-replay-enabled, the chrono-replay tier or --two-stage. Default (flag omitted): no timing, scorecard unchanged.");
+                    eprintln!("  --qso-partner-hz HZ: PAN-165 [HARNESS] — requires --budget-anchor receipt. Simulates an active QSO with a partner at HZ: runs production's scoped fast-path call (partner ±5 bins), then narrows the native call to the partner ±60 Hz with HZ as its relaxed-sync partner frequency (overrides --partner-freq-hz on that call).");
                     std::process::exit(0);
                 }
                 other => anyhow::bail!("unknown arg: {other}"),
             }
         }
+        let tiers: Vec<String> = tiers.context("--tier required")?;
+        let mode = mode.context("--mode required")?;
+        // PAN-165: `max` depends on `--mode`, which may come after `--effort`.
+        let effort_budget_ms = match effort_name {
+            Some(name) => effort_preset_budget_ms(&name, mode)?,
+            None => None,
+        };
+        anyhow::ensure!(
+            qso_partner_hz.is_none() || budget_anchor == Some(BudgetAnchor::Receipt),
+            "--qso-partner-hz requires --budget-anchor receipt"
+        );
+        if budget_anchor == Some(BudgetAnchor::Receipt) {
+            // These route `Ft8Decoder::decode_wav` off its plain path, which
+            // the receipt-anchored production sequence replaces.
+            let conflicts: Vec<&str> = [
+                (ap_my_call.is_some(), "--ap-my-call"),
+                (ap_recent_calls.is_some(), "--ap-recent-calls"),
+                (ap_rolling_window.is_some(), "--ap-rolling-window"),
+                (
+                    chrono_replay_enabled == Some(true),
+                    "--chrono-replay-enabled",
+                ),
+                (
+                    tiers.iter().any(|t| t == "chrono-replay"),
+                    "the chrono-replay tier",
+                ),
+                (two_stage == Some(true), "--two-stage"),
+            ]
+            .into_iter()
+            .filter_map(|(set, name)| set.then_some(name))
+            .collect();
+            anyhow::ensure!(
+                conflicts.is_empty(),
+                "--budget-anchor receipt reproduces production's plain decode path and cannot be \
+                 combined with {}",
+                conflicts.join(", ")
+            );
+        }
         Ok(Self {
-            tiers: tiers.context("--tier required")?,
-            mode: mode.context("--mode required")?,
+            tiers,
+            mode,
             output: output.context("--output required")?,
             seed,
             max_passes,
@@ -1064,6 +1141,8 @@ impl Args {
             noise_manifest,
             synth_ft4_manifest,
             effort_budget_ms,
+            budget_anchor,
+            qso_partner_hz,
         })
     }
 }
@@ -1071,7 +1150,11 @@ impl Args {
 /// Task W3.3b [HARNESS]: effort-preset name → per-window wall-clock decode
 /// budget in milliseconds, mirroring the production mapping in
 /// `pancetta/src/coordinator/effort.rs::preset_budget_ms` (decoder-speed-
-/// overhaul Task 14: `Eco`=1, `Standard`=250, `Deep`=1000, `Max`=unlimited).
+/// overhaul Task 14: `Eco`=1, `Standard`=250, `Deep`=1000, `Max`=0).
+///
+/// PAN-165: production maps `Max`'s `0` to the protocol's decode ceiling
+/// (`decode_budget_ceiling_ms` in `pancetta/src/coordinator/ft8.rs`: FT8
+/// 2000 ms, FT4 800 ms), so `max` resolves to that ceiling for `mode`.
 ///
 /// This is a deliberate, documented LOCAL RE-DERIVATION rather than a
 /// cross-crate call into that function: `preset_budget_ms` is `pub(crate)`
@@ -1091,18 +1174,22 @@ impl Args {
 /// `coordinator/tier.rs`/`coordinator/mod.rs`'s pre-probe seeding) — the
 /// eval harness has no live hardware-tier probe, and probing would make
 /// scorecards host-dependent and non-reproducible. `unlimited` returns
-/// `None`, which `Ft8Decoder::decode_budget()` maps to
+/// `None`, which `Ft8Decoder::decode_budget_from()` maps to
 /// `DecodeBudget::unlimited()` — the harness's pre-existing, and default,
 /// behavior.
-fn effort_preset_budget_ms(name: &str) -> anyhow::Result<Option<u64>> {
+fn effort_preset_budget_ms(name: &str, mode: Mode) -> anyhow::Result<Option<u64>> {
     Ok(match name {
         "unlimited" => None,
         "eco" => Some(1),
         "standard" => Some(250),
         "deep" => Some(1000),
+        "max" => Some(match mode {
+            Mode::Ft8 => 2000,
+            Mode::Ft4 => 800,
+        }),
         "auto" => Some(1000),
         other => anyhow::bail!(
-            "--effort: unknown preset {other:?} (expected eco|standard|deep|auto|unlimited)"
+            "--effort: unknown preset {other:?} (expected eco|standard|deep|max|auto|unlimited)"
         ),
     })
 }
@@ -1127,9 +1214,77 @@ fn apply_fp_filter(
     }
 }
 
+/// PAN-165: the run settings a tier's `window_timing` summary records next
+/// to its per-window timings. Present only when `--budget-anchor` was set.
+#[derive(Debug, Clone, Copy)]
+struct WindowTimingRun {
+    anchor: BudgetAnchor,
+    budget_ms: Option<u64>,
+    qso_partner_hz: Option<f64>,
+}
+
+impl WindowTimingRun {
+    fn from_args(args: &Args) -> Option<Self> {
+        args.budget_anchor.map(|anchor| Self {
+            anchor,
+            budget_ms: args.effort_budget_ms,
+            qso_partner_hz: args.qso_partner_hz,
+        })
+    }
+
+    /// Summarise a tier's collected timings and print one stderr line in
+    /// the style of the synth-pair regime map. `None` when no window
+    /// recorded a timing.
+    fn summarize(&self, tier: &str, timings: &[WindowTiming]) -> Option<WindowTimingSummary> {
+        let s = WindowTimingSummary::from_timings(
+            timings,
+            self.anchor,
+            self.budget_ms,
+            pancetta_ft8::ft8lib_is_available(),
+            self.qso_partner_hz,
+        )?;
+        let budget = s
+            .budget_ms
+            .map_or("unlimited".to_string(), |ms| format!("{ms}ms"));
+        let headroom_min = s
+            .headroom_at_native_ms
+            .as_ref()
+            .map_or("unlimited".to_string(), |d| format!("{:.1}ms", d.min));
+        let scoped_p50 = s
+            .scoped_ms
+            .as_ref()
+            .map_or("not run".to_string(), |d| format!("{:.1}ms", d.p50));
+        eprintln!(
+            "{tier} window timing ({} windows, anchor={}, budget={budget}, ft8lib_available={}): \
+             pre_native p50/p95/max={:.1}/{:.1}/{:.1}ms (waterfall p50={:.1}ms, scoped p50={scoped_p50}, \
+             ft8lib p50={:.1}ms), headroom_at_native min={headroom_min}, \
+             window_total p50/p95/max={:.1}/{:.1}/{:.1}ms, multipass_ran={}/{}, \
+             over_deadline={}/{} (max {:.1}ms)",
+            s.windows,
+            s.anchor,
+            s.ft8lib_available,
+            s.pre_native_ms.p50,
+            s.pre_native_ms.p95,
+            s.pre_native_ms.max,
+            s.waterfall_ms.p50,
+            s.ft8lib_ms.p50,
+            s.window_total_ms.p50,
+            s.window_total_ms.p95,
+            s.window_total_ms.max,
+            s.windows_multipass_ran,
+            s.windows,
+            s.windows_over_deadline,
+            s.windows,
+            s.max_over_deadline_ms,
+        );
+        Some(s)
+    }
+}
+
 fn run_fixtures_tier(
     decoder: &dyn DecoderUnderTest,
     workspace: &std::path::Path,
+    timing_run: Option<WindowTimingRun>,
 ) -> anyhow::Result<TierResult> {
     // Fixtures tier is a decoder regression test — it does NOT apply the
     // FP filter. The eval-side FpFilter is strict-membership against jt9
@@ -1146,9 +1301,11 @@ fn run_fixtures_tier(
     let mut passed = 0u32;
     let mut skipped = 0u32;
     let mut failures = Vec::new();
+    let mut timings: Vec<WindowTiming> = Vec::new();
     for f in &fixtures {
         let entry = truth.get(&f.display_name);
         let decodes_result = decoder.decode_wav(&f.wav_path);
+        timings.extend(decoder.take_last_window_timing());
         match (decodes_result, entry) {
             (Ok(decodes), Some(entry)) => match entry.category {
                 FixtureCategory::Exact => {
@@ -1217,6 +1374,7 @@ fn run_fixtures_tier(
         fixtures_skipped: Some(skipped),
         failures,
         pass_rate: Some(pass_rate),
+        window_timing: timing_run.and_then(|r| r.summarize("fixtures", &timings)),
         ..Default::default()
     })
 }
@@ -1393,6 +1551,7 @@ fn run_synth_pair_tier(
     workspace: &std::path::Path,
     manifest_path: &std::path::Path,
     fp_filter: Option<&pancetta_research::FpFilter>,
+    timing_run: Option<WindowTimingRun>,
 ) -> anyhow::Result<TierResult> {
     let entries = load_synth_pair_corpus(workspace, manifest_path)?;
     let total = entries.len() as u32;
@@ -1410,6 +1569,7 @@ fn run_synth_pair_tier(
     let mut buckets: BTreeMap<(i64, i64, i64), Bucket> = BTreeMap::new();
     let mut strong_total = 0u32;
     let mut weak_total = 0u32;
+    let mut timings: Vec<WindowTiming> = Vec::new();
 
     for entry in &entries {
         let key = (
@@ -1421,6 +1581,7 @@ fn run_synth_pair_tier(
         bucket.2 += 1;
 
         let mut decodes = decoder.decode_wav(&entry.wav_path).unwrap_or_default();
+        timings.extend(decoder.take_last_window_timing());
         apply_fp_filter(fp_filter, &mut decodes);
 
         let got_strong = decodes
@@ -1479,6 +1640,15 @@ fn run_synth_pair_tier(
         100.0 * weak_total as f64 / total as f64,
     );
 
+    let window_timing = timing_run.and_then(|r| r.summarize("synth-pair-200", &timings));
+    // PAN-165: only anchored runs carry `pair_recovery`, so unanchored
+    // scorecards stay byte-identical.
+    let pair_recovery = timing_run.map(|_| PairRecovery {
+        strong_recovered: strong_total,
+        weak_recovered: weak_total,
+        wavs: total,
+    });
+
     let truth_total = total * 2; // strong + weak per WAV
     let recovered = strong_total + weak_total;
     let decode_rate = recovered as f64 / truth_total as f64;
@@ -1487,6 +1657,8 @@ fn run_synth_pair_tier(
         truth_decodes_total: Some(truth_total),
         truth_decodes_recovered: Some(recovered),
         decode_rate: Some(decode_rate),
+        window_timing,
+        pair_recovery,
         ..Default::default()
     })
 }
@@ -2327,6 +2499,13 @@ fn build_decoder_from_args(args: &Args, protocol: pancetta_ft8::Protocol) -> Ft8
     if args.effort_budget_ms.is_some() {
         d = d.with_effort_budget_ms(args.effort_budget_ms);
     }
+    // PAN-165: only touched when --budget-anchor / --qso-partner-hz are passed.
+    if let Some(anchor) = args.budget_anchor {
+        d = d.with_budget_anchor(anchor);
+    }
+    if let Some(hz) = args.qso_partner_hz {
+        d = d.with_qso_partner_hz(hz);
+    }
 
     d
 }
@@ -2360,6 +2539,7 @@ fn main() -> anyhow::Result<()> {
         Mode::Ft4 => pancetta_ft8::Protocol::Ft4,
     };
     let decoder: Box<dyn DecoderUnderTest> = Box::new(build_decoder_from_args(&args, protocol));
+    let timing_run = WindowTimingRun::from_args(&args);
 
     // hb-052: build FP filter from configured sources, if any.
     let fp_filter: Option<pancetta_research::FpFilter> = if args.fp_filter_baselines.is_some()
@@ -2506,7 +2686,7 @@ fn main() -> anyhow::Result<()> {
         };
         match tier_name.as_str() {
             "fixtures" => {
-                let result = run_fixtures_tier(decoder.as_ref(), &workspace)?;
+                let result = run_fixtures_tier(decoder.as_ref(), &workspace, timing_run)?;
                 tiers.insert("fixtures".to_string(), result);
             }
             "synth-clean" => {
@@ -2595,8 +2775,13 @@ fn main() -> anyhow::Result<()> {
                     "synth-pair-200 manifest missing at {}; run `cargo run --release -p pancetta-research --bin gen-synth-pair -- --config research/corpus/synth/manifests/synth_pair_200.config.json --output research/corpus/synth/manifests/synth_pair_200.manifest.json`",
                     manifest.display()
                 );
-                let result =
-                    run_synth_pair_tier(decoder.as_ref(), &workspace, &manifest, fp_filter_ref)?;
+                let result = run_synth_pair_tier(
+                    decoder.as_ref(),
+                    &workspace,
+                    &manifest,
+                    fp_filter_ref,
+                    timing_run,
+                )?;
                 tiers.insert("synth-pair-200".to_string(), result);
             }
             "curated-hard-200" | "curated-hard-1000" | "wild-50" | "wild-100" | "lid-of-band" => {
@@ -2879,6 +3064,94 @@ fn main() -> anyhow::Result<()> {
         card.harness.elapsed_seconds,
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod arg_tests {
+    use super::*;
+
+    fn parse(extra: &[&str]) -> anyhow::Result<Args> {
+        let base = [
+            "--tier",
+            "fixtures",
+            "--mode",
+            "ft8",
+            "--output",
+            "/tmp/x.json",
+        ];
+        Args::parse_from(
+            base.iter()
+                .chain(extra.iter())
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .into_iter(),
+        )
+    }
+
+    #[test]
+    fn effort_max_resolves_to_protocol_ceiling() {
+        assert_eq!(
+            effort_preset_budget_ms("max", Mode::Ft8).unwrap(),
+            Some(2000)
+        );
+        assert_eq!(
+            effort_preset_budget_ms("max", Mode::Ft4).unwrap(),
+            Some(800)
+        );
+        for mode in [Mode::Ft8, Mode::Ft4] {
+            assert_eq!(effort_preset_budget_ms("unlimited", mode).unwrap(), None);
+            assert_eq!(effort_preset_budget_ms("eco", mode).unwrap(), Some(1));
+            assert_eq!(
+                effort_preset_budget_ms("standard", mode).unwrap(),
+                Some(250)
+            );
+            assert_eq!(effort_preset_budget_ms("deep", mode).unwrap(), Some(1000));
+            assert_eq!(effort_preset_budget_ms("auto", mode).unwrap(), Some(1000));
+            assert!(effort_preset_budget_ms("turbo", mode).is_err());
+        }
+        // `--effort max` resolves against `--mode` even when the mode comes later.
+        let args = Args::parse_from(
+            [
+                "--effort",
+                "max",
+                "--tier",
+                "fixtures",
+                "--mode",
+                "ft4",
+                "--output",
+                "/tmp/x.json",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        )
+        .unwrap();
+        assert_eq!(args.effort_budget_ms, Some(800));
+    }
+
+    #[test]
+    fn parse_rejects_qso_partner_without_receipt_anchor() {
+        let err = parse(&["--qso-partner-hz", "1500"]).unwrap_err();
+        assert!(err.to_string().contains("--qso-partner-hz"), "{err}");
+        let err = parse(&["--budget-anchor", "call", "--qso-partner-hz", "1500"]).unwrap_err();
+        assert!(err.to_string().contains("--qso-partner-hz"), "{err}");
+        let args = parse(&["--budget-anchor", "receipt", "--qso-partner-hz", "1500"]).unwrap();
+        assert_eq!(args.budget_anchor, Some(BudgetAnchor::Receipt));
+        assert_eq!(args.qso_partner_hz, Some(1500.0));
+    }
+
+    #[test]
+    fn parse_rejects_receipt_anchor_with_ap_rolling_window() {
+        let err = parse(&["--budget-anchor", "receipt", "--ap-rolling-window", "8"]).unwrap_err();
+        assert!(err.to_string().contains("--ap-rolling-window"), "{err}");
+        // The call anchor keeps working on every decode path.
+        let args = parse(&["--budget-anchor", "call", "--ap-rolling-window", "8"]).unwrap();
+        assert_eq!(args.budget_anchor, Some(BudgetAnchor::Call));
+        // Without the flag nothing PAN-165 adds is set.
+        let args = parse(&[]).unwrap();
+        assert_eq!(args.budget_anchor, None);
+        assert_eq!(args.qso_partner_hz, None);
+        assert!(WindowTimingRun::from_args(&args).is_none());
+    }
 }
 
 #[cfg(test)]
