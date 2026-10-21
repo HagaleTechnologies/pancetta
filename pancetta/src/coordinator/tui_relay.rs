@@ -2547,18 +2547,14 @@ impl super::ApplicationCoordinator {
                             }
                             cmd_ptt_state.store(new_state, Ordering::Release);
                             info!("TUI TogglePtt: {} -> {}", current, new_state);
-                            let msg = ComponentMessage::new(
+                            if super::tx::send_ptt_command(
+                                &cmd_message_bus,
                                 ComponentId::Tui,
-                                ComponentId::Hamlib,
-                                MessageType::RigControl(
-                                    crate::message_bus::RigControlMessage::SetPtt {
-                                        state: new_state,
-                                    },
-                                ),
-                                Instant::now(),
-                            );
-                            if let Err(e) = cmd_message_bus.send_message(msg).await {
-                                warn!("Failed to toggle PTT: {}", e);
+                                new_state,
+                                || true,
+                            ) != crate::message_bus::SendIfOutcome::Enqueued
+                            {
+                                warn!("Failed to toggle PTT: message dropped");
                             }
                         }
                         pancetta_tui::tui_runner::TuiCommand::SelectDevice {
