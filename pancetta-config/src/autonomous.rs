@@ -218,11 +218,13 @@ pub struct AutonomousConfig {
     /// tracks but never acts on this). Default 4.
     #[serde(default = "default_cq_no_response_switch_after")]
     pub cq_no_response_switch_after: u32,
-    /// Consecutive stalled cycles before an in-progress QSO's TX offset is
-    /// switched/reverted (Auto TX-freq mode only). Threaded by the
-    /// coordinator into `pancetta_qso::QsoManagerConfig::TimeoutConfig::
-    /// qso_stall_switch_after` — see that field's doc comment for the full
-    /// switch/revert mechanics (PAN-72). Default 4.
+    /// Consecutive unanswered own-parity TX slots (the QSO only transmits
+    /// on its own parity — every other protocol slot) before an in-progress
+    /// QSO's TX offset is switched/reverted (Auto TX-freq mode only).
+    /// Threaded by the coordinator into
+    /// `pancetta_qso::QsoManagerConfig::TimeoutConfig::qso_stall_switch_after`
+    /// — see that field's doc comment for the full switch/revert mechanics
+    /// (PAN-72, counted per own TX slot since PAN-128). Default 4.
     #[serde(default = "default_qso_stall_switch_after")]
     pub qso_stall_switch_after: u32,
     /// Maximum concurrent QSOs (default 1, capability for 2).

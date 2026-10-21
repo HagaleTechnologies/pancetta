@@ -67,9 +67,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0.3 s to under 1.0 s, which it used to PASS.
 
 - Adaptive TX-offset switching (PAN-72): in `AUTO` TX-frequency mode, an
-  in-progress QSO that goes `[autonomous] qso_stall_switch_after` slots (default
-  4) without the DX advancing — **silence now counts, not just a repeated
-  frame** — moves to a fresh offset picked by the smart frequency allocator. If
+  in-progress QSO that goes `[autonomous] qso_stall_switch_after` of its own
+  transmit slots (default 4) without the DX advancing — **silence now
+  counts, not just a repeated frame** — moves to a fresh offset picked by
+  the smart frequency allocator. If
   it stalls again on that new offset it reverts to the last offset the QSO was
   known to work on, ping-ponging rather than wandering. New `u` keystroke forces
   the same move on demand without leaving `AUTO`: it nudges the active QSO, or
@@ -131,6 +132,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Fixed
+
+- A remote client that disarmed or lost control while pancetta was busy could
+  still use up its manual-call budget. Repeating a call on an existing QSO
+  charged the resend, and could advance or complete the QSO, after the
+  permission check had already passed. The check, the rebind and the charge
+  now happen under one lock. An automatic 73 resend that emits no frame
+  because the client lost permission or the engine refused it no longer
+  uses one of the three automatic resends (PAN-138).
+
+- When another remote client took control, the previous controller's QSOs
+  could hold the TX window and a QSO slot until the manual-call watchdog
+  ended them, by default five minutes after they started. They now end with
+  the reason "remote control passed to another client". The previous client's
+  queued calls are dropped, so a waiting call from the new controller or
+  local operator can start as soon as the window is free. This applies to
+  `takeControl` and the first control action after the previous controller
+  leaves. Disarming, a heartbeat timeout, releasing control or disconnecting
+  without a new controller still leaves that client's QSO to resume (PAN-137).
+
+- Pressing `u` just before the DX moved the QSO on (or before a caller
+  answered an autonomous CQ) could record a new TX offset that nothing was
+  ever sent on. The nudge is now dropped and the QSO stays on the offset it
+  is really using (PAN-131).
+
+- Pressing `u` to move an established QSO that had no TX/RX split could be
+  undone automatically. The DX's next reply recorded the offset you had just
+  left as the one that works, so if the QSO later went quiet it moved straight
+  back there. The reply now credits the offset you moved to, and a later stall
+  looks for a new offset instead (PAN-132).
+
+- Pressing `u` on a Hound QSO right after the Fox's report moved it off its
+  calling offset now moves the QSO at least `min_separation_hz` from its real
+  TX offset, instead of leaving it in place or shifting it by only a few Hz
+  (PAN-130).
+
+- A DX that kept repeating its report to a manual QSO held back our
+  keep-call R-report by a full slot after every decode. On FT2 that skipped
+  re-sends and delayed the adaptive TX-offset switch to as late as the 11th
+  repeat. A repeated report now leaves keep-calling to run exactly as it does
+  while the DX is silent (PAN-129).
+
+- The stall detector behind adaptive TX-offset switching counted every
+  keep-call re-send, so it ran at twice the rate of real transmissions and
+  moved a silent QSO after about two unanswered transmissions instead of
+  `qso_stall_switch_after`. It now counts each of the QSO's own transmit
+  slots once (PAN-128), attributing an emission to the slot the TX
+  scheduler actually targets — the current slot while inside its
+  queue-time acceptance window (`tx_late_max_ms` less the coalesce
+  overhead, 1.7 s for FT8 by default), otherwise the next own-parity slot —
+  so a re-arm pair aimed at one real TX opportunity can never count twice
+  and trip the switch a transmission early (PR-review follow-up).
+
+- The remote-access audit log (`~/.pancetta/agent-audit.log`) now stays
+  within 4 MiB: it rotates at 1 MiB into `.1`–`.3` archives, caps long
+  fields, and writes a `Summary` record for events it skipped because of the
+  rate limit or a failed write (PAN-104). A failed audit write now shows
+  `⚠ DEGRADED: Remote audit unavailable; events may be missing` in the
+  readiness strip and logs an ERROR, and the warning clears itself once
+  writes work again. Disarm and PTT-off never wait on the log. A pre-existing
+  log over 1 MiB is reset on first use, so copy it elsewhere first if you
+  need it.
 
 - With concurrent QSOs, a request the transmitter set aside while another QSO was on the air can no longer be overtaken by a newer one, or lost when its queue was full (PAN-73). Before, the older request could key while the fresher one was discarded.
 
@@ -306,6 +368,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - DX Hunter scores follow the latest decode and cqdx spot, so a station drops
   after you work it or a QSO with it fails.
+- `pancetta --help` no longer claims general config hot-reload or unmeasured
+  decoder, latency and memory figures; it says which settings apply live and
+  points to the new Capability status table in README.md (PAN-124). That
+  table rates each capability experimental, implemented, integration-tested
+  or radio-qualified, with the environment it was proven in. CONTRIBUTING.md
+  and SECURITY.md now describe the real build commands, review process,
+  stored credentials and `unsafe` sites.
 
 - TUI status surfaces (PAN-89): the `AUDIO DEAD` / `DECODER STUB` / `CLOCK`
   alarm chips move from the title bar to the readiness strip, where several can
@@ -330,6 +399,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and rig pickers also keep comments and section order.
 - `pancetta config --generate` writes the same header-annotated schema as
   `pancetta-config/defaults.toml`, without a random `[metadata]` block.
+- WAV recording of decode windows is now off by default (PAN-125). Pancetta
+  used to write every 15-second window to `~/.pancetta/recordings` (about
+  1.7 GB a day, up to 10 GB) on every install, ignoring `[audio.recording]`.
+  It now records only with `[audio.recording] auto_record = true`, into
+  `audio.recording.directory` (a leading `~` is expanded), and `--replay`
+  and `--no-audio` runs never record (closes #265). The once-per-start
+  `raw_48khz_diagnostic.wav` follows the same switch. The startup log says
+  whether recording is on and where. To keep recording into the old
+  location, set `auto_record = true` and
+  `directory = "~/.pancetta/recordings"` before upgrading. Existing
+  recordings are left in place.
 
 ### Removed
 
@@ -346,6 +426,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Responses from cqdx.io, QRZ, the online logbooks, the DX cluster and the station-agent relay are now read within fixed size limits (PAN-101).
 - Station agent: a relay connection that stops responding or stops accepting data is now closed within seconds, remote TX is disarmed, and the agent reconnects (PAN-102).
 - Release workflow: every GitHub Action is pinned to a full commit SHA, and only the job that creates the draft release can write to the repository (PAN-106).
+- Semgrep workflow: a run without `SEMGREP_APP_TOKEN` (fork PRs, Dependabot) no longer reports the same success as a completed scan — the platform check now shows as skipped and a separate secret-free scan of a vendored, pinned ruleset runs instead (PAN-107).
 
 ## [0.9.6] - 2026-09-02
 

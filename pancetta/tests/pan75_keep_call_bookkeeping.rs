@@ -161,8 +161,11 @@ async fn never_aired_qso_does_not_trip_the_stall_offset_switch() {
         .first_call_at
         .unwrap();
     let mut a_switched = false;
+    // PAN-128: A's aired rearms step two slots (30 s) apart so each feeds a
+    // distinct own-parity TX slot — the stall counter counts own TX slots,
+    // not protocol slots — and the threshold trip is phase-independent.
     for slot in 0..=6 {
-        let t = opened + Duration::seconds(slot * 15);
+        let t = opened + Duration::seconds(slot * 30);
         let (aired, _, actions) = cycle(&manager, &mut rx, b, 1, t).await;
         assert!(!aired.contains(&b));
         assert!(!actions.contains(&b));
@@ -170,7 +173,7 @@ async fn never_aired_qso_does_not_trip_the_stall_offset_switch() {
         assert_eq!(manager.get_qso(b).await.unwrap().metadata.stall_cycles, 0);
         if slot < 6 {
             manager
-                .rearm_manual_calls_at(t + Duration::seconds(15))
+                .rearm_manual_calls_at(t + Duration::seconds(30))
                 .await;
         }
     }

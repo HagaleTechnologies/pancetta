@@ -426,6 +426,7 @@ cargo run --release -p pancetta-research --bin gen-synth -- \
     --output research/corpus/synth/manifests/clean.manifest.json
 
 # Curate the operator's real-world WAVs.
+# ~/.pancetta/recordings fills only on a station whose config sets [audio.recording] auto_record = true and directory = "~/.pancetta/recordings" (docs/CONFIG.md).
 cargo run --release -p pancetta-research --bin curate -- \
     --source-dir ~/.pancetta/recordings --output-prefix research/corpus/curated/ft8
 

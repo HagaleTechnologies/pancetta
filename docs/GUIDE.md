@@ -172,7 +172,10 @@ contemporaneous-initiation posture), and if you must step away, press `g`
 until the policy reads **Respond-only** — or `Shift+Q` to stop TX
 entirely. The licensee remains responsible either way (§97.103).
 
-### …upload my logs (QRZ / LoTW / ClubLog)?
+### …upload my logs (QRZ / LoTW / ClubLog / eQSL)?
+
+eQSL upload is experimental, and no upload is retried if it fails; see
+[Capability status](../README.md#capability-status).
 
 Every QSO is appended to `~/.pancetta/qsos.adi` (durable ADIF — back it
 up). For live per-QSO uploads, enable the blocks in
