@@ -552,6 +552,21 @@ impl DxStation {
     }
 }
 
+/// Exact station identity for worked status: a resolved hash render matches
+/// its plain call, but a portable variant is a different station, matching
+/// the scorer's exact-call duplicate check (PAN-94, PAN-228).
+pub(crate) fn same_station(a: &str, b: &str) -> bool {
+    let a = a.trim().to_uppercase();
+    let b = b.trim().to_uppercase();
+    matches!(
+        (
+            pancetta_core::callsign::resolve_hash_render(&a),
+            pancetta_core::callsign::resolve_hash_render(&b),
+        ),
+        (Some(a), Some(b)) if a == b
+    )
+}
+
 fn tui_rank(
     adapter: DxStationLookupAdapter,
     call: &str,
@@ -3390,15 +3405,12 @@ impl App {
         rank.factors = Some(factors);
         if factors.worked_on_band {
             entry.worked_before = true;
-            let identity = |call: &str| {
-                pancetta_core::callsign::resolve_hash_render(&call.trim().to_uppercase())
-                    .map(str::to_owned)
-            };
-            if let Some(target) = identity(callsign) {
-                for m in &mut self.decoded_messages {
-                    if m.call_sign.as_deref().and_then(identity).as_deref() == Some(&target) {
-                        m.worked_before = true;
-                    }
+            for m in &mut self.decoded_messages {
+                if m.call_sign
+                    .as_deref()
+                    .is_some_and(|c| same_station(c, callsign))
+                {
+                    m.worked_before = true;
                 }
             }
         }
