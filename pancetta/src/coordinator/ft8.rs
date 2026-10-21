@@ -62,7 +62,6 @@ pub(crate) fn decode_budget_ceiling_ms(slot_ns: u64) -> u64 {
     }
 }
 
-<<<<<<< HEAD
 /// The `Ft8Config` fields a live `Ft8Decoder` bakes in at construction.
 /// When any of them changes, the hot loop rebuilds the decoder before it
 /// uses the budget published with that change. Every field
@@ -159,7 +158,8 @@ pub(crate) fn refresh_decode_window<E>(
         }
         Err(e) => DecodeWindowRefresh::RebuildFailed(e),
     }
-=======
+}
+
 /// PAN-165: ms left on `budget` at `at` (`None` = unlimited).
 fn headroom_ms(budget: &pancetta_ft8::DecodeBudget, at: Instant) -> Option<u64> {
     budget
@@ -172,7 +172,6 @@ fn over_deadline_ms(budget: &pancetta_ft8::DecodeBudget, at: Instant) -> u64 {
     budget
         .deadline()
         .map_or(0, |d| at.saturating_duration_since(d).as_millis() as u64)
->>>>>>> a4726c339acda83e4f0481846509f62cdc127b60
 }
 
 /// Compute the active protocol's slot parity for a decoded window.

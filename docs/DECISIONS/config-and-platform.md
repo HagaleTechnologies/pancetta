@@ -98,13 +98,9 @@ PAN-157's `Max` override (2 passes + time-varying subtraction) was justified by 
 ### Open follow-ups (decoder speed overhaul)
 
 - **BP escalation ladder (S3) escalates in candidate rank order, not by promise** — inert today (`escalation_enabled=false`), but if ever flipped on under real time pressure this could waste a tight budget on an early low-promise candidate while skipping a later near-certain one. Fix is a global collect-sort-escalate restructure per the original design, not yet built.
-<<<<<<< HEAD
+- **Legacy `BudgetTracker` silently caps the pass loop (PAN-165).** `decode_window_with_ap_scoped_partner_impl` still builds `BudgetTracker::new(2000 + 500 × osd_depth)` anchored at call start and checks it before every pass. It is redundant in production, where the receipt-anchored `DecodeBudget` deadline is never later, but it makes `DecodeBudget::unlimited()` harness runs host-dependent (on a 2-core host it cancelled pass 2 in 16 of 18 synth-pair windows). It is now visible as a `multipass-legacy-deadline` stage; candidate for retirement.
 - **Effort budget is not re-seeded by config hot-reload.** `seed_effort_budget` only runs at coordinator startup and tier-probe completion; editing `[decoder]` in a running instance's config file has no live effect (restart required). The live `e`-key TUI control is unaffected — it publishes into the `DecodeWindowConfig` directly. Root cause: `pancetta-config`'s hot-reload file watcher is a documented no-op in this codebase today.
 - **Budget/config window atomicity (PAN-164, resolved).** Budget and the effort-conditional `Ft8Config` fields publish as one `DecodeWindowConfig` under one lock; the FT8 hot loop reads it once per window and keeps the whole previous state on contention or a failed rebuild; the budget ceiling now comes from the decoder's own protocol, which also closes the FT4→FT8-on-Max mode-switch tear.
-=======
-- **Legacy `BudgetTracker` silently caps the pass loop (PAN-165).** `decode_window_with_ap_scoped_partner_impl` still builds `BudgetTracker::new(2000 + 500 × osd_depth)` anchored at call start and checks it before every pass. It is redundant in production, where the receipt-anchored `DecodeBudget` deadline is never later, but it makes `DecodeBudget::unlimited()` harness runs host-dependent (on a 2-core host it cancelled pass 2 in 16 of 18 synth-pair windows). It is now visible as a `multipass-legacy-deadline` stage; candidate for retirement.
-- **Effort budget is not re-seeded by config hot-reload.** `seed_effort_budget` only runs at coordinator startup and tier-probe completion; editing `[decoder]` in a running instance's config file has no live effect (restart required). The live `e`-key TUI control is unaffected — it writes the atomic directly. Root cause: `pancetta-config`'s hot-reload file watcher is a documented no-op in this codebase today.
->>>>>>> a4726c339acda83e4f0481846509f62cdc127b60
 
 ## Audio auto-recovery supervisor (2026-07-11)
 
