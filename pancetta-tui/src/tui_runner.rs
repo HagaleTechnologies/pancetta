@@ -340,6 +340,14 @@ pub enum TuiMessage {
     /// once per callsign per sender, and only when a value actually exists,
     /// so a state learned later in the session still propagates.
     StationState { callsign: String, state: String },
+    /// The relay rescored a station's latest decode after a QSO with it ended
+    /// (PAN-94), so new worked or failure history reaches DX Hunter before
+    /// that station is decoded again.
+    DxRankRefresh {
+        callsign: String,
+        score: u32,
+        factors: pancetta_qso::priority::PriorityFactors,
+    },
 }
 
 /// Commands sent from TUI
@@ -1016,6 +1024,13 @@ impl TuiRunner {
             }
             TuiMessage::StationState { callsign, state } => {
                 app.set_station_state(&callsign, &state);
+            }
+            TuiMessage::DxRankRefresh {
+                callsign,
+                score,
+                factors,
+            } => {
+                app.refresh_local_rank(&callsign, score, factors);
             }
         }
 

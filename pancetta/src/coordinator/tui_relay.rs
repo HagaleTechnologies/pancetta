@@ -54,6 +54,53 @@ fn display_grid(
     }
 }
 
+/// Inputs of a station's latest decode, per exact callsign (PAN-94).
+#[derive(Debug, Clone)]
+struct RankInputs {
+    grid: Option<String>,
+    snr_db: f32,
+    dial_mhz: f64,
+}
+
+/// Rescore every row a terminal QSO outcome names from its latest decode's
+/// inputs, so worked and failure history recorded at QSO end reach DX Hunter
+/// before that station is decoded again. Rows match on resolved identity, so
+/// a hash-rendered decode (`<PJ4/K1ABC>`) and the QSO's plain callsign find
+/// each other in either direction. Empty when no matching callsign has been
+/// decoded in this relay session.
+fn outcome_rank_refresh(
+    scorer: &pancetta_qso::PriorityScorer,
+    last_inputs: &std::collections::HashMap<String, RankInputs>,
+    callsign: &str,
+) -> Vec<pancetta_tui::tui_runner::TuiMessage> {
+    let identity = |call: &str| {
+        pancetta_core::callsign::resolve_hash_render(&call.trim().to_uppercase()).map(str::to_owned)
+    };
+    let Some(target) = identity(callsign) else {
+        return Vec::new();
+    };
+    last_inputs
+        .iter()
+        .filter(|(call, _)| identity(call).as_deref() == Some(target.as_str()))
+        .filter_map(|(call, inputs)| {
+            let (Some(score), Some(factors)) = display_rank(
+                scorer,
+                Some(call),
+                inputs.grid.as_deref(),
+                inputs.snr_db,
+                inputs.dial_mhz,
+            ) else {
+                return None;
+            };
+            Some(pancetta_tui::tui_runner::TuiMessage::DxRankRefresh {
+                callsign: call.clone(),
+                score,
+                factors,
+            })
+        })
+        .collect()
+}
+
 /// Capture score and explanation in one scoring call over the shared lookup.
 fn display_rank(
     scorer: &pancetta_qso::PriorityScorer,
@@ -232,6 +279,7 @@ impl super::ApplicationCoordinator {
             let mut sent_states: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
             let mut last_grids = std::collections::HashMap::new();
+            let mut last_rank_inputs = std::collections::HashMap::new();
             while !relay_shutdown.load(Ordering::Acquire) {
                 if !ft8_disconnected {
                     match ft8_to_tui_rx.try_recv() {
@@ -332,6 +380,13 @@ impl super::ApplicationCoordinator {
                             let (priority_score, priority_factors) = display_rank(
                                 &relay_scorer, call_sign.as_deref(), grid_square.as_deref(),
                                 decoded_msg.snr_db, dial_mhz);
+                            if let Some(call) = call_sign.as_deref() {
+                                last_rank_inputs.insert(call.to_owned(), RankInputs {
+                                    grid: grid_square.clone(),
+                                    snr_db: decoded_msg.snr_db,
+                                    dial_mhz,
+                                });
+                            }
 
                             let tui_decoded = pancetta_tui::DecodedMessageView {
                                 timestamp: chrono::Utc::now(),
@@ -685,6 +740,14 @@ impl super::ApplicationCoordinator {
                                     map_recent_qso_outcome(outcome),
                                 ),
                             );
+                            // PAN-94: the QSO task records worked/failure
+                            // history before emitting this outcome, so rescore
+                            // the row now rather than at its next decode.
+                            for refresh in outcome_rank_refresh(
+                                &relay_scorer, &last_rank_inputs, &outcome.callsign)
+                            {
+                                let _ = tui_msg_tx_relay.send(refresh);
+                            }
                         }
                         MessageType::TxPlacementUpdate { ref snapshot } => {
                             // TX-placement instrument (Task 9/10): convert the
@@ -4155,6 +4218,85 @@ mod tui_relay_tests {
             super::display_grid(&mut last_grids, Some("K1ABC"), None, 14.074).as_deref(),
             Some("FN43")
         );
+    }
+
+    #[tokio::test]
+    async fn qso_outcome_rescores_the_row_from_fresh_failure_history() {
+        use pancetta_tui::{app::App, tui_runner::TuiMessage, Config, DecodedMessageView};
+
+        let lookup = crate::priority_evaluator::CachedStationLookup::new();
+        let scorer = pancetta_qso::PriorityScorer::new(
+            pancetta_qso::priority::PriorityWeights::default(),
+            Box::new(lookup.clone()),
+        );
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        let (priority_score, priority_factors) =
+            super::display_rank(&scorer, Some("K1ABC/P"), Some("FN42"), -3.0, 14.074);
+        app.add_decoded_message(DecodedMessageView {
+            timestamp: chrono::Utc::now(),
+            frequency: 14.074,
+            mode: "FT8".into(),
+            snr: -3,
+            delta_time: 0.0,
+            delta_freq: 1500.0,
+            call_sign: Some("K1ABC/P".into()),
+            grid_square: Some("FN42".into()),
+            message: "CQ K1ABC/P FN42".into(),
+            distance: None,
+            bearing: None,
+            slot_parity: None,
+            is_directed_at_us: false,
+            worked_before: false,
+            needed: false,
+            atno: false,
+            band_needed: false,
+            priority_score,
+            priority_factors,
+            is_own_tx: false,
+        })
+        .await
+        .unwrap();
+        let before = app.dx_stations["K1ABC/P"].priority_score;
+        let heard_at = app.dx_stations["K1ABC/P"].local_rank.unwrap().at;
+
+        let mut last_inputs = std::collections::HashMap::new();
+        last_inputs.insert(
+            "K1ABC/P".to_owned(),
+            super::RankInputs {
+                grid: Some("FN42".into()),
+                snr_db: -3.0,
+                dial_mhz: 14.074,
+            },
+        );
+        // A QSO with a station never decoded here has no row to rescore.
+        assert!(super::outcome_rank_refresh(&scorer, &last_inputs, "K2ABC").is_empty());
+
+        // The QSO task records the failure, then emits the outcome.
+        lookup.record_failure("K1ABC/P");
+        // The outcome may name the station in hash-rendered form.
+        let refreshes = super::outcome_rank_refresh(&scorer, &last_inputs, "<K1ABC/P>");
+        assert_eq!(refreshes.len(), 1);
+        let Some(TuiMessage::DxRankRefresh {
+            callsign,
+            score,
+            factors,
+        }) = refreshes.into_iter().next()
+        else {
+            panic!("a decoded station's QSO outcome must rescore its row");
+        };
+        app.refresh_local_rank(&callsign, score, factors);
+
+        let row = &app.dx_stations["K1ABC/P"];
+        assert!(
+            row.priority_score < before,
+            "{} >= {before}",
+            row.priority_score
+        );
+        let rank = row.local_rank.unwrap();
+        assert!(rank.factors.unwrap().recent_failure);
+        assert_eq!(rank.at, heard_at, "a rescore is not a new decode");
+        let reason = pancetta_tui::dx_reason::reason_for(row, None, chrono::Utc::now()).summary();
+        assert!(reason.contains("QSO failed this session"), "{reason}");
     }
 
     #[test]

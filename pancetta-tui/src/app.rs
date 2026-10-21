@@ -3343,6 +3343,22 @@ impl App {
         }
     }
 
+    /// Replace a row's local-decode rank with the relay's rescore after a QSO
+    /// with that station ended (PAN-94). Keeps when it was heard; rows with no
+    /// local decode are left alone.
+    pub fn refresh_local_rank(&mut self, callsign: &str, score: u32, factors: PriorityFactors) {
+        let Some(entry) = self.dx_stations.get_mut(callsign) else {
+            return;
+        };
+        let Some(rank) = entry.local_rank.as_mut() else {
+            return;
+        };
+        rank.score = score;
+        rank.factors = Some(factors);
+        entry.refresh_priority_score();
+        self.clamp_dx_hunter_selection();
+    }
+
     /// Apply a fresh TX-placement snapshot (relayed from the coordinator's
     /// `MessageType::TxPlacementUpdate`). `v.received_at` is stamped by the
     /// relay layer (`tui_relay.rs`) at conversion time, since it owns the
