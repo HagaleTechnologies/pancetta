@@ -4984,8 +4984,8 @@ pub(crate) mod audit_test_util {
         /// PAN-147 regression: a stale file left at the exact path a later
         /// PID-reusing run regenerates used to precede that run's append-mode
         /// writes, inflating the read-back (2 lines instead of 1). The guard
-        /// must sweep both the stale file and a stale rotation sibling before
-        /// use, and everything again on drop.
+        /// must sweep the stale file and its `.1`..`.4` rotation siblings
+        /// before use, and everything again on drop.
         #[test]
         fn stale_leftover_file_and_archive_are_swept_before_use() {
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -4993,13 +4993,19 @@ pub(crate) mod audit_test_util {
                 "pancetta-audit-util-test-{}-{n}.log",
                 std::process::id()
             ));
-            let sibling = p.with_extension("log.1");
+            let siblings: Vec<PathBuf> = (1..=4)
+                .map(|slot| p.with_extension(&format!("log.{slot}")))
+                .collect();
             std::fs::write(&p, "stale line\n").unwrap();
-            std::fs::write(&sibling, "stale archive\n").unwrap();
+            for s in &siblings {
+                std::fs::write(s, "stale archive\n").unwrap();
+            }
 
             let t = TempPath::at(p.clone());
             assert!(!p.exists(), "stale base file must be gone before use");
-            assert!(!sibling.exists(), "stale archive sibling must be gone");
+            for s in &siblings {
+                assert!(!s.exists(), "stale archive sibling {s:?} must be gone");
+            }
 
             let audit = pancetta_agent::audit::AuditLog::new(p.clone());
             audit
@@ -5010,11 +5016,7 @@ pub(crate) mod audit_test_util {
                     detail: "one fresh line".into(),
                 })
                 .expect("append must record");
-            let lines = std::fs::read_to_string(&p)
-                .unwrap()
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .count();
+            let lines = std::fs::read_to_string(&p).unwrap().lines().count();
             assert_eq!(
                 lines, 1,
                 "exactly this run's record — stale bytes must not precede it"
@@ -5022,7 +5024,9 @@ pub(crate) mod audit_test_util {
 
             drop(t);
             assert!(!p.exists(), "drop must delete the base file");
-            assert!(!sibling.exists(), "drop must delete archive siblings");
+            for s in &siblings {
+                assert!(!s.exists(), "drop must delete archive sibling {s:?}");
+            }
         }
 
         #[test]
