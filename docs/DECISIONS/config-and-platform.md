@@ -674,3 +674,26 @@ remote-gateway acceptor does not follow this rule yet (PAN-99).
   unread. Restart-required like every non-live key — including across DSP
   supervisor restarts, because the running config snapshot is patched only
   for security fields.
+
+## `--replay` feed waits for the QSO history seed (PAN-42, 2026-10-21)
+
+- `run()` starts the replay feeder (`start_pipeline()`) before the QSO
+  component, and both `start_*` calls return once their task is spawned.
+  Under `--replay` the QSO task rebuilds a `:memory:` index from the whole
+  `qsos.adi` and seeds worked/DX-Hunter/display history before its receiver
+  loop, so on a large logbook decodes queued unread (or were aborted by
+  replay's self-shutdown). Deferred from PR #293 round 6.
+- Fix: `ApplicationCoordinator::qso_consumer_ready` (`watch<bool>`). The QSO
+  task's `replay::QsoConsumerReadyGuard` stores `true` immediately before
+  the receiver loop, or on drop (startup error, panic, abort), so a dead
+  QSO task never hangs a replay. The feeder's `wait_for_qso_consumer` waits
+  for it, polling shutdown every 100 ms, then does its slot-boundary
+  pre-roll.
+- Rejected: reordering `run()` or awaiting the seed in
+  `start_qso_component()` (that is also the supervisor's restart path), and
+  seeding off the receiver loop (early decodes would be scored without
+  history, so results would still depend on logbook size). No timeout cap,
+  for the same reason. The flag is never reset, so a Qso restart does not
+  re-gate a running feed.
+- Live mode is unchanged: live audio cannot be held back. A slow live index
+  rebuild can likewise delay the first live decodes; that is a separate gap.

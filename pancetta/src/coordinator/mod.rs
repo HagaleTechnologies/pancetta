@@ -1764,6 +1764,18 @@ pub struct ApplicationCoordinator {
     /// one -- `send` would see `receiver_count() == 0` and discard the value
     /// instead of storing it, leaving every later subscriber seeded `None`.
     pub(crate) qso_manager_watch: tokio::sync::watch::Sender<Option<pancetta_qso::QsoManager>>,
+
+    /// PAN-42: `true` once the QSO component's task has finished its startup
+    /// worked-history seed and is about to drain `ComponentId::Qso` (or has
+    /// exited without getting there). The `--replay` feeder
+    /// (`replay.rs`) waits on this before its slot-boundary pre-roll, so
+    /// replayed audio never reaches the decoder while the QSO engine is
+    /// still rebuilding history from a large `qsos.adi`. Written only through
+    /// `replay::QsoConsumerReadyGuard` (released on every exit path); never
+    /// reset to `false`, so a Qso restart does not re-gate a running feed.
+    /// `send_replace` semantics for the same zero-receiver reason as
+    /// `qso_manager_watch` above.
+    pub(crate) qso_consumer_ready: tokio::sync::watch::Sender<bool>,
 }
 
 #[cfg(feature = "pancetta-hamlib")]
@@ -2389,6 +2401,7 @@ impl ApplicationCoordinator {
             wsjtx_qso_events_rx: None,
             qso_manager_for_supervisor: None,
             qso_manager_watch: tokio::sync::watch::channel(None).0,
+            qso_consumer_ready: tokio::sync::watch::channel(false).0,
         };
 
         info!("Application Coordinator initialized with ID: {}", id);
