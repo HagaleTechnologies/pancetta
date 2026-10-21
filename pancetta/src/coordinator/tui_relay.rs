@@ -1118,16 +1118,15 @@ impl super::ApplicationCoordinator {
         let cmd_tx_offset_hold_hz = self.tx_offset_hold_hz();
         // decoder-speed-overhaul Task 15: live decode-effort cycling (`e`).
         // The handler cycles `cmd_current_decode_effort`, resolves `Auto`
-        // against `cmd_resolved_hardware_tier`, and writes the resulting
-        // budget into `cmd_decode_effort_budget_ms` — the same atomic
-        // `ft8.rs` reads at both budgeted decode call sites.
+        // against `cmd_resolved_hardware_tier`, and publishes the resulting
+        // budget with its decoder config into `cmd_decode_window` — the one
+        // `DecodeWindowConfig` `ft8.rs` reads once per window (PAN-164).
         let cmd_current_decode_effort = self.current_decode_effort();
         let cmd_resolved_hardware_tier = self.resolved_hardware_tier();
-        let cmd_decode_effort_budget_ms = self.decode_effort_budget_ms();
         // Mode-switch machinery (Shift+M). Cloned here (not previously
         // needed by this task) so the CycleOperatingMode handler can call
         // `try_switch_operating_mode` directly, mirroring how `cmd_tx_policy`
-        // is used by CycleTxPolicy. `ft8_config`/`active_tx_qsos` are
+        // is used by CycleTxPolicy. `decode_window`/`active_tx_qsos` are
         // `pub(crate)` fields so they clone directly with no accessor;
         // `active_protocol_mode`/`active_slot_ns`/`active_decode_phase_ns` go
         // through their `pub(crate) fn` accessors.
@@ -1154,7 +1153,7 @@ impl super::ApplicationCoordinator {
         let cmd_qso_manager_watch = self.qso_manager_watch.subscribe();
         let cmd_pending_qso_offset_requests = self.pending_qso_offset_requests.clone();
         let cmd_pending_cq_offset_nudge = self.pending_cq_offset_nudge.clone();
-        let cmd_ft8_config = self.ft8_config.clone();
+        let cmd_decode_window = self.decode_window.clone();
         let cmd_active_protocol_mode = self.active_protocol_mode();
         let cmd_active_slot_ns = self.active_slot_ns();
         let cmd_active_decode_phase_ns = self.active_decode_phase_ns();
@@ -1324,7 +1323,7 @@ impl super::ApplicationCoordinator {
                 )
                 .label()
                 .to_string();
-                let budget_ms = cmd_decode_effort_budget_ms.load(Ordering::Acquire);
+                let budget_ms = cmd_decode_window.read().await.budget_ms();
                 let _ =
                     cmd_tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::DecodeEffortUpdate {
                         effort,
@@ -1921,13 +1920,12 @@ impl super::ApplicationCoordinator {
                             match super::try_switch_operating_mode(
                                 next,
                                 &cmd_active_tx_qsos,
-                                &cmd_ft8_config,
+                                &cmd_decode_window,
                                 &cmd_active_protocol_mode,
                                 &cmd_active_slot_ns,
                                 &cmd_active_decode_phase_ns,
                                 &cmd_current_decode_effort,
                                 &cmd_resolved_hardware_tier,
-                                &cmd_decode_effort_budget_ms,
                             ) {
                                 Ok(()) => {
                                     let mode_str = super::mode_str(next).to_string();
@@ -2031,85 +2029,29 @@ impl super::ApplicationCoordinator {
                             // state (spec §6.2) — so there is no active-QSO
                             // gate and no optimistic local flip on the TUI side;
                             // the TUI simply waits for this authoritative echo.
-                            let tier = pancetta_ft8::tier_probe::HardwareTier::from_u8(
-                                cmd_resolved_hardware_tier.load(Ordering::Acquire),
-                            );
-                            let (next, mut budget_ms) = super::effort::cycle_decode_effort(
-                                &cmd_current_decode_effort,
-                                &cmd_decode_effort_budget_ms,
-                                tier,
-                            );
-                            // PAN-156: re-apply the new preset's Ft8Config
-                            // overrides immediately so a live cycle doesn't
-                            // wait for a restart to take effect (and so
-                            // cycling AWAY from a preset with an override
-                            // reverts it, not just cycling into one).
                             //
-                            // PAN-156 round-2 review finding: `write().await`
-                            // can yield, and `tier` above was snapshotted
-                            // before that yield — if the background tier
-                            // probe resolves and applies its own (correct)
-                            // overrides in that gap, this continuation must
-                            // not clobber them with a stale tier's overrides.
-                            // Re-read the resolved-tier atomic fresh, after
-                            // the lock is actually held, mirroring the same
-                            // fix on the probe-worker side (`tier.rs`'s
-                            // `spawn_probe_worker`, which re-checks
-                            // `current_decode_effort` at the same point for
-                            // the opposite direction of this race).
-                            //
-                            // PAN-156 round-6 review finding: fixing the
-                            // config override alone left the BUDGET
-                            // inconsistent with it — `budget_ms` above was
-                            // still computed from the stale pre-lock `tier`
-                            // snapshot, so an Auto cycle racing the tier
-                            // probe could end up with e.g. Slow-tier
-                            // overrides paired with the Fast-tier budget.
-                            // Recompute the budget from the same
-                            // `tier_at_write` used for the override, and
-                            // re-store it, so both halves of Auto's
-                            // tier-dependent state come from one consistent
-                            // read.
-                            // PAN-157 round-9 review finding: budget must
-                            // publish no later than config, not after —
-                            // ft8.rs's hot loop reads the budget atomic
-                            // first and the config `try_read` second, so
-                            // publishing config before budget can land a
-                            // window on the NEW config with the OLD,
-                            // possibly-bounded budget (risking starving a
-                            // pass the new config just enabled). The
-                            // reverse tear (new budget + old config) is
-                            // harmless — nothing in the old config needs
-                            // the extra time. See `effort.rs`'s
-                            // `apply_effort_overrides` doc for the full
-                            // reasoning; `tier.rs`'s probe-completion path
-                            // got the same fix.
-                            {
-                                let mut cfg_guard = cmd_ft8_config.write().await;
-                                let tier_at_write = pancetta_ft8::tier_probe::HardwareTier::from_u8(
+                            // PAN-164: the cycle, its tier read and its
+                            // publish all happen under one `decode_window`
+                            // write guard, so the hot loop sees the whole
+                            // change (budget + the Ft8Config overrides
+                            // derived from it) or none of it. Reading the
+                            // tier under the lock also serialises this with
+                            // the tier probe, which stores it inside its own
+                            // critical section on this same lock (PAN-156
+                            // rounds 2 and 6): whichever runs second
+                            // publishes a consistent final state.
+                            let (next, budget_ms, tier) = {
+                                let mut window_guard = cmd_decode_window.write().await;
+                                let tier = pancetta_ft8::tier_probe::HardwareTier::from_u8(
                                     cmd_resolved_hardware_tier.load(Ordering::Acquire),
                                 );
-                                if next == pancetta_config::DecodeEffort::Auto {
-                                    budget_ms =
-                                        super::effort::preset_budget_ms(next, tier_at_write);
-                                    cmd_decode_effort_budget_ms.store(budget_ms, Ordering::Release);
-                                }
-                                // Round-12 review finding: pass the SAME
-                                // `budget_ms` value that's already been
-                                // stored into `cmd_decode_effort_budget_ms`
-                                // (by `cycle_decode_effort` above, or by
-                                // the Auto-recompute just above this),
-                                // not a guessed `None` — this is always
-                                // consistent with the atomic's actual
-                                // state by construction, the same fix
-                                // applied to `try_switch_operating_mode`.
-                                super::effort::apply_effort_overrides(
-                                    next,
-                                    tier_at_write,
-                                    budget_ms,
-                                    &mut cfg_guard,
+                                let (next, budget_ms) = super::effort::cycle_decode_effort(
+                                    &cmd_current_decode_effort,
+                                    &mut window_guard,
+                                    tier,
                                 );
-                            }
+                                (next, budget_ms, tier)
+                            };
                             let label = next.label().to_string();
                             info!(
                                 target: "decoder.effort",

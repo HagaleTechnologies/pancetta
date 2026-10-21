@@ -1,20 +1,22 @@
 //! Decode-effort preset → wall-time budget mapping (decoder-speed-overhaul
 //! Task 14).
 //!
-//! Task 12 wired a `decode_effort_budget_ms: Arc<AtomicU64>` atomic into the
-//! FT8 decode loop's two budgeted call sites (`coordinator/ft8.rs`), but left
-//! it permanently `0` (unlimited) — nothing wrote to it. Task 13 added the
-//! persisted `[decoder]` config section (`pancetta_config::DecoderConfig`,
+//! Task 12 wired a per-window decode budget into the FT8 decode loop's two
+//! budgeted call sites (`coordinator/ft8.rs`), but left it permanently `0`
+//! (unlimited) — nothing wrote to it. Task 13 added the persisted
+//! `[decoder]` config section (`pancetta_config::DecoderConfig`,
 //! `effort: DecodeEffort` + `budget_ms: Option<u64>`), but nothing read it.
 //! This module is the seam that connects them: [`preset_budget_ms`] maps an
 //! effort preset (plus, for `Auto`, the probed [`HardwareTier`]) to a budget
-//! in milliseconds, and [`seed_effort_budget`] is the single place that
-//! writes the result into the shared atomic (honoring an explicit
-//! `budget_ms` config override, which always wins over the preset).
+//! in milliseconds, and [`seed_effort_budget`] publishes the result
+//! (honoring an explicit `budget_ms` config override, which always wins
+//! over the preset) together with the `Ft8Config` overrides derived from
+//! it, as one [`DecodeWindowConfig`] change (PAN-164).
 //!
 //! ## Seeding sites
 //!
-//! `seed_effort_budget` is called from three places:
+//! The budget is published from four places, each holding the coordinator's
+//! `decode_window` write guard:
 //!
 //! 1. **Coordinator startup** (`coordinator/mod.rs`) — seeds an initial value
 //!    before the hardware tier is known, assuming [`HardwareTier::Fast`] (the
@@ -24,19 +26,18 @@
 //! 2. **Tier-probe completion** (`tier.rs`) — both the synchronous
 //!    cache-hit path and the asynchronous background-probe-completion path
 //!    re-seed with the now-known tier.
-//! 3. **Config hot-reload** — as of this task, pancetta's coordinator has no
-//!    wired *live* config-reload apply path (see `coordinator::health`'s C19
+//! 3. **TUI effort cycle** (`tui_relay.rs`'s `CycleDecodeEffort` arm) —
+//!    [`cycle_decode_effort`], the operator's `e` keybinding (spec
+//!    2026-07-06, §6.2).
+//! 4. **Config hot-reload** — still not wired: pancetta's coordinator has
+//!    no *live* config-reload apply path (see `coordinator::health`'s C19
 //!    doc comment: `pancetta_config::ConfigHotReload`'s file watcher exists
 //!    but is never constructed anywhere in this crate; hot-reload is a
 //!    documented no-op by design so a reload can never clobber latched QSO
-//!    state). There is therefore no existing "config changed live" call site
-//!    to hook today. `seed_effort_budget` is exposed as `pub(crate)`
-//!    specifically so that whichever lands first — a general hot-reload
-//!    apply handler, or the effort-cycling TUI keybinding described in the
-//!    design spec (2026-07-06, §6.2) — can call it directly instead of
-//!    re-deriving the mapping.
+//!    state). A future apply handler should call [`seed_effort_budget`]
+//!    under the same write guard instead of re-deriving the mapping.
 
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use pancetta_config::DecodeEffort;
 use pancetta_ft8::tier_probe::HardwareTier;
@@ -45,8 +46,8 @@ use pancetta_ft8::Ft8Config;
 /// Map a decode-effort preset (and, for `Auto`, the probed hardware tier) to
 /// a per-window wall-time budget in milliseconds.
 ///
-/// `0` is the unlimited sentinel (matches `decode_effort_budget_ms`'s
-/// contract in `coordinator/ft8.rs`). `Eco` (and `Auto` on `Slow` hardware)
+/// `0` is the no-preset-limit sentinel (the FT8 hot loop resolves it to
+/// the protocol's slot ceiling, `coordinator/ft8.rs`). `Eco` (and `Auto` on `Slow` hardware)
 /// deliberately use `1`, NOT `0` — a 1ms budget forces the decode loop's
 /// anytime scheduler to stop after the floor stage(s) deterministically,
 /// whereas `0` would mean *unlimited*, the opposite intent.
@@ -69,25 +70,28 @@ pub(crate) fn preset_budget_ms(effort: DecodeEffort, tier: HardwareTier) -> u64 
 }
 
 /// Compute the effective budget (config override wins over the preset) and
-/// store it into the shared atomic.
+/// publish it, with the effort overrides derived from that same value, into
+/// `window` (PAN-164).
 ///
 /// This is the single seeding entry point — called at coordinator startup
-/// (with an assumed tier, before the probe resolves), on tier-probe
-/// completion (cache-hit or background-probe path), and available for a
-/// future live-reload/TUI-cycle call site (see the module doc).
+/// (with an assumed tier, before the probe resolves) and on tier-probe
+/// completion (cache-hit or background-probe path); see the module doc.
+/// Callers hold the `decode_window` write guard, so the FT8 hot loop sees
+/// the whole change or none of it.
 pub(crate) fn seed_effort_budget(
     effort: DecodeEffort,
     budget_override: Option<u64>,
     tier: HardwareTier,
-    decode_effort_budget_ms: &AtomicU64,
+    window: &mut DecodeWindowConfig,
 ) {
     let budget = budget_override.unwrap_or_else(|| preset_budget_ms(effort, tier));
-    decode_effort_budget_ms.store(budget, Ordering::Release);
+    window.publish_effort(effort, tier, budget);
 }
 
 /// Cycle the operator's live decode-effort preset (Eco → Standard → Deep →
 /// Max → Auto → Eco — decoder-speed-overhaul Task 15, TUI `e` keybinding)
-/// and immediately write the resulting budget into the shared atomic.
+/// and immediately publish the resulting budget and effort overrides into
+/// `window` as one change (PAN-164).
 ///
 /// Unlike [`seed_effort_budget`], this deliberately ignores any config
 /// `budget_ms` override: an explicit operator keypress asking for a
@@ -95,6 +99,7 @@ pub(crate) fn seed_effort_budget(
 /// override silently re-clobber it back. `current_effort` is read/written
 /// with the SAME stable `u8` encoding as [`DecodeEffort::as_u8`]/`from_u8`,
 /// so it round-trips exactly through the atomic across repeated presses.
+/// The caller holds the `decode_window` write guard across the whole call.
 ///
 /// Returns `(new_preset, new_budget_ms)` — the caller (the TUI relay's
 /// command handler) uses this to build the `DecodeEffortUpdate` echo sent
@@ -103,14 +108,14 @@ pub(crate) fn seed_effort_budget(
 /// succeeds.
 pub(crate) fn cycle_decode_effort(
     current_effort: &AtomicU8,
-    decode_effort_budget_ms: &AtomicU64,
+    window: &mut DecodeWindowConfig,
     tier: HardwareTier,
 ) -> (DecodeEffort, u64) {
     let current = DecodeEffort::from_u8(current_effort.load(Ordering::Acquire));
     let next = current.cycle();
     current_effort.store(next.as_u8(), Ordering::Release);
     let budget = preset_budget_ms(next, tier);
-    decode_effort_budget_ms.store(budget, Ordering::Release);
+    window.publish_effort(next, tier, budget);
     (next, budget)
 }
 
@@ -145,13 +150,14 @@ fn resolve_effective_effort(effort: DecodeEffort, tier: HardwareTier) -> DecodeE
 /// via [`resolve_effective_effort`] first, so it picks up the same
 /// overrides a station manually set to that preset would get.
 ///
-/// Called at coordinator startup, from the TUI's live effort-cycle
-/// handler (`tui_relay.rs`'s `CycleDecodeEffort` arm), and from
-/// `tier::initialize`/`tier::spawn_probe_worker`'s tier-resolution paths
-/// (guarded by the same `Auto`-only race guard `seed_effort_budget`
-/// uses there) — so a live preset switch OR a tier probe landing after
-/// startup both re-apply the right fields immediately rather than only
-/// at restart.
+/// Production code reaches it only through [`DecodeWindowConfig`]'s
+/// methods: [`seed_effort_budget`] (startup and
+/// `tier::initialize`/`tier::spawn_probe_worker`'s tier-resolution
+/// paths), [`cycle_decode_effort`] (the TUI's live effort-cycle handler)
+/// and [`DecodeWindowConfig::switch_protocol`] (runtime mode switch) — so
+/// a live preset switch OR a tier probe landing after startup both
+/// re-apply the right fields immediately rather than only at restart,
+/// always together with the budget they were derived from.
 ///
 /// ## PAN-157: the first real override — `Max` only
 ///
@@ -244,70 +250,28 @@ fn resolve_effective_effort(effort: DecodeEffort, tier: HardwareTier) -> DecodeE
 ///   `tier.rs` just spent 9 review rounds hardening.
 ///
 /// Both fields are always set TOGETHER by every arm, never
-/// independently — see the note below on why that means
-/// `coordinator/ft8.rs`'s decoder-rebuild-trigger comparison needs no
-/// new field.
+/// independently. Each is a decoder-rebuild trigger in
+/// `coordinator/ft8.rs`'s `DecoderRebuildKey`
+/// (`every_effort_override_field_is_a_rebuild_trigger` guards that for
+/// any future field this function writes).
 ///
-/// **Round-7/round-9 review findings — window atomicity.**
-/// `coordinator/ft8.rs`'s hot loop reads `decode_effort_budget_ms` (a
-/// plain atomic) and `ft8_config_shared` (a separate `try_read`)
-/// independently per window (`ft8.rs:~1547-1569`).
+/// **Window atomicity (PAN-164).** The budget and the fields this
+/// function writes publish together as one [`DecodeWindowConfig`] change
+/// under one write guard. `coordinator/ft8.rs`'s hot loop reads them with
+/// one `try_read()` per window (`refresh_decode_window`) and keeps the
+/// whole previous state on contention or a failed decoder rebuild, so
 /// `docs/superpowers/specs/2026-07-06-decoder-speed-overhaul-design.md`
-/// §6.2 states the authoritative invariant: "effort changes take effect
-/// at the next window" — atomically, as one unit, never a mix of the
-/// old budget with the new config or vice versa.
-///
-/// Round-9 review correctly rejected an earlier draft of this comment's
-/// claim that a torn read here "can't produce a wrong decode" — that
-/// overstated it. A **new bounded budget + an OLD (1-pass) config** is
-/// harmless (nothing extra configured to starve). But an **OLD bounded
-/// budget + the NEW 2-pass config** (e.g. mid-transition into `Max`) CAN
-/// transiently starve pass 2 for one window — not a wrong DECODE
-/// (LDPC/CRC still gate correctness) and not new territory (it's the
-/// same "budget exhausted, skip optional work" degradation the anytime-
-/// decoder architecture already tolerates at every bounded tier,
-/// signal-difficulty-dependent), but a real, slightly-longer-than-"next-
-/// window" gap this comment should not have waved away. Both writer
-/// call sites (`tier.rs`'s probe-completion path, `tui_relay.rs`'s live
-/// cycle handler — the latter already had the safe order) now publish
-/// the budget no later than the config write, which limits the tear to
-/// exactly that one harmless-vs-benign-degradation pair rather than an
-/// unbounded ordering. Full atomic-snapshot publishing (one generation
-/// counter for both) remains deferred until a bounded preset needs the
-/// override too, per the same reasoning PAN-156 used to defer this
-/// originally — this round only fixes the ordering, not the tear itself.
+/// §6.2's "effort changes take effect at the next window" holds as one
+/// unit — never an old budget paired with a new config or vice versa.
 pub(crate) fn apply_effort_overrides(
     effort: DecodeEffort,
     tier: HardwareTier,
-    // Round-12-of-PAN-157 review finding: an earlier version of this
-    // parameter was `budget_override: Option<u64>` (the STARTUP config
-    // value) — wrong axis. `try_switch_operating_mode` passed `None`
-    // for it unconditionally, on the theory that a live operator action
-    // ignores the persisted override the same way `cycle_decode_effort`
-    // does — but `cycle_decode_effort` ALSO reseeds
-    // `decode_effort_budget_ms` to the plain preset value, so `None`
-    // was consistent with the atomic's actual post-call state there. A
-    // mode switch does NOT touch `decode_effort_budget_ms` at all — the
-    // atomic keeps whatever it held before (possibly an explicit
-    // startup `budget_ms` override), so passing `None` there was
-    // internally inconsistent: it could re-enable the override while
-    // the REAL atomic stayed at a too-small explicit budget.
-    //
-    // Fixed by asking every caller for what actually matters: the
-    // resolved EFFECTIVE per-window budget this call will leave in
-    // place (`decode_effort_budget_ms`'s own `0`-means-unlimited-or-
-    // ceiling convention — see `preset_budget_ms`), not whether a
-    // persisted override happens to exist. Each call site already
-    // knows or can read this value directly:
-    // - Startup / `tier.rs`'s two paths: `budget_override.unwrap_or_else
-    //   (|| preset_budget_ms(effort, tier))` — literally what
-    //   `seed_effort_budget` is about to store, computed the same way.
-    // - `tui_relay.rs`'s `CycleDecodeEffort` handler: the `budget_ms`
-    //   `cycle_decode_effort` already computed and stored — pass it
-    //   directly instead of recomputing.
-    // - `try_switch_operating_mode`: reads `decode_effort_budget_ms`
-    //   fresh, since a mode switch never changes it — always correct by
-    //   construction, unlike guessing `None`.
+    // The resolved effective per-window budget published with this
+    // config (`0` = the protocol ceiling, see `preset_budget_ms`), not the
+    // persisted `budget_ms` override (PAN-157 round 12). Production
+    // callers are `DecodeWindowConfig::publish_effort` (the budget it is
+    // publishing) and `DecodeWindowConfig::switch_protocol` (the budget
+    // already published); other callers are tests only.
     effective_budget_ms: u64,
     config: &mut Ft8Config,
 ) {
@@ -357,6 +321,62 @@ pub(crate) fn apply_effort_overrides(
             config.time_varying_subtraction_enabled = false;
         }
         DecodeEffort::Auto => unreachable!("resolve_effective_effort never returns Auto"),
+    }
+}
+
+/// The per-window decode budget and the `Ft8Config` derived with it,
+/// published together behind one lock (PAN-164).
+///
+/// `coordinator/ft8.rs`'s hot loop takes both from a single `try_read()`
+/// per window, so it can never pair one publish's budget with another's
+/// config. Fields are private: the only ways to change the budget
+/// ([`Self::publish_effort`], via [`seed_effort_budget`] and
+/// [`cycle_decode_effort`]) re-derive the effort overrides from that same
+/// value under the caller's write guard.
+#[derive(Debug, Clone)]
+pub struct DecodeWindowConfig {
+    ft8: Ft8Config,
+    /// `0` = no preset limit; the hot loop resolves it to the protocol ceiling.
+    budget_ms: u64,
+}
+
+impl DecodeWindowConfig {
+    /// Wrap `ft8` and `budget_ms` as given, applying no effort overrides.
+    /// Production code calls [`seed_effort_budget`] right after.
+    pub fn new(ft8: Ft8Config, budget_ms: u64) -> Self {
+        Self { ft8, budget_ms }
+    }
+
+    pub fn ft8(&self) -> &Ft8Config {
+        &self.ft8
+    }
+
+    pub fn budget_ms(&self) -> u64 {
+        self.budget_ms
+    }
+
+    /// Publish `budget_ms` and the overrides [`apply_effort_overrides`]
+    /// derives from it, as one change.
+    pub(crate) fn publish_effort(
+        &mut self,
+        effort: DecodeEffort,
+        tier: HardwareTier,
+        budget_ms: u64,
+    ) {
+        self.budget_ms = budget_ms;
+        apply_effort_overrides(effort, tier, budget_ms, &mut self.ft8);
+    }
+
+    /// Runtime mode switch: set the protocol and re-derive the overrides
+    /// against the budget already published. Never changes the budget.
+    pub(crate) fn switch_protocol(
+        &mut self,
+        protocol: pancetta_ft8::Protocol,
+        effort: DecodeEffort,
+        tier: HardwareTier,
+    ) {
+        self.ft8.protocol = protocol;
+        apply_effort_overrides(effort, tier, self.budget_ms, &mut self.ft8);
     }
 }
 
@@ -439,23 +459,38 @@ mod tests {
 
     #[test]
     fn seed_effort_budget_uses_preset_when_no_override() {
-        let atomic = AtomicU64::new(999);
-        seed_effort_budget(DecodeEffort::Standard, None, HardwareTier::Fast, &atomic);
-        assert_eq!(atomic.load(Ordering::Acquire), 250);
+        let mut window = DecodeWindowConfig::new(Ft8Config::default(), 999);
+        seed_effort_budget(
+            DecodeEffort::Standard,
+            None,
+            HardwareTier::Fast,
+            &mut window,
+        );
+        assert_eq!(window.budget_ms(), 250);
     }
 
     #[test]
     fn seed_effort_budget_override_wins_over_preset() {
-        let atomic = AtomicU64::new(0);
-        seed_effort_budget(DecodeEffort::Eco, Some(5_000), HardwareTier::Slow, &atomic);
-        assert_eq!(atomic.load(Ordering::Acquire), 5_000);
+        let mut window = DecodeWindowConfig::new(Ft8Config::default(), 0);
+        seed_effort_budget(
+            DecodeEffort::Eco,
+            Some(5_000),
+            HardwareTier::Slow,
+            &mut window,
+        );
+        assert_eq!(window.budget_ms(), 5_000);
     }
 
     #[test]
     fn seed_effort_budget_auto_follows_tier_with_no_override() {
-        let atomic = AtomicU64::new(0);
-        seed_effort_budget(DecodeEffort::Auto, None, HardwareTier::Moderate, &atomic);
-        assert_eq!(atomic.load(Ordering::Acquire), 250);
+        let mut window = DecodeWindowConfig::new(Ft8Config::default(), 0);
+        seed_effort_budget(
+            DecodeEffort::Auto,
+            None,
+            HardwareTier::Moderate,
+            &mut window,
+        );
+        assert_eq!(window.budget_ms(), 250);
     }
 
     // ------------------------------------------------------------------
@@ -465,8 +500,9 @@ mod tests {
     #[test]
     fn cycle_decode_effort_advances_preset_and_writes_budget() {
         let current_effort = AtomicU8::new(DecodeEffort::Eco.as_u8());
-        let budget = AtomicU64::new(1);
-        let (next, budget_ms) = cycle_decode_effort(&current_effort, &budget, HardwareTier::Fast);
+        let mut window = DecodeWindowConfig::new(Ft8Config::default(), 1);
+        let (next, budget_ms) =
+            cycle_decode_effort(&current_effort, &mut window, HardwareTier::Fast);
         assert_eq!(next, DecodeEffort::Standard, "Eco -> Standard");
         assert_eq!(budget_ms, 250);
         assert_eq!(
@@ -475,31 +511,136 @@ mod tests {
             "current-effort atomic must reflect the new preset"
         );
         assert_eq!(
-            budget.load(Ordering::Acquire),
+            window.budget_ms(),
             250,
-            "decode_effort_budget_ms atomic must be updated to the new preset's budget"
+            "published budget must be updated to the new preset's budget"
         );
     }
 
     #[test]
     fn cycle_decode_effort_wraps_from_max_to_auto_and_resolves_via_tier() {
         let current_effort = AtomicU8::new(DecodeEffort::Max.as_u8());
-        let budget = AtomicU64::new(0);
-        let (next, budget_ms) = cycle_decode_effort(&current_effort, &budget, HardwareTier::Slow);
+        let mut window = DecodeWindowConfig::new(Ft8Config::default(), 0);
+        let (next, budget_ms) =
+            cycle_decode_effort(&current_effort, &mut window, HardwareTier::Slow);
         assert_eq!(next, DecodeEffort::Auto, "Max -> Auto");
         // Auto on a Slow tier resolves to the 1ms floor-only budget.
         assert_eq!(budget_ms, 1);
-        assert_eq!(budget.load(Ordering::Acquire), 1);
+        assert_eq!(window.budget_ms(), 1);
     }
 
     #[test]
     fn cycle_decode_effort_wraps_from_auto_to_eco() {
         let current_effort = AtomicU8::new(DecodeEffort::Auto.as_u8());
-        let budget = AtomicU64::new(1000);
-        let (next, budget_ms) = cycle_decode_effort(&current_effort, &budget, HardwareTier::Fast);
+        let mut window = DecodeWindowConfig::new(Ft8Config::default(), 1000);
+        let (next, budget_ms) =
+            cycle_decode_effort(&current_effort, &mut window, HardwareTier::Fast);
         assert_eq!(next, DecodeEffort::Eco, "Auto -> Eco");
         assert_eq!(budget_ms, 1);
-        assert_eq!(budget.load(Ordering::Acquire), 1);
+        assert_eq!(window.budget_ms(), 1);
+    }
+
+    /// PAN-164: one cycle publishes the budget AND the overrides derived
+    /// from it, so a reader of the window can never see one without the
+    /// other.
+    #[test]
+    fn cycle_decode_effort_publishes_budget_and_overrides_together() {
+        let current_effort = AtomicU8::new(DecodeEffort::Deep.as_u8());
+        let mut window = DecodeWindowConfig::new(Ft8Config::default(), 1000);
+        let (next, budget_ms) =
+            cycle_decode_effort(&current_effort, &mut window, HardwareTier::Slow);
+        assert_eq!(next, DecodeEffort::Max, "Deep -> Max");
+        assert_eq!(budget_ms, 0);
+        assert_eq!(window.budget_ms(), 0);
+        assert_eq!(window.ft8().max_decode_passes, 2);
+        assert!(window.ft8().time_varying_subtraction_enabled);
+
+        let (next, budget_ms) =
+            cycle_decode_effort(&current_effort, &mut window, HardwareTier::Slow);
+        assert_eq!(next, DecodeEffort::Auto, "Max -> Auto");
+        assert_eq!(budget_ms, 1);
+        assert_eq!(window.budget_ms(), 1);
+        assert_eq!(
+            window.ft8().max_decode_passes,
+            1,
+            "Auto on Slow must clear Max's second pass in the same publish"
+        );
+        assert!(!window.ft8().time_varying_subtraction_enabled);
+    }
+
+    // ------------------------------------------------------------------
+    // PAN-164: DecodeWindowConfig publishes budget + config as one unit
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn publish_effort_sets_budget_and_overrides_in_one_call() {
+        let mut w = DecodeWindowConfig::new(Ft8Config::default(), 250);
+        w.publish_effort(DecodeEffort::Max, HardwareTier::Fast, 0);
+        assert_eq!(w.budget_ms(), 0);
+        assert_eq!(w.ft8().max_decode_passes, 2);
+        assert!(w.ft8().time_varying_subtraction_enabled);
+
+        w.publish_effort(DecodeEffort::Standard, HardwareTier::Fast, 250);
+        assert_eq!(w.budget_ms(), 250);
+        assert_eq!(w.ft8().max_decode_passes, 1);
+        assert!(!w.ft8().time_varying_subtraction_enabled);
+    }
+
+    #[test]
+    fn publish_effort_derives_the_override_from_the_budget_it_publishes() {
+        // Max with an explicit 250 ms budget can't afford pass 2 (round-11
+        // rule), and the published budget is that same 250.
+        let mut w = DecodeWindowConfig::new(Ft8Config::default(), 0);
+        w.publish_effort(DecodeEffort::Max, HardwareTier::Fast, 250);
+        assert_eq!(w.budget_ms(), 250);
+        assert_eq!(w.ft8().max_decode_passes, 1);
+    }
+
+    #[test]
+    fn switch_protocol_reuses_the_published_budget_and_never_changes_it() {
+        let mut w = DecodeWindowConfig::new(
+            Ft8Config {
+                protocol: pancetta_ft8::Protocol::Ft4,
+                ..Ft8Config::default()
+            },
+            250,
+        );
+        w.switch_protocol(
+            pancetta_ft8::Protocol::Ft8,
+            DecodeEffort::Max,
+            HardwareTier::Fast,
+        );
+        assert_eq!(w.ft8().protocol, pancetta_ft8::Protocol::Ft8);
+        assert_eq!(w.budget_ms(), 250);
+        assert_eq!(
+            w.ft8().max_decode_passes,
+            1,
+            "250 ms can't afford the FT8 second pass"
+        );
+
+        let mut w = DecodeWindowConfig::new(Ft8Config::default(), 0);
+        w.publish_effort(DecodeEffort::Max, HardwareTier::Fast, 0);
+        w.switch_protocol(
+            pancetta_ft8::Protocol::Ft4,
+            DecodeEffort::Max,
+            HardwareTier::Fast,
+        );
+        assert_eq!(w.budget_ms(), 0);
+        assert_eq!(
+            w.ft8().max_decode_passes,
+            1,
+            "FT4 must clear the FT8-only override"
+        );
+    }
+
+    #[test]
+    fn new_applies_no_overrides() {
+        let w = DecodeWindowConfig::new(Ft8Config::default(), 1000);
+        assert_eq!(
+            format!("{:?}", w.ft8()),
+            format!("{:?}", Ft8Config::default())
+        );
+        assert_eq!(w.budget_ms(), 1000);
     }
 
     // ------------------------------------------------------------------

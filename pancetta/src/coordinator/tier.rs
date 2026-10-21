@@ -12,13 +12,13 @@
 //!    tier directly or spawns a background probe.
 //! 2. The atomic is handed to the FT8 hot loop; reading it is a single
 //!    relaxed load per window iteration.
-//! 3. `initialize` and the background probe worker both also re-seed the
-//!    `decode_effort_budget_ms` atomic (decoder-speed-overhaul Task 14, see
-//!    `effort.rs`) once the tier is known — this **replaces** the old
+//! 3. `initialize` and the background probe worker both also re-publish
+//!    the decode budget (decoder-speed-overhaul Task 14, see `effort.rs`)
+//!    into the coordinator's `DecodeWindowConfig` once the tier is known — this **replaces** the old
 //!    Slow-tier `Ft8Config` numeric-field rewrite (`max_decode_passes=1` +
 //!    `max_sync_candidates=150`) that used to live in [`apply_tier`]: the
 //!    `[decoder]` effort-preset system now owns tuning decode thoroughness
-//!    for the Slow tier via the budget atomic instead of mutating
+//!    for the Slow tier via the published budget instead of mutating
 //!    `Ft8Config` fields directly. `scoped_fast_path` handling is
 //!    unaffected by this change — it remains a separate, still-valid
 //!    mechanism.
@@ -44,16 +44,15 @@
 //! and `docs/superpowers/specs/2026-07-06-decoder-speed-overhaul-design.md`.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use pancetta_config::DecodeEffort;
 use pancetta_ft8::tier_probe::{recommend_actions, HardwareTier};
-use pancetta_ft8::Ft8Config;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use super::effort::{apply_effort_overrides, preset_budget_ms, seed_effort_budget};
+use super::effort::{seed_effort_budget, DecodeWindowConfig};
 
 const CACHE_SCHEMA_VERSION: u32 = 1;
 const ENV_OVERRIDE: &str = "PANCETTA_SCOPED_FAST_PATH";
@@ -265,7 +264,7 @@ fn detect_cpu_model() -> Option<String> {
 /// `Ft8Config.max_decode_passes`/`max_sync_candidates` on the Slow tier.
 /// That rewrite is retired — the `[decoder]` effort-preset system
 /// (`effort.rs`) now owns tuning decode thoroughness per tier via the
-/// `decode_effort_budget_ms` atomic instead. This function no longer
+/// published decode budget instead. This function no longer
 /// touches `Ft8Config` at all; `scoped_fast_path` handling is unchanged.
 pub(crate) async fn apply_tier(
     tier: HardwareTier,
@@ -287,7 +286,7 @@ pub(crate) async fn apply_tier(
     format!("scoped_fast_path={} ({})", atomic_value, atomic_reason)
 }
 
-/// Whether a tier-probe completion should re-seed `decode_effort_budget_ms`
+/// Whether a tier-probe completion should re-seed the decode budget
 /// given the operator's LIVE decode-effort preset (final-review Finding 1).
 ///
 /// Pure decision function, factored out of [`spawn_probe_worker`] so the
@@ -305,7 +304,7 @@ fn probe_completion_should_reseed_budget(live_effort: DecodeEffort) -> bool {
 /// persists the cache, and applies the tier to runtime state. All
 /// failures log and return — never panic.
 ///
-/// Also re-seeds `decode_effort_budget_ms` (decoder-speed-overhaul Task 14)
+/// Also re-publishes the decode budget (decoder-speed-overhaul Task 14)
 /// with the now-known tier via [`seed_effort_budget`], honoring
 /// `budget_override` when set, and stores the resolved tier into
 /// `resolved_hardware_tier` (decoder-speed-overhaul Task 15) so a later live
@@ -330,10 +329,9 @@ fn spawn_probe_worker(
     override_: Override,
     scoped_fast_path: Arc<AtomicBool>,
     budget_override: Option<u64>,
-    decode_effort_budget_ms: Arc<AtomicU64>,
     current_decode_effort: Arc<AtomicU8>,
     resolved_hardware_tier: Arc<AtomicU8>,
-    ft8_config: Arc<tokio::sync::RwLock<Ft8Config>>,
+    decode_window: Arc<tokio::sync::RwLock<DecodeWindowConfig>>,
 ) {
     tokio::task::spawn_blocking(move || {
         let result = match pancetta_ft8::tier_probe::probe_hardware_tier(10) {
@@ -405,18 +403,12 @@ fn spawn_probe_worker(
         // critical section, so budget and config can never disagree
         // about which effort/tier they're for.
         //
-        // PAN-157 round-9 review finding: the budget write must happen
-        // BEFORE the config write, not after. `ft8.rs`'s hot loop reads
-        // `decode_effort_budget_ms` first, then separately `try_read`s
-        // the config — so if config publishes first, a window can land
-        // in the gap and see the NEW (e.g. 2-pass) config with the OLD,
-        // possibly-bounded budget, which can starve the very pass the
-        // new config just enabled. Publishing budget first means the
-        // only reachable tear is the opposite (new budget + old config),
-        // which is harmless: nothing in the old config needs the extra
-        // time the new budget grants.
+        // PAN-164: the budget and the overrides derived from it publish as
+        // one `DecodeWindowConfig` change under this one write guard, and
+        // the FT8 hot loop reads both with one `try_read()`, so no write
+        // ordering inside this section matters any more.
         tokio::runtime::Handle::current().block_on(async {
-            let mut cfg_guard = ft8_config.write().await;
+            let mut window_guard = decode_window.write().await;
             let live_effort_at_write =
                 DecodeEffort::from_u8(current_decode_effort.load(Ordering::Acquire));
             if live_effort_at_write == DecodeEffort::Auto {
@@ -424,17 +416,10 @@ fn spawn_probe_worker(
                     DecodeEffort::Auto,
                     budget_override,
                     result.tier,
-                    &decode_effort_budget_ms,
-                );
-                apply_effort_overrides(
-                    DecodeEffort::Auto,
-                    result.tier,
-                    budget_override
-                        .unwrap_or_else(|| preset_budget_ms(DecodeEffort::Auto, result.tier)),
-                    &mut cfg_guard,
+                    &mut window_guard,
                 );
                 info!(
-                    "tier probe: decode_effort_budget_ms re-seeded for {} tier (Auto)",
+                    "tier probe: decode budget re-published for {} tier (Auto)",
                     result.tier.as_str()
                 );
             } else {
@@ -456,11 +441,11 @@ fn spawn_probe_worker(
 /// applies the cached tier synchronously or schedules a background
 /// probe. Returns the `Arc<AtomicBool>` that the FT8 hot loop reads.
 ///
-/// Also re-seeds `decode_effort_budget_ms` (decoder-speed-overhaul Task 14)
+/// Also re-publishes the decode budget (decoder-speed-overhaul Task 14)
 /// once the tier is known — on the synchronous cache-hit path here, or
 /// asynchronously from the background probe worker (see
 /// [`spawn_probe_worker`]). The caller is expected to have already seeded
-/// `decode_effort_budget_ms` with an assumed tier before calling this (see
+/// `decode_window` with an assumed tier before calling this (see
 /// `coordinator/mod.rs`), since a cache-miss means the real tier isn't
 /// known until the probe completes.
 ///
@@ -480,10 +465,9 @@ fn spawn_probe_worker(
 pub(crate) async fn initialize(
     effort: DecodeEffort,
     budget_override: Option<u64>,
-    decode_effort_budget_ms: Arc<AtomicU64>,
     current_decode_effort: Arc<AtomicU8>,
     resolved_hardware_tier: Arc<AtomicU8>,
-    ft8_config: Arc<tokio::sync::RwLock<Ft8Config>>,
+    decode_window: Arc<tokio::sync::RwLock<DecodeWindowConfig>>,
 ) -> Arc<AtomicBool> {
     let scoped_fast_path = Arc::new(AtomicBool::new(false));
 
@@ -519,15 +503,9 @@ pub(crate) async fn initialize(
                     tier.as_str(),
                     summary
                 );
-                seed_effort_budget(effort, budget_override, tier, &decode_effort_budget_ms);
                 {
-                    let mut cfg_guard = ft8_config.write().await;
-                    apply_effort_overrides(
-                        effort,
-                        tier,
-                        budget_override.unwrap_or_else(|| preset_budget_ms(effort, tier)),
-                        &mut cfg_guard,
-                    );
+                    let mut window_guard = decode_window.write().await;
+                    seed_effort_budget(effort, budget_override, tier, &mut window_guard);
                 }
                 resolved_hardware_tier.store(tier.as_u8(), Ordering::Release);
                 false
@@ -555,10 +533,9 @@ pub(crate) async fn initialize(
             override_,
             scoped_fast_path.clone(),
             budget_override,
-            decode_effort_budget_ms,
             current_decode_effort,
             resolved_hardware_tier,
-            ft8_config,
+            decode_window,
         );
     }
 
@@ -676,7 +653,7 @@ mod tests {
         // rewrite (max_decode_passes=1, max_sync_candidates=150) is
         // retired — `apply_tier` now only flips `scoped_fast_path` for the
         // Slow tier; the `[decoder]` effort-preset system owns decode
-        // thoroughness via `decode_effort_budget_ms` instead (see
+        // thoroughness via the published decode budget instead (see
         // `effort.rs`).
         let atomic = AtomicBool::new(false);
         apply_tier(HardwareTier::Slow, Override::None, &atomic).await;
@@ -731,7 +708,7 @@ mod tests {
         ] {
             assert!(
                 !probe_completion_should_reseed_budget(cycled),
-                "probe completion must not re-seed the budget atomic when the \
+                "probe completion must not re-seed the published budget when the \
                  operator has cycled to {cycled:?} — doing so would silently \
                  revert their live choice (final-review Finding 1)"
             );

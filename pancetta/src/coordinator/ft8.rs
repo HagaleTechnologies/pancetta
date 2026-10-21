@@ -50,7 +50,7 @@ const MAX_DECODED_FIELD_LEN: usize = 64;
 /// inclusive on the FT4 (800 ms) side — a slot period at or below FT4's is
 /// treated as the faster mode's tighter budget.
 ///
-/// Scope: this ceiling (and `decode_effort_budget_ms`) only governs the
+/// Scope: this ceiling (and the published per-window budget) only governs the
 /// native `pancetta-ft8` AP-enhanced decode call. The separate
 /// `decode_window_ft8lib_protocol` ft8_lib C FFI decode path (below) runs
 /// unconditionally and is not bounded by either budget.
@@ -59,6 +59,104 @@ pub(crate) fn decode_budget_ceiling_ms(slot_ns: u64) -> u64 {
         800
     } else {
         2000
+    }
+}
+
+/// The `Ft8Config` fields a live `Ft8Decoder` bakes in at construction.
+/// When any of them changes, the hot loop rebuilds the decoder before it
+/// uses the budget published with that change. Every field
+/// `effort::apply_effort_overrides` writes must be here
+/// (`every_effort_override_field_is_a_rebuild_trigger`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DecoderRebuildKey {
+    pub(crate) max_decode_passes: usize,
+    pub(crate) osd_depth: Option<u8>,
+    pub(crate) protocol: pancetta_ft8::Protocol,
+    pub(crate) time_varying_subtraction_enabled: bool,
+}
+
+impl DecoderRebuildKey {
+    pub(crate) fn of(cfg: &pancetta_ft8::Ft8Config) -> Self {
+        Self {
+            max_decode_passes: cfg.max_decode_passes,
+            osd_depth: cfg.osd_depth,
+            protocol: cfg.protocol,
+            time_varying_subtraction_enabled: cfg.time_varying_subtraction_enabled,
+        }
+    }
+}
+
+/// Everything the hot loop uses for one window, all from one
+/// `DecodeWindowConfig` publish (PAN-164).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AppliedDecodeWindow {
+    pub(crate) rebuild_key: DecoderRebuildKey,
+    pub(crate) budget_ms: u64,
+    pub(crate) cross_sequence_a7_enabled: bool,
+}
+
+impl AppliedDecodeWindow {
+    pub(crate) fn of(window: &super::DecodeWindowConfig) -> Self {
+        Self {
+            rebuild_key: DecoderRebuildKey::of(window.ft8()),
+            budget_ms: window.budget_ms(),
+            cross_sequence_a7_enabled: window.ft8().cross_sequence_a7_enabled,
+        }
+    }
+
+    /// `0` resolves to the ceiling of the protocol the live decoder was
+    /// built for; a nonzero budget is clamped to it.
+    pub(crate) fn effective_budget_ms(&self) -> u64 {
+        let ceiling_ms =
+            decode_budget_ceiling_ms(self.rebuild_key.protocol.slot_ns().max(0) as u64);
+        if self.budget_ms == 0 {
+            ceiling_ms
+        } else {
+            self.budget_ms.min(ceiling_ms)
+        }
+    }
+}
+
+/// Outcome of one [`refresh_decode_window`] call.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DecodeWindowRefresh<E> {
+    /// A writer holds the lock; `applied` is untouched.
+    Busy,
+    /// Same decoder fields; the new budget (and flags) adopted.
+    Adopted,
+    /// Decoder rebuilt from the new publish, which is now adopted whole.
+    Rebuilt,
+    /// Rebuild failed; the previous decoder and its budget stay paired.
+    RebuildFailed(E),
+}
+
+/// The hot loop's one read of the shared decode-window state per window
+/// (PAN-164). A single `try_read`; everything adopted comes from that guard.
+/// When the published decoder fields differ from `applied`'s, `rebuild`
+/// gets a clone of the published config (guard already dropped) and
+/// `applied` adopts the publish only if it returns `Ok`.
+pub(crate) fn refresh_decode_window<E>(
+    shared: &tokio::sync::RwLock<super::DecodeWindowConfig>,
+    applied: &mut AppliedDecodeWindow,
+    rebuild: impl FnOnce(pancetta_ft8::Ft8Config) -> Result<(), E>,
+) -> DecodeWindowRefresh<E> {
+    let Ok(guard) = shared.try_read() else {
+        return DecodeWindowRefresh::Busy;
+    };
+    let next = AppliedDecodeWindow::of(&guard);
+    if next.rebuild_key == applied.rebuild_key {
+        drop(guard);
+        *applied = next;
+        return DecodeWindowRefresh::Adopted;
+    }
+    let cfg = guard.ft8().clone();
+    drop(guard);
+    match rebuild(cfg) {
+        Ok(()) => {
+            *applied = next;
+            DecodeWindowRefresh::Rebuilt
+        }
+        Err(e) => DecodeWindowRefresh::RebuildFailed(e),
     }
 }
 
@@ -1285,14 +1383,14 @@ impl super::ApplicationCoordinator {
 
         info!("Starting FT8 component");
 
-        // hb-216 S2: read the shared Ft8Config. The tier probe (background
-        // task spawned by coordinator::tier::initialize) may rewrite this
-        // with the Slow-tier preset after measurement; the hot loop
-        // re-reads it each iteration and rebuilds the decoder if
-        // (max_decode_passes, osd_depth) changed.
-        let initial_ft8_config = self.ft8_config.read().await.clone();
-        let mut decoder = Ft8Decoder::new(initial_ft8_config.clone())?;
-        let ft8_config_shared = self.ft8_config.clone();
+        // hb-216 S2 / PAN-164: read the shared decode window (budget +
+        // Ft8Config, published together). The tier probe, the TUI effort
+        // cycle and a mode switch may republish it; the hot loop re-reads
+        // it once per window and rebuilds the decoder when a
+        // `DecoderRebuildKey` field changed.
+        let initial_window = self.decode_window.read().await.clone();
+        let mut decoder = Ft8Decoder::new(initial_window.ft8().clone())?;
+        let decode_window_shared = self.decode_window.clone();
 
         // hb-216 S2: scoped fast-path activation flag. Seeded from env at
         // startup; rewritten by the tier probe (Moderate/Slow → true).
@@ -1421,16 +1519,11 @@ impl super::ApplicationCoordinator {
         // `Duration::seconds(13)`.
         let active_decode_phase_ns = self.active_decode_phase_ns.clone();
 
-        // decoder-speed-overhaul Task 12: mode-aware decode deadline wiring.
-        // `decode_effort_budget_ms` is the operator/preset-configured effort
-        // (0 = unlimited; Task 14 is the first writer). Re-read once per
-        // window alongside the slot/decode-phase atomics above so a live
-        // config/TUI change (once Task 14 lands) takes effect on the very
-        // next window. `decode_last_elapsed_ms`/`decode_last_budget_exhausted`
-        // are the metrics counterparts written after each window's budgeted
-        // decode calls and read by the TUI relay's periodic `PipelineHealth`
-        // push.
-        let decode_effort_budget_ms = self.decode_effort_budget_ms.clone();
+        // decoder-speed-overhaul Task 12: decode-budget metrics.
+        // `decode_last_elapsed_ms`/`decode_last_budget_exhausted` are written
+        // after each window's budgeted decode calls and read by the TUI
+        // relay's periodic `PipelineHealth` push. The budget itself comes
+        // from `decode_window_shared`, read once per window (PAN-164).
         let decode_last_elapsed_ms = self.decode_last_elapsed_ms.clone();
         let decode_last_budget_exhausted = self.decode_last_budget_exhausted.clone();
 
@@ -1439,12 +1532,11 @@ impl super::ApplicationCoordinator {
             let rt = tokio::runtime::Handle::current();
             info!("FT8 decoder thread started");
 
-            // hb-216 S2: track the config tuple the current decoder was
-            // built with. When the shared config changes (tier probe
-            // landing a Slow preset), rebuild before the next decode.
-            let mut last_max_passes = initial_ft8_config.max_decode_passes;
-            let mut last_osd_depth = initial_ft8_config.osd_depth;
-            let mut last_protocol = initial_ft8_config.protocol;
+            // hb-216 S2 / PAN-164: the decode-window publish the current
+            // decoder was built from, with its budget. Written only by
+            // `refresh_decode_window`, so the decoder fields and the
+            // budget always come from the same publish.
+            let mut applied_window = AppliedDecodeWindow::of(&initial_window);
 
             // Create persistent AP state for enhanced decoding
             let my_call_ap = pancetta_ft8::MyCallAp::new(&station_callsign);
@@ -1557,104 +1649,67 @@ impl super::ApplicationCoordinator {
                             active_decode_phase_ns.load(Ordering::Relaxed),
                         );
 
-                        // decoder-speed-overhaul Task 12: mode-aware decode
-                        // deadline for this window. `decode_effort_budget_ms
-                        // == 0` (unlimited, the only value set anywhere
-                        // today — Task 14 is the first writer) falls back to
-                        // the ceiling alone; a nonzero operator/preset value
-                        // is clamped to never exceed the ceiling. Shared by
-                        // both decode call sites below so a single window
-                        // has one consistent deadline.
-                        let decode_budget = {
-                            let cfg_ms = decode_effort_budget_ms.load(Ordering::Relaxed);
-                            let ceiling_ms = decode_budget_ceiling_ms(slot_ns.max(0) as u64);
-                            let budget_ms = if cfg_ms == 0 {
-                                ceiling_ms
-                            } else {
-                                cfg_ms.min(ceiling_ms)
-                            };
-                            pancetta_ft8::DecodeBudget::until(
-                                window_ready_at + std::time::Duration::from_millis(budget_ms),
-                            )
-                        };
-
-                        // hb-216 S2: re-check the shared Ft8Config. If the
-                        // tier probe landed a Slow preset since the last
-                        // window, rebuild the decoder. `try_read` keeps the
-                        // hot loop non-blocking; on contention, we skip the
-                        // check this iteration and pick it up on the next.
-                        // hb-237: cache the cross-sequence A7 enable flag
-                        // alongside the config-rebuild check so we read the
-                        // shared Ft8Config at most once per window.
-                        //
-                        // PAN-156 round-7 review finding: `decode_budget`
-                        // above and this config read are two independent,
-                        // unsynchronized reads -- see
-                        // `coordinator::effort::apply_effort_overrides`'s
-                        // doc comment for the §6.2 window-atomicity
-                        // invariant this must satisfy once a real
-                        // effort-conditional Ft8Config field exists.
-                        // PAN-157: `effort::apply_effort_overrides`'s `Max`
-                        // arm sets `max_decode_passes` AND
-                        // `time_varying_subtraction_enabled` together,
-                        // never independently — so `cur_max !=
-                        // last_max_passes` already fires a rebuild (which
-                        // clones the WHOLE current config, below) whenever
-                        // either field changes. `time_varying_subtraction_
-                        // enabled` doesn't need its own tracked `last_*`
-                        // variable unless a future override decouples the
-                        // two fields.
-                        let mut cross_seq_enabled = false;
-                        if let Ok(cfg_guard) = ft8_config_shared.try_read() {
-                            let cur_max = cfg_guard.max_decode_passes;
-                            let cur_osd = cfg_guard.osd_depth;
-                            let cur_protocol = cfg_guard.protocol;
-                            cross_seq_enabled = cfg_guard.cross_sequence_a7_enabled;
-                            if cur_max != last_max_passes
-                                || cur_osd != last_osd_depth
-                                || cur_protocol != last_protocol
-                            {
-                                let new_cfg = cfg_guard.clone();
-                                drop(cfg_guard);
-                                match Ft8Decoder::new(new_cfg) {
-                                    Ok(mut d) => {
-                                        info!(
-                                            "FT8 decoder rebuilt: max_decode_passes={}, osd_depth={:?}, protocol={}",
-                                            cur_max, cur_osd, cur_protocol
-                                        );
-                                        // PAN-17 round 2: a rebuild is a
-                                        // fresh Ft8Decoder with an empty
-                                        // hash table — re-seed our own
-                                        // callsign or a compound-call DX's
-                                        // reply silently stops resolving
-                                        // after the next tier/protocol
-                                        // config change.
-                                        d.seed_hash_callsign(&station_callsign);
-                                        // PAN-27 finding 2: also carry over
-                                        // every OTHER caller this decoder
-                                        // instance had already learned (the
-                                        // round-2/round-4 seeding loops
-                                        // below) — otherwise a compound
-                                        // operator learned earlier this
-                                        // session decodes as unresolved
-                                        // again immediately after a rebuild,
-                                        // even though the hash had already
-                                        // resolved once.
-                                        for call in decoder.learned_callsigns() {
-                                            d.seed_hash_callsign(&call);
-                                        }
-                                        decoder = d;
-                                        last_max_passes = cur_max;
-                                        last_osd_depth = cur_osd;
-                                        last_protocol = cur_protocol;
-                                    }
-                                    Err(e) => warn!(
-                                        "FT8 decoder rebuild failed (keeping previous): {}",
-                                        e
-                                    ),
+                        // PAN-164: one read of the shared decode-window
+                        // state per window. Budget, decoder fields and flags
+                        // all come from the same publish; on contention (a
+                        // writer holds the lock — hb-216 S2's "skip and pick
+                        // it up next window") or a failed rebuild, the whole
+                        // previous window state (decoder included) is kept.
+                        let refresh = refresh_decode_window(
+                            &decode_window_shared,
+                            &mut applied_window,
+                            |cfg| {
+                                let (passes, osd, protocol) =
+                                    (cfg.max_decode_passes, cfg.osd_depth, cfg.protocol);
+                                let mut d = Ft8Decoder::new(cfg)?;
+                                info!(
+                                    "FT8 decoder rebuilt: max_decode_passes={}, osd_depth={:?}, protocol={}",
+                                    passes, osd, protocol
+                                );
+                                // PAN-17 round 2: a rebuild is a fresh
+                                // Ft8Decoder with an empty hash table —
+                                // re-seed our own callsign or a compound-call
+                                // DX's reply silently stops resolving after
+                                // the next tier/protocol config change.
+                                d.seed_hash_callsign(&station_callsign);
+                                // PAN-27 finding 2: also carry over every
+                                // OTHER caller this decoder instance had
+                                // already learned (the round-2/round-4
+                                // seeding loops below) — otherwise a
+                                // compound operator learned earlier this
+                                // session decodes as unresolved again
+                                // immediately after a rebuild, even though
+                                // the hash had already resolved once.
+                                for call in decoder.learned_callsigns() {
+                                    d.seed_hash_callsign(&call);
                                 }
-                            }
+                                decoder = d;
+                                Ok::<(), pancetta_ft8::Ft8Error>(())
+                            },
+                        );
+                        if let DecodeWindowRefresh::RebuildFailed(e) = refresh {
+                            warn!(
+                                "FT8 decoder rebuild failed (keeping previous decoder and its budget): {}",
+                                e
+                            );
                         }
+                        // The protocol the live decoder was built for.
+                        let last_protocol = applied_window.rebuild_key.protocol;
+                        // hb-237: cross-sequence A7 enable flag, from the
+                        // same publish.
+                        let cross_seq_enabled = applied_window.cross_sequence_a7_enabled;
+                        // decoder-speed-overhaul Task 12: mode-aware decode
+                        // deadline for this window. A `0` budget falls back
+                        // to the ceiling of the live decoder's own protocol;
+                        // a nonzero operator/preset value is clamped to it.
+                        // Shared by both decode call sites below so a single
+                        // window has one consistent deadline.
+                        let decode_budget = pancetta_ft8::DecodeBudget::until(
+                            window_ready_at
+                                + std::time::Duration::from_millis(
+                                    applied_window.effective_budget_ms(),
+                                ),
+                        );
 
                         // hb-237 cross-sequence A7 — pre-decode seed read
                         // (Session 3 wiring).
@@ -3293,5 +3348,317 @@ mod decode_budget_ceiling_ms_tests {
     fn zero_slot_ns_is_treated_as_the_tighter_ceiling() {
         // Degenerate input; falls on the <= branch, so 800ms — never panics.
         assert_eq!(decode_budget_ceiling_ms(0), 800);
+    }
+}
+
+/// PAN-164: the hot loop takes the budget and the decoder config from ONE
+/// `DecodeWindowConfig` publish per window, never one publish's budget with
+/// another's config. The old shape (a budget atomic loaded, then a separate
+/// config `try_read`) tore whenever a writer's whole critical section
+/// landed between the two reads; these tests pin the one-read contract.
+#[cfg(test)]
+mod decode_window_refresh_tests {
+    use super::super::effort::{apply_effort_overrides, DecodeWindowConfig};
+    use super::{
+        refresh_decode_window, AppliedDecodeWindow, DecodeWindowRefresh, DecoderRebuildKey,
+    };
+    use pancetta_config::DecodeEffort;
+    use pancetta_ft8::{tier_probe::HardwareTier, Ft8Config, Protocol};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    /// Standard on FT8: `(250 ms, 1 pass)`.
+    fn standard() -> DecodeWindowConfig {
+        let mut w = DecodeWindowConfig::new(Ft8Config::default(), 0);
+        w.publish_effort(DecodeEffort::Standard, HardwareTier::Fast, 250);
+        w
+    }
+
+    fn pair(a: &AppliedDecodeWindow) -> (u64, usize) {
+        (a.budget_ms, a.rebuild_key.max_decode_passes)
+    }
+
+    const OLD: (u64, usize) = (250, 1);
+    const NEW: (u64, usize) = (0, 2);
+
+    fn assert_untorn(a: &AppliedDecodeWindow) {
+        let p = pair(a);
+        assert!(
+            p == OLD || p == NEW,
+            "torn decode window: (budget_ms, max_decode_passes) = {p:?}, \
+             expected {OLD:?} or {NEW:?}"
+        );
+    }
+
+    #[test]
+    fn refresh_adopts_budget_and_config_from_one_publish() {
+        let shared = tokio::sync::RwLock::new(standard());
+        let mut applied = AppliedDecodeWindow::of(&standard());
+        assert_eq!(pair(&applied), OLD);
+
+        shared.try_write().expect("uncontended").publish_effort(
+            DecodeEffort::Max,
+            HardwareTier::Fast,
+            0,
+        );
+
+        let refresh = refresh_decode_window(&shared, &mut applied, |cfg| {
+            assert_eq!(cfg.max_decode_passes, 2);
+            Ok::<_, ()>(())
+        });
+        assert_eq!(refresh, DecodeWindowRefresh::Rebuilt);
+        assert_eq!(pair(&applied), NEW);
+        assert_eq!(applied.effective_budget_ms(), 2000);
+    }
+
+    #[test]
+    fn refresh_while_a_writer_holds_the_lock_keeps_the_whole_previous_window() {
+        let shared = tokio::sync::RwLock::new(standard());
+        let mut applied = AppliedDecodeWindow::of(&standard());
+
+        let mut g = shared.try_write().expect("uncontended");
+        g.publish_effort(DecodeEffort::Max, HardwareTier::Fast, 0);
+        let refresh = refresh_decode_window(&shared, &mut applied, |_| -> Result<(), ()> {
+            panic!("no rebuild may run while a writer holds the window")
+        });
+        assert_eq!(refresh, DecodeWindowRefresh::Busy);
+        assert_eq!(
+            pair(&applied),
+            OLD,
+            "a busy window keeps the whole old pair"
+        );
+
+        drop(g);
+        let refresh = refresh_decode_window(&shared, &mut applied, |_| Ok::<_, ()>(()));
+        assert_eq!(refresh, DecodeWindowRefresh::Rebuilt);
+        assert_eq!(pair(&applied), NEW);
+    }
+
+    #[test]
+    fn budget_only_publish_is_adopted_without_a_rebuild() {
+        let shared = tokio::sync::RwLock::new(standard());
+        let mut applied = AppliedDecodeWindow::of(&standard());
+
+        // Standard -> Deep: 250 -> 1000 ms, same decoder fields.
+        shared.try_write().expect("uncontended").publish_effort(
+            DecodeEffort::Deep,
+            HardwareTier::Fast,
+            1000,
+        );
+        let refresh = refresh_decode_window(&shared, &mut applied, |_| -> Result<(), ()> {
+            panic!("a budget-only publish must not rebuild the decoder")
+        });
+        assert_eq!(refresh, DecodeWindowRefresh::Adopted);
+        assert_eq!(applied.budget_ms, 1000);
+        assert_eq!(applied.rebuild_key.max_decode_passes, 1);
+    }
+
+    #[test]
+    fn failed_rebuild_keeps_the_previous_decoder_and_its_budget() {
+        let shared = tokio::sync::RwLock::new(standard());
+        let mut applied = AppliedDecodeWindow::of(&standard());
+
+        shared.try_write().expect("uncontended").publish_effort(
+            DecodeEffort::Max,
+            HardwareTier::Fast,
+            0,
+        );
+        let refresh = refresh_decode_window(&shared, &mut applied, |_| Err("boom"));
+        assert_eq!(refresh, DecodeWindowRefresh::RebuildFailed("boom"));
+        assert_eq!(
+            pair(&applied),
+            OLD,
+            "the new budget must not be adopted without the decoder it was published with"
+        );
+
+        let refresh = refresh_decode_window(&shared, &mut applied, |_| Ok::<_, &str>(()));
+        assert_eq!(refresh, DecodeWindowRefresh::Rebuilt);
+        assert_eq!(pair(&applied), NEW);
+    }
+
+    /// The ticket's reproduction shape, against the new code: the writer's
+    /// whole critical section runs between two windows, then the writer
+    /// holds the guard across a window. Every window sees a whole publish.
+    #[test]
+    fn pan164_writer_critical_section_between_two_windows_cannot_tear() {
+        let shared = Arc::new(tokio::sync::RwLock::new(standard()));
+        let barrier = Arc::new(Barrier::new(2));
+
+        let writer = {
+            let shared = Arc::clone(&shared);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                // Round 1: a whole publish between window N and N+1.
+                barrier.wait(); // A: reader finished window N
+                {
+                    let mut g = shared.blocking_write();
+                    g.publish_effort(DecodeEffort::Max, HardwareTier::Fast, 0);
+                }
+                barrier.wait(); // B: publish done
+                barrier.wait(); // B2: reader finished window N+1
+
+                // Round 2: hold the guard across the reader's window.
+                let mut g = shared.blocking_write();
+                barrier.wait(); // C: guard held
+                barrier.wait(); // D: reader's window ran
+                g.publish_effort(DecodeEffort::Standard, HardwareTier::Fast, 250);
+                drop(g);
+                barrier.wait(); // E: publish done
+            })
+        };
+
+        let mut applied = AppliedDecodeWindow::of(&standard());
+        let mut decoder_passes = applied.rebuild_key.max_decode_passes;
+        let mut window = |applied: &mut AppliedDecodeWindow| {
+            let r = refresh_decode_window(&shared, applied, |cfg| {
+                decoder_passes = cfg.max_decode_passes;
+                Ok::<_, ()>(())
+            });
+            assert_untorn(applied);
+            r
+        };
+
+        assert_eq!(window(&mut applied), DecodeWindowRefresh::Adopted);
+        assert_eq!(pair(&applied), OLD);
+        barrier.wait(); // A
+        barrier.wait(); // B
+        assert_eq!(window(&mut applied), DecodeWindowRefresh::Rebuilt);
+        assert_eq!(pair(&applied), NEW);
+        barrier.wait(); // B2
+
+        barrier.wait(); // C
+        assert_eq!(window(&mut applied), DecodeWindowRefresh::Busy);
+        assert_eq!(
+            pair(&applied),
+            NEW,
+            "a busy window keeps the whole NEW pair"
+        );
+        barrier.wait(); // D
+        barrier.wait(); // E
+        assert_eq!(window(&mut applied), DecodeWindowRefresh::Rebuilt);
+        assert_eq!(pair(&applied), OLD);
+        assert_eq!(decoder_passes, 1);
+
+        writer.join().expect("writer thread");
+    }
+
+    /// Free-running stress: a writer flips between two consistent
+    /// publishes as fast as it can while the reader refreshes. On the old
+    /// two-read shape the equivalent loop tore 21–73 552 times per 200k
+    /// reads (plan, Current State §1); with one read it cannot tear.
+    #[test]
+    fn concurrent_publishes_never_yield_a_torn_window() {
+        let shared = Arc::new(tokio::sync::RwLock::new(standard()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let publishes = Arc::new(AtomicU64::new(0));
+
+        let writer = {
+            let shared = Arc::clone(&shared);
+            let stop = Arc::clone(&stop);
+            let publishes = Arc::clone(&publishes);
+            std::thread::spawn(move || {
+                let mut max = true;
+                while !stop.load(Ordering::Relaxed) {
+                    let mut g = shared.blocking_write();
+                    if max {
+                        g.publish_effort(DecodeEffort::Max, HardwareTier::Fast, 0);
+                    } else {
+                        g.publish_effort(DecodeEffort::Standard, HardwareTier::Fast, 250);
+                    }
+                    drop(g);
+                    max = !max;
+                    publishes.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+
+        let mut applied = AppliedDecodeWindow::of(&standard());
+        let mut decoder_passes = applied.rebuild_key.max_decode_passes;
+        let mut refreshes: u64 = 0;
+        while refreshes < 50_000 || publishes.load(Ordering::Relaxed) < 1_000 {
+            let _ = refresh_decode_window(&shared, &mut applied, |cfg| {
+                decoder_passes = cfg.max_decode_passes;
+                Ok::<_, ()>(())
+            });
+            refreshes += 1;
+            assert_untorn(&applied);
+            assert_eq!(
+                applied.rebuild_key.max_decode_passes, decoder_passes,
+                "the adopted window must describe the decoder actually built"
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().expect("writer thread");
+    }
+
+    #[test]
+    fn effective_budget_uses_the_decoders_own_protocol_ceiling() {
+        let cases = [
+            (Protocol::Ft8, 0, 2000),
+            (Protocol::Ft4, 0, 800),
+            (Protocol::Ft8, 250, 250),
+            (Protocol::Ft8, 5000, 2000),
+            (Protocol::Ft4, 1000, 800),
+        ];
+        for (protocol, budget_ms, expected) in cases {
+            let cfg = Ft8Config {
+                protocol,
+                ..Ft8Config::default()
+            };
+            let applied = AppliedDecodeWindow::of(&DecodeWindowConfig::new(cfg, budget_ms));
+            assert_eq!(
+                applied.effective_budget_ms(),
+                expected,
+                "{protocol:?} with budget {budget_ms} ms"
+            );
+        }
+    }
+
+    /// Generalisation guard: any `Ft8Config` field `apply_effort_overrides`
+    /// writes must be a decoder-rebuild trigger, or the hot loop would
+    /// adopt a publish's budget while decoding with the old value of that
+    /// field.
+    #[test]
+    fn every_effort_override_field_is_a_rebuild_trigger() {
+        let mut configs: Vec<(String, String, DecoderRebuildKey)> = Vec::new();
+        for effort in [
+            DecodeEffort::Eco,
+            DecodeEffort::Standard,
+            DecodeEffort::Deep,
+            DecodeEffort::Max,
+            DecodeEffort::Auto,
+        ] {
+            for tier in [
+                HardwareTier::Slow,
+                HardwareTier::Moderate,
+                HardwareTier::Fast,
+            ] {
+                for budget_ms in [0u64, 1, 250, 1000, 2000] {
+                    for protocol in [Protocol::Ft8, Protocol::Ft4] {
+                        let mut cfg = Ft8Config {
+                            protocol,
+                            ..Ft8Config::default()
+                        };
+                        apply_effort_overrides(effort, tier, budget_ms, &mut cfg);
+                        configs.push((
+                            format!("{effort:?}/{tier:?}/{budget_ms}ms/{protocol:?}"),
+                            format!("{cfg:?}"),
+                            DecoderRebuildKey::of(&cfg),
+                        ));
+                    }
+                }
+            }
+        }
+        for (label_a, debug_a, key_a) in &configs {
+            for (label_b, debug_b, key_b) in &configs {
+                if debug_a != debug_b {
+                    assert_ne!(
+                        key_a, key_b,
+                        "{label_a} vs {label_b}: a field apply_effort_overrides writes \
+                         is missing from DecoderRebuildKey"
+                    );
+                }
+            }
+        }
     }
 }
