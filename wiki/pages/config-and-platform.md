@@ -45,3 +45,11 @@ bot-owned pause can repair its missing provenance marker on handoff rerun;
 human pauses remain in force. See
 [Interrupted native queue recovery](../../docs/DECISIONS/config-and-platform.md#interrupted-native-queue-recovery-pan-150-2026-10-20)
 for ownership checks and recovery limits.
+
+Toolchain gotcha (PAN-56): **`rust-toolchain.toml` pins an exact Rust release
+(`1.98.0`, matching the Catalyst runner image), and the `dtolnay/rust-toolchain`
+steps in `ci.yml`, `docs.yml`, `demo-assets.yml` and `release.yml` pass the same
+version as `toolchain:`.** Bump the channel and all of those inputs in one PR. A missed input still builds with the
+pinned compiler, because rustup's override wins, but that job downloads a second
+toolchain and its rust-cache key churns. See
+[Exact Rust toolchain pin](../../docs/DECISIONS/config-and-platform.md#exact-rust-toolchain-pin-pan-56-2026-10-21).

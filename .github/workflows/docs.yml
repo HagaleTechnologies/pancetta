@@ -6,6 +6,7 @@ on:
     paths:
       - '**/*.rs'
       - '**/Cargo.toml'
+      - 'rust-toolchain.toml'
       - '.github/workflows/docs.yml'
 
 jobs:
@@ -19,7 +20,13 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libssl-dev pkg-config
 
-      - uses: dtolnay/rust-toolchain@stable
+      # PAN-56: exact pin matching rust-toolchain.toml -- install the pinned
+      # toolchain up front instead of letting rustup's override auto-install
+      # it mid-job (a second, wasted download per run). See
+      # docs/DECISIONS/config-and-platform.md.
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: 1.98.0
 
       - uses: Swatinem/rust-cache@v2
         with:

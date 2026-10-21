@@ -697,3 +697,35 @@ remote-gateway acceptor does not follow this rule yet (PAN-99).
   re-gate a running feed.
 - Live mode is unchanged: live audio cannot be held back. A slow live index
   rebuild can likewise delay the first live decodes; that is a separate gap.
+
+## Exact Rust toolchain pin (PAN-56, 2026-10-21)
+
+- **Pin.** `rust-toolchain.toml` sets an exact `channel` (`1.98.0`, shipped in PR #447), never
+  `stable`. rustup's `cargo`/`rustc` proxies read that file on every invocation, ahead of the
+  user's default and of whatever toolchain a CI action installed, so a fresh clone, every CI lane
+  and a Catalyst cloud run build with the same compiler.
+- **Install steps match the pin.** Every `dtolnay/rust-toolchain` step in `ci.yml` (5),
+  `docs.yml`, `demo-assets.yml` and `release.yml` uses SHA `686976e1…` (`# stable`) with
+  `toolchain: 1.98.0`. Without that input the action installs the floating stable its `@rev`
+  names, which the override then ignores: each job downloaded a second toolchain (~8.5 s) and
+  `Swatinem/rust-cache` hashed both versions into its key, so the cache missed after every
+  upstream stable release.
+- **Version rule.** Match the Catalyst runner image: "1.98.0 matches the Catalyst runner image, so
+  cloud runs don't download a second toolchain" (`rust-toolchain.toml`). manta MAN-36 instead
+  pins whatever `stable` resolved to when its pin landed; do not copy manta's rule here.
+- **Bump procedure.** Change `rust-toolchain.toml`'s `channel` and every `toolchain:` input in
+  `.github/workflows/` together, in their own PR; `grep -rn 'toolchain: 1\.98\.0'
+  .github/workflows/` lists the inputs (`supply-chain.yml`'s step has none yet). `ci.yml`'s
+  `changes` filter and `docs.yml`'s push filter both list `rust-toolchain.toml`, so the Rust
+  lanes and the docs build re-run on the bump. A missed input still builds with the pinned
+  compiler; it only brings the second download back.
+- **Rejected.** Floating `stable`: on 2026-10-14 stale local stables (1.94.1, 1.96.1) on macOS 27
+  emitted proc-macro dylibs that dyld refused to load. A `scripts/check-rust-toolchain-pin.sh`
+  guard like manta's: CI run logs already show the override putting 1.98.0 behind every `cargo`
+  call, and the one incident was on local machines a CI guard cannot see. `mise` or another
+  cross-language manager: the repo is Rust/cargo only.
+- **PAN-106 follow-up status.** This closes the `dtolnay/rust-toolchain` pinning in `ci.yml`,
+  `docs.yml` and `demo-assets.yml`. Still deferred: pinning their other actions
+  (`actions/checkout`, `Swatinem/rust-cache`), permission scoping for those files and
+  `dependabot-auto-merge.yml`, and moving `supply-chain.yml`'s `dtolnay/rust-toolchain` pin
+  (`4360b525…`, 2026-08-05) to `686976e1…`.
