@@ -249,6 +249,11 @@ impl OutboxStore {
     /// followed or truncated; the random name means a stale leftover from a
     /// crash never blocks a write either. A failed write removes its own
     /// temporary file.
+    ///
+    /// `std::fs::rename` replaces an existing destination file on every
+    /// platform, Windows included (`MoveFileExW` with replace-existing, or
+    /// POSIX-semantics `FileRenameInfoEx` on Windows 10 1607+), so repeated
+    /// writes always land; only a directory at `path` would refuse it.
     pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let parent = match path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p,
