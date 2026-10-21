@@ -2603,7 +2603,7 @@ async fn refresh_active_qso_ap(
     qso_manager: &pancetta_qso::QsoManager,
     my_call: &str,
     scorer: &pancetta_qso::PriorityScorer,
-    ft8_config: &std::sync::Arc<tokio::sync::RwLock<pancetta_ft8::Ft8Config>>,
+    decode_window: &std::sync::Arc<tokio::sync::RwLock<super::DecodeWindowConfig>>,
     ap_state: &std::sync::Arc<std::sync::RwLock<Vec<pancetta_ft8::QsoAp>>>,
 ) {
     let active = qso_manager.get_active_qsos().await;
@@ -2613,7 +2613,7 @@ async fn refresh_active_qso_ap(
             qso_ap_candidate_from_progress(&progress.state, &progress.metadata, my_call)
         })
         .collect();
-    let max_ap_qsos = ft8_config.read().await.max_ap_qsos;
+    let max_ap_qsos = decode_window.read().await.ft8().max_ap_qsos;
     let ranked = rank_active_qsos_for_ap(&candidates, scorer, max_ap_qsos);
     if let Ok(mut guard) = ap_state.write() {
         *guard = ranked;
@@ -3038,7 +3038,7 @@ impl super::ApplicationCoordinator {
         // Task 5: `max_ap_qsos` is hot-reloadable, so the AP-context write
         // site below re-reads it fresh from this shared handle on every
         // QSO event rather than snapshotting it once at startup.
-        let ft8_config_for_ap = self.ft8_config.clone();
+        let decode_window_for_ap = self.decode_window.clone();
         let active_qso_freq_hz = self.active_qso_freq_hz.clone();
         // PAN-72 round-8 redesign (fix 2): the same live `active_slot_ns`
         // atomic Fix 1 uses inside `pancetta-qso`, so the decoder hint's
@@ -3664,7 +3664,7 @@ impl super::ApplicationCoordinator {
                                     &snapshot_qso_manager,
                                     &tx_callsign,
                                     &ap_priority_scorer,
-                                    &ft8_config_for_ap,
+                                    &decode_window_for_ap,
                                     &ap_state,
                                 )
                                 .await;
@@ -3995,7 +3995,7 @@ impl super::ApplicationCoordinator {
                                     &snapshot_qso_manager,
                                     &tx_callsign,
                                     &ap_priority_scorer,
-                                    &ft8_config_for_ap,
+                                    &decode_window_for_ap,
                                     &ap_state,
                                 )
                                 .await;
@@ -4172,7 +4172,7 @@ impl super::ApplicationCoordinator {
                                     &snapshot_qso_manager,
                                     &tx_callsign,
                                     &ap_priority_scorer,
-                                    &ft8_config_for_ap,
+                                    &decode_window_for_ap,
                                     &ap_state,
                                 )
                                 .await;

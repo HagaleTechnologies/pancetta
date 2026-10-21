@@ -119,7 +119,19 @@ fn render_line1<'a>(app: &App, call: &str, last_decode: Option<&DecodedMessageVi
         .map(|e| crate::dxcc::format_entity_with_state(&e, app.station_state_for(call)))
         .unwrap_or_else(|| "---".to_string());
 
-    let status_flag = last_decode
+    // Worked status is per exact call: a newer decode of the base or
+    // portable form must not hide this call's own status (PAN-228).
+    let status_decode = app
+        .decoded_messages
+        .iter()
+        .rev()
+        .find(|m| {
+            m.call_sign
+                .as_deref()
+                .is_some_and(|c| crate::app::same_station(c, call))
+        })
+        .or(last_decode);
+    let status_flag = status_decode
         .map(|m| {
             if m.atno {
                 "ATNO\u{2605}"
@@ -364,6 +376,47 @@ pub(in crate::ui) mod tests {
             &render_at(&app, 130, 6),
             "Why: not scored yet (no decode or cqdx data)"
         ));
+    }
+
+    /// PAN-228: after a completed QSO, with no later decode, the card and
+    /// the Why line agree the station is already worked.
+    #[tokio::test]
+    async fn completed_qso_card_and_why_line_say_worked() {
+        let mut app = ranked_app("JA1ABC", false, false).await;
+        assert!(buffer_contains(&render_at(&app, 130, 6), " new"));
+        let mut factors = app.dx_stations["JA1ABC"]
+            .local_rank
+            .unwrap()
+            .factors
+            .unwrap();
+        factors.worked_on_band = true;
+        app.refresh_local_rank("JA1ABC", 900, factors);
+        let buf = render_at(&app, 130, 6);
+        let line1 = row(&buf, 1);
+        assert!(line1.contains(" worked"), "{line1}");
+        assert!(!line1.contains(" new"), "{line1}");
+        let why = row(&buf, 2);
+        assert!(why.contains("Why: "), "{why}");
+        assert!(why.contains("already worked on 20M"), "{why}");
+    }
+
+    /// PAN-228 (Codex #493): a newer decode of the bare call must not hide
+    /// the completed portable call's worked status.
+    #[tokio::test]
+    async fn completed_portable_call_stays_worked_after_a_bare_decode() {
+        let mut app = ranked_app("K1ABC/P", false, false).await;
+        let mut factors = app.dx_stations["K1ABC/P"]
+            .local_rank
+            .unwrap()
+            .factors
+            .unwrap();
+        factors.worked_on_band = true;
+        app.refresh_local_rank("K1ABC/P", 900, factors);
+        app.decoded_messages.push_back(fixture_view("K1ABC", -5));
+        assert_eq!(app.focused_callsign().as_deref(), Some("K1ABC/P"));
+        let line1 = row(&render_at(&app, 130, 6), 1);
+        assert!(line1.contains(" worked"), "{line1}");
+        assert!(!line1.contains(" new"), "{line1}");
     }
 
     #[tokio::test]

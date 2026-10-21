@@ -146,6 +146,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- TX no longer keys late while another component is registering on the
+  internal message bus (PAN-202). The key-down used to wait for that
+  registration after every pre-PTT check had already passed, so a frame
+  cleared as in time could key past the `tx_late_max_ms` cap. Every PTT-on
+  (scheduled TX, multi-TX bundles, tune and manual PTT) now reaches the rig's
+  command queue without waiting.
+
+- Decode effort `Max` no longer delays a busy window's decodes by seconds on
+  slower computers. Before an extra decode pass, pancetta now checks that the
+  pass fits in the time left before the next slot, and skips it when it would
+  not (PAN-165).
+
 - A remote client that disarmed or lost control while pancetta was busy could
   still use up its manual-call budget. Repeating a call on an existing QSO
   charged the resend, and could advance or complete the QSO, after the

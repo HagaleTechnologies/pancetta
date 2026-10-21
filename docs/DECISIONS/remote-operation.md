@@ -534,7 +534,10 @@ cannot connect until it sends `hello.gatewayToken`.
 `MessageBus::send_message_if` waits for the channel table's read lock, calls a
 synchronous authorization predicate, then enqueues with `try_send`. No await
 separates the predicate from enqueue. Both single-TX and multi-TX use it for
-PTT-on and audio output. A disarm or control transfer during the table-lock wait
+PTT-on and audio output. Since PAN-202, PTT-on uses
+`MessageBus::send_rig_command_if` instead, with the same predicate, no table
+lock and no await; audio output still uses `send_message_if` (see
+tx-scheduling.md, PAN-202). A disarm or control transfer during the table-lock wait
 is therefore observed before either message can reach its consumer.
 
 The predicate must be a leaf with no bus calls, awaits, or blocking work beyond

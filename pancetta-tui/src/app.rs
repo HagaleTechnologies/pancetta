@@ -26,7 +26,9 @@ pub const AUDIO_PASSBAND_MAX_HZ: u64 = 3000;
 
 // Test-only thread-local backing `App::set_test_tui_state_path` /
 // `App::tui_state_path`. See those for why this is a thread-local rather
-// than a process-global env var. Never compiled into production builds.
+// than a process-global env var. Unset (`None`) means "no state file" in
+// test builds — never the real `~/.pancetta/tui_state.json` (PAN-194).
+// Never compiled into production builds.
 #[cfg(test)]
 thread_local! {
     static TEST_TUI_STATE_PATH_OVERRIDE: std::cell::RefCell<Option<std::path::PathBuf>> =
@@ -550,6 +552,21 @@ impl DxStation {
             at,
         )
     }
+}
+
+/// Exact station identity for worked status: a resolved hash render matches
+/// its plain call, but a portable variant is a different station, matching
+/// the scorer's exact-call duplicate check (PAN-94, PAN-228).
+pub(crate) fn same_station(a: &str, b: &str) -> bool {
+    let a = a.trim().to_uppercase();
+    let b = b.trim().to_uppercase();
+    matches!(
+        (
+            pancetta_core::callsign::resolve_hash_render(&a),
+            pancetta_core::callsign::resolve_hash_render(&b),
+        ),
+        (Some(a), Some(b)) if a == b
+    )
 }
 
 fn tui_rank(
@@ -1881,23 +1898,33 @@ impl App {
     /// Path to the persisted TUI state file (`~/.pancetta/tui_state.json`).
     /// `None` if the home directory can't be resolved.
     ///
-    /// Test-only seam: honors a thread-local override (see
-    /// [`Self::set_test_tui_state_path`]) so the unit test suite never reads
-    /// or writes the operator's real state file — compiled out of
-    /// production builds entirely (`#[cfg(test)]`), so this is a no-op for
-    /// the real TUI.
+    /// Test builds (`#[cfg(test)]`) never resolve the real file: they return
+    /// only the thread-local override (see [`Self::set_test_tui_state_path`]),
+    /// and an unset override means `None` — no state file, so loads fall back
+    /// to their defaults and `persist_tui_state` skips the write (PAN-194). A
+    /// test that needs persistence opts in with `set_test_tui_state_path`.
+    /// Production builds always use [`Self::home_tui_state_path`].
     fn tui_state_path() -> Option<std::path::PathBuf> {
         #[cfg(test)]
         {
-            if let Some(p) = TEST_TUI_STATE_PATH_OVERRIDE.with(|cell| cell.borrow().clone()) {
-                return Some(p);
-            }
+            TEST_TUI_STATE_PATH_OVERRIDE.with(|cell| cell.borrow().clone())
         }
+        #[cfg(not(test))]
+        {
+            Self::home_tui_state_path()
+        }
+    }
+
+    /// The real `~/.pancetta/tui_state.json`; `None` if the home directory can't be resolved.
+    fn home_tui_state_path() -> Option<std::path::PathBuf> {
         dirs::home_dir().map(|h| h.join(".pancetta").join("tui_state.json"))
     }
 
     /// Test-only: point [`Self::tui_state_path`] at `path` for the calling
-    /// thread only, so tests never touch `~/.pancetta/tui_state.json`.
+    /// thread only. Leaving it unset means "no state file" in test builds
+    /// (defaults load, writes are skipped) — never the real
+    /// `~/.pancetta/tui_state.json`, so only a test that needs persistence
+    /// calls this.
     /// `#[tokio::test]` defaults to a current-thread runtime, so a value set
     /// here is visible for the rest of the test body (including any tasks
     /// it spawns) — unlike a process-global env var, a thread-local can't
@@ -3374,6 +3401,11 @@ impl App {
     /// with that station ended (PAN-94), and rescore its cqdx spot with the
     /// same history so a stale network score cannot keep the row up. Keeps
     /// when each source was heard; rows with no local decode are left alone.
+    ///
+    /// A completed QSO (`worked_on_band`) also marks the row and its retained
+    /// decodes worked, so the DX Hunter partition and the Station card agree
+    /// with the Why line before the station is decoded again (PAN-228).
+    /// Decodes match by the relay's hash-render identity, not by base call.
     pub fn refresh_local_rank(&mut self, callsign: &str, score: u32, factors: PriorityFactors) {
         let Some(entry) = self.dx_stations.get_mut(callsign) else {
             return;
@@ -3383,6 +3415,17 @@ impl App {
         };
         rank.score = score;
         rank.factors = Some(factors);
+        if factors.worked_on_band {
+            entry.worked_before = true;
+            for m in &mut self.decoded_messages {
+                if m.call_sign
+                    .as_deref()
+                    .is_some_and(|c| same_station(c, callsign))
+                {
+                    m.worked_before = true;
+                }
+            }
+        }
         if let Some(network_at) = entry.network_rank.map(|rank| rank.at) {
             entry.network_rank = Some(entry.score_network_spot(network_at));
         }
@@ -5016,6 +5059,114 @@ mod tests {
         assert!(network.factors.unwrap().recent_failure);
     }
 
+    /// Rescore factors as the relay sends them once a QSO with `call` ended.
+    fn outcome_factors(app: &App, call: &str, worked: bool, failed: bool) -> PriorityFactors {
+        let mut factors = app.dx_stations[call].local_rank.unwrap().factors.unwrap();
+        factors.worked_on_band = worked;
+        factors.recent_failure = failed;
+        factors
+    }
+
+    fn null_factors(call: &str) -> PriorityFactors {
+        pancetta_qso::PriorityScorer::new(
+            pancetta_qso::priority::PriorityWeights::default(),
+            Box::new(pancetta_qso::priority::NullLookup),
+        )
+        .score_tiered_explained(call, None, -7, 14_074_000.0)
+        .factors
+    }
+
+    async fn two_unworked_rows() -> App {
+        let mut app = fixture_app().await;
+        let mut lead = fixture_view("JA1ABC", -7);
+        lead.priority_score = Some(4100);
+        lead.priority_factors = Some(null_factors("JA1ABC"));
+        app.add_decoded_message(lead).await.unwrap();
+        let mut other = fixture_view("K1AAA", -7);
+        other.priority_score = Some(1500);
+        other.priority_factors = Some(null_factors("K1AAA"));
+        app.add_decoded_message(other).await.unwrap();
+        let order: Vec<_> = app
+            .displayed_dx_stations()
+            .iter()
+            .map(|s| s.call_sign.clone())
+            .collect();
+        assert_eq!(order, ["JA1ABC", "K1AAA"]);
+        app
+    }
+
+    /// PAN-228: a completed QSO marks the row worked before the station is
+    /// decoded again, so it leaves the unworked-first partition.
+    #[tokio::test]
+    async fn completed_qso_moves_the_row_out_of_the_unworked_partition() {
+        let mut app = two_unworked_rows().await;
+        let factors = outcome_factors(&app, "JA1ABC", true, false);
+        app.refresh_local_rank("JA1ABC", 4100, factors);
+        let order: Vec<_> = app
+            .displayed_dx_stations()
+            .iter()
+            .map(|s| (s.call_sign.clone(), s.worked_before))
+            .collect();
+        assert_eq!(
+            order,
+            [("K1AAA".to_owned(), false), ("JA1ABC".to_owned(), true)]
+        );
+        // The Station card reads the retained decode.
+        let decode = app
+            .decoded_messages
+            .iter()
+            .find(|m| m.call_sign.as_deref() == Some("JA1ABC"))
+            .unwrap();
+        assert!(decode.worked_before);
+        let other = app
+            .decoded_messages
+            .iter()
+            .find(|m| m.call_sign.as_deref() == Some("K1AAA"))
+            .unwrap();
+        assert!(!other.worked_before);
+    }
+
+    /// PAN-228: retained decodes match the completed call by the same
+    /// hash-render identity the relay's outcome refresh uses (PAN-94), and
+    /// never by base call.
+    #[tokio::test]
+    async fn completed_qso_marks_hash_rendered_decodes_only() {
+        let mut app = fixture_app().await;
+        let mut msg = fixture_view("JA1ABC", -7);
+        msg.priority_score = Some(1500);
+        msg.priority_factors = Some(null_factors("JA1ABC"));
+        app.add_decoded_message(msg).await.unwrap();
+        app.decoded_messages.push_back(fixture_view("<JA1ABC>", -7));
+        app.decoded_messages.push_back(fixture_view("JA1ABC/P", -7));
+        let factors = outcome_factors(&app, "JA1ABC", true, false);
+        app.refresh_local_rank("JA1ABC", 1500, factors);
+        let worked: Vec<_> = app
+            .decoded_messages
+            .iter()
+            .map(|m| (m.call_sign.clone().unwrap(), m.worked_before))
+            .collect();
+        assert_eq!(
+            worked,
+            [
+                ("JA1ABC".to_owned(), true),
+                ("<JA1ABC>".to_owned(), true),
+                ("JA1ABC/P".to_owned(), false),
+            ]
+        );
+    }
+
+    /// PAN-228: a failed QSO is not a worked station.
+    #[tokio::test]
+    async fn failed_qso_keeps_the_row_in_the_unworked_partition() {
+        let mut app = two_unworked_rows().await;
+        let factors = outcome_factors(&app, "JA1ABC", false, true);
+        app.refresh_local_rank("JA1ABC", 4100, factors);
+        let row = &app.dx_stations["JA1ABC"];
+        assert!(!row.worked_before);
+        assert_eq!(app.displayed_dx_stations()[0].call_sign, "JA1ABC");
+        assert!(app.decoded_messages.iter().all(|m| !m.worked_before));
+    }
+
     #[tokio::test]
     async fn equal_scores_prefer_the_local_basis() {
         let mut app = fixture_app().await;
@@ -5190,18 +5341,25 @@ mod tests {
         assert!(m.rx_buffer.is_empty() && m.tx_buffer.is_empty());
     }
 
-    /// With the test-only override unset, `tui_state_path()` must resolve
-    /// to exactly `~/.pancetta/tui_state.json` — the real production path.
-    /// This is a computation-only check (it never reads/writes the file
-    /// itself), so it's safe to run without touching the operator's real
-    /// state file.
+    /// `home_tui_state_path()` — what production builds' `tui_state_path()`
+    /// resolves to — must be exactly `~/.pancetta/tui_state.json`. This is a
+    /// computation-only check (it never reads/writes the file itself), so
+    /// it's safe to run without touching the operator's real state file.
     #[test]
-    fn tui_state_path_default_is_real_home_pancetta_path() {
-        // Explicitly clear any override a prior test on this thread may
-        // have left behind, so this test is order-independent.
-        TEST_TUI_STATE_PATH_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+    fn home_tui_state_path_is_real_home_pancetta_path() {
         let expected = dirs::home_dir().map(|h| h.join(".pancetta").join("tui_state.json"));
-        assert_eq!(App::tui_state_path(), expected);
+        assert_eq!(App::home_tui_state_path(), expected);
+    }
+
+    /// PAN-194: with no override, test builds resolve no state file, so `App::new`
+    /// seeds the defaults whatever the developer saved in ~/.pancetta/tui_state.json.
+    #[tokio::test]
+    async fn tui_state_path_without_override_is_none_and_app_seeds_defaults() {
+        TEST_TUI_STATE_PATH_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+        assert_eq!(App::tui_state_path(), None);
+        let app = fixture_app().await;
+        assert_eq!(app.decode_effort, "AUTO");
+        assert_eq!(app.active_view, crate::view::ActiveView::Operate);
     }
 
     /// `set_decode_effort` (decoder-speed-overhaul Task 15) persists the

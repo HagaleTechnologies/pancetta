@@ -51,6 +51,7 @@ pub use tx::{
     tx_rf_for_gate, tx_signal_span_hz, CoalesceEntry, CoalesceOutcome, TxSchedule,
 };
 
+pub use effort::DecodeWindowConfig;
 pub use qso::compute_manual_tx_offset;
 
 // PAN-51: the decode-path message classifier. Re-exported so the loopback
@@ -714,41 +715,24 @@ pub enum ModeSwitchError {
 /// slip through and run under the new mode's timing. Narrow, low-severity
 /// residual window; not a full closure of the race.
 ///
-/// Ordering: the fallible step (`ft8_config.try_write()`) happens BEFORE any
+/// Ordering: the fallible step (`decode_window.try_write()`) happens BEFORE any
 /// atomic store, so a failure here leaves every consumer (DSP, decode, TX,
 /// QSO) seeing the OLD mode consistently — never a torn state where some
 /// consumers see new atomics but the decoder config is still old.
 pub fn try_switch_operating_mode(
     new_mode: pancetta_config::OperatingMode,
     active_tx_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
-    ft8_config: &std::sync::Arc<tokio::sync::RwLock<pancetta_ft8::Ft8Config>>,
+    decode_window: &std::sync::Arc<tokio::sync::RwLock<DecodeWindowConfig>>,
     active_protocol_mode: &std::sync::Arc<std::sync::atomic::AtomicU8>,
     active_slot_ns: &std::sync::Arc<std::sync::atomic::AtomicI64>,
     active_decode_phase_ns: &std::sync::Arc<std::sync::atomic::AtomicI64>,
-    // PAN-157 round 3 review finding: a station already on the `Max`
-    // effort preset that switches protocol (e.g. FT8 -> FT4) must not
-    // carry FT8's `max_decode_passes = 2` override into FT4, where the
-    // coherent-subtraction machinery is FT8-79-symbol-specific — a
-    // second pass just repeats the full decode against an unchanged
-    // residual, wasting time under FT4's tighter 800ms slot budget.
-    // `apply_effort_overrides` itself now gates its `Max` arm on
-    // `config.protocol == Protocol::Ft8`, but that gate only re-fires
-    // when apply_effort_overrides is CALLED — a bare protocol switch
-    // previously never called it at all, leaving a stale FT8-era
-    // override in place. Re-run it here, right after the protocol
-    // write, using the CURRENT effort/tier atomics, so a protocol
-    // switch alone (no effort-preset change) also re-evaluates the
-    // override under the new protocol.
+    // PAN-157 round 3 review finding: a protocol switch while already
+    // on `Max` must re-evaluate the FT8-only multipass override under the
+    // new protocol, using the CURRENT effort/tier atomics —
+    // `DecodeWindowConfig::switch_protocol` does it against the budget
+    // already published, which a mode switch never changes.
     current_decode_effort: &std::sync::Arc<std::sync::atomic::AtomicU8>,
     resolved_hardware_tier: &std::sync::Arc<std::sync::atomic::AtomicU8>,
-    // Round-12-of-PAN-157 review finding: a mode switch never touches
-    // `decode_effort_budget_ms` — it stays at whatever it held before
-    // (possibly an explicit startup `[decoder].budget_ms` override
-    // smaller than the FT8 ceiling). Passing a guessed `None`/`Some`
-    // here would be wrong; read the atomic fresh so the override
-    // decision always matches the budget this station will ACTUALLY
-    // run under, which this function does not and must not change.
-    decode_effort_budget_ms: &std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<(), ModeSwitchError> {
     use std::sync::atomic::Ordering;
 
@@ -760,18 +744,16 @@ pub fn try_switch_operating_mode(
     }
 
     let new_protocol = protocol_from_mode(new_mode);
-    let mut cfg_guard = ft8_config
+    let mut window_guard = decode_window
         .try_write()
         .map_err(|_| ModeSwitchError::ConfigLockBusy)?;
-    cfg_guard.protocol = new_protocol;
     let effort =
         pancetta_config::DecodeEffort::from_u8(current_decode_effort.load(Ordering::Acquire));
     let tier = pancetta_ft8::tier_probe::HardwareTier::from_u8(
         resolved_hardware_tier.load(Ordering::Acquire),
     );
-    let effective_budget_ms = decode_effort_budget_ms.load(Ordering::Acquire);
-    effort::apply_effort_overrides(effort, tier, effective_budget_ms, &mut cfg_guard);
-    drop(cfg_guard);
+    window_guard.switch_protocol(new_protocol, effort, tier);
+    drop(window_guard);
 
     let timing = derive_dsp_timing(&pancetta_ft8::ProtocolParams::from_protocol(new_protocol));
     let decode_phase_ns = timing
@@ -1420,20 +1402,6 @@ pub struct ApplicationCoordinator {
     /// byte-identical to the prior hardcoded `Duration::seconds(13)`.
     active_decode_phase_ns: Arc<std::sync::atomic::AtomicI64>,
 
-    /// Operator/preset-configured decode wall-time effort budget in
-    /// milliseconds (decoder-speed-overhaul Task 12). `0` is the unlimited
-    /// sentinel — the decode loop then falls back to the mode-aware
-    /// ceiling (`decode_budget_ceiling_ms`) alone. Read once per window at
-    /// both decode call sites in `ft8.rs`. Seeded from `[decoder]`
-    /// (`effort` mapped via `effort::preset_budget_ms`, or the explicit
-    /// `budget_ms` override when set) at coordinator startup (assuming
-    /// `HardwareTier::Fast` before the tier is known) and re-seeded by
-    /// `tier::initialize` once the real hardware tier resolves — see
-    /// `effort.rs` (Task 14). A live-reload/TUI-cycle call site landing
-    /// later should re-seed through `effort::seed_effort_budget` too (see
-    /// that module's doc comment).
-    decode_effort_budget_ms: Arc<std::sync::atomic::AtomicU64>,
-
     /// Wall-clock time (ms) the most recently completed decode window spent
     /// in the budgeted decode call(s) — decoder-speed-overhaul Task 12
     /// metrics. `0` until the first window completes. Written by the FT8
@@ -1442,9 +1410,7 @@ pub struct ApplicationCoordinator {
 
     /// Whether the most recently completed decode window ran out of its
     /// [`pancetta_ft8::DecodeBudget`] before all optional work finished
-    /// (decoder-speed-overhaul Task 12 metrics). Always `false` while
-    /// `decode_effort_budget_ms == 0` (unlimited) — this task alone can
-    /// never flip it. Written by the FT8 decode loop, read by the TUI
+    /// (decoder-speed-overhaul Task 12 metrics). Written by the FT8 decode loop, read by the TUI
     /// relay's periodic `PipelineHealth` push.
     decode_last_budget_exhausted: Arc<AtomicBool>,
 
@@ -1453,8 +1419,8 @@ pub struct ApplicationCoordinator {
     /// `from_u8`. Seeded from `[decoder].effort` at startup; from this task
     /// onward it is also the state the TUI's `e` keybinding cycles
     /// (Eco → Standard → Deep → Max → Auto → Eco) via
-    /// `effort::cycle_decode_effort`, which also re-derives and writes
-    /// `decode_effort_budget_ms` for the new preset.
+    /// `effort::cycle_decode_effort`, which also re-derives and publishes
+    /// the new preset's budget into `decode_window`.
     current_decode_effort: Arc<std::sync::atomic::AtomicU8>,
 
     /// Best-known hardware tier (decoder-speed-overhaul Task 15), encoded
@@ -1531,6 +1497,11 @@ pub struct ApplicationCoordinator {
     /// Test handshake after waveform construction, immediately before the gate wait.
     #[cfg(test)]
     tx_before_ptt_gate: Arc<tokio::sync::Notify>,
+
+    /// PAN-202 test seam: parks the TX worker between its last pre-PTT gate
+    /// and the key-down when armed.
+    #[cfg(test)]
+    pub(crate) key_down_probe: Arc<tx::KeyDownProbe>,
 
     /// Epoch-ms timestamp of the most recent PTT-on (updated alongside
     /// `ptt_active` going true). Unlike the boolean, this survives past
@@ -1664,12 +1635,17 @@ pub struct ApplicationCoordinator {
     /// the prior env-var probe.
     pub(crate) scoped_fast_path: Arc<AtomicBool>,
 
-    /// hb-216 S2 — shared decoder config the FT8 thread reads on each
-    /// window iteration. The tier probe may rewrite Slow-tier presets
-    /// (`max_decode_passes=1`, `osd_depth=Some(1)`) once it classifies
-    /// the host; the FT8 thread rebuilds its decoder when the
-    /// `(max_decode_passes, osd_depth)` tuple changes.
-    pub(crate) ft8_config: Arc<RwLock<Ft8Config>>,
+    /// hb-216 S2 / PAN-164 — the per-window decode budget (milliseconds,
+    /// `0` = the protocol ceiling; decoder-speed-overhaul Task 12) and the
+    /// decoder config derived with it, published together as ONE
+    /// [`DecodeWindowConfig`] behind one lock. Seeded at startup from
+    /// `[decoder]` (assuming `HardwareTier::Fast`), re-published by
+    /// `tier::initialize` once the real tier resolves, by the TUI effort
+    /// cycle and (protocol only) by `try_switch_operating_mode`. The FT8
+    /// thread reads it with ONE `try_read()` per window, so the budget and
+    /// the decoder fields it uses always come from the same publish, and
+    /// rebuilds its decoder when a `DecoderRebuildKey` field changes.
+    pub(crate) decode_window: Arc<RwLock<DecodeWindowConfig>>,
 
     /// Non-fatal config-load warnings (e.g. a `pancetta.toml` that existed but
     /// failed to parse and was silently reverted to defaults). Surfaced to the
@@ -2098,8 +2074,8 @@ impl ApplicationCoordinator {
 
         // Snapshot [decoder] before config is moved into the Arc<RwLock>
         // (decoder-speed-overhaul Task 14). `effort` + an optional explicit
-        // `budget_ms` override drive the `decode_effort_budget_ms` atomic
-        // seeded below; `budget_ms` always wins over the preset when set.
+        // `budget_ms` override drive the decode budget published into
+        // `decode_window` below; `budget_ms` always wins over the preset when set.
         let decoder_effort_init = config.decoder.effort;
         let decoder_budget_override_init = config.decoder.budget_ms;
 
@@ -2143,47 +2119,31 @@ impl ApplicationCoordinator {
         // Costas) in FT4 mode, not just retunes the slot grid. Without this the
         // decoder would run FT8 geometry against FT4 audio. mode=FT8 →
         // protocol=Ft8, byte-identical to the previous `Ft8Config::default()`.
-        let mut ft8_config_init = Ft8Config {
-            protocol: active_protocol,
-            ..Ft8Config::default()
-        };
-        // PAN-156: apply the initial decode-effort preset's Ft8Config
-        // overrides before the config is shared, assuming
-        // `HardwareTier::Fast` until the probe resolves (same convention
-        // `decode_effort_budget_ms`'s own initial seed below uses).
-        // `tier::initialize` re-applies this once the real tier is known
-        // (mirroring how it re-seeds `decode_effort_budget_ms`), and
-        // `tui_relay.rs`'s `CycleDecodeEffort` handler re-applies it on
-        // every live preset switch — so this seeds the starting point
-        // only.
-        effort::apply_effort_overrides(
-            decoder_effort_init,
-            pancetta_ft8::tier_probe::HardwareTier::Fast,
-            decoder_budget_override_init.unwrap_or_else(|| {
-                effort::preset_budget_ms(
-                    decoder_effort_init,
-                    pancetta_ft8::tier_probe::HardwareTier::Fast,
-                )
-            }),
-            &mut ft8_config_init,
+        //
+        // decoder-speed-overhaul Task 14 / PAN-156 / PAN-164: publish the
+        // initial budget and the effort preset's Ft8Config overrides
+        // together, before the window is shared, assuming
+        // `HardwareTier::Fast` until the tier is known — the same
+        // "innocent until proven otherwise" convention `tier::initialize`
+        // already uses for `scoped_fast_path`. `tier::initialize`
+        // re-publishes with the real tier on both the synchronous
+        // cache-hit path and the async probe-completion path, and
+        // `tui_relay.rs`'s `CycleDecodeEffort` handler on every live
+        // preset switch — so this seeds the starting point only.
+        let mut decode_window_init = DecodeWindowConfig::new(
+            Ft8Config {
+                protocol: active_protocol,
+                ..Ft8Config::default()
+            },
+            0,
         );
-        let ft8_config = Arc::new(RwLock::new(ft8_config_init));
-
-        // decoder-speed-overhaul Task 14: seed `decode_effort_budget_ms` with
-        // an initial value before the hardware tier is known, assuming
-        // `HardwareTier::Fast` — the same "innocent until proven otherwise"
-        // convention `tier::initialize` already uses for `scoped_fast_path`
-        // (which also defaults to the fast-tier assumption until a cache hit
-        // or background probe resolves the real tier). `tier::initialize`
-        // re-seeds this atomic with the real tier on both the synchronous
-        // cache-hit path and the async probe-completion path.
-        let decode_effort_budget_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
         effort::seed_effort_budget(
             decoder_effort_init,
             decoder_budget_override_init,
             pancetta_ft8::tier_probe::HardwareTier::Fast,
-            &decode_effort_budget_ms,
+            &mut decode_window_init,
         );
+        let decode_window = Arc::new(RwLock::new(decode_window_init));
         // decoder-speed-overhaul Task 15: the operator's current decode-effort
         // preset, so the TUI's `e` cycle key has a starting point that
         // matches `[decoder].effort` rather than always starting from Auto.
@@ -2191,7 +2151,7 @@ impl ApplicationCoordinator {
             decoder_effort_init.as_u8(),
         ));
         // Assume Fast until the tier probe resolves (same convention as the
-        // `decode_effort_budget_ms` seed just above); `tier::initialize`
+        // `decode_window` seed just above); `tier::initialize`
         // re-seeds this with the real tier on both the cache-hit and
         // background-probe-completion paths.
         let resolved_hardware_tier = Arc::new(std::sync::atomic::AtomicU8::new(
@@ -2200,10 +2160,9 @@ impl ApplicationCoordinator {
         let scoped_fast_path = tier::initialize(
             decoder_effort_init,
             decoder_budget_override_init,
-            decode_effort_budget_ms.clone(),
             current_decode_effort.clone(),
             resolved_hardware_tier.clone(),
-            ft8_config.clone(),
+            decode_window.clone(),
         )
         .await;
 
@@ -2328,10 +2287,6 @@ impl ApplicationCoordinator {
             active_decode_phase_ns: Arc::new(std::sync::atomic::AtomicI64::new(
                 active_decode_phase_ns_init,
             )),
-            // Seeded above (Task 14) from `[decoder]` effort/budget_ms and the
-            // assumed-then-probed hardware tier; re-seeded on tier-probe
-            // completion by `tier::initialize`.
-            decode_effort_budget_ms,
             decode_last_elapsed_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             decode_last_budget_exhausted: Arc::new(AtomicBool::new(false)),
             current_decode_effort,
@@ -2347,6 +2302,8 @@ impl ApplicationCoordinator {
             tx_requeue: tx::TxRequeue::default(),
             #[cfg(test)]
             tx_before_ptt_gate: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            key_down_probe: Arc::new(tx::KeyDownProbe::default()),
             last_ptt_on_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             // C9 dedup anchor — no pancetta-initiated frequency command yet.
             last_freq_command: Arc::new(std::sync::Mutex::new(None)),
@@ -2395,7 +2352,10 @@ impl ApplicationCoordinator {
                 crate::coordinator::hamlib::RigConnState::default().as_u8(),
             )),
             scoped_fast_path,
-            ft8_config,
+            // Seeded above (Task 14 / PAN-164) from `[decoder]`
+            // effort/budget_ms and the assumed-then-probed hardware tier;
+            // re-published on tier-probe completion by `tier::initialize`.
+            decode_window,
             config_warnings,
             active_tx_qsos: Arc::new(std::sync::RwLock::new(HashSet::new())),
             fox_admitted_qsos: Arc::new(std::sync::RwLock::new(HashSet::new())),
@@ -2857,14 +2817,6 @@ impl ApplicationCoordinator {
     /// (from this task onward) written by `try_switch_operating_mode`.
     pub(crate) fn active_decode_phase_ns(&self) -> Arc<std::sync::atomic::AtomicI64> {
         self.active_decode_phase_ns.clone()
-    }
-
-    /// Decode wall-time effort budget atomic in milliseconds (`0` =
-    /// unlimited). Decoder-speed-overhaul Task 12 plumbing: read every
-    /// window at both decode call sites in `ft8.rs`; Task 14 is the first
-    /// writer (config/TUI-driven effort presets).
-    pub(crate) fn decode_effort_budget_ms(&self) -> Arc<std::sync::atomic::AtomicU64> {
-        self.decode_effort_budget_ms.clone()
     }
 
     /// Operator-facing decode-effort preset atomic (decoder-speed-overhaul
@@ -4525,7 +4477,10 @@ mod tests {
         let active_tx_qsos = Arc::new(std::sync::RwLock::new(std::collections::HashSet::from([
             "W1ABC-14074000".to_string(),
         ])));
-        let ft8_config = Arc::new(tokio::sync::RwLock::new(Ft8Config::default()));
+        let decode_window = Arc::new(tokio::sync::RwLock::new(DecodeWindowConfig::new(
+            Ft8Config::default(),
+            0,
+        )));
         let active_protocol_mode = Arc::new(std::sync::atomic::AtomicU8::new(
             pancetta_config::OperatingMode::Ft8.as_u8(),
         ));
@@ -4537,18 +4492,16 @@ mod tests {
         let resolved_hardware_tier = Arc::new(std::sync::atomic::AtomicU8::new(
             pancetta_ft8::tier_probe::HardwareTier::Fast.as_u8(),
         ));
-        let decode_effort_budget_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let result = try_switch_operating_mode(
             pancetta_config::OperatingMode::Ft4,
             &active_tx_qsos,
-            &ft8_config,
+            &decode_window,
             &active_protocol_mode,
             &active_slot_ns,
             &active_decode_phase_ns,
             &current_decode_effort,
             &resolved_hardware_tier,
-            &decode_effort_budget_ms,
         );
 
         assert!(matches!(result, Err(ModeSwitchError::QsosActive(1))));
@@ -4563,7 +4516,10 @@ mod tests {
     #[tokio::test]
     async fn try_switch_operating_mode_succeeds_when_idle() {
         let active_tx_qsos = Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
-        let ft8_config = Arc::new(tokio::sync::RwLock::new(Ft8Config::default()));
+        let decode_window = Arc::new(tokio::sync::RwLock::new(DecodeWindowConfig::new(
+            Ft8Config::default(),
+            0,
+        )));
         let active_protocol_mode = Arc::new(std::sync::atomic::AtomicU8::new(
             pancetta_config::OperatingMode::Ft8.as_u8(),
         ));
@@ -4575,18 +4531,16 @@ mod tests {
         let resolved_hardware_tier = Arc::new(std::sync::atomic::AtomicU8::new(
             pancetta_ft8::tier_probe::HardwareTier::Fast.as_u8(),
         ));
-        let decode_effort_budget_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let result = try_switch_operating_mode(
             pancetta_config::OperatingMode::Ft4,
             &active_tx_qsos,
-            &ft8_config,
+            &decode_window,
             &active_protocol_mode,
             &active_slot_ns,
             &active_decode_phase_ns,
             &current_decode_effort,
             &resolved_hardware_tier,
-            &decode_effort_budget_ms,
         );
 
         assert!(result.is_ok());
@@ -4596,7 +4550,7 @@ mod tests {
         );
         assert_eq!(active_slot_ns.load(Ordering::Relaxed), 7_500_000_000);
         assert_eq!(
-            ft8_config.read().await.protocol,
+            decode_window.read().await.ft8().protocol,
             pancetta_ft8::Protocol::Ft4
         );
     }
@@ -4607,11 +4561,14 @@ mod tests {
     #[tokio::test]
     async fn switching_away_from_ft8_clears_the_ft8_only_multipass_override() {
         let active_tx_qsos = Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
-        let ft8_config = Arc::new(tokio::sync::RwLock::new(Ft8Config {
-            max_decode_passes: 2,
-            time_varying_subtraction_enabled: true,
-            ..Ft8Config::default()
-        }));
+        let decode_window = Arc::new(tokio::sync::RwLock::new(DecodeWindowConfig::new(
+            Ft8Config {
+                max_decode_passes: 2,
+                time_varying_subtraction_enabled: true,
+                ..Ft8Config::default()
+            },
+            0,
+        )));
         let active_protocol_mode = Arc::new(std::sync::atomic::AtomicU8::new(
             pancetta_config::OperatingMode::Ft8.as_u8(),
         ));
@@ -4623,22 +4580,21 @@ mod tests {
         let resolved_hardware_tier = Arc::new(std::sync::atomic::AtomicU8::new(
             pancetta_ft8::tier_probe::HardwareTier::Fast.as_u8(),
         ));
-        let decode_effort_budget_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let result = try_switch_operating_mode(
             pancetta_config::OperatingMode::Ft4,
             &active_tx_qsos,
-            &ft8_config,
+            &decode_window,
             &active_protocol_mode,
             &active_slot_ns,
             &active_decode_phase_ns,
             &current_decode_effort,
             &resolved_hardware_tier,
-            &decode_effort_budget_ms,
         );
 
         assert!(result.is_ok());
-        let cfg = ft8_config.read().await;
+        let guard = decode_window.read().await;
+        let cfg = guard.ft8();
         assert_eq!(cfg.protocol, pancetta_ft8::Protocol::Ft4);
         assert_eq!(
             cfg.max_decode_passes, 1,
@@ -4651,8 +4607,8 @@ mod tests {
     }
 
     /// Round-12 review finding regression: a mode switch never touches
-    /// `decode_effort_budget_ms`, so a station on `Max` with an explicit,
-    /// too-small `[decoder].budget_ms` already active in that atomic
+    /// the published budget, so a station on `Max` with an explicit,
+    /// too-small `[decoder].budget_ms` already published
     /// (simulated here directly, as a live config-loaded station would
     /// have it) must NOT get the multipass override re-enabled just by
     /// switching (back) into FT8 — the guessed-`None` bug would have
@@ -4660,10 +4616,15 @@ mod tests {
     #[tokio::test]
     async fn switching_into_ft8_honors_an_already_bounded_budget_atomic() {
         let active_tx_qsos = Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
-        let ft8_config = Arc::new(tokio::sync::RwLock::new(Ft8Config {
-            protocol: pancetta_ft8::Protocol::Ft4,
-            ..Ft8Config::default()
-        }));
+        // Simulates an explicit `[decoder].budget_ms = 250` already
+        // published at startup -- smaller than the FT8 ceiling (2000ms).
+        let decode_window = Arc::new(tokio::sync::RwLock::new(DecodeWindowConfig::new(
+            Ft8Config {
+                protocol: pancetta_ft8::Protocol::Ft4,
+                ..Ft8Config::default()
+            },
+            250,
+        )));
         let active_protocol_mode = Arc::new(std::sync::atomic::AtomicU8::new(
             pancetta_config::OperatingMode::Ft4.as_u8(),
         ));
@@ -4675,45 +4636,44 @@ mod tests {
         let resolved_hardware_tier = Arc::new(std::sync::atomic::AtomicU8::new(
             pancetta_ft8::tier_probe::HardwareTier::Fast.as_u8(),
         ));
-        // Simulates an explicit `[decoder].budget_ms = 250` already
-        // seeded into the atomic at startup -- smaller than the FT8
-        // ceiling (2000ms).
-        let decode_effort_budget_ms = Arc::new(std::sync::atomic::AtomicU64::new(250));
 
         let result = try_switch_operating_mode(
             pancetta_config::OperatingMode::Ft8,
             &active_tx_qsos,
-            &ft8_config,
+            &decode_window,
             &active_protocol_mode,
             &active_slot_ns,
             &active_decode_phase_ns,
             &current_decode_effort,
             &resolved_hardware_tier,
-            &decode_effort_budget_ms,
         );
 
         assert!(result.is_ok());
-        let cfg = ft8_config.read().await;
+        let guard = decode_window.read().await;
+        let cfg = guard.ft8();
         assert_eq!(cfg.protocol, pancetta_ft8::Protocol::Ft8);
         assert_eq!(
             cfg.max_decode_passes, 1,
-            "the already-bounded 250ms budget atomic can't afford the \
+            "the already-bounded 250ms published budget can't afford the \
              second pass, even though the mode switch landed on FT8 \
              while the preset is Max"
         );
         assert!(!cfg.time_varying_subtraction_enabled);
-        // The mode switch itself must not have touched the budget atomic.
+        // The mode switch itself must not have touched the budget.
         assert_eq!(
-            decode_effort_budget_ms.load(Ordering::Relaxed),
+            guard.budget_ms(),
             250,
-            "try_switch_operating_mode must never reseed decode_effort_budget_ms"
+            "try_switch_operating_mode must never change the published budget"
         );
     }
 
     #[test]
     fn try_switch_operating_mode_reports_unavailable_on_poisoned_lock() {
         let active_tx_qsos = Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
-        let ft8_config = Arc::new(tokio::sync::RwLock::new(Ft8Config::default()));
+        let decode_window = Arc::new(tokio::sync::RwLock::new(DecodeWindowConfig::new(
+            Ft8Config::default(),
+            0,
+        )));
         let active_protocol_mode = Arc::new(std::sync::atomic::AtomicU8::new(
             pancetta_config::OperatingMode::Ft8.as_u8(),
         ));
@@ -4725,7 +4685,6 @@ mod tests {
         let resolved_hardware_tier = Arc::new(std::sync::atomic::AtomicU8::new(
             pancetta_ft8::tier_probe::HardwareTier::Fast.as_u8(),
         ));
-        let decode_effort_budget_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         // Poison the lock by panicking while holding a write guard.
         let poison_target = Arc::clone(&active_tx_qsos);
@@ -4738,16 +4697,94 @@ mod tests {
         let result = try_switch_operating_mode(
             pancetta_config::OperatingMode::Ft4,
             &active_tx_qsos,
-            &ft8_config,
+            &decode_window,
             &active_protocol_mode,
             &active_slot_ns,
             &active_decode_phase_ns,
             &current_decode_effort,
             &resolved_hardware_tier,
-            &decode_effort_budget_ms,
         );
 
         assert!(matches!(result, Err(ModeSwitchError::QsoSetUnavailable)));
+    }
+
+    /// PAN-164 (Current State §3 of the plan): an FT4->FT8 switch while on
+    /// `Max` must pair FT8's just-enabled second pass with FT8's 2000ms
+    /// ceiling, never FT4's 800ms. The hot loop takes the ceiling from
+    /// the protocol of the decoder it actually built, read in the same
+    /// `try_read()` as the budget, so no separate atomic can tear it.
+    #[tokio::test]
+    async fn mode_switch_publish_pairs_the_ceiling_with_the_protocol() {
+        use super::ft8::{refresh_decode_window, AppliedDecodeWindow, DecodeWindowRefresh};
+
+        let active_tx_qsos = Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
+        let mut ft4_on_max = DecodeWindowConfig::new(
+            Ft8Config {
+                protocol: pancetta_ft8::Protocol::Ft4,
+                ..Ft8Config::default()
+            },
+            0,
+        );
+        ft4_on_max.publish_effort(
+            pancetta_config::DecodeEffort::Max,
+            pancetta_ft8::tier_probe::HardwareTier::Fast,
+            0,
+        );
+        assert_eq!(ft4_on_max.ft8().max_decode_passes, 1, "sanity: FT4 on Max");
+        let mut applied = AppliedDecodeWindow::of(&ft4_on_max);
+        assert_eq!(applied.effective_budget_ms(), 800);
+        let decode_window = Arc::new(tokio::sync::RwLock::new(ft4_on_max));
+        let active_protocol_mode = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_config::OperatingMode::Ft4.as_u8(),
+        ));
+        let active_slot_ns = Arc::new(std::sync::atomic::AtomicI64::new(7_500_000_000));
+        let active_decode_phase_ns = Arc::new(std::sync::atomic::AtomicI64::new(6_500_000_000));
+        let current_decode_effort = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_config::DecodeEffort::Max.as_u8(),
+        ));
+        let resolved_hardware_tier = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_ft8::tier_probe::HardwareTier::Fast.as_u8(),
+        ));
+
+        let result = try_switch_operating_mode(
+            pancetta_config::OperatingMode::Ft8,
+            &active_tx_qsos,
+            &decode_window,
+            &active_protocol_mode,
+            &active_slot_ns,
+            &active_decode_phase_ns,
+            &current_decode_effort,
+            &resolved_hardware_tier,
+        );
+        assert!(result.is_ok());
+
+        // A writer holding the window across the hot loop's refresh: the
+        // loop keeps the whole previous FT4 window (decoder, budget,
+        // ceiling), never FT8's passes under FT4's ceiling.
+        {
+            let held = decode_window.try_write().expect("uncontended");
+            let refresh = refresh_decode_window(&decode_window, &mut applied, |_| {
+                panic!("no rebuild may run while a writer holds the window")
+            });
+            assert_eq!(refresh, DecodeWindowRefresh::<()>::Busy);
+            assert_eq!(applied.rebuild_key.protocol, pancetta_ft8::Protocol::Ft4);
+            assert_eq!(applied.rebuild_key.max_decode_passes, 1);
+            assert_eq!(applied.effective_budget_ms(), 800);
+            drop(held);
+        }
+
+        let refresh = refresh_decode_window(&decode_window, &mut applied, |cfg| {
+            assert_eq!(cfg.protocol, pancetta_ft8::Protocol::Ft8);
+            Ok::<_, ()>(())
+        });
+        assert_eq!(refresh, DecodeWindowRefresh::Rebuilt);
+        assert_eq!(applied.rebuild_key.protocol, pancetta_ft8::Protocol::Ft8);
+        assert_eq!(applied.rebuild_key.max_decode_passes, 2);
+        assert_eq!(
+            applied.effective_budget_ms(),
+            2000,
+            "FT8's second pass must run under FT8's ceiling, never FT4's 800ms"
+        );
     }
 
     #[test]
