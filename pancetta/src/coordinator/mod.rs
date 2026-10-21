@@ -40,6 +40,7 @@ pub mod station_agent;
 mod tier;
 mod tui_relay;
 mod tx;
+mod tx_log;
 mod util;
 mod wav_playback;
 pub(crate) mod wsjtx_udp;
@@ -1493,6 +1494,11 @@ pub struct ApplicationCoordinator {
     /// not handled yet. Owned here so a supervised worker restart keeps them.
     pub(crate) tx_requeue: tx::TxRequeue,
 
+    /// PAN-122: the durable local TX log (`~/.pancetta/tx-log.jsonl`). Created
+    /// by the first `start_transmitter_component` and reused on every
+    /// supervisor restart, so the file never has two writers. `None` until then.
+    pub(crate) tx_frame_log: Option<Arc<tx_log::TxFrameLog>>,
+
     /// Test handshake after waveform construction, immediately before the gate wait.
     #[cfg(test)]
     tx_before_ptt_gate: Arc<tokio::sync::Notify>,
@@ -1748,6 +1754,18 @@ pub struct ApplicationCoordinator {
     /// one -- `send` would see `receiver_count() == 0` and discard the value
     /// instead of storing it, leaving every later subscriber seeded `None`.
     pub(crate) qso_manager_watch: tokio::sync::watch::Sender<Option<pancetta_qso::QsoManager>>,
+
+    /// PAN-42: `true` once the QSO component's task has finished its startup
+    /// worked-history seed and is about to drain `ComponentId::Qso` (or has
+    /// exited without getting there). The `--replay` feeder
+    /// (`replay.rs`) waits on this before its slot-boundary pre-roll, so
+    /// replayed audio never reaches the decoder while the QSO engine is
+    /// still rebuilding history from a large `qsos.adi`. Written only through
+    /// `replay::QsoConsumerReadyGuard` (released on every exit path); never
+    /// reset to `false`, so a Qso restart does not re-gate a running feed.
+    /// `send_replace` semantics for the same zero-receiver reason as
+    /// `qso_manager_watch` above.
+    pub(crate) qso_consumer_ready: tokio::sync::watch::Sender<bool>,
 }
 
 #[cfg(feature = "pancetta-hamlib")]
@@ -2288,6 +2306,7 @@ impl ApplicationCoordinator {
             ptt_sync_gate: Arc::new(tokio::sync::Mutex::new(())),
             relocation_epochs: Arc::new(pancetta_qso::qso_manager::TxRelocationEpochs::default()),
             tx_requeue: tx::TxRequeue::default(),
+            tx_frame_log: None,
             #[cfg(test)]
             tx_before_ptt_gate: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
@@ -2370,6 +2389,7 @@ impl ApplicationCoordinator {
             wsjtx_qso_events_rx: None,
             qso_manager_for_supervisor: None,
             qso_manager_watch: tokio::sync::watch::channel(None).0,
+            qso_consumer_ready: tokio::sync::watch::channel(false).0,
         };
 
         info!("Application Coordinator initialized with ID: {}", id);
@@ -2764,6 +2784,9 @@ impl ApplicationCoordinator {
     ///   into a demo process.
     /// - Clock-skew monitor (`coordinator/clock_monitor.rs`) — not started, so
     ///   no SNTP query leaves a replay.
+    /// - Local TX log (`tx.rs`, `ensure_tx_frame_log`) — `~/.pancetta/tx-log.jsonl`
+    ///   is not opened. Replay starts no Hamlib, so no frame is really
+    ///   transmitted.
     /// - WAV recording (`dsp.rs`'s `resolve_wav_recording`, which also gates
     ///   `audio.rs`'s raw 48 kHz diagnostic capture) — never enabled, even
     ///   with `[audio.recording] auto_record = true`, so a replayed window

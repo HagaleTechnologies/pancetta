@@ -110,6 +110,52 @@ fn replay_mode_runs_full_pipeline_and_exits_cleanly() {
     cmd.assert().success();
 }
 
+/// PAN-42: with a logbook big enough that seeding takes visible time, the
+/// replay feed (first DSP batch) must start only after the QSO component has
+/// finished seeding and is ready to drain decodes.
+#[test]
+fn replay_feed_starts_only_after_the_qso_component_is_ready() {
+    let station = ScratchStation::new("");
+    let mut adif = String::from("<ADIF_VER:5>3.1.4 <PROGRAMID:8>pancetta\n<EOH>\n");
+    for i in 0..20_000u32 {
+        let call = format!("W{}X{:05}", i % 10, i);
+        adif.push_str(&format!(
+            "<CALL:{}>{} <QSO_DATE:8>20250101 <TIME_ON:6>120000 <MODE:3>FT8 \
+             <FREQ:9>14.074000 <BAND:3>20m <EOR>\n",
+            call.len(),
+            call
+        ));
+    }
+    std::fs::write(station.home.path().join(".pancetta/qsos.adi"), adif).unwrap();
+    let dir = station.wav_dir();
+    write_short_wav(&dir.join("a_first.wav"), 12000, 1.0);
+
+    // Worst case: startup + seed + <=15 s pre-roll + 1 s audio +
+    // REPLAY_GRACE_PERIOD (20 s); 90 s leaves CI headroom.
+    let mut cmd = station.command();
+    cmd.args(["--headless", "--replay"])
+        .arg(&dir)
+        .timeout(Duration::from_secs(90));
+    let output = cmd.assert().success().get_output().clone();
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let at = |needle: &str| {
+        log.find(needle)
+            .unwrap_or_else(|| panic!("missing {needle:?} in log:\n{log}"))
+    };
+    let seeded = at("Replayed 20000 records");
+    let ready = at("QSO component ready (callsign=");
+    let released = at("Replay: QSO component ready after");
+    let first_audio = at("DSP first batch");
+    assert!(
+        seeded < ready && ready < released && released < first_audio,
+        "order wrong:\n{log}"
+    );
+}
+
 /// `--no-audio` short-circuits `start_audio_pipeline` before the replay
 /// branch, so the combination used to spawn no feeder at all -- nothing ever
 /// set the shutdown signal and the process hung indefinitely. clap now

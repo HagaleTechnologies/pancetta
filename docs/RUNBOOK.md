@@ -270,6 +270,13 @@ operator-supervised.
   ```bash
   grep -c "<eor>" ~/.pancetta/qsos.adi
   ```
+- Review what the station transmitted:
+  ```bash
+  tail -5 ~/.pancetta/tx-log.jsonl
+  ```
+  Each line is one frame whose audio went to the rig while PTT was keyed:
+  UTC time, mode, TX dial, audio offset, the exact text, local or remote
+  origin, and the QSO it belonged to (fields in `docs/CONFIG.md`, "TX log").
 
 ---
 

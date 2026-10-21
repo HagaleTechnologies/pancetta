@@ -30,3 +30,10 @@ duplicate is advisory and non-fatal everywhere. Gotcha worth knowing: enabling
 an upload target requires credentials or validation rejects it, and credentials
 are never logged. Endpoint shapes, status-code mappings, and the cqdx idempotency
 key are normative in the digest and the dispensa `cqdx-api.v1` contract.
+
+Gotcha (PAN-122): the local TX log `~/.pancetta/tx-log.jsonl` is written by
+the TX worker directly through `TxFrameLog` (`coordinator/tx_log.rs`), never
+via the message bus, and only once a frame's audio is `Enqueued`. The worker
+waits at most 250 ms for the fsync, so a stalled disk never holds PTT, and
+`--replay` writes nothing. Don't route it through `TxFrameLogged`: that event
+is best-effort and is dropped headless.
