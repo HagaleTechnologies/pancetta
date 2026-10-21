@@ -22,6 +22,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Shift+S and one Shift+D row per change; upload warnings never hold TX.
   LoTW keeps its single tqsl attempt.
 
+- Local TX log (PAN-122): every transmitted frame is appended to
+  `~/.pancetta/tx-log.jsonl` as one JSON line (`v`, `utc`, `mode`, `dial_hz`,
+  `offset_hz`, `text`, `origin`, `qso_id`), headless or with the TUI. The TX
+  worker writes each record itself (never through the message bus) with one
+  `write_all` plus `sync_data` once the frame's audio is handed to the audio
+  output, so the record survives a burst of decodes or a crash right after.
+  Each bundle item gets its own line. The file rotates at 8 MiB and keeps 7
+  archives (`tx-log.jsonl.1` … `.7`, at most 64 MiB). `--replay` writes
+  nothing. A write failure never stops TX: it shows as an `ERROR` line that
+  carries the frame text, and a disk slower than 250 ms shows as a `WARN`
+  while the record is still written when the disk responds.
+
 - DX Hunter explains its ranking (PAN-94): a `Why:` line on the Station card,
   a `Why` column on wide DX Hunter panels, and `w` for the full score breakdown.
   A `/P`-style suffix now reads `maybe POTA/SOTA (/P suffix)`; it is a callsign

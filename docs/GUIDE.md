@@ -355,5 +355,7 @@ once `accept_udp_requests = true`, independent of `allow_tx_initiation`
    speakers, not the rig) and `⚠ RX→fallback device` (configured input
    device not found).
 5. Logs: `~/.pancetta/logs/` (daily rotation, 14 kept).
+6. What went out on the air: `~/.pancetta/tx-log.jsonl`, one JSON line
+   per transmitted frame (written headless too).
 
 Press `?` any time for the complete key list.
