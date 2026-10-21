@@ -161,7 +161,7 @@ pub fn reason_for(
     need: Option<&DxNeedStatus>,
     now: DateTime<Utc>,
 ) -> DxReason {
-    let Some((_, rank)) = station.rank_basis() else {
+    let Some((origin, rank)) = station.rank_basis() else {
         return DxReason {
             headline: Headline::NotScored,
             cautions: vec![],
@@ -208,6 +208,10 @@ pub fn reason_for(
     }
     if station.local_rank.is_none() {
         cautions.push(Caution::NetworkOnly);
+    }
+    // Spot-quality cautions follow the source the displayed score came from,
+    // so a mixed row ranked by a weak spot still says so.
+    if origin == RankOrigin::NetworkSpot {
         if station.reporter_count == Some(1) {
             cautions.push(Caution::OneReporter);
         }
@@ -461,7 +465,7 @@ pub fn detail_for(
     }
     lines.push(match origin {
         RankOrigin::LocalDecode => "Scored by the station from your log and this session's history (local decode).",
-        RankOrigin::NetworkSpot => "Scored by the TUI from cqdx spot data. Per-band history comes only from an earlier local decode; failure history is not checked.",
+        RankOrigin::NetworkSpot => "Scored by the TUI from cqdx spot data. Per-band and failure history come only from an earlier local decode.",
     }.into());
     WhyDetail { lines }
 }
@@ -698,6 +702,26 @@ mod tests {
         s.last_seen_network = Some((now() - Duration::seconds(299)).timestamp());
         assert_eq!(reason_for(&s, None, now()).cautions.len(), 2);
     }
+
+    #[test]
+    fn mixed_row_warns_only_when_the_spot_wins() {
+        let mut s = station("K1ABC");
+        let mut spot = s.local_rank.unwrap();
+        spot.score += 1;
+        s.network_rank = Some(spot);
+        s.reporter_count = Some(1);
+        s.last_seen_network = Some((now() - Duration::seconds(400)).timestamp());
+        let texts = |s: &DxStation| {
+            reason_for(s, None, now())
+                .cautions
+                .iter()
+                .map(Caution::text)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(texts(&s), ["1 network reporter", "network spot 6m old"]);
+        s.network_rank.as_mut().unwrap().score -= 2;
+        assert!(texts(&s).is_empty());
+    }
     #[test]
     fn heard_this_slot_boundaries() {
         let mut s = station("K1ABC");
@@ -907,6 +931,6 @@ mod tests {
             "Scored by the station from your log and this session's history (local decode)."
         );
         s.network_rank = s.local_rank.take();
-        assert_eq!(detail_for(&s, None, now()).lines.last().unwrap(), "Scored by the TUI from cqdx spot data. Per-band history comes only from an earlier local decode; failure history is not checked.");
+        assert_eq!(detail_for(&s, None, now()).lines.last().unwrap(), "Scored by the TUI from cqdx spot data. Per-band and failure history come only from an earlier local decode.");
     }
 }

@@ -74,6 +74,8 @@ struct DxStationLookupAdapter {
     atno: bool,
     band_needed: bool,
     worked_before: bool,
+    /// Session failure history the relay's local rescore found (PAN-94).
+    recent_failure: bool,
     rarity_tier: Option<String>,
     is_notable: bool,
 }
@@ -83,7 +85,7 @@ impl pancetta_qso::priority::WorkedStationLookup for DxStationLookupAdapter {
         self.worked_before
     }
     fn is_recent_failure(&self, _callsign: &str) -> bool {
-        false
+        self.recent_failure
     }
     fn is_needed_dxcc(&self, _callsign: &str) -> bool {
         self.needed
@@ -523,6 +525,30 @@ impl DxStation {
 
     fn refresh_priority_score(&mut self) {
         self.priority_score = self.rank_basis().map_or(0, |(_, rank)| rank.score);
+    }
+
+    /// Score this row's latest cqdx spot. Worked and failure history from the
+    /// relay's local rank applies too, so a QSO outcome lowers both sources
+    /// (PAN-94).
+    fn score_network_spot(&self, at: DateTime<Utc>) -> RankedBy {
+        let local = self.local_rank.and_then(|rank| rank.factors);
+        let adapter = DxStationLookupAdapter {
+            needed: self.needed,
+            atno: self.atno,
+            band_needed: self.band_needed,
+            worked_before: self.worked_before || local.is_some_and(|f| f.worked_on_band),
+            recent_failure: local.is_some_and(|f| f.recent_failure),
+            rarity_tier: self.rarity_tier.clone(),
+            is_notable: self.is_notable,
+        };
+        tui_rank(
+            adapter,
+            &self.call_sign,
+            self.grid_square.as_deref(),
+            self.best_snr_network.unwrap_or(0),
+            self.frequency,
+            at,
+        )
     }
 }
 
@@ -2367,6 +2393,7 @@ impl App {
             atno: message.atno,
             band_needed: message.band_needed,
             worked_before: message.worked_before,
+            recent_failure: false,
             rarity_tier: None,
             is_notable: false,
         };
@@ -3344,8 +3371,9 @@ impl App {
     }
 
     /// Replace a row's local-decode rank with the relay's rescore after a QSO
-    /// with that station ended (PAN-94). Keeps when it was heard; rows with no
-    /// local decode are left alone.
+    /// with that station ended (PAN-94), and rescore its cqdx spot with the
+    /// same history so a stale network score cannot keep the row up. Keeps
+    /// when each source was heard; rows with no local decode are left alone.
     pub fn refresh_local_rank(&mut self, callsign: &str, score: u32, factors: PriorityFactors) {
         let Some(entry) = self.dx_stations.get_mut(callsign) else {
             return;
@@ -3355,6 +3383,9 @@ impl App {
         };
         rank.score = score;
         rank.factors = Some(factors);
+        if let Some(network_at) = entry.network_rank.map(|rank| rank.at) {
+            entry.network_rank = Some(entry.score_network_spot(network_at));
+        }
         entry.refresh_priority_score();
         self.clamp_dx_hunter_selection();
     }
@@ -4393,22 +4424,7 @@ impl App {
             // Replace this source's score using the latest spot signal.
             // Local band/worked history remains available when previously decoded.
             // The display chooses the higher of the two latest source scores.
-            let adapter = DxStationLookupAdapter {
-                needed: entry.needed,
-                atno: entry.atno,
-                band_needed: entry.band_needed,
-                worked_before: entry.worked_before,
-                rarity_tier: entry.rarity_tier.clone(),
-                is_notable: entry.is_notable,
-            };
-            entry.network_rank = Some(tui_rank(
-                adapter,
-                &entry.call_sign,
-                entry.grid_square.as_deref(),
-                spot.best_snr.unwrap_or(0),
-                entry.frequency,
-                Utc::now(),
-            ));
+            entry.network_rank = Some(entry.score_network_spot(Utc::now()));
             entry.refresh_priority_score();
         }
 
@@ -4971,6 +4987,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn qso_outcome_refresh_also_lowers_a_winning_network_rank() {
+        let mut app = fixture_app().await;
+        let mut msg = fixture_view("JA1ABC", -7);
+        msg.priority_score = Some(1500);
+        app.add_decoded_message(msg).await.unwrap();
+        let mut spot = reason_spot("JA1ABC", false);
+        spot.is_notable = true;
+        app.merge_spot_groups(&[spot.clone()]);
+        let row = &app.dx_stations["JA1ABC"];
+        assert_eq!(row.rank_basis().unwrap().0, RankOrigin::NetworkSpot);
+        let before = row.priority_score;
+        let spotted_at = row.network_rank.unwrap().at;
+
+        let mut factors = row.network_rank.unwrap().factors.unwrap();
+        factors.recent_failure = true;
+        app.refresh_local_rank("JA1ABC", 900, factors);
+        let row = &app.dx_stations["JA1ABC"];
+        let network = row.network_rank.unwrap();
+        assert!(network.factors.unwrap().recent_failure);
+        assert!(network.score < before, "{} >= {before}", network.score);
+        assert_eq!(network.at, spotted_at, "a rescore is not a new spot");
+        assert!(row.priority_score < before);
+
+        // The next spot keeps the session's failure history.
+        app.merge_spot_groups(&[spot]);
+        let network = app.dx_stations["JA1ABC"].network_rank.unwrap();
+        assert!(network.factors.unwrap().recent_failure);
+    }
+
+    #[tokio::test]
     async fn equal_scores_prefer_the_local_basis() {
         let mut app = fixture_app().await;
         app.merge_spot_groups(&[reason_spot("JA1ABC", false)]);
@@ -5085,6 +5131,7 @@ mod tests {
             atno: true,
             band_needed: false,
             worked_before: true,
+            recent_failure: true,
             rarity_tier: Some("rare".to_string()),
             is_notable: true,
         };
@@ -5092,9 +5139,9 @@ mod tests {
         assert!(adapter.is_atno("JA1ABC"));
         assert!(!adapter.is_dxcc_needed_on_band("JA1ABC", 14_074_000.0));
         assert!(adapter.is_duplicate("JA1ABC", 14_074_000.0));
+        assert!(adapter.is_recent_failure("JA1ABC"));
         assert!(adapter.is_notable("JA1ABC"));
         assert!((adapter.rarity("JA1ABC") - 0.65).abs() < f64::EPSILON);
-        assert!(!adapter.is_recent_failure("JA1ABC"));
         assert!(!adapter.is_needed_grid("PM95"));
     }
 
