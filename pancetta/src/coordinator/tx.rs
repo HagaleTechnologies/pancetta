@@ -13773,8 +13773,8 @@ mod schedule_tx_tests {
         ));
     }
 
-    /// Band granularity, not exact dial: the DSP's captured dial only
-    /// advances on a band change, so an intra-band retune must still count.
+    /// Band granularity, not exact dial: an entry keeps the exact dial its
+    /// window closed on (PAN-67), so an intra-band retune must still count.
     #[test]
     fn dx_parity_conflict_still_holds_after_intra_band_retune() {
         let cts = pancetta_qso::CrossTimeState::empty();

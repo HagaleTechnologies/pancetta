@@ -20,8 +20,10 @@ parameter at all four call sites (Step 4b/4d, single and multi TX).
 - **Filter on read, not invalidate on change.** Clearing the table on a switch
   needs a hook at every dial and mode writer and races decode latency; recorded
   context is race-free.
-- **Band, not exact dial.** DSP's captured dial only advances on a band change,
-  so exact-Hz matching would drop same-band evidence after a retune.
+- **Band, not exact dial.** The captured dial is the exact dial at window close
+  (`dsp.rs` `cur_dial_hz`, re-read every audio batch, PAN-67), so an entry keeps
+  its pre-retune dial and exact-Hz matching would drop same-band evidence after
+  any retune, so the gate defers to `is_band_change` instead.
 - **`slot_ns`, not `Protocol`.** Parity is a function of the instant and the
   slot period, and `pancetta-qso` has no non-optional `pancetta-ft8` dependency.
 - **Table unchanged.** Still one entry per callsign spelling, newest wins. A
