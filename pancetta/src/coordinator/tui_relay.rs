@@ -31,10 +31,91 @@ use tracing::{debug, info, span, warn, Level};
 
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
 
+/// Per-callsign decode memory kept by the relay loop. Entries live as long as
+/// the TUI keeps a DX Hunter row (`App::cleanup_old_data`: 24 h), and the map
+/// holds at most `RELAY_CACHE_CAP` entries, dropping the oldest first, so a
+/// busy band or decoder-noise callsigns cannot grow it without limit.
+const RELAY_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const RELAY_CACHE_CAP: usize = 4096;
+
+struct RelayCache<K, V> {
+    entries: std::collections::HashMap<K, (V, Instant)>,
+    ttl: Duration,
+    cap: usize,
+}
+
+impl<K: std::hash::Hash + Eq + Clone, V> Default for RelayCache<K, V> {
+    fn default() -> Self {
+        Self::new(RELAY_CACHE_TTL, RELAY_CACHE_CAP)
+    }
+}
+
+impl<K: std::hash::Hash + Eq + Clone, V> RelayCache<K, V> {
+    fn new(ttl: Duration, cap: usize) -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            ttl,
+            cap,
+        }
+    }
+
+    fn live(&self, at: Instant, now: Instant) -> bool {
+        now.saturating_duration_since(at) <= self.ttl
+    }
+
+    fn insert(&mut self, key: K, value: V) {
+        self.insert_at(key, value, Instant::now());
+    }
+
+    fn insert_at(&mut self, key: K, value: V, now: Instant) {
+        self.entries.insert(key, (value, now));
+        if self.entries.len() <= self.cap {
+            return;
+        }
+        let ttl = self.ttl;
+        self.entries
+            .retain(|_, (_, at)| now.saturating_duration_since(*at) <= ttl);
+        while self.entries.len() > self.cap {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+
+    fn get(&self, key: &K) -> Option<&V> {
+        self.get_at(key, Instant::now())
+    }
+
+    fn get_at(&self, key: &K, now: Instant) -> Option<&V> {
+        self.entries
+            .get(key)
+            .filter(|(_, at)| self.live(*at, now))
+            .map(|(value, _)| value)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        let now = Instant::now();
+        self.entries
+            .iter()
+            .filter(move |(_, (_, at))| self.live(*at, now))
+            .map(|(key, (value, _))| (key, value))
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 /// Keep the last decoded grid for this exact callsign and band during the relay
 /// session. Report/acknowledgment frames omit it; a later grid replaces it.
 fn display_grid(
-    last_grids: &mut std::collections::HashMap<(String, String), String>,
+    last_grids: &mut RelayCache<(String, String), String>,
     call_sign: Option<&str>,
     grid: Option<&str>,
     dial_mhz: f64,
@@ -70,7 +151,7 @@ struct RankInputs {
 /// decoded in this relay session.
 fn outcome_rank_refresh(
     scorer: &pancetta_qso::PriorityScorer,
-    last_inputs: &std::collections::HashMap<String, RankInputs>,
+    last_inputs: &RelayCache<String, RankInputs>,
     callsign: &str,
 ) -> Vec<pancetta_tui::tui_runner::TuiMessage> {
     let identity = |call: &str| {
@@ -278,8 +359,8 @@ impl super::ApplicationCoordinator {
             // of an unchanged value are still suppressed.
             let mut sent_states: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
-            let mut last_grids = std::collections::HashMap::new();
-            let mut last_rank_inputs = std::collections::HashMap::new();
+            let mut last_grids = RelayCache::default();
+            let mut last_rank_inputs = RelayCache::default();
             while !relay_shutdown.load(Ordering::Acquire) {
                 if !ft8_disconnected {
                     match ft8_to_tui_rx.try_recv() {
@@ -4136,7 +4217,7 @@ mod tui_relay_tests {
             Box::new(lookup.clone()),
         );
         let mut app = App::new(Config::default(), None).await.unwrap();
-        let mut last_grids = std::collections::HashMap::new();
+        let mut last_grids = super::RelayCache::default();
         for worked_grid in [false, true] {
             if worked_grid {
                 lookup.record_worked_grid("FN42", "20M");
@@ -4220,6 +4301,34 @@ mod tui_relay_tests {
         );
     }
 
+    #[test]
+    fn relay_cache_expires_and_caps_entries() {
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        let mut cache = super::RelayCache::new(Duration::from_secs(60), 3);
+        cache.insert_at("K1ABC".to_owned(), 1, start);
+        assert_eq!(cache.get_at(&"K1ABC".to_owned(), start), Some(&1));
+        // Past the TTL an entry reads as gone even before it is pruned.
+        let late = start + Duration::from_secs(61);
+        assert_eq!(cache.get_at(&"K1ABC".to_owned(), late), None);
+
+        // Going over the cap prunes expired entries first...
+        for (i, call) in ["K2ABC", "K3ABC", "K4ABC"].into_iter().enumerate() {
+            cache.insert_at(call.to_owned(), i, late);
+        }
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.get_at(&"K1ABC".to_owned(), start), None);
+
+        // ...then the oldest live ones.
+        let later = late + Duration::from_secs(1);
+        cache.insert_at("K5ABC".to_owned(), 5, later);
+        cache.insert_at("K6ABC".to_owned(), 6, later);
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.get_at(&"K5ABC".to_owned(), later), Some(&5));
+        assert_eq!(cache.get_at(&"K6ABC".to_owned(), later), Some(&6));
+    }
+
     #[tokio::test]
     async fn qso_outcome_rescores_the_row_from_fresh_failure_history() {
         use pancetta_tui::{app::App, tui_runner::TuiMessage, Config, DecodedMessageView};
@@ -4259,7 +4368,7 @@ mod tui_relay_tests {
         let before = app.dx_stations["K1ABC/P"].priority_score;
         let heard_at = app.dx_stations["K1ABC/P"].local_rank.unwrap().at;
 
-        let mut last_inputs = std::collections::HashMap::new();
+        let mut last_inputs = super::RelayCache::default();
         last_inputs.insert(
             "K1ABC/P".to_owned(),
             super::RankInputs {
