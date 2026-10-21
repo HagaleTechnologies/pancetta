@@ -46,7 +46,8 @@ runs as happily over SSH on a headless box behind the radio as on a desktop.
   `ft8_lib` is not the bar operators care about.) Full numbers and caveats:
   [`docs/decoder-comparison.md`](docs/decoder-comparison.md).
 - **A priority engine, not a list.** Every decoded CQ is scored against
-  needed DXCC, needed grid, POTA/SOTA, rarity, signal, and recent activity —
+  needed DXCC, needed grid, a portable callsign suffix (`/P`, `/POTA`…) as a
+  possible POTA/SOTA hint, rarity, signal, and recent activity —
   so the station you should work is the one at the top.
 - **Multi-stream TX.** A smart frequency allocator places N simultaneous FT8
   signals inside one 15-second slot, each on its own audio offset, all on the

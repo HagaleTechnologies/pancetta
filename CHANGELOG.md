@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing. A write failure never stops TX: it shows as an `ERROR` line that
   carries the frame text, and a disk slower than 250 ms shows as a `WARN`
   while the record is still written when the disk responds.
+
+- DX Hunter explains its ranking (PAN-94): a `Why:` line on the Station card,
+  a `Why` column on wide DX Hunter panels, and `w` for the full score breakdown.
+  A `/P`-style suffix now reads `maybe POTA/SOTA (/P suffix)`; it is a callsign
+  guess, not a confirmed activation.
+
 - `pancetta import <FILE> [--dry-run]` (PAN-127): bring an existing ADIF
   log from WSJT-X, N1MM, LoTW, QRZ or another logger into Pancetta. New
   contacts are appended to `~/.pancetta/qsos.adi` with every field kept as
@@ -372,6 +378,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- DX Hunter scores follow the latest decode and cqdx spot, so a station drops
+  after you work it or a QSO with it fails.
 - `pancetta --help` no longer claims general config hot-reload or unmeasured
   decoder, latency and memory figures; it says which settings apply live and
   points to the new Capability status table in README.md (PAN-124). That

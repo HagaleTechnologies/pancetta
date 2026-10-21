@@ -94,3 +94,21 @@ test (`secondary_score_rarity_spread_moves_the_display_by_a_meaningful_fraction_
 asserts the full rarity spectrum (never-spotted vs. maximally-rare) must move the display by
 >200 of the 999-wide band — it failed at 99 before the fix, passes at 250 after. On-air
 re-verification of the visible gradient is still operator-gated.
+
+## Explain the score and retain the latest observation (PAN-94, 2026-10-18)
+
+`PriorityScorer::score_tiered_explained` captures each lookup input once in
+`PriorityFactors` and computes the tier and secondary score from that record.
+`score_tiered` delegates to it. Tier ordering, weights, operation order and the
+continuous autonomous scorer are unchanged. A pre-refactor fingerprint over
+18,432 input combinations verifies bit-identical scores; the explanation carries
+its actual weighted terms, network bonus, ceiling and freshness multiplier.
+
+DX Hunter stores the latest local and latest cqdx scoring separately. It displays
+the higher of those two scores, preferring local data on ties. This replaces the
+running maximum that kept old scores after a station was worked or a QSO failed.
+The reason's headline and supporting clauses follow the winning score. Cautions
+also retain authoritative failure/worked information from the other source.
+The cqdx path still uses default weights and has no session failure history;
+the detail view states that limitation. Local relay scores use operator weights
+and the coordinator's shared lookup. DX-cluster-only rows remain unscored.

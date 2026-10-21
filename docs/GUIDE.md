@@ -131,7 +131,9 @@ until you configured a rig and pressed a key that means "transmit".
 ### …work a specific DX station?
 
 The **DX Hunter** panel (`4`) scores every decoded station by what *you*
-need (new DXCC, grid, POTA/SOTA, rarity). Select and press **Space** — same
+need (new DXCC, grid, rarity), with a portable callsign suffix (`/P`, `/POTA`…)
+as a possible POTA/SOTA hint. Press `w` for the reason behind a ranking and
+its score breakdown. Select and press **Space** — same
 exchange as above, but pancetta places your TX and picks the slot parity to
 match theirs. `c` starts a repeating CQ of your own; `s` stops it.
 
