@@ -407,8 +407,12 @@ The `w` overlay's "needed entity" row shows a value and its source:
 | No list, guess said needed | `unknown` | `cqdx list not loaded; scored as needed (not a home or logged prefix)` |
 | No list, guess said not needed | `unknown` | `cqdx list not loaded; scored as not needed (home or logged prefix)` |
 
-The Why text updates on the next frame after the list loads; `+` appears when
-the station is next decoded, within one slot.
+For a station DX Hunter lists, the Why text, its `+` and the station card's
+`needed` flag follow the list on the next frame after it loads or changes,
+without waiting for another decode. A list that no longer names the entity
+also clears `!` and the card's `ATNO★`. A newly listed ATNO's `!` and the
+row's score and position in the list change when the station is next decoded
+or spotted; the remote `DecodedView.needed` changes at its next decode.
 
 **Strip chips.** `⚠ CQDX NEEDS UNKNOWN` shows while a configured cqdx.io has not
 delivered the needed-entity list: an outage, an empty or invalid token, or a

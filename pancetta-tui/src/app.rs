@@ -2749,6 +2749,20 @@ impl App {
         self.dx_need.get(key)
     }
 
+    /// PAN-93: `(needed, atno)` as the row at `key` shows them (`+`/`!`, the
+    /// station card's `needed`/`ATNO★`). This frame's cqdx verdict, when there
+    /// is one, wins over the flags stored at decode or spot time, so both
+    /// follow a list that loads or changes between decodes, as the Why view
+    /// does. ATNO is a subset of needed, so a "not needed" verdict clears it
+    /// too; a newly needed ATNO waits for the next decode. With no verdict
+    /// for the row, the stored flags stand.
+    pub fn dx_need_flags_shown(&self, key: &str, needed: bool, atno: bool) -> (bool, bool) {
+        match self.dx_need_for(key).and_then(|need| need.dxcc_needed) {
+            Some(listed) => (listed, atno && listed),
+            None => (needed, atno),
+        }
+    }
+
     /// Called when the radio reports its actual frequency (via hamlib/rigctld).
     /// Updates radio_frequency for delta display. Does NOT change our target operating frequency.
     pub fn update_frequency(&mut self, freq: u64) {
