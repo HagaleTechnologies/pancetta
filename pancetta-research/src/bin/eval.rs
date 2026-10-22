@@ -1508,6 +1508,9 @@ fn run_synth_tier(
         match decoded {
             Ok(mut decodes) => {
                 apply_fp_filter(fp_filter, &mut decodes);
+                // PAN-110: a merged set leads with ft8_lib's copies, which
+                // carry no decode time, so it has no meaningful TTFD.
+                let merged = side_texts.is_some();
                 if let Some(texts) = side_texts {
                     side_texts_seen = true;
                     let side = side_bins.entry(bin_key).or_default();
@@ -1528,6 +1531,7 @@ fn run_synth_tier(
                         None => Some(t),
                         Some(cur) => Some(cur.min(t)),
                     })
+                    .filter(|_| !merged)
                 {
                     per_wav_ttfd_s.push(min_ttfd);
                 }
@@ -1600,8 +1604,9 @@ fn run_synth_tier(
         (curve, at_50)
     };
 
-    let false_positives_total =
-        side_texts_seen.then(|| side_bins.values().map(|s| s.fp).sum::<u32>());
+    // PAN-110: the per-bin `fp` counts are the record. `false_positives_total`
+    // stays unset: `compare`'s FP hard gate reads it on every shared tier,
+    // and a merged synth run counts false decodes that other synth runs do not.
     let tier_name = manifest_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -1613,7 +1618,6 @@ fn run_synth_tier(
         by_snr_db: by_snr,
         snr_at_50pct_recovery_db: snr_at_50,
         snr_at_90pct_recovery_db: snr_at_90,
-        false_positives_total,
         ttfd_distribution,
         jt9_snr_curve,
         jt9_snr_at_50pct_recovery_db,
@@ -3460,7 +3464,7 @@ mod merge_scoring_tests {
                     dt_s: 0.0,
                     snr_db: -20.0,
                     crc_valid: true,
-                    decode_time_into_window_s: None,
+                    decode_time_into_window_s: Some(1.0),
                     soft_distance: None,
                     hard_errors: None,
                     coherence: None,
@@ -3571,7 +3575,10 @@ mod merge_scoring_tests {
         assert_eq!(b19.native_decoded, Some(0));
         assert_eq!(b19.ft8lib_decoded, Some(1));
         assert_eq!(b19.fp, 0);
-        assert_eq!(r.false_positives_total, Some(1));
+        // Left unset so `compare`'s noise-tier FP gate cannot misfire on a
+        // merged synth run, and no TTFD from a set led by ft8_lib copies.
+        assert_eq!(r.false_positives_total, None);
+        assert!(r.ttfd_distribution.is_none());
     }
 
     #[test]
@@ -3588,6 +3595,10 @@ mod merge_scoring_tests {
         }
         assert_eq!(r.by_snr_db[0].decoded, 2);
         assert_eq!(r.false_positives_total, None);
+        assert!(
+            r.ttfd_distribution.is_some(),
+            "TTFD unchanged without --merge-ft8lib"
+        );
         let json = serde_json::to_value(&r).unwrap();
         assert!(
             json["by_snr_db"][0].get("native_decoded").is_none(),
