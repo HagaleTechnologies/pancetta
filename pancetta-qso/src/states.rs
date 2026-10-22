@@ -772,6 +772,21 @@ pub struct ContestInfo {
 
     /// Multiplier information
     pub multiplier: Option<String>,
+
+    /// The ADIF `CONTEST_ID` value this QSO exports with (PAN-52): an
+    /// ADIF 3.1.5 Contest_ID enumeration value when the engaged contest has
+    /// one, `None` (field omitted) when it does not. Kept separate from
+    /// `contest_name`, which remains the internal catalog/session key:
+    /// `engage_contest_profile` copies it from
+    /// `ContestProfile::adif_contest_id`, and ADIF import stores a
+    /// third-party file's verbatim `CONTEST_ID` here so re-export is
+    /// lossless.
+    ///
+    /// `#[serde(default)]` is mandatory: `QsoMetadata` is persisted as JSON
+    /// in SQLite, and every pre-PAN-52 row's serialized `ContestInfo` lacks
+    /// this field.
+    #[serde(default)]
+    pub adif_contest_id: Option<String>,
 }
 
 /// Contest serial numbers

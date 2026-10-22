@@ -2485,7 +2485,9 @@ impl QsoManager {
     /// `metadata.contest_info` so `process_message_with_parity`'s
     /// reclassification step (PAN-49) knows to try this QSO's engaged
     /// profile's exchange-shape matcher against otherwise-`NonStandard`
-    /// decodes, and so ADIF logging picks up `CONTEST_ID` (adif.rs).
+    /// decodes, and so ADIF logging stamps `CONTEST_ID` from the profile's
+    /// `adif_contest_id` when it has one (adif.rs) — the profile id itself
+    /// never reaches the wire (PAN-52).
     ///
     /// No operator UI calls this yet — a later plan wires the "enter this
     /// contest?" modal to it (docs/superpowers/specs/
@@ -2501,6 +2503,7 @@ impl QsoManager {
             .ok_or(QsoManagerError::QsoNotFound { qso_id })?;
         progress.metadata.contest_info = Some(ContestInfo {
             contest_name: profile.id,
+            adif_contest_id: profile.adif_contest_id.clone(),
             category: String::new(),
             serials: ContestSerials {
                 sent: None,
