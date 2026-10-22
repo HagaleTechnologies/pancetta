@@ -1454,13 +1454,19 @@ mod tests {
 
     /// A merged-mode coordinator: `dirs` each hold a `pancetta.toml` (lowest
     /// precedence first); the running config and the baseline are the merged
-    /// result, as at startup.
+    /// result, as at startup. PAN-147: also returns `test_coordinator`'s
+    /// audit-path guard — bind it for the whole test, since later reloads
+    /// append to that file.
     async fn merged_coordinator(
         dirs: Vec<std::path::PathBuf>,
-    ) -> (ApplicationCoordinator, impl Fn() -> ConfigReloadOutcome) {
+    ) -> (
+        ApplicationCoordinator,
+        impl Fn() -> ConfigReloadOutcome,
+        crate::coordinator::audit_test_util::TempPath,
+    ) {
         let load = merged_loader(dirs.clone());
         let (startup, _) = load().expect("merged config loads");
-        let (mut coordinator, _audit_tmp) = test_coordinator(startup.clone()).await;
+        let (mut coordinator, audit_tmp) = test_coordinator(startup.clone()).await;
         let seeded = startup.network.station_agent.remote_tx_enabled;
         coordinator
             .remote_tx_arm
@@ -1471,7 +1477,7 @@ mod tests {
         // The running config also carries test_coordinator's audit-log path;
         // the baseline is the merged load, like the watcher's first read.
         coordinator.config_file_baseline = Some(load().unwrap().0);
-        (coordinator, load)
+        (coordinator, load, audit_tmp)
     }
 
     fn station_agent_consent(coordinator: &ApplicationCoordinator) -> bool {
@@ -1493,7 +1499,8 @@ mod tests {
         std::fs::create_dir_all(&high).unwrap();
         std::fs::write(watched.join("pancetta.toml"), STATION_TOML).unwrap();
         std::fs::write(high.join("pancetta.toml"), station_agent_toml(false)).unwrap();
-        let (mut coordinator, load) = merged_coordinator(vec![watched.clone(), high]).await;
+        let (mut coordinator, load, _audit_tmp) =
+            merged_coordinator(vec![watched.clone(), high]).await;
         assert!(!station_agent_consent(&coordinator), "setup: consent off");
         let rx = tui_rx(&coordinator).await;
 
@@ -1533,7 +1540,8 @@ mod tests {
         std::fs::create_dir_all(&high).unwrap();
         std::fs::write(watched.join("pancetta.toml"), STATION_TOML).unwrap();
         std::fs::write(high.join("pancetta.toml"), station_agent_toml(true)).unwrap();
-        let (mut coordinator, load) = merged_coordinator(vec![watched.clone(), high.clone()]).await;
+        let (mut coordinator, load, audit_tmp) =
+            merged_coordinator(vec![watched.clone(), high.clone()]).await;
         assert!(station_agent_consent(&coordinator), "setup: consent on");
         arm_client(&coordinator, "A");
         assert!(permitted(&coordinator, "A"), "setup: armed");
@@ -1554,6 +1562,13 @@ mod tests {
             texts(&diagnostics(&rx)).contains(&MSG_STATION_AGENT_CONSENT_OFF),
             "the revocation is reported"
         );
+        // PAN-147: the reload's audit record lands in the guarded path, and
+        // the guard `merged_coordinator` hands back deletes it.
+        let audit_path = coordinator.audit_log().path().clone();
+        assert_eq!(audit_path, audit_tmp.path());
+        assert!(audit_path.exists(), "the revocation is audited");
+        drop(audit_tmp);
+        assert!(!audit_path.exists(), "the guard deletes the audit file");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2367,7 +2382,7 @@ mod tests {
         std::fs::create_dir_all(&watched).unwrap();
         let path = watched.join("pancetta.toml");
         std::fs::write(&path, station_agent_toml(true)).unwrap();
-        let (mut coordinator, _load) = merged_coordinator(vec![watched.clone()]).await;
+        let (mut coordinator, _load, _audit_tmp) = merged_coordinator(vec![watched.clone()]).await;
         coordinator.config_file_baseline = None;
         assert!(station_agent_consent(&coordinator), "setup: consent on");
         let rx = tui_rx(&coordinator).await;
@@ -2416,7 +2431,7 @@ mod tests {
         let path = watched.join("pancetta.toml");
         let text = station_agent_toml(true);
         std::fs::write(&path, &text).unwrap();
-        let (mut coordinator, _load) = merged_coordinator(vec![watched.clone()]).await;
+        let (mut coordinator, _load, _audit_tmp) = merged_coordinator(vec![watched.clone()]).await;
         assert!(station_agent_consent(&coordinator), "setup: consent on");
         arm_client(&coordinator, "A");
         assert!(permitted(&coordinator, "A"), "setup: armed");
