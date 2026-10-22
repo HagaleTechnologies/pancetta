@@ -15044,14 +15044,10 @@ mod disarm_interrupt_signal_tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
-    fn audit_tmp() -> std::path::PathBuf {
-        use std::sync::atomic::AtomicU64;
-        static C: AtomicU64 = AtomicU64::new(0);
-        let n = C.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "pancetta-tx-disarm-signal-test-{}-{n}.log",
-            std::process::id()
-        ))
+    /// PAN-147: guarded path (pre-cleaned, deleted on drop) — see
+    /// [`crate::coordinator::audit_test_util`].
+    fn audit_tmp() -> crate::coordinator::audit_test_util::TempPath {
+        crate::coordinator::audit_test_util::TempPath::new("pancetta-tx-disarm-signal-test")
     }
 
     fn read_audit_lines(path: &std::path::Path) -> Vec<pancetta_agent::audit::AuditEvent> {
@@ -15137,7 +15133,8 @@ mod disarm_interrupt_signal_tests {
             .await
             .unwrap();
         let (_rig_tx, rig_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
-        let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp());
+        let audit_tmp = audit_tmp();
+        let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp.path());
         let display_feed_enabled = Arc::new(AtomicBool::new(true));
         let arm = Arc::new(std::sync::Mutex::new(pancetta_agent::arm::ArmState::new()));
         let items = [
@@ -15231,7 +15228,8 @@ mod disarm_interrupt_signal_tests {
             .create_channel(ComponentId::RemoteGateway)
             .await
             .unwrap();
-        let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp());
+        let audit_tmp = audit_tmp();
+        let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp.path());
         let display_feed_enabled = Arc::new(AtomicBool::new(true));
 
         // client-a is armed; the frame is bound to client-b — an identity
@@ -15320,7 +15318,8 @@ mod disarm_interrupt_signal_tests {
         // the wording an already-on-the-air interruption reports.
         let bus = MessageBus::new(16).unwrap();
         let (_tui_tx, tui_rx) = bus.create_channel(ComponentId::Tui).await.unwrap();
-        let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp());
+        let audit_tmp = audit_tmp();
+        let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp.path());
         let display_feed_enabled = Arc::new(AtomicBool::new(false));
         let arm = Arc::new(std::sync::Mutex::new(pancetta_agent::arm::ArmState::new()));
 
@@ -17454,14 +17453,8 @@ mod coalesce_tests {
     use super::*;
     use std::collections::HashSet;
 
-    fn audit_tmp() -> std::path::PathBuf {
-        use std::sync::atomic::AtomicU64;
-        static C: AtomicU64 = AtomicU64::new(0);
-        let n = C.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "pancetta-tx-coalesce-test-{}-{n}.log",
-            std::process::id()
-        ))
+    fn audit_tmp() -> crate::coordinator::audit_test_util::TempPath {
+        crate::coordinator::audit_test_util::TempPath::new("pancetta-tx-coalesce-test")
     }
 
     /// `max_concurrent_qsos` for tests that aren't about the concurrent-QSO
@@ -17524,6 +17517,9 @@ mod coalesce_tests {
         live: &[&str],
     ) -> MessageType {
         let bus = MessageBus::new(16).unwrap();
+        // PAN-147: bind the guard so it outlives every write inside this
+        // helper's `.await` and cleans the path afterward.
+        let audit_tmp = audit_tmp();
         coalesce_backlog_into(
             head,
             inbox,
@@ -17532,7 +17528,7 @@ mod coalesce_tests {
             &std::sync::Arc::new(std::sync::RwLock::new(HashSet::new())),
             4,
             &std::sync::Arc::new(std::sync::Mutex::new(pancetta_agent::arm::ArmState::new())),
-            &pancetta_agent::audit::AuditLog::new(audit_tmp()),
+            &pancetta_agent::audit::AuditLog::new(audit_tmp.path()),
             &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             None,
         )
@@ -17660,6 +17656,7 @@ mod coalesce_tests {
                 .unwrap();
         }
         let backlog_inbox = super::TxInbox::new(backlog_rx, Default::default());
+        let audit_tmp = audit_tmp();
         let result = coalesce_backlog_into(
             request(true),
             &backlog_inbox,
@@ -17668,7 +17665,7 @@ mod coalesce_tests {
             &Arc::new(RwLock::new(HashSet::new())),
             2,
             &arm,
-            &pancetta_agent::audit::AuditLog::new(audit_tmp()),
+            &pancetta_agent::audit::AuditLog::new(audit_tmp.path()),
             &Arc::new(std::sync::atomic::AtomicBool::new(false)),
             None,
         )
@@ -18183,7 +18180,8 @@ mod coalesce_tests {
         // Every entry here is Local, so the identity-bound arm gate never
         // consults this — an unarmed ArmState is the neutral choice.
         let arm = Arc::new(std::sync::Mutex::new(pancetta_agent::arm::ArmState::new()));
-        let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp());
+        let audit_tmp = audit_tmp();
+        let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp.path());
         let display_feed_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let backlog_inbox = super::TxInbox::new(backlog_rx.clone(), Default::default());
         let _ = coalesce_backlog_into(
@@ -18291,6 +18289,7 @@ mod coalesce_tests {
                 ))
                 .unwrap();
             let backlog_inbox = super::TxInbox::new(backlog_rx.clone(), Default::default());
+            let audit_tmp = audit_tmp();
             let result = coalesce_backlog_into(
                 request(udp_first),
                 &backlog_inbox,
@@ -18299,7 +18298,7 @@ mod coalesce_tests {
                 &Arc::new(RwLock::new(HashSet::new())),
                 2,
                 &arm,
-                &pancetta_agent::audit::AuditLog::new(audit_tmp()),
+                &pancetta_agent::audit::AuditLog::new(audit_tmp.path()),
                 &Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 None,
             )
@@ -18403,6 +18402,7 @@ mod coalesce_tests {
             .unwrap();
 
         let backlog_inbox = super::TxInbox::new(backlog_rx, Default::default());
+        let audit_tmp = audit_tmp();
         let result = coalesce_backlog_into(
             head,
             &backlog_inbox,
@@ -18411,7 +18411,7 @@ mod coalesce_tests {
             &Arc::new(RwLock::new(HashSet::new())),
             2,
             &arm,
-            &pancetta_agent::audit::AuditLog::new(audit_tmp()),
+            &pancetta_agent::audit::AuditLog::new(audit_tmp.path()),
             &Arc::new(std::sync::atomic::AtomicBool::new(false)),
             None,
         )
@@ -18512,7 +18512,8 @@ mod coalesce_tests {
             ))
             .unwrap();
 
-        let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp());
+        let audit_tmp = audit_tmp();
+        let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp.path());
         let display_feed_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let backlog_inbox = super::TxInbox::new(backlog_rx.clone(), Default::default());
         let result = coalesce_backlog_into(
@@ -18632,7 +18633,8 @@ mod coalesce_tests {
             ("K1ABC N0CALL -07".to_string(), replaced.clone()),
         );
 
-        let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp());
+        let audit_tmp = audit_tmp();
+        let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp.path());
         let display_feed_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let backlog_inbox = super::TxInbox::new(backlog_rx.clone(), Default::default());
         let result = coalesce_backlog_into(
@@ -18907,7 +18909,8 @@ mod coalesce_tests {
         }
 
         let arm = Arc::new(std::sync::Mutex::new(pancetta_agent::arm::ArmState::new()));
-        let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp());
+        let audit_tmp = audit_tmp();
+        let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp.path());
         let display_feed_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let backlog_inbox = super::TxInbox::new(backlog_rx.clone(), Default::default());
         let result = coalesce_backlog_into(

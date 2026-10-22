@@ -1237,12 +1237,30 @@ mod tests {
         ))
     }
 
+    /// PAN-147: the agent audit log's temp path as a guarded path
+    /// (pre-cleaned, deleted on drop) — see
+    /// [`crate::coordinator::audit_test_util`]. Unlike `temp_path`, this one
+    /// IS written to (consent flips append `LocalConsentChanged` records),
+    /// so it must not leak.
+    fn audit_tmp_path() -> crate::coordinator::audit_test_util::TempPath {
+        crate::coordinator::audit_test_util::TempPath::at(temp_path("audit.log"))
+    }
+
     /// Same direct-construction pattern as `health.rs`'s `test_coordinator`
     /// (`--replay` so no real logbook is touched), with the agent audit log
-    /// pointed at a temp file instead of `~/.pancetta`.
-    async fn test_coordinator(mut config: Config) -> ApplicationCoordinator {
+    /// pointed at a temp file instead of `~/.pancetta`. PAN-147: also
+    /// returns the audit path's guard — bind it
+    /// (`let (coordinator, _audit_tmp) = …`) so the file is deleted at test
+    /// end instead of accumulating in TMPDIR.
+    async fn test_coordinator(
+        mut config: Config,
+    ) -> (
+        ApplicationCoordinator,
+        crate::coordinator::audit_test_util::TempPath,
+    ) {
+        let audit_tmp = audit_tmp_path();
         config.network.station_agent.audit_log_path =
-            Some(temp_path("audit.log").to_string_lossy().into_owned());
+            Some(audit_tmp.path().to_string_lossy().into_owned());
         let mut coordinator = ApplicationCoordinator::new(
             config,
             None,
@@ -1262,7 +1280,7 @@ mod tests {
         .await
         .expect("coordinator creation should succeed");
         coordinator.pancetta_home_override = Some(temp_path("home"));
-        coordinator
+        (coordinator, audit_tmp)
     }
 
     async fn tui_rx(
@@ -1325,7 +1343,7 @@ mod tests {
 
     #[tokio::test]
     async fn reload_with_a_non_security_change_keeps_running_config_and_says_restart() {
-        let mut coordinator = test_coordinator(base()).await;
+        let (mut coordinator, _audit_tmp) = test_coordinator(base()).await;
         let rx = tui_rx(&coordinator).await;
         let before = toml::to_string(&*coordinator.config.read().await).unwrap();
         let ptt_off_before = coordinator.wants_direct_rigctld_ptt_off().await;
@@ -1358,7 +1376,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_key_the_tui_already_applied_is_not_reported_as_restart_required() {
-        let mut coordinator = test_coordinator(base()).await;
+        let (mut coordinator, _audit_tmp) = test_coordinator(base()).await;
         let rx = tui_rx(&coordinator).await;
         let mut new = coordinator.config.read().await.clone();
         new.audio.output_device = "Picked In TUI".to_string();
@@ -1382,7 +1400,7 @@ mod tests {
         // watched file has said `true` all along.
         let mut running = base();
         running.network.station_agent.remote_tx_enabled = false;
-        let mut coordinator = test_coordinator(running).await;
+        let (mut coordinator, _audit_tmp) = test_coordinator(running).await;
         let mut file = coordinator.config.read().await.clone();
         file.network.station_agent.remote_tx_enabled = true;
         coordinator.config_file_baseline = Some(file.clone());
@@ -1436,13 +1454,19 @@ mod tests {
 
     /// A merged-mode coordinator: `dirs` each hold a `pancetta.toml` (lowest
     /// precedence first); the running config and the baseline are the merged
-    /// result, as at startup.
+    /// result, as at startup. PAN-147: also returns `test_coordinator`'s
+    /// audit-path guard — bind it for the whole test, since later reloads
+    /// append to that file.
     async fn merged_coordinator(
         dirs: Vec<std::path::PathBuf>,
-    ) -> (ApplicationCoordinator, impl Fn() -> ConfigReloadOutcome) {
+    ) -> (
+        ApplicationCoordinator,
+        impl Fn() -> ConfigReloadOutcome,
+        crate::coordinator::audit_test_util::TempPath,
+    ) {
         let load = merged_loader(dirs.clone());
         let (startup, _) = load().expect("merged config loads");
-        let mut coordinator = test_coordinator(startup.clone()).await;
+        let (mut coordinator, audit_tmp) = test_coordinator(startup.clone()).await;
         let seeded = startup.network.station_agent.remote_tx_enabled;
         coordinator
             .remote_tx_arm
@@ -1453,7 +1477,7 @@ mod tests {
         // The running config also carries test_coordinator's audit-log path;
         // the baseline is the merged load, like the watcher's first read.
         coordinator.config_file_baseline = Some(load().unwrap().0);
-        (coordinator, load)
+        (coordinator, load, audit_tmp)
     }
 
     fn station_agent_consent(coordinator: &ApplicationCoordinator) -> bool {
@@ -1475,7 +1499,8 @@ mod tests {
         std::fs::create_dir_all(&high).unwrap();
         std::fs::write(watched.join("pancetta.toml"), STATION_TOML).unwrap();
         std::fs::write(high.join("pancetta.toml"), station_agent_toml(false)).unwrap();
-        let (mut coordinator, load) = merged_coordinator(vec![watched.clone(), high]).await;
+        let (mut coordinator, load, _audit_tmp) =
+            merged_coordinator(vec![watched.clone(), high]).await;
         assert!(!station_agent_consent(&coordinator), "setup: consent off");
         let rx = tui_rx(&coordinator).await;
 
@@ -1515,7 +1540,8 @@ mod tests {
         std::fs::create_dir_all(&high).unwrap();
         std::fs::write(watched.join("pancetta.toml"), STATION_TOML).unwrap();
         std::fs::write(high.join("pancetta.toml"), station_agent_toml(true)).unwrap();
-        let (mut coordinator, load) = merged_coordinator(vec![watched.clone(), high.clone()]).await;
+        let (mut coordinator, load, audit_tmp) =
+            merged_coordinator(vec![watched.clone(), high.clone()]).await;
         assert!(station_agent_consent(&coordinator), "setup: consent on");
         arm_client(&coordinator, "A");
         assert!(permitted(&coordinator, "A"), "setup: armed");
@@ -1536,6 +1562,13 @@ mod tests {
             texts(&diagnostics(&rx)).contains(&MSG_STATION_AGENT_CONSENT_OFF),
             "the revocation is reported"
         );
+        // PAN-147: the reload's audit record lands in the guarded path, and
+        // the guard `merged_coordinator` hands back deletes it.
+        let audit_path = coordinator.audit_log().path().clone();
+        assert_eq!(audit_path, audit_tmp.path());
+        assert!(audit_path.exists(), "the revocation is audited");
+        drop(audit_tmp);
+        assert!(!audit_path.exists(), "the guard deletes the audit file");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1549,7 +1582,7 @@ mod tests {
         let mut config = base();
         config.station.callsign = "K1TEST".to_string();
         config.station.grid_square = "FN42".to_string();
-        let mut coordinator = test_coordinator(config.clone()).await;
+        let (mut coordinator, _audit_tmp) = test_coordinator(config.clone()).await;
         coordinator
             .remote_tx_arm
             .lock()
@@ -1604,7 +1637,7 @@ mod tests {
         let mut config = base();
         config.station.callsign = "K1TEST".to_string();
         config.station.grid_square = "FN42".to_string();
-        let mut coordinator = test_coordinator(config).await;
+        let (mut coordinator, _audit_tmp) = test_coordinator(config).await;
         coordinator
             .remote_tx_arm
             .lock()
@@ -1653,7 +1686,7 @@ mod tests {
         let mut config = base();
         config.station.callsign = "K1TEST".to_string();
         config.station.grid_square = "FN42".to_string();
-        let mut coordinator = test_coordinator(config).await;
+        let (mut coordinator, _audit_tmp) = test_coordinator(config).await;
         let rx = tui_rx(&coordinator).await;
         let running = coordinator.config.read().await.clone();
         let text = toml::to_string(&running).unwrap() + "\n[bogus_section]\nx = 1\n";
@@ -1684,7 +1717,7 @@ mod tests {
         let mut config = base();
         config.station.callsign = "K1TEST".to_string();
         config.station.grid_square = "FN42".to_string();
-        let mut coordinator = test_coordinator(config).await;
+        let (mut coordinator, _audit_tmp) = test_coordinator(config).await;
         coordinator
             .remote_tx_arm
             .lock()
@@ -1726,7 +1759,7 @@ mod tests {
         let mut config = base();
         config.station.callsign = "K1TEST".to_string();
         config.station.grid_square = "FN42".to_string();
-        let mut coordinator = test_coordinator(config).await;
+        let (mut coordinator, _audit_tmp) = test_coordinator(config).await;
         coordinator
             .remote_tx_arm
             .lock()
@@ -1789,7 +1822,7 @@ mod tests {
         let mut config = base();
         config.station.callsign = "K1TEST".to_string();
         config.station.grid_square = "FN42".to_string();
-        let mut coordinator = test_coordinator(config).await;
+        let (mut coordinator, _audit_tmp) = test_coordinator(config).await;
         let rx = tui_rx(&coordinator).await;
         let running = coordinator.config.read().await.clone();
         std::fs::write(&path, toml::to_string(&running).unwrap()).unwrap();
@@ -1805,7 +1838,7 @@ mod tests {
 
     #[tokio::test]
     async fn reload_with_identical_content_emits_nothing() {
-        let mut coordinator = test_coordinator(base()).await;
+        let (mut coordinator, _audit_tmp) = test_coordinator(base()).await;
         let rx = tui_rx(&coordinator).await;
         let same = coordinator.config.read().await.clone();
         coordinator
@@ -1816,7 +1849,7 @@ mod tests {
 
     #[tokio::test]
     async fn reload_failure_keeps_the_previous_config_and_reports_an_error() {
-        let mut coordinator = test_coordinator(base()).await;
+        let (mut coordinator, _audit_tmp) = test_coordinator(base()).await;
         let rx = tui_rx(&coordinator).await;
         let before = toml::to_string(&*coordinator.config.read().await).unwrap();
         coordinator
@@ -1834,7 +1867,7 @@ mod tests {
 
     #[tokio::test]
     async fn latched_change_is_never_applied_but_a_revocation_in_the_same_save_is() {
-        let mut coordinator = test_coordinator(base()).await;
+        let (mut coordinator, _audit_tmp) = test_coordinator(base()).await;
         let running_call = coordinator.config.read().await.station.callsign.clone();
         coordinator
             .active_tx_qsos
@@ -1888,7 +1921,7 @@ mod tests {
     async fn revocation_reloads_disarm_despite_a_failing_audit_sink() {
         let mut running = base();
         running.network.station_agent.enabled = true;
-        let mut coordinator = test_coordinator(running).await;
+        let (mut coordinator, _audit_tmp) = test_coordinator(running).await;
         coordinator.audit_log = pancetta_agent::audit::AuditLog::new(
             temp_path("missing-audit-dir")
                 .join("nope")
@@ -1927,7 +1960,7 @@ mod tests {
 
     #[tokio::test]
     async fn consent_off_refuses_remote_tx_live_and_consent_on_restores_it() {
-        let mut coordinator = test_coordinator(base()).await;
+        let (mut coordinator, _audit_tmp) = test_coordinator(base()).await;
         coordinator
             .remote_tx_arm
             .lock()
@@ -1975,7 +2008,7 @@ mod tests {
         let mut config = base();
         config.network.wsjtx_udp.enabled = true;
         config.network.wsjtx_udp.allow_tx_initiation = true;
-        let mut coordinator = test_coordinator(config).await;
+        let (mut coordinator, _audit_tmp) = test_coordinator(config).await;
         assert!(coordinator
             .remote_tx_arm
             .lock()
@@ -2009,7 +2042,7 @@ mod tests {
 
     #[tokio::test]
     async fn allow_list_removal_on_an_inert_agent_updates_the_snapshot_only() {
-        let mut coordinator = test_coordinator(base()).await;
+        let (mut coordinator, _audit_tmp) = test_coordinator(base()).await;
         assert!(coordinator.station_agent_live.is_none());
         let rx = tui_rx(&coordinator).await;
         let mut new = coordinator.config.read().await.clone();
@@ -2038,7 +2071,7 @@ mod tests {
 
     #[tokio::test]
     async fn allow_list_removal_with_a_live_session_prunes_disarms_and_bumps_generation() {
-        let mut coordinator = test_coordinator(base()).await;
+        let (mut coordinator, _audit_tmp) = test_coordinator(base()).await;
         let live = crate::coordinator::station_agent::StationAgentLiveHandles {
             tx_allow_list: Arc::new(std::sync::RwLock::new(
                 ["A".to_string(), "B".to_string()].into_iter().collect(),
@@ -2086,7 +2119,7 @@ mod tests {
     /// removed client is never permitted, at any point.
     #[tokio::test]
     async fn consent_on_with_a_removal_in_the_same_save_revokes_first() {
-        let mut coordinator = test_coordinator(base()).await;
+        let (mut coordinator, _audit_tmp) = test_coordinator(base()).await;
         let live = crate::coordinator::station_agent::StationAgentLiveHandles {
             tx_allow_list: Arc::new(std::sync::RwLock::new(
                 ["A".to_string(), "B".to_string()].into_iter().collect(),
@@ -2142,7 +2175,7 @@ mod tests {
 
     #[tokio::test]
     async fn allow_list_addition_and_transport_change_are_restart_required() {
-        let mut coordinator = test_coordinator(base()).await;
+        let (mut coordinator, _audit_tmp) = test_coordinator(base()).await;
         let live = crate::coordinator::station_agent::StationAgentLiveHandles {
             tx_allow_list: Arc::new(std::sync::RwLock::new(
                 ["A".to_string(), "B".to_string()].into_iter().collect(),
@@ -2188,7 +2221,7 @@ mod tests {
     async fn disabling_the_station_agent_stops_it_without_a_supervisor_crash() {
         let mut config = base();
         config.network.station_agent.enabled = true;
-        let mut coordinator = test_coordinator(config).await;
+        let (mut coordinator, _audit_tmp) = test_coordinator(config).await;
         coordinator
             .remote_tx_arm
             .lock()
@@ -2275,7 +2308,7 @@ mod tests {
 
     #[tokio::test]
     async fn enabling_the_station_agent_only_reports_restart_required() {
-        let mut coordinator = test_coordinator(base()).await;
+        let (mut coordinator, _audit_tmp) = test_coordinator(base()).await;
         let rx = tui_rx(&coordinator).await;
         let mut new = coordinator.config.read().await.clone();
         new.network.station_agent.enabled = true;
@@ -2291,7 +2324,7 @@ mod tests {
 
     #[tokio::test]
     async fn watcher_is_not_started_without_a_config_directory() {
-        let mut coordinator = test_coordinator(base()).await;
+        let (mut coordinator, _audit_tmp) = test_coordinator(base()).await;
         coordinator.set_config_watch_path(temp_path("no-such-dir").join("pancetta.toml"));
         coordinator.start_config_reload_watcher().await.unwrap();
         assert!(coordinator.config_reload_rx.is_none());
@@ -2308,7 +2341,7 @@ mod tests {
         config.station.grid_square = "FN42".to_string();
         std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
 
-        let mut coordinator = test_coordinator(config.clone()).await;
+        let (mut coordinator, _audit_tmp) = test_coordinator(config.clone()).await;
         coordinator.config_path = path.clone();
         coordinator.set_config_watch_path(path.clone());
         coordinator
@@ -2349,7 +2382,7 @@ mod tests {
         std::fs::create_dir_all(&watched).unwrap();
         let path = watched.join("pancetta.toml");
         std::fs::write(&path, station_agent_toml(true)).unwrap();
-        let (mut coordinator, _load) = merged_coordinator(vec![watched.clone()]).await;
+        let (mut coordinator, _load, _audit_tmp) = merged_coordinator(vec![watched.clone()]).await;
         coordinator.config_file_baseline = None;
         assert!(station_agent_consent(&coordinator), "setup: consent on");
         let rx = tui_rx(&coordinator).await;
@@ -2398,7 +2431,7 @@ mod tests {
         let path = watched.join("pancetta.toml");
         let text = station_agent_toml(true);
         std::fs::write(&path, &text).unwrap();
-        let (mut coordinator, _load) = merged_coordinator(vec![watched.clone()]).await;
+        let (mut coordinator, _load, _audit_tmp) = merged_coordinator(vec![watched.clone()]).await;
         assert!(station_agent_consent(&coordinator), "setup: consent on");
         arm_client(&coordinator, "A");
         assert!(permitted(&coordinator, "A"), "setup: armed");
@@ -2507,7 +2540,7 @@ mod tests {
         let dir = temp_path("explicit-delete");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("pancetta.toml");
-        let mut coordinator = test_coordinator(base()).await;
+        let (mut coordinator, _audit_tmp) = test_coordinator(base()).await;
         coordinator
             .remote_tx_arm
             .lock()
@@ -2577,7 +2610,7 @@ mod tests {
         let link = link_dir.join("pancetta.toml");
         std::os::unix::fs::symlink(&old_target, &link).unwrap();
 
-        let mut coordinator = test_coordinator(config.clone()).await;
+        let (mut coordinator, _audit_tmp) = test_coordinator(config.clone()).await;
         coordinator.config_path = std::fs::canonicalize(&link).unwrap();
         coordinator.set_config_watch_path(link.clone());
         coordinator
@@ -2665,7 +2698,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_new_reload_warning_reaches_the_operator_once() {
-        let mut coordinator = test_coordinator(base()).await;
+        let (mut coordinator, _audit_tmp) = test_coordinator(base()).await;
         let rx = tui_rx(&coordinator).await;
         let first = "unknown config section [autonomous_operator]".to_string();
         let second = "unknown key [ui].themee".to_string();
