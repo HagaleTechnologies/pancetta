@@ -791,9 +791,9 @@ Both are accepted, with no producer-side inhibit. The first widens the TX
 worker's existing window only by this gap. The second needs a stall at
 least as long as Hamlib's dequeue and CAT round trip.
 
-Not covered: a split changed at the radio itself is still never polled back
-(PAN-206), and a TUI and a remote `SetSplit` interleaving between enqueue
-and store can still leave the atomic on the earlier of the two.
+Rig-side split readback is now covered by PAN-206's poll-loop reconciliation
+(see `tx-scheduling.md`). A TUI and a remote `SetSplit` interleaving between
+enqueue and store can still leave the atomic on the earlier of the two.
 
 ## PAN-139: refuse denied remote close-step opens before mutating the QSO
 

@@ -5798,6 +5798,31 @@ mod tui_relay_tests {
     /// operator-facing status while the effective TX dial sits outside the
     /// configured amateur band plan (15.000 MHz is inside no allocation).
     #[test]
+    fn pan206_polled_out_of_band_split_refuses_manual_ptt() {
+        assert_eq!(
+            ptt_band_plan_refusal(
+                &Arc::new(std::sync::atomic::AtomicU64::new(14_074_000)),
+                &Arc::new(std::sync::atomic::AtomicU64::new(15_000_000)),
+                &pancetta_config::BandPlanConfig::default(),
+            )
+            .as_deref(),
+            Some("Can't key PTT — TX dial 15000000 Hz is outside the configured amateur band plan"),
+        );
+    }
+
+    #[test]
+    fn pan206_in_band_polled_split_allows_manual_ptt() {
+        assert_eq!(
+            ptt_band_plan_refusal(
+                &Arc::new(std::sync::atomic::AtomicU64::new(14_074_000)),
+                &Arc::new(std::sync::atomic::AtomicU64::new(14_078_000)),
+                &pancetta_config::BandPlanConfig::default(),
+            ),
+            None,
+        );
+    }
+
+    #[test]
     fn ptt_band_plan_refusal_names_the_out_of_band_dial() {
         assert_eq!(
             ptt_band_plan_refusal(

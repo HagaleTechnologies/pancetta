@@ -158,6 +158,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The TX band-plan gate now sees split enabled at the radio's front panel or by
+  another CAT client (PAN-206). The Hamlib poll loop reads split every 500 ms
+  and refuses QSO TX and manual PTT outside the configured band plan. Rigs
+  that cannot report split keep the previous behavior and log once per outage.
+
 - `--replay` no longer starts feeding audio while pancetta is still loading
   your logbook history. With a large `~/.pancetta/qsos.adi`, decodes from the
   first slots could sit unprocessed behind that load, or be lost when the
