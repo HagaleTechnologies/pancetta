@@ -477,11 +477,16 @@ impl CqdxBridge {
                 }
 
                 // PAN-93: spots wait for the needed-entity list, so network
-                // rows are never scored against an unknown list.
-                if !matches!(
-                    cached_lookup.dxcc_need_list(),
-                    NeedListAvailability::Loaded { .. }
-                ) {
+                // rows are never scored against an unknown list. A permanent
+                // error seen on any endpoint (e.g. a rejected PAT) also stops
+                // live polling: like `report_spots`/`report_qso`, no further
+                // request would succeed until restart.
+                if bridge.pending().blocked
+                    || !matches!(
+                        cached_lookup.dxcc_need_list(),
+                        NeedListAvailability::Loaded { .. }
+                    )
+                {
                     continue;
                 }
 
@@ -613,6 +618,18 @@ impl CqdxBridge {
                         c.update_spot_groups(groups);
                     }
                     Err(e) => {
+                        if !retry_can_help(&e) {
+                            // PAN-93: a permanent error (e.g. a rejected PAT)
+                            // fails every later request the same way. Record
+                            // it once and stop polling for the session, like
+                            // `report_spots`/`report_qso` already do.
+                            warn!(
+                                "cqdx.io live spot poll failed permanently ({e}); \
+                                 stopping until restart"
+                            );
+                            bridge.pending().blocked = true;
+                            continue;
+                        }
                         consecutive_failures += 1;
                         warn!(
                             "cqdx.io live spot poll failed ({}/3): {}",
@@ -1055,6 +1072,122 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         handle.abort();
         assert!(is_unavailable(&lookup.dxcc_need_list(), true));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn live_polling_stops_after_a_permanent_error_on_a_later_endpoint() {
+        // Review finding (PAN-93 remediation): entities and the needed
+        // list load, then needed-grids answers 401 — a permanent error,
+        // so `pending.blocked` is set while the DXCC list stays Loaded.
+        // The spot gate must also refuse on `blocked`, or the poller
+        // keeps sending the rejected PAT to /api/v1/spots every tick.
+        let server = MockServer::start().await;
+        mount(
+            &server,
+            "/api/v1/entities",
+            200,
+            serde_json::json!({"entities": []}),
+        )
+        .await;
+        mount(
+            &server,
+            "/api/v1/entities/needed",
+            200,
+            needed_json(&["JA"]),
+        )
+        .await;
+        mount(
+            &server,
+            "/api/v1/entities/needed-grids",
+            401,
+            serde_json::json!({}),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/spots"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"groups": []})),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+        let lookup = Arc::new(CachedStationLookup::new());
+        let config = pancetta_config::network::CqdxConfig {
+            poll_interval_secs: 10,
+            ..cfg(&server.uri(), Some(TOKEN))
+        };
+        let bridge = Arc::new(CqdxBridge::from_config(&config, lookup.clone()).unwrap());
+        bridge.startup().await.unwrap();
+        assert!(matches!(
+            lookup.dxcc_need_list(),
+            NeedListAvailability::Loaded { .. }
+        ));
+        assert!(bridge.pending().blocked, "grids 401 must block the session");
+        let handle = bridge.spawn_spot_poller(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            None,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        handle.abort();
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn permanent_live_spot_error_blocks_further_polling() {
+        // Review finding (PAN-93 remediation): a permanent error from the
+        // live-spots request itself (401) must classify as blocked instead
+        // of retrying on backoff until restart.
+        let server = MockServer::start().await;
+        mount(
+            &server,
+            "/api/v1/entities",
+            200,
+            serde_json::json!({"entities": []}),
+        )
+        .await;
+        mount(
+            &server,
+            "/api/v1/entities/needed",
+            200,
+            needed_json(&["JA"]),
+        )
+        .await;
+        mount(
+            &server,
+            "/api/v1/entities/needed-grids",
+            200,
+            serde_json::json!({"grids": []}),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/spots"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let lookup = Arc::new(CachedStationLookup::new());
+        let config = pancetta_config::network::CqdxConfig {
+            poll_interval_secs: 1,
+            ..cfg(&server.uri(), Some(TOKEN))
+        };
+        let bridge = Arc::new(CqdxBridge::from_config(&config, lookup.clone()).unwrap());
+        bridge.startup().await.unwrap();
+        assert!(!bridge.pending().blocked);
+        let handle = bridge.spawn_spot_poller(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            None,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2300)).await;
+        handle.abort();
+        assert!(
+            bridge.pending().blocked,
+            "401 on spots must block the session"
+        );
         server.verify().await;
     }
 }
