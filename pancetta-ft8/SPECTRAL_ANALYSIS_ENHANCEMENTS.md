@@ -1,5 +1,11 @@
 # Enhanced Spectral Analysis for FT8 Weak Signal Detection
 
+> **Historical design note (PAN-110).** This file records design intent from
+> early development. Its SNR and accuracy statements are unmeasured targets,
+> not benchmark results. Measured decode performance, for the shipped
+> pipeline and for the native decoder alone, is in
+> [docs/decoder-comparison.md](../docs/decoder-comparison.md).
+
 ## Overview
 
 The FT8 decoder in `~/Code/pancetta/pancetta-ft8/src/decoder.rs` has been enhanced with advanced spectral analysis capabilities to achieve weak signal detection down to -24 dB SNR as per FT8 specifications.

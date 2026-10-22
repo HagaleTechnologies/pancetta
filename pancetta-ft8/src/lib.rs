@@ -5,7 +5,7 @@
 //! High-performance FT8 digital mode decoder and encoder optimized for real-time processing.
 //!
 //! This crate provides a complete FT8 implementation with:
-//! - >95% decode accuracy at SNR -20dB
+//! - Measured decode performance (shipped pipeline and native-only curves): docs/decoder-comparison.md
 //! - 12.64 second processing windows
 //! - Support for 50+ simultaneous decodes
 //! - Zero-allocation hot path
