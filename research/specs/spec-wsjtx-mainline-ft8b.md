@@ -266,6 +266,19 @@ For `ipass = 1` to `npasses`:
 - Passes 5+ use `llra` again, but with AP bits locked per the
   iaptype-specific apmask + LLR injection.
 
+**Version note (WSJT-X 3.2.0-rc1; added 2026-10-22, PAN-171).** The two
+bullets above are this spec's 2026-06-08 reading. The 2026-10-05 web
+scan (`research/notes/web-scan-2026-10-05.md`, hb-271 item 1, sourced
+from mfsk-core issue #435's audit of 3.2.0-rc1) reports that each AP
+type now runs twice, once with `llra` (`nsym = 1`) and once with `llrc`
+(`nsym = 3`, Variant C), so AP passes alternate between `llra` and
+`llrc`; `llrb` and `llrd` never feed an AP pass. An upstream comment
+labels the second pass `nsym = 2`, but the metric it selects is `llrc`.
+Implementers targeting hb-271 / 3.2.0-rc1 follow this note, not "Passes
+5+ use `llra` again". Items 2-5 of the same scan list the other
+3.2.0-rc1 deltas that touch this spec (apmag scaling, the `ndepth = 2`
+OSD cap, the `nsync` reject threshold, `mlag`).
+
 **AP guards (cycle the pass if any fails):**
 
 - AP types ≥3 only run within `±napwid` of nfqso or nftx (except
