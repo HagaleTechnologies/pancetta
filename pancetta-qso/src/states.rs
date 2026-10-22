@@ -757,6 +757,7 @@ pub struct GridSquares {
 
 /// Contest-specific information
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "ContestInfoRow")]
 pub struct ContestInfo {
     /// Contest name/identifier
     pub contest_name: String,
@@ -782,11 +783,65 @@ pub struct ContestInfo {
     /// third-party file's verbatim `CONTEST_ID` here so re-export is
     /// lossless.
     ///
-    /// `#[serde(default)]` is mandatory: `QsoMetadata` is persisted as JSON
-    /// in SQLite, and every pre-PAN-52 row's serialized `ContestInfo` lacks
-    /// this field.
-    #[serde(default)]
+    /// `QsoMetadata` is persisted as JSON in SQLite, and every pre-PAN-52
+    /// row's serialized `ContestInfo` lacks this key; deserialization fills
+    /// it for those rows (`legacy_adif_contest_id`).
     pub adif_contest_id: Option<String>,
+}
+
+/// How [`ContestInfo`] deserializes: the same fields, except that it tells
+/// a row written before `adif_contest_id` existed (key absent) apart from
+/// one written since (key present; `null` when the contest has no ADIF id).
+#[derive(Deserialize)]
+struct ContestInfoRow {
+    contest_name: String,
+    category: String,
+    serials: ContestSerials,
+    points: u32,
+    multiplier: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present_key")]
+    adif_contest_id: Option<Option<String>>,
+}
+
+/// `Some(value)` whenever the key is present, so a present `null` stays
+/// distinguishable from an absent key (which `#[serde(default)]` makes
+/// `None`).
+fn deserialize_present_key<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
+/// The `adif_contest_id` of a pre-PAN-52 row (PR #502 review). Before
+/// PAN-52, ADIF import was the only production code that built a
+/// `ContestInfo`, and it stored the file's verbatim `CONTEST_ID` in
+/// `contest_name`, which export then stamped as `CONTEST_ID`. Restoring it
+/// keeps the upgraded index → export path lossless. A built-in contest
+/// profile's id is the internal slug PAN-52 keeps off the wire, so it is
+/// never restored.
+fn legacy_adif_contest_id(contest_name: &str) -> Option<String> {
+    let is_profile_slug = crate::contest::catalog::builtin_catalog()
+        .iter()
+        .any(|profile| profile.id == contest_name);
+    (!is_profile_slug).then(|| contest_name.to_string())
+}
+
+impl From<ContestInfoRow> for ContestInfo {
+    fn from(row: ContestInfoRow) -> Self {
+        let adif_contest_id = match row.adif_contest_id {
+            Some(written) => written,
+            None => legacy_adif_contest_id(&row.contest_name),
+        };
+        Self {
+            contest_name: row.contest_name,
+            category: row.category,
+            serials: row.serials,
+            points: row.points,
+            multiplier: row.multiplier,
+            adif_contest_id,
+        }
+    }
 }
 
 /// Contest serial numbers

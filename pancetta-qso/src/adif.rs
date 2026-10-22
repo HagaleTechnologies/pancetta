@@ -607,6 +607,9 @@ impl AdifProcessor {
             cqz: None,     // Would need callsign lookup
             ituz: None,    // Would need callsign lookup
             state: metadata.their_state.clone(),
+            // A row persisted before PAN-52 has no `adif_contest_id` key;
+            // deserialization restores its imported CONTEST_ID
+            // (states.rs `legacy_adif_contest_id`).
             contest_id: contest_info.and_then(|c| c.adif_contest_id.clone()),
             stx: contest_info.and_then(|c| c.serials.sent),
             stx_string: None,

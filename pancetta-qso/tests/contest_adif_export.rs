@@ -90,7 +90,8 @@ async fn profile_with_adif_contest_id_stamps_it_on_the_wire() {
 
 /// Legacy-compat guard: `QsoMetadata` is persisted as JSON in SQLite, and
 /// every pre-PAN-52 row's `ContestInfo` lacks `adif_contest_id`. Those rows
-/// must keep deserializing, with the new field defaulting to `None`.
+/// must keep deserializing, and a built-in profile slug in `contest_name`
+/// is never restored as the ADIF id.
 #[test]
 fn contest_info_json_without_adif_contest_id_deserializes() {
     let legacy = serde_json::json!({
@@ -103,5 +104,22 @@ fn contest_info_json_without_adif_contest_id_deserializes() {
     let info: pancetta_qso::states::ContestInfo = serde_json::from_value(legacy)
         .expect("pre-PAN-52 ContestInfo JSON must keep deserializing");
     assert_eq!(info.contest_name, "us-state-qso-party");
+    assert!(info.adif_contest_id.is_none());
+}
+
+/// The legacy fallback applies only to pre-PAN-52 rows (key absent). A row
+/// written since carries the key; a `null` there means "this contest has no
+/// ADIF id" and must stay `None`, whatever `contest_name` holds.
+#[test]
+fn contest_info_json_with_null_adif_contest_id_stays_none() {
+    let current = serde_json::json!({
+        "contest_name": "my-custom-contest",
+        "category": "",
+        "serials": {"sent": null, "received": null},
+        "points": 0,
+        "multiplier": null,
+        "adif_contest_id": null,
+    });
+    let info: pancetta_qso::states::ContestInfo = serde_json::from_value(current).unwrap();
     assert!(info.adif_contest_id.is_none());
 }
