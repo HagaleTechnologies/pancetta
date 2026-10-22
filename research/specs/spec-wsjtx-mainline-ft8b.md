@@ -275,9 +275,9 @@ type now runs twice, once with `llra` (`nsym = 1`) and once with `llrc`
 `llrc`; `llrb` and `llrd` never feed an AP pass. An upstream comment
 labels the second pass `nsym = 2`, but the metric it selects is `llrc`.
 Implementers targeting hb-271 / 3.2.0-rc1 follow this note, not "Passes
-5+ use `llra` again". Items 2-5 of the same scan list the other
-3.2.0-rc1 deltas that touch this spec (apmag scaling, the `ndepth = 2`
-OSD cap, the `nsync` reject threshold, `mlag`).
+5+ use `llra` again". Items 2, 3, 5 and 6 of the same scan list the
+other 3.2.0-rc1 deltas that touch this spec (apmag scaling, the
+`ndepth = 2` OSD cap, the `nsync` reject threshold, the SNR floor).
 
 **AP guards (cycle the pass if any fails):**
 
