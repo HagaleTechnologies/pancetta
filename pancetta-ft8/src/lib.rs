@@ -117,6 +117,9 @@ pub use budget::{DecodeBudget, DecodeBudgetReport};
 pub mod bp_trajectory_capture;
 pub mod decoder;
 pub mod ldpc;
+// PAN-110: production's ft8_lib + native decode-set merge, shared by the
+// coordinator and the research harness.
+pub mod merge;
 pub mod message;
 #[cfg(feature = "neural_osd")]
 pub mod neural_osd;
