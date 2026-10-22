@@ -537,10 +537,13 @@ fn poll_slot_deadline_mode_aware(
 /// computed for, polled through [`poll_slot_deadline_mode_aware`]. Replaces
 /// the call site's two loose locals so every poll also classifies the
 /// tracked deadline against the wall clock and reports a jump.
+/// PAN-133: also remembers every poll's time so a mode change can recover
+/// one boundary in `(last_poll_now, now]` without replaying older boundaries.
 #[derive(Debug, Clone, Copy)]
 struct SlotTicker {
     deadline: chrono::DateTime<chrono::Utc>,
     deadline_slot_ns: i64,
+    last_poll_now: chrono::DateTime<chrono::Utc>,
 }
 
 /// One [`SlotTicker::poll`] result: `due` gates the per-slot body; `jump`
@@ -561,6 +564,7 @@ impl SlotTicker {
                 slot_ns,
             ),
             deadline_slot_ns: slot_ns,
+            last_poll_now: now,
         }
     }
 
@@ -572,6 +576,15 @@ impl SlotTicker {
             self.deadline,
             self.deadline_slot_ns,
         );
+        // A new-mode boundary may have passed between polls while the old
+        // deadline is still ahead. Recover it once; a backward clock step
+        // cannot satisfy this interval, and several crossed boundaries
+        // still earn only one tick.
+        let crossed_mode_boundary = current_slot_ns != self.deadline_slot_ns && {
+            let boundary =
+                pancetta_core::slot::current_slot_start_with_period(now, current_slot_ns);
+            self.last_poll_now < boundary && boundary <= now
+        };
         let (due, next_deadline, next_slot_ns) = poll_slot_deadline_mode_aware(
             now,
             self.deadline,
@@ -580,7 +593,11 @@ impl SlotTicker {
         );
         self.deadline = next_deadline;
         self.deadline_slot_ns = next_slot_ns;
-        SlotTick { due, jump }
+        self.last_poll_now = now;
+        SlotTick {
+            due: due || crossed_mode_boundary,
+            jump,
+        }
     }
 }
 
@@ -3447,6 +3464,142 @@ mod poll_slot_deadline_tests {
     }
 
     #[test]
+    fn slot_ticker_recovers_ft2_boundary_crossed_between_polls_once() {
+        const FT2_SLOT_NS: i64 = 3_200_000_000;
+        let mut ticker = SlotTicker::new(at(98_750), FT8_SLOT_NS);
+        assert!(!ticker.poll(at(99_000), FT8_SLOT_NS).due);
+        assert_eq!(ticker.deadline, at(105_000));
+
+        assert_eq!(
+            ticker.poll(at(99_250), FT2_SLOT_NS),
+            SlotTick {
+                due: true,
+                jump: None
+            }
+        );
+        assert_eq!(ticker.deadline, at(102_400));
+        assert_eq!(ticker.deadline_slot_ns, FT2_SLOT_NS);
+        assert!(!ticker.poll(at(99_250), FT2_SLOT_NS).due);
+        assert!(!ticker.poll(at(99_500), FT2_SLOT_NS).due);
+        assert!(ticker.poll(at(102_400), FT2_SLOT_NS).due);
+        assert_eq!(ticker.deadline, at(105_600));
+    }
+
+    #[test]
+    fn slot_ticker_recovers_ft4_boundary_at_or_before_current_poll() {
+        for observed_at in [97_500, 97_750] {
+            let mut ticker = SlotTicker::new(at(97_250), FT8_SLOT_NS);
+            assert_eq!(
+                ticker.poll(at(observed_at), FT4_SLOT_NS),
+                SlotTick {
+                    due: true,
+                    jump: None
+                }
+            );
+            assert_eq!(ticker.deadline, at(105_000));
+            assert_eq!(ticker.deadline_slot_ns, FT4_SLOT_NS);
+            assert!(!ticker.poll(at(observed_at), FT4_SLOT_NS).due);
+            assert!(!ticker.poll(at(98_000), FT4_SLOT_NS).due);
+            assert!(ticker.poll(at(105_000), FT4_SLOT_NS).due);
+            assert_eq!(ticker.deadline, at(112_500));
+        }
+    }
+
+    #[test]
+    fn slot_ticker_mode_switch_without_crossed_boundary_only_recomputes() {
+        let mut ticker = SlotTicker::new(at(97_000), FT8_SLOT_NS);
+        assert_eq!(
+            ticker.poll(at(97_250), FT4_SLOT_NS),
+            SlotTick {
+                due: false,
+                jump: None
+            }
+        );
+        assert_eq!(ticker.deadline, at(97_500));
+        assert_eq!(ticker.deadline_slot_ns, FT4_SLOT_NS);
+        assert!(ticker.poll(at(97_500), FT4_SLOT_NS).due);
+    }
+
+    #[test]
+    fn slot_ticker_non_due_poll_advances_boundary_recovery_history() {
+        let mut ticker = SlotTicker::new(at(97_250), FT8_SLOT_NS);
+        // The FT4 boundary passed while we still observed FT8. It is no
+        // longer inside the interval when the next poll observes FT4.
+        assert!(!ticker.poll(at(97_750), FT8_SLOT_NS).due);
+        assert_eq!(
+            ticker.poll(at(98_000), FT4_SLOT_NS),
+            SlotTick {
+                due: false,
+                jump: None
+            }
+        );
+        assert_eq!(ticker.deadline, at(105_000));
+        assert_eq!(ticker.deadline_slot_ns, FT4_SLOT_NS);
+    }
+
+    #[test]
+    fn slot_ticker_boundary_at_previous_poll_is_excluded() {
+        let mut ticker = SlotTicker::new(at(97_250), FT8_SLOT_NS);
+        assert!(!ticker.poll(at(97_500), FT8_SLOT_NS).due);
+        assert_eq!(
+            ticker.poll(at(97_750), FT4_SLOT_NS),
+            SlotTick {
+                due: false,
+                jump: None
+            }
+        );
+        assert_eq!(ticker.deadline, at(105_000));
+    }
+
+    #[test]
+    fn slot_ticker_backward_step_with_mode_switch_updates_history_without_firing() {
+        const FT2_SLOT_NS: i64 = 3_200_000_000;
+        let mut ticker = SlotTicker::new(at(700_000), FT8_SLOT_NS);
+        let tick = ticker.poll(at(99_000), FT4_SLOT_NS);
+        assert!(!tick.due);
+        assert!(matches!(
+            tick.jump,
+            Some(pancetta_core::slot_clock::WallClockJump::Backward(_))
+        ));
+        assert_eq!(ticker.deadline, at(105_000));
+        assert_eq!(ticker.deadline_slot_ns, FT4_SLOT_NS);
+        // History must use the corrected clock even though that poll was
+        // not due. The FT2 boundary at 99.2s is now inside the interval.
+        assert_eq!(
+            ticker.poll(at(99_250), FT2_SLOT_NS),
+            SlotTick {
+                due: true,
+                jump: None
+            }
+        );
+        assert_eq!(ticker.deadline, at(102_400));
+        assert!(!ticker.poll(at(99_500), FT2_SLOT_NS).due);
+        assert!(ticker.poll(at(102_400), FT2_SLOT_NS).due);
+    }
+
+    #[test]
+    fn slot_ticker_delayed_mode_switch_recovers_only_one_tick() {
+        const FT2_SLOT_NS: i64 = 3_200_000_000;
+        let mut ticker = SlotTicker::new(at(90_250), FT8_SLOT_NS);
+        // Cross 92.8s, 96s and 99.2s without reaching the old 105s deadline.
+        assert_eq!(
+            ticker.poll(at(99_250), FT2_SLOT_NS),
+            SlotTick {
+                due: true,
+                jump: None
+            }
+        );
+        assert_eq!(ticker.deadline, at(102_400));
+        assert_eq!(ticker.deadline_slot_ns, FT2_SLOT_NS);
+        assert!(!ticker.poll(at(99_250), FT2_SLOT_NS).due);
+        for millis in (99_500..102_400).step_by(250) {
+            assert!(!ticker.poll(at(millis), FT2_SLOT_NS).due);
+        }
+        assert!(ticker.poll(at(102_400), FT2_SLOT_NS).due);
+        assert_eq!(ticker.deadline, at(105_600));
+    }
+
+    #[test]
     fn no_fire_before_deadline() {
         let (fired, deadline) = poll_slot_deadline(at(10_000), at(15_000), FT8_SLOT_NS);
         assert!(!fired);
@@ -3791,6 +3944,7 @@ mod poll_slot_deadline_tests {
         let mut ticker = SlotTicker {
             deadline: now + chrono::Duration::seconds(14),
             deadline_slot_ns: FT8_SLOT_NS,
+            last_poll_now: now - chrono::Duration::milliseconds(250),
         };
         let tick = ticker.poll(now, FT4_SLOT_NS);
         assert_eq!(
