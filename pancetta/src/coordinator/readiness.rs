@@ -14,13 +14,15 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use pancetta_tui::readiness::{
-    ClockState, StationReadiness, TxMuteCause as TuiTxMuteCause, UploadIssue, UploadIssueKind,
+    ClockState, NeedListHealth, StationReadiness, TxMuteCause as TuiTxMuteCause, UploadIssue,
+    UploadIssueKind,
 };
 
 use super::tx::{self, TxMuteCause};
 use super::upload_outbox::{clip, OutboxTiming, UploadHealth};
 use crate::clock_skew::{ClockSkewShared, ClockStatus};
 use crate::message_bus::ComponentMessage;
+use crate::priority_evaluator::{CachedStationLookup, NeedListAvailability};
 use tracing::debug;
 
 /// Clones of every coordinator input to a [`StationReadiness`] snapshot.
@@ -40,6 +42,9 @@ pub(crate) struct ReadinessSources {
     upload_health: Arc<Mutex<UploadHealth>>,
     /// PAN-104: the shared audit log, read only through its health lock.
     audit: pancetta_agent::audit::AuditLog,
+    /// PAN-93: the cqdx.io needed lists' availability. `parking_lot` locks
+    /// only (no tokio lock), so the relay's OS thread can read it.
+    cached_lookup: Arc<CachedStationLookup>,
     /// The cause list of the previous snapshot, so a changed TX verdict is
     /// logged once (in the gate's own words) rather than every tick.
     last_tx_mute_causes: RefCell<Option<Vec<TxMuteCause>>>,
@@ -61,6 +66,7 @@ impl ReadinessSources {
             degraded_summary: c.degraded_summary.clone(),
             upload_health: c.upload_health.clone(),
             audit: c.audit_log(),
+            cached_lookup: c.cached_lookup.clone(),
             last_tx_mute_causes: RefCell::new(None),
         }
     }
@@ -105,7 +111,26 @@ impl ReadinessSources {
             input_silent,
             upload_issues,
             upload_queue_refused,
+            cqdx_dxcc_needs: tui_need_list_health(&self.cached_lookup.dxcc_need_list()),
+            cqdx_grid_needs: tui_need_list_health(&self.cached_lookup.grid_need_list()),
         }
+    }
+}
+
+/// PAN-93: the strip's view of one cqdx.io needed list. Only a list that
+/// has not loaded this session warns; its error is clipped like upload text.
+fn tui_need_list_health(a: &NeedListAvailability) -> NeedListHealth {
+    match a {
+        NeedListAvailability::NotConfigured
+        | NeedListAvailability::Loading
+        | NeedListAvailability::NotOffered
+        | NeedListAvailability::Loaded { .. } => NeedListHealth::NoWarning,
+        NeedListAvailability::Unavailable {
+            error, retrying, ..
+        } => NeedListHealth::Unavailable {
+            error: clip(error),
+            retrying: *retrying,
+        },
     }
 }
 
@@ -252,6 +277,7 @@ mod tests {
             audit: pancetta_agent::audit::AuditLog::new(
                 std::env::temp_dir().join("pancetta-readiness-unused-audit.log"),
             ),
+            cached_lookup: Arc::new(CachedStationLookup::new()),
             last_tx_mute_causes: RefCell::new(None),
         }
     }
@@ -332,6 +358,10 @@ mod tests {
         s.ptt_off_unconfirmed.store(true, Ordering::Release);
         s.clock_skew.set_status(ClockStatus::Unreachable);
         *s.degraded_summary.lock().unwrap() = Some("dx_cluster: telnet closed".into());
+        s.cached_lookup
+            .mark_dxcc_need_list_failed("HTTP request failed", true);
+        s.cached_lookup
+            .mark_grid_need_list_failed("Authentication failed", false);
 
         assert_eq!(
             s.snapshot(true, true),
@@ -344,6 +374,14 @@ mod tests {
                 input_silent: true,
                 upload_issues: vec![],
                 upload_queue_refused: 0,
+                cqdx_dxcc_needs: NeedListHealth::Unavailable {
+                    error: "HTTP request failed".into(),
+                    retrying: true,
+                },
+                cqdx_grid_needs: NeedListHealth::Unavailable {
+                    error: "Authentication failed".into(),
+                    retrying: false,
+                },
             }
         );
 
@@ -364,6 +402,55 @@ mod tests {
             s.snapshot(false, false).degraded.as_deref(),
             Some("dx_cluster: telnet closed")
         );
+    }
+
+    /// PAN-93: only a list that has not loaded warns, with its error clipped.
+    #[test]
+    fn need_list_health_maps_only_unavailable() {
+        for quiet in [
+            NeedListAvailability::NotConfigured,
+            NeedListAvailability::Loading,
+            NeedListAvailability::NotOffered,
+            NeedListAvailability::Loaded {
+                fetched_at: chrono::Utc::now(),
+                band: Some("20m".into()),
+            },
+        ] {
+            assert_eq!(
+                tui_need_list_health(&quiet),
+                NeedListHealth::NoWarning,
+                "{quiet:?}"
+            );
+        }
+        for (error, retrying) in [
+            ("HTTP request failed".to_string(), true),
+            ("x".repeat(400), false),
+        ] {
+            assert_eq!(
+                tui_need_list_health(&NeedListAvailability::Unavailable {
+                    since: chrono::Utc::now(),
+                    error: error.clone(),
+                    retrying,
+                }),
+                NeedListHealth::Unavailable {
+                    error: clip(&error),
+                    retrying,
+                }
+            );
+        }
+        assert_eq!(clip(&"x".repeat(400)).chars().count(), 161);
+
+        // A loaded list stops warning on the next snapshot.
+        let s = sources();
+        s.cached_lookup
+            .mark_need_lists_unavailable("HTTP request failed", true);
+        assert!(matches!(
+            s.snapshot(false, false).cqdx_dxcc_needs,
+            NeedListHealth::Unavailable { .. }
+        ));
+        s.cached_lookup.update_needed_dxcc(Default::default());
+        s.cached_lookup.update_needed_grids(Default::default());
+        assert_eq!(s.snapshot(false, false), StationReadiness::default());
     }
 
     fn dest_health(d: UploadDestination) -> DestinationHealth {

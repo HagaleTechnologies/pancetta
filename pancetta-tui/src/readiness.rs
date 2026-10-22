@@ -103,6 +103,17 @@ pub struct UploadIssue {
     pub last_call: Option<String>,
 }
 
+/// PAN-93: a cqdx.io needed list as the strip sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum NeedListHealth {
+    /// Not configured, loading, loaded, or not offered by cqdx.io.
+    #[default]
+    NoWarning,
+    /// No list has loaded this session. `retrying` is false when only a
+    /// config fix and restart can help. `error` is ≤ 160 chars, never a credential.
+    Unavailable { error: String, retrying: bool },
+}
+
 /// Coordinator → TUI readiness snapshot (relay, 2 s tick, pushed on change).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StationReadiness {
@@ -120,6 +131,10 @@ pub struct StationReadiness {
     pub upload_issues: Vec<UploadIssue>,
     /// New uploads refused this session because the queue was full.
     pub upload_queue_refused: usize,
+    /// PAN-93: the cqdx.io needed-entity list.
+    pub cqdx_dxcc_needs: NeedListHealth,
+    /// PAN-93: the cqdx.io needed-grid list.
+    pub cqdx_grid_needs: NeedListHealth,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +169,11 @@ pub enum ReadinessKey {
     /// an ack survives a count change (PAN-57).
     Upload(String, UploadIssueKind),
     UploadQueueFull,
+    /// The cqdx.io needed-entity list has not loaded (PAN-93). Carries no
+    /// error text, so an ack survives a changed error.
+    CqdxNeeds,
+    /// Only the cqdx.io needed-grid list has not loaded (PAN-93).
+    CqdxGridNeeds,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,6 +324,60 @@ fn upload_item(i: &UploadIssue) -> ReadinessItem {
         detail,
         acknowledged: false,
     }
+}
+
+/// Shift+S wording for one cqdx.io needed list that has not loaded. `list`
+/// is `entity` or `grid`; `effect` says what is missing until it loads.
+fn cqdx_need_detail(list: &str, error: &str, retrying: bool, effect: &str) -> String {
+    let error = error.trim_end_matches('.');
+    let (action, until) = if retrying {
+        ("pancetta keeps retrying.", "Until it loads")
+    } else {
+        (
+            "Fix [network.cqdx] token and restart pancetta.",
+            "Until then",
+        )
+    };
+    format!("cqdx.io needed-{list} list not loaded: {error}. {action} {until}, {effect}")
+}
+
+/// PAN-93: at most one strip item for cqdx.io needed lists that have not
+/// loaded. The grid chip shows only while the entity list is fine, so one
+/// outage gives one chip. Always a Warning: it never changes the TX verdict.
+fn cqdx_need_item(r: &StationReadiness) -> Option<ReadinessItem> {
+    let grids_down = matches!(r.cqdx_grid_needs, NeedListHealth::Unavailable { .. });
+    let (key, label, detail) = match (&r.cqdx_dxcc_needs, &r.cqdx_grid_needs) {
+        (NeedListHealth::Unavailable { error, retrying }, _) => {
+            let mut detail = cqdx_need_detail(
+                "entity",
+                error,
+                *retrying,
+                "no station shows the + needed marker and ranking guesses from your home and logged prefixes.",
+            );
+            if grids_down {
+                detail.push_str(" Needed grids are unavailable too.");
+            }
+            (ReadinessKey::CqdxNeeds, "⚠ CQDX NEEDS UNKNOWN", detail)
+        }
+        (NeedListHealth::NoWarning, NeedListHealth::Unavailable { error, retrying }) => (
+            ReadinessKey::CqdxGridNeeds,
+            "⚠ CQDX GRID NEEDS UNKNOWN",
+            cqdx_need_detail(
+                "grid",
+                error,
+                *retrying,
+                "needed grids add nothing to autonomous scoring.",
+            ),
+        ),
+        (NeedListHealth::NoWarning, NeedListHealth::NoWarning) => return None,
+    };
+    Some(ReadinessItem {
+        key,
+        severity: Severity::Warning,
+        label: label.to_string(),
+        detail,
+        acknowledged: false,
+    })
 }
 
 fn item(key: ReadinessKey, severity: Severity, label: &str, detail: &str) -> ReadinessItem {
@@ -482,6 +556,8 @@ fn condition_items(
                 acknowledged: false,
             });
         }
+        // PAN-93: a configured cqdx.io whose needed list has not loaded.
+        warnings.extend(cqdx_need_item(r));
     }
     for warning in warnings.iter_mut() {
         warning.acknowledged = app.acknowledged_readiness.contains(&warning.key);
@@ -980,5 +1056,134 @@ mod tests {
         for i in items {
             assert!(i.detail.split_once(" — ").is_some(), "{}", i.detail);
         }
+    }
+
+    // ----- PAN-93: cqdx.io needed lists. ------------------------------------
+
+    fn unavailable(error: &str, retrying: bool) -> NeedListHealth {
+        NeedListHealth::Unavailable {
+            error: error.to_string(),
+            retrying,
+        }
+    }
+
+    fn with_needs(dxcc: NeedListHealth, grids: NeedListHealth) -> StationReadiness {
+        StationReadiness {
+            cqdx_dxcc_needs: dxcc,
+            cqdx_grid_needs: grids,
+            ..StationReadiness::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn cqdx_needs_unknown_is_an_acknowledgeable_warning() {
+        let mut app = app().await;
+        app.station_readiness = Some(with_needs(
+            unavailable("HTTP request failed", true),
+            NeedListHealth::NoWarning,
+        ));
+        assert_eq!(labels(&app), vec!["⚠ CQDX NEEDS UNKNOWN"]);
+        let items = readiness_items(&app);
+        let i = &items[0];
+        assert_eq!(i.severity, Severity::Warning);
+        assert!(i.is_acknowledgeable());
+        assert_eq!(
+            i.detail,
+            "cqdx.io needed-entity list not loaded: HTTP request failed. pancetta keeps retrying. Until it loads, no station shows the + needed marker and ranking guesses from your home and logged prefixes."
+        );
+        assert!(app
+            .station_readiness
+            .as_ref()
+            .is_some_and(|r| r.tx_mute_causes.is_empty()));
+        assert_eq!(verdict(&app), Verdict::Ready);
+    }
+
+    #[tokio::test]
+    async fn cqdx_needs_token_problem_says_fix_and_restart() {
+        let mut app = app().await;
+        app.station_readiness = Some(with_needs(
+            unavailable("Authentication failed: invalid or expired PAT.", false),
+            NeedListHealth::NoWarning,
+        ));
+        let detail = readiness_items(&app)[0].detail.clone();
+        assert!(
+            detail.contains("Fix [network.cqdx] token and restart pancetta."),
+            "{detail}"
+        );
+        assert_eq!(
+            detail,
+            "cqdx.io needed-entity list not loaded: Authentication failed: invalid or expired PAT. Fix [network.cqdx] token and restart pancetta. Until then, no station shows the + needed marker and ranking guesses from your home and logged prefixes."
+        );
+        assert!(!detail.contains("keeps retrying"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn cqdx_grid_chip_only_when_entity_list_is_fine() {
+        let mut app = app().await;
+        app.station_readiness = Some(with_needs(
+            NeedListHealth::NoWarning,
+            unavailable("Server error: 503", true),
+        ));
+        assert_eq!(labels(&app), vec!["⚠ CQDX GRID NEEDS UNKNOWN"]);
+        assert_eq!(
+            readiness_items(&app)[0].detail,
+            "cqdx.io needed-grid list not loaded: Server error: 503. pancetta keeps retrying. Until it loads, needed grids add nothing to autonomous scoring."
+        );
+        app.station_readiness = Some(with_needs(
+            NeedListHealth::NoWarning,
+            unavailable("Authentication failed", false),
+        ));
+        assert_eq!(
+            readiness_items(&app)[0].detail,
+            "cqdx.io needed-grid list not loaded: Authentication failed. Fix [network.cqdx] token and restart pancetta. Until then, needed grids add nothing to autonomous scoring."
+        );
+
+        app.station_readiness = Some(with_needs(
+            unavailable("HTTP request failed", true),
+            unavailable("HTTP request failed", true),
+        ));
+        assert_eq!(labels(&app), vec!["⚠ CQDX NEEDS UNKNOWN"]);
+        let detail = readiness_items(&app)[0].detail.clone();
+        assert!(
+            detail.ends_with("Needed grids are unavailable too."),
+            "{detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cqdx_needs_ack_survives_error_change_and_is_pruned_on_recovery() {
+        let mut app = app().await;
+        app.station_readiness = Some(with_needs(
+            unavailable("HTTP request failed", true),
+            NeedListHealth::NoWarning,
+        ));
+        assert_eq!(app.acknowledge_readiness(), 1);
+        assert!(visible_labels(&app).is_empty());
+
+        // A different error is the same outage: the ack holds.
+        app.station_readiness = Some(with_needs(
+            unavailable("Server error: 503", true),
+            NeedListHealth::NoWarning,
+        ));
+        app.prune_acknowledged_readiness();
+        assert!(visible_labels(&app).is_empty());
+        assert!(readiness_items(&app)[0].acknowledged);
+
+        // The list loads: the episode ends and the ack is forgotten.
+        app.station_readiness = Some(with_needs(
+            NeedListHealth::NoWarning,
+            NeedListHealth::NoWarning,
+        ));
+        app.prune_acknowledged_readiness();
+        assert!(app.acknowledged_readiness.is_empty());
+        assert!(readiness_items(&app).is_empty());
+
+        // A later outage shows again.
+        app.station_readiness = Some(with_needs(
+            unavailable("HTTP request failed", true),
+            NeedListHealth::NoWarning,
+        ));
+        app.prune_acknowledged_readiness();
+        assert_eq!(visible_labels(&app), vec!["⚠ CQDX NEEDS UNKNOWN"]);
     }
 }

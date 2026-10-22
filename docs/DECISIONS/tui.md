@@ -375,3 +375,57 @@ The detail view lists every input with its source, the actual weights and
 within-tier arithmetic, and whether the station relay or TUI scored the row.
 The existing Pri column remains available; raw arithmetic lives in the overlay.
 Callsign-pinned focus remains stable when a fresh score moves a station in the list.
+
+## Needed entity only from a loaded cqdx.io list (PAN-93, 2026-10-22)
+
+DX Hunter's `+` before a callsign, the station card's `needed` flag and the
+remote `DecodedView.needed` mean one thing: the entity matches a prefix in
+cqdx.io's most recently loaded needed-entity list. That is the per-band list
+for the operating band when cqdx answered for that band, otherwise the
+all-bands list. While no list has loaded, no row shows `+` and the card shows
+`worked` or `new`. `!` (ATNO) and `▲` (new on this band, from the local log)
+are unchanged. The scorer still uses a home/logged-prefix guess while the list
+is unknown; see
+[the priority-scoring decision](priority-scoring.md#needed-is-a-claim-with-availability-pan-93-2026-10-22).
+
+For a per-band-DXCC-new row, the card's `Why:` line, the DX Hunter Why column
+and the overlay's `Why:` line use one of three headlines:
+
+- `needed entity (cqdx list)`: the loaded list names the entity.
+- `maybe needed entity (cqdx list changed)`: the row was scored as needed, and
+  the list loaded since says it is not. It lasts until the next decode
+  re-scores the row.
+- `maybe needed entity (cqdx list not loaded)`: no list has loaded, so the
+  score used the guess.
+
+The `w` overlay's "needed entity" row shows a value and its source:
+
+| Case | Value | Source |
+|---|---|---|
+| List loaded | `yes` / `no` | `cqdx needed list, <band or all bands>, <age> old` |
+| Row scored before the list changed | what the score used | `scored before the cqdx list changed (now yes)` / `(now no)` |
+| No list, guess said needed | `unknown` | `cqdx list not loaded; scored as needed (not a home or logged prefix)` |
+| No list, guess said not needed | `unknown` | `cqdx list not loaded; scored as not needed (home or logged prefix)` |
+
+The Why text updates on the next frame after the list loads; `+` appears when
+the station is next decoded, within one slot.
+
+**Strip chips.** `⚠ CQDX NEEDS UNKNOWN` shows while a configured cqdx.io has not
+delivered the needed-entity list: an outage, an empty or invalid token, or a
+401. `⚠ CQDX GRID NEEDS UNKNOWN` shows when only the needed-grid list failed
+with an error other than 404. Both are Warning severity (yellow), acknowledgeable
+with `!`, and never change the TX verdict. The Shift+S detail names the clipped
+error (at most 160 characters, never the token), then says either "pancetta
+keeps retrying." or "Fix [network.cqdx] token and restart pancetta.", and what
+is missing until the list loads. One outage gives one chip: when both lists are
+unavailable only `⚠ CQDX NEEDS UNKNOWN` shows, and its detail ends with "Needed
+grids are unavailable too." The chips clear at the next 2 s snapshot after the
+list loads. Their keys carry no error text, so an acknowledgement survives a
+changed error and is pruned on recovery; a later outage shows again. There is
+no chip when cqdx is not configured, while the first fetch is in flight, or
+when cqdx does not offer the needed-grid endpoint (404). Not configuring cqdx
+is a choice, not a fault.
+
+**No per-row unknown glyph.** An outage would put the same mark on every row
+and say nothing about any one station. The strip chip and the Why text carry
+"unknown" instead, as PAN-86 does for unknown grid and state history.

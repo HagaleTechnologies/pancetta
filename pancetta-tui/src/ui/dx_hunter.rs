@@ -652,6 +652,7 @@ mod tests {
             grid_needed: needed,
             state: Some("AR".into()),
             state_needed: needed,
+            ..Default::default()
         })));
     }
 
@@ -793,6 +794,7 @@ mod tests {
                 grid_needed: Some(true),
                 state: state.map(str::to_string),
                 state_needed: Some(true),
+                ..Default::default()
             })));
             let buf = render_buffer(&app, 100, 8);
             let output = text(&buf);

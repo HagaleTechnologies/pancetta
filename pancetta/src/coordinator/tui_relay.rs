@@ -3648,16 +3648,15 @@ fn worked_before_for(
 }
 
 /// Compute `(needed, atno)` for a callsign against the same
-/// `CachedStationLookup` the autonomous scorer consults. Both inert
-/// (false) when cqdx supplies no needed set, or the callsign is absent.
-/// `atno` implies `needed`.
+/// `CachedStationLookup` the autonomous scorer consults. `needed` only when
+/// cqdx's loaded list names the entity; false while the list is unknown
+/// (PAN-93), or the callsign is absent. `atno` implies `needed`.
 fn needed_atno_for(
     lookup: &crate::priority_evaluator::CachedStationLookup,
     callsign: Option<&str>,
 ) -> (bool, bool) {
-    use pancetta_qso::priority::WorkedStationLookup;
     match callsign {
-        Some(c) if !c.is_empty() => (lookup.is_needed_dxcc(c), lookup.is_atno(c)),
+        Some(c) if !c.is_empty() => lookup.display_needed_atno(c),
         _ => (false, false),
     }
 }
@@ -4141,6 +4140,28 @@ where
 
 #[cfg(test)]
 mod tui_relay_tests {
+    #[test]
+    fn needed_atno_for_reports_unknown_as_not_needed() {
+        // PAN-93: no cqdx list loaded → not shown as needed, even though the
+        // scorer's no-exclusions guess would call every station needed.
+        let lookup = crate::priority_evaluator::CachedStationLookup::new();
+        assert_eq!(
+            super::needed_atno_for(&lookup, Some("JA1ABC")),
+            (false, false)
+        );
+        lookup.update_needed_dxcc(std::collections::HashSet::from(["JA".to_owned()]));
+        lookup.update_needed_atno(std::collections::HashSet::from(["JA".to_owned()]));
+        assert_eq!(
+            super::needed_atno_for(&lookup, Some("JA1ABC")),
+            (true, true)
+        );
+        assert_eq!(
+            super::needed_atno_for(&lookup, Some("DL1ABC")),
+            (false, false)
+        );
+        assert_eq!(super::needed_atno_for(&lookup, None), (false, false));
+    }
+
     #[tokio::test]
     async fn gridless_decodes_keep_grid_rank_but_refresh_live_history() {
         use pancetta_qso::priority::WorkedStationLookup;

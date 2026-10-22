@@ -2492,30 +2492,33 @@ impl ApplicationCoordinator {
             .map(|b| b.with_operating_frequency(self.operating_frequency_hz.clone()))
             {
                 drop(config);
+                // PAN-93: the bridge registers and its poller runs whether or
+                // not this first attempt succeeds. Whatever did not load is
+                // marked unavailable on the lookup (readiness strip) and the
+                // poller retries it; spot polling waits for the needed list.
+                let bridge = std::sync::Arc::new(bridge);
                 match bridge.startup().await {
-                    Ok(()) => {
-                        info!("cqdx.io integration initialized");
-                        let poller_handle = bridge.spawn_spot_poller(
-                            self.shutdown_signal.clone(),
-                            self.last_decode_timestamp.clone(),
-                            None,
-                            None, // TUI tx — set up later in pipeline if available
-                        );
-                        // Wrap the JoinHandle<()> into JoinHandle<Result<()>> for named_task_handles
-                        let wrapped = tokio::spawn(async move {
-                            poller_handle
-                                .await
-                                .map_err(|e| anyhow::anyhow!("cqdx poller join error: {}", e))?;
-                            Ok(())
-                        });
-                        self.named_task_handles
-                            .push((ComponentId::DxCluster, wrapped));
-                        self.cqdx_bridge = Some(std::sync::Arc::new(bridge));
-                    }
-                    Err(e) => {
-                        warn!("cqdx.io startup failed, running in degraded mode: {}", e);
-                    }
+                    Ok(()) => info!("cqdx.io integration initialized"),
+                    Err(e) => warn!(
+                        "cqdx.io startup incomplete ({e}); needed lists unavailable, retrying in the background"
+                    ),
                 }
+                let poller_handle = bridge.spawn_spot_poller(
+                    self.shutdown_signal.clone(),
+                    self.last_decode_timestamp.clone(),
+                    None,
+                    None, // TUI tx — set up later in pipeline if available
+                );
+                // Wrap the JoinHandle<()> into JoinHandle<Result<()>> for named_task_handles
+                let wrapped = tokio::spawn(async move {
+                    poller_handle
+                        .await
+                        .map_err(|e| anyhow::anyhow!("cqdx poller join error: {}", e))?;
+                    Ok(())
+                });
+                self.named_task_handles
+                    .push((ComponentId::DxCluster, wrapped));
+                self.cqdx_bridge = Some(bridge);
             } else {
                 drop(config);
                 info!("cqdx.io integration not configured, running in degraded mode");

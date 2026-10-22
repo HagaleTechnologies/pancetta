@@ -158,6 +158,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- DX Hunter no longer marks stations needed when cqdx.io's needed list never
+  loaded. A failed cqdx.io start used to give every station outside your home
+  and logged prefixes a `+` and the reason "needed entity (cqdx list)", and an
+  empty answer from cqdx.io ("nothing needed") did the same. Now `+` appears
+  only for entities on a loaded list, and an empty answer means nothing is
+  needed. While the list is not loaded, the Why text reads "maybe needed
+  entity (cqdx list not loaded)", and a row scored before the list changed
+  reads "maybe needed entity (cqdx list changed)". While a configured cqdx.io
+  has not delivered its list, the readiness strip shows `⚠ CQDX NEEDS UNKNOWN`
+  (or `⚠ CQDX GRID NEEDS UNKNOWN` for the needed-grid list). After a failed
+  start pancetta now retries in the background instead of leaving cqdx.io off
+  until restart; a token problem still needs a fix and a restart. A
+  needed-grids 404 is recorded as not offered, not as "no grids needed".
+  Autonomous ranking during an outage is unchanged, and remote clients see
+  `needed` as false while the list is unknown (PAN-93).
+
 - `--replay` no longer starts feeding audio while pancetta is still loading
   your logbook history. With a large `~/.pancetta/qsos.adi`, decodes from the
   first slots could sit unprocessed behind that load, or be lost when the

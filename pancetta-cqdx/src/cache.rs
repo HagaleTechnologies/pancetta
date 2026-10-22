@@ -13,7 +13,8 @@ pub struct CqdxCache {
     prefixes: Vec<(String, u32)>,
     /// Entity details by ADIF number.
     entities: HashMap<u32, DxccEntity>,
-    /// Entity IDs the user still needs. None = no data loaded (conservative: everything needed).
+    /// Entity IDs the user still needs. None = no data loaded (needed status
+    /// unknown); `Some` of an empty set = cqdx answered "nothing needed".
     needed_entity_ids: Option<HashSet<u32>>,
     /// Rarity scores from live spot groups, keyed by uppercase callsign.
     rarity_scores: HashMap<String, f64>,
@@ -89,17 +90,17 @@ impl CqdxCache {
     }
 
     /// Check if a callsign's DXCC entity is still needed.
-    /// Returns true if: no needed data loaded (conservative), or entity is in needed set.
-    pub fn is_needed_dxcc(&self, callsign: &str) -> bool {
-        match &self.needed_entity_ids {
-            None => true, // No data loaded = conservative: everything needed
-            Some(ids) => {
-                match self.resolve_entity(callsign) {
-                    Some(entity_id) => ids.contains(&entity_id),
-                    None => false, // Can't resolve = can't be needed
-                }
-            }
-        }
+    ///
+    /// PAN-93: `None` while no needed data is loaded (status unknown, never
+    /// "everything needed"); otherwise `Some(true)` when the entity is in the
+    /// needed set and `Some(false)` when it is not, cannot be resolved, or
+    /// the loaded set is empty.
+    pub fn is_needed_dxcc(&self, callsign: &str) -> Option<bool> {
+        let ids = self.needed_entity_ids.as_ref()?;
+        Some(
+            self.resolve_entity(callsign)
+                .is_some_and(|entity_id| ids.contains(&entity_id)),
+        )
     }
 
     /// Get current live spot groups for frequency nudge decisions.
@@ -267,17 +268,27 @@ mod tests {
             prefix: "3Y/B".to_string(),
             atno: true,
         }]);
-        assert!(cache.is_needed_dxcc("3Y/B1234")); // Bouvet is needed
-        assert!(!cache.is_needed_dxcc("K1ABC")); // US is NOT needed
+        assert_eq!(cache.is_needed_dxcc("3Y/B1234"), Some(true)); // Bouvet is needed
+        assert_eq!(cache.is_needed_dxcc("K1ABC"), Some(false)); // US is NOT needed
     }
 
     #[test]
-    fn test_is_needed_dxcc_empty_means_all_needed() {
+    fn test_is_needed_dxcc_unloaded_is_unknown() {
         let mut cache = CqdxCache::new();
         cache.load_entities(sample_entities());
-        // No needed data loaded -> conservative: everything is needed
-        assert!(cache.is_needed_dxcc("K1ABC"));
-        assert!(cache.is_needed_dxcc("JA1XYZ"));
+        // PAN-93: no needed data loaded -> unknown, not "everything needed".
+        assert_eq!(cache.is_needed_dxcc("K1ABC"), None);
+        assert_eq!(cache.is_needed_dxcc("JA1XYZ"), None);
+    }
+
+    #[test]
+    fn test_is_needed_dxcc_loaded_empty_is_not_needed() {
+        let mut cache = CqdxCache::new();
+        cache.load_entities(sample_entities());
+        cache.load_needed(vec![]);
+        // PAN-93: a successful empty answer means nothing is needed.
+        assert_eq!(cache.is_needed_dxcc("K1ABC"), Some(false));
+        assert_eq!(cache.is_needed_dxcc("3Y/B1234"), Some(false));
     }
 
     #[test]
