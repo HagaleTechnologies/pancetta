@@ -24205,7 +24205,6 @@ mod pan122_tx_log_worker_tests {
     }
 }
 
-<<<<<<< HEAD
 /// PAN-146: the DX-parity gate, through the real TX worker, scopes its a7
 /// evidence to the live dial's band. A DX kept fresh on 20 m Odd holds an
 /// Odd call on 20 m, and does not hold the same call after the operator
@@ -24243,33 +24242,10 @@ mod pan146_dx_parity_context_worker_tests {
             .await
             .unwrap();
         h.coordinator.qso_manager_watch.send_replace(Some(manager));
-=======
-#[cfg(test)]
-mod pan182_audio_delivery_tests {
-    use super::pan115_worker_gate_tests::worker_harness;
-    use super::pan122_tx_log_worker_tests::fill_channel;
-    use crate::message_bus::{ComponentId, ComponentMessage, MessageType, QsoMessage, TxOrigin};
-    use std::time::{Duration, Instant};
-
-    /// PR #507 review (P1): a Step-7 audio send that comes back `Dropped`
-    /// (here: the Audio channel is full) enqueued no samples, so the frame
-    /// never aired even though PTT keyed. Step 10 must report it as not
-    /// sent: the QSO engine gets the PAN-75 `TxFrameNotSent` mirror (which
-    /// rolls the attempt back) and never `TxFrameSent`, whose false
-    /// confirmation would release a held PAN-182 stall switch on a frame
-    /// that never keyed any audio.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dropped_audio_delivery_reports_the_frame_as_not_sent() {
-        let h = worker_harness().await;
-        assert!(fill_channel(&h, ComponentId::Audio).await > 0);
-        // The defer-time liveness gate needs the QSO id to be TX-live (the
-        // QSO component publishes this set; here it is seeded directly).
->>>>>>> e31ba0dba6b4471f068c9edbbd82caa7395547dd
         h.coordinator
             .active_tx_qsos
             .write()
             .unwrap()
-<<<<<<< HEAD
             .insert(super::super::active_tx_qso_key(&id.to_string()));
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -24293,9 +24269,6 @@ mod pan182_audio_delivery_tests {
                 }
             })
         };
-=======
-            .insert("Q1".into());
->>>>>>> e31ba0dba6b4471f068c9edbbd82caa7395547dd
 
         h.coordinator
             .message_bus
@@ -24303,17 +24276,10 @@ mod pan182_audio_delivery_tests {
                 ComponentId::Autonomous,
                 ComponentId::Ft8Transmitter,
                 MessageType::TransmitRequest {
-<<<<<<< HEAD
                     message_text: TEXT.into(),
                     frequency_offset: 1500.0,
                     qso_id: Some(id.to_string()),
                     tx_parity: Some(SlotParity::Odd),
-=======
-                    message_text: "K1ABC N0CALL FN20".to_string(),
-                    frequency_offset: 1500.0,
-                    qso_id: Some("q1".into()),
-                    tx_parity: None,
->>>>>>> e31ba0dba6b4471f068c9edbbd82caa7395547dd
                     origin: TxOrigin::Local,
                     remote_client_key_id: None,
                 },
@@ -24321,7 +24287,6 @@ mod pan182_audio_delivery_tests {
             ))
             .await
             .unwrap();
-<<<<<<< HEAD
         let result = await_completion(h, TEXT, Duration::from_secs(50)).await;
         stop.store(true, Ordering::Release);
         let _ = refresher.await;
@@ -24350,7 +24315,51 @@ mod pan182_audio_delivery_tests {
         assert!(ptt_on, "the 15 m call must key");
         assert!(!diagnostics.iter().any(|d| d.contains("colliding parity")));
     }
-=======
+}
+
+#[cfg(test)]
+mod pan182_audio_delivery_tests {
+    use super::pan115_worker_gate_tests::worker_harness;
+    use super::pan122_tx_log_worker_tests::fill_channel;
+    use crate::message_bus::{ComponentId, ComponentMessage, MessageType, QsoMessage, TxOrigin};
+    use std::time::{Duration, Instant};
+
+    /// PR #507 review (P1): a Step-7 audio send that comes back `Dropped`
+    /// (here: the Audio channel is full) enqueued no samples, so the frame
+    /// never aired even though PTT keyed. Step 10 must report it as not
+    /// sent: the QSO engine gets the PAN-75 `TxFrameNotSent` mirror (which
+    /// rolls the attempt back) and never `TxFrameSent`, whose false
+    /// confirmation would release a held PAN-182 stall switch on a frame
+    /// that never keyed any audio.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_audio_delivery_reports_the_frame_as_not_sent() {
+        let h = worker_harness().await;
+        assert!(fill_channel(&h, ComponentId::Audio).await > 0);
+        // The defer-time liveness gate needs the QSO id to be TX-live (the
+        // QSO component publishes this set; here it is seeded directly).
+        h.coordinator
+            .active_tx_qsos
+            .write()
+            .unwrap()
+            .insert("Q1".into());
+
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Autonomous,
+                ComponentId::Ft8Transmitter,
+                MessageType::TransmitRequest {
+                    message_text: "K1ABC N0CALL FN20".to_string(),
+                    frequency_offset: 1500.0,
+                    qso_id: Some("q1".into()),
+                    tx_parity: None,
+                    origin: TxOrigin::Local,
+                    remote_client_key_id: None,
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(45);
         let mut completion = None;
@@ -24411,5 +24420,4 @@ mod pan182_audio_delivery_tests {
             "no aired mirror may be sent for a frame that never keyed audio"
         );
     }
->>>>>>> e31ba0dba6b4471f068c9edbbd82caa7395547dd
 }
