@@ -443,14 +443,16 @@ The ledger keeps a separate `last_emitted_at` anchor. Rearm pacing uses the late
 of that anchor and `last_call_at`; rollback never changes the anchor. TX cadence,
 coalescing order, parity and frequency selection therefore stay unchanged.
 
-Correlation uses the newest matching `(qso_id, message_text)` within four slots,
-with at most eight attempts per QSO. A same-text emission arriving between TX
-drain and rollback can be matched instead, so its timestamp may differ by one
-emission; the count still reverses one attempt. When the newer same-text
-entry is an explicit resend, its flags are reversed instead of the failed
-frame's (follow-up: PAN-183). Expired or unmatched reports and
-terminal QSOs are no-ops. The ledger is shared across manager clones, pruned on
-rearm and rollback, and never persisted.
+Correlation is by attempt identity first (PAN-183): every ledger attempt gets a
+`TxAttemptId` when it is recorded, and the report of a frame that never aired
+carries the id of the attempt that frame came from. A report with an id
+reverses exactly that attempt, within four slots and at most eight attempts per
+QSO; an id with no surviving attempt is a no-op and never falls back to content
+matching. Reports without an id (frames with no ledger attempt, and any
+reporter that had none) keep the newest matching `(qso_id, message_text)`,
+narrowed by the replaced frame's payload on a pivot. Expired or unmatched
+reports and terminal QSOs are no-ops. The ledger is shared across manager
+clones, pruned on rearm and rollback, and never persisted.
 
 The same accounting rule covers cap truncation, F8 abort, supersede, arm or
 identity refusal, hard mute, PAN-141 hold, PAN-114 clock-jump drops, and
@@ -491,6 +493,37 @@ change) so the rollback cannot hit the replacement's attempt. Offsets within
 0.5 Hz count as unchanged, and items count as carried only once the
 re-enqueued bundle is confirmed queued. Rollback emits no new snapshot or QSO event; the existing status panel
 and remote snapshot fields show corrected values on the next normal push.
+
+### Attempt identity (PAN-183)
+
+Text matching could pick the wrong attempt when two attempts in the window
+render the same text: a failed keep-call rearm whose newer twin is an
+operator's explicit resend gave up the resend's entry and kept its own stall
+increment and `Sent` entry, which could trip the stall offset switch a cycle
+early. The id now travels with the frame:
+
+- `QsoEvent::MessageToSend::attempt_id` is `Some` for the three
+  ledger-recorded emissions (keep-call rearm, explicit resend, offset-switch
+  retransmit) and `None` for opening calls and advances.
+- The QSO loop copies it onto the `TransmitRequest` and the `LatestTxIntent`.
+  The coalescer keeps each entry's own id on every request or bundle item it
+  rebuilds, and each `TransmitRequestItem` carries its own. A multi-TX bundle
+  has no bundle-level id.
+- A key-time pivot adopts the intent's id with its payload and records the
+  replaced frame's id beside its text and payload, so a pivot-replaced report
+  rolls back the replaced attempt. A `Replace` or `Bundle` supersede re-keys or
+  re-enqueues the new request under that request's own id.
+- Every `TxFrameNotSent` carries the failed frame's id, or the replaced frame's
+  on a pivot. Autonomous-facing `TransmitComplete` is unchanged (PAN-185).
+
+The same mechanism closes two PR #419 review threads. An identity-conflict
+supersede reported abandoned bundle items without their binding, so a
+same-text, same-offset rollback could select the newer, differently bound
+attempt (thread 4244657620). And applying a mixed bundle's folded `Remote`
+binding to every abandoned item could miss a local item's entry (thread
+4244657622). Both now report each item's own id. The PAN-182 stall-trigger
+hold compares ids when its trigger is rolled back; its release on an aired
+frame still matches content within the trigger's own slot.
 
 ## Fox-admitted QSOs keep their TX slots after Fox mode is turned off (PAN-76)
 
