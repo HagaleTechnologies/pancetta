@@ -1186,6 +1186,9 @@ async fn interruptible_sleep_or_supersede(
                     in_flight_origin,
                     in_flight_remote_client_key_id,
                 ) {
+                    // Silent to Autonomous: the keyed pivoted frame owns the
+                    // QSO's outcome (ownership rule: `report_unaired_frame`,
+                    // PAN-185).
                     IncomingDuringTx::Drop => {}
                     // PAN-73 round 2: not a match for any in-flight QSO —
                     // requeue rather than discard (see IncomingDuringTx::Requeue).
@@ -3051,6 +3054,8 @@ type PivotReplaced = std::collections::HashMap<String, ReplacedFrame>;
 /// A bundle refused before it aired: clear the tombstones its Step 4b pivot
 /// inserted and return the frames those pivots replaced, so each item's
 /// failure rolls back the replaced frame (see [`report_unaired_frame`]).
+/// Clearing a tombstone hands the QSO's Autonomous outcome to the queued
+/// request that produced the pivoted payload (ownership rule, PAN-185).
 fn unwind_bundle_pivots(
     keys: &[String],
     pivoted_once: &mut std::collections::HashMap<String, (String, f64)>,
@@ -6500,6 +6505,8 @@ pub(crate) async fn coalesce_backlog_into(
                         pivoted_once,
                     )
                 {
+                    // Silent to Autonomous: the pivoted frame keyed and
+                    // reported (ownership rule: `report_unaired_frame`).
                     let replaced = entry.qso_id.as_deref().and_then(|id| {
                         let key = super::active_tx_qso_key(id);
                         pivoted_once.remove(&key);
@@ -7327,8 +7334,10 @@ fn item_rebound_by_supersede(
 /// rollback cannot land on a newer same-text attempt at another offset or
 /// authority (PAN-75). The item's own ledger attempt decides the match when
 /// it has one, so a folded bundle binding cannot miss or mis-pick it
-/// (PAN-183). Autonomous gets the usual failed completion (follow-up:
-/// PAN-185).
+/// (PAN-183). Autonomous gets the usual failed completion, even when the
+/// superseding request later airs: supersede abandonment is outside the
+/// pivot ownership rule (gap recorded in
+/// docs/DECISIONS/2026-07-development-phases-and-gaps.md, PAN-185).
 async fn report_abandoned_bundle_item(
     message_bus: &MessageBus,
     item: &crate::message_bus::TransmitRequestItem,
@@ -7870,7 +7879,10 @@ impl super::ApplicationCoordinator {
                 // a second time. Worker-local (this loop is the single
                 // consumer; no concurrent access), so a plain `HashMap`
                 // suffices — no new `Arc`/lock. See `is_pivot_duplicate`
-                // (coordinator/mod.rs) for the pure membership check.
+                // (coordinator/mod.rs) for the pure membership check. The
+                // tombstone also decides which request reports the QSO's
+                // outcome to Autonomous (ownership rule:
+                // `report_unaired_frame`, PAN-185).
                 let mut pivoted_once: std::collections::HashMap<String, (String, f64)> =
                     std::collections::HashMap::new();
                 // PAN-75: the text and payload each tombstoned pivot replaced.
@@ -8182,6 +8194,9 @@ impl super::ApplicationCoordinator {
                                     // drop (no PTT, no schedule), and clear the tombstone so
                                     // a genuinely later legitimate re-send of the same text
                                     // (e.g. a keep-call rearm) is never wrongly suppressed.
+                                    // Autonomous hears nothing: the pivoted frame keyed and
+                                    // reported (ownership rule: `report_unaired_frame`,
+                                    // PAN-185).
                                     if super::is_pivot_duplicate(
                                         qso_id.as_deref(),
                                         &message_text,
@@ -9030,7 +9045,10 @@ impl super::ApplicationCoordinator {
                                         // Round-6 review (Codex P2): tracks the
                                         // `pivoted_once` key Step 4c inserts below (if it
                                         // pivots this cycle) so Step 4d-arm's denial branch
-                                        // can remove it — see that branch for why.
+                                        // can remove it — see that branch for why. Every
+                                        // `pivoted_this_key.take()` refusal hands the QSO's
+                                        // Autonomous outcome to the queued request
+                                        // (ownership rule: `report_unaired_frame`, PAN-185).
                                         let mut pivoted_this_key: Option<String> = None;
 
                                         // --- Step 4c: late pivot to the freshest message ---

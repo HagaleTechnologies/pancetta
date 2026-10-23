@@ -411,8 +411,22 @@ A pivoted frame or multi-TX bundle refused before it airs (pre-PTT hard mute,
 liveness or arm recheck, disarm, pre-slot clock jump) clears its pivot tombstones, so the
 request that produced each pivoted frame stays queued and accounts for
 itself; the worker reports the replaced frame to the QSO engine instead.
-Autonomous still gets a failed completion for the pivoted payload, as on Step
-0-dup; correlating it with the queued request's eventual outcome is PAN-185. An F8 abort keeps the
+
+Pivot ownership rule (PAN-185): the tombstone decides which request reports
+the QSO's outcome to Autonomous, so a tracked self-CQ settles exactly once. A
+pivot targets only an intent whose `TransmitRequest` the bus confirmed queued
+(`LatestTxIntent::request_queued`: the QSO forwarder publishes the intent
+unqueued, sends the request checked, then marks it queued or withdraws it).
+A refused pivot (tombstone cleared) sends Autonomous nothing; the queued
+request reports its own outcome when it airs, is refused, or is discarded. A
+keyed pivot (tombstone kept) reports, and the request it absorbed is dropped
+silently by Step 0-dup, the backlog pivot-duplicate pass or a mid-TX
+duplicate drop. Backlog coalescing reports a failed completion to Autonomous,
+and to Autonomous only, for every QSO request it drops as terminal or excludes
+for parity or frequency; a request coalesced into a newer one for the same QSO
+stays silent because the newer one reports. A request the TX channel never
+accepted rolls back its ledger attempt through a self-addressed
+`TxFrameNotSent`. An F8 abort keeps the
 tombstone, so Step 0-dup later reports the replaced frame. Backlog coalescing
 consumes pivot duplicates before it picks the newest request per QSO, so a
 duplicate superseded in the backlog still reports its replaced frame. Since PAN-136,
@@ -503,8 +517,16 @@ tick its re-call reached the cap, so the cap-reaching frame never aired and an
 unsent report for it found no active QSO. Retirement on the call cap now lands
 up to four slots after the last call.
 
-Rollback reports are best-effort bus messages; a full or missing QSO channel
-loses them (follow-up: PAN-185).
+Rollback reports travel the bus's durable tier (PAN-185):
+`send_message_durable` parks `TxFrameNotSent`, `TxFrameSent` and
+`TransmitComplete` on a bus-owned lane when the Qso or Autonomous channel is
+full, and those loops read the lane through their `DurableInbox` after the
+channel. The lane belongs to the bus, so it survives a restart of either
+component; after a Qso restart the parked reports name QSOs the new manager
+never had and are no-ops. Limits: a lane holds at most 4096 messages
+(`DURABLE_LANE_CAPACITY`; past that the report is dropped, logged and
+counted), and a rollback still finds nothing once it is processed more than
+four slots after the attempt (the unsent-attempt retention window).
 
 Shutdown aborts deliberately send no rollback. The TX and QSO loops stop on the
 same global flag, and shutdown persists no active-QSO state. Adding a bus await
@@ -548,7 +570,8 @@ early. The id now travels with the frame:
   rolls back the replaced attempt. A `Replace` or `Bundle` supersede re-keys or
   re-enqueues the new request under that request's own id.
 - Every `TxFrameNotSent` carries the failed frame's id, or the replaced frame's
-  on a pivot. Autonomous-facing `TransmitComplete` is unchanged (PAN-185).
+  on a pivot. Autonomous-facing `TransmitComplete` correlates on `qso_id`
+  under the pivot ownership rule above (PAN-185).
 
 The same mechanism closes two PR #419 review threads. An identity-conflict
 supersede reported abandoned bundle items without their binding, so a

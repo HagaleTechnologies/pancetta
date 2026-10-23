@@ -158,6 +158,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A frame that never airs now gives back its call, stall count and `Sent`
+  timeline entry even when the QSO engine is briefly backed up (PAN-185).
+  Before, that correction could be lost and the frame stayed counted. An
+  autonomous CQ whose frame was swapped for a fresher one and then refused no
+  longer counts as a failed CQ before the replacement airs; it now settles
+  once, on what actually aired.
+
 - A keep-call frame that never airs now gives back its own call, stall count
   and `Sent` timeline entry even when you resent the same message for that QSO
   after it was queued (PAN-183). The TX worker used to hand back the newest
