@@ -236,6 +236,12 @@ pub enum MessageType {
         /// later must not authorize a frame it never requested. `None` for
         /// every `Local` request.
         remote_client_key_id: Option<String>,
+        /// PAN-183: the keep-call ledger attempt this frame accounts for
+        /// (`QsoEvent::MessageToSend::attempt_id`), echoed on
+        /// `QsoMessage::TxFrameNotSent` if the frame never airs. `None` for
+        /// frames with no ledger attempt (opening calls, advances, manual
+        /// and tune frames).
+        attempt_id: Option<pancetta_qso::TxAttemptId>,
     },
 
     /// Transmit completed notification
@@ -514,6 +520,10 @@ pub struct TransmitRequestItem {
     /// every `Local` item.
     #[serde(default)]
     pub remote_client_key_id: Option<String>,
+    /// See `MessageType::TransmitRequest::attempt_id`. Per item, so a
+    /// bundle's not-sent report rolls back each item's own attempt (PAN-183).
+    #[serde(default)]
+    pub attempt_id: Option<pancetta_qso::TxAttemptId>,
 }
 
 /// One row in a `MessageType::TxQueueStatus` payload — a compact,
@@ -889,6 +899,10 @@ pub enum QsoMessage {
         /// Set when the frame was replaced by a TX pivot: its own offset and
         /// binding, so the rollback skips the same-text frame that aired.
         replaced: Option<pancetta_qso::UnsentAttemptPayload>,
+        /// PAN-183: the failed frame's ledger attempt (the replaced frame's
+        /// on a pivot), so the rollback reverses exactly that attempt. `None`
+        /// when the frame carried none; the rollback then matches content.
+        attempt_id: Option<pancetta_qso::TxAttemptId>,
     },
     /// PAN-182: a QSO frame that aired, mirrored by Ft8Transmitter after
     /// playback alongside the Autonomous completion. Qso uses it to release

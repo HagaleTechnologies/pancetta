@@ -3806,6 +3806,7 @@ impl super::ApplicationCoordinator {
                                 }
                             }
                             Ok(pancetta_qso::QsoEvent::MessageToSend {
+                                attempt_id,
                                 qso_id,
                                 message,
                                 frequency,
@@ -3844,6 +3845,7 @@ impl super::ApplicationCoordinator {
                                             m.insert(
                                                 super::active_tx_qso_key(&qso_id.to_string()),
                                                 super::LatestTxIntent {
+                                                    attempt_id,
                                                     message_text: text.clone(),
                                                     frequency_offset: frequency,
                                                     tx_parity,
@@ -3857,6 +3859,7 @@ impl super::ApplicationCoordinator {
                                             ComponentId::Qso,
                                             ComponentId::Ft8Transmitter,
                                             MessageType::TransmitRequest {
+                                                attempt_id,
                                                 message_text: text,
                                                 frequency_offset: frequency,
                                                 qso_id: Some(qso_id.to_string()),
@@ -5579,11 +5582,11 @@ impl super::ApplicationCoordinator {
                                                 ),
                                             }
                                         }
-                                        crate::message_bus::QsoMessage::TxFrameNotSent { qso_id, message_text, replaced } => {
+                                        crate::message_bus::QsoMessage::TxFrameNotSent { qso_id, message_text, replaced, attempt_id } => {
                                             match qso_id.parse::<pancetta_qso::QsoId>() {
                                                 Ok(id) => {
-                                                    let outcome = qso_manager.roll_back_unsent_attempt(id, &message_text, replaced.as_ref()).await;
-                                                    debug!(target: "qso", "TX frame not sent for QSO {} ('{}'): {:?}", qso_id, message_text, outcome);
+                                                    let outcome = qso_manager.roll_back_unsent_attempt(id, &message_text, replaced.as_ref(), attempt_id).await;
+                                                    debug!(target: "qso", "TX frame not sent for QSO {} ('{}', attempt {:?}): {:?}", qso_id, message_text, attempt_id, outcome);
                                                 }
                                                 Err(e) => debug!(target: "qso", "TxFrameNotSent: bad QSO id '{}': {}", qso_id, e),
                                             }
@@ -11509,6 +11512,7 @@ mod respond_to_caller_admission_tests {
                     ComponentId::Ft8Transmitter,
                     ComponentId::Qso,
                     MessageType::QsoMessage(QsoMessage::TxFrameNotSent {
+                        attempt_id: None,
                         qso_id,
                         message_text: text.clone(),
                         replaced: None,
@@ -12580,6 +12584,7 @@ mod respond_to_caller_admission_tests {
 
     fn pan76_request(qso_id: &pancetta_qso::QsoId, text: &str, freq: f64) -> MessageType {
         MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: text.to_string(),
             frequency_offset: freq,
             qso_id: Some(qso_id.to_string()),

@@ -2580,7 +2580,7 @@ impl super::ApplicationCoordinator {
                                             }
                                         }
                                         tx_items.push((
-                                            crate::message_bus::TransmitRequestItem {
+                                            crate::message_bus::TransmitRequestItem { attempt_id: None,
                                                 message_text: message_text.clone(),
                                                 frequency_offset,
                                                 qso_id: qso_id.clone(),
@@ -2922,7 +2922,7 @@ impl super::ApplicationCoordinator {
                                     let msg = ComponentMessage::new(
                                         ComponentId::Autonomous,
                                         ComponentId::Ft8Transmitter,
-                                        MessageType::TransmitRequest {
+                                        MessageType::TransmitRequest { attempt_id: item.attempt_id,
                                             message_text: item.message_text,
                                             frequency_offset: item.frequency_offset,
                                             qso_id: item.qso_id,
@@ -3032,7 +3032,7 @@ impl super::ApplicationCoordinator {
                                         let msg = ComponentMessage::new(
                                             ComponentId::Autonomous,
                                             ComponentId::Ft8Transmitter,
-                                            MessageType::TransmitRequest {
+                                            MessageType::TransmitRequest { attempt_id: item.attempt_id,
                                                 message_text: item.message_text,
                                                 frequency_offset: item.frequency_offset,
                                                 qso_id: item.qso_id,
@@ -4086,6 +4086,7 @@ mod plan_slot_transmissions_tests {
     fn opening(text: &str, offset: f64) -> (TransmitRequestItem, Option<SlotParity>) {
         (
             TransmitRequestItem {
+                attempt_id: None,
                 message_text: text.to_string(),
                 frequency_offset: offset,
                 qso_id: None,
@@ -4099,6 +4100,7 @@ mod plan_slot_transmissions_tests {
     fn in_progress(text: &str, qso_id: &str) -> (TransmitRequestItem, Option<SlotParity>) {
         (
             TransmitRequestItem {
+                attempt_id: None,
                 message_text: text.to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some(qso_id.to_string()),
