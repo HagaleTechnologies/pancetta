@@ -24634,6 +24634,7 @@ mod pan146_dx_parity_context_worker_tests {
                 ComponentId::Autonomous,
                 ComponentId::Ft8Transmitter,
                 MessageType::TransmitRequest {
+                    attempt_id: None,
                     message_text: TEXT.into(),
                     frequency_offset: 1500.0,
                     qso_id: Some(id.to_string()),
