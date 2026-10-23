@@ -8830,6 +8830,43 @@ mod tests {
         assert_eq!(after.metadata.last_call_at, Some(opened));
     }
 
+    // PAN-183 reproduction: the ledger holds an older keep-call rearm attempt
+    // (bumped_stall, recorded_sent) and a NEWER operator resend of the same
+    // text (no stall bump, no Sent entry). Reporting the OLDER rearm frame as
+    // not sent must roll the rearm back; today it matches newest-same-text
+    // first and removes the resend's entry instead.
+    #[tokio::test]
+    async fn pan183_repro_rollback_of_older_rearm_removes_newer_same_text_resend() {
+        let (manager, id, opened, text) = rollback_fixture().await;
+        // The operator explicitly resends the same text while the rearm frame
+        // is still waiting before PTT.
+        manager.resend_last_tx(id).await.unwrap();
+        let before = manager.get_qso(id).await.unwrap();
+        assert_eq!(before.metadata.call_count, 3);
+        assert_eq!(before.metadata.stall_cycles, 1);
+        assert_eq!(before.messages.len(), 2); // resend adds no Sent entry
+        assert_eq!(manager.keep_call_ledger_len(id), 2);
+        // The TX worker reports the OLDER rearm frame as not sent.
+        assert_eq!(
+            manager
+                .roll_back_unsent_attempt_at(id, &text, opened + Duration::seconds(20))
+                .await,
+            UnsentAttemptRollback::RolledBack { call_count: 2 }
+        );
+        let after = manager.get_qso(id).await.unwrap();
+        // CURRENT (buggy) behaviour, pinned as documentation: the resend's
+        // ledger entry was removed while the failed rearm's stall increment
+        // and Sent timeline entry survive.
+        assert_eq!(manager.keep_call_ledger_len(id), 1);
+        assert_eq!(after.metadata.stall_cycles, 1);
+        assert_eq!(after.messages.len(), 2);
+        assert_eq!(
+            after.messages.last().unwrap().timestamp,
+            opened + Duration::seconds(15)
+        );
+        assert_eq!(after.metadata.last_call_at, Some(opened + Duration::seconds(15)));
+    }
+
     #[tokio::test]
     async fn rollback_after_advance_preserves_new_stall_and_stamp() {
         let (manager, id, opened, old_text) = rollback_fixture().await;
