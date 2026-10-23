@@ -685,8 +685,22 @@ impl RigConnState {
 enum SplitPollOutcome {
     Changed(u64),
     Unchanged,
+    /// The rig answered but cannot report split (unsupported verb, bad or
+    /// zero frequency). Best-effort: does not affect CAT-link health.
     Unobservable,
+    /// A split read failed AND left the CAT link disconnected (timeout, EOF,
+    /// incomplete `s` reply). Counts as a failed poll so a persistent
+    /// split-read transport failure reaches `PollingFailed` and the TX hard
+    /// mute instead of being masked by the preceding frequency read.
+    LinkLost,
     Skipped,
+}
+
+impl SplitPollOutcome {
+    /// Whether the enclosing poll tick still counts as a successful poll.
+    fn keeps_poll_ok(self) -> bool {
+        !matches!(self, SplitPollOutcome::LinkLost)
+    }
 }
 
 /// Separate from CAT-link health: an unsupported split read must not mute TX.
@@ -708,14 +722,19 @@ impl SplitReadHealth {
                 self.unobservable = false;
                 false
             }
-            SplitPollOutcome::Skipped => false,
+            // Link health is RigPollHealth's job; a dropped link says
+            // nothing about whether the rig supports split readback.
+            SplitPollOutcome::LinkLost | SplitPollOutcome::Skipped => false,
         }
     }
 }
 
 /// Reconcile the gate's split input without issuing any split commands.
 /// Best-effort, like S-meter reads: callers must NOT count Unobservable
-/// toward poll_ok / RigPollHealth. A failed read preserves commanded state.
+/// toward poll_ok / RigPollHealth, but MUST count LinkLost as a failed poll.
+/// A failed read preserves commanded state. Callers only invoke this while
+/// the rig reports Connected, so a post-failure Disconnected status means
+/// the split read itself broke the link.
 async fn reconcile_polled_split(
     rig: &dyn pancetta_hamlib::RigControl,
     split_tx_hz: &std::sync::atomic::AtomicU64,
@@ -730,12 +749,12 @@ async fn reconcile_polled_split(
     }
     let previous = split_tx_hz.load(Ordering::Relaxed);
     let tx_hz = match rig.get_split().await {
-        Err(_) => return SplitPollOutcome::Unobservable,
+        Err(_) => return split_read_failure(rig).await,
         Ok((false, _)) => 0,
         Ok((true, _)) => match rig.get_split_freq().await {
             // Zero means simplex to the gate, not an unknown split frequency.
             Ok(frequency) if frequency != 0 => frequency,
-            _ => return SplitPollOutcome::Unobservable,
+            _ => return split_read_failure(rig).await,
         },
     };
     // A split command may have been queued, applied, or retried during the
@@ -759,6 +778,18 @@ async fn reconcile_polled_split(
             }
         })
         .unwrap_or(SplitPollOutcome::Skipped)
+}
+
+/// Classify a failed split read: unsupported readback on a live link, or a
+/// transport failure that dropped the link (rigctld clears its connected flag
+/// on timeout, EOF and incomplete replies).
+async fn split_read_failure(rig: &dyn pancetta_hamlib::RigControl) -> SplitPollOutcome {
+    match rig.get_status().await {
+        Ok(status) if status.connection_state == pancetta_hamlib::ConnectionState::Connected => {
+            SplitPollOutcome::Unobservable
+        }
+        _ => SplitPollOutcome::LinkLost,
+    }
 }
 
 /// Echo rig readback through the same display-only event as commanded split.
@@ -2029,7 +2060,8 @@ impl super::ApplicationCoordinator {
                                     }
                                     // PAN-206: every successful frequency poll also
                                     // observes split. An unsupported read does not
-                                    // affect poll_ok or the CAT-link hard mute.
+                                    // affect poll_ok or the CAT-link hard mute; a
+                                    // read that dropped the link fails this poll.
                                     let outcome = reconcile_polled_split(
                                         rig_for_polling.as_ref(),
                                         &split_tx_hz_for_polling,
@@ -2045,10 +2077,16 @@ impl super::ApplicationCoordinator {
                                              TX band check keeps pancetta's own split state"
                                         );
                                     }
+                                    if outcome == SplitPollOutcome::LinkLost {
+                                        debug!(
+                                            target: "rig.split",
+                                            "Split read dropped the CAT link — counting this poll as failed"
+                                        );
+                                    }
                                     if let SplitPollOutcome::Changed(tx_hz) = outcome {
                                         emit_split_status(&message_bus, &display_feed_enabled_poll, tx_hz).await;
                                     }
-                                    true
+                                    outcome.keeps_poll_ok()
                                 } else {
                                     false
                                 }
@@ -7646,6 +7684,8 @@ mod pan206_split_poll_tests {
             split_read_supported: false,
             ..Default::default()
         });
+        // Callers reconcile only while the link reports Connected.
+        rig.connect().await.unwrap();
         let split = AtomicU64::new(15_000_000);
         let mut health = SplitReadHealth::default();
         for should_log in [true, false, false] {
@@ -7726,6 +7766,10 @@ mod pan206_split_poll_tests {
         during_read: Box<dyn Fn() + Send + Sync>,
         enabled: bool,
         frequency: Option<u64>,
+        /// Reported by get_status; a failed split-frequency read clears it
+        /// when `drop_link_on_failure` is set (rigctld timeout/EOF behavior).
+        link_up: AtomicBool,
+        drop_link_on_failure: bool,
     }
 
     #[async_trait::async_trait]
@@ -7737,7 +7781,14 @@ mod pan206_split_poll_tests {
             unimplemented!()
         }
         async fn get_status(&self) -> Result<RigStatus> {
-            unimplemented!()
+            Ok(RigStatus {
+                connection_state: if self.link_up.load(Ordering::Acquire) {
+                    pancetta_hamlib::ConnectionState::Connected
+                } else {
+                    pancetta_hamlib::ConnectionState::Disconnected
+                },
+                ..RigStatus::default()
+            })
         }
         async fn set_frequency(&self, _vfo: Vfo, _freq: u64) -> Result<()> {
             unimplemented!()
@@ -7792,6 +7843,9 @@ mod pan206_split_poll_tests {
             Ok((self.enabled, Vfo::B))
         }
         async fn get_split_freq(&self) -> Result<u64> {
+            if self.frequency.is_none() && self.drop_link_on_failure {
+                self.link_up.store(false, Ordering::Release);
+            }
             self.frequency
                 .ok_or_else(|| anyhow::anyhow!("split frequency unsupported"))
         }
@@ -7800,6 +7854,8 @@ mod pan206_split_poll_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn split_on_but_freq_read_fails_is_unobservable() {
         let rig = SplitReadRig {
+            link_up: AtomicBool::new(true),
+            drop_link_on_failure: false,
             during_read: Box::new(|| {}),
             enabled: true,
             frequency: None,
@@ -7818,9 +7874,63 @@ mod pan206_split_poll_tests {
         assert_eq!(split.load(Ordering::Relaxed), 15_000_000);
     }
 
+    /// Codex P1 (PR #506): a split read that drops the CAT link (timeout,
+    /// EOF, incomplete `s` reply) is a link failure, not unsupported readback.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pan206_split_read_that_drops_the_link_is_link_lost() {
+        let rig = SplitReadRig {
+            link_up: AtomicBool::new(true),
+            drop_link_on_failure: true,
+            during_read: Box::new(|| {}),
+            enabled: true,
+            frequency: None,
+        };
+        let split = AtomicU64::new(15_000_000);
+        let outcome = reconcile_polled_split(
+            &rig,
+            &split,
+            &AtomicU32::new(0),
+            &SplitObservationFence::default(),
+        )
+        .await;
+        assert_eq!(outcome, SplitPollOutcome::LinkLost);
+        assert!(!outcome.keeps_poll_ok());
+        assert_eq!(split.load(Ordering::Relaxed), 15_000_000);
+        // Not an unsupported-readback episode: no "cannot report split" log.
+        assert!(!SplitReadHealth::default().note_outcome(outcome));
+    }
+
+    #[test]
+    fn pan206_only_link_lost_fails_the_poll() {
+        assert!(SplitPollOutcome::Changed(15_000_000).keeps_poll_ok());
+        assert!(SplitPollOutcome::Unchanged.keeps_poll_ok());
+        assert!(SplitPollOutcome::Unobservable.keeps_poll_ok());
+        assert!(SplitPollOutcome::Skipped.keeps_poll_ok());
+        assert!(!SplitPollOutcome::LinkLost.keeps_poll_ok());
+    }
+
+    /// The finding's scenario: each tick the redialled link answers the
+    /// frequency read, then the split read drops it again. Counting the
+    /// split outcome into poll_ok must still reach PollingFailed (TX mute);
+    /// before the fix every such tick reset RigPollHealth.
+    #[test]
+    fn pan206_persistent_split_read_disconnects_reach_polling_failed() {
+        let mut health = RigPollHealth::new();
+        let mut transitions = Vec::new();
+        for _ in 0..RIG_POLL_FAILED_THRESHOLD {
+            let frequency_read_ok = true;
+            let poll_ok = frequency_read_ok && SplitPollOutcome::LinkLost.keeps_poll_ok();
+            transitions.push(health.on_poll(poll_ok));
+        }
+        assert_eq!(transitions.last(), Some(&RigPollTransition::PollingFailed));
+        assert_eq!(health.consecutive_failures(), RIG_POLL_FAILED_THRESHOLD);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn split_on_with_zero_frequency_never_clears_the_gate() {
         let rig = SplitReadRig {
+            link_up: AtomicBool::new(true),
+            drop_link_on_failure: false,
             during_read: Box::new(|| {}),
             enabled: true,
             frequency: Some(0),
@@ -7844,6 +7954,8 @@ mod pan206_split_poll_tests {
         let in_flight = Arc::new(AtomicU32::new(0));
         let count = in_flight.clone();
         let rig = SplitReadRig {
+            link_up: AtomicBool::new(true),
+            drop_link_on_failure: false,
             during_read: Box::new(move || {
                 count.store(1, Ordering::Release);
             }),
@@ -7864,6 +7976,8 @@ mod pan206_split_poll_tests {
         let split = Arc::new(AtomicU64::new(14_078_000));
         let commanded = split.clone();
         let rig = SplitReadRig {
+            link_up: AtomicBool::new(true),
+            drop_link_on_failure: false,
             during_read: Box::new(move || {
                 commanded.store(15_000_000, Ordering::Relaxed);
             }),
@@ -7936,6 +8050,8 @@ mod pan206_split_poll_tests {
         let fence = Arc::new(SplitObservationFence::default());
         let command_fence = fence.clone();
         let rig = SplitReadRig {
+            link_up: AtomicBool::new(true),
+            drop_link_on_failure: false,
             during_read: Box::new(move || {
                 drop(command_fence.begin_command());
             }),

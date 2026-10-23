@@ -381,8 +381,11 @@ recording, CAT application, and pending retries. The message carries a cloned ow
 cannot erase an accepted command while it is still queued. A revision invalidates reads that
 span a completed command, including repeated commands for the same frequency. Only split-command
 creation and poll publication take this short lock; PTT enqueue stays lock-free.
-Split reads are best-effort and do not count toward CAT `PollingFailed`. An unsupported or failed
-read preserves the previous split and logs once per unavailable episode, re-arming after recovery.
+Unsupported split readback is best-effort and does not count toward CAT `PollingFailed`: a read
+that fails while the link stays Connected preserves the previous split and logs once per
+unavailable episode, re-arming after recovery. A split read that drops the link (timeout, EOF,
+incomplete `s` reply) fails that poll tick, so a link that answers the frequency read but loses
+every split read still reaches `PollingFailed` and the TX hard mute.
 Zero or malformed TX-frequency responses never clear a known split. Both `s` response lines are
 consumed under one connection lock so concurrent CAT traffic cannot consume half a reply.
 The gate still uses sampled state, not confirmed RF at key-time. FTdx10 confirmation of the read
