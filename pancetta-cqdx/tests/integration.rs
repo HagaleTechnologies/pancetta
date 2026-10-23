@@ -58,9 +58,9 @@ async fn test_startup_flow_entities_and_needed() {
     assert_eq!(needed.len(), 1);
     cache.load_needed(needed);
 
-    assert!(cache.is_needed_dxcc("3Y/B1234"));
-    assert!(!cache.is_needed_dxcc("K1ABC"));
-    assert!(!cache.is_needed_dxcc("JA1XYZ"));
+    assert_eq!(cache.is_needed_dxcc("3Y/B1234"), Some(true));
+    assert_eq!(cache.is_needed_dxcc("K1ABC"), Some(false));
+    assert_eq!(cache.is_needed_dxcc("JA1XYZ"), Some(false));
 }
 
 /// Live spot poll updates rarity scores in cache.
@@ -175,12 +175,13 @@ async fn test_spot_and_qso_reporting() {
     client.report_qso(qso).await.unwrap();
 }
 
-/// Degraded mode: CqdxCache with no data returns conservative defaults.
+/// Degraded mode: CqdxCache with no data returns conservative defaults
+/// (PAN-93: needed status is unknown, not "needed").
 #[test]
 fn test_degraded_mode_defaults() {
     let cache = CqdxCache::new();
     assert_eq!(cache.resolve_entity("K1ABC"), None);
-    assert!(cache.is_needed_dxcc("K1ABC"));
+    assert_eq!(cache.is_needed_dxcc("K1ABC"), None);
     assert!((cache.rarity("K1ABC") - 0.5).abs() < f64::EPSILON);
     assert!(cache.spot_groups().is_empty());
 }

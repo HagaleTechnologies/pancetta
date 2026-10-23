@@ -230,6 +230,12 @@ Returns grid squares the user still needs for grid-chasing awards.
 - Pancetta fetches this on startup and caches it for the session
 - This drives the `needed_grids` scoring factor in pancetta's priority engine
 - **Priority:** Low — conservative fallback (treat all grids as needed) is acceptable until this endpoint exists.
+- Pancetta calls this as `GET /api/v1/entities/needed-grids`. Since PAN-93 it
+  records a `404` as "not offered", not as "no grids needed": needed grids then
+  add nothing to scoring, and the readiness strip shows no warning. A `200`
+  with `{"grids": []}` is a loaded answer meaning no grids are needed. A 5xx
+  or transport error marks the list unavailable and is retried; a `401` is
+  not retried.
 
 ### `GET /api/v1/entities/needed?band=<band>` — per-band DXCC needs (PROPOSED)
 
@@ -267,6 +273,6 @@ I'm operating right now" (a band-fill) from "needed everywhere" (ATNO).
   keyed to the current operating band; it keeps the all-time set too (for the
   ATNO badge fallback when `atno` is absent).
 - **Priority:** Medium — drives a `needed_dxcc_this_band` scoring factor and the
-  DX Hunter ATNO/band-fill display. Pancetta degrades gracefully (treats the
-  per-band set as empty/inert) on 404 until this ships, exactly like
-  `/entities/needed-grids`.
+  DX Hunter ATNO/band-fill display. Pancetta degrades gracefully on a
+  per-band error until this ships: it keeps the last loaded needed set, or
+  reports the needed status as unknown when none has loaded (PAN-93).

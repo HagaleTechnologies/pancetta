@@ -56,7 +56,8 @@ pub struct NeededResponse {
 /// still needs as a flat list of grid-field strings (e.g. `["JD15", "FN42"]`).
 /// Mirrors the `needed` envelope of [`NeededResponse`]. The endpoint may not
 /// exist on the cqdx.io server yet — see `CqdxClient::fetch_needed_grids`,
-/// which degrades gracefully (empty list) when it is absent.
+/// which reports a 404 as "not offered" (`Ok(None)`), distinct from an empty
+/// list (PAN-93).
 #[derive(Debug, Clone, Deserialize)]
 pub struct NeededGridsResponse {
     pub grids: Vec<String>,

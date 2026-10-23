@@ -110,6 +110,8 @@ base64 = { workspace = true }
 snow = "0.10"
 # Station-agent lock-order tests hold an audit write mid-transaction.
 pancetta-agent = { path = "../pancetta-agent", features = ["test-hooks"] }
+# PAN-93: cqdx bridge startup/retry tests against a local mock cqdx.io.
+wiremock = "0.6"
 
 [features]
 default = ["metrics", "pancetta-hamlib"]
