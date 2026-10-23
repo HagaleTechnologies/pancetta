@@ -835,6 +835,31 @@ pub(crate) enum RigPollTransition {
     PollingFailed,
 }
 
+/// PAN-206: startup split reconciliation can mark the link `PollingFailed`
+/// before this generation's poll loop has counted a single failure. Treat the
+/// first successful poll after that as a recovery from `PollingFailed`, so the
+/// hard mute clears (and the restore is announced) exactly as it would after
+/// ten counted failures.
+fn startup_aware_transition(
+    transition: RigPollTransition,
+    poll_ok: bool,
+    link_marked_failed: bool,
+) -> RigPollTransition {
+    match transition {
+        RigPollTransition::Steady if poll_ok && link_marked_failed => {
+            RigPollTransition::Recovered {
+                from_polling_failed: true,
+            }
+        }
+        RigPollTransition::Recovered {
+            from_polling_failed,
+        } => RigPollTransition::Recovered {
+            from_polling_failed: from_polling_failed || link_marked_failed,
+        },
+        other => other,
+    }
+}
+
 /// PAN-115: the poll loop's failure counting and redial schedule, pulled out of
 /// the spawned task so it can be unit-tested.
 pub(crate) struct RigPollHealth {
@@ -2097,7 +2122,14 @@ impl super::ApplicationCoordinator {
                             false
                         };
 
-                        match poll_health.on_poll(poll_ok) {
+                        let link_marked_failed = rig_enabled
+                            && RigConnState::from_u8(rig_conn_state_poll.load(Ordering::Acquire))
+                                == RigConnState::PollingFailed;
+                        match startup_aware_transition(
+                            poll_health.on_poll(poll_ok),
+                            poll_ok,
+                            link_marked_failed,
+                        ) {
                             RigPollTransition::Steady => {}
                             RigPollTransition::Recovered {
                                 from_polling_failed,
@@ -2348,10 +2380,13 @@ impl super::ApplicationCoordinator {
                 // PAN-206: observe the rig's split before readiness is
                 // published below. The poll loop's first connected tick can
                 // be up to 500 ms away, and until then the gate would check
-                // a split the rig never reported. A failed read keeps
-                // today's behavior; the poll loop logs it once.
+                // a split the rig never reported. An unsupported read keeps
+                // today's behavior; the poll loop logs it once. A read that
+                // dropped the CAT link marks the link failed (TX hard mute)
+                // so readiness cannot let PTT key on an unobserved split;
+                // the poll loop clears it on its next successful poll.
                 if startup_connected {
-                    if let SplitPollOutcome::Changed(tx_hz) = reconcile_polled_split(
+                    match reconcile_polled_split(
                         rig.as_ref(),
                         &split_tx_hz_for_startup,
                         &hamlib_command_in_flight,
@@ -2359,8 +2394,26 @@ impl super::ApplicationCoordinator {
                     )
                     .await
                     {
-                        emit_split_status(&message_bus_for_connect, &display_feed_enabled, tx_hz)
+                        SplitPollOutcome::Changed(tx_hz) => {
+                            emit_split_status(
+                                &message_bus_for_connect,
+                                &display_feed_enabled,
+                                tx_hz,
+                            )
                             .await;
+                        }
+                        SplitPollOutcome::LinkLost if rig_enabled => {
+                            rig_conn_state
+                                .store(RigConnState::PollingFailed.as_u8(), Ordering::Release);
+                            report_rig_error(
+                                &message_bus_for_connect,
+                                "Rig CAT link dropped while reading split at startup — \
+                                 TX inhibited until it reconnects"
+                                    .into(),
+                            )
+                            .await;
+                        }
+                        _ => {}
                     }
                 }
 
@@ -7898,6 +7951,44 @@ mod pan206_split_poll_tests {
         assert_eq!(split.load(Ordering::Relaxed), 15_000_000);
         // Not an unsupported-readback episode: no "cannot report split" log.
         assert!(!SplitReadHealth::default().note_outcome(outcome));
+    }
+
+    /// Codex P1 (PR #506, round 2): startup marks the link failed on
+    /// LinkLost; the poll loop must clear that on its first good poll even
+    /// though its own failure counter never reached the threshold.
+    #[test]
+    fn pan206_startup_link_failure_recovers_on_first_good_poll() {
+        assert_eq!(
+            startup_aware_transition(RigPollTransition::Steady, true, true),
+            RigPollTransition::Recovered {
+                from_polling_failed: true
+            }
+        );
+        assert_eq!(
+            startup_aware_transition(
+                RigPollTransition::Recovered {
+                    from_polling_failed: false
+                },
+                true,
+                true
+            ),
+            RigPollTransition::Recovered {
+                from_polling_failed: true
+            }
+        );
+        // Still failing, or never marked: unchanged.
+        assert_eq!(
+            startup_aware_transition(RigPollTransition::Steady, false, true),
+            RigPollTransition::Steady
+        );
+        assert_eq!(
+            startup_aware_transition(RigPollTransition::Steady, true, false),
+            RigPollTransition::Steady
+        );
+        assert_eq!(
+            startup_aware_transition(RigPollTransition::PollingFailed, false, true),
+            RigPollTransition::PollingFailed
+        );
     }
 
     #[test]
