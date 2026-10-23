@@ -2930,11 +2930,13 @@ async fn report_transmit_complete(
     result
 }
 
-/// Report a frame whose audio played out, after PTT is released. Same as
-/// [`report_transmit_complete`]; on success it also tells the QSO engine the
-/// frame aired, with the offset and binding it aired on, so a stall offset
-/// action held on that frame can commit (PAN-182). Never called before or
-/// during key-down (PAN-202).
+/// Report a frame after PTT is released — one whose audio played out
+/// (`success` from a Step-7 `Enqueued`), or one whose audio delivery
+/// failed (`Dropped`/error: no samples were ever enqueued, so the frame
+/// never aired and routes through the PAN-75 not-sent path). On success it
+/// also tells the QSO engine the frame aired, with the offset and binding
+/// it aired on, so a stall offset action held on that frame can commit
+/// (PAN-182). Never called before or during key-down (PAN-202).
 async fn report_played_transmit_complete(
     message_bus: &MessageBus,
     success: bool,
@@ -9784,6 +9786,11 @@ impl super::ApplicationCoordinator {
                                         // PR #468 review: playback is timed from the enqueue, so the
                                         // bounded TX-log wait below never extends key-down past the audio.
                                         let audio_enqueued_at = tokio::time::Instant::now();
+                                        // PAN-182 (PR #507 review): only an `Enqueued` outcome put
+                                        // samples on the Audio route. A `Dropped`/error delivery keyed
+                                        // no audio, so Step 10 must report the frame as not sent.
+                                        let audio_enqueued =
+                                            matches!(outcome, Ok(SendIfOutcome::Enqueued));
                                         match outcome {
                                             Ok(SendIfOutcome::Enqueued) => {
                                                 // Band Activity's own-TX history logs the actual
@@ -10198,7 +10205,11 @@ impl super::ApplicationCoordinator {
                                                 }
                                             }
                                         }
-                                        let success = true;
+                                        // PAN-182 (PR #507 review): success means the audio actually
+                                        // enqueued at Step 7 — a `Dropped`/error delivery keyed no
+                                        // samples, so the frame never aired and Step 10 reports it
+                                        // through the PAN-75 not-sent path instead.
+                                        let success = audio_enqueued;
                                         let duration_ms = audio_duration_ms;
 
                                         // --- Step 9: De-assert PTT (with tail delay) ---
@@ -12524,6 +12535,11 @@ impl super::ApplicationCoordinator {
                                     // PR #468 review: playback is timed from the enqueue, so the
                                     // bounded TX-log wait below never extends key-down past the audio.
                                     let audio_enqueued_at = tokio::time::Instant::now();
+                                    // PAN-182 (PR #507 review): only an `Enqueued` outcome put
+                                    // samples on the Audio route. A `Dropped`/error delivery keyed
+                                    // no audio, so Step 10 must report every item as not sent.
+                                    let audio_enqueued =
+                                        matches!(outcome, Ok(SendIfOutcome::Enqueued));
                                     match outcome {
                                         Ok(SendIfOutcome::Enqueued) => {
                                             // Band Activity's own-TX history logs the actual
@@ -12769,7 +12785,11 @@ impl super::ApplicationCoordinator {
                                             continue;
                                         }
                                     }
-                                    let success = true;
+                                    // PAN-182 (PR #507 review): success means the audio actually
+                                    // enqueued at Step 7 — a `Dropped`/error delivery keyed no
+                                    // samples, so no item aired and Step 10 reports each through
+                                    // the PAN-75 not-sent path instead.
+                                    let success = audio_enqueued;
                                     let duration_ms = audio_duration_ms;
 
                                     // --- Step 9: De-assert PTT (with tail delay) ---
@@ -23483,7 +23503,9 @@ mod pan122_tx_log_worker_tests {
     }
 
     /// Fill `dst`'s channel until the bus refuses another message.
-    async fn fill_channel(h: &Harness, dst: ComponentId) -> usize {
+    /// `pub(crate)`: shared with the PAN-182 audio-delivery module, the way
+    /// the PAN-115 harness is shared with this one.
+    pub(crate) async fn fill_channel(h: &Harness, dst: ComponentId) -> usize {
         let mut sent = 0;
         while h
             .coordinator
@@ -23854,5 +23876,110 @@ mod pan122_tx_log_worker_tests {
             TxLogAppend::Disabled
         );
         assert!(!tx_log_path(Some(home.path())).exists());
+    }
+}
+
+#[cfg(test)]
+mod pan182_audio_delivery_tests {
+    use super::pan115_worker_gate_tests::worker_harness;
+    use super::pan122_tx_log_worker_tests::fill_channel;
+    use crate::message_bus::{ComponentId, ComponentMessage, MessageType, QsoMessage, TxOrigin};
+    use std::time::{Duration, Instant};
+
+    /// PR #507 review (P1): a Step-7 audio send that comes back `Dropped`
+    /// (here: the Audio channel is full) enqueued no samples, so the frame
+    /// never aired even though PTT keyed. Step 10 must report it as not
+    /// sent: the QSO engine gets the PAN-75 `TxFrameNotSent` mirror (which
+    /// rolls the attempt back) and never `TxFrameSent`, whose false
+    /// confirmation would release a held PAN-182 stall switch on a frame
+    /// that never keyed any audio.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_audio_delivery_reports_the_frame_as_not_sent() {
+        let h = worker_harness().await;
+        assert!(fill_channel(&h, ComponentId::Audio).await > 0);
+        // The defer-time liveness gate needs the QSO id to be TX-live (the
+        // QSO component publishes this set; here it is seeded directly).
+        h.coordinator
+            .active_tx_qsos
+            .write()
+            .unwrap()
+            .insert("Q1".into());
+
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Autonomous,
+                ComponentId::Ft8Transmitter,
+                MessageType::TransmitRequest {
+                    message_text: "K1ABC N0CALL FN20".to_string(),
+                    frequency_offset: 1500.0,
+                    qso_id: Some("q1".into()),
+                    tx_parity: None,
+                    origin: TxOrigin::Local,
+                    remote_client_key_id: None,
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let mut completion = None;
+        let mut not_sent_mirror = false;
+        let mut sent_mirror = false;
+        fn capture(
+            completion: &mut Option<bool>,
+            not_sent_mirror: &mut bool,
+            sent_mirror: &mut bool,
+            msg: ComponentMessage,
+        ) {
+            match msg.message_type {
+                MessageType::TransmitComplete {
+                    success,
+                    ref message_text,
+                    ..
+                } if message_text == "K1ABC N0CALL FN20" => {
+                    *completion = Some(success);
+                }
+                MessageType::QsoMessage(QsoMessage::TxFrameNotSent { ref qso_id, .. })
+                    if qso_id == "q1" =>
+                {
+                    *not_sent_mirror = true;
+                }
+                MessageType::QsoMessage(QsoMessage::TxFrameSent { ref qso_id, .. })
+                    if qso_id == "q1" =>
+                {
+                    *sent_mirror = true;
+                }
+                _ => {}
+            }
+        }
+        while completion.is_none() && Instant::now() < deadline {
+            while let Ok(msg) = h.autonomous_rx.try_recv() {
+                capture(&mut completion, &mut not_sent_mirror, &mut sent_mirror, msg);
+            }
+            while let Ok(msg) = h.qso_rx.try_recv() {
+                capture(&mut completion, &mut not_sent_mirror, &mut sent_mirror, msg);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Anything still in flight after the completion.
+        while let Ok(msg) = h.qso_rx.try_recv() {
+            capture(&mut completion, &mut not_sent_mirror, &mut sent_mirror, msg);
+        }
+
+        assert_eq!(
+            completion,
+            Some(false),
+            "a frame whose audio never enqueued must complete as failed"
+        );
+        assert!(
+            not_sent_mirror,
+            "the QSO engine must get the PAN-75 not-sent mirror"
+        );
+        assert!(
+            !sent_mirror,
+            "no aired mirror may be sent for a frame that never keyed audio"
+        );
     }
 }

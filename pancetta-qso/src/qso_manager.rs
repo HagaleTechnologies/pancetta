@@ -4300,6 +4300,22 @@ impl QsoManager {
                     if was_at_threshold && progress.metadata.stall_cycles < threshold {
                         entry.stall_action_revoked = true;
                     }
+                    // PAN-182 (PR #507 review): with no heir the streak lost
+                    // one count, but a NEWER counted attempt can keep it at
+                    // or above the threshold — the trigger was peeled by a
+                    // payload-qualified rollback after a later own-slot
+                    // emission already pushed the streak past it. That newer
+                    // attempt is now the decisive count and its outcome is
+                    // just as unresolved as the trigger's was, so the hold
+                    // moves to it instead of vanishing; otherwise the next
+                    // drain commits before its frame airs (the PAN-182 race
+                    // again).
+                    if trigger_rolled_back && progress.metadata.stall_cycles >= threshold {
+                        if let Some(newest) = entry.attempts.iter().rposition(|a| a.bumped_stall) {
+                            entry.pending_stall_trigger =
+                                Some(PendingStallTrigger::from_attempt(&entry.attempts[newest]));
+                        }
+                    }
                 }
             }
         }
@@ -23359,6 +23375,134 @@ mod pan72_stall_detection_tests {
             (qso.metadata.frequency - FREQ).abs() < f64::EPSILON,
             "the QSO is not left on an offset chosen from a stall that never aired"
         );
+    }
+
+    /// PR #507 review (P2): when the held trigger is peeled by a
+    /// payload-qualified rollback while a LATER own-slot emission already
+    /// pushed the streak past the threshold, the streak stays at/above it
+    /// and that newer counted attempt becomes the decisive count. The hold
+    /// must move to it — clearing the hold would let the next drain commit
+    /// before the newer frame's outcome is known, the PAN-182 race again.
+    #[tokio::test]
+    async fn pan182_trigger_roll_back_above_threshold_moves_the_hold_to_the_newer_count() {
+        use pancetta_core::slot::SlotParity;
+
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        let manager = manager_auto(config);
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, Some(SlotParity::Odd))
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+        // Counts 1 and 2: the second rearm trips threshold 2 and arms the
+        // PAN-182 trigger on its own emission (feeding the x+30 slot).
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(1))
+            .await;
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(16))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            2
+        );
+        let trigger_text = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .messages
+            .last()
+            .unwrap()
+            .raw_text
+            .clone();
+
+        // An operator nudge moves the offset between the trigger and the
+        // next rearm, so the newer counted attempt is payload-distinguishable
+        // from the trigger — the precondition for a pivot rollback to peel
+        // the trigger while the newer count survives.
+        let nudged = FREQ + 500.0;
+        manager
+            .qsos
+            .write()
+            .await
+            .get_mut(&qso_id)
+            .unwrap()
+            .metadata
+            .frequency = nudged;
+        // Count 3: a later own-parity slot, at the nudged offset.
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(46))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            3
+        );
+
+        // The trigger's frame was pivoted away; its payload-qualified
+        // not-sent report peels exactly the trigger attempt (the newer count
+        // sits at the nudged offset and does not carry the payload).
+        assert!(matches!(
+            manager
+                .roll_back_replaced_attempt_at(
+                    qso_id,
+                    &trigger_text,
+                    Some(&UnsentAttemptPayload {
+                        frequency_hz: FREQ,
+                        remote_binding: Some((false, None)),
+                    }),
+                    x + Duration::seconds(50),
+                )
+                .await,
+            UnsentAttemptRollback::RolledBack { .. }
+        ));
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            2,
+            "the newer counted attempt keeps the streak at the threshold"
+        );
+
+        // The hold must have moved to that newer attempt: the commit is
+        // still refused until its frame's outcome is known.
+        let result = manager
+            .apply_tx_offset_switch(qso_id, nudged + 300.0, stall_origin(&manager, qso_id).await)
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(QsoManagerError::OffsetActionTriggerOutcomePending { .. })
+            ),
+            "the hold moves to the newer counted attempt, got {result:?}"
+        );
+
+        // Once that newer frame airs on its own slot, the hold releases and
+        // the commit lands.
+        assert!(
+            manager
+                .confirm_stall_trigger_aired(
+                    qso_id,
+                    &trigger_text,
+                    &UnsentAttemptPayload {
+                        frequency_hz: nudged,
+                        remote_binding: Some((false, None)),
+                    },
+                    trigger_slot_played_out(&manager, qso_id),
+                )
+                .await,
+            "the re-pointed hold releases on the newer attempt airing"
+        );
+        manager
+            .apply_tx_offset_switch(qso_id, nudged + 300.0, stall_origin(&manager, qso_id).await)
+            .await
+            .expect("a released stall switch commits");
     }
 }
 
