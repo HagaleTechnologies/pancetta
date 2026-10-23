@@ -81,7 +81,7 @@ Instead: a small in-memory tracker (rolling counts of unclassified-exchange-shap
 
 ## 6. Logging — ADIF + Cabrillo
 
-**ADIF:** contest QSOs flow through the existing logger unchanged, populating ADIF's already-standard contest fields (`CONTEST_ID`, `SRX_STRING`/`STX_STRING` or `SRX`/`STX` for numeric exchanges) rather than inventing new ones.
+**ADIF:** contest QSOs flow through the existing logger unchanged, populating ADIF's already-standard contest fields (`CONTEST_ID`, `SRX_STRING`/`STX_STRING` or `SRX`/`STX` for numeric exchanges) rather than inventing new ones. Two rules govern `CONTEST_ID` (PAN-52): a profile carries its wire id as data in `adif_contest_id`, which must be a value from the ADIF 3.1.5 Contest_ID enumeration when set; and a family/aggregate profile that has no single valid id (the built-in `us-state-qso-party` — ADIF enumerates state parties per state with no family value) omits `CONTEST_ID` rather than emitting the internal slug. Per-state resolution (engaging `KS-QSO-PARTY` &c. from the detected CQ tag) arrives with the §4 modal follow-on; imported third-party `CONTEST_ID` values are kept verbatim and re-export unchanged.
 
 **Cabrillo:** new capability. Cabrillo's QSO-line format varies by contest sponsor, so each `ContestProfile` carries its own `cabrillo_qso_line_format` template, and export is a post-hoc pass over the ADIF-logged contest QSOs for a given profile/date-range — not real-time generation, and no attempt at a universal Cabrillo generator for arbitrary contests.
 

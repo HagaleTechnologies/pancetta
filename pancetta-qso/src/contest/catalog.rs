@@ -12,13 +12,20 @@ pub fn builtin_catalog() -> Vec<ContestProfile> {
         exchange_shape: ExchangeShape::GridWithRAck,
         verified: true,
         source_notes: "Live-confirmed 2026-08-29/30: 285 KSQP (Kansas QSO \
-            Party) \"R\"+grid exchanges across dozens of unrelated \
-            callsign pairs (~/.pancetta/logs/pancetta.log.2026-08-30), plus \
-            the SC QSO Party's own published FT8/FT4 digital-mode \
-            instructions. Tag list intentionally partial — most US state \
-            QSO parties use their own state abbreviation as the CQ tag; \
-            add others via contest.custom_profiles as confirmed."
+             Party) \"R\"+grid exchanges across dozens of unrelated \
+             callsign pairs (~/.pancetta/logs/pancetta.log.2026-08-30), plus \
+             the SC QSO Party's own published FT8/FT4 digital-mode \
+             instructions. Tag list intentionally partial — most US state \
+             QSO parties use their own state abbreviation as the CQ tag; \
+             add others via contest.custom_profiles as confirmed."
             .to_string(),
+        // ADIF 3.1.5 has no family-aggregation CONTEST_ID: it enumerates
+        // state parties per state (KS-QSO-PARTY, SC-QSO-PARTY, …), and this
+        // profile deliberately models the whole family. `None` omits the
+        // field from ADIF output (correct: absent beats a value no logbook
+        // service can interpret) until the operator-UX follow-on resolves
+        // the concrete per-state profile from the detected CQ tag.
+        adif_contest_id: None,
     }]
 }
 

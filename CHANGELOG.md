@@ -163,6 +163,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and refuses QSO TX and manual PTT outside the configured band plan. Rigs
   that cannot report split keep the previous behavior and log once per outage.
 
+- Contest QSOs no longer stamp ADIF's `CONTEST_ID` field with pancetta's
+  internal profile slug (PAN-52). `CONTEST_ID` is now written from the engaged
+  contest profile's `adif_contest_id`, which must be a value from the ADIF
+  3.1.5 Contest_ID enumeration (e.g. `KS-QSO-PARTY`, `WFD`, `NAQP-CW`). The
+  built-in `us-state-qso-party` profile models the whole family of US state
+  QSO parties, for which no single valid ADIF id exists, so those QSOs log
+  with no `CONTEST_ID` at all — an absent field is legal, unambiguous ADIF,
+  unlike a slug no logbook service can interpret. Third-party ADIF imports
+  still re-export their original `CONTEST_ID` verbatim. Nothing calls
+  `engage_contest_profile` in production yet, so no previously exported ADIF
+  file is affected.
+
 - A keep-call frame that never airs now gives back its own call, stall count
   and `Sent` timeline entry even when you resent the same message for that QSO
   after it was queued (PAN-183). The TX worker used to hand back the newest
