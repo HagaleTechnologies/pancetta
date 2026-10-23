@@ -1603,6 +1603,7 @@ impl super::ApplicationCoordinator {
         // doc comment.
         let hamlib_command_in_flight_for_polling = self.hamlib_command_in_flight.clone();
         let split_tx_hz_for_polling = self.split_tx_frequency_hz();
+        let split_tx_hz_for_startup = self.split_tx_frequency_hz();
         // PAN-19 round-15 review (Codex P1): "keep TX muted until restored
         // rig state is applied". The message loop's own SetFrequency/
         // SetSplit arms need to reach the pending slots directly -- on a
@@ -2221,9 +2222,11 @@ impl super::ApplicationCoordinator {
                 // `ptt_safe_tx` signal that gates aborting an orphaned
                 // watchdog retained from a prior failed teardown.
                 let mut startup_ptt_off_succeeded = false;
+                let mut startup_connected = false;
                 match rig.connect().await {
                     Ok(_) => {
                         info!("Rig connected successfully");
+                        startup_connected = true;
                         match rig
                             .set_ptt(
                                 pancetta_hamlib::Vfo::Current,
@@ -2303,6 +2306,25 @@ impl super::ApplicationCoordinator {
                 // with a bounded timeout; send errors are harmless (timeout
                 // already elapsed).
                 let _ = initial_read_tx.send(());
+
+                // PAN-206: observe the rig's split before readiness is
+                // published below. The poll loop's first connected tick can
+                // be up to 500 ms away, and until then the gate would check
+                // a split the rig never reported. A failed read keeps
+                // today's behavior; the poll loop logs it once.
+                if startup_connected {
+                    if let SplitPollOutcome::Changed(tx_hz) = reconcile_polled_split(
+                        rig.as_ref(),
+                        &split_tx_hz_for_startup,
+                        &hamlib_command_in_flight,
+                        &message_bus_for_connect.split_observation_fence,
+                    )
+                    .await
+                    {
+                        emit_split_status(&message_bus_for_connect, &display_feed_enabled, tx_hz)
+                            .await;
+                    }
+                }
 
                 // PAN-19 round-8 review (Codex P1, two findings addressed
                 // together at this one call site so neither reintroduces an
@@ -8000,5 +8022,53 @@ mod pan206_split_poll_tests {
                 );
             }
         }
+    }
+
+    /// Readiness is published right after the startup frequency read, while
+    /// the first connected poll tick can still be up to 500 ms away. The gate
+    /// must already see the rig's split by then. The disabled-rig path starts
+    /// a fresh simplex MockRig, so a split value left in the atomic stands in
+    /// for one the radio no longer has.
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn pan206_startup_reconciles_split_before_publishing_readiness() {
+        let mut coordinator = super::super::ApplicationCoordinator::new(
+            pancetta_config::Config::default(),
+            None,
+            true,  // no_audio
+            true,  // headless
+            false, // metrics
+            9090,
+            None, // no WAV
+            None, // no replay
+            None, // no test-tx
+            1500.0,
+            Arc::new(AtomicBool::new(false)),
+            Vec::new(),
+            std::env::temp_dir().join("pancetta-test-config.toml"),
+            true,
+        )
+        .await
+        .expect("coordinator creation should succeed");
+        let split = coordinator.split_tx_frequency_hz();
+        split.store(15_000_000, Ordering::Relaxed);
+
+        coordinator.start_hamlib_component().await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !coordinator
+            .hamlib_command_loop_ready
+            .load(Ordering::Acquire)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "Hamlib readiness was never published"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            split.load(Ordering::Relaxed),
+            0,
+            "readiness must not be published before the rig's split is observed"
+        );
     }
 }

@@ -339,6 +339,11 @@ acceptance; its accepted enqueue/store windows are documented in `remote-operati
 PAN-206 closes the rig-side split readback gap: every successful 500 ms Connected poll tick reads
 split with rigctld `s` and, when enabled, the TX frequency with `i`. It reconciles
 `split_tx_frequency_hz` and echoes `SplitStatus` to the existing TUI chip and remote display feed.
+`start_hamlib_component` (boot, supervisor restart, live rig-config reconnect) also runs one
+reconciliation after a successful startup connect and before it publishes command-loop readiness.
+When that read succeeds, a split already set at the radio is in the gate before the first poll
+tick. A failed startup connect, an unobservable or skipped read, and the poll loop's own redial
+leave the split to the next successful poll tick.
 The poll skips commands in flight and discards a read if the shared split changed during it.
 PAN-206 also gives `forward_split_change` a shared observation guard that lives through enqueue,
 recording, CAT application, and pending retries. The message carries a cloned owner, so polling
