@@ -3111,6 +3111,9 @@ impl super::ApplicationCoordinator {
                                                         .confidence_features
                                                         .as_ref()
                                                         .and_then(|c| c.decode_origin),
+                                                    // PAN-68: keep the decode's own window dial so the slot-tick
+                                                    // cqdx report never reads the live atomic for a heard-on band.
+                                                    captured_dial_hz: decoded_msg.captured_dial_hz,
                                                 });
                                             }
                                             // PAN-38: a dispatched self-CQ
@@ -4007,6 +4010,7 @@ mod classify_autonomous_opening_tests {
             confidence: None,
             time_offset_s: None,
             decode_origin: None,
+            captured_dial_hz: None,
         }
     }
 
@@ -4080,6 +4084,7 @@ mod plan_slot_transmissions_tests {
             confidence: None,
             time_offset_s: None,
             decode_origin: None,
+            captured_dial_hz: None,
         }
     }
 
@@ -4756,6 +4761,7 @@ mod drain_pending_qso_offset_requests_tests {
                 confidence: None,
                 time_offset_s: None,
                 decode_origin: None,
+                captured_dial_hz: None,
             }
         }
 
