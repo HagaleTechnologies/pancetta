@@ -2955,7 +2955,8 @@ async fn report_played_transmit_complete(
     result
 }
 
-/// PAN-182: tell the QSO engine `message_text` aired for `qso_id`.
+/// PAN-182: tell the QSO engine `message_text` aired for `qso_id`, stamped
+/// with the post-playback report time.
 async fn report_frame_sent(
     message_bus: &MessageBus,
     qso_id: String,
@@ -2970,6 +2971,7 @@ async fn report_frame_sent(
                 qso_id,
                 message_text,
                 aired,
+                aired_at: chrono::Utc::now(),
             }),
             Instant::now(),
         ))
@@ -21644,6 +21646,7 @@ mod report_transmit_complete_tests {
                 remote_binding: Some((true, Some("peer".into()))),
             }
         );
+        let reported_from = chrono::Utc::now();
         report_played_transmit_complete(
             &bus,
             true,
@@ -21664,8 +21667,9 @@ mod report_transmit_complete_tests {
         assert_eq!(msg.source, ComponentId::Ft8Transmitter);
         assert!(matches!(
             msg.message_type,
-            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameSent { ref qso_id, ref message_text, aired: ref got })
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameSent { ref qso_id, ref message_text, aired: ref got, aired_at })
                 if qso_id == "q1" && message_text == "K1ABC N0CALL FN20" && *got == aired
+                    && aired_at >= reported_from && aired_at <= chrono::Utc::now()
         ));
         assert!(qso.try_recv().is_err());
     }

@@ -900,6 +900,10 @@ pub enum QsoMessage {
         /// The aired frame's own offset and binding, so a pivot-replaced
         /// same-text frame does not release a hold it did not serve.
         aired: pancetta_qso::UnsentAttemptPayload,
+        /// When the worker reported it, after playback. An earlier slot's
+        /// identical keep-call frame reports before the trigger's own slot
+        /// starts, so it cannot release the hold.
+        aired_at: chrono::DateTime<chrono::Utc>,
     },
     /// Enable or disable Fox (DXpedition operator) mode.
     ///

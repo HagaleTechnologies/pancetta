@@ -5588,10 +5588,10 @@ impl super::ApplicationCoordinator {
                                                 Err(e) => debug!(target: "qso", "TxFrameNotSent: bad QSO id '{}': {}", qso_id, e),
                                             }
                                         }
-                                        crate::message_bus::QsoMessage::TxFrameSent { qso_id, message_text, aired } => {
+                                        crate::message_bus::QsoMessage::TxFrameSent { qso_id, message_text, aired, aired_at } => {
                                             match qso_id.parse::<pancetta_qso::QsoId>() {
                                                 Ok(id) => {
-                                                    let released = qso_manager.confirm_stall_trigger_aired(id, &message_text, &aired).await;
+                                                    let released = qso_manager.confirm_stall_trigger_aired(id, &message_text, &aired, aired_at).await;
                                                     debug!(target: "qso", "TX frame aired for QSO {} ('{}'): released held stall action: {}", qso_id, message_text, released);
                                                 }
                                                 Err(e) => debug!(target: "qso", "TxFrameSent: bad QSO id '{}': {}", qso_id, e),
@@ -11444,6 +11444,8 @@ mod respond_to_caller_admission_tests {
                             frequency_hz: 1500.0,
                             remote_binding: Some((false, None)),
                         },
+                        // After the rearm's own TX slot has played out.
+                        aired_at: opened + chrono::Duration::minutes(2),
                     }),
                     Instant::now(),
                 ))

@@ -5417,6 +5417,8 @@ mod drain_pending_qso_offset_requests_tests {
                         frequency_hz: 1500.0,
                         remote_binding: Some((false, None)),
                     },
+                    // After the rearm's own TX slot has played out.
+                    chrono::Utc::now() + chrono::Duration::minutes(2),
                 )
                 .await
         );

@@ -1283,6 +1283,9 @@ impl KeepCallAttempt {
 #[derive(Debug, Clone)]
 struct PendingStallTrigger {
     emitted_at: DateTime<Utc>,
+    // The own-parity TX slot the trigger feeds; no frame that aired before
+    // it started can be the trigger.
+    tx_slot: Option<DateTime<Utc>>,
     raw_text: String,
     frequency_hz: f64,
     remote_origin: bool,
@@ -1293,6 +1296,7 @@ impl PendingStallTrigger {
     fn from_attempt(attempt: &KeepCallAttempt) -> Self {
         Self {
             emitted_at: attempt.emitted_at,
+            tx_slot: attempt.tx_slot,
             raw_text: attempt.raw_text.clone(),
             frequency_hz: attempt.frequency_hz,
             remote_origin: attempt.remote_origin,
@@ -1306,9 +1310,18 @@ impl PendingStallTrigger {
 
     // Matches on the aired frame's offset and binding, not text alone: a
     // pivot can air a same-text frame elsewhere while the trigger's own
-    // not-sent report is still on its way.
-    fn aired_as(&self, message_text: &str, aired: &UnsentAttemptPayload) -> bool {
+    // not-sent report is still on its way. Keep-calling repeats the same
+    // text on the same offset every slot, so a frame reported aired before
+    // the trigger's own slot started is an earlier emission's, not the
+    // trigger's.
+    fn aired_as(
+        &self,
+        message_text: &str,
+        aired: &UnsentAttemptPayload,
+        aired_at: DateTime<Utc>,
+    ) -> bool {
         self.raw_text == message_text
+            && self.tx_slot.is_none_or(|slot| aired_at >= slot)
             && emission_carries(
                 self.frequency_hz,
                 self.remote_origin,
@@ -4304,16 +4317,19 @@ impl QsoManager {
         }
     }
 
-    /// PAN-182: the TX worker reports a QSO frame that aired. If it is the
-    /// frame a raised stall action is waiting on — same text, same offset
-    /// and remote binding (see [`UnsentAttemptPayload`]) — release the hold
-    /// so the next drain can commit the action. Returns whether a hold was
-    /// released; any other frame leaves the ledger untouched.
+    /// PAN-182: the TX worker reports a QSO frame that aired, at `aired_at`
+    /// (stamped after playback). If it is the frame a raised stall action is
+    /// waiting on — same text, same offset and remote binding (see
+    /// [`UnsentAttemptPayload`]), reported no earlier than the start of the
+    /// own-parity TX slot the trigger feeds — release the hold so the next
+    /// drain can commit the action. Returns whether a hold was released; any
+    /// other frame leaves the ledger untouched.
     pub async fn confirm_stall_trigger_aired(
         &self,
         qso_id: QsoId,
         message_text: &str,
         aired: &UnsentAttemptPayload,
+        aired_at: DateTime<Utc>,
     ) -> bool {
         let qsos = self.qsos.write().await;
         if !qsos.get(&qso_id).is_some_and(|p| p.state.is_active()) {
@@ -4329,7 +4345,7 @@ impl QsoManager {
         if !entry
             .pending_stall_trigger
             .as_ref()
-            .is_some_and(|trigger| trigger.aired_as(message_text, aired))
+            .is_some_and(|trigger| trigger.aired_as(message_text, aired, aired_at))
         {
             return false;
         }
@@ -18901,10 +18917,27 @@ mod pan72_stall_detection_tests {
                         frequency_hz,
                         remote_binding: Some((false, None)),
                     },
+                    trigger_slot_played_out(manager, qso_id),
                 )
                 .await,
             "precondition: the stall switch was held on this frame"
         );
+    }
+
+    /// When the pending trigger's own TX slot has played out — the earliest
+    /// a `TxFrameSent` for it can carry — or far in the future when no
+    /// trigger is recorded.
+    fn trigger_slot_played_out(manager: &QsoManager, qso_id: QsoId) -> DateTime<Utc> {
+        manager
+            .keep_call_ledger
+            .lock()
+            .unwrap()
+            .get(&qso_id)
+            .and_then(|entry| entry.pending_stall_trigger.as_ref())
+            .and_then(|trigger| trigger.tx_slot)
+            .map_or(Utc::now() + Duration::days(1), |slot| {
+                slot + Duration::seconds(13)
+            })
     }
 
     /// DX sends us a plain signal report — a genuine forward advance from
@@ -22798,7 +22831,7 @@ mod pan72_stall_detection_tests {
         manager_auto(config)
     }
 
-    fn aired_at(frequency_hz: f64) -> UnsentAttemptPayload {
+    fn aired_on(frequency_hz: f64) -> UnsentAttemptPayload {
         UnsentAttemptPayload {
             frequency_hz,
             remote_binding: Some((false, None)),
@@ -22836,7 +22869,12 @@ mod pan72_stall_detection_tests {
 
         assert!(
             manager
-                .confirm_stall_trigger_aired(qso_id, &text, &aired_at(FREQ))
+                .confirm_stall_trigger_aired(
+                    qso_id,
+                    &text,
+                    &aired_on(FREQ),
+                    trigger_slot_played_out(&manager, qso_id)
+                )
                 .await,
             "the trigger frame airing releases the hold"
         );
@@ -22876,7 +22914,12 @@ mod pan72_stall_detection_tests {
         assert_eq!(qso.metadata.stall_cycles, 0);
         assert!(
             !manager
-                .confirm_stall_trigger_aired(qso_id, &text, &aired_at(FREQ))
+                .confirm_stall_trigger_aired(
+                    qso_id,
+                    &text,
+                    &aired_on(FREQ),
+                    trigger_slot_played_out(&manager, qso_id)
+                )
                 .await,
             "no trigger is left to release"
         );
@@ -22891,7 +22934,12 @@ mod pan72_stall_detection_tests {
         // binding: neither is the trigger frame.
         assert!(
             !manager
-                .confirm_stall_trigger_aired(qso_id, &text, &aired_at(FREQ + 300.0))
+                .confirm_stall_trigger_aired(
+                    qso_id,
+                    &text,
+                    &aired_on(FREQ + 300.0),
+                    trigger_slot_played_out(&manager, qso_id)
+                )
                 .await
         );
         assert!(
@@ -22903,12 +22951,18 @@ mod pan72_stall_detection_tests {
                         frequency_hz: FREQ,
                         remote_binding: Some((true, Some("peer".into()))),
                     },
+                    trigger_slot_played_out(&manager, qso_id),
                 )
                 .await
         );
         assert!(
             !manager
-                .confirm_stall_trigger_aired(qso_id, "CQ K5ARH EM12", &aired_at(FREQ))
+                .confirm_stall_trigger_aired(
+                    qso_id,
+                    "CQ K5ARH EM12",
+                    &aired_on(FREQ),
+                    trigger_slot_played_out(&manager, qso_id)
+                )
                 .await
         );
         let result = manager
@@ -22997,7 +23051,12 @@ mod pan72_stall_detection_tests {
         assert_eq!(trigger_at(&manager), Some(late));
         assert!(
             manager
-                .confirm_stall_trigger_aired(qso_id, &text, &aired_at(FREQ))
+                .confirm_stall_trigger_aired(
+                    qso_id,
+                    &text,
+                    &aired_on(FREQ),
+                    trigger_slot_played_out(&manager, qso_id)
+                )
                 .await
         );
         manager
@@ -23013,7 +23072,12 @@ mod pan72_stall_detection_tests {
         let (qso_id, _, text) = pan182_raise(&manager).await;
         assert!(
             manager
-                .confirm_stall_trigger_aired(qso_id, &text, &aired_at(FREQ))
+                .confirm_stall_trigger_aired(
+                    qso_id,
+                    &text,
+                    &aired_on(FREQ),
+                    trigger_slot_played_out(&manager, qso_id)
+                )
                 .await
         );
         manager
@@ -23022,7 +23086,12 @@ mod pan72_stall_detection_tests {
             .expect("released switch commits");
         assert!(
             !manager
-                .confirm_stall_trigger_aired(qso_id, &text, &aired_at(FREQ))
+                .confirm_stall_trigger_aired(
+                    qso_id,
+                    &text,
+                    &aired_on(FREQ),
+                    trigger_slot_played_out(&manager, qso_id)
+                )
                 .await,
             "nothing is held after the commit"
         );
@@ -23037,7 +23106,12 @@ mod pan72_stall_detection_tests {
         );
         assert!(
             !manager
-                .confirm_stall_trigger_aired(qso_id, &text, &aired_at(FREQ))
+                .confirm_stall_trigger_aired(
+                    qso_id,
+                    &text,
+                    &aired_on(FREQ),
+                    trigger_slot_played_out(&manager, qso_id)
+                )
                 .await,
             "a DX advance retires the hold with the streak"
         );
@@ -23093,7 +23167,7 @@ mod pan72_stall_detection_tests {
                 .roll_back_replaced_attempt_at(
                     qso_id,
                     &text,
-                    Some(&aired_at(FREQ)),
+                    Some(&aired_on(FREQ)),
                     x + Duration::seconds(35)
                 )
                 .await,
@@ -23116,13 +23190,23 @@ mod pan72_stall_detection_tests {
         );
         assert!(
             !manager
-                .confirm_stall_trigger_aired(qso_id, &text, &aired_at(FREQ))
+                .confirm_stall_trigger_aired(
+                    qso_id,
+                    &text,
+                    &aired_on(FREQ),
+                    trigger_slot_played_out(&manager, qso_id)
+                )
                 .await,
             "the rolled-back trigger's payload no longer releases anything"
         );
         assert!(
             manager
-                .confirm_stall_trigger_aired(qso_id, &text, &aired_at(FREQ + 100.0))
+                .confirm_stall_trigger_aired(
+                    qso_id,
+                    &text,
+                    &aired_on(FREQ + 100.0),
+                    trigger_slot_played_out(&manager, qso_id)
+                )
                 .await,
             "the heir airing releases the hold"
         );
@@ -23130,6 +23214,90 @@ mod pan72_stall_detection_tests {
             .apply_tx_offset_switch(qso_id, FREQ + 300.0, stall_origin(&manager, qso_id).await)
             .await
             .expect("released by the heir");
+    }
+
+    /// PAN-182 (self-review): keep-calling repeats the same text on the same
+    /// offset every slot. A rearm late in its own-parity slot feeds the NEXT
+    /// own slot and trips the threshold while the current slot's frame — an
+    /// earlier emission, identical on the air — is still playing. That
+    /// frame's `TxFrameSent` lands before the trigger's slot even starts and
+    /// must not release the hold; the trigger's own report, after its slot
+    /// played out, does.
+    #[tokio::test]
+    async fn pan182_an_earlier_same_text_frame_airing_does_not_release_the_hold() {
+        use pancetta_core::slot::SlotParity;
+
+        let manager = pan182_threshold_one();
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, Some(SlotParity::Odd))
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+        // 10 s into own slot x: past the acceptance cap, so it feeds x+30.
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(10))
+            .await;
+        let text = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .messages
+            .last()
+            .unwrap()
+            .raw_text
+            .clone();
+        assert_eq!(
+            manager
+                .keep_call_ledger
+                .lock()
+                .unwrap()
+                .get(&qso_id)
+                .and_then(|entry| entry.pending_stall_trigger.as_ref())
+                .and_then(|trigger| trigger.tx_slot),
+            Some(x + Duration::seconds(30)),
+            "precondition: the trigger feeds the next own-parity slot"
+        );
+
+        assert!(
+            !manager
+                .confirm_stall_trigger_aired(
+                    qso_id,
+                    &text,
+                    &aired_on(FREQ),
+                    x + Duration::seconds(13)
+                )
+                .await,
+            "slot x's frame finishing is not the trigger airing"
+        );
+        let result = manager
+            .apply_tx_offset_switch(qso_id, FREQ + 300.0, stall_origin(&manager, qso_id).await)
+            .await;
+        assert!(matches!(
+            result,
+            Err(QsoManagerError::OffsetActionTriggerOutcomePending { .. })
+        ));
+        assert!(
+            manager
+                .confirm_stall_trigger_aired(
+                    qso_id,
+                    &text,
+                    &aired_on(FREQ),
+                    x + Duration::seconds(43)
+                )
+                .await,
+            "the trigger's own slot played out"
+        );
+        manager
+            .apply_tx_offset_switch(qso_id, FREQ + 300.0, stall_origin(&manager, qso_id).await)
+            .await
+            .expect("released by the trigger's own report");
     }
 
     /// An operator `u` nudge carries no stall evidence and is never held by

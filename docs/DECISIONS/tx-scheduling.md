@@ -402,7 +402,11 @@ key-down path), which releases the hold, so the next drain commits; a
 `TxFrameNotSent` instead clears it and the revocation above refuses the
 action. The release matches the aired frame's text, offset and binding, so a
 pivot that aired a same-text frame elsewhere cannot release a hold its
-replaced frame's not-sent report is about to revoke; if the trigger is rolled
+replaced frame's not-sent report is about to revoke, and `TxFrameSent` carries
+its post-playback report time, which must not precede the own-parity slot the
+trigger feeds: keep-calling repeats the same frame every slot, and a rearm late
+in its own slot trips the threshold for the next one while the current slot's
+identical frame is still playing; if the trigger is rolled
 back while a PAN-128 same-slot twin survives, the hold moves to the twin. Later
 re-raises on the same streak leave the hold alone (re-arming it every slot
 could keep it from ever releasing) unless it has expired: a trigger left
