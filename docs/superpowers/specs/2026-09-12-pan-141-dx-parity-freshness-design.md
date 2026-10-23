@@ -205,3 +205,13 @@ All three per the recommended options above.
   review.
 - No on-air/loopback coverage possible for a genuine fast-cycling pileup DX — flagged for an
   on-air sanity check after merge, consistent with recent PAN tickets (PAN-72, PAN-108, PAN-91/92).
+
+## Amendment: band and slot-grid scoping (PAN-146, 2026-10-21)
+
+The gate logic above now takes a `DxParityContext { dial_hz, slot_ns }` in
+place of `freshness_window`. Only `a7_recent_calls` entries recorded on the
+same slot grid and, when both dials are known, the same band (`is_band_change`)
+count as evidence, and the newest-entry pick runs over those entries only. The
+freshness window is still `2 × slot_ns`, taken from the context. See
+`docs/DECISIONS/tx-scheduling.md` § "DX-parity evidence is scoped to band and
+slot grid (PAN-146, 2026-10-21)".
