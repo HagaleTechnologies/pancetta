@@ -3806,6 +3806,7 @@ impl super::ApplicationCoordinator {
                                 }
                             }
                             Ok(pancetta_qso::QsoEvent::MessageToSend {
+                                attempt_id,
                                 qso_id,
                                 message,
                                 frequency,
@@ -3844,6 +3845,7 @@ impl super::ApplicationCoordinator {
                                             m.insert(
                                                 super::active_tx_qso_key(&qso_id.to_string()),
                                                 super::LatestTxIntent {
+                                                    attempt_id,
                                                     message_text: text.clone(),
                                                     frequency_offset: frequency,
                                                     tx_parity,
@@ -3857,6 +3859,7 @@ impl super::ApplicationCoordinator {
                                             ComponentId::Qso,
                                             ComponentId::Ft8Transmitter,
                                             MessageType::TransmitRequest {
+                                                attempt_id,
                                                 message_text: text,
                                                 frequency_offset: frequency,
                                                 qso_id: Some(qso_id.to_string()),
@@ -5579,13 +5582,22 @@ impl super::ApplicationCoordinator {
                                                 ),
                                             }
                                         }
-                                        crate::message_bus::QsoMessage::TxFrameNotSent { qso_id, message_text, replaced } => {
+                                        crate::message_bus::QsoMessage::TxFrameNotSent { qso_id, message_text, replaced, attempt_id } => {
                                             match qso_id.parse::<pancetta_qso::QsoId>() {
                                                 Ok(id) => {
-                                                    let outcome = qso_manager.roll_back_unsent_attempt(id, &message_text, replaced.as_ref()).await;
-                                                    debug!(target: "qso", "TX frame not sent for QSO {} ('{}'): {:?}", qso_id, message_text, outcome);
+                                                    let outcome = qso_manager.roll_back_unsent_attempt(id, &message_text, replaced.as_ref(), attempt_id).await;
+                                                    debug!(target: "qso", "TX frame not sent for QSO {} ('{}', attempt {:?}): {:?}", qso_id, message_text, attempt_id, outcome);
                                                 }
                                                 Err(e) => debug!(target: "qso", "TxFrameNotSent: bad QSO id '{}': {}", qso_id, e),
+                                            }
+                                        }
+                                        crate::message_bus::QsoMessage::TxFrameSent { qso_id, message_text, aired, aired_at } => {
+                                            match qso_id.parse::<pancetta_qso::QsoId>() {
+                                                Ok(id) => {
+                                                    let released = qso_manager.confirm_stall_trigger_aired(id, &message_text, &aired, aired_at).await;
+                                                    debug!(target: "qso", "TX frame aired for QSO {} ('{}'): released held stall action: {}", qso_id, message_text, released);
+                                                }
+                                                Err(e) => debug!(target: "qso", "TxFrameSent: bad QSO id '{}': {}", qso_id, e),
                                             }
                                         }
                                         crate::message_bus::QsoMessage::ResendQso { qso_id } => {
@@ -11373,6 +11385,99 @@ mod respond_to_caller_admission_tests {
         coordinator
     }
 
+    /// PAN-182: the Qso loop hands a `TxFrameSent` for a live QSO to
+    /// `confirm_stall_trigger_aired`, releasing the stall switch held on that
+    /// frame; a malformed id is dropped without disturbing the next message.
+    #[tokio::test]
+    async fn tx_frame_sent_releases_a_held_stall_switch() {
+        let mut coordinator = test_coordinator().await;
+        coordinator.config.write().await.station.callsign = "W1ABC".to_string();
+        coordinator
+            .config
+            .write()
+            .await
+            .autonomous
+            .qso_stall_switch_after = 1;
+        coordinator.tx_freq_mode.store(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        coordinator.start_qso_component().await.unwrap();
+        // See `tx_offset_action_needed_event_is_forwarded_to_pending_qso_offset_requests`:
+        // this clone must read the coordinator's live Auto mode too.
+        let mut manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        manager.set_tx_freq_mode_source(coordinator.tx_freq_mode.clone());
+        let id = manager
+            .respond_to_cq_manual("K1ABC".into(), 1500.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        let opened = manager
+            .get_qso(id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        manager
+            .rearm_manual_calls_at(opened + chrono::Duration::seconds(15))
+            .await;
+        let qso = manager.get_qso(id).await.unwrap();
+        let text = qso.messages.last().unwrap().raw_text.clone();
+        let origin = pancetta_qso::qso_manager::OffsetRelocationOrigin::StallDetected {
+            raised_at_generation: qso.metadata.advance_generation,
+        };
+        assert!(
+            matches!(
+                manager.apply_tx_offset_switch(id, 1800.0, origin).await,
+                Err(pancetta_qso::QsoManagerError::OffsetActionTriggerOutcomePending { .. })
+            ),
+            "precondition: the stall switch is held on the rearm's frame"
+        );
+
+        for qso_id in ["not-a-uuid".to_string(), id.to_string()] {
+            coordinator
+                .message_bus
+                .send_message(ComponentMessage::new(
+                    ComponentId::Ft8Transmitter,
+                    ComponentId::Qso,
+                    MessageType::QsoMessage(QsoMessage::TxFrameSent {
+                        qso_id,
+                        message_text: text.clone(),
+                        aired: pancetta_qso::UnsentAttemptPayload {
+                            frequency_hz: 1500.0,
+                            remote_binding: Some((false, None)),
+                        },
+                        // After the rearm's own TX slot has played out.
+                        aired_at: opened + chrono::Duration::minutes(2),
+                    }),
+                    Instant::now(),
+                ))
+                .await
+                .unwrap();
+        }
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match manager.apply_tx_offset_switch(id, 1800.0, origin).await {
+                Ok(applied) => {
+                    assert_eq!(applied, 1800.0);
+                    break;
+                }
+                Err(pancetta_qso::QsoManagerError::OffsetActionTriggerOutcomePending {
+                    ..
+                }) => {}
+                Err(e) => panic!("unexpected refusal: {e}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "QSO loop did not release the held switch"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     async fn check_tx_frame_not_sent(malformed_first: bool) {
         let mut coordinator = test_coordinator().await;
         coordinator.config.write().await.station.callsign = "W1ABC".to_string();
@@ -11407,6 +11512,7 @@ mod respond_to_caller_admission_tests {
                     ComponentId::Ft8Transmitter,
                     ComponentId::Qso,
                     MessageType::QsoMessage(QsoMessage::TxFrameNotSent {
+                        attempt_id: None,
                         qso_id,
                         message_text: text.clone(),
                         replaced: None,
@@ -11445,6 +11551,188 @@ mod respond_to_caller_admission_tests {
     #[tokio::test]
     async fn tx_frame_not_sent_with_malformed_qso_id_is_ignored() {
         check_tx_frame_not_sent(true).await;
+    }
+
+    /// PAN-183: the next `TransmitRequest` the QSO loop forwards for `qso`,
+    /// as `(text, attempt_id)`.
+    async fn pan183_next_transmit_request(
+        tx: &crossbeam_channel::Receiver<ComponentMessage>,
+        qso: &str,
+    ) -> (String, Option<pancetta_qso::TxAttemptId>) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            while let Ok(msg) = tx.try_recv() {
+                if let MessageType::TransmitRequest {
+                    message_text,
+                    qso_id: Some(id),
+                    attempt_id,
+                    ..
+                } = msg.message_type
+                {
+                    if id == qso {
+                        return (message_text, attempt_id);
+                    }
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "QSO loop forwarded no TransmitRequest"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// PAN-183: the QSO loop forwards each `MessageToSend`'s attempt id on
+    /// both the `TransmitRequest` and the `LatestTxIntent` a key-time pivot
+    /// adopts.
+    #[tokio::test]
+    async fn pan183_latest_tx_intent_carries_attempt_id() {
+        let mut coordinator = test_coordinator().await;
+        {
+            let mut cfg = coordinator.config.write().await;
+            cfg.station.callsign = "W1ABC".to_string();
+            cfg.station.grid_square = "FN42".to_string();
+        }
+        let (_tx_s, tx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        coordinator.start_qso_component().await.unwrap();
+        // Yield so the spawned event-forwarding task subscribes first.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        let mut events = manager.subscribe();
+        let id = manager
+            .respond_to_cq_manual("K1ABC".into(), 1500.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        let (_, opening) = pan183_next_transmit_request(&tx, &id.to_string()).await;
+        assert!(opening.is_some(), "every engine emission carries an id");
+        let opened = manager
+            .get_qso(id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        manager
+            .rearm_manual_calls_at(opened + chrono::Duration::seconds(15))
+            .await;
+        let mut emitted = None;
+        while let Ok(event) = events.try_recv() {
+            if let pancetta_qso::QsoEvent::MessageToSend { attempt_id, .. } = event {
+                emitted = attempt_id;
+            }
+        }
+        let emitted = emitted.expect("the rearm records a ledger attempt");
+        let (_, forwarded) = pan183_next_transmit_request(&tx, &id.to_string()).await;
+        assert_eq!(forwarded, Some(emitted));
+        assert_ne!(forwarded, opening);
+        let intent = coordinator
+            .latest_tx_intent
+            .read()
+            .unwrap()
+            .get(&super::super::active_tx_qso_key(&id.to_string()))
+            .cloned()
+            .expect("the funnel records the intent");
+        assert_eq!(intent.attempt_id, Some(emitted));
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// PAN-183 gherkin through the running QSO loop: a keep-call rearm frame
+    /// waits before PTT, the operator resends the same text, and the TX
+    /// worker reports the OLDER rearm frame as not sent with the attempt id
+    /// its request carried. The rearm's call, stall increment and Sent entry
+    /// roll back; the resend's accounting stays.
+    #[tokio::test]
+    async fn pan183_tx_frame_not_sent_rolls_back_the_reported_attempt_not_a_newer_resend() {
+        let mut coordinator = test_coordinator().await;
+        {
+            let mut cfg = coordinator.config.write().await;
+            cfg.station.callsign = "W1ABC".to_string();
+            cfg.station.grid_square = "FN42".to_string();
+        }
+        let (_tx_s, tx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        coordinator.start_qso_component().await.unwrap();
+        // Yield so the spawned event-forwarding task subscribes first.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        let id = manager
+            .respond_to_cq_manual("K1ABC".into(), 1500.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        let qso = id.to_string();
+        pan183_next_transmit_request(&tx, &qso).await;
+        let opened = manager
+            .get_qso(id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        manager
+            .rearm_manual_calls_at(opened + chrono::Duration::seconds(15))
+            .await;
+        let (rearm_text, rearm_id) = pan183_next_transmit_request(&tx, &qso).await;
+        manager.resend_last_tx(id).await.unwrap();
+        let (resend_text, resend_id) = pan183_next_transmit_request(&tx, &qso).await;
+        assert_eq!(rearm_text, resend_text);
+        assert!(rearm_id.is_some() && resend_id.is_some() && rearm_id != resend_id);
+        let before = manager.get_qso(id).await.unwrap();
+        assert_eq!(before.metadata.call_count, 3);
+        assert_eq!(before.metadata.stall_cycles, 1);
+
+        coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Ft8Transmitter,
+                ComponentId::Qso,
+                MessageType::QsoMessage(QsoMessage::TxFrameNotSent {
+                    qso_id: qso.clone(),
+                    message_text: rearm_text,
+                    replaced: None,
+                    attempt_id: rearm_id,
+                }),
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let after = manager.get_qso(id).await.unwrap();
+            if after.metadata.call_count == 2 {
+                assert_eq!(
+                    after.metadata.stall_cycles, 0,
+                    "the rearm's stall increment"
+                );
+                assert_eq!(
+                    after
+                        .messages
+                        .iter()
+                        .filter(|m| m.direction == pancetta_qso::MessageDirection::Sent)
+                        .count(),
+                    1,
+                    "the rearm's Sent entry"
+                );
+                assert_eq!(
+                    after.metadata.last_call_at, before.metadata.last_call_at,
+                    "the resend is still the latest call"
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "QSO loop did not apply rollback");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Drain the Tui channel (bounded crossbeam queue, not broadcast — a
@@ -12478,6 +12766,7 @@ mod respond_to_caller_admission_tests {
 
     fn pan76_request(qso_id: &pancetta_qso::QsoId, text: &str, freq: f64) -> MessageType {
         MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: text.to_string(),
             frequency_offset: freq,
             qso_id: Some(qso_id.to_string()),
