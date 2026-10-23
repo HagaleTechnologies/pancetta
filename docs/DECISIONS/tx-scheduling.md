@@ -3,6 +3,37 @@
 
 # TX scheduling
 
+## DX-parity evidence is scoped to band and slot grid (PAN-146, 2026-10-21)
+
+PAN-141's pre-PTT hold reads the DX's newest fresh sighting in
+`CrossTimeState::a7_recent_calls`. Entries were keyed by callsign with no band
+or slot grid, so a sighting heard on 20 m, or on the FT8 grid, could hold a call
+on 15 m or in FT4 for one cycle (Codex P2 on PR #370, deferred). Each entry now
+records `captured_dial_hz` (from `DecodedMessage::captured_dial_hz`, PAN-67;
+0 = unknown) and `slot_ns` (the period its `slot_parity` was computed on). The
+gate counts only entries on the frame's slot grid and, per `is_band_change`, on
+its band, filtering before the newest-entry pick. The band check is skipped
+while either dial is 0, so a session without a CAT dial keeps the PAN-141 hold.
+The context's `slot_ns` also sets the freshness window, replacing the separate
+parameter at all four call sites (Step 4b/4d, single and multi TX).
+
+- **Filter on read, not invalidate on change.** Clearing the table on a switch
+  needs a hook at every dial and mode writer and races decode latency; recorded
+  context is race-free.
+- **Band, not exact dial.** The captured dial is the exact dial at window close
+  (`dsp.rs` `cur_dial_hz`, re-read every audio batch, PAN-67), so an entry keeps
+  its pre-retune dial and exact-Hz matching would drop same-band evidence after
+  any retune, so the gate defers to `is_band_change` instead.
+- **`slot_ns`, not `Protocol`.** Parity is a function of the instant and the
+  slot period, and `pancetta-qso` has no non-optional `pancetta-ft8` dependency.
+- **Table unchanged.** Still one entry per callsign spelling, newest wins. A
+  round trip (20 m → 15 m → 20 m inside the window) can lose the 20 m sighting;
+  the gate then proceeds, which is the pre-PAN-141 behaviour for that cycle.
+- **Tests.** Unit tests in `schedule_tx_tests` pin cross-band, cross-grid,
+  intra-band retune, unknown dial, filter order, Step 4d and the bundle mask.
+  `pan146_dx_parity_context_worker_tests` runs the real TX worker: a 15 m call
+  with a fresh 20 m sighting keys, and the same call on 20 m is held.
+
 ## The TX worker keeps what it takes off its channel (PAN-73 follow-up, 2026-10-17)
 
 During a keyed transmission the worker takes messages off its own

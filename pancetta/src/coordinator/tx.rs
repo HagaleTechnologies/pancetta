@@ -4799,6 +4799,42 @@ fn dx_parity_freshness_window(slot_ns: i64) -> std::time::Duration {
     std::time::Duration::from_nanos(slot_ns.max(0) as u64 * 2)
 }
 
+/// PAN-146 (Codex P2 on PR #370, round 1): the band and slot grid the frame
+/// about to key belongs to. An `a7_recent_calls` entry counts as DX-parity
+/// evidence only if it was observed in this context — a parity heard on
+/// another band says nothing about this one, and a parity computed on
+/// another protocol's slot grid describes different slot boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DxParityContext {
+    /// Live RX dial (Hz) from `operating_frequency_hz`; `0` = unknown.
+    dial_hz: u64,
+    /// Slot period (ns) `required_parity` was computed on. Also sets the
+    /// freshness window ([`dx_parity_freshness_window`]).
+    slot_ns: i64,
+}
+
+impl DxParityContext {
+    /// Reads the live dial now — call at the gate, not earlier.
+    fn live(operating_frequency_hz: &std::sync::atomic::AtomicU64, slot_ns: i64) -> Self {
+        Self {
+            dial_hz: operating_frequency_hz.load(Ordering::Relaxed),
+            slot_ns,
+        }
+    }
+
+    /// Same slot grid, and same band per [`super::is_band_change`] — the rule
+    /// the DSP band-change flush and the C9 QSO teardown use. The band check
+    /// is skipped while either dial is the unknown-0 sentinel (as PAN-118's
+    /// band-plan gate does): with no dial known there is no band switch to
+    /// detect, so the PAN-141 hold keeps working on a station without CAT.
+    fn observed_in(self, entry: &pancetta_qso::A7ExpectedCall) -> bool {
+        entry.slot_ns == self.slot_ns
+            && (entry.captured_dial_hz == 0
+                || self.dial_hz == 0
+                || !super::is_band_change(entry.captured_dial_hz, self.dial_hz))
+    }
+}
+
 /// PAN-141: does the DX's most recently observed OWN-TX slot parity (from
 /// [`pancetta_qso::CrossTimeState::a7_recent_calls`] — populated from every
 /// decode this station makes, regardless of QSO relevance) conflict with
@@ -4838,13 +4874,19 @@ fn dx_parity_freshness_window(slot_ns: i64) -> std::time::Duration {
 /// single NEWEST fresh matching entry across both parities first, then
 /// comparing only its parity, uses the DX's actual latest known state
 /// rather than whichever alias happens to match the parity being tested.
+///
+/// PAN-146: only entries observed in `context` (same band, same slot grid —
+/// [`DxParityContext::observed_in`]) are candidates, and the context filter
+/// runs before the newest-entry pick, so an out-of-context alias can neither
+/// hold the frame nor hide an in-context entry.
 fn dx_parity_conflict(
     their_callsign: &str,
     required_parity: pancetta_core::slot::SlotParity,
+    context: DxParityContext,
     cross_time_state: &pancetta_qso::CrossTimeState,
     now: std::time::SystemTime,
-    freshness_window: std::time::Duration,
 ) -> bool {
+    let freshness_window = dx_parity_freshness_window(context.slot_ns);
     let Ok(a7) = cross_time_state.a7_recent_calls.read() else {
         return false;
     };
@@ -4852,6 +4894,7 @@ fn dx_parity_conflict(
         .entries_with_parity(0)
         .chain(a7.entries_with_parity(1))
         .filter(|entry| pancetta_core::callsign::callsigns_match(&entry.callsign, their_callsign))
+        .filter(|entry| context.observed_in(entry))
         .filter(|entry| {
             now.duration_since(entry.decoded_at)
                 .is_ok_and(|age| age <= freshness_window)
@@ -4902,12 +4945,16 @@ async fn resolve_their_callsign(
 /// PAN-141: resolves `qso_id` to its established DX callsign, then applies
 /// [`dx_parity_conflict`]. See [`resolve_their_callsign`] for the fail-open
 /// conditions.
+///
+/// PAN-146: the live dial is read AFTER the resolver's await, alongside the
+/// clock, so a band switch landing during that await is seen.
 async fn dx_parity_conflict_for_qso(
     qso_id: Option<&str>,
     required_parity: pancetta_core::slot::SlotParity,
+    operating_frequency_hz: &std::sync::atomic::AtomicU64,
+    slot_ns: i64,
     qso_manager_watch: &tokio::sync::watch::Receiver<Option<pancetta_qso::QsoManager>>,
     cross_time_state: &pancetta_qso::CrossTimeState,
-    freshness_window: std::time::Duration,
 ) -> bool {
     let Some(their_callsign) = resolve_their_callsign(qso_id, qso_manager_watch).await else {
         return false;
@@ -4915,9 +4962,9 @@ async fn dx_parity_conflict_for_qso(
     dx_parity_conflict(
         &their_callsign,
         required_parity,
+        DxParityContext::live(operating_frequency_hz, slot_ns),
         cross_time_state,
         std::time::SystemTime::now(),
-        freshness_window,
     )
 }
 
@@ -4984,10 +5031,10 @@ async fn resolve_callsigns(
 fn final_single_tx_gate_denial(
     qso_id: Option<&str>,
     required_parity: pancetta_core::slot::SlotParity,
+    context: DxParityContext,
     active_tx_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
     their_callsign: Option<&str>,
     cross_time_state: &pancetta_qso::CrossTimeState,
-    freshness_window: std::time::Duration,
 ) -> Option<FinalGateDenial> {
     if !tx_qso_is_live(qso_id, active_tx_qsos) {
         return Some(FinalGateDenial::StaleQso);
@@ -4996,9 +5043,9 @@ fn final_single_tx_gate_denial(
         dx_parity_conflict(
             callsign,
             required_parity,
+            context,
             cross_time_state,
             std::time::SystemTime::now(),
-            freshness_window,
         )
     });
     if conflict {
@@ -5110,16 +5157,16 @@ fn bundle_live_mask(
     encoded_qso_ids: &[Option<String>],
     callsigns: &[Option<String>],
     required_parity: pancetta_core::slot::SlotParity,
+    context: DxParityContext,
     active_tx_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
     cross_time_state: &pancetta_qso::CrossTimeState,
-    freshness_window: std::time::Duration,
 ) -> (Vec<bool>, Vec<bool>) {
     let now = std::time::SystemTime::now();
     let parity_hold_mask: Vec<bool> = callsigns
         .iter()
         .map(|callsign| {
             callsign.as_deref().is_some_and(|cs| {
-                dx_parity_conflict(cs, required_parity, cross_time_state, now, freshness_window)
+                dx_parity_conflict(cs, required_parity, context, cross_time_state, now)
             })
         })
         .collect();
@@ -8644,9 +8691,10 @@ impl super::ApplicationCoordinator {
                                         if dx_parity_conflict_for_qso(
                                             qso_id.as_deref(),
                                             required_parity,
+                                            &operating_frequency_hz,
+                                            slot_ns,
                                             &qso_manager_watch,
                                             &cross_time_state,
-                                            dx_parity_freshness_window(slot_ns),
                                         )
                                         .await
                                         {
@@ -9212,10 +9260,10 @@ impl super::ApplicationCoordinator {
                                         if let Some(denial) = final_single_tx_gate_denial(
                                             qso_id.as_deref(),
                                             required_parity,
+                                            DxParityContext::live(&operating_frequency_hz, slot_ns),
                                             &active_tx_qsos,
                                             final_gate_callsign.as_deref(),
                                             &cross_time_state,
-                                            dx_parity_freshness_window(slot_ns),
                                         ) {
                                             ptt_active.store(false, Ordering::Release);
                                             ptt_guard.disarm();
@@ -11362,9 +11410,9 @@ impl super::ApplicationCoordinator {
                                         &encoded_qso_ids,
                                         &step_4b_callsigns,
                                         required_parity,
+                                        DxParityContext::live(&operating_frequency_hz, slot_ns),
                                         &active_tx_qsos,
                                         &cross_time_state,
-                                        dx_parity_freshness_window(slot_ns),
                                     );
 
                                     // PAN-118: re-evaluate the band plan per item
@@ -12220,9 +12268,9 @@ impl super::ApplicationCoordinator {
                                             &encoded_qso_ids_final,
                                             &final_gate_callsigns,
                                             required_parity,
+                                            DxParityContext::live(&operating_frequency_hz, slot_ns),
                                             &active_tx_qsos,
                                             &cross_time_state,
-                                            dx_parity_freshness_window(slot_ns),
                                         );
                                     if !final_live_mask.iter().all(|&live| live) {
                                         ptt_active.store(false, Ordering::Release);
@@ -13799,16 +13847,41 @@ mod schedule_tx_tests {
 
     // --- PAN-141: DX-parity freshness gate ---
 
+    const DIAL_20M: u64 = 14_074_000;
+    const DIAL_15M: u64 = 21_074_000;
+
+    /// An a7 entry heard on 20 m on the FT8 grid — the context every
+    /// pre-PAN-146 test implicitly assumed.
     fn a7_call(
         callsign: &str,
         slot_parity: u8,
         decoded_at: std::time::SystemTime,
+    ) -> pancetta_qso::A7ExpectedCall {
+        a7_call_in(callsign, slot_parity, decoded_at, DIAL_20M, SLOT_NS)
+    }
+
+    fn a7_call_in(
+        callsign: &str,
+        slot_parity: u8,
+        decoded_at: std::time::SystemTime,
+        captured_dial_hz: u64,
+        slot_ns: i64,
     ) -> pancetta_qso::A7ExpectedCall {
         pancetta_qso::A7ExpectedCall {
             callsign: callsign.to_string(),
             freq_hz: 1500.0,
             slot_parity,
             decoded_at,
+            captured_dial_hz,
+            slot_ns,
+        }
+    }
+
+    /// Keying on 20 m, FT8 grid.
+    fn ft8_20m() -> super::DxParityContext {
+        super::DxParityContext {
+            dial_hz: DIAL_20M,
+            slot_ns: SLOT_NS,
         }
     }
 
@@ -13826,9 +13899,9 @@ mod schedule_tx_tests {
         assert!(super::dx_parity_conflict(
             "5Z4VJ",
             SlotParity::Odd,
+            ft8_20m(),
             &cts,
             now,
-            std::time::Duration::from_secs(30),
         ));
     }
 
@@ -13848,9 +13921,9 @@ mod schedule_tx_tests {
         assert!(super::dx_parity_conflict(
             "5z4vj",
             SlotParity::Odd,
+            ft8_20m(),
             &cts,
             now,
-            std::time::Duration::from_secs(30),
         ));
     }
 
@@ -13871,9 +13944,9 @@ mod schedule_tx_tests {
         assert!(super::dx_parity_conflict(
             "EA8/G8BCG",
             SlotParity::Odd,
+            ft8_20m(),
             &cts,
             now,
-            std::time::Duration::from_secs(30),
         ));
     }
 
@@ -13898,13 +13971,7 @@ mod schedule_tx_tests {
             .record(a7_call("G8BCG", 0 /* Even */, now));
 
         assert!(
-            !super::dx_parity_conflict(
-                "G8BCG",
-                SlotParity::Odd,
-                &cts,
-                now,
-                std::time::Duration::from_secs(30),
-            ),
+            !super::dx_parity_conflict("G8BCG", SlotParity::Odd, ft8_20m(), &cts, now,),
             "the newest entry (Even, now) must win over the older Odd alias"
         );
     }
@@ -13922,9 +13989,9 @@ mod schedule_tx_tests {
         assert!(!super::dx_parity_conflict(
             "5Z4VJ",
             SlotParity::Odd,
+            ft8_20m(),
             &cts,
             now,
-            std::time::Duration::from_secs(30),
         ));
     }
 
@@ -13942,9 +14009,9 @@ mod schedule_tx_tests {
         assert!(!super::dx_parity_conflict(
             "5Z4VJ",
             SlotParity::Odd,
+            ft8_20m(),
             &cts,
             std::time::SystemTime::now(),
-            std::time::Duration::from_secs(30),
         ));
     }
 
@@ -13954,9 +14021,9 @@ mod schedule_tx_tests {
         assert!(!super::dx_parity_conflict(
             "UNKNOWN",
             SlotParity::Odd,
+            ft8_20m(),
             &cts,
             std::time::SystemTime::now(),
-            std::time::Duration::from_secs(30),
         ));
     }
 
@@ -13971,9 +14038,9 @@ mod schedule_tx_tests {
         assert!(!super::dx_parity_conflict(
             "5Z4VJ",
             SlotParity::Odd,
+            ft8_20m(),
             &cts,
             std::time::SystemTime::now(),
-            std::time::Duration::from_secs(30),
         ));
     }
 
@@ -13987,6 +14054,273 @@ mod schedule_tx_tests {
             super::dx_parity_freshness_window(FT4_SLOT_NS),
             std::time::Duration::from_millis(15_000)
         );
+    }
+
+    // --- PAN-146: DX-parity evidence is scoped to band and slot grid ---
+
+    /// The ticket's scenario: 5Z4VJ heard on 20 m on Odd; the operator
+    /// switches to 15 m while idle and calls 5Z4VJ there, keying Odd. The
+    /// 20 m observation says nothing about 15 m — proceed.
+    #[test]
+    fn dx_parity_conflict_ignores_entry_heard_on_another_band() {
+        let cts = pancetta_qso::CrossTimeState::empty();
+        let now = std::time::SystemTime::now();
+        cts.a7_recent_calls
+            .write()
+            .unwrap()
+            .record(a7_call_in("5Z4VJ", 1, now, DIAL_20M, SLOT_NS));
+        let on_15m = super::DxParityContext {
+            dial_hz: DIAL_15M,
+            slot_ns: SLOT_NS,
+        };
+        assert!(!super::dx_parity_conflict(
+            "5Z4VJ",
+            SlotParity::Odd,
+            on_15m,
+            &cts,
+            now
+        ));
+        // Control: the same entry still holds on its own band.
+        assert!(super::dx_parity_conflict(
+            "5Z4VJ",
+            SlotParity::Odd,
+            ft8_20m(),
+            &cts,
+            now
+        ));
+    }
+
+    /// FT8 and FT4 parities describe different slot boundaries: an FT8-grid
+    /// Odd is not evidence against an FT4-grid Odd key-up on the same band.
+    #[test]
+    fn dx_parity_conflict_ignores_entry_from_another_slot_grid() {
+        let cts = pancetta_qso::CrossTimeState::empty();
+        let now = std::time::SystemTime::now();
+        cts.a7_recent_calls
+            .write()
+            .unwrap()
+            .record(a7_call_in("5Z4VJ", 1, now, DIAL_20M, SLOT_NS));
+        let ft4_20m = super::DxParityContext {
+            dial_hz: DIAL_20M,
+            slot_ns: FT4_SLOT_NS,
+        };
+        assert!(!super::dx_parity_conflict(
+            "5Z4VJ",
+            SlotParity::Odd,
+            ft4_20m,
+            &cts,
+            now
+        ));
+    }
+
+    /// Band granularity, not exact dial: an entry keeps the exact dial its
+    /// window closed on (PAN-67), so an intra-band retune must still count.
+    #[test]
+    fn dx_parity_conflict_still_holds_after_intra_band_retune() {
+        let cts = pancetta_qso::CrossTimeState::empty();
+        let now = std::time::SystemTime::now();
+        cts.a7_recent_calls
+            .write()
+            .unwrap()
+            .record(a7_call_in("5Z4VJ", 1, now, DIAL_20M, SLOT_NS));
+        let retuned = super::DxParityContext {
+            dial_hz: 14_090_000,
+            slot_ns: SLOT_NS,
+        };
+        assert!(super::dx_parity_conflict(
+            "5Z4VJ",
+            SlotParity::Odd,
+            retuned,
+            &cts,
+            now
+        ));
+    }
+
+    /// With the dial unknown (0) on either side there is no band switch to
+    /// detect, so the band check is skipped and the PAN-141 hold still
+    /// works (e.g. a station with no CAT dial, or decodes from before the
+    /// first rig poll). The slot-grid check still applies.
+    #[test]
+    fn dx_parity_conflict_skips_band_check_when_a_dial_is_unknown() {
+        let now = std::time::SystemTime::now();
+        for (entry_dial, live_dial) in [(0, 0), (0, DIAL_15M), (DIAL_20M, 0)] {
+            let cts = pancetta_qso::CrossTimeState::empty();
+            cts.a7_recent_calls
+                .write()
+                .unwrap()
+                .record(a7_call_in("5Z4VJ", 1, now, entry_dial, SLOT_NS));
+            let live = super::DxParityContext {
+                dial_hz: live_dial,
+                slot_ns: SLOT_NS,
+            };
+            assert!(
+                super::dx_parity_conflict("5Z4VJ", SlotParity::Odd, live, &cts, now),
+                "entry dial {entry_dial}, live dial {live_dial} must still hold"
+            );
+            let ft4 = super::DxParityContext {
+                dial_hz: live_dial,
+                slot_ns: FT4_SLOT_NS,
+            };
+            assert!(!super::dx_parity_conflict(
+                "5Z4VJ",
+                SlotParity::Odd,
+                ft4,
+                &cts,
+                now
+            ));
+        }
+    }
+
+    /// The context filter runs before the newest-entry pick: a newer alias
+    /// heard on another band must not hide the in-context entry.
+    #[test]
+    fn dx_parity_conflict_newest_pick_is_among_in_context_entries() {
+        let cts = pancetta_qso::CrossTimeState::empty();
+        let now = std::time::SystemTime::now();
+        let older = now - std::time::Duration::from_secs(20);
+        cts.a7_recent_calls.write().unwrap().record(a7_call_in(
+            "EA8/G8BCG",
+            1,
+            older,
+            DIAL_20M,
+            SLOT_NS,
+        ));
+        cts.a7_recent_calls
+            .write()
+            .unwrap()
+            .record(a7_call_in("G8BCG", 0, now, DIAL_15M, SLOT_NS));
+        assert!(super::dx_parity_conflict(
+            "G8BCG",
+            SlotParity::Odd,
+            ft8_20m(),
+            &cts,
+            now
+        ));
+    }
+
+    /// End to end through the async resolver with the live dial atom: the
+    /// PAN-146 repro (20 m entry, operator now on 15 m) proceeds; the same
+    /// call on 20 m still holds.
+    #[tokio::test]
+    async fn dx_parity_conflict_for_qso_scopes_to_live_dial() {
+        let manager = pancetta_qso::QsoManager::new(test_qso_manager_config());
+        let qso_id = manager
+            .respond_to_cq_manual("5Z4VJ".to_string(), 1500.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        let cts = pancetta_qso::CrossTimeState::empty();
+        cts.a7_recent_calls.write().unwrap().record(a7_call_in(
+            "5Z4VJ",
+            1,
+            std::time::SystemTime::now(),
+            DIAL_20M,
+            SLOT_NS,
+        ));
+        let (_tx, rx) = tokio::sync::watch::channel(Some(manager));
+        let dial = std::sync::atomic::AtomicU64::new(DIAL_15M);
+        assert!(
+            !super::dx_parity_conflict_for_qso(
+                Some(&qso_id.to_string()),
+                SlotParity::Odd,
+                &dial,
+                SLOT_NS,
+                &rx,
+                &cts,
+            )
+            .await
+        );
+        dial.store(DIAL_20M, Ordering::Relaxed);
+        assert!(
+            super::dx_parity_conflict_for_qso(
+                Some(&qso_id.to_string()),
+                SlotParity::Odd,
+                &dial,
+                SLOT_NS,
+                &rx,
+                &cts,
+            )
+            .await
+        );
+    }
+
+    /// Step 4d uses the same context rule as Step 4b.
+    #[test]
+    fn final_single_tx_gate_denial_ignores_out_of_context_entry() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, RwLock};
+        let active: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+        active
+            .write()
+            .unwrap()
+            .insert(super::super::active_tx_qso_key("qso-kenya"));
+        let cts = pancetta_qso::CrossTimeState::empty();
+        cts.a7_recent_calls.write().unwrap().record(a7_call_in(
+            "5Z4VJ",
+            1,
+            std::time::SystemTime::now(),
+            DIAL_20M,
+            SLOT_NS,
+        ));
+        let on_15m = super::DxParityContext {
+            dial_hz: DIAL_15M,
+            slot_ns: SLOT_NS,
+        };
+        assert!(super::final_single_tx_gate_denial(
+            Some("qso-kenya"),
+            SlotParity::Odd,
+            on_15m,
+            &active,
+            Some("5Z4VJ"),
+            &cts,
+        )
+        .is_none());
+        assert_eq!(
+            super::final_single_tx_gate_denial(
+                Some("qso-kenya"),
+                SlotParity::Odd,
+                ft8_20m(),
+                &active,
+                Some("5Z4VJ"),
+                &cts,
+            ),
+            Some(super::FinalGateDenial::DxParityConflict)
+        );
+    }
+
+    /// Multi-TX: only the item whose DX was observed in the bundle's
+    /// context is held.
+    #[test]
+    fn bundle_live_mask_holds_only_items_observed_in_context() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, RwLock};
+        let active: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+        active
+            .write()
+            .unwrap()
+            .insert(super::super::active_tx_qso_key("qso-kenya"));
+        active
+            .write()
+            .unwrap()
+            .insert(super::super::active_tx_qso_key("qso-spain"));
+        let cts = pancetta_qso::CrossTimeState::empty();
+        let now = std::time::SystemTime::now();
+        cts.a7_recent_calls
+            .write()
+            .unwrap()
+            .record(a7_call_in("5Z4VJ", 1, now, DIAL_20M, SLOT_NS));
+        cts.a7_recent_calls.write().unwrap().record(a7_call_in(
+            "EA8BCG",
+            1,
+            now,
+            DIAL_20M,
+            FT4_SLOT_NS,
+        ));
+        let ids = vec![Some("qso-kenya".to_string()), Some("qso-spain".to_string())];
+        let callsigns = vec![Some("5Z4VJ".to_string()), Some("EA8BCG".to_string())];
+        let (live, held) =
+            super::bundle_live_mask(&ids, &callsigns, SlotParity::Odd, ft8_20m(), &active, &cts);
+        assert_eq!(held, vec![true, false]);
+        assert_eq!(live, vec![false, true]);
     }
 
     fn test_qso_manager_config() -> pancetta_qso::QsoManagerConfig {
@@ -14025,9 +14359,10 @@ mod schedule_tx_tests {
             super::dx_parity_conflict_for_qso(
                 Some(&qso_id.to_string()),
                 SlotParity::Odd,
+                &std::sync::atomic::AtomicU64::new(DIAL_20M),
+                SLOT_NS,
                 &rx,
                 &cts,
-                std::time::Duration::from_secs(30),
             )
             .await,
             "must detect the collision: DX just observed on the exact parity we're about to key"
@@ -14061,9 +14396,10 @@ mod schedule_tx_tests {
             !super::dx_parity_conflict_for_qso(
                 Some(&qso_id.to_string()),
                 SlotParity::Odd,
+                &std::sync::atomic::AtomicU64::new(DIAL_20M),
+                SLOT_NS,
                 &rx,
                 &cts,
-                std::time::Duration::from_secs(30),
             )
             .await
         );
@@ -14080,9 +14416,10 @@ mod schedule_tx_tests {
             !super::dx_parity_conflict_for_qso(
                 None,
                 SlotParity::Odd,
+                &std::sync::atomic::AtomicU64::new(DIAL_20M),
+                SLOT_NS,
                 &rx,
                 &cts,
-                std::time::Duration::from_secs(30),
             )
             .await
         );
@@ -14090,9 +14427,10 @@ mod schedule_tx_tests {
             !super::dx_parity_conflict_for_qso(
                 Some("00000000-0000-0000-0000-000000000000"),
                 SlotParity::Odd,
+                &std::sync::atomic::AtomicU64::new(DIAL_20M),
+                SLOT_NS,
                 &rx,
                 &cts,
-                std::time::Duration::from_secs(30),
             )
             .await
         );
@@ -14116,10 +14454,10 @@ mod schedule_tx_tests {
         assert!(super::final_single_tx_gate_denial(
             Some("qso-peru"),
             SlotParity::Odd,
+            ft8_20m(),
             &active,
             None,
             &cts,
-            std::time::Duration::from_secs(30),
         )
         .is_none());
     }
@@ -14150,10 +14488,10 @@ mod schedule_tx_tests {
             super::final_single_tx_gate_denial(
                 Some("qso-peru"),
                 SlotParity::Odd,
+                ft8_20m(),
                 &active,
                 None,
                 &cts,
-                std::time::Duration::from_secs(30),
             )
             .is_none(),
             "Step 4b's check must see the QSO as live"
@@ -14171,10 +14509,10 @@ mod schedule_tx_tests {
             super::final_single_tx_gate_denial(
                 Some("qso-peru"),
                 SlotParity::Odd,
+                ft8_20m(),
                 &active,
                 None,
                 &cts,
-                std::time::Duration::from_secs(30),
             ),
             Some(super::FinalGateDenial::StaleQso),
             "Step 4d's final check must catch a cancellation Step 4b could not have seen"
@@ -14211,10 +14549,10 @@ mod schedule_tx_tests {
             super::final_single_tx_gate_denial(
                 Some(&qso_id.to_string()),
                 SlotParity::Odd,
+                ft8_20m(),
                 &active,
                 their_callsign.as_deref(),
                 &cts,
-                std::time::Duration::from_secs(30),
             )
             .is_none(),
             "Step 4b's check must see no conflict yet"
@@ -14232,10 +14570,10 @@ mod schedule_tx_tests {
             super::final_single_tx_gate_denial(
                 Some(&qso_id.to_string()),
                 SlotParity::Odd,
+                ft8_20m(),
                 &active,
                 their_callsign.as_deref(),
                 &cts,
-                std::time::Duration::from_secs(30),
             ),
             Some(super::FinalGateDenial::DxParityConflict),
             "Step 4d's final check must catch a collision decode Step 4b could not have seen"
@@ -14301,10 +14639,10 @@ mod schedule_tx_tests {
         assert!(super::final_single_tx_gate_denial(
             Some("qso-peru"),
             SlotParity::Odd,
+            ft8_20m(),
             &active,
             None,
             &cts,
-            std::time::Duration::from_secs(30),
         )
         .is_none());
         assert_eq!(
@@ -14343,14 +14681,8 @@ mod schedule_tx_tests {
         let ids = vec![Some("qso-peru".to_string()), Some("qso-kenya".to_string())];
         let callsigns: Vec<Option<String>> = vec![None, None];
 
-        let (live, held) = super::bundle_live_mask(
-            &ids,
-            &callsigns,
-            SlotParity::Odd,
-            &active,
-            &cts,
-            std::time::Duration::from_secs(30),
-        );
+        let (live, held) =
+            super::bundle_live_mask(&ids, &callsigns, SlotParity::Odd, ft8_20m(), &active, &cts);
         assert_eq!(live, vec![true, true]);
         assert_eq!(held, vec![false, false]);
 
@@ -14358,14 +14690,8 @@ mod schedule_tx_tests {
             .write()
             .unwrap()
             .remove(&super::super::active_tx_qso_key("qso-kenya"));
-        let (live, held) = super::bundle_live_mask(
-            &ids,
-            &callsigns,
-            SlotParity::Odd,
-            &active,
-            &cts,
-            std::time::Duration::from_secs(30),
-        );
+        let (live, held) =
+            super::bundle_live_mask(&ids, &callsigns, SlotParity::Odd, ft8_20m(), &active, &cts);
         assert_eq!(live, vec![true, false]);
         assert_eq!(held, vec![false, false]);
     }
@@ -14401,9 +14727,9 @@ mod schedule_tx_tests {
             &survivors,
             &callsigns,
             SlotParity::Odd,
+            ft8_20m(),
             &active,
             &cts,
-            std::time::Duration::from_secs(30),
         );
         assert_eq!(
             step_4b_mask,
@@ -14422,9 +14748,9 @@ mod schedule_tx_tests {
             &survivors,
             &callsigns,
             SlotParity::Odd,
+            ft8_20m(),
             &active,
             &cts,
-            std::time::Duration::from_secs(30),
         );
         assert_eq!(
             step_4d_mask,
@@ -24234,6 +24560,118 @@ mod pan122_tx_log_worker_tests {
             TxLogAppend::Disabled
         );
         assert!(!tx_log_path(Some(home.path())).exists());
+    }
+}
+
+/// PAN-146: the DX-parity gate, through the real TX worker, scopes its a7
+/// evidence to the live dial's band. A DX kept fresh on 20 m Odd holds an
+/// Odd call on 20 m, and does not hold the same call after the operator
+/// moved to 15 m.
+#[cfg(test)]
+mod pan146_dx_parity_context_worker_tests {
+    use super::pan115_worker_gate_tests::{await_completion, worker_harness, Harness};
+    use crate::message_bus::{ComponentId, ComponentMessage, MessageType, TxOrigin};
+    use pancetta_core::slot::{SlotParity, SLOT_NS};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const DIAL_20M: u64 = 14_074_000;
+    const DIAL_15M: u64 = 21_074_000;
+    const TEXT: &str = "5Z4VJ W5AU EM10";
+
+    /// Opens a manual call to 5Z4VJ (latched `tx_parity = Odd`), publishes
+    /// the manager to the worker, keeps a 20 m / FT8-grid Odd sighting of
+    /// 5Z4VJ fresh, and sends one Odd frame for the QSO with the dial at
+    /// `live_dial_hz`. Returns `(completed, diagnostics, ptt_on)`.
+    async fn call_with_dx_heard_on_20m(
+        h: &Harness,
+        live_dial_hz: u64,
+    ) -> (Option<bool>, Vec<String>, bool) {
+        h.coordinator
+            .operating_frequency_hz
+            .store(live_dial_hz, Ordering::Relaxed);
+        let manager = pancetta_qso::QsoManager::new(pancetta_qso::QsoManagerConfig {
+            our_callsign: "W5AU".into(), // QsoManager refuses the N0CALL placeholder
+            ..Default::default()
+        });
+        let id = manager
+            .respond_to_cq_manual("5Z4VJ".into(), 1500.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        h.coordinator.qso_manager_watch.send_replace(Some(manager));
+        h.coordinator
+            .active_tx_qsos
+            .write()
+            .unwrap()
+            .insert(super::super::active_tx_qso_key(&id.to_string()));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let refresher = {
+            let cts = h.coordinator.cross_time_state.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Acquire) {
+                    cts.a7_recent_calls
+                        .write()
+                        .unwrap()
+                        .record(pancetta_qso::A7ExpectedCall {
+                            callsign: "5Z4VJ".into(),
+                            freq_hz: 1500.0,
+                            slot_parity: 1,
+                            decoded_at: std::time::SystemTime::now(),
+                            captured_dial_hz: DIAL_20M,
+                            slot_ns: SLOT_NS,
+                        });
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            })
+        };
+
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Autonomous,
+                ComponentId::Ft8Transmitter,
+                MessageType::TransmitRequest {
+                    message_text: TEXT.into(),
+                    frequency_offset: 1500.0,
+                    qso_id: Some(id.to_string()),
+                    tx_parity: Some(SlotParity::Odd),
+                    origin: TxOrigin::Local,
+                    remote_client_key_id: None,
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+        let result = await_completion(h, TEXT, Duration::from_secs(50)).await;
+        stop.store(true, Ordering::Release);
+        let _ = refresher.await;
+        result
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_band_sighting_still_holds_the_call() {
+        let h = worker_harness().await;
+        let (completed, diagnostics, ptt_on) = call_with_dx_heard_on_20m(&h, DIAL_20M).await;
+        assert_eq!(completed, Some(false));
+        assert!(!ptt_on, "a same-band collision must not key");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.contains("DX observed transmitting on the colliding parity")),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn other_band_sighting_does_not_hold_the_call() {
+        let h = worker_harness().await;
+        let (completed, diagnostics, ptt_on) = call_with_dx_heard_on_20m(&h, DIAL_15M).await;
+        assert_eq!(completed, Some(true), "{diagnostics:?}");
+        assert!(ptt_on, "the 15 m call must key");
+        assert!(!diagnostics.iter().any(|d| d.contains("colliding parity")));
     }
 }
 
