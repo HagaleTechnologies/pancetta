@@ -443,14 +443,15 @@ The ledger keeps a separate `last_emitted_at` anchor. Rearm pacing uses the late
 of that anchor and `last_call_at`; rollback never changes the anchor. TX cadence,
 coalescing order, parity and frequency selection therefore stay unchanged.
 
-Correlation is by attempt identity first (PAN-183): every ledger attempt gets a
-`TxAttemptId` when it is recorded, and the report of a frame that never aired
-carries the id of the attempt that frame came from. A report with an id
-reverses exactly that attempt, within four slots and at most eight attempts per
-QSO; an id with no surviving attempt is a no-op and never falls back to content
-matching. Reports without an id (frames with no ledger attempt, and any
-reporter that had none) keep the newest matching `(qso_id, message_text)`,
-narrowed by the replaced frame's payload on a pivot. Expired or unmatched
+Correlation is by attempt identity first (PAN-183): every QSO-engine emission
+gets a `TxAttemptId`, ledger attempts record theirs, and the report of a frame
+that never aired carries the id of the emission that frame came from. A report
+with an id reverses exactly that attempt, within four slots and at most eight
+attempts per QSO; an id with no surviving attempt (including an opening call's
+or an advance's, which record none) is a no-op and never falls back to content
+matching. Reports without an id (frames from outside the QSO engine) keep the
+newest matching `(qso_id, message_text)`, narrowed by the replaced frame's
+payload on a pivot. Expired or unmatched
 reports and terminal QSOs are no-ops. The ledger is shared across manager
 clones, pruned on rearm and rollback, and never persisted.
 
@@ -502,9 +503,11 @@ operator's explicit resend gave up the resend's entry and kept its own stall
 increment and `Sent` entry, which could trip the stall offset switch a cycle
 early. The id now travels with the frame:
 
-- `QsoEvent::MessageToSend::attempt_id` is `Some` for the three
-  ledger-recorded emissions (keep-call rearm, explicit resend, offset-switch
-  retransmit) and `None` for opening calls and advances.
+- `QsoEvent::MessageToSend::attempt_id` names the ledger attempt for the
+  three ledger-recorded emissions (keep-call rearm, explicit resend,
+  offset-switch retransmit). Opening calls and advances get a fresh id that
+  matches no attempt, so their failure can no longer take a newer same-text
+  resend's entry either.
 - The QSO loop copies it onto the `TransmitRequest` and the `LatestTxIntent`.
   The coalescer keeps each entry's own id on every request or bundle item it
   rebuilds, and each `TransmitRequestItem` carries its own. A multi-TX bundle

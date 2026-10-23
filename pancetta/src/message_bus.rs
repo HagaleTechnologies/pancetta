@@ -236,11 +236,11 @@ pub enum MessageType {
         /// later must not authorize a frame it never requested. `None` for
         /// every `Local` request.
         remote_client_key_id: Option<String>,
-        /// PAN-183: the keep-call ledger attempt this frame accounts for
+        /// PAN-183: the QSO engine's attempt id for this frame
         /// (`QsoEvent::MessageToSend::attempt_id`), echoed on
         /// `QsoMessage::TxFrameNotSent` if the frame never airs. `None` for
-        /// frames with no ledger attempt (opening calls, advances, manual
-        /// and tune frames).
+        /// frames the engine did not emit (manual, tune, test-TX and
+        /// Autonomous frames).
         attempt_id: Option<pancetta_qso::TxAttemptId>,
     },
 

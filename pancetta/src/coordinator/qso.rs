@@ -11574,7 +11574,10 @@ mod respond_to_caller_admission_tests {
                     }
                 }
             }
-            assert!(Instant::now() < deadline, "QSO loop forwarded no TransmitRequest");
+            assert!(
+                Instant::now() < deadline,
+                "QSO loop forwarded no TransmitRequest"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
@@ -11605,7 +11608,7 @@ mod respond_to_caller_admission_tests {
             .await
             .unwrap();
         let (_, opening) = pan183_next_transmit_request(&tx, &id.to_string()).await;
-        assert_eq!(opening, None, "an opening call has no ledger attempt");
+        assert!(opening.is_some(), "every engine emission carries an id");
         let opened = manager
             .get_qso(id)
             .await
@@ -11625,6 +11628,7 @@ mod respond_to_caller_admission_tests {
         let emitted = emitted.expect("the rearm records a ledger attempt");
         let (_, forwarded) = pan183_next_transmit_request(&tx, &id.to_string()).await;
         assert_eq!(forwarded, Some(emitted));
+        assert_ne!(forwarded, opening);
         let intent = coordinator
             .latest_tx_intent
             .read()
@@ -11704,7 +11708,10 @@ mod respond_to_caller_admission_tests {
         loop {
             let after = manager.get_qso(id).await.unwrap();
             if after.metadata.call_count == 2 {
-                assert_eq!(after.metadata.stall_cycles, 0, "the rearm's stall increment");
+                assert_eq!(
+                    after.metadata.stall_cycles, 0,
+                    "the rearm's stall increment"
+                );
                 assert_eq!(
                     after
                         .messages

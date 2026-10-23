@@ -1065,11 +1065,14 @@ pub enum QsoEvent {
         /// different peer taking control later can never authorize a frame it
         /// never requested.
         remote_client_key_id: Option<String>,
-        /// PAN-183: the keep-call ledger attempt this emission recorded, so a
-        /// failed frame rolls back exactly its own accounting. `Some` only for
-        /// ledger-recorded emissions (keep-call rearm, operator re-send, the
-        /// offset-switch one-shot retransmit); `None` for opening calls and
-        /// advances, which have no ledger entry.
+        /// PAN-183: this emission's attempt id, so a failed frame rolls back
+        /// exactly its own accounting. For a keep-call rearm, an operator
+        /// re-send or the offset-switch one-shot retransmit it names the
+        /// ledger attempt the emission recorded. Opening calls and advances
+        /// record none and get a fresh id that matches no attempt, so their
+        /// failure rolls nothing back, never a newer same-text attempt. The
+        /// engine always sets it; `Option` matches the bus fields, where
+        /// frames from outside the engine carry `None`.
         attempt_id: Option<TxAttemptId>,
     },
 
@@ -1247,10 +1250,11 @@ fn emission_carries(
             })
 }
 
-/// PAN-183: identifies one keep-call ledger attempt. Allocated when the
-/// attempt is recorded, carried on its `MessageToSend` and the TX request
-/// built from it, and echoed back on the not-sent report so the rollback
-/// reverses that attempt and no other. Never reused within a process.
+/// PAN-183: identifies one QSO-engine emission and, for a keep-call rearm,
+/// re-send or offset-switch retransmit, the ledger attempt it recorded.
+/// Carried on its `MessageToSend` and the TX request built from it, and
+/// echoed back on the not-sent report so the rollback reverses that attempt
+/// and no other. Never reused within a process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TxAttemptId(pub u64);
 
@@ -2407,7 +2411,7 @@ impl QsoManager {
             tx_parity,
             remote_origin,
             remote_client_key_id,
-            attempt_id: None,
+            attempt_id: Some(self.next_attempt_id()),
         })
         .await;
 
@@ -2560,7 +2564,7 @@ impl QsoManager {
             tx_parity,
             remote_origin,
             remote_client_key_id,
-            attempt_id: None,
+            attempt_id: Some(self.next_attempt_id()),
         })
         .await;
 
@@ -3016,7 +3020,7 @@ impl QsoManager {
             tx_parity,
             remote_origin,
             remote_client_key_id,
-            attempt_id: None,
+            attempt_id: Some(self.next_attempt_id()),
         })
         .await;
 
@@ -3476,7 +3480,7 @@ impl QsoManager {
             tx_parity,
             remote_origin,
             remote_client_key_id,
-            attempt_id: None,
+            attempt_id: Some(self.next_attempt_id()),
         })
         .await;
 
@@ -4090,18 +4094,18 @@ impl QsoManager {
     /// exposed as `pub` so integration tests can drive additional
     /// MessageToSend events without going through the auto_sequencer.
     pub async fn send_message(&self, qso_id: QsoId, message: MessageType, frequency: f64) {
-        self.send_attempt_message(qso_id, message, frequency, None)
+        self.send_attempt_message(qso_id, message, frequency, self.next_attempt_id())
             .await;
     }
 
-    /// [`Self::send_message`] for an emission that recorded keep-call ledger
-    /// attempt `attempt_id` (PAN-183).
+    /// [`Self::send_message`] under a given attempt id: the keep-call ledger
+    /// attempt the emission recorded, or a fresh unrecorded one (PAN-183).
     async fn send_attempt_message(
         &self,
         qso_id: QsoId,
         message: MessageType,
         frequency: f64,
-        attempt_id: Option<TxAttemptId>,
+        attempt_id: TxAttemptId,
     ) {
         let (tx_parity, remote_origin, remote_client_key_id) = self
             .qsos
@@ -4123,7 +4127,7 @@ impl QsoManager {
             tx_parity,
             remote_origin,
             remote_client_key_id,
-            attempt_id,
+            attempt_id: Some(attempt_id),
         })
         .await;
     }
@@ -4156,7 +4160,7 @@ impl QsoManager {
                 None => return ManualCallOutcome::NothingToResend,
             }
         };
-        self.send_attempt_message(qso_id, message, frequency, Some(attempt_id))
+        self.send_attempt_message(qso_id, message, frequency, attempt_id)
             .await;
         ManualCallOutcome::Resent
     }
@@ -4483,7 +4487,7 @@ impl QsoManager {
         };
         match emit {
             Some((message, frequency, attempt_id)) => {
-                self.send_attempt_message(qso_id, message, frequency, Some(attempt_id))
+                self.send_attempt_message(qso_id, message, frequency, attempt_id)
                     .await
             }
             None => info!("resend_last_tx: no prior Sent message for QSO {}", qso_id),
@@ -5801,7 +5805,7 @@ impl QsoManager {
                 tx_parity: qso_tx_parity,
                 remote_origin,
                 remote_client_key_id,
-                attempt_id: None,
+                attempt_id: Some(self.next_attempt_id()),
             })
             .await;
         }
@@ -7708,7 +7712,7 @@ impl QsoManager {
             tx_parity,
             remote_origin,
             remote_client_key_id,
-            attempt_id: None,
+            attempt_id: Some(self.next_attempt_id()),
         })
         .await;
         if let Some(metadata) = completed_metadata {
@@ -9130,14 +9134,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pan183_opening_message_to_send_carries_none() {
+    async fn pan183_opening_message_to_send_carries_an_unrecorded_id() {
         let manager = QsoManager::new(test_config());
         let mut events = manager.subscribe();
-        manager
+        let id = manager
             .respond_to_cq_manual("K1DEF".into(), 1500.0, None)
             .await
             .unwrap();
-        assert_eq!(pan183_emitted_attempt_ids(&drain(&mut events)), vec![None]);
+        let emitted = pan183_emitted_attempt_ids(&drain(&mut events));
+        assert_eq!(emitted.len(), 1);
+        assert!(emitted[0].is_some(), "every engine emission has an id");
+        assert_eq!(
+            manager.keep_call_ledger_len(id),
+            0,
+            "an opening records none"
+        );
+    }
+
+    // PR review on PAN-183: a failed opening call whose text a newer resend
+    // repeats rolls back nothing; by text alone it took the resend's entry.
+    #[tokio::test]
+    async fn pan183_failed_opening_call_never_takes_a_newer_resend_entry() {
+        let manager = QsoManager::new(test_config());
+        let mut events = manager.subscribe();
+        let id = manager
+            .respond_to_cq_manual("K1DEF".into(), 1500.0, None)
+            .await
+            .unwrap();
+        let opening = pan183_emitted_attempt_ids(&drain(&mut events))[0];
+        let text = manager.get_qso(id).await.unwrap().messages[0]
+            .raw_text
+            .clone();
+        manager.resend_last_tx(id).await.unwrap();
+        let resend = manager.keep_call_attempt_ids(id);
+        assert_eq!(resend.len(), 1);
+        let before = format!("{:?}", manager.get_qso(id).await.unwrap());
+        assert_eq!(
+            manager
+                .roll_back_unsent_attempt(id, &text, None, opening)
+                .await,
+            UnsentAttemptRollback::NoMatchingAttempt
+        );
+        assert_eq!(before, format!("{:?}", manager.get_qso(id).await.unwrap()));
+        assert_eq!(manager.keep_call_attempt_ids(id), resend);
     }
 
     #[tokio::test]

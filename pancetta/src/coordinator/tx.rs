@@ -24645,8 +24645,22 @@ mod pan183_attempt_identity_tests {
         let tx_params = pancetta_ft8::ProtocolParams::from_protocol(pancetta_ft8::Protocol::Ft8);
         let remote = crate::message_bus::TxOrigin::Remote;
         let in_flight = [
-            item("KA1ABC K5ARH R-15", "qso-1", 1000.0, remote, Some("client-a"), 21),
-            item("OTHER W5AU R-08", "qso-other", 1400.0, remote, Some("client-a"), 22),
+            item(
+                "KA1ABC K5ARH R-15",
+                "qso-1",
+                1000.0,
+                remote,
+                Some("client-a"),
+                21,
+            ),
+            item(
+                "OTHER W5AU R-08",
+                "qso-other",
+                1400.0,
+                remote,
+                Some("client-a"),
+                22,
+            ),
         ];
         let now = chrono::Utc::now();
         let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
@@ -24684,7 +24698,11 @@ mod pan183_attempt_identity_tests {
             2,
         )
         .await;
-        match inbox.try_recv().expect("the new request is re-enqueued").message_type {
+        match inbox
+            .try_recv()
+            .expect("the new request is re-enqueued")
+            .message_type
+        {
             MessageType::TransmitRequest { attempt_id, .. } => {
                 assert_eq!(attempt_id, Some(TxAttemptId(23)));
             }
