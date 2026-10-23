@@ -44,6 +44,7 @@ async fn cycle(
                 tx_parity,
                 ..
             } => entries.push(CoalesceEntry {
+                attempt_id: None,
                 message_text: pancetta_qso::utils::generate_ft8_message(&message, "W1ABC").unwrap(),
                 frequency_offset: frequency,
                 qso_id: Some(qso_id.to_string()),

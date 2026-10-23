@@ -604,6 +604,7 @@ fn tx_pivot_target_carries_origin_and_client_identity() {
     latest.insert(
         active_tx_qso_key(qid),
         LatestTxIntent {
+            attempt_id: None,
             message_text: "K5ARH W1AW 73".to_string(),
             frequency_offset: current_freq,
             tx_parity: Some(SlotParity::Even),
@@ -655,6 +656,7 @@ fn tx_pivot_target_pivots_on_an_authorization_only_change() {
     latest.insert(
         active_tx_qso_key(qid),
         LatestTxIntent {
+            attempt_id: None,
             message_text: text.to_string(),
             frequency_offset: freq,
             tx_parity: Some(SlotParity::Even),
@@ -708,6 +710,7 @@ fn tx_pivot_target_swaps_only_on_a_fresher_message() {
     latest.insert(
         active_tx_qso_key(qid),
         LatestTxIntent {
+            attempt_id: None,
             message_text: "KF9UG K5ARH 73".to_string(),
             frequency_offset: 1353.0,
             tx_parity: Some(SlotParity::Even),
@@ -750,6 +753,7 @@ fn tx_pivot_target_pivots_on_an_offset_only_change() {
     latest.insert(
         active_tx_qso_key(qid),
         LatestTxIntent {
+            attempt_id: None,
             // Same rendered text the worker is holding — only the offset moved.
             message_text: "KF9UG K5ARH RR73".to_string(),
             frequency_offset: 1753.0,

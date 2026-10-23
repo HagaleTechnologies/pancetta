@@ -1303,6 +1303,7 @@ impl Sim {
                 tx_parity,
                 remote_origin: _,
                 remote_client_key_id: _,
+                attempt_id: _,
             } => {
                 let text = self
                     .exchange

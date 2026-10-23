@@ -382,6 +382,7 @@ pub fn classify_incoming_during_tx(
 
     match candidate {
         MessageType::TransmitRequest {
+            attempt_id: _,
             message_text,
             frequency_offset,
             qso_id,
@@ -794,12 +795,12 @@ fn ptt_hold_exceeds_bound(hold: Duration, ptt_lead_ms: u64) -> bool {
 /// Callers that hold PTT must release it BEFORE calling this (it awaits).
 async fn drop_frames_for_clock_jump(
     message_bus: &MessageBus,
-    frames: &[(String, Option<String>)],
+    frames: &[(String, Option<String>, Option<pancetta_qso::TxAttemptId>)],
     jump: pancetta_core::slot_clock::WallClockJump,
     pivot_replaced: &mut PivotReplaced,
 ) {
     let secs = jump.signed_secs();
-    for (message_text, qso_id) in frames {
+    for (message_text, qso_id, _) in frames {
         warn!(
             target: "pancetta::tx.policy",
             "dropping stale TX for QSO {} after a {secs:+.1} s clock jump: '{message_text}' — next frame uses the current UTC slot",
@@ -817,11 +818,12 @@ async fn drop_frames_for_clock_jump(
         .await;
     }
     send_tx_queue_status(message_bus, None, Vec::new()).await;
-    for (message_text, qso_id) in frames {
+    for (message_text, qso_id, attempt_id) in frames {
         if let Err(e) = report_unaired_frame(
             message_bus,
             message_text.clone(),
             qso_id.clone(),
+            *attempt_id,
             take_bundle_replaced(pivot_replaced, qso_id.as_deref()),
         )
         .await
@@ -1300,6 +1302,7 @@ mod interruptible_sleep_tests {
             &abort,
             &inbox,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "in flight text".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
@@ -1380,6 +1383,7 @@ mod interruptible_sleep_tests {
             &abort,
             &inbox,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "in flight text".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
@@ -1492,6 +1496,7 @@ mod interruptible_sleep_tests {
             &abort,
             &inbox,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "in flight text".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
@@ -1570,6 +1575,7 @@ mod interruptible_sleep_tests {
             &abort,
             &inbox,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "in flight text".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
@@ -1606,6 +1612,7 @@ mod interruptible_sleep_tests {
             &abort,
             &inbox,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "in flight text".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
@@ -1627,6 +1634,7 @@ mod interruptible_sleep_tests {
         let pivoted_once = std::collections::HashMap::new();
 
         let new_request = MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: "KA1ABC K5ARH RR73".to_string(),
             frequency_offset: 1500.0,
             qso_id: Some("qso-1".to_string()),
@@ -1649,6 +1657,7 @@ mod interruptible_sleep_tests {
             &abort,
             &inbox,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
@@ -1689,6 +1698,7 @@ mod interruptible_sleep_tests {
         // Identical content to what's in flight — should be Dropped, not treated
         // as a trigger, and the sleep should complete normally.
         let duplicate = MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: "KA1ABC K5ARH R-15".to_string(),
             frequency_offset: 1500.0,
             qso_id: Some("qso-1".to_string()),
@@ -1711,6 +1721,7 @@ mod interruptible_sleep_tests {
             &abort,
             &inbox,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
@@ -1739,6 +1750,7 @@ mod interruptible_sleep_tests {
             &abort,
             &inbox,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "in flight text".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
@@ -1795,6 +1807,7 @@ mod interruptible_sleep_tests {
             &abort,
             &inbox,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
@@ -1861,6 +1874,7 @@ mod interruptible_sleep_tests {
 
         // A different QSO's own closing RR73 arrives while qso-1 is in flight.
         let other_qso_request = MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: "OTHER1 W5AU RR73".to_string(),
             frequency_offset: 900.0,
             qso_id: Some("qso-other1".to_string()),
@@ -1884,6 +1898,7 @@ mod interruptible_sleep_tests {
             &abort,
             &inbox,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
@@ -1949,6 +1964,7 @@ mod interruptible_sleep_tests {
                     crate::message_bus::ComponentId::Qso,
                     crate::message_bus::ComponentId::Ft8Transmitter,
                     MessageType::TransmitRequest {
+                        attempt_id: None,
                         message_text: text.to_string(),
                         frequency_offset: 900.0,
                         qso_id: Some(qso_id.to_string()),
@@ -1972,6 +1988,7 @@ mod interruptible_sleep_tests {
             &abort,
             &inbox,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
@@ -2023,6 +2040,7 @@ mod interruptible_sleep_tests {
         let bundle = MessageType::MultiTransmitRequest {
             items: vec![
                 crate::message_bus::TransmitRequestItem {
+                    attempt_id: None,
                     message_text: "KA1ABC K5ARH R-15".to_string(),
                     frequency_offset: 1500.0,
                     qso_id: Some("qso-1".to_string()),
@@ -2030,6 +2048,7 @@ mod interruptible_sleep_tests {
                     remote_client_key_id: None,
                 },
                 crate::message_bus::TransmitRequestItem {
+                    attempt_id: None,
                     message_text: "OTHER W5AU RR73".to_string(),
                     frequency_offset: 900.0,
                     qso_id: Some("qso-other".to_string()),
@@ -2057,6 +2076,7 @@ mod interruptible_sleep_tests {
             &abort,
             &inbox,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
@@ -2102,6 +2122,7 @@ mod interruptible_sleep_tests {
 
         let bundle = MessageType::MultiTransmitRequest {
             items: vec![crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
@@ -2128,6 +2149,7 @@ mod interruptible_sleep_tests {
             &abort,
             &inbox,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
@@ -2165,6 +2187,7 @@ mod interruptible_sleep_tests {
         let pivoted_once = std::collections::HashMap::new();
         let item = |text: &str, qso: &str, origin, client: Option<&str>| {
             crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: text.to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some(qso.to_string()),
@@ -2293,6 +2316,7 @@ mod interruptible_sleep_tests {
                     crate::message_bus::ComponentId::Qso,
                     crate::message_bus::ComponentId::Ft8Transmitter,
                     MessageType::TransmitRequest {
+                        attempt_id: None,
                         message_text: text.to_string(),
                         frequency_offset: 900.0,
                         qso_id: Some(qso_id.to_string()),
@@ -2317,6 +2341,7 @@ mod interruptible_sleep_tests {
             &abort,
             &inbox,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
@@ -2355,6 +2380,7 @@ mod interruptible_sleep_tests {
             crate::message_bus::ComponentId::Qso,
             crate::message_bus::ComponentId::Ft8Transmitter,
             MessageType::TransmitRequest {
+                attempt_id: None,
                 message_text: text,
                 frequency_offset: 900.0,
                 qso_id: Some(qso),
@@ -2378,6 +2404,7 @@ mod interruptible_sleep_tests {
 
     fn pan73_in_flight() -> [crate::message_bus::TransmitRequestItem; 1] {
         [crate::message_bus::TransmitRequestItem {
+            attempt_id: None,
             message_text: "KA1ABC K5ARH R-15".to_string(),
             frequency_offset: 1500.0,
             qso_id: Some("qso-1".to_string()),
@@ -2505,6 +2532,7 @@ mod interruptible_sleep_tests {
             inbox.requeue_front(vec![super::self_message(
                 MessageType::MultiTransmitRequest {
                     items: vec![crate::message_bus::TransmitRequestItem {
+                        attempt_id: None,
                         message_text: "WINNER".into(),
                         frequency_offset: 1500.0,
                         qso_id: Some("qso-1".into()),
@@ -2905,12 +2933,15 @@ async fn send_tx_queue_status(
 /// Shutdown branches deliberately send nothing: the QSO loop stops on the
 /// same flag and its in-memory accounting is discarded at exit.
 /// Returns the Autonomous send result to preserve callers' error handling.
+/// `attempt_id` is the frame's own ledger attempt (PAN-183), echoed on the
+/// QSO-engine mirror only; Autonomous correlates on `qso_id` (PAN-185).
 async fn report_transmit_complete(
     message_bus: &MessageBus,
     success: bool,
     message_text: String,
     duration_ms: u64,
     qso_id: Option<String>,
+    attempt_id: Option<pancetta_qso::TxAttemptId>,
 ) -> Result<()> {
     let not_sent = (!success)
         .then(|| qso_id.clone())
@@ -2925,15 +2956,95 @@ async fn report_transmit_complete(
     )
     .await;
     if let Some((qso_id, message_text)) = not_sent {
-        report_frame_not_sent(message_bus, qso_id, message_text, None).await;
+        report_frame_not_sent(message_bus, qso_id, message_text, None, attempt_id).await;
     }
     result
 }
 
+/// Report a frame after PTT is released — one whose audio played out
+/// (`success` from a Step-7 `Enqueued`), or one whose audio delivery
+/// failed (`Dropped`/error: no samples were ever enqueued, so the frame
+/// never aired and routes through the PAN-75 not-sent path). On success it
+/// also tells the QSO engine the frame aired, with the offset and binding
+/// it aired on, so a stall offset action held on that frame can commit
+/// (PAN-182). Never called before or during key-down (PAN-202).
+async fn report_played_transmit_complete(
+    message_bus: &MessageBus,
+    success: bool,
+    message_text: String,
+    duration_ms: u64,
+    qso_id: Option<String>,
+    aired: pancetta_qso::UnsentAttemptPayload,
+    attempt_id: Option<pancetta_qso::TxAttemptId>,
+) -> Result<()> {
+    let sent = success
+        .then(|| qso_id.clone())
+        .flatten()
+        .map(|id| (id, message_text.clone()));
+    let result = report_transmit_complete(
+        message_bus,
+        success,
+        message_text,
+        duration_ms,
+        qso_id,
+        attempt_id,
+    )
+    .await;
+    if let Some((qso_id, message_text)) = sent {
+        report_frame_sent(message_bus, qso_id, message_text, aired).await;
+    }
+    result
+}
+
+/// PAN-182: tell the QSO engine `message_text` aired for `qso_id`, stamped
+/// with the post-playback report time.
+async fn report_frame_sent(
+    message_bus: &MessageBus,
+    qso_id: String,
+    message_text: String,
+    aired: pancetta_qso::UnsentAttemptPayload,
+) {
+    let _ = message_bus
+        .send_message(ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Qso,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameSent {
+                qso_id,
+                message_text,
+                aired,
+                aired_at: chrono::Utc::now(),
+            }),
+            Instant::now(),
+        ))
+        .await;
+}
+
+/// The offset and binding a transmitted frame carried (PAN-182).
+fn aired_payload(
+    frequency_hz: f64,
+    origin: crate::message_bus::TxOrigin,
+    remote_client_key_id: Option<String>,
+) -> pancetta_qso::UnsentAttemptPayload {
+    pancetta_qso::UnsentAttemptPayload {
+        frequency_hz,
+        remote_binding: Some((
+            origin == crate::message_bus::TxOrigin::Remote,
+            remote_client_key_id,
+        )),
+    }
+}
+
+/// A frame a pivot replaced: its text, its payload (PAN-75) and its ledger
+/// attempt (PAN-183).
+type ReplacedFrame = (
+    String,
+    pancetta_qso::UnsentAttemptPayload,
+    Option<pancetta_qso::TxAttemptId>,
+);
+
 /// Pivot sources cleared from a refused frame or bundle, keyed by
 /// `active_tx_qso_key` (PAN-75).
-type PivotReplaced =
-    std::collections::HashMap<String, (String, pancetta_qso::UnsentAttemptPayload)>;
+type PivotReplaced = std::collections::HashMap<String, ReplacedFrame>;
 
 /// A bundle refused before it aired: clear the tombstones its Step 4b pivot
 /// inserted and return the frames those pivots replaced, so each item's
@@ -2957,7 +3068,7 @@ fn unwind_bundle_pivots(
 fn take_bundle_replaced(
     replaced: &mut PivotReplaced,
     qso_id: Option<&str>,
-) -> Option<(String, pancetta_qso::UnsentAttemptPayload)> {
+) -> Option<ReplacedFrame> {
     qso_id.and_then(|id| replaced.remove(&super::active_tx_qso_key(id)))
 }
 
@@ -2966,32 +3077,46 @@ fn take_bundle_replaced(
 /// itself, so the QSO engine instead rolls back the frame the pivot
 /// replaced (`pivot_replaced`), which never aired either (PAN-75).
 /// Autonomous gets the usual failed completion either way (follow-up:
-/// PAN-185).
+/// PAN-185). `attempt_id` is the unaired frame's own attempt, reported only
+/// when no pivot replaced it; a pivot reports the replaced frame's (PAN-183).
 async fn report_unaired_frame(
     message_bus: &MessageBus,
     message_text: String,
     qso_id: Option<String>,
-    pivot_replaced: Option<(String, pancetta_qso::UnsentAttemptPayload)>,
+    attempt_id: Option<pancetta_qso::TxAttemptId>,
+    pivot_replaced: Option<ReplacedFrame>,
 ) -> Result<()> {
     if pivot_replaced.is_none() {
-        return report_transmit_complete(message_bus, false, message_text, 0, qso_id).await;
+        return report_transmit_complete(message_bus, false, message_text, 0, qso_id, attempt_id)
+            .await;
     }
     let result =
         report_transmit_complete_to_autonomous(message_bus, false, message_text, 0, qso_id.clone())
             .await;
-    if let (Some(qso_id), Some((replaced_text, replaced))) = (qso_id, pivot_replaced) {
-        report_frame_not_sent(message_bus, qso_id, replaced_text, Some(replaced)).await;
+    if let (Some(qso_id), Some((replaced_text, replaced, replaced_attempt_id))) =
+        (qso_id, pivot_replaced)
+    {
+        report_frame_not_sent(
+            message_bus,
+            qso_id,
+            replaced_text,
+            Some(replaced),
+            replaced_attempt_id,
+        )
+        .await;
     }
     result
 }
 
 /// PAN-75: tell the QSO engine `message_text` never aired for `qso_id`.
-/// `replaced` carries the payload of a frame a pivot replaced.
+/// `replaced` carries the payload of a frame a pivot replaced; `attempt_id`
+/// the unaired frame's own ledger attempt, which decides the match (PAN-183).
 async fn report_frame_not_sent(
     message_bus: &MessageBus,
     qso_id: String,
     message_text: String,
     replaced: Option<pancetta_qso::UnsentAttemptPayload>,
+    attempt_id: Option<pancetta_qso::TxAttemptId>,
 ) {
     let _ = message_bus
         .send_message(ComponentMessage::new(
@@ -3001,6 +3126,7 @@ async fn report_frame_not_sent(
                 qso_id,
                 message_text,
                 replaced,
+                attempt_id,
             }),
             Instant::now(),
         ))
@@ -3017,7 +3143,7 @@ async fn report_pivot_duplicate_dropped(
     message_bus: &MessageBus,
     message_text: String,
     qso_id: Option<String>,
-    pivoted_from: Option<(String, pancetta_qso::UnsentAttemptPayload)>,
+    pivoted_from: Option<ReplacedFrame>,
 ) {
     if let Err(e) =
         report_transmit_complete_to_autonomous(message_bus, false, message_text, 0, qso_id.clone())
@@ -3025,8 +3151,17 @@ async fn report_pivot_duplicate_dropped(
     {
         warn!("Failed to send TransmitComplete: {}", e);
     }
-    if let (Some(qso_id), Some((pivoted_from_text, replaced))) = (qso_id, pivoted_from) {
-        report_frame_not_sent(message_bus, qso_id, pivoted_from_text, Some(replaced)).await;
+    if let (Some(qso_id), Some((pivoted_from_text, replaced, replaced_attempt_id))) =
+        (qso_id, pivoted_from)
+    {
+        report_frame_not_sent(
+            message_bus,
+            qso_id,
+            pivoted_from_text,
+            Some(replaced),
+            replaced_attempt_id,
+        )
+        .await;
     }
 }
 
@@ -3069,12 +3204,19 @@ async fn emit_failed_transmit_complete_for_request(
     if let MessageType::TransmitRequest {
         message_text,
         qso_id,
+        attempt_id,
         ..
     } = message_type
     {
-        if let Err(e) =
-            report_transmit_complete(message_bus, false, message_text.clone(), 0, qso_id.clone())
-                .await
+        if let Err(e) = report_transmit_complete(
+            message_bus,
+            false,
+            message_text.clone(),
+            0,
+            qso_id.clone(),
+            *attempt_id,
+        )
+        .await
         {
             warn!("Failed to send TransmitComplete: {}", e);
         }
@@ -4657,6 +4799,42 @@ fn dx_parity_freshness_window(slot_ns: i64) -> std::time::Duration {
     std::time::Duration::from_nanos(slot_ns.max(0) as u64 * 2)
 }
 
+/// PAN-146 (Codex P2 on PR #370, round 1): the band and slot grid the frame
+/// about to key belongs to. An `a7_recent_calls` entry counts as DX-parity
+/// evidence only if it was observed in this context — a parity heard on
+/// another band says nothing about this one, and a parity computed on
+/// another protocol's slot grid describes different slot boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DxParityContext {
+    /// Live RX dial (Hz) from `operating_frequency_hz`; `0` = unknown.
+    dial_hz: u64,
+    /// Slot period (ns) `required_parity` was computed on. Also sets the
+    /// freshness window ([`dx_parity_freshness_window`]).
+    slot_ns: i64,
+}
+
+impl DxParityContext {
+    /// Reads the live dial now — call at the gate, not earlier.
+    fn live(operating_frequency_hz: &std::sync::atomic::AtomicU64, slot_ns: i64) -> Self {
+        Self {
+            dial_hz: operating_frequency_hz.load(Ordering::Relaxed),
+            slot_ns,
+        }
+    }
+
+    /// Same slot grid, and same band per [`super::is_band_change`] — the rule
+    /// the DSP band-change flush and the C9 QSO teardown use. The band check
+    /// is skipped while either dial is the unknown-0 sentinel (as PAN-118's
+    /// band-plan gate does): with no dial known there is no band switch to
+    /// detect, so the PAN-141 hold keeps working on a station without CAT.
+    fn observed_in(self, entry: &pancetta_qso::A7ExpectedCall) -> bool {
+        entry.slot_ns == self.slot_ns
+            && (entry.captured_dial_hz == 0
+                || self.dial_hz == 0
+                || !super::is_band_change(entry.captured_dial_hz, self.dial_hz))
+    }
+}
+
 /// PAN-141: does the DX's most recently observed OWN-TX slot parity (from
 /// [`pancetta_qso::CrossTimeState::a7_recent_calls`] — populated from every
 /// decode this station makes, regardless of QSO relevance) conflict with
@@ -4696,13 +4874,19 @@ fn dx_parity_freshness_window(slot_ns: i64) -> std::time::Duration {
 /// single NEWEST fresh matching entry across both parities first, then
 /// comparing only its parity, uses the DX's actual latest known state
 /// rather than whichever alias happens to match the parity being tested.
+///
+/// PAN-146: only entries observed in `context` (same band, same slot grid —
+/// [`DxParityContext::observed_in`]) are candidates, and the context filter
+/// runs before the newest-entry pick, so an out-of-context alias can neither
+/// hold the frame nor hide an in-context entry.
 fn dx_parity_conflict(
     their_callsign: &str,
     required_parity: pancetta_core::slot::SlotParity,
+    context: DxParityContext,
     cross_time_state: &pancetta_qso::CrossTimeState,
     now: std::time::SystemTime,
-    freshness_window: std::time::Duration,
 ) -> bool {
+    let freshness_window = dx_parity_freshness_window(context.slot_ns);
     let Ok(a7) = cross_time_state.a7_recent_calls.read() else {
         return false;
     };
@@ -4710,6 +4894,7 @@ fn dx_parity_conflict(
         .entries_with_parity(0)
         .chain(a7.entries_with_parity(1))
         .filter(|entry| pancetta_core::callsign::callsigns_match(&entry.callsign, their_callsign))
+        .filter(|entry| context.observed_in(entry))
         .filter(|entry| {
             now.duration_since(entry.decoded_at)
                 .is_ok_and(|age| age <= freshness_window)
@@ -4760,12 +4945,16 @@ async fn resolve_their_callsign(
 /// PAN-141: resolves `qso_id` to its established DX callsign, then applies
 /// [`dx_parity_conflict`]. See [`resolve_their_callsign`] for the fail-open
 /// conditions.
+///
+/// PAN-146: the live dial is read AFTER the resolver's await, alongside the
+/// clock, so a band switch landing during that await is seen.
 async fn dx_parity_conflict_for_qso(
     qso_id: Option<&str>,
     required_parity: pancetta_core::slot::SlotParity,
+    operating_frequency_hz: &std::sync::atomic::AtomicU64,
+    slot_ns: i64,
     qso_manager_watch: &tokio::sync::watch::Receiver<Option<pancetta_qso::QsoManager>>,
     cross_time_state: &pancetta_qso::CrossTimeState,
-    freshness_window: std::time::Duration,
 ) -> bool {
     let Some(their_callsign) = resolve_their_callsign(qso_id, qso_manager_watch).await else {
         return false;
@@ -4773,9 +4962,9 @@ async fn dx_parity_conflict_for_qso(
     dx_parity_conflict(
         &their_callsign,
         required_parity,
+        DxParityContext::live(operating_frequency_hz, slot_ns),
         cross_time_state,
         std::time::SystemTime::now(),
-        freshness_window,
     )
 }
 
@@ -4842,10 +5031,10 @@ async fn resolve_callsigns(
 fn final_single_tx_gate_denial(
     qso_id: Option<&str>,
     required_parity: pancetta_core::slot::SlotParity,
+    context: DxParityContext,
     active_tx_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
     their_callsign: Option<&str>,
     cross_time_state: &pancetta_qso::CrossTimeState,
-    freshness_window: std::time::Duration,
 ) -> Option<FinalGateDenial> {
     if !tx_qso_is_live(qso_id, active_tx_qsos) {
         return Some(FinalGateDenial::StaleQso);
@@ -4854,9 +5043,9 @@ fn final_single_tx_gate_denial(
         dx_parity_conflict(
             callsign,
             required_parity,
+            context,
             cross_time_state,
             std::time::SystemTime::now(),
-            freshness_window,
         )
     });
     if conflict {
@@ -4968,16 +5157,16 @@ fn bundle_live_mask(
     encoded_qso_ids: &[Option<String>],
     callsigns: &[Option<String>],
     required_parity: pancetta_core::slot::SlotParity,
+    context: DxParityContext,
     active_tx_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
     cross_time_state: &pancetta_qso::CrossTimeState,
-    freshness_window: std::time::Duration,
 ) -> (Vec<bool>, Vec<bool>) {
     let now = std::time::SystemTime::now();
     let parity_hold_mask: Vec<bool> = callsigns
         .iter()
         .map(|callsign| {
             callsign.as_deref().is_some_and(|cs| {
-                dx_parity_conflict(cs, required_parity, cross_time_state, now, freshness_window)
+                dx_parity_conflict(cs, required_parity, context, cross_time_state, now)
             })
         })
         .collect();
@@ -5627,6 +5816,9 @@ pub struct CoalesceEntry {
     /// (PAN-91). Threaded through the coalescer alongside `origin` — see
     /// `MessageType::TransmitRequest::remote_client_key_id`.
     pub remote_client_key_id: Option<String>,
+    /// The entry's own ledger attempt (PAN-183), kept on every request or
+    /// bundle item rebuilt from it.
+    pub attempt_id: Option<pancetta_qso::TxAttemptId>,
 }
 
 /// Result of draining + coalescing a backlog of `TransmitRequest`s.
@@ -6188,6 +6380,7 @@ pub(crate) async fn coalesce_backlog_into(
     // Decompose the head into a CoalesceEntry. (Caller guarantees the variant.)
     let head_entry = match head {
         MessageType::TransmitRequest {
+            attempt_id,
             message_text,
             frequency_offset,
             qso_id,
@@ -6195,6 +6388,7 @@ pub(crate) async fn coalesce_backlog_into(
             origin,
             remote_client_key_id,
         } => CoalesceEntry {
+            attempt_id,
             message_text,
             frequency_offset,
             qso_id,
@@ -6212,6 +6406,7 @@ pub(crate) async fn coalesce_backlog_into(
     while let Ok(msg) = inbox.try_recv() {
         match msg.message_type {
             MessageType::TransmitRequest {
+                attempt_id,
                 message_text,
                 frequency_offset,
                 qso_id,
@@ -6220,6 +6415,7 @@ pub(crate) async fn coalesce_backlog_into(
                 remote_client_key_id,
             } => {
                 drained.push(CoalesceEntry {
+                    attempt_id,
                     message_text,
                     frequency_offset,
                     qso_id,
@@ -6401,6 +6597,7 @@ pub(crate) async fn coalesce_backlog_into(
                     entry.message_text.clone(),
                     0,
                     entry.qso_id.clone(),
+                    entry.attempt_id,
                 )
                 .await
                 {
@@ -6430,6 +6627,7 @@ pub(crate) async fn coalesce_backlog_into(
     if admitted.len() == 1 {
         let e = admitted.into_iter().next().expect("len == 1");
         return MessageType::TransmitRequest {
+            attempt_id: e.attempt_id,
             message_text: e.message_text,
             frequency_offset: e.frequency_offset,
             qso_id: e.qso_id,
@@ -6491,6 +6689,7 @@ pub(crate) async fn coalesce_backlog_into(
             entry.message_text.clone(),
             0,
             entry.qso_id.clone(),
+            entry.attempt_id,
         )
         .await
         {
@@ -6522,6 +6721,7 @@ pub(crate) async fn coalesce_backlog_into(
             .into_iter()
             .map(|entry| {
                 self_message(MessageType::TransmitRequest {
+                    attempt_id: entry.attempt_id,
                     message_text: entry.message_text,
                     frequency_offset: entry.frequency_offset,
                     qso_id: entry.qso_id,
@@ -6551,6 +6751,7 @@ pub(crate) async fn coalesce_backlog_into(
     if outcome.retained.len() == 1 {
         let e = outcome.retained.into_iter().next().expect("len == 1");
         return MessageType::TransmitRequest {
+            attempt_id: e.attempt_id,
             message_text: e.message_text,
             frequency_offset: e.frequency_offset,
             qso_id: e.qso_id,
@@ -6576,6 +6777,7 @@ pub(crate) async fn coalesce_backlog_into(
         .retained
         .into_iter()
         .map(|e| crate::message_bus::TransmitRequestItem {
+            attempt_id: e.attempt_id,
             message_text: e.message_text,
             frequency_offset: e.frequency_offset,
             qso_id: e.qso_id,
@@ -6738,6 +6940,10 @@ enum SupersedeOutcome {
         /// windows over the DX's expected reply instead of the QSO's own
         /// latched parity.
         tx_parity: Option<pancetta_core::slot::SlotParity>,
+        /// PAN-183: the NEW superseding request's OWN ledger attempt, for the
+        /// same reason as `qso_id`: the re-keyed frame, or the request
+        /// rebuilt to re-enqueue it, reports this attempt if it never airs.
+        attempt_id: Option<pancetta_qso::TxAttemptId>,
     },
     /// Bundle-add is viable. The caller encodes `items` via
     /// `encode_and_modulate_multi_tx`; on success it re-enqueues a
@@ -6764,6 +6970,9 @@ enum SupersedeOutcome {
         new_origin: crate::message_bus::TxOrigin,
         /// The NEW request's OWN `remote_client_key_id`, mirroring `new_origin`.
         new_remote_client_key_id: Option<String>,
+        /// The NEW request's OWN ledger attempt, for the single-item replace
+        /// fallback (PAN-183). Each item in `items` keeps its own.
+        new_attempt_id: Option<pancetta_qso::TxAttemptId>,
     },
 }
 
@@ -6810,6 +7019,7 @@ async fn supersede_and_rekey_or_bundle(
     ptt_active.store(false, Ordering::Release);
 
     let MessageType::TransmitRequest {
+        attempt_id: new_attempt_id,
         message_text: new_text,
         frequency_offset: new_freq,
         tx_parity: new_tx_parity,
@@ -6888,6 +7098,7 @@ async fn supersede_and_rekey_or_bundle(
             .cloned()
             .collect();
         candidate_items.push(crate::message_bus::TransmitRequestItem {
+            attempt_id: new_attempt_id,
             message_text: new_text,
             frequency_offset: new_freq,
             qso_id: new_qso_id.clone(),
@@ -6966,6 +7177,7 @@ async fn supersede_and_rekey_or_bundle(
                 bundle_remote_client_key_id,
                 new_origin,
                 new_remote_client_key_id,
+                new_attempt_id,
             };
         } else {
             info!(
@@ -6987,6 +7199,7 @@ async fn supersede_and_rekey_or_bundle(
         qso_id: new_qso_id,
         identity_conflict: replace_is_identity_conflict,
         tx_parity: new_tx_parity,
+        attempt_id: new_attempt_id,
     }
 }
 
@@ -7074,8 +7287,10 @@ fn item_rebound_by_supersede(
 /// Report an in-flight bundle item a supersede abandoned. The QSO engine gets
 /// the item's own offset (and, when known, the bundle's binding) so the
 /// rollback cannot land on a newer same-text attempt at another offset or
-/// authority (PAN-75). Autonomous gets the usual failed completion
-/// (follow-up: PAN-185).
+/// authority (PAN-75). The item's own ledger attempt decides the match when
+/// it has one, so a folded bundle binding cannot miss or mis-pick it
+/// (PAN-183). Autonomous gets the usual failed completion (follow-up:
+/// PAN-185).
 async fn report_abandoned_bundle_item(
     message_bus: &MessageBus,
     item: &crate::message_bus::TransmitRequestItem,
@@ -7101,6 +7316,7 @@ async fn report_abandoned_bundle_item(
                 frequency_hz: item.frequency_offset,
                 remote_binding,
             }),
+            item.attempt_id,
         )
         .await;
     }
@@ -7236,6 +7452,7 @@ async fn supersede_multi_reenqueue(
             bundle_remote_client_key_id,
             new_origin,
             new_remote_client_key_id,
+            new_attempt_id,
         } => {
             let bundle_outcome =
                 encode_and_modulate_multi_tx(encoder, active_protocol, tx_params, &items);
@@ -7266,6 +7483,7 @@ async fn supersede_multi_reenqueue(
                     .cloned()
                     .expect("candidate bundle always contains the new item");
                 self_message(MessageType::TransmitRequest {
+                    attempt_id: new_attempt_id,
                     message_text: new_item.message_text,
                     frequency_offset: new_item.frequency_offset,
                     qso_id: new_item.qso_id,
@@ -7282,6 +7500,7 @@ async fn supersede_multi_reenqueue(
             qso_id: new_qso_id,
             identity_conflict,
             tx_parity: new_tx_parity,
+            attempt_id: new_attempt_id,
         } => {
             // Codex P1, PR #362 round 18: an `identity_conflict` Replace
             // means control legitimately transferred (the in-flight bundle
@@ -7298,6 +7517,9 @@ async fn supersede_multi_reenqueue(
             // re-enqueued for the worker's next dequeue to immediately
             // collide with.
             if identity_conflict {
+                // PAN-183 (PR #419 thread 4244657620): each abandoned item
+                // reports its own attempt, so the rollback cannot pick the
+                // newer, differently bound same-text request keyed instead.
                 for item in in_flight_items {
                     if let Err(e) = report_transmit_complete(
                         message_bus,
@@ -7305,6 +7527,7 @@ async fn supersede_multi_reenqueue(
                         item.message_text.clone(),
                         0,
                         item.qso_id.clone(),
+                        item.attempt_id,
                     )
                     .await
                     {
@@ -7312,6 +7535,7 @@ async fn supersede_multi_reenqueue(
                     }
                 }
                 inbox.requeue_front(vec![self_message(MessageType::TransmitRequest {
+                    attempt_id: new_attempt_id,
                     message_text: scratch_text,
                     frequency_offset: scratch_freq,
                     qso_id: new_qso_id,
@@ -7362,8 +7586,15 @@ async fn supersede_multi_reenqueue(
                  behind the preserved bundle (would livelock); its own cadence will retry next cycle",
                 scratch_text
             );
-            if let Err(e) =
-                report_transmit_complete(message_bus, false, scratch_text, 0, new_qso_id).await
+            if let Err(e) = report_transmit_complete(
+                message_bus,
+                false,
+                scratch_text,
+                0,
+                new_qso_id,
+                new_attempt_id,
+            )
+            .await
             {
                 warn!("Failed to send TransmitComplete: {}", e);
             }
@@ -7608,10 +7839,7 @@ impl super::ApplicationCoordinator {
                 // Written with every `pivoted_once` insert and read only on a
                 // Step 0-dup hit, so entries left behind when a tombstone is
                 // cleared are inert.
-                let mut pivoted_from: std::collections::HashMap<
-                    String,
-                    (String, pancetta_qso::UnsentAttemptPayload),
-                > = std::collections::HashMap::new();
+                let mut pivoted_from = PivotReplaced::new();
 
                 let inbox = TxInbox::new(tx_rx, tx_requeue);
                 'worker: while !shutdown.load(Ordering::Acquire) {
@@ -7877,6 +8105,10 @@ impl super::ApplicationCoordinator {
 
                             match message.message_type {
                                 MessageType::TransmitRequest {
+                                    // `mut`: re-pointed with the payload by a key-time pivot and by a
+                                    // `Replace` supersede, so a failure reports the attempt actually
+                                    // keyed (PAN-183).
+                                    mut attempt_id,
                                     mut message_text,
                                     mut frequency_offset,
                                     // `mut`: a mid-TX supersede on the `Replace` path re-keys
@@ -7989,6 +8221,7 @@ impl super::ApplicationCoordinator {
                                             message_text,
                                             0,
                                             qso_id.clone(),
+                                            attempt_id,
                                         )
                                         .await;
                                         continue;
@@ -8039,6 +8272,7 @@ impl super::ApplicationCoordinator {
                                             message_text,
                                             0,
                                             qso_id.clone(),
+                                            attempt_id,
                                         )
                                         .await;
                                         continue;
@@ -8110,6 +8344,7 @@ impl super::ApplicationCoordinator {
                                             message_text,
                                             0,
                                             qso_id.clone(),
+                                            attempt_id,
                                         )
                                         .await;
                                         continue;
@@ -8180,6 +8415,7 @@ impl super::ApplicationCoordinator {
                                                 message_text,
                                                 0,
                                                 qso_id.clone(),
+                                                attempt_id,
                                             )
                                             .await;
                                             continue 'worker;
@@ -8233,6 +8469,7 @@ impl super::ApplicationCoordinator {
                                                     message_text,
                                                     0,
                                                     qso_id.clone(),
+                                                    attempt_id,
                                                 )
                                                 .await;
                                                 continue 'worker;
@@ -8332,6 +8569,7 @@ impl super::ApplicationCoordinator {
                                                     message_text,
                                                     0,
                                                     qso_id.clone(),
+                                                    attempt_id,
                                                 )
                                                 .await;
                                                 continue 'worker;
@@ -8374,7 +8612,11 @@ impl super::ApplicationCoordinator {
                                             PttWait::ClockJumped(jump) => {
                                                 drop_frames_for_clock_jump(
                                                     &message_bus,
-                                                    &[(message_text.clone(), qso_id.clone())],
+                                                    &[(
+                                                        message_text.clone(),
+                                                        qso_id.clone(),
+                                                        attempt_id,
+                                                    )],
                                                     jump,
                                                     &mut PivotReplaced::new(),
                                                 )
@@ -8418,6 +8660,7 @@ impl super::ApplicationCoordinator {
                                                     message_text.clone(),
                                                     0,
                                                     qso_id.clone(),
+                                                    attempt_id,
                                                 )
                                                 .await;
                                                 continue 'worker;
@@ -8448,9 +8691,10 @@ impl super::ApplicationCoordinator {
                                         if dx_parity_conflict_for_qso(
                                             qso_id.as_deref(),
                                             required_parity,
+                                            &operating_frequency_hz,
+                                            slot_ns,
                                             &qso_manager_watch,
                                             &cross_time_state,
-                                            dx_parity_freshness_window(slot_ns),
                                         )
                                         .await
                                         {
@@ -8479,6 +8723,7 @@ impl super::ApplicationCoordinator {
                                                 message_text,
                                                 0,
                                                 qso_id.clone(),
+                                                attempt_id,
                                             )
                                             .await;
                                             continue 'worker;
@@ -8530,6 +8775,7 @@ impl super::ApplicationCoordinator {
                                                 message_text,
                                                 0,
                                                 qso_id.clone(),
+                                                attempt_id,
                                             )
                                             .await;
                                             continue 'worker;
@@ -8583,6 +8829,7 @@ impl super::ApplicationCoordinator {
                                                 message_text,
                                                 0,
                                                 qso_id.clone(),
+                                                attempt_id,
                                             )
                                             .await;
                                             continue 'worker;
@@ -8614,6 +8861,7 @@ impl super::ApplicationCoordinator {
                                                 message_text,
                                                 0,
                                                 qso_id.clone(),
+                                                attempt_id,
                                             )
                                             .await;
                                             continue 'worker;
@@ -8654,6 +8902,7 @@ impl super::ApplicationCoordinator {
                                                 message_text,
                                                 0,
                                                 qso_id.clone(),
+                                                attempt_id,
                                             )
                                             .await;
                                             continue 'worker;
@@ -8732,6 +8981,7 @@ impl super::ApplicationCoordinator {
                                                 message_text,
                                                 0,
                                                 qso_id.clone(),
+                                                attempt_id,
                                             )
                                             .await;
                                             continue 'worker;
@@ -8795,6 +9045,7 @@ impl super::ApplicationCoordinator {
                                             let new_origin = intent.origin;
                                             let new_remote_client_key_id =
                                                 intent.remote_client_key_id;
+                                            let new_attempt_id = intent.attempt_id;
                                             // TX-F4: protocol-aware re-encode/re-modulate
                                             // (mirrors Step 1's `encode_for_protocol` /
                                             // `modulate_for_protocol` call above) — the
@@ -8875,6 +9126,13 @@ impl super::ApplicationCoordinator {
                                                     // doc.
                                                     origin = new_origin;
                                                     remote_client_key_id = new_remote_client_key_id;
+                                                    // PAN-183: the keyed frame is now the
+                                                    // intent's attempt; the replaced one's is
+                                                    // kept below for its not-sent report.
+                                                    let replaced_attempt_id = std::mem::replace(
+                                                        &mut attempt_id,
+                                                        new_attempt_id,
+                                                    );
                                                     // Double-PTT fix: record this pivot so the
                                                     // newer request that PRODUCED `message_text`
                                                     // — still queued behind this one — is
@@ -8898,7 +9156,11 @@ impl super::ApplicationCoordinator {
                                                         );
                                                         pivoted_from.insert(
                                                             key.clone(),
-                                                            (pivoted_from_text, replaced),
+                                                            (
+                                                                pivoted_from_text,
+                                                                replaced,
+                                                                replaced_attempt_id,
+                                                            ),
                                                         );
                                                         pivoted_this_key = Some(key);
                                                     }
@@ -8988,6 +9250,7 @@ impl super::ApplicationCoordinator {
                                                 &message_bus,
                                                 message_text,
                                                 qso_id.clone(),
+                                                attempt_id,
                                                 pivot_replaced,
                                             )
                                             .await;
@@ -8997,10 +9260,10 @@ impl super::ApplicationCoordinator {
                                         if let Some(denial) = final_single_tx_gate_denial(
                                             qso_id.as_deref(),
                                             required_parity,
+                                            DxParityContext::live(&operating_frequency_hz, slot_ns),
                                             &active_tx_qsos,
                                             final_gate_callsign.as_deref(),
                                             &cross_time_state,
-                                            dx_parity_freshness_window(slot_ns),
                                         ) {
                                             ptt_active.store(false, Ordering::Release);
                                             ptt_guard.disarm();
@@ -9032,6 +9295,7 @@ impl super::ApplicationCoordinator {
                                                 &message_bus,
                                                 message_text,
                                                 qso_id.clone(),
+                                                attempt_id,
                                                 pivot_replaced,
                                             )
                                             .await;
@@ -9084,6 +9348,7 @@ impl super::ApplicationCoordinator {
                                                 &message_bus,
                                                 message_text,
                                                 qso_id.clone(),
+                                                attempt_id,
                                                 pivot_replaced,
                                             )
                                             .await;
@@ -9137,6 +9402,7 @@ impl super::ApplicationCoordinator {
                                                 &message_bus,
                                                 message_text,
                                                 qso_id.clone(),
+                                                attempt_id,
                                                 pivot_replaced,
                                             )
                                             .await;
@@ -9190,6 +9456,7 @@ impl super::ApplicationCoordinator {
                                                 &message_bus,
                                                 message_text,
                                                 qso_id.clone(),
+                                                attempt_id,
                                                 pivot_replaced,
                                             )
                                             .await;
@@ -9270,6 +9537,7 @@ impl super::ApplicationCoordinator {
                                                     &message_bus,
                                                     message_text,
                                                     qso_id.clone(),
+                                                    attempt_id,
                                                     pivot_replaced,
                                                 )
                                                 .await;
@@ -9323,7 +9591,11 @@ impl super::ApplicationCoordinator {
                                                 });
                                             drop_frames_for_clock_jump(
                                                 &message_bus,
-                                                &[(message_text.clone(), qso_id.clone())],
+                                                &[(
+                                                    message_text.clone(),
+                                                    qso_id.clone(),
+                                                    attempt_id,
+                                                )],
                                                 pancetta_core::slot_clock::WallClockJump::Backward(
                                                     chrono::Duration::from_std(to_slot)
                                                         .unwrap_or(chrono::Duration::MAX),
@@ -9350,6 +9622,7 @@ impl super::ApplicationCoordinator {
                                             &inbox,
                                             std::slice::from_ref(
                                                 &crate::message_bus::TransmitRequestItem {
+                                                    attempt_id,
                                                     message_text: message_text.clone(),
                                                     frequency_offset,
                                                     qso_id: qso_id.clone(),
@@ -9389,6 +9662,7 @@ impl super::ApplicationCoordinator {
                                                     message_text.clone(),
                                                     0,
                                                     qso_id.clone(),
+                                                    attempt_id,
                                                 )
                                                 .await
                                                 {
@@ -9439,6 +9713,7 @@ impl super::ApplicationCoordinator {
                                                     &message_bus,
                                                     message_text.clone(),
                                                     qso_id.clone(),
+                                                    attempt_id,
                                                     pivot_replaced,
                                                 )
                                                 .await
@@ -9453,6 +9728,7 @@ impl super::ApplicationCoordinator {
                                                 // can fold the new request alongside it.
                                                 let in_flight_items =
                                                     vec![crate::message_bus::TransmitRequestItem {
+                                                        attempt_id,
                                                         message_text: message_text.clone(),
                                                         frequency_offset,
                                                         qso_id: qso_id.clone(),
@@ -9514,6 +9790,7 @@ impl super::ApplicationCoordinator {
                                                                     abandoned.message_text.clone(),
                                                                     0,
                                                                     abandoned.qso_id.clone(),
+                                                                    abandoned.attempt_id,
                                                                 )
                                                                 .await
                                                             {
@@ -9532,6 +9809,7 @@ impl super::ApplicationCoordinator {
                                                         qso_id: new_qso_id,
                                                         identity_conflict: _,
                                                         tx_parity: _,
+                                                        attempt_id: new_attempt_id,
                                                     } => {
                                                         // Viable single-item re-key (Task 6): carry
                                                         // the recomputed schedule into the retry,
@@ -9568,6 +9846,7 @@ impl super::ApplicationCoordinator {
                                                                     abandoned.message_text.clone(),
                                                                     0,
                                                                     abandoned.qso_id.clone(),
+                                                                    abandoned.attempt_id,
                                                                 )
                                                                 .await
                                                             {
@@ -9581,6 +9860,7 @@ impl super::ApplicationCoordinator {
                                                         remote_client_key_id =
                                                             new_remote_client_key_id;
                                                         qso_id = new_qso_id;
+                                                        attempt_id = new_attempt_id;
                                                         rekey_schedule = Some(schedule);
                                                         is_rekey = true;
                                                         abort_current_tx
@@ -9594,6 +9874,7 @@ impl super::ApplicationCoordinator {
                                                         bundle_remote_client_key_id,
                                                         new_origin,
                                                         new_remote_client_key_id,
+                                                        new_attempt_id,
                                                     } => {
                                                         // Prefer a multi-TX bundle: encode the
                                                         // in-flight + new item together. On success,
@@ -9665,6 +9946,7 @@ impl super::ApplicationCoordinator {
                                                                     abandoned.message_text.clone(),
                                                                     0,
                                                                     abandoned.qso_id.clone(),
+                                                                    abandoned.attempt_id,
                                                                 )
                                                                 .await
                                                             {
@@ -9677,6 +9959,7 @@ impl super::ApplicationCoordinator {
                                                         qso_id = items
                                                             .last()
                                                             .and_then(|item| item.qso_id.clone());
+                                                        attempt_id = new_attempt_id;
                                                         rekey_schedule = Some(schedule);
                                                         is_rekey = true;
                                                         abort_current_tx
@@ -9721,6 +10004,11 @@ impl super::ApplicationCoordinator {
                                         // PR #468 review: playback is timed from the enqueue, so the
                                         // bounded TX-log wait below never extends key-down past the audio.
                                         let audio_enqueued_at = tokio::time::Instant::now();
+                                        // PAN-182 (PR #507 review): only an `Enqueued` outcome put
+                                        // samples on the Audio route. A `Dropped`/error delivery keyed
+                                        // no audio, so Step 10 must report the frame as not sent.
+                                        let audio_enqueued =
+                                            matches!(outcome, Ok(SendIfOutcome::Enqueued));
                                         match outcome {
                                             Ok(SendIfOutcome::Enqueued) => {
                                                 // Band Activity's own-TX history logs the actual
@@ -9802,6 +10090,7 @@ impl super::ApplicationCoordinator {
                                                     &message_bus,
                                                     message_text,
                                                     qso_id.clone(),
+                                                    attempt_id,
                                                     pivot_replaced,
                                                 )
                                                 .await;
@@ -9831,6 +10120,7 @@ impl super::ApplicationCoordinator {
                                             &inbox,
                                             std::slice::from_ref(
                                                 &crate::message_bus::TransmitRequestItem {
+                                                    attempt_id,
                                                     message_text: message_text.clone(),
                                                     frequency_offset,
                                                     qso_id: qso_id.clone(),
@@ -9869,6 +10159,7 @@ impl super::ApplicationCoordinator {
                                                     message_text.clone(),
                                                     0,
                                                     qso_id.clone(),
+                                                    attempt_id,
                                                 )
                                                 .await
                                                 {
@@ -9923,6 +10214,7 @@ impl super::ApplicationCoordinator {
                                                     message_text.clone(),
                                                     0,
                                                     qso_id.clone(),
+                                                    attempt_id,
                                                 )
                                                 .await
                                                 {
@@ -9934,6 +10226,7 @@ impl super::ApplicationCoordinator {
                                                 // Same bundle-add-or-replace decision as Step 6.
                                                 let in_flight_items =
                                                     vec![crate::message_bus::TransmitRequestItem {
+                                                        attempt_id,
                                                         message_text: message_text.clone(),
                                                         frequency_offset,
                                                         qso_id: qso_id.clone(),
@@ -9991,6 +10284,7 @@ impl super::ApplicationCoordinator {
                                                                     abandoned.message_text.clone(),
                                                                     0,
                                                                     abandoned.qso_id.clone(),
+                                                                    abandoned.attempt_id,
                                                                 )
                                                                 .await
                                                             {
@@ -10009,6 +10303,7 @@ impl super::ApplicationCoordinator {
                                                         qso_id: new_qso_id,
                                                         identity_conflict: _,
                                                         tx_parity: _,
+                                                        attempt_id: new_attempt_id,
                                                     } => {
                                                         // Re-point `origin` at the superseding
                                                         // request's origin so the retry's Step 4b-arm
@@ -10035,6 +10330,7 @@ impl super::ApplicationCoordinator {
                                                                     abandoned.message_text.clone(),
                                                                     0,
                                                                     abandoned.qso_id.clone(),
+                                                                    abandoned.attempt_id,
                                                                 )
                                                                 .await
                                                             {
@@ -10048,6 +10344,7 @@ impl super::ApplicationCoordinator {
                                                         remote_client_key_id =
                                                             new_remote_client_key_id;
                                                         qso_id = new_qso_id;
+                                                        attempt_id = new_attempt_id;
                                                         rekey_schedule = Some(schedule);
                                                         is_rekey = true;
                                                         abort_current_tx
@@ -10061,6 +10358,7 @@ impl super::ApplicationCoordinator {
                                                         bundle_remote_client_key_id,
                                                         new_origin,
                                                         new_remote_client_key_id,
+                                                        new_attempt_id,
                                                     } => {
                                                         let tx_params =
                                                             pancetta_ft8::ProtocolParams::from_protocol(
@@ -10110,6 +10408,7 @@ impl super::ApplicationCoordinator {
                                                                     abandoned.message_text.clone(),
                                                                     0,
                                                                     abandoned.qso_id.clone(),
+                                                                    abandoned.attempt_id,
                                                                 )
                                                                 .await
                                                             {
@@ -10125,6 +10424,7 @@ impl super::ApplicationCoordinator {
                                                         qso_id = items
                                                             .last()
                                                             .and_then(|item| item.qso_id.clone());
+                                                        attempt_id = new_attempt_id;
                                                         rekey_schedule = Some(schedule);
                                                         is_rekey = true;
                                                         abort_current_tx
@@ -10135,7 +10435,11 @@ impl super::ApplicationCoordinator {
                                                 }
                                             }
                                         }
-                                        let success = true;
+                                        // PAN-182 (PR #507 review): success means the audio actually
+                                        // enqueued at Step 7 — a `Dropped`/error delivery keyed no
+                                        // samples, so the frame never aired and Step 10 reports it
+                                        // through the PAN-75 not-sent path instead.
+                                        let success = audio_enqueued;
                                         let duration_ms = audio_duration_ms;
 
                                         // --- Step 9: De-assert PTT (with tail delay) ---
@@ -10165,12 +10469,18 @@ impl super::ApplicationCoordinator {
                                             // pending_self_cq_qsos and, if `success` is false,
                                             // never roll back the streak) or fabricating a
                                             // failure for a CQ that may have transmitted fine.
-                                            if let Err(e) = report_transmit_complete(
+                                            if let Err(e) = report_played_transmit_complete(
                                                 &message_bus,
                                                 success,
                                                 message_text.clone(),
                                                 duration_ms,
                                                 qso_id.clone(),
+                                                aired_payload(
+                                                    frequency_offset,
+                                                    origin,
+                                                    remote_client_key_id.clone(),
+                                                ),
+                                                attempt_id,
                                             )
                                             .await
                                             {
@@ -10198,12 +10508,18 @@ impl super::ApplicationCoordinator {
                                         ptt_guard.disarm();
 
                                         // --- Step 10: Send TransmitComplete ---
-                                        if let Err(e) = report_transmit_complete(
+                                        if let Err(e) = report_played_transmit_complete(
                                             &message_bus,
                                             success,
                                             message_text,
                                             duration_ms,
                                             qso_id.clone(),
+                                            aired_payload(
+                                                frequency_offset,
+                                                origin,
+                                                remote_client_key_id.clone(),
+                                            ),
+                                            attempt_id,
                                         )
                                         .await
                                         {
@@ -10344,6 +10660,7 @@ impl super::ApplicationCoordinator {
                                                 item.message_text.clone(),
                                                 0,
                                                 item.qso_id.clone(),
+                                                item.attempt_id,
                                             )
                                             .await;
                                         }
@@ -10403,6 +10720,7 @@ impl super::ApplicationCoordinator {
                                                         item.message_text.clone(),
                                                         0,
                                                         item.qso_id.clone(),
+                                                        item.attempt_id,
                                                     )
                                                     .await;
                                                 }
@@ -10495,6 +10813,7 @@ impl super::ApplicationCoordinator {
                                                 item.message_text.clone(),
                                                 0,
                                                 item.qso_id.clone(),
+                                                item.attempt_id,
                                             )
                                             .await;
                                         }
@@ -10540,6 +10859,7 @@ impl super::ApplicationCoordinator {
                                                     item.message_text.clone(),
                                                     0,
                                                     item.qso_id.clone(),
+                                                    item.attempt_id,
                                                 )
                                                 .await;
                                             }
@@ -10617,6 +10937,7 @@ impl super::ApplicationCoordinator {
                                             item.message_text.clone(),
                                             0,
                                             item.qso_id.clone(),
+                                            item.attempt_id,
                                         )
                                         .await;
                                     }
@@ -10669,8 +10990,10 @@ impl super::ApplicationCoordinator {
                                                     .await;
                                                 }
                                             }
-                                            for (text, qso_id) in
-                                                item_texts.into_iter().zip(encoded_qso_ids)
+                                            for ((text, qso_id), item) in item_texts
+                                                .into_iter()
+                                                .zip(encoded_qso_ids)
+                                                .zip(&items)
                                             {
                                                 let _ = report_transmit_complete(
                                                     &message_bus,
@@ -10678,6 +11001,7 @@ impl super::ApplicationCoordinator {
                                                     text,
                                                     0,
                                                     qso_id,
+                                                    item.attempt_id,
                                                 )
                                                 .await;
                                             }
@@ -10780,6 +11104,7 @@ impl super::ApplicationCoordinator {
                                                     item.message_text.clone(),
                                                     0,
                                                     item.qso_id.clone(),
+                                                    item.attempt_id,
                                                 )
                                                 .await;
                                             }
@@ -10817,6 +11142,7 @@ impl super::ApplicationCoordinator {
                                                             item.message_text.clone(),
                                                             0,
                                                             item.qso_id.clone(),
+                                                            item.attempt_id,
                                                         )
                                                         .await;
                                                     }
@@ -10852,6 +11178,7 @@ impl super::ApplicationCoordinator {
                                                         item.message_text.clone(),
                                                         0,
                                                         item.qso_id.clone(),
+                                                        item.attempt_id,
                                                     )
                                                     .await;
                                                 }
@@ -10898,9 +11225,10 @@ impl super::ApplicationCoordinator {
                                                             Vec::new(),
                                                         )
                                                         .await;
-                                                        for (text, qso_id) in rebuilt_texts
+                                                        for ((text, qso_id), item) in rebuilt_texts
                                                             .into_iter()
                                                             .zip(rebuilt_qso_ids)
+                                                            .zip(&rebuilt_items)
                                                         {
                                                             let _ = report_transmit_complete(
                                                                 &message_bus,
@@ -10908,6 +11236,7 @@ impl super::ApplicationCoordinator {
                                                                 text,
                                                                 0,
                                                                 qso_id,
+                                                                item.attempt_id,
                                                             )
                                                             .await;
                                                         }
@@ -10970,9 +11299,13 @@ impl super::ApplicationCoordinator {
                                         PttWait::ClockJumped(jump) => {
                                             // One drop per bundle item, like the F8
                                             // abort below.
-                                            let frames: Vec<(String, Option<String>)> = item_texts
+                                            let frames: Vec<_> = item_texts
                                                 .into_iter()
                                                 .zip(encoded_qso_ids)
+                                                .zip(&items)
+                                                .map(|((text, qso_id), item)| {
+                                                    (text, qso_id, item.attempt_id)
+                                                })
                                                 .collect();
                                             drop_frames_for_clock_jump(
                                                 &message_bus,
@@ -10994,8 +11327,10 @@ impl super::ApplicationCoordinator {
                                             // was ever sent for any bundle item, leaking a
                                             // self-CQ's pending_self_cq_qsos entry and never
                                             // rolling back its speculative streak/offset.
-                                            for (text, qso_id) in
-                                                item_texts.into_iter().zip(encoded_qso_ids)
+                                            for ((text, qso_id), item) in item_texts
+                                                .into_iter()
+                                                .zip(encoded_qso_ids)
+                                                .zip(&items)
                                             {
                                                 if let Err(e) = report_transmit_complete(
                                                     &message_bus,
@@ -11003,6 +11338,7 @@ impl super::ApplicationCoordinator {
                                                     text,
                                                     0,
                                                     qso_id,
+                                                    item.attempt_id,
                                                 )
                                                 .await
                                                 {
@@ -11074,9 +11410,9 @@ impl super::ApplicationCoordinator {
                                         &encoded_qso_ids,
                                         &step_4b_callsigns,
                                         required_parity,
+                                        DxParityContext::live(&operating_frequency_hz, slot_ns),
                                         &active_tx_qsos,
                                         &cross_time_state,
-                                        dx_parity_freshness_window(slot_ns),
                                     );
 
                                     // PAN-118: re-evaluate the band plan per item
@@ -11159,6 +11495,7 @@ impl super::ApplicationCoordinator {
                                                 item.message_text.clone(),
                                                 0,
                                                 item.qso_id.clone(),
+                                                item.attempt_id,
                                             )
                                             .await;
                                         }
@@ -11222,7 +11559,7 @@ impl super::ApplicationCoordinator {
                                     // a fresher same-text frame re-bound by the pivot.
                                     let pre_pivot_frames: std::collections::HashMap<
                                         String,
-                                        (String, pancetta_qso::UnsentAttemptPayload),
+                                        ReplacedFrame,
                                     > = live_items_pre
                                         .iter()
                                         .filter_map(|item| {
@@ -11239,6 +11576,7 @@ impl super::ApplicationCoordinator {
                                                                 item.remote_client_key_id.clone(),
                                                             )),
                                                         },
+                                                        item.attempt_id,
                                                     ),
                                                 )
                                             })
@@ -11448,6 +11786,7 @@ impl super::ApplicationCoordinator {
                                                         &message_bus,
                                                         item.message_text.clone(),
                                                         item.qso_id.clone(),
+                                                        item.attempt_id,
                                                         take_bundle_replaced(
                                                             &mut early_replaced,
                                                             item.qso_id.as_deref(),
@@ -11485,6 +11824,7 @@ impl super::ApplicationCoordinator {
                                                     &message_bus,
                                                     item.message_text.clone(),
                                                     item.qso_id.clone(),
+                                                    item.attempt_id,
                                                     take_bundle_replaced(
                                                         &mut early_replaced,
                                                         item.qso_id.as_deref(),
@@ -11530,14 +11870,16 @@ impl super::ApplicationCoordinator {
                                                         Vec::new(),
                                                     )
                                                     .await;
-                                                    for (text, qso_id) in rebuilt_texts
+                                                    for ((text, qso_id), item) in rebuilt_texts
                                                         .into_iter()
                                                         .zip(rebuilt_qso_ids)
+                                                        .zip(&rebuilt_items)
                                                     {
                                                         let _ = report_unaired_frame(
                                                             &message_bus,
                                                             text,
                                                             qso_id.clone(),
+                                                            item.attempt_id,
                                                             take_bundle_replaced(
                                                                 &mut early_replaced,
                                                                 qso_id.as_deref(),
@@ -11607,6 +11949,7 @@ impl super::ApplicationCoordinator {
                                                 &message_bus,
                                                 item.message_text.clone(),
                                                 item.qso_id.clone(),
+                                                item.attempt_id,
                                                 take_bundle_replaced(
                                                     &mut early_replaced,
                                                     item.qso_id.as_deref(),
@@ -11644,6 +11987,7 @@ impl super::ApplicationCoordinator {
                                                 &message_bus,
                                                 item.message_text.clone(),
                                                 item.qso_id.clone(),
+                                                item.attempt_id,
                                                 take_bundle_replaced(
                                                     &mut early_replaced,
                                                     item.qso_id.as_deref(),
@@ -11697,6 +12041,7 @@ impl super::ApplicationCoordinator {
                                                 &message_bus,
                                                 item.message_text.clone(),
                                                 item.qso_id.clone(),
+                                                item.attempt_id,
                                                 take_bundle_replaced(
                                                     &mut early_replaced,
                                                     item.qso_id.as_deref(),
@@ -11780,8 +12125,10 @@ impl super::ApplicationCoordinator {
                                             .await;
                                         }
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
-                                        for (text, qso_id) in
-                                            item_texts.into_iter().zip(encoded_qso_ids_final)
+                                        for ((text, qso_id), item) in item_texts
+                                            .into_iter()
+                                            .zip(encoded_qso_ids_final)
+                                            .zip(&items)
                                         {
                                             let _ = report_transmit_complete(
                                                 &message_bus,
@@ -11789,6 +12136,7 @@ impl super::ApplicationCoordinator {
                                                 text,
                                                 0,
                                                 qso_id,
+                                                item.attempt_id,
                                             )
                                             .await;
                                         }
@@ -11904,6 +12252,7 @@ impl super::ApplicationCoordinator {
                                                 &message_bus,
                                                 item.message_text.clone(),
                                                 item.qso_id.clone(),
+                                                item.attempt_id,
                                                 take_bundle_replaced(
                                                     &mut bundle_replaced,
                                                     item.qso_id.as_deref(),
@@ -11919,9 +12268,9 @@ impl super::ApplicationCoordinator {
                                             &encoded_qso_ids_final,
                                             &final_gate_callsigns,
                                             required_parity,
+                                            DxParityContext::live(&operating_frequency_hz, slot_ns),
                                             &active_tx_qsos,
                                             &cross_time_state,
-                                            dx_parity_freshness_window(slot_ns),
                                         );
                                     if !final_live_mask.iter().all(|&live| live) {
                                         ptt_active.store(false, Ordering::Release);
@@ -11960,6 +12309,7 @@ impl super::ApplicationCoordinator {
                                                 &message_bus,
                                                 item.message_text.clone(),
                                                 item.qso_id.clone(),
+                                                item.attempt_id,
                                                 take_bundle_replaced(
                                                     &mut bundle_replaced,
                                                     item.qso_id.as_deref(),
@@ -12016,6 +12366,7 @@ impl super::ApplicationCoordinator {
                                                 &message_bus,
                                                 item.message_text.clone(),
                                                 item.qso_id.clone(),
+                                                item.attempt_id,
                                                 take_bundle_replaced(
                                                     &mut bundle_replaced,
                                                     item.qso_id.as_deref(),
@@ -12076,6 +12427,7 @@ impl super::ApplicationCoordinator {
                                                 &message_bus,
                                                 item.message_text.clone(),
                                                 item.qso_id.clone(),
+                                                item.attempt_id,
                                                 take_bundle_replaced(
                                                     &mut bundle_replaced,
                                                     item.qso_id.as_deref(),
@@ -12142,6 +12494,7 @@ impl super::ApplicationCoordinator {
                                                 &message_bus,
                                                 item.message_text.clone(),
                                                 item.qso_id.clone(),
+                                                item.attempt_id,
                                                 take_bundle_replaced(
                                                     &mut bundle_replaced,
                                                     item.qso_id.as_deref(),
@@ -12220,6 +12573,7 @@ impl super::ApplicationCoordinator {
                                                     &message_bus,
                                                     item.message_text.clone(),
                                                     item.qso_id.clone(),
+                                                    item.attempt_id,
                                                     take_bundle_replaced(
                                                         &mut bundle_replaced,
                                                         item.qso_id.as_deref(),
@@ -12271,10 +12625,14 @@ impl super::ApplicationCoordinator {
                                             &mut pivoted_once,
                                             &mut pivoted_from,
                                         );
-                                        let frames: Vec<(String, Option<String>)> = items
+                                        let frames: Vec<_> = items
                                             .iter()
                                             .map(|item| {
-                                                (item.message_text.clone(), item.qso_id.clone())
+                                                (
+                                                    item.message_text.clone(),
+                                                    item.qso_id.clone(),
+                                                    item.attempt_id,
+                                                )
                                             })
                                             .collect();
                                         drop_frames_for_clock_jump(
@@ -12327,6 +12685,7 @@ impl super::ApplicationCoordinator {
                                                     item.message_text.clone(),
                                                     0,
                                                     item.qso_id.clone(),
+                                                    item.attempt_id,
                                                 )
                                                 .await
                                                 {
@@ -12370,6 +12729,7 @@ impl super::ApplicationCoordinator {
                                                     &message_bus,
                                                     item.message_text.clone(),
                                                     item.qso_id.clone(),
+                                                    item.attempt_id,
                                                     take_bundle_replaced(
                                                         &mut bundle_replaced,
                                                         item.qso_id.as_deref(),
@@ -12451,6 +12811,11 @@ impl super::ApplicationCoordinator {
                                     // PR #468 review: playback is timed from the enqueue, so the
                                     // bounded TX-log wait below never extends key-down past the audio.
                                     let audio_enqueued_at = tokio::time::Instant::now();
+                                    // PAN-182 (PR #507 review): only an `Enqueued` outcome put
+                                    // samples on the Audio route. A `Dropped`/error delivery keyed
+                                    // no audio, so Step 10 must report every item as not sent.
+                                    let audio_enqueued =
+                                        matches!(outcome, Ok(SendIfOutcome::Enqueued));
                                     match outcome {
                                         Ok(SendIfOutcome::Enqueued) => {
                                             // Band Activity's own-TX history logs the actual
@@ -12537,6 +12902,7 @@ impl super::ApplicationCoordinator {
                                                     &message_bus,
                                                     item.message_text.clone(),
                                                     item.qso_id.clone(),
+                                                    item.attempt_id,
                                                     take_bundle_replaced(
                                                         &mut bundle_replaced,
                                                         item.qso_id.as_deref(),
@@ -12600,6 +12966,7 @@ impl super::ApplicationCoordinator {
                                                     item.message_text.clone(),
                                                     0,
                                                     item.qso_id.clone(),
+                                                    item.attempt_id,
                                                 )
                                                 .await
                                                 {
@@ -12649,6 +13016,7 @@ impl super::ApplicationCoordinator {
                                                     item.message_text.clone(),
                                                     0,
                                                     item.qso_id.clone(),
+                                                    item.attempt_id,
                                                 )
                                                 .await
                                                 {
@@ -12696,7 +13064,11 @@ impl super::ApplicationCoordinator {
                                             continue;
                                         }
                                     }
-                                    let success = true;
+                                    // PAN-182 (PR #507 review): success means the audio actually
+                                    // enqueued at Step 7 — a `Dropped`/error delivery keyed no
+                                    // samples, so no item aired and Step 10 reports each through
+                                    // the PAN-75 not-sent path instead.
+                                    let success = audio_enqueued;
                                     let duration_ms = audio_duration_ms;
 
                                     // --- Step 9: De-assert PTT (with tail delay) ---
@@ -12719,15 +13091,23 @@ impl super::ApplicationCoordinator {
                                         // real values now, per item, rather than skipping
                                         // TransmitComplete entirely (leaking every bundle
                                         // item's pending_self_cq_qsos entry).
-                                        for (text, qso_id) in
-                                            item_texts.into_iter().zip(encoded_qso_ids_final)
+                                        for ((text, qso_id), item) in item_texts
+                                            .into_iter()
+                                            .zip(encoded_qso_ids_final)
+                                            .zip(&items)
                                         {
-                                            if let Err(e) = report_transmit_complete(
+                                            if let Err(e) = report_played_transmit_complete(
                                                 &message_bus,
                                                 success,
                                                 text,
                                                 duration_ms,
                                                 qso_id,
+                                                aired_payload(
+                                                    item.frequency_offset,
+                                                    item.origin,
+                                                    item.remote_client_key_id.clone(),
+                                                ),
+                                                item.attempt_id,
                                             )
                                             .await
                                             {
@@ -12752,15 +13132,23 @@ impl super::ApplicationCoordinator {
                                     ptt_guard.disarm();
 
                                     // --- Step 10: Send TransmitComplete for each item ---
-                                    for (text, qso_id) in
-                                        item_texts.into_iter().zip(encoded_qso_ids_final)
+                                    for ((text, qso_id), item) in item_texts
+                                        .into_iter()
+                                        .zip(encoded_qso_ids_final)
+                                        .zip(&items)
                                     {
-                                        if let Err(e) = report_transmit_complete(
+                                        if let Err(e) = report_played_transmit_complete(
                                             &message_bus,
                                             success,
                                             text,
                                             duration_ms,
                                             qso_id,
+                                            aired_payload(
+                                                item.frequency_offset,
+                                                item.origin,
+                                                item.remote_client_key_id.clone(),
+                                            ),
+                                            item.attempt_id,
                                         )
                                         .await
                                         {
@@ -13459,16 +13847,41 @@ mod schedule_tx_tests {
 
     // --- PAN-141: DX-parity freshness gate ---
 
+    const DIAL_20M: u64 = 14_074_000;
+    const DIAL_15M: u64 = 21_074_000;
+
+    /// An a7 entry heard on 20 m on the FT8 grid — the context every
+    /// pre-PAN-146 test implicitly assumed.
     fn a7_call(
         callsign: &str,
         slot_parity: u8,
         decoded_at: std::time::SystemTime,
+    ) -> pancetta_qso::A7ExpectedCall {
+        a7_call_in(callsign, slot_parity, decoded_at, DIAL_20M, SLOT_NS)
+    }
+
+    fn a7_call_in(
+        callsign: &str,
+        slot_parity: u8,
+        decoded_at: std::time::SystemTime,
+        captured_dial_hz: u64,
+        slot_ns: i64,
     ) -> pancetta_qso::A7ExpectedCall {
         pancetta_qso::A7ExpectedCall {
             callsign: callsign.to_string(),
             freq_hz: 1500.0,
             slot_parity,
             decoded_at,
+            captured_dial_hz,
+            slot_ns,
+        }
+    }
+
+    /// Keying on 20 m, FT8 grid.
+    fn ft8_20m() -> super::DxParityContext {
+        super::DxParityContext {
+            dial_hz: DIAL_20M,
+            slot_ns: SLOT_NS,
         }
     }
 
@@ -13486,9 +13899,9 @@ mod schedule_tx_tests {
         assert!(super::dx_parity_conflict(
             "5Z4VJ",
             SlotParity::Odd,
+            ft8_20m(),
             &cts,
             now,
-            std::time::Duration::from_secs(30),
         ));
     }
 
@@ -13508,9 +13921,9 @@ mod schedule_tx_tests {
         assert!(super::dx_parity_conflict(
             "5z4vj",
             SlotParity::Odd,
+            ft8_20m(),
             &cts,
             now,
-            std::time::Duration::from_secs(30),
         ));
     }
 
@@ -13531,9 +13944,9 @@ mod schedule_tx_tests {
         assert!(super::dx_parity_conflict(
             "EA8/G8BCG",
             SlotParity::Odd,
+            ft8_20m(),
             &cts,
             now,
-            std::time::Duration::from_secs(30),
         ));
     }
 
@@ -13558,13 +13971,7 @@ mod schedule_tx_tests {
             .record(a7_call("G8BCG", 0 /* Even */, now));
 
         assert!(
-            !super::dx_parity_conflict(
-                "G8BCG",
-                SlotParity::Odd,
-                &cts,
-                now,
-                std::time::Duration::from_secs(30),
-            ),
+            !super::dx_parity_conflict("G8BCG", SlotParity::Odd, ft8_20m(), &cts, now,),
             "the newest entry (Even, now) must win over the older Odd alias"
         );
     }
@@ -13582,9 +13989,9 @@ mod schedule_tx_tests {
         assert!(!super::dx_parity_conflict(
             "5Z4VJ",
             SlotParity::Odd,
+            ft8_20m(),
             &cts,
             now,
-            std::time::Duration::from_secs(30),
         ));
     }
 
@@ -13602,9 +14009,9 @@ mod schedule_tx_tests {
         assert!(!super::dx_parity_conflict(
             "5Z4VJ",
             SlotParity::Odd,
+            ft8_20m(),
             &cts,
             std::time::SystemTime::now(),
-            std::time::Duration::from_secs(30),
         ));
     }
 
@@ -13614,9 +14021,9 @@ mod schedule_tx_tests {
         assert!(!super::dx_parity_conflict(
             "UNKNOWN",
             SlotParity::Odd,
+            ft8_20m(),
             &cts,
             std::time::SystemTime::now(),
-            std::time::Duration::from_secs(30),
         ));
     }
 
@@ -13631,9 +14038,9 @@ mod schedule_tx_tests {
         assert!(!super::dx_parity_conflict(
             "5Z4VJ",
             SlotParity::Odd,
+            ft8_20m(),
             &cts,
             std::time::SystemTime::now(),
-            std::time::Duration::from_secs(30),
         ));
     }
 
@@ -13647,6 +14054,273 @@ mod schedule_tx_tests {
             super::dx_parity_freshness_window(FT4_SLOT_NS),
             std::time::Duration::from_millis(15_000)
         );
+    }
+
+    // --- PAN-146: DX-parity evidence is scoped to band and slot grid ---
+
+    /// The ticket's scenario: 5Z4VJ heard on 20 m on Odd; the operator
+    /// switches to 15 m while idle and calls 5Z4VJ there, keying Odd. The
+    /// 20 m observation says nothing about 15 m — proceed.
+    #[test]
+    fn dx_parity_conflict_ignores_entry_heard_on_another_band() {
+        let cts = pancetta_qso::CrossTimeState::empty();
+        let now = std::time::SystemTime::now();
+        cts.a7_recent_calls
+            .write()
+            .unwrap()
+            .record(a7_call_in("5Z4VJ", 1, now, DIAL_20M, SLOT_NS));
+        let on_15m = super::DxParityContext {
+            dial_hz: DIAL_15M,
+            slot_ns: SLOT_NS,
+        };
+        assert!(!super::dx_parity_conflict(
+            "5Z4VJ",
+            SlotParity::Odd,
+            on_15m,
+            &cts,
+            now
+        ));
+        // Control: the same entry still holds on its own band.
+        assert!(super::dx_parity_conflict(
+            "5Z4VJ",
+            SlotParity::Odd,
+            ft8_20m(),
+            &cts,
+            now
+        ));
+    }
+
+    /// FT8 and FT4 parities describe different slot boundaries: an FT8-grid
+    /// Odd is not evidence against an FT4-grid Odd key-up on the same band.
+    #[test]
+    fn dx_parity_conflict_ignores_entry_from_another_slot_grid() {
+        let cts = pancetta_qso::CrossTimeState::empty();
+        let now = std::time::SystemTime::now();
+        cts.a7_recent_calls
+            .write()
+            .unwrap()
+            .record(a7_call_in("5Z4VJ", 1, now, DIAL_20M, SLOT_NS));
+        let ft4_20m = super::DxParityContext {
+            dial_hz: DIAL_20M,
+            slot_ns: FT4_SLOT_NS,
+        };
+        assert!(!super::dx_parity_conflict(
+            "5Z4VJ",
+            SlotParity::Odd,
+            ft4_20m,
+            &cts,
+            now
+        ));
+    }
+
+    /// Band granularity, not exact dial: an entry keeps the exact dial its
+    /// window closed on (PAN-67), so an intra-band retune must still count.
+    #[test]
+    fn dx_parity_conflict_still_holds_after_intra_band_retune() {
+        let cts = pancetta_qso::CrossTimeState::empty();
+        let now = std::time::SystemTime::now();
+        cts.a7_recent_calls
+            .write()
+            .unwrap()
+            .record(a7_call_in("5Z4VJ", 1, now, DIAL_20M, SLOT_NS));
+        let retuned = super::DxParityContext {
+            dial_hz: 14_090_000,
+            slot_ns: SLOT_NS,
+        };
+        assert!(super::dx_parity_conflict(
+            "5Z4VJ",
+            SlotParity::Odd,
+            retuned,
+            &cts,
+            now
+        ));
+    }
+
+    /// With the dial unknown (0) on either side there is no band switch to
+    /// detect, so the band check is skipped and the PAN-141 hold still
+    /// works (e.g. a station with no CAT dial, or decodes from before the
+    /// first rig poll). The slot-grid check still applies.
+    #[test]
+    fn dx_parity_conflict_skips_band_check_when_a_dial_is_unknown() {
+        let now = std::time::SystemTime::now();
+        for (entry_dial, live_dial) in [(0, 0), (0, DIAL_15M), (DIAL_20M, 0)] {
+            let cts = pancetta_qso::CrossTimeState::empty();
+            cts.a7_recent_calls
+                .write()
+                .unwrap()
+                .record(a7_call_in("5Z4VJ", 1, now, entry_dial, SLOT_NS));
+            let live = super::DxParityContext {
+                dial_hz: live_dial,
+                slot_ns: SLOT_NS,
+            };
+            assert!(
+                super::dx_parity_conflict("5Z4VJ", SlotParity::Odd, live, &cts, now),
+                "entry dial {entry_dial}, live dial {live_dial} must still hold"
+            );
+            let ft4 = super::DxParityContext {
+                dial_hz: live_dial,
+                slot_ns: FT4_SLOT_NS,
+            };
+            assert!(!super::dx_parity_conflict(
+                "5Z4VJ",
+                SlotParity::Odd,
+                ft4,
+                &cts,
+                now
+            ));
+        }
+    }
+
+    /// The context filter runs before the newest-entry pick: a newer alias
+    /// heard on another band must not hide the in-context entry.
+    #[test]
+    fn dx_parity_conflict_newest_pick_is_among_in_context_entries() {
+        let cts = pancetta_qso::CrossTimeState::empty();
+        let now = std::time::SystemTime::now();
+        let older = now - std::time::Duration::from_secs(20);
+        cts.a7_recent_calls.write().unwrap().record(a7_call_in(
+            "EA8/G8BCG",
+            1,
+            older,
+            DIAL_20M,
+            SLOT_NS,
+        ));
+        cts.a7_recent_calls
+            .write()
+            .unwrap()
+            .record(a7_call_in("G8BCG", 0, now, DIAL_15M, SLOT_NS));
+        assert!(super::dx_parity_conflict(
+            "G8BCG",
+            SlotParity::Odd,
+            ft8_20m(),
+            &cts,
+            now
+        ));
+    }
+
+    /// End to end through the async resolver with the live dial atom: the
+    /// PAN-146 repro (20 m entry, operator now on 15 m) proceeds; the same
+    /// call on 20 m still holds.
+    #[tokio::test]
+    async fn dx_parity_conflict_for_qso_scopes_to_live_dial() {
+        let manager = pancetta_qso::QsoManager::new(test_qso_manager_config());
+        let qso_id = manager
+            .respond_to_cq_manual("5Z4VJ".to_string(), 1500.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        let cts = pancetta_qso::CrossTimeState::empty();
+        cts.a7_recent_calls.write().unwrap().record(a7_call_in(
+            "5Z4VJ",
+            1,
+            std::time::SystemTime::now(),
+            DIAL_20M,
+            SLOT_NS,
+        ));
+        let (_tx, rx) = tokio::sync::watch::channel(Some(manager));
+        let dial = std::sync::atomic::AtomicU64::new(DIAL_15M);
+        assert!(
+            !super::dx_parity_conflict_for_qso(
+                Some(&qso_id.to_string()),
+                SlotParity::Odd,
+                &dial,
+                SLOT_NS,
+                &rx,
+                &cts,
+            )
+            .await
+        );
+        dial.store(DIAL_20M, Ordering::Relaxed);
+        assert!(
+            super::dx_parity_conflict_for_qso(
+                Some(&qso_id.to_string()),
+                SlotParity::Odd,
+                &dial,
+                SLOT_NS,
+                &rx,
+                &cts,
+            )
+            .await
+        );
+    }
+
+    /// Step 4d uses the same context rule as Step 4b.
+    #[test]
+    fn final_single_tx_gate_denial_ignores_out_of_context_entry() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, RwLock};
+        let active: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+        active
+            .write()
+            .unwrap()
+            .insert(super::super::active_tx_qso_key("qso-kenya"));
+        let cts = pancetta_qso::CrossTimeState::empty();
+        cts.a7_recent_calls.write().unwrap().record(a7_call_in(
+            "5Z4VJ",
+            1,
+            std::time::SystemTime::now(),
+            DIAL_20M,
+            SLOT_NS,
+        ));
+        let on_15m = super::DxParityContext {
+            dial_hz: DIAL_15M,
+            slot_ns: SLOT_NS,
+        };
+        assert!(super::final_single_tx_gate_denial(
+            Some("qso-kenya"),
+            SlotParity::Odd,
+            on_15m,
+            &active,
+            Some("5Z4VJ"),
+            &cts,
+        )
+        .is_none());
+        assert_eq!(
+            super::final_single_tx_gate_denial(
+                Some("qso-kenya"),
+                SlotParity::Odd,
+                ft8_20m(),
+                &active,
+                Some("5Z4VJ"),
+                &cts,
+            ),
+            Some(super::FinalGateDenial::DxParityConflict)
+        );
+    }
+
+    /// Multi-TX: only the item whose DX was observed in the bundle's
+    /// context is held.
+    #[test]
+    fn bundle_live_mask_holds_only_items_observed_in_context() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, RwLock};
+        let active: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+        active
+            .write()
+            .unwrap()
+            .insert(super::super::active_tx_qso_key("qso-kenya"));
+        active
+            .write()
+            .unwrap()
+            .insert(super::super::active_tx_qso_key("qso-spain"));
+        let cts = pancetta_qso::CrossTimeState::empty();
+        let now = std::time::SystemTime::now();
+        cts.a7_recent_calls
+            .write()
+            .unwrap()
+            .record(a7_call_in("5Z4VJ", 1, now, DIAL_20M, SLOT_NS));
+        cts.a7_recent_calls.write().unwrap().record(a7_call_in(
+            "EA8BCG",
+            1,
+            now,
+            DIAL_20M,
+            FT4_SLOT_NS,
+        ));
+        let ids = vec![Some("qso-kenya".to_string()), Some("qso-spain".to_string())];
+        let callsigns = vec![Some("5Z4VJ".to_string()), Some("EA8BCG".to_string())];
+        let (live, held) =
+            super::bundle_live_mask(&ids, &callsigns, SlotParity::Odd, ft8_20m(), &active, &cts);
+        assert_eq!(held, vec![true, false]);
+        assert_eq!(live, vec![false, true]);
     }
 
     fn test_qso_manager_config() -> pancetta_qso::QsoManagerConfig {
@@ -13685,9 +14359,10 @@ mod schedule_tx_tests {
             super::dx_parity_conflict_for_qso(
                 Some(&qso_id.to_string()),
                 SlotParity::Odd,
+                &std::sync::atomic::AtomicU64::new(DIAL_20M),
+                SLOT_NS,
                 &rx,
                 &cts,
-                std::time::Duration::from_secs(30),
             )
             .await,
             "must detect the collision: DX just observed on the exact parity we're about to key"
@@ -13721,9 +14396,10 @@ mod schedule_tx_tests {
             !super::dx_parity_conflict_for_qso(
                 Some(&qso_id.to_string()),
                 SlotParity::Odd,
+                &std::sync::atomic::AtomicU64::new(DIAL_20M),
+                SLOT_NS,
                 &rx,
                 &cts,
-                std::time::Duration::from_secs(30),
             )
             .await
         );
@@ -13740,9 +14416,10 @@ mod schedule_tx_tests {
             !super::dx_parity_conflict_for_qso(
                 None,
                 SlotParity::Odd,
+                &std::sync::atomic::AtomicU64::new(DIAL_20M),
+                SLOT_NS,
                 &rx,
                 &cts,
-                std::time::Duration::from_secs(30),
             )
             .await
         );
@@ -13750,9 +14427,10 @@ mod schedule_tx_tests {
             !super::dx_parity_conflict_for_qso(
                 Some("00000000-0000-0000-0000-000000000000"),
                 SlotParity::Odd,
+                &std::sync::atomic::AtomicU64::new(DIAL_20M),
+                SLOT_NS,
                 &rx,
                 &cts,
-                std::time::Duration::from_secs(30),
             )
             .await
         );
@@ -13776,10 +14454,10 @@ mod schedule_tx_tests {
         assert!(super::final_single_tx_gate_denial(
             Some("qso-peru"),
             SlotParity::Odd,
+            ft8_20m(),
             &active,
             None,
             &cts,
-            std::time::Duration::from_secs(30),
         )
         .is_none());
     }
@@ -13810,10 +14488,10 @@ mod schedule_tx_tests {
             super::final_single_tx_gate_denial(
                 Some("qso-peru"),
                 SlotParity::Odd,
+                ft8_20m(),
                 &active,
                 None,
                 &cts,
-                std::time::Duration::from_secs(30),
             )
             .is_none(),
             "Step 4b's check must see the QSO as live"
@@ -13831,10 +14509,10 @@ mod schedule_tx_tests {
             super::final_single_tx_gate_denial(
                 Some("qso-peru"),
                 SlotParity::Odd,
+                ft8_20m(),
                 &active,
                 None,
                 &cts,
-                std::time::Duration::from_secs(30),
             ),
             Some(super::FinalGateDenial::StaleQso),
             "Step 4d's final check must catch a cancellation Step 4b could not have seen"
@@ -13871,10 +14549,10 @@ mod schedule_tx_tests {
             super::final_single_tx_gate_denial(
                 Some(&qso_id.to_string()),
                 SlotParity::Odd,
+                ft8_20m(),
                 &active,
                 their_callsign.as_deref(),
                 &cts,
-                std::time::Duration::from_secs(30),
             )
             .is_none(),
             "Step 4b's check must see no conflict yet"
@@ -13892,10 +14570,10 @@ mod schedule_tx_tests {
             super::final_single_tx_gate_denial(
                 Some(&qso_id.to_string()),
                 SlotParity::Odd,
+                ft8_20m(),
                 &active,
                 their_callsign.as_deref(),
                 &cts,
-                std::time::Duration::from_secs(30),
             ),
             Some(super::FinalGateDenial::DxParityConflict),
             "Step 4d's final check must catch a collision decode Step 4b could not have seen"
@@ -13961,10 +14639,10 @@ mod schedule_tx_tests {
         assert!(super::final_single_tx_gate_denial(
             Some("qso-peru"),
             SlotParity::Odd,
+            ft8_20m(),
             &active,
             None,
             &cts,
-            std::time::Duration::from_secs(30),
         )
         .is_none());
         assert_eq!(
@@ -14003,14 +14681,8 @@ mod schedule_tx_tests {
         let ids = vec![Some("qso-peru".to_string()), Some("qso-kenya".to_string())];
         let callsigns: Vec<Option<String>> = vec![None, None];
 
-        let (live, held) = super::bundle_live_mask(
-            &ids,
-            &callsigns,
-            SlotParity::Odd,
-            &active,
-            &cts,
-            std::time::Duration::from_secs(30),
-        );
+        let (live, held) =
+            super::bundle_live_mask(&ids, &callsigns, SlotParity::Odd, ft8_20m(), &active, &cts);
         assert_eq!(live, vec![true, true]);
         assert_eq!(held, vec![false, false]);
 
@@ -14018,14 +14690,8 @@ mod schedule_tx_tests {
             .write()
             .unwrap()
             .remove(&super::super::active_tx_qso_key("qso-kenya"));
-        let (live, held) = super::bundle_live_mask(
-            &ids,
-            &callsigns,
-            SlotParity::Odd,
-            &active,
-            &cts,
-            std::time::Duration::from_secs(30),
-        );
+        let (live, held) =
+            super::bundle_live_mask(&ids, &callsigns, SlotParity::Odd, ft8_20m(), &active, &cts);
         assert_eq!(live, vec![true, false]);
         assert_eq!(held, vec![false, false]);
     }
@@ -14061,9 +14727,9 @@ mod schedule_tx_tests {
             &survivors,
             &callsigns,
             SlotParity::Odd,
+            ft8_20m(),
             &active,
             &cts,
-            std::time::Duration::from_secs(30),
         );
         assert_eq!(
             step_4b_mask,
@@ -14082,9 +14748,9 @@ mod schedule_tx_tests {
             &survivors,
             &callsigns,
             SlotParity::Odd,
+            ft8_20m(),
             &active,
             &cts,
-            std::time::Duration::from_secs(30),
         );
         assert_eq!(
             step_4d_mask,
@@ -14155,6 +14821,7 @@ mod schedule_tx_tests {
 
     fn tx_request(tx_parity: Option<SlotParity>) -> MessageType {
         MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: "CQ TEST".to_string(),
             frequency_offset: 1500.0,
             qso_id: None,
@@ -15139,6 +15806,7 @@ mod disarm_interrupt_signal_tests {
         let arm = Arc::new(std::sync::Mutex::new(pancetta_agent::arm::ArmState::new()));
         let items = [
             crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "W1ABC K5ARH -10".into(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-a".into()),
@@ -15146,6 +15814,7 @@ mod disarm_interrupt_signal_tests {
                 remote_client_key_id: None,
             },
             crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "K2DEF K5ARH -15".into(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-b".into()),
@@ -15384,6 +16053,7 @@ mod supersede_rekey_tests {
         let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
 
         let new_request = MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: "NEW TEXT".to_string(),
             frequency_offset: 1500.0,
             qso_id: Some("qso-1".to_string()),
@@ -15498,6 +16168,7 @@ mod supersede_rekey_tests {
         let b_text = "W1AW K5ARH R-09";
         let b_freq = 1600.0_f64;
         let new_request = MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: b_text.to_string(),
             frequency_offset: b_freq,
             qso_id: Some("qso-super".to_string()),
@@ -15635,6 +16306,7 @@ mod supersede_rekey_tests {
         let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
 
         let in_flight = [crate::message_bus::TransmitRequestItem {
+            attempt_id: None,
             message_text: "KA1ABC K5ARH R-15".to_string(),
             frequency_offset: 1000.0,
             qso_id: Some("qso-1".to_string()),
@@ -15643,6 +16315,7 @@ mod supersede_rekey_tests {
         }];
 
         let new_request = MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: "CQ K5ARH EM12".to_string(),
             frequency_offset: 1400.0,
             qso_id: Some("qso-2".to_string()),
@@ -15726,6 +16399,7 @@ mod supersede_rekey_tests {
             let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
 
             let in_flight = [crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-1".to_string()),
@@ -15734,6 +16408,7 @@ mod supersede_rekey_tests {
             }];
 
             let new_request = MessageType::TransmitRequest {
+                attempt_id: None,
                 message_text: "CQ K5ARH EM12".to_string(),
                 frequency_offset: 1400.0,
                 qso_id: Some("qso-2".to_string()),
@@ -15813,6 +16488,7 @@ mod supersede_rekey_tests {
         let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
 
         let in_flight = [crate::message_bus::TransmitRequestItem {
+            attempt_id: None,
             message_text: "KA1ABC K5ARH R-15".to_string(),
             frequency_offset: 1000.0,
             qso_id: Some("qso-1".to_string()),
@@ -15821,6 +16497,7 @@ mod supersede_rekey_tests {
         }];
 
         let new_request = MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: "CQ K5ARH EM12".to_string(),
             frequency_offset: 1400.0,
             qso_id: Some("qso-2".to_string()),
@@ -15902,6 +16579,7 @@ mod supersede_rekey_tests {
         let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
 
         let in_flight = [crate::message_bus::TransmitRequestItem {
+            attempt_id: None,
             message_text: "KA1ABC K5ARH R-15".to_string(),
             frequency_offset: 1000.0,
             qso_id: Some("qso-1".to_string()),
@@ -15910,6 +16588,7 @@ mod supersede_rekey_tests {
         }];
 
         let new_request = MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: "CQ K5ARH EM12".to_string(),
             frequency_offset: 1400.0,
             qso_id: Some("qso-2".to_string()),
@@ -15945,6 +16624,7 @@ mod supersede_rekey_tests {
                 qso_id,
                 identity_conflict,
                 tx_parity,
+                attempt_id: _,
             } => {
                 assert_eq!(origin, crate::message_bus::TxOrigin::Remote);
                 assert_eq!(
@@ -16010,6 +16690,7 @@ mod supersede_rekey_tests {
         // Two in-flight QSOs; qso-1 is about to hop off 1000.0 Hz.
         let in_flight = [
             crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-1".to_string()),
@@ -16017,6 +16698,7 @@ mod supersede_rekey_tests {
                 remote_client_key_id: None,
             },
             crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "OTHER W5AU R-08".to_string(),
                 frequency_offset: 1400.0,
                 qso_id: Some("qso-other".to_string()),
@@ -16028,6 +16710,7 @@ mod supersede_rekey_tests {
         // Same text, same QSO, hopped 300 Hz off — the stuck-DX collision
         // avoidance shape.
         let new_request = MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: "KA1ABC K5ARH R-15".to_string(),
             frequency_offset: 1300.0,
             qso_id: Some("qso-1".to_string()),
@@ -16120,6 +16803,7 @@ mod supersede_rekey_tests {
         // Already 2 distinct in-flight QSOs — the configured cap.
         let in_flight = [
             crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-1".to_string()),
@@ -16127,6 +16811,7 @@ mod supersede_rekey_tests {
                 remote_client_key_id: None,
             },
             crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "OTHER W5AU R-08".to_string(),
                 frequency_offset: 1400.0,
                 qso_id: Some("qso-other".to_string()),
@@ -16137,6 +16822,7 @@ mod supersede_rekey_tests {
 
         // A THIRD, genuinely new QSO — not a refresh of either in-flight one.
         let new_request = MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: "THIRD W5AU EM10".to_string(),
             frequency_offset: 1800.0,
             qso_id: Some("qso-third".to_string()),
@@ -16223,6 +16909,7 @@ mod supersede_rekey_tests {
         // One tracked QSO + one manual (untracked) item already in flight.
         let in_flight = [
             crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-1".to_string()),
@@ -16230,6 +16917,7 @@ mod supersede_rekey_tests {
                 remote_client_key_id: None,
             },
             crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "MANUAL TUNE".to_string(),
                 frequency_offset: 1400.0,
                 qso_id: None,
@@ -16240,6 +16928,7 @@ mod supersede_rekey_tests {
 
         // A second new manual item — untracked, so `qso_id == None`.
         let new_request = MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: "SECOND MANUAL".to_string(),
             frequency_offset: 1800.0,
             qso_id: None,
@@ -16333,6 +17022,7 @@ mod supersede_rekey_tests {
             let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
 
             let new_request = MessageType::TransmitRequest {
+                attempt_id: None,
                 message_text: "NEW TEXT".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-new".to_string()),
@@ -16369,6 +17059,7 @@ mod supersede_rekey_tests {
                     remote_client_key_id: _,
                     identity_conflict: _,
                     tx_parity: _,
+                    attempt_id: _,
                 } => {
                     assert_eq!(
                         origin, new_origin,
@@ -16457,6 +17148,7 @@ mod supersede_rekey_tests {
             let ptt_active = Arc::new(AtomicBool::new(true));
             let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
             let in_flight = [crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-1".to_string()),
@@ -16465,6 +17157,7 @@ mod supersede_rekey_tests {
             }];
 
             let new_request = MessageType::TransmitRequest {
+                attempt_id: None,
                 message_text: "CQ K5ARH EM12".to_string(),
                 frequency_offset: 1400.0,
                 qso_id: Some("qso-2".to_string()),
@@ -16599,6 +17292,7 @@ mod supersede_rekey_tests {
 
         // The bundle currently on the air.
         let in_flight = [crate::message_bus::TransmitRequestItem {
+            attempt_id: None,
             message_text: "KA1ABC K5ARH R-15".to_string(),
             frequency_offset: 1000.0,
             qso_id: Some("qso-1".to_string()),
@@ -16611,6 +17305,7 @@ mod supersede_rekey_tests {
         let superseding = MessageType::MultiTransmitRequest {
             items: vec![
                 crate::message_bus::TransmitRequestItem {
+                    attempt_id: None,
                     message_text: "JA1XYZ K5ARH 73".to_string(),
                     frequency_offset: 1300.0,
                     qso_id: Some("qso-2".to_string()),
@@ -16618,6 +17313,7 @@ mod supersede_rekey_tests {
                     remote_client_key_id: None,
                 },
                 crate::message_bus::TransmitRequestItem {
+                    attempt_id: None,
                     message_text: "CQ K5ARH EM12".to_string(),
                     frequency_offset: 1700.0,
                     qso_id: None,
@@ -16723,6 +17419,7 @@ mod supersede_rekey_tests {
         // Already a full 2-item bundle in flight — the configured cap.
         let in_flight = [
             crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-1".to_string()),
@@ -16730,6 +17427,7 @@ mod supersede_rekey_tests {
                 remote_client_key_id: None,
             },
             crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "OTHER W5AU R-08".to_string(),
                 frequency_offset: 1400.0,
                 qso_id: Some("qso-other".to_string()),
@@ -16745,6 +17443,7 @@ mod supersede_rekey_tests {
             pancetta_core::slot::SLOT_NS,
         );
         let superseding = MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: "THIRD W5AU EM10".to_string(),
             frequency_offset: 1800.0,
             qso_id: Some("qso-third".to_string()),
@@ -16858,6 +17557,7 @@ mod supersede_rekey_tests {
         // A 2-item bundle in flight, bound to client-a.
         let in_flight = [
             crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-1".to_string()),
@@ -16865,6 +17565,7 @@ mod supersede_rekey_tests {
                 remote_client_key_id: Some("client-a".to_string()),
             },
             crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "OTHER W5AU R-08".to_string(),
                 frequency_offset: 1400.0,
                 qso_id: Some("qso-other".to_string()),
@@ -16880,6 +17581,7 @@ mod supersede_rekey_tests {
             pancetta_core::slot::SLOT_NS,
         );
         let superseding = MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: "K5ARH KA1ABC 73".to_string(),
             frequency_offset: 1500.0,
             qso_id: Some("qso-1".to_string()),
@@ -17003,6 +17705,7 @@ mod supersede_rekey_tests {
 
         // A single in-flight QSO — cap=2 leaves room for one more.
         let in_flight = [crate::message_bus::TransmitRequestItem {
+            attempt_id: None,
             message_text: "KA1ABC K5ARH R-15".to_string(),
             frequency_offset: 1000.0,
             qso_id: Some("qso-1".to_string()),
@@ -17017,6 +17720,7 @@ mod supersede_rekey_tests {
         );
         // A genuinely new QSO, well clear in frequency — the Bundle path.
         let superseding = MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: "SECOND W5AU EM10".to_string(),
             frequency_offset: 1400.0,
             qso_id: Some("qso-2".to_string()),
@@ -17077,6 +17781,7 @@ mod supersede_rekey_tests {
         let mut encoder = super::Ft8Encoder::new();
         let tx_params = pancetta_ft8::ProtocolParams::from_protocol(pancetta_ft8::Protocol::Ft8);
         let in_flight = [crate::message_bus::TransmitRequestItem {
+            attempt_id: None,
             message_text: "KA1ABC K5ARH R-15".to_string(),
             frequency_offset: 1000.0,
             qso_id: Some("qso-1".to_string()),
@@ -17084,6 +17789,7 @@ mod supersede_rekey_tests {
             remote_client_key_id: None,
         }];
         let new_item = crate::message_bus::TransmitRequestItem {
+            attempt_id: None,
             message_text: "CQ K5ARH EM12".to_string(),
             frequency_offset: 1400.0, // 400 Hz away — well clear of the ~75 Hz minimum
             qso_id: None,
@@ -17117,6 +17823,7 @@ mod supersede_rekey_tests {
         let mut encoder = super::Ft8Encoder::new();
         let tx_params = pancetta_ft8::ProtocolParams::from_protocol(pancetta_ft8::Protocol::Ft8);
         let in_flight = [crate::message_bus::TransmitRequestItem {
+            attempt_id: None,
             message_text: "KA1ABC K5ARH R-15".to_string(),
             frequency_offset: 1000.0,
             qso_id: Some("qso-1".to_string()),
@@ -17124,6 +17831,7 @@ mod supersede_rekey_tests {
             remote_client_key_id: None,
         }];
         let new_item = crate::message_bus::TransmitRequestItem {
+            attempt_id: None,
             message_text: "CQ K5ARH EM12".to_string(),
             frequency_offset: 1010.0, // 10 Hz away — well inside the ~75 Hz minimum, must collide
             qso_id: None,
@@ -17164,6 +17872,7 @@ mod supersede_rekey_tests {
 
         let in_flight = [
             crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "W1AAA K5ARH -10".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("hound-1".to_string()),
@@ -17171,6 +17880,7 @@ mod supersede_rekey_tests {
                 remote_client_key_id: None,
             },
             crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "W2BBB K5ARH -12".to_string(),
                 frequency_offset: 1300.0,
                 qso_id: Some("hound-2".to_string()),
@@ -17178,6 +17888,7 @@ mod supersede_rekey_tests {
                 remote_client_key_id: None,
             },
             crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "W3CCC K5ARH -08".to_string(),
                 frequency_offset: 1600.0,
                 qso_id: Some("hound-3".to_string()),
@@ -17186,6 +17897,7 @@ mod supersede_rekey_tests {
             },
         ];
         let refresh = || MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: "W1AAA K5ARH RR73".to_string(),
             frequency_offset: 1000.0,
             qso_id: Some("hound-1".to_string()),
@@ -17269,6 +17981,7 @@ mod supersede_rekey_tests {
             pancetta_core::slot::SLOT_NS,
         );
         let item = |text: &str, freq: f64, id: &str| crate::message_bus::TransmitRequestItem {
+            attempt_id: None,
             message_text: text.to_string(),
             frequency_offset: freq,
             qso_id: Some(id.to_string()),
@@ -17292,6 +18005,7 @@ mod supersede_rekey_tests {
         );
         let outcome = super::supersede_and_rekey_or_bundle(
             MessageType::TransmitRequest {
+                attempt_id: None,
                 message_text: "W1AAA K5ARH RR73".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("hound-1".to_string()),
@@ -17465,6 +18179,7 @@ mod coalesce_tests {
 
     fn entry(text: &str, qso_id: Option<&str>) -> CoalesceEntry {
         CoalesceEntry {
+            attempt_id: None,
             message_text: text.to_string(),
             frequency_offset: 1000.0,
             qso_id: qso_id.map(|s| s.to_string()),
@@ -17482,6 +18197,7 @@ mod coalesce_tests {
     /// call in this module).
     fn entry_freq(text: &str, qso_id: Option<&str>, freq: f64) -> CoalesceEntry {
         CoalesceEntry {
+            attempt_id: None,
             message_text: text.to_string(),
             frequency_offset: freq,
             qso_id: qso_id.map(|s| s.to_string()),
@@ -17502,6 +18218,7 @@ mod coalesce_tests {
 
     fn pan73_tx(text: &str, qso: &str, hz: f64) -> MessageType {
         MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: text.into(),
             frequency_offset: hz,
             qso_id: Some(qso.into()),
@@ -17631,6 +18348,7 @@ mod coalesce_tests {
         );
         let arm = Arc::new(Mutex::new(state));
         let request = |udp: bool| MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: if udp { "UDP" } else { "AGENT" }.into(),
             frequency_offset: if udp { 1000.0 } else { 1300.0 },
             qso_id: Some(if udp { "udp-qso" } else { "agent-qso" }.into()),
@@ -17878,6 +18596,7 @@ mod coalesce_tests {
         tx_parity: Option<pancetta_core::slot::SlotParity>,
     ) -> CoalesceEntry {
         CoalesceEntry {
+            attempt_id: None,
             message_text: text.to_string(),
             frequency_offset: 1000.0,
             qso_id: qso_id.map(|s| s.to_string()),
@@ -17898,6 +18617,7 @@ mod coalesce_tests {
         freq: f64,
     ) -> CoalesceEntry {
         CoalesceEntry {
+            attempt_id: None,
             message_text: text.to_string(),
             frequency_offset: freq,
             qso_id: qso_id.map(|s| s.to_string()),
@@ -18151,6 +18871,7 @@ mod coalesce_tests {
         ])));
 
         let head = MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: "A".to_string(),
             frequency_offset: 1000.0,
             qso_id: Some("qso-a".to_string()),
@@ -18164,6 +18885,7 @@ mod coalesce_tests {
                     ComponentId::Ft8Transmitter,
                     ComponentId::Ft8Transmitter,
                     MessageType::TransmitRequest {
+                        attempt_id: None,
                         message_text: text.to_string(),
                         frequency_offset: freq,
                         qso_id: Some(id.to_string()),
@@ -18221,6 +18943,7 @@ mod coalesce_tests {
         let mut notices = Vec::new();
         while let Ok(msg) = qso_rx.try_recv() {
             if let MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent {
+                attempt_id: _,
                 qso_id,
                 message_text,
                 replaced: None,
@@ -18273,6 +18996,7 @@ mod coalesce_tests {
             );
             let arm = Arc::new(Mutex::new(state));
             let request = |udp| MessageType::TransmitRequest {
+                attempt_id: None,
                 message_text: if udp { "UDP" } else { "AGENT" }.into(),
                 frequency_offset: if udp { 1000.0 } else { 1300.0 },
                 qso_id: Some(if udp { "udp-qso" } else { "agent-qso" }.into()),
@@ -18378,6 +19102,7 @@ mod coalesce_tests {
 
         // Head: a Local manual send. Backlog: a Remote/client-a QSO frame.
         let head = MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: "CQ K5ARH EM10".into(),
             frequency_offset: 900.0,
             qso_id: None,
@@ -18390,6 +19115,7 @@ mod coalesce_tests {
                 ComponentId::Ft8Transmitter,
                 ComponentId::Ft8Transmitter,
                 MessageType::TransmitRequest {
+                    attempt_id: None,
                     message_text: "SM2LIY K5ARH R-14".into(),
                     frequency_offset: 1500.0,
                     qso_id: Some("agent-qso".into()),
@@ -18487,6 +19213,7 @@ mod coalesce_tests {
 
         // Head entry: bound to client-a (armed) — must survive.
         let head = MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: "A".to_string(),
             frequency_offset: 1000.0,
             qso_id: Some("qso-a".to_string()),
@@ -18501,6 +19228,7 @@ mod coalesce_tests {
                 ComponentId::Ft8Transmitter,
                 ComponentId::Ft8Transmitter,
                 MessageType::TransmitRequest {
+                    attempt_id: None,
                     message_text: "B".to_string(),
                     frequency_offset: 1300.0,
                     qso_id: Some("qso-b".to_string()),
@@ -18575,6 +19303,7 @@ mod coalesce_tests {
         let mut notices = Vec::new();
         while let Ok(msg) = qso_rx.try_recv() {
             if let MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent {
+                attempt_id: _,
                 qso_id,
                 message_text,
                 replaced: None,
@@ -18604,6 +19333,7 @@ mod coalesce_tests {
         let active_tx_qsos = Arc::new(std::sync::RwLock::new(liveset(&["qso-a"])));
         let arm = Arc::new(std::sync::Mutex::new(pancetta_agent::arm::ArmState::new()));
         let request = |text: &str| MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: text.to_string(),
             frequency_offset: 1000.0,
             qso_id: Some("qso-a".to_string()),
@@ -18630,7 +19360,7 @@ mod coalesce_tests {
         let mut pivoted_from = PivotReplaced::new();
         pivoted_from.insert(
             key.clone(),
-            ("K1ABC N0CALL -07".to_string(), replaced.clone()),
+            ("K1ABC N0CALL -07".to_string(), replaced.clone(), None),
         );
 
         let audit_tmp = audit_tmp();
@@ -18879,6 +19609,7 @@ mod coalesce_tests {
         ])));
 
         let head = MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: "O".to_string(),
             frequency_offset: 700.0,
             qso_id: Some("qso-o".to_string()),
@@ -18896,6 +19627,7 @@ mod coalesce_tests {
                     ComponentId::Ft8Transmitter,
                     ComponentId::Ft8Transmitter,
                     MessageType::TransmitRequest {
+                        attempt_id: None,
                         message_text: text.to_string(),
                         frequency_offset: freq,
                         qso_id: Some(id.to_string()),
@@ -19111,6 +19843,7 @@ mod protocol_tx_tests {
         qso_id: Option<&str>,
     ) -> crate::message_bus::TransmitRequestItem {
         crate::message_bus::TransmitRequestItem {
+            attempt_id: None,
             message_text: text.to_string(),
             frequency_offset: freq,
             qso_id: qso_id.map(|s| s.to_string()),
@@ -19922,6 +20655,7 @@ mod classifier_tests {
 
     fn transmit_request(text: &str, qso_id: Option<&str>) -> MessageType {
         MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: text.to_string(),
             frequency_offset: 1500.0,
             qso_id: qso_id.map(|s| s.to_string()),
@@ -19938,6 +20672,7 @@ mod classifier_tests {
         let outcome = super::classify_incoming_during_tx(
             &candidate,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
@@ -19967,6 +20702,7 @@ mod classifier_tests {
         let outcome = super::classify_incoming_during_tx(
             &candidate,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
@@ -19992,6 +20728,7 @@ mod classifier_tests {
         let outcome = super::classify_incoming_during_tx(
             &candidate,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "CQ K5ARH EM12".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: None,
@@ -20017,6 +20754,7 @@ mod classifier_tests {
         let outcome = super::classify_incoming_during_tx(
             &candidate,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "TEST TEST TEST".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: None,
@@ -20049,6 +20787,7 @@ mod classifier_tests {
         let outcome = super::classify_incoming_during_tx(
             &candidate,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "VP2MAA W5AU EM10".to_string(),
                 frequency_offset: 1450.0,
                 qso_id: Some("qso-vp2maa".to_string()),
@@ -20077,6 +20816,7 @@ mod classifier_tests {
         let candidate = transmit_request("SECOND W5AU RR73", Some("qso-second"));
         let in_flight = [
             crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "FIRST W5AU R-10".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-first".to_string()),
@@ -20084,6 +20824,7 @@ mod classifier_tests {
                 remote_client_key_id: None,
             },
             crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "SECOND W5AU R-08".to_string(),
                 frequency_offset: 1400.0,
                 qso_id: Some("qso-second".to_string()),
@@ -20116,6 +20857,7 @@ mod classifier_tests {
         let outcome = super::classify_incoming_during_tx(
             &candidate,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
@@ -20140,6 +20882,7 @@ mod classifier_tests {
     fn classify_supersedes_identical_content_when_authorization_differs() {
         let pivoted_once = std::collections::HashMap::new();
         let candidate = MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: "KA1ABC K5ARH R-15".to_string(),
             frequency_offset: 1500.0,
             qso_id: Some("qso-1".to_string()),
@@ -20150,6 +20893,7 @@ mod classifier_tests {
         let outcome = super::classify_incoming_during_tx(
             &candidate,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
@@ -20179,6 +20923,7 @@ mod classifier_tests {
         let pivoted_once = std::collections::HashMap::new();
         let candidate = MessageType::MultiTransmitRequest {
             items: vec![crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "IN-FLIGHT W5AU R-01".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-in-flight".to_string()),
@@ -20192,6 +20937,7 @@ mod classifier_tests {
         let outcome = super::classify_incoming_during_tx(
             &candidate,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "IN-FLIGHT W5AU R-01".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-in-flight".to_string()),
@@ -20216,6 +20962,7 @@ mod classifier_tests {
         client: Option<&str>,
     ) -> crate::message_bus::TransmitRequestItem {
         crate::message_bus::TransmitRequestItem {
+            attempt_id: None,
             message_text: text.to_string(),
             frequency_offset: 1000.0,
             qso_id: Some(qso.to_string()),
@@ -20265,6 +21012,7 @@ mod classifier_tests {
         use crate::message_bus::TxOrigin::{Local, Remote};
         let pivoted_once = std::collections::HashMap::new();
         let candidate = MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: "B W5AU R-02".to_string(),
             frequency_offset: 1000.0,
             qso_id: Some("qso-2".to_string()),
@@ -20333,6 +21081,7 @@ mod classifier_tests {
         let outcome = super::classify_incoming_during_tx(
             &candidate,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
@@ -20362,6 +21111,7 @@ mod classifier_tests {
         let outcome = super::classify_incoming_during_tx(
             &candidate,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
@@ -20389,6 +21139,7 @@ mod classifier_tests {
             ("KA1ABC K5ARH RR73".to_string(), 1500.0),
         );
         let candidate = MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: "KA1ABC K5ARH RR73".to_string(),
             frequency_offset: 1500.0,
             qso_id: Some("qso-1".to_string()),
@@ -20399,6 +21150,7 @@ mod classifier_tests {
         let outcome = super::classify_incoming_during_tx(
             &candidate,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "KA1ABC K5ARH RR73".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
@@ -20444,6 +21196,7 @@ mod classifier_tests {
         let outcome = super::classify_incoming_during_tx(
             &candidate,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "KA1ABC K5ARH RR73".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
@@ -20471,6 +21224,7 @@ mod classifier_tests {
         let pivoted_once = std::collections::HashMap::new();
         let candidate = MessageType::MultiTransmitRequest {
             items: vec![crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "OTHER1 W5AU R-05".to_string(),
                 frequency_offset: 900.0,
                 qso_id: Some("qso-other1".to_string()),
@@ -20484,6 +21238,7 @@ mod classifier_tests {
         let outcome = super::classify_incoming_during_tx(
             &candidate,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "IN-FLIGHT W5AU R-01".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-in-flight".to_string()),
@@ -20510,6 +21265,7 @@ mod classifier_tests {
         let candidate = MessageType::MultiTransmitRequest {
             items: vec![
                 crate::message_bus::TransmitRequestItem {
+                    attempt_id: None,
                     message_text: "OTHER1 W5AU R-05".to_string(),
                     frequency_offset: 900.0,
                     qso_id: Some("qso-other1".to_string()),
@@ -20517,6 +21273,7 @@ mod classifier_tests {
                     remote_client_key_id: None,
                 },
                 crate::message_bus::TransmitRequestItem {
+                    attempt_id: None,
                     message_text: "IN-FLIGHT W5AU RR73".to_string(),
                     frequency_offset: 1000.0,
                     qso_id: Some("qso-in-flight".to_string()),
@@ -20531,6 +21288,7 @@ mod classifier_tests {
         let outcome = super::classify_incoming_during_tx(
             &candidate,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "IN-FLIGHT W5AU R-01".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-in-flight".to_string()),
@@ -20562,6 +21320,7 @@ mod classifier_tests {
         let candidate = MessageType::MultiTransmitRequest {
             items: vec![
                 crate::message_bus::TransmitRequestItem {
+                    attempt_id: None,
                     message_text: "OTHER1 W5AU R-05".to_string(),
                     frequency_offset: 900.0,
                     qso_id: Some("qso-other1".to_string()),
@@ -20571,6 +21330,7 @@ mod classifier_tests {
                 // Byte-identical to the in-flight item below — no fresher
                 // content for the currently-keyed QSO.
                 crate::message_bus::TransmitRequestItem {
+                    attempt_id: None,
                     message_text: "IN-FLIGHT W5AU R-01".to_string(),
                     frequency_offset: 1000.0,
                     qso_id: Some("qso-in-flight".to_string()),
@@ -20585,6 +21345,7 @@ mod classifier_tests {
         let outcome = super::classify_incoming_during_tx(
             &candidate,
             &[crate::message_bus::TransmitRequestItem {
+                attempt_id: None,
                 message_text: "IN-FLIGHT W5AU R-01".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-in-flight".to_string()),
@@ -20721,6 +21482,7 @@ mod pan115_worker_gate_tests {
             ComponentId::Autonomous,
             ComponentId::Ft8Transmitter,
             MessageType::TransmitRequest {
+                attempt_id: None,
                 message_text: text.to_string(),
                 frequency_offset: 1500.0,
                 qso_id: None,
@@ -20844,6 +21606,7 @@ mod pan115_worker_gate_tests {
         h.coordinator.latest_tx_intent.write().unwrap().insert(
             super::super::active_tx_qso_key(id),
             super::super::LatestTxIntent {
+                attempt_id: None,
                 message_text: text.into(),
                 frequency_offset,
                 tx_parity: None,
@@ -20860,6 +21623,7 @@ mod pan115_worker_gate_tests {
                 ComponentId::Autonomous,
                 ComponentId::Ft8Transmitter,
                 MessageType::TransmitRequest {
+                    attempt_id: None,
                     message_text: "CQ W5AU FN20".into(),
                     frequency_offset,
                     qso_id: Some(id.into()),
@@ -21061,6 +21825,7 @@ mod pan115_worker_gate_tests {
             .zip(texts)
             .map(
                 |((id, frequency_offset), text)| crate::message_bus::TransmitRequestItem {
+                    attempt_id: None,
                     message_text: text.into(),
                     frequency_offset,
                     qso_id: Some(id.clone()),
@@ -21255,6 +22020,7 @@ mod pan115_worker_gate_tests {
                 ComponentId::Autonomous,
                 ComponentId::Ft8Transmitter,
                 MessageType::TransmitRequest {
+                    attempt_id: None,
                     message_text: "CQ N0CALL FN20".into(),
                     frequency_offset: 1500.0,
                     qso_id: None,
@@ -21298,6 +22064,7 @@ mod pan115_worker_gate_tests {
                 ComponentId::Qso,
                 ComponentId::Ft8Transmitter,
                 MessageType::TransmitRequest {
+                    attempt_id: None,
                     message_text: text.into(),
                     frequency_offset: 1500.0,
                     qso_id: Some("qso-f8".into()),
@@ -21326,7 +22093,7 @@ mod pan115_worker_gate_tests {
         loop {
             if let Ok(msg) = h.qso_rx.try_recv() {
                 assert!(
-                    matches!(msg.message_type, MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { qso_id, message_text, replaced: None }) if qso_id == "qso-f8" && message_text == text)
+                    matches!(msg.message_type, MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { attempt_id: _, qso_id, message_text, replaced: None }) if qso_id == "qso-f8" && message_text == text)
                 );
                 break;
             }
@@ -21368,6 +22135,7 @@ mod pan115_worker_gate_tests {
                 ComponentId::Qso,
                 ComponentId::Ft8Transmitter,
                 MessageType::TransmitRequest {
+                    attempt_id: None,
                     message_text: text.into(),
                     frequency_offset: 1500.0,
                     qso_id: Some("qso-sv".into()),
@@ -21401,6 +22169,7 @@ mod pan115_worker_gate_tests {
                 ComponentId::Ft8Transmitter,
                 MessageType::MultiTransmitRequest {
                     items: vec![crate::message_bus::TransmitRequestItem {
+                        attempt_id: None,
                         message_text: "K1ABC N0CALL -10".into(),
                         frequency_offset: 1500.0,
                         qso_id: Some("qso-sv".into()),
@@ -21423,7 +22192,7 @@ mod pan115_worker_gate_tests {
         loop {
             if let Ok(msg) = h.qso_rx.try_recv() {
                 assert!(
-                    matches!(msg.message_type, MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { qso_id, message_text, replaced: None }) if qso_id == "qso-sv" && message_text == text)
+                    matches!(msg.message_type, MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { attempt_id: _, qso_id, message_text, replaced: None }) if qso_id == "qso-sv" && message_text == text)
                 );
                 break;
             }
@@ -21511,6 +22280,7 @@ mod report_transmit_complete_tests {
             "K1ABC N0CALL FN20".into(),
             0,
             qso_id.map(str::to_string),
+            None,
         )
         .await
         .unwrap();
@@ -21520,7 +22290,7 @@ mod report_transmit_complete_tests {
         assert!(autonomous.try_recv().is_err());
         if !success && qso_id.is_some() {
             assert!(
-                matches!(qso.try_recv().unwrap().message_type, MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { qso_id: id, message_text, replaced: None }) if Some(id.as_str()) == qso_id && message_text == "K1ABC N0CALL FN20")
+                matches!(qso.try_recv().unwrap().message_type, MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { attempt_id: _, qso_id: id, message_text, replaced: None }) if Some(id.as_str()) == qso_id && message_text == "K1ABC N0CALL FN20")
             );
         }
         assert!(qso.try_recv().is_err());
@@ -21539,6 +22309,90 @@ mod report_transmit_complete_tests {
         check(false, Some("q1")).await;
     }
 
+    /// PAN-182: a QSO frame that played out also tells the QSO engine it
+    /// aired, with the offset and binding it aired on, after the unchanged
+    /// Autonomous completion.
+    #[tokio::test]
+    async fn successful_transmit_complete_mirrors_tx_frame_sent_to_qso() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_, autonomous) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        let aired = aired_payload(
+            1500.0,
+            crate::message_bus::TxOrigin::Remote,
+            Some("peer".into()),
+        );
+        assert_eq!(
+            aired,
+            pancetta_qso::UnsentAttemptPayload {
+                frequency_hz: 1500.0,
+                remote_binding: Some((true, Some("peer".into()))),
+            }
+        );
+        let reported_from = chrono::Utc::now();
+        report_played_transmit_complete(
+            &bus,
+            true,
+            "K1ABC N0CALL FN20".into(),
+            12_640,
+            Some("q1".into()),
+            aired.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            autonomous.try_recv().unwrap().message_type,
+            MessageType::TransmitComplete { success: true, ref message_text, duration_ms: 12_640, qso_id: Some(ref id) }
+                if id == "q1" && message_text == "K1ABC N0CALL FN20"
+        ));
+        assert!(autonomous.try_recv().is_err());
+        let msg = qso.try_recv().unwrap();
+        assert_eq!(msg.source, ComponentId::Ft8Transmitter);
+        assert!(matches!(
+            msg.message_type,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameSent { ref qso_id, ref message_text, aired: ref got, aired_at })
+                if qso_id == "q1" && message_text == "K1ABC N0CALL FN20" && *got == aired
+                    && aired_at >= reported_from && aired_at <= chrono::Utc::now()
+        ));
+        assert!(qso.try_recv().is_err());
+    }
+
+    /// PAN-182: a frame that did not play out reports only the PAN-75
+    /// not-sent mirror, never `TxFrameSent`; an untracked frame (no QSO)
+    /// reports nothing to the QSO engine either way.
+    #[tokio::test]
+    async fn failed_transmit_complete_sends_no_tx_frame_sent() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_, autonomous) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        let aired = aired_payload(1500.0, crate::message_bus::TxOrigin::Local, None);
+        report_played_transmit_complete(
+            &bus,
+            false,
+            "K1ABC N0CALL FN20".into(),
+            0,
+            Some("q1".into()),
+            aired.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(autonomous.try_recv().is_ok());
+        assert!(matches!(
+            qso.try_recv().unwrap().message_type,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { ref qso_id, replaced: None, .. })
+                if qso_id == "q1"
+        ));
+        assert!(qso.try_recv().is_err());
+
+        report_played_transmit_complete(&bus, true, "CQ N0CALL FN20".into(), 0, None, aired, None)
+            .await
+            .unwrap();
+        assert!(autonomous.try_recv().is_ok());
+        assert!(qso.try_recv().is_err());
+    }
+
     /// A pivot-duplicate's payload already aired via the pivot, so the QSO
     /// engine must roll back the frame the pivot replaced, never this one.
     #[tokio::test]
@@ -21554,7 +22408,7 @@ mod report_transmit_complete_tests {
             &bus,
             "K1ABC N0CALL R-07".into(),
             Some("q1".into()),
-            Some(("K1ABC N0CALL FN20".into(), replaced.clone())),
+            Some(("K1ABC N0CALL FN20".into(), replaced.clone(), None)),
         )
         .await;
         assert!(matches!(
@@ -21564,7 +22418,7 @@ mod report_transmit_complete_tests {
         ));
         assert!(matches!(
             qso.try_recv().unwrap().message_type,
-            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { ref qso_id, ref message_text, replaced: Some(ref payload) })
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { attempt_id: _, ref qso_id, ref message_text, replaced: Some(ref payload) })
                 if qso_id == "q1" && message_text == "K1ABC N0CALL FN20" && *payload == replaced
         ));
         assert!(qso.try_recv().is_err());
@@ -21592,13 +22446,13 @@ mod report_transmit_complete_tests {
         for key in [&a, &b, &other] {
             once.insert(key.clone(), ("NEW".to_string(), 1500.0));
         }
-        from.insert(a.clone(), ("A OLD".to_string(), payload.clone()));
-        from.insert(other.clone(), ("Z OLD".to_string(), payload.clone()));
+        from.insert(a.clone(), ("A OLD".to_string(), payload.clone(), None));
+        from.insert(other.clone(), ("Z OLD".to_string(), payload.clone(), None));
         let mut replaced = unwind_bundle_pivots(&[a.clone(), b.clone()], &mut once, &mut from);
         assert_eq!(once.keys().collect::<Vec<_>>(), vec![&other]);
         assert_eq!(from.keys().collect::<Vec<_>>(), vec![&other]);
         assert_eq!(
-            take_bundle_replaced(&mut replaced, Some("qa")).map(|(t, _)| t),
+            take_bundle_replaced(&mut replaced, Some("qa")).map(|(t, _, _)| t),
             Some("A OLD".to_string())
         );
         assert!(take_bundle_replaced(&mut replaced, Some("qa")).is_none());
@@ -21611,6 +22465,7 @@ mod report_transmit_complete_tests {
     #[test]
     fn notviable_supersede_skips_items_the_new_bundle_carries_over() {
         let item = |q: &str, text: &str| crate::message_bus::TransmitRequestItem {
+            attempt_id: None,
             message_text: text.to_string(),
             frequency_offset: 1500.0,
             qso_id: Some(q.to_string()),
@@ -21669,6 +22524,7 @@ mod report_transmit_complete_tests {
         let (_, autonomous) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
         let (_, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
         let item = crate::message_bus::TransmitRequestItem {
+            attempt_id: None,
             message_text: "K1A N0CALL -07".to_string(),
             frequency_offset: 1250.0,
             qso_id: Some("qa".to_string()),
@@ -21705,7 +22561,8 @@ mod report_transmit_complete_tests {
             &bus,
             "K1ABC N0CALL R-07".into(),
             Some("q1".into()),
-            Some(("K1ABC N0CALL FN20".into(), replaced.clone())),
+            None,
+            Some(("K1ABC N0CALL FN20".into(), replaced.clone(), None)),
         )
         .await
         .unwrap();
@@ -21716,14 +22573,20 @@ mod report_transmit_complete_tests {
         ));
         assert!(matches!(
             qso.try_recv().unwrap().message_type,
-            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { ref qso_id, ref message_text, replaced: Some(ref payload) })
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { attempt_id: _, ref qso_id, ref message_text, replaced: Some(ref payload) })
                 if qso_id == "q1" && message_text == "K1ABC N0CALL FN20" && *payload == replaced
         ));
         assert!(qso.try_recv().is_err());
 
-        report_unaired_frame(&bus, "K1ABC N0CALL R-07".into(), Some("q1".into()), None)
-            .await
-            .unwrap();
+        report_unaired_frame(
+            &bus,
+            "K1ABC N0CALL R-07".into(),
+            Some("q1".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(autonomous.try_recv().is_ok());
         assert!(matches!(
             qso.try_recv().unwrap().message_type,
@@ -22060,6 +22923,7 @@ mod pan118_worker_band_plan_tests {
                 MessageType::MultiTransmitRequest {
                     items: vec![
                         TransmitRequestItem {
+                            attempt_id: None,
                             message_text: "CQ N0CALL FN20".to_string(),
                             frequency_offset: a_offset,
                             qso_id: None,
@@ -22067,6 +22931,7 @@ mod pan118_worker_band_plan_tests {
                             remote_client_key_id: None,
                         },
                         TransmitRequestItem {
+                            attempt_id: None,
                             message_text: "CQ N0CALL EN27".to_string(),
                             frequency_offset: b_offset,
                             qso_id: None,
@@ -22273,6 +23138,7 @@ mod pan202_key_down_worker_tests {
                 MessageType::MultiTransmitRequest {
                     items: vec![
                         TransmitRequestItem {
+                            attempt_id: None,
                             message_text: "CQ N0CALL FN20".to_string(),
                             frequency_offset: a_offset,
                             qso_id: None,
@@ -22280,6 +23146,7 @@ mod pan202_key_down_worker_tests {
                             remote_client_key_id: None,
                         },
                         TransmitRequestItem {
+                            attempt_id: None,
                             message_text: "CQ N0CALL EN27".to_string(),
                             frequency_offset: b_offset,
                             qso_id: None,
@@ -22418,6 +23285,7 @@ mod pan136_bundle_binding_worker_tests {
             h.coordinator.latest_tx_intent.write().unwrap().insert(
                 super::super::active_tx_qso_key("qa"),
                 super::super::LatestTxIntent {
+                    attempt_id: None,
                     message_text: text.to_string(),
                     frequency_offset: 1000.0,
                     tx_parity: None,
@@ -22433,6 +23301,7 @@ mod pan136_bundle_binding_worker_tests {
     /// 4b-pivot after the slot wait.
     async fn send_bundle(h: &Harness, origin: TxOrigin, key: Option<&str>) {
         let item = |text: &str, offset: f64, qso: &str| TransmitRequestItem {
+            attempt_id: None,
             message_text: text.to_string(),
             frequency_offset: offset,
             qso_id: Some(qso.to_string()),
@@ -22617,6 +23486,7 @@ mod pan136_bundle_binding_worker_tests {
         );
         let replaced = c.frames_not_sent.iter().find_map(|q| match q {
             QsoMessage::TxFrameNotSent {
+                attempt_id: _,
                 qso_id,
                 message_text,
                 replaced: Some(p),
@@ -23059,6 +23929,7 @@ mod pan135_worker_disarm_tests {
                 ComponentId::StationAgent,
                 ComponentId::Ft8Transmitter,
                 MessageType::TransmitRequest {
+                    attempt_id: None,
                     message_text: TEXT.into(),
                     frequency_offset: 1500.0,
                     qso_id: None,
@@ -23314,7 +24185,9 @@ mod pan122_tx_log_worker_tests {
     }
 
     /// Fill `dst`'s channel until the bus refuses another message.
-    async fn fill_channel(h: &Harness, dst: ComponentId) -> usize {
+    /// `pub(crate)`: shared with the PAN-182 audio-delivery module, the way
+    /// the PAN-115 harness is shared with this one.
+    pub(crate) async fn fill_channel(h: &Harness, dst: ComponentId) -> usize {
         let mut sent = 0;
         while h
             .coordinator
@@ -23419,6 +24292,7 @@ mod pan122_tx_log_worker_tests {
                 MessageType::MultiTransmitRequest {
                     items: vec![
                         TransmitRequestItem {
+                            attempt_id: None,
                             message_text: "CQ N0CALL FN20".to_string(),
                             frequency_offset: 1000.0,
                             qso_id: None,
@@ -23426,6 +24300,7 @@ mod pan122_tx_log_worker_tests {
                             remote_client_key_id: None,
                         },
                         TransmitRequestItem {
+                            attempt_id: None,
                             message_text: "CQ N0CALL EN27".to_string(),
                             frequency_offset: 1600.0,
                             qso_id: None,
@@ -23685,5 +24560,671 @@ mod pan122_tx_log_worker_tests {
             TxLogAppend::Disabled
         );
         assert!(!tx_log_path(Some(home.path())).exists());
+    }
+}
+
+/// PAN-146: the DX-parity gate, through the real TX worker, scopes its a7
+/// evidence to the live dial's band. A DX kept fresh on 20 m Odd holds an
+/// Odd call on 20 m, and does not hold the same call after the operator
+/// moved to 15 m.
+#[cfg(test)]
+mod pan146_dx_parity_context_worker_tests {
+    use super::pan115_worker_gate_tests::{await_completion, worker_harness, Harness};
+    use crate::message_bus::{ComponentId, ComponentMessage, MessageType, TxOrigin};
+    use pancetta_core::slot::{SlotParity, SLOT_NS};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const DIAL_20M: u64 = 14_074_000;
+    const DIAL_15M: u64 = 21_074_000;
+    const TEXT: &str = "5Z4VJ W5AU EM10";
+
+    /// Opens a manual call to 5Z4VJ (latched `tx_parity = Odd`), publishes
+    /// the manager to the worker, keeps a 20 m / FT8-grid Odd sighting of
+    /// 5Z4VJ fresh, and sends one Odd frame for the QSO with the dial at
+    /// `live_dial_hz`. Returns `(completed, diagnostics, ptt_on)`.
+    async fn call_with_dx_heard_on_20m(
+        h: &Harness,
+        live_dial_hz: u64,
+    ) -> (Option<bool>, Vec<String>, bool) {
+        h.coordinator
+            .operating_frequency_hz
+            .store(live_dial_hz, Ordering::Relaxed);
+        let manager = pancetta_qso::QsoManager::new(pancetta_qso::QsoManagerConfig {
+            our_callsign: "W5AU".into(), // QsoManager refuses the N0CALL placeholder
+            ..Default::default()
+        });
+        let id = manager
+            .respond_to_cq_manual("5Z4VJ".into(), 1500.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        h.coordinator.qso_manager_watch.send_replace(Some(manager));
+        h.coordinator
+            .active_tx_qsos
+            .write()
+            .unwrap()
+            .insert(super::super::active_tx_qso_key(&id.to_string()));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let refresher = {
+            let cts = h.coordinator.cross_time_state.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Acquire) {
+                    cts.a7_recent_calls
+                        .write()
+                        .unwrap()
+                        .record(pancetta_qso::A7ExpectedCall {
+                            callsign: "5Z4VJ".into(),
+                            freq_hz: 1500.0,
+                            slot_parity: 1,
+                            decoded_at: std::time::SystemTime::now(),
+                            captured_dial_hz: DIAL_20M,
+                            slot_ns: SLOT_NS,
+                        });
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            })
+        };
+
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Autonomous,
+                ComponentId::Ft8Transmitter,
+                MessageType::TransmitRequest {
+                    attempt_id: None,
+                    message_text: TEXT.into(),
+                    frequency_offset: 1500.0,
+                    qso_id: Some(id.to_string()),
+                    tx_parity: Some(SlotParity::Odd),
+                    origin: TxOrigin::Local,
+                    remote_client_key_id: None,
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+        let result = await_completion(h, TEXT, Duration::from_secs(50)).await;
+        stop.store(true, Ordering::Release);
+        let _ = refresher.await;
+        result
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_band_sighting_still_holds_the_call() {
+        let h = worker_harness().await;
+        let (completed, diagnostics, ptt_on) = call_with_dx_heard_on_20m(&h, DIAL_20M).await;
+        assert_eq!(completed, Some(false));
+        assert!(!ptt_on, "a same-band collision must not key");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.contains("DX observed transmitting on the colliding parity")),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn other_band_sighting_does_not_hold_the_call() {
+        let h = worker_harness().await;
+        let (completed, diagnostics, ptt_on) = call_with_dx_heard_on_20m(&h, DIAL_15M).await;
+        assert_eq!(completed, Some(true), "{diagnostics:?}");
+        assert!(ptt_on, "the 15 m call must key");
+        assert!(!diagnostics.iter().any(|d| d.contains("colliding parity")));
+    }
+}
+
+#[cfg(test)]
+mod pan182_audio_delivery_tests {
+    use super::pan115_worker_gate_tests::worker_harness;
+    use super::pan122_tx_log_worker_tests::fill_channel;
+    use crate::message_bus::{ComponentId, ComponentMessage, MessageType, QsoMessage, TxOrigin};
+    use std::time::{Duration, Instant};
+
+    /// PR #507 review (P1): a Step-7 audio send that comes back `Dropped`
+    /// (here: the Audio channel is full) enqueued no samples, so the frame
+    /// never aired even though PTT keyed. Step 10 must report it as not
+    /// sent: the QSO engine gets the PAN-75 `TxFrameNotSent` mirror (which
+    /// rolls the attempt back) and never `TxFrameSent`, whose false
+    /// confirmation would release a held PAN-182 stall switch on a frame
+    /// that never keyed any audio.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_audio_delivery_reports_the_frame_as_not_sent() {
+        let h = worker_harness().await;
+        assert!(fill_channel(&h, ComponentId::Audio).await > 0);
+        // The defer-time liveness gate needs the QSO id to be TX-live (the
+        // QSO component publishes this set; here it is seeded directly).
+        h.coordinator
+            .active_tx_qsos
+            .write()
+            .unwrap()
+            .insert("Q1".into());
+
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Autonomous,
+                ComponentId::Ft8Transmitter,
+                MessageType::TransmitRequest {
+                    attempt_id: None,
+                    message_text: "K1ABC N0CALL FN20".to_string(),
+                    frequency_offset: 1500.0,
+                    qso_id: Some("q1".into()),
+                    tx_parity: None,
+                    origin: TxOrigin::Local,
+                    remote_client_key_id: None,
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let mut completion = None;
+        let mut not_sent_mirror = false;
+        let mut sent_mirror = false;
+        fn capture(
+            completion: &mut Option<bool>,
+            not_sent_mirror: &mut bool,
+            sent_mirror: &mut bool,
+            msg: ComponentMessage,
+        ) {
+            match msg.message_type {
+                MessageType::TransmitComplete {
+                    success,
+                    ref message_text,
+                    ..
+                } if message_text == "K1ABC N0CALL FN20" => {
+                    *completion = Some(success);
+                }
+                MessageType::QsoMessage(QsoMessage::TxFrameNotSent { ref qso_id, .. })
+                    if qso_id == "q1" =>
+                {
+                    *not_sent_mirror = true;
+                }
+                MessageType::QsoMessage(QsoMessage::TxFrameSent { ref qso_id, .. })
+                    if qso_id == "q1" =>
+                {
+                    *sent_mirror = true;
+                }
+                _ => {}
+            }
+        }
+        while completion.is_none() && Instant::now() < deadline {
+            while let Ok(msg) = h.autonomous_rx.try_recv() {
+                capture(&mut completion, &mut not_sent_mirror, &mut sent_mirror, msg);
+            }
+            while let Ok(msg) = h.qso_rx.try_recv() {
+                capture(&mut completion, &mut not_sent_mirror, &mut sent_mirror, msg);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Anything still in flight after the completion.
+        while let Ok(msg) = h.qso_rx.try_recv() {
+            capture(&mut completion, &mut not_sent_mirror, &mut sent_mirror, msg);
+        }
+
+        assert_eq!(
+            completion,
+            Some(false),
+            "a frame whose audio never enqueued must complete as failed"
+        );
+        assert!(
+            not_sent_mirror,
+            "the QSO engine must get the PAN-75 not-sent mirror"
+        );
+        assert!(
+            !sent_mirror,
+            "no aired mirror may be sent for a frame that never keyed audio"
+        );
+    }
+}
+
+/// PAN-183: each frame's keep-call ledger attempt rides its request through
+/// coalescing, pivots and supersedes, and comes back on `TxFrameNotSent`, so
+/// the QSO engine rolls back exactly the attempt that failed.
+#[cfg(test)]
+mod pan183_attempt_identity_tests {
+    use super::*;
+    use pancetta_qso::TxAttemptId;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::Arc;
+
+    fn audit_tmp() -> crate::coordinator::audit_test_util::TempPath {
+        crate::coordinator::audit_test_util::TempPath::new("pancetta-tx-pan183-test")
+    }
+
+    fn request(text: &str, qso: &str, hz: f64, id: u64) -> MessageType {
+        MessageType::TransmitRequest {
+            message_text: text.into(),
+            frequency_offset: hz,
+            qso_id: Some(qso.into()),
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
+            attempt_id: Some(TxAttemptId(id)),
+        }
+    }
+
+    fn item(
+        text: &str,
+        qso: &str,
+        hz: f64,
+        origin: crate::message_bus::TxOrigin,
+        client: Option<&str>,
+        id: u64,
+    ) -> crate::message_bus::TransmitRequestItem {
+        crate::message_bus::TransmitRequestItem {
+            message_text: text.into(),
+            frequency_offset: hz,
+            qso_id: Some(qso.into()),
+            origin,
+            remote_client_key_id: client.map(str::to_string),
+            attempt_id: Some(TxAttemptId(id)),
+        }
+    }
+
+    /// Coalesce `head` with the queued `backlog`, every QSO live.
+    async fn coalesce(head: MessageType, backlog: Vec<MessageType>, live: &[&str]) -> MessageType {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        for m in backlog {
+            tx.send(ComponentMessage::new(
+                ComponentId::Qso,
+                ComponentId::Ft8Transmitter,
+                m,
+                Instant::now(),
+            ))
+            .unwrap();
+        }
+        let inbox = super::TxInbox::new(rx, Default::default());
+        let bus = MessageBus::new(16).unwrap();
+        let audit_tmp = audit_tmp();
+        let live: HashSet<String> = live
+            .iter()
+            .map(|id| super::super::active_tx_qso_key(id))
+            .collect();
+        coalesce_backlog_into(
+            head,
+            &inbox,
+            &bus,
+            &std::sync::Arc::new(std::sync::RwLock::new(live)),
+            &std::sync::Arc::new(std::sync::RwLock::new(HashSet::new())),
+            4,
+            &std::sync::Arc::new(std::sync::Mutex::new(pancetta_agent::arm::ArmState::new())),
+            &pancetta_agent::audit::AuditLog::new(audit_tmp.path()),
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
+        )
+        .await
+    }
+
+    fn not_sent(
+        msg: ComponentMessage,
+    ) -> (
+        String,
+        String,
+        Option<pancetta_qso::UnsentAttemptPayload>,
+        Option<TxAttemptId>,
+    ) {
+        match msg.message_type {
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent {
+                qso_id,
+                message_text,
+                replaced,
+                attempt_id,
+            }) => (qso_id, message_text, replaced, attempt_id),
+            other => panic!("expected TxFrameNotSent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pan183_coalesce_preserves_attempt_id_through_newest_wins() {
+        // Two frames for one QSO: the newer one is kept, with its own id.
+        let result = coalesce(
+            request("K1A N0CALL FN20", "qa", 1000.0, 1),
+            vec![request("K1A N0CALL R-07", "qa", 1000.0, 2)],
+            &["qa"],
+        )
+        .await;
+        match result {
+            MessageType::TransmitRequest {
+                message_text,
+                attempt_id,
+                ..
+            } => {
+                assert_eq!(message_text, "K1A N0CALL R-07");
+                assert_eq!(attempt_id, Some(TxAttemptId(2)));
+            }
+            other => panic!("expected a single TransmitRequest, got {other:?}"),
+        }
+        // A lone request passes through with its id.
+        match coalesce(request("K1A N0CALL FN20", "qa", 1000.0, 3), vec![], &["qa"]).await {
+            MessageType::TransmitRequest { attempt_id, .. } => {
+                assert_eq!(attempt_id, Some(TxAttemptId(3)));
+            }
+            other => panic!("expected a single TransmitRequest, got {other:?}"),
+        }
+        // The pure coalescer keeps each retained entry's own id.
+        let entry = |text: &str, qso: &str, hz: f64, id: u64| CoalesceEntry {
+            message_text: text.into(),
+            frequency_offset: hz,
+            qso_id: Some(qso.into()),
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
+            attempt_id: Some(TxAttemptId(id)),
+        };
+        let outcome = coalesce_transmit_requests(
+            vec![
+                entry("A1", "qa", 1000.0, 10),
+                entry("B1", "qb", 1600.0, 11),
+                entry("A2", "qa", 1000.0, 12),
+            ],
+            4,
+            |_| true,
+        );
+        let mut kept: Vec<(String, Option<TxAttemptId>)> = outcome
+            .retained
+            .iter()
+            .map(|e| (e.message_text.clone(), e.attempt_id))
+            .collect();
+        kept.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            kept,
+            vec![
+                ("A2".to_string(), Some(TxAttemptId(12))),
+                ("B1".to_string(), Some(TxAttemptId(11))),
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pan183_bundle_fold_preserves_per_item_attempt_ids() {
+        let result = coalesce(
+            request("K1A N0CALL FN20", "qa", 1000.0, 1),
+            vec![request("K2B N0CALL FN20", "qb", 1600.0, 2)],
+            &["qa", "qb"],
+        )
+        .await;
+        let MessageType::MultiTransmitRequest { items, .. } = result else {
+            panic!("expected a folded bundle, got {result:?}");
+        };
+        let mut ids: Vec<(Option<String>, Option<TxAttemptId>)> = items
+            .iter()
+            .map(|it| (it.qso_id.clone(), it.attempt_id))
+            .collect();
+        ids.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            ids,
+            vec![
+                (Some("qa".to_string()), Some(TxAttemptId(1))),
+                (Some("qb".to_string()), Some(TxAttemptId(2))),
+            ]
+        );
+
+        // A key-time bundle pivot adopts the intent's attempt with its
+        // payload; an item with no fresher intent keeps its own.
+        let mut latest = std::collections::HashMap::new();
+        latest.insert(
+            super::super::active_tx_qso_key("qa"),
+            super::super::LatestTxIntent {
+                message_text: "K1A N0CALL R-07".into(),
+                frequency_offset: 1000.0,
+                tx_parity: None,
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
+                attempt_id: Some(TxAttemptId(9)),
+            },
+        );
+        let (pivoted, pivots) = super::super::pivot_bundle_items(items, &latest);
+        assert_eq!(pivots.len(), 1);
+        for it in &pivoted {
+            let expected = match it.qso_id.as_deref() {
+                Some("qa") => TxAttemptId(9),
+                _ => TxAttemptId(2),
+            };
+            assert_eq!(it.attempt_id, Some(expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn pan183_not_sent_report_carries_request_attempt_id() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_, autonomous) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        report_transmit_complete(
+            &bus,
+            false,
+            "K1A N0CALL FN20".into(),
+            0,
+            Some("qa".into()),
+            Some(TxAttemptId(7)),
+        )
+        .await
+        .unwrap();
+        assert!(autonomous.try_recv().is_ok());
+        assert_eq!(
+            not_sent(qso.try_recv().unwrap()),
+            (
+                "qa".to_string(),
+                "K1A N0CALL FN20".to_string(),
+                None,
+                Some(TxAttemptId(7))
+            )
+        );
+        // An abort before encode reports the dequeued request's own id.
+        emit_failed_transmit_complete_for_request(
+            &bus,
+            &request("K1A N0CALL R-07", "qa", 1000.0, 8),
+        )
+        .await;
+        assert!(autonomous.try_recv().is_ok());
+        assert_eq!(not_sent(qso.try_recv().unwrap()).3, Some(TxAttemptId(8)));
+        // A frame refused before PTT with no pivot reports its own id too.
+        report_unaired_frame(
+            &bus,
+            "K1A N0CALL RR73".into(),
+            Some("qa".into()),
+            Some(TxAttemptId(5)),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(autonomous.try_recv().is_ok());
+        assert_eq!(not_sent(qso.try_recv().unwrap()).3, Some(TxAttemptId(5)));
+        assert!(qso.try_recv().is_err());
+    }
+
+    /// PR #419 thread 4244657622: a mixed bundle's abandoned local item is
+    /// reported with the folded Remote binding, which alone would miss its
+    /// ledger entry; its own id now decides the match.
+    #[tokio::test]
+    async fn pan183_abandoned_bundle_item_report_carries_item_id_and_own_binding_shape() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_, _autonomous) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        let local = item(
+            "K1A N0CALL -07",
+            "qa",
+            1250.0,
+            crate::message_bus::TxOrigin::Local,
+            None,
+            31,
+        );
+        report_abandoned_bundle_item(&bus, &local, Some((true, Some("client-a".into())))).await;
+        let (qso_id, text, replaced, attempt_id) = not_sent(qso.try_recv().unwrap());
+        assert_eq!((qso_id.as_str(), text.as_str()), ("qa", "K1A N0CALL -07"));
+        assert_eq!(
+            replaced,
+            Some(pancetta_qso::UnsentAttemptPayload {
+                frequency_hz: 1250.0,
+                remote_binding: Some((true, Some("client-a".into()))),
+            })
+        );
+        assert_eq!(attempt_id, Some(TxAttemptId(31)));
+    }
+
+    /// PR #419 thread 4244657620: an identity-conflict supersede abandons the
+    /// in-flight bundle; each item reports its own attempt, and the new
+    /// request is re-enqueued with its own.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pan183_identity_conflict_abandon_reports_item_ids() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let (_tx_tx, tx_rx) = bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        let (_a_tx, _autonomous) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_q_tx, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        let mut encoder = super::Ft8Encoder::new();
+        let tx_params = pancetta_ft8::ProtocolParams::from_protocol(pancetta_ft8::Protocol::Ft8);
+        let remote = crate::message_bus::TxOrigin::Remote;
+        let in_flight = [
+            item(
+                "KA1ABC K5ARH R-15",
+                "qso-1",
+                1000.0,
+                remote,
+                Some("client-a"),
+                21,
+            ),
+            item(
+                "OTHER W5AU R-08",
+                "qso-other",
+                1400.0,
+                remote,
+                Some("client-a"),
+                22,
+            ),
+        ];
+        let now = chrono::Utc::now();
+        let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
+            pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
+            pancetta_core::slot::SLOT_NS,
+        );
+        let superseding = MessageType::TransmitRequest {
+            message_text: "KA1ABC K5ARH R-15".to_string(),
+            frequency_offset: 1000.0,
+            qso_id: Some("qso-1".to_string()),
+            tx_parity: Some(cur_parity),
+            origin: remote,
+            remote_client_key_id: Some("client-b".to_string()),
+            attempt_id: Some(TxAttemptId(23)),
+        };
+        let inbox = super::TxInbox::new(tx_rx.clone(), Default::default());
+        super::supersede_multi_reenqueue(
+            superseding,
+            &in_flight,
+            remote,
+            Some("client-a".to_string()),
+            Some(cur_parity),
+            &mut encoder,
+            pancetta_ft8::Protocol::Ft8,
+            &tx_params,
+            &bus,
+            &inbox,
+            &Arc::new(AtomicBool::new(true)),
+            &Arc::new(AtomicU64::new(0)),
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+            pancetta_config::station::TxSelfParity::Auto,
+            now,
+            2,
+        )
+        .await;
+        match inbox
+            .try_recv()
+            .expect("the new request is re-enqueued")
+            .message_type
+        {
+            MessageType::TransmitRequest { attempt_id, .. } => {
+                assert_eq!(attempt_id, Some(TxAttemptId(23)));
+            }
+            other => panic!("expected the new request, got {other:?}"),
+        }
+        let mut reported: Vec<(String, Option<TxAttemptId>)> =
+            std::iter::from_fn(|| qso.try_recv().ok())
+                .map(not_sent)
+                .map(|(qso_id, _, _, attempt_id)| (qso_id, attempt_id))
+                .collect();
+        reported.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            reported,
+            vec![
+                ("qso-1".to_string(), Some(TxAttemptId(21))),
+                ("qso-other".to_string(), Some(TxAttemptId(22))),
+            ],
+            "each abandoned item reports its own attempt, never the same-text \\
+             request keyed in its place"
+        );
+    }
+
+    #[tokio::test]
+    async fn pan183_pivot_replaced_report_carries_replaced_frame_id() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_, _autonomous) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        let payload = pancetta_qso::UnsentAttemptPayload {
+            frequency_hz: 1500.0,
+            remote_binding: Some((false, None)),
+        };
+        // Refused before PTT after a pivot: the replaced frame's id, not the
+        // pivoted-to frame's.
+        report_unaired_frame(
+            &bus,
+            "K1A N0CALL R-07".into(),
+            Some("qa".into()),
+            Some(TxAttemptId(2)),
+            Some((
+                "K1A N0CALL FN20".into(),
+                payload.clone(),
+                Some(TxAttemptId(1)),
+            )),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            not_sent(qso.try_recv().unwrap()),
+            (
+                "qa".to_string(),
+                "K1A N0CALL FN20".to_string(),
+                Some(payload.clone()),
+                Some(TxAttemptId(1))
+            )
+        );
+        // Step 0-dup: the duplicate's own attempt is kept; the replaced one
+        // is rolled back.
+        report_pivot_duplicate_dropped(
+            &bus,
+            "K1A N0CALL R-07".into(),
+            Some("qa".into()),
+            Some((
+                "K1A N0CALL FN20".into(),
+                payload.clone(),
+                Some(TxAttemptId(1)),
+            )),
+        )
+        .await;
+        assert_eq!(not_sent(qso.try_recv().unwrap()).3, Some(TxAttemptId(1)));
+        // A bundle refused after its pivots hands back each replaced id.
+        let key = super::super::active_tx_qso_key("qa");
+        let mut once = std::collections::HashMap::new();
+        once.insert(key.clone(), ("K1A N0CALL R-07".to_string(), 1500.0));
+        let mut from = PivotReplaced::new();
+        from.insert(
+            key.clone(),
+            ("K1A N0CALL FN20".to_string(), payload, Some(TxAttemptId(1))),
+        );
+        let mut replaced = unwind_bundle_pivots(&[key], &mut once, &mut from);
+        assert_eq!(
+            take_bundle_replaced(&mut replaced, Some("qa")).and_then(|(_, _, id)| id),
+            Some(TxAttemptId(1))
+        );
+        assert!(qso.try_recv().is_err());
     }
 }

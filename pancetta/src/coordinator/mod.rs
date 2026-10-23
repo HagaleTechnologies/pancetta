@@ -139,6 +139,9 @@ pub struct LatestTxIntent {
     pub origin: crate::message_bus::TxOrigin,
     /// Paired with `origin` — see its doc.
     pub remote_client_key_id: Option<String>,
+    /// PAN-183: the intent's ledger attempt, adopted with the payload by a
+    /// key-time pivot so the pivoted frame reports its own attempt.
+    pub attempt_id: Option<pancetta_qso::TxAttemptId>,
 }
 
 /// Smallest offset difference (Hz) [`tx_pivot_target`] treats as a genuine
@@ -334,6 +337,8 @@ pub fn pivot_bundle_items(
                 // replaced ATOMICALLY with the payload, never left stale.
                 item.origin = intent.origin;
                 item.remote_client_key_id = intent.remote_client_key_id;
+                // PAN-183: the item now keys the intent's attempt.
+                item.attempt_id = intent.attempt_id;
                 pivots.push((key, item.message_text.clone(), item.frequency_offset));
             }
             item
@@ -2658,6 +2663,7 @@ impl ApplicationCoordinator {
                     crate::message_bus::ComponentId::Coordinator,
                     crate::message_bus::ComponentId::Ft8Transmitter,
                     crate::message_bus::MessageType::TransmitRequest {
+                        attempt_id: None,
                         message_text: test_tx_text.clone(),
                         frequency_offset: offset,
                         qso_id: None,
@@ -3244,6 +3250,7 @@ mod pivot_bundle_tests {
 
     fn item(qso_id: Option<&str>, text: &str, freq: f64) -> TransmitRequestItem {
         TransmitRequestItem {
+            attempt_id: None,
             message_text: text.to_string(),
             frequency_offset: freq,
             qso_id: qso_id.map(|s| s.to_string()),
@@ -3260,6 +3267,7 @@ mod pivot_bundle_tests {
 
     fn intent(text: &str, freq: f64) -> LatestTxIntent {
         LatestTxIntent {
+            attempt_id: None,
             message_text: text.to_string(),
             frequency_offset: freq,
             tx_parity: None,
