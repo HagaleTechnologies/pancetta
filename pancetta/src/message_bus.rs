@@ -1300,29 +1300,84 @@ pub enum DurableDelivery {
 /// consumer is dead.
 pub const DURABLE_LANE_CAPACITY: usize = 4096;
 
-type DurableLane = Arc<std::sync::Mutex<VecDeque<ComponentMessage>>>;
+/// One message parked on a [`DurableLane`] (PAN-185), plus the bound that
+/// keeps its place in receive order: the inbox yields it only after it has
+/// yielded `yields_after` messages from the channel — every message the
+/// channel held when this one parked, and none that arrived later.
+struct ParkedMessage {
+    message: ComponentMessage,
+    yields_after: u64,
+}
 
-fn lock_lane(lane: &DurableLane) -> std::sync::MutexGuard<'_, VecDeque<ComponentMessage>> {
+/// A destination's bus-owned durable lane (PAN-185): the messages parked
+/// because their channel was full, and how many messages the destination's
+/// [`DurableInbox`] has yielded from the channel so far — the clock each
+/// [`ParkedMessage::yields_after`] bound is measured against.
+#[derive(Default)]
+struct DurableLaneState {
+    parked: VecDeque<ParkedMessage>,
+    channel_yields: u64,
+}
+
+impl DurableLaneState {
+    /// Park `message` behind the `channel_backlog` messages the channel
+    /// holds right now, so the inbox cannot yield it before them.
+    fn park(&mut self, message: ComponentMessage, channel_backlog: usize) {
+        let yields_after = self.channel_yields + channel_backlog as u64;
+        self.parked.push_back(ParkedMessage {
+            message,
+            yields_after,
+        });
+    }
+}
+
+type DurableLane = Arc<std::sync::Mutex<DurableLaneState>>;
+
+fn lock_lane(lane: &DurableLane) -> std::sync::MutexGuard<'_, DurableLaneState> {
     // No holder panics while holding it; the queue is still valid if a
     // panic elsewhere poisoned it.
     lane.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// A component's receive side for durable delivery (PAN-185): its channel,
-/// then its bus-owned durable lane. Same `try_recv` contract as the channel.
+/// A component's receive side for durable delivery (PAN-185): its channel
+/// and its bus-owned durable lane in send order. Same `try_recv` contract as
+/// the channel.
 pub struct DurableInbox {
     rx: Receiver<ComponentMessage>,
     lane: DurableLane,
 }
 
 impl DurableInbox {
-    /// The channel's next message; once it is empty or disconnected, the
-    /// lane's oldest parked message; otherwise the channel's error.
+    /// The next message in send order. A parked message keeps its place
+    /// behind the channel backlog that preceded it (PAN-185 review: traffic
+    /// refilling a freed slot must not overtake a parked rollback, or it
+    /// starves past the QSO engine's unsent-attempt retention window and
+    /// finds nothing to roll back); once that backlog has been read, the
+    /// park is yielded before anything sent later. A channel with nothing
+    /// left to yield (empty or disconnected) yields the oldest park
+    /// immediately: the backlog it waited behind can no longer be read.
     pub fn try_recv(&self) -> Result<ComponentMessage, crossbeam_channel::TryRecvError> {
-        match self.rx.try_recv() {
-            Ok(message) => Ok(message),
-            Err(e) => lock_lane(&self.lane).pop_front().ok_or(e),
+        let mut lane = lock_lane(&self.lane);
+        let front_due = lane
+            .parked
+            .front()
+            .is_some_and(|front| lane.channel_yields >= front.yields_after);
+        if !front_due {
+            if let Ok(message) = self.rx.try_recv() {
+                lane.channel_yields += 1;
+                return Ok(message);
+            }
+        }
+        match lane.parked.pop_front() {
+            Some(parked) => Ok(parked.message),
+            None => match self.rx.try_recv() {
+                Ok(message) => {
+                    lane.channel_yields += 1;
+                    Ok(message)
+                }
+                Err(e) => Err(e),
+            },
         }
     }
 }
@@ -1484,8 +1539,10 @@ impl MessageBus {
     ///   (e.g. the disarm audio flush vs the next PTT-on) (PAN-135).
     /// - `send_message_durable` + [`DurableInbox`]: never silently dropped
     ///   while the destination reads through its inbox; a full channel parks
-    ///   the message on a bus-owned lane read after the channel. For
-    ///   order-independent state corrections (PAN-185).
+    ///   the message on a bus-owned lane, and the inbox yields it once the
+    ///   channel backlog that preceded it has been read — traffic refilling
+    ///   a freed slot cannot overtake it. For order-independent,
+    ///   replay-safe state corrections (PAN-185).
     pub async fn send_message(&self, message: ComponentMessage) -> Result<()> {
         self.send_message_checked(message).await?;
         Ok(())
@@ -1531,12 +1588,14 @@ impl MessageBus {
     }
 
     /// Durable delivery (PAN-185): the destination's channel if it has room,
-    /// otherwise its durable lane, read by its [`DurableInbox`] after the
-    /// channel. Once a message is parked, later durable messages to that
-    /// destination park behind it, so durable messages stay FIFO. A
-    /// destination with no inbox gets exactly [`Self::send_message_checked`]
-    /// behaviour. No await beyond the channel table's read lock, no retry,
-    /// no sleep; parks and drops are logged and counted here.
+    /// otherwise its durable lane. A parked message keeps its place behind
+    /// the channel backlog that preceded it: the inbox yields it once that
+    /// backlog has been read, before anything sent later. Once a message is
+    /// parked, later durable messages to that destination park behind it, so
+    /// durable messages stay FIFO. A destination with no inbox gets exactly
+    /// [`Self::send_message_checked`] behaviour. No await beyond the channel
+    /// table's read lock, no retry, no sleep; parks and drops are logged and
+    /// counted here.
     pub async fn send_message_durable(&self, mut message: ComponentMessage) -> DurableDelivery {
         if message.is_expired(self.config.message_timeout_us) {
             self.expired_messages.fetch_add(1, Ordering::Relaxed);
@@ -1564,7 +1623,7 @@ impl MessageBus {
         let src = message.source;
         let dst = message.destination;
         let message = match channels.get(&dst) {
-            Some(channel) if parked.is_empty() => {
+            Some(channel) if parked.parked.is_empty() => {
                 let msg_id = message.id;
                 let transit = message.transit_latency_us();
                 match channel.tx.sender.try_send(message) {
@@ -1580,7 +1639,7 @@ impl MessageBus {
             }
             _ => message,
         };
-        if parked.len() >= DURABLE_LANE_CAPACITY {
+        if parked.parked.len() >= DURABLE_LANE_CAPACITY {
             self.dropped_messages.fetch_add(1, Ordering::Relaxed);
             error!(
                 "Durable lane to {} is full ({} messages); dropping message from {}",
@@ -1588,11 +1647,19 @@ impl MessageBus {
             );
             return DurableDelivery::Dropped;
         }
+        // The park keeps its place behind the backlog in the channel right
+        // now (all of it when the send just failed on a full channel).
+        // Reading both the counter and the length under the lane lock keeps
+        // the bound consistent with the inbox's yields, which increment
+        // under the same lock.
+        let channel_backlog = channels
+            .get(&dst)
+            .map_or(0, |channel| channel.tx.sender.len());
         warn!(
             "Channel to {} full; parking message from {} on its durable lane",
             dst, src
         );
-        parked.push_back(message);
+        parked.park(message, channel_backlog);
         self.parked_messages.fetch_add(1, Ordering::Relaxed);
         DurableDelivery::Parked
     }
@@ -1863,18 +1930,19 @@ impl MessageBus {
     }
 
     /// Push onto the destination's registered durable lane, as a send to a
-    /// full channel would (PAN-185 loop-level tests).
+    /// full channel would (PAN-185 loop-level tests). Parks due immediately:
+    /// the loop-level tests park on a quiet channel.
     pub(crate) fn park_for_test(&self, message: ComponentMessage) {
         let lane = self
             .durable_lane(message.destination)
             .expect("park_for_test: destination has no durable inbox");
-        lock_lane(&lane).push_back(message);
+        lock_lane(&lane).park(message, 0);
         self.parked_messages.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn durable_lane_len(&self, id: ComponentId) -> usize {
         self.durable_lane(id)
-            .map_or(0, |lane| lock_lane(&lane).len())
+            .map_or(0, |lane| lock_lane(&lane).parked.len())
     }
 }
 
@@ -2533,6 +2601,40 @@ mod tests {
         assert!(inbox.try_recv().is_err());
     }
 
+    /// PAN-185 review (P1): a parked message keeps its place behind the
+    /// channel backlog that preceded it. Reading the lane only once the
+    /// channel is empty lets every later ordinary send that refills a freed
+    /// slot overtake the park — under sustained QSO/decode traffic a parked
+    /// `TxFrameNotSent` would starve past the QSO engine's four-slot
+    /// unsent-attempt retention window, and the rollback would find nothing
+    /// (`NoMatchingAttempt`) in precisely the full-channel scenario the
+    /// durable tier exists to repair.
+    #[tokio::test]
+    async fn pan185_parked_message_keeps_its_place_ahead_of_traffic_refilling_freed_slots() {
+        let bus = MessageBus::new(2).unwrap();
+        let inbox = bus.durable_inbox(ComponentId::Qso).await.unwrap();
+        let (tx, _rx) = bus.get_or_create_channel(ComponentId::Qso).await.unwrap();
+        tx.try_send(durable_msg(ComponentId::Qso, 0.0)).unwrap();
+        tx.try_send(durable_msg(ComponentId::Qso, 1.0)).unwrap();
+        assert_eq!(
+            bus.send_message_durable(durable_msg(ComponentId::Qso, 2.0))
+                .await,
+            DurableDelivery::Parked
+        );
+        // Sustained traffic: every slot the inbox frees is refilled at once
+        // by an ordinary best-effort send, so the channel never empties.
+        assert_eq!(tag(inbox.try_recv().unwrap()), 0.0);
+        tx.try_send(durable_msg(ComponentId::Qso, 3.0)).unwrap();
+        assert_eq!(tag(inbox.try_recv().unwrap()), 1.0);
+        tx.try_send(durable_msg(ComponentId::Qso, 4.0)).unwrap();
+        // The backlog the park waited behind has been read; the park — not
+        // the refills sent after it — is next.
+        assert_eq!(tag(inbox.try_recv().unwrap()), 2.0);
+        assert_eq!(tag(inbox.try_recv().unwrap()), 3.0);
+        assert_eq!(tag(inbox.try_recv().unwrap()), 4.0);
+        assert!(inbox.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn pan185_durable_send_without_an_inbox_matches_checked_delivery() {
         let bus = MessageBus::new(1).unwrap();
@@ -2614,9 +2716,7 @@ mod tests {
     fn pan185_inbox_yields_parked_messages_before_reporting_disconnected() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let lane = DurableLane::default();
-        lane.lock()
-            .unwrap()
-            .push_back(durable_msg(ComponentId::Qso, 1.0));
+        lock_lane(&lane).park(durable_msg(ComponentId::Qso, 1.0), 0);
         let inbox = DurableInbox { rx, lane };
         drop(tx);
         assert_eq!(tag(inbox.try_recv().unwrap()), 1.0);
@@ -2630,9 +2730,7 @@ mod tests {
     fn pan185_poisoned_lane_lock_still_yields_its_messages() {
         let (_tx, rx) = crossbeam_channel::unbounded();
         let lane = DurableLane::default();
-        lane.lock()
-            .unwrap()
-            .push_back(durable_msg(ComponentId::Qso, 1.0));
+        lock_lane(&lane).park(durable_msg(ComponentId::Qso, 1.0), 0);
         let inbox = DurableInbox {
             rx,
             lane: lane.clone(),

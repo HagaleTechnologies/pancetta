@@ -576,9 +576,11 @@ the message confirms the consumer applied it.
 
 PAN-185 added the fourth, `send_message_durable` with `DurableInbox`. A
 message to a destination that reads through its inbox is never silently
-dropped: a full channel parks it on a bus-owned FIFO lane the inbox reads
-after the channel, and once one message is parked later durable messages
-park behind it. A destination with no inbox gets checked delivery. It adds no
+dropped: a full channel parks it on a bus-owned FIFO lane the inbox yields
+once the channel backlog that preceded it has been read (never overtaken by
+traffic refilling a freed slot), and once one message is parked later
+durable messages park behind it. A destination with no inbox gets checked
+delivery. It adds no
 retry, sleep or await beyond the channel table's read lock. Use it for
 order-independent, replay-safe corrections whose consumer reads through an
 inbox; today that is the TX worker's outcome reports to the Qso and

@@ -523,8 +523,12 @@ up to four slots after the last call.
 Rollback reports travel the bus's durable tier (PAN-185):
 `send_message_durable` parks `TxFrameNotSent`, `TxFrameSent` and
 `TransmitComplete` on a bus-owned lane when the Qso or Autonomous channel is
-full, and those loops read the lane through their `DurableInbox` after the
-channel. The lane belongs to the bus, so it survives a restart of either
+full, and those loops read the lane through their `DurableInbox`. A parked
+report keeps its place behind the channel backlog that preceded it — the
+inbox yields it once that backlog has been read, before anything sent later,
+so ordinary traffic refilling a freed slot cannot starve it past the
+retention window below. The lane belongs to the bus, so it survives a
+restart of either
 component; after a Qso restart the parked reports name QSOs the new manager
 never had and are no-ops. Limits: a lane holds at most 4096 messages
 (`DURABLE_LANE_CAPACITY`; past that the report is dropped, logged and
