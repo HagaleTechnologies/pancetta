@@ -555,6 +555,7 @@ impl CoordSim {
                 self.active_tx_offsets.write().unwrap().remove(&key);
             }
             QsoEvent::MessageToSend {
+                attempt_id: _,
                 qso_id,
                 message,
                 frequency,
@@ -696,6 +697,7 @@ impl CoordSim {
         let drained: Vec<CoalesceEntry> = pending
             .iter()
             .map(|p| CoalesceEntry {
+                attempt_id: None,
                 message_text: p.text.clone(),
                 frequency_offset: p.frequency_offset,
                 qso_id: p.qso_id.clone(),
