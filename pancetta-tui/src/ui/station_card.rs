@@ -131,11 +131,16 @@ fn render_line1<'a>(app: &App, call: &str, last_decode: Option<&DecodedMessageVi
                 .is_some_and(|c| crate::app::same_station(c, call))
         })
         .or(last_decode);
+    // PAN-93: read this frame's cqdx verdict for the row the Why line explains.
+    let row_key = app
+        .dx_station_for(call)
+        .map_or(call, |row| row.call_sign.as_str());
     let status_flag = status_decode
         .map(|m| {
-            if m.atno {
+            let (needed, atno) = app.dx_need_flags_shown(row_key, m.needed, m.atno);
+            if atno {
                 "ATNO\u{2605}"
-            } else if m.needed {
+            } else if needed {
                 "needed"
             } else if m.worked_before {
                 "worked"
@@ -508,6 +513,62 @@ pub(in crate::ui) mod tests {
                 "expected flag {expected} for atno={atno} needed={needed} worked_before={worked_before}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn needed_flag_follows_this_frames_cqdx_verdict() {
+        // PAN-93: when the cqdx list loads or changes after the station's
+        // last decode, the card agrees with DX Hunter's `+` and the Why view.
+        struct Verdict(Option<bool>);
+        impl crate::dx_need::DxNeedLookup for Verdict {
+            fn lookup_need(
+                &self,
+                _: &str,
+                _: Option<&str>,
+                _: Option<&str>,
+                _: f64,
+            ) -> crate::dx_need::DxNeedStatus {
+                crate::dx_need::DxNeedStatus {
+                    dxcc_needed: self.0,
+                    ..Default::default()
+                }
+            }
+        }
+        let line1 = |app: &App| row(&render_at(app, 130, 6), 1);
+        // (needed, atno) stored at decode time, then this frame's verdict.
+        for (needed, atno, verdict, expected) in [
+            (false, false, Some(true), "needed"),
+            (true, false, Some(false), "new"),
+            (true, true, Some(false), "new"),
+            (true, true, Some(true), "ATNO\u{2605}"),
+            (true, false, None, "needed"),
+        ] {
+            let mut app = fixture_app().await;
+            let mut view = fixture_view("W1XYZ", -5);
+            view.needed = needed;
+            view.atno = atno;
+            app.add_decoded_message(view).await.unwrap();
+            app.refresh_dx_need(Some(&Verdict(verdict)));
+
+            let line1 = line1(&app);
+            assert!(
+                line1.contains(&format!(" {expected} ")),
+                "needed={needed} atno={atno} verdict={verdict:?}: {line1}"
+            );
+        }
+
+        // The focus names the base call while the DX row is the portable
+        // form: the card reads the verdict for the row the Why line uses.
+        let mut app = fixture_app().await;
+        app.add_decoded_message(fixture_view("W1XYZ/P", -5))
+            .await
+            .unwrap();
+        app.decoded_messages.clear();
+        app.decoded_messages.push_back(fixture_view("W1XYZ", -5));
+        app.refresh_dx_need(Some(&Verdict(Some(true))));
+        assert_eq!(app.focused_callsign().as_deref(), Some("W1XYZ"));
+        let line1 = line1(&app);
+        assert!(line1.contains(" needed "), "{line1}");
     }
 
     #[tokio::test]
