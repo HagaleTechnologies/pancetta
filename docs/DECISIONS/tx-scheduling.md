@@ -390,8 +390,30 @@ and offset, and reports the replaced frame's binding like a single-frame pivot.
 If a rollback takes `stall_cycles` from the switch threshold back below it
 before the coordinator's drain commits a stall offset action that attempt
 raised, the commit is refused (`OffsetActionStallRolledBack`) until the streak
-reaches the threshold again. A rollback that arrives after the commit cannot
-undo the move (follow-up: PAN-182). Since PAN-128 each attempt records the
+reaches the threshold again. Since PAN-182 the commit cannot come first: a
+stall action commits only once its trigger frame's outcome is known. The rearm
+whose emission brought the streak to the threshold records that emission as
+the action's pending trigger, and `apply_tx_offset_switch` refuses a
+stall-origin commit with `OffsetActionTriggerOutcomePending` while it is
+recorded; the drain requeues the action like a PTT-in-flight refusal. The TX
+worker mirrors every QSO frame that played out to the QSO engine as
+`TxFrameSent` (sibling of `TxFrameNotSent`, sent after PTT release, never on a
+key-down path), which releases the hold, so the next drain commits; a
+`TxFrameNotSent` instead clears it and the revocation above refuses the
+action. The release matches the aired frame's text, offset and binding, so a
+pivot that aired a same-text frame elsewhere cannot release a hold its
+replaced frame's not-sent report is about to revoke, and `TxFrameSent` carries
+its post-playback report time, which must not precede the own-parity slot the
+trigger feeds: keep-calling repeats the same frame every slot, and a rearm late
+in its own slot trips the threshold for the next one while the current slot's
+identical frame is still playing; if the trigger is rolled
+back while a PAN-128 same-slot twin survives, the hold moves to the twin. Later
+re-raises on the same streak leave the hold alone (re-arming it every slot
+could keep it from ever releasing) unless it has expired: a trigger left
+unreported for four slots (a frame dropped with no report, such as on
+shutdown) is refused as `OffsetActionTriggerOutcomeExpired` and dropped, never
+committed, and the next re-raise arms a fresh hold. Operator `u` nudges are
+never held. Every stall reset (commit, forward advance) clears the hold. Since PAN-128 each attempt records the
 own-parity TX slot its emission feeds, derived with the TX scheduler's own
 current-slot acceptance rule (the CURRENT slot while inside the worker's
 PAN-117 queue-time acceptance cap — mode-scaled `tx_late_max_ms` minus the

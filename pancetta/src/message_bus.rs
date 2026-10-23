@@ -245,7 +245,8 @@ pub enum MessageType {
         duration_ms: u64,
         /// QSO owning this frame, or `None` for untracked manual/tune TX.
         /// Autonomous uses it for PAN-38 self-CQ correlation. PAN-75 mirrors
-        /// failed QSO-keyed outcomes as `QsoMessage::TxFrameNotSent` to Qso.
+        /// failed QSO-keyed outcomes as `QsoMessage::TxFrameNotSent` to Qso;
+        /// PAN-182 mirrors aired ones as `QsoMessage::TxFrameSent`.
         qso_id: Option<String>,
     },
 
@@ -888,6 +889,21 @@ pub enum QsoMessage {
         /// Set when the frame was replaced by a TX pivot: its own offset and
         /// binding, so the rollback skips the same-text frame that aired.
         replaced: Option<pancetta_qso::UnsentAttemptPayload>,
+    },
+    /// PAN-182: a QSO frame that aired, mirrored by Ft8Transmitter after
+    /// playback alongside the Autonomous completion. Qso uses it to release
+    /// a stall offset action held on that frame through
+    /// `QsoManager::confirm_stall_trigger_aired`.
+    TxFrameSent {
+        qso_id: String,
+        message_text: String,
+        /// The aired frame's own offset and binding, so a pivot-replaced
+        /// same-text frame does not release a hold it did not serve.
+        aired: pancetta_qso::UnsentAttemptPayload,
+        /// When the worker reported it, after playback. An earlier slot's
+        /// identical keep-call frame reports before the trigger's own slot
+        /// starts, so it cannot release the hold.
+        aired_at: chrono::DateTime<chrono::Utc>,
     },
     /// Enable or disable Fox (DXpedition operator) mode.
     ///
