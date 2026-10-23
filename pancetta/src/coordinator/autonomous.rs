@@ -537,10 +537,13 @@ fn poll_slot_deadline_mode_aware(
 /// computed for, polled through [`poll_slot_deadline_mode_aware`]. Replaces
 /// the call site's two loose locals so every poll also classifies the
 /// tracked deadline against the wall clock and reports a jump.
+/// PAN-133: also remembers every poll's time so a mode change can recover
+/// one boundary in `(last_poll_now, now]` without replaying older boundaries.
 #[derive(Debug, Clone, Copy)]
 struct SlotTicker {
     deadline: chrono::DateTime<chrono::Utc>,
     deadline_slot_ns: i64,
+    last_poll_now: chrono::DateTime<chrono::Utc>,
 }
 
 /// One [`SlotTicker::poll`] result: `due` gates the per-slot body; `jump`
@@ -561,6 +564,7 @@ impl SlotTicker {
                 slot_ns,
             ),
             deadline_slot_ns: slot_ns,
+            last_poll_now: now,
         }
     }
 
@@ -572,6 +576,15 @@ impl SlotTicker {
             self.deadline,
             self.deadline_slot_ns,
         );
+        // A new-mode boundary may have passed between polls while the old
+        // deadline is still ahead. Recover it once; a backward clock step
+        // cannot satisfy this interval, and several crossed boundaries
+        // still earn only one tick.
+        let crossed_mode_boundary = current_slot_ns != self.deadline_slot_ns && {
+            let boundary =
+                pancetta_core::slot::current_slot_start_with_period(now, current_slot_ns);
+            self.last_poll_now < boundary && boundary <= now
+        };
         let (due, next_deadline, next_slot_ns) = poll_slot_deadline_mode_aware(
             now,
             self.deadline,
@@ -580,7 +593,11 @@ impl SlotTicker {
         );
         self.deadline = next_deadline;
         self.deadline_slot_ns = next_slot_ns;
-        SlotTick { due, jump }
+        self.last_poll_now = now;
+        SlotTick {
+            due: due || crossed_mode_boundary,
+            jump,
+        }
     }
 }
 
@@ -1256,6 +1273,32 @@ async fn drain_pending_qso_offset_requests(
                     qso_id = %qso_id,
                     "PAN-140: deferring TX-offset action — a PTT keyed for the \
                      current slot between this drain's own pre-check and its commit"
+                );
+                if let Ok(mut pending) = pending_qso_offset_requests.lock() {
+                    pending.push(pancetta_qso::qso_manager::OffsetActionRequest {
+                        qso_id,
+                        action: action_for_requeue,
+                        origin,
+                    });
+                }
+            }
+            Err(pancetta_qso::QsoManagerError::OffsetActionTriggerOutcomePending { .. }) => {
+                // PAN-182: the frame whose emission raised this stall action
+                // has not been reported aired or unsent yet, and committing
+                // first would leave a later not-sent report nothing to undo.
+                // Re-queue exactly like the PTT arm above: the next drain
+                // commits once `TxFrameSent` releases the hold, or drops it
+                // as `OffsetActionStallRolledBack` once `TxFrameNotSent`
+                // revokes it. An `OffsetActionTriggerOutcomeExpired` refusal
+                // (no report within four slots) is NOT requeued: it falls to
+                // the expected-refusal arm below and is discarded, never
+                // committed — the still-standing streak re-raises the action
+                // with a fresh hold.
+                info!(
+                    target: "tx.freq",
+                    qso_id = %qso_id,
+                    "PAN-182: deferring TX-offset action — its trigger frame's \
+                     outcome is not yet known"
                 );
                 if let Ok(mut pending) = pending_qso_offset_requests.lock() {
                     pending.push(pancetta_qso::qso_manager::OffsetActionRequest {
@@ -3447,6 +3490,142 @@ mod poll_slot_deadline_tests {
     }
 
     #[test]
+    fn slot_ticker_recovers_ft2_boundary_crossed_between_polls_once() {
+        const FT2_SLOT_NS: i64 = 3_200_000_000;
+        let mut ticker = SlotTicker::new(at(98_750), FT8_SLOT_NS);
+        assert!(!ticker.poll(at(99_000), FT8_SLOT_NS).due);
+        assert_eq!(ticker.deadline, at(105_000));
+
+        assert_eq!(
+            ticker.poll(at(99_250), FT2_SLOT_NS),
+            SlotTick {
+                due: true,
+                jump: None
+            }
+        );
+        assert_eq!(ticker.deadline, at(102_400));
+        assert_eq!(ticker.deadline_slot_ns, FT2_SLOT_NS);
+        assert!(!ticker.poll(at(99_250), FT2_SLOT_NS).due);
+        assert!(!ticker.poll(at(99_500), FT2_SLOT_NS).due);
+        assert!(ticker.poll(at(102_400), FT2_SLOT_NS).due);
+        assert_eq!(ticker.deadline, at(105_600));
+    }
+
+    #[test]
+    fn slot_ticker_recovers_ft4_boundary_at_or_before_current_poll() {
+        for observed_at in [97_500, 97_750] {
+            let mut ticker = SlotTicker::new(at(97_250), FT8_SLOT_NS);
+            assert_eq!(
+                ticker.poll(at(observed_at), FT4_SLOT_NS),
+                SlotTick {
+                    due: true,
+                    jump: None
+                }
+            );
+            assert_eq!(ticker.deadline, at(105_000));
+            assert_eq!(ticker.deadline_slot_ns, FT4_SLOT_NS);
+            assert!(!ticker.poll(at(observed_at), FT4_SLOT_NS).due);
+            assert!(!ticker.poll(at(98_000), FT4_SLOT_NS).due);
+            assert!(ticker.poll(at(105_000), FT4_SLOT_NS).due);
+            assert_eq!(ticker.deadline, at(112_500));
+        }
+    }
+
+    #[test]
+    fn slot_ticker_mode_switch_without_crossed_boundary_only_recomputes() {
+        let mut ticker = SlotTicker::new(at(97_000), FT8_SLOT_NS);
+        assert_eq!(
+            ticker.poll(at(97_250), FT4_SLOT_NS),
+            SlotTick {
+                due: false,
+                jump: None
+            }
+        );
+        assert_eq!(ticker.deadline, at(97_500));
+        assert_eq!(ticker.deadline_slot_ns, FT4_SLOT_NS);
+        assert!(ticker.poll(at(97_500), FT4_SLOT_NS).due);
+    }
+
+    #[test]
+    fn slot_ticker_non_due_poll_advances_boundary_recovery_history() {
+        let mut ticker = SlotTicker::new(at(97_250), FT8_SLOT_NS);
+        // The FT4 boundary passed while we still observed FT8. It is no
+        // longer inside the interval when the next poll observes FT4.
+        assert!(!ticker.poll(at(97_750), FT8_SLOT_NS).due);
+        assert_eq!(
+            ticker.poll(at(98_000), FT4_SLOT_NS),
+            SlotTick {
+                due: false,
+                jump: None
+            }
+        );
+        assert_eq!(ticker.deadline, at(105_000));
+        assert_eq!(ticker.deadline_slot_ns, FT4_SLOT_NS);
+    }
+
+    #[test]
+    fn slot_ticker_boundary_at_previous_poll_is_excluded() {
+        let mut ticker = SlotTicker::new(at(97_250), FT8_SLOT_NS);
+        assert!(!ticker.poll(at(97_500), FT8_SLOT_NS).due);
+        assert_eq!(
+            ticker.poll(at(97_750), FT4_SLOT_NS),
+            SlotTick {
+                due: false,
+                jump: None
+            }
+        );
+        assert_eq!(ticker.deadline, at(105_000));
+    }
+
+    #[test]
+    fn slot_ticker_backward_step_with_mode_switch_updates_history_without_firing() {
+        const FT2_SLOT_NS: i64 = 3_200_000_000;
+        let mut ticker = SlotTicker::new(at(700_000), FT8_SLOT_NS);
+        let tick = ticker.poll(at(99_000), FT4_SLOT_NS);
+        assert!(!tick.due);
+        assert!(matches!(
+            tick.jump,
+            Some(pancetta_core::slot_clock::WallClockJump::Backward(_))
+        ));
+        assert_eq!(ticker.deadline, at(105_000));
+        assert_eq!(ticker.deadline_slot_ns, FT4_SLOT_NS);
+        // History must use the corrected clock even though that poll was
+        // not due. The FT2 boundary at 99.2s is now inside the interval.
+        assert_eq!(
+            ticker.poll(at(99_250), FT2_SLOT_NS),
+            SlotTick {
+                due: true,
+                jump: None
+            }
+        );
+        assert_eq!(ticker.deadline, at(102_400));
+        assert!(!ticker.poll(at(99_500), FT2_SLOT_NS).due);
+        assert!(ticker.poll(at(102_400), FT2_SLOT_NS).due);
+    }
+
+    #[test]
+    fn slot_ticker_delayed_mode_switch_recovers_only_one_tick() {
+        const FT2_SLOT_NS: i64 = 3_200_000_000;
+        let mut ticker = SlotTicker::new(at(90_250), FT8_SLOT_NS);
+        // Cross 92.8s, 96s and 99.2s without reaching the old 105s deadline.
+        assert_eq!(
+            ticker.poll(at(99_250), FT2_SLOT_NS),
+            SlotTick {
+                due: true,
+                jump: None
+            }
+        );
+        assert_eq!(ticker.deadline, at(102_400));
+        assert_eq!(ticker.deadline_slot_ns, FT2_SLOT_NS);
+        assert!(!ticker.poll(at(99_250), FT2_SLOT_NS).due);
+        for millis in (99_500..102_400).step_by(250) {
+            assert!(!ticker.poll(at(millis), FT2_SLOT_NS).due);
+        }
+        assert!(ticker.poll(at(102_400), FT2_SLOT_NS).due);
+        assert_eq!(ticker.deadline, at(105_600));
+    }
+
+    #[test]
     fn no_fire_before_deadline() {
         let (fired, deadline) = poll_slot_deadline(at(10_000), at(15_000), FT8_SLOT_NS);
         assert!(!fired);
@@ -3791,6 +3970,7 @@ mod poll_slot_deadline_tests {
         let mut ticker = SlotTicker {
             deadline: now + chrono::Duration::seconds(14),
             deadline_slot_ns: FT8_SLOT_NS,
+            last_poll_now: now - chrono::Duration::milliseconds(250),
         };
         let tick = ticker.poll(now, FT4_SLOT_NS);
         assert_eq!(
@@ -5119,6 +5299,157 @@ mod drain_pending_qso_offset_requests_tests {
              same-batch commit moved through",
             1500.0
         );
+    }
+
+    /// [`manager`] with `qso_stall_switch_after = 1`, so one silent rearm
+    /// raises a stall action (PAN-182).
+    fn manager_with_stall_threshold_one() -> pancetta_qso::QsoManager {
+        let mut config = pancetta_qso::QsoManagerConfig {
+            our_callsign: "W1ABC".to_string(),
+            our_grid: Some("FN42".to_string()),
+            ..Default::default()
+        };
+        config.timeouts.qso_stall_switch_after = 1;
+        let mut m = pancetta_qso::QsoManager::new(config);
+        m.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        m
+    }
+
+    /// A manual QSO whose one silent rearm raised a stall action, plus the
+    /// request the coordinator's forwarder pushes for it and the trigger
+    /// frame's text (PAN-182).
+    async fn raised_stall_action(
+        qso_manager: &pancetta_qso::QsoManager,
+    ) -> (
+        pancetta_qso::QsoId,
+        pancetta_qso::qso_manager::OffsetActionRequest,
+        String,
+    ) {
+        let qso_id = qso_manager
+            .respond_to_cq_manual("K9ZZ".to_string(), 1500.0, None)
+            .await
+            .unwrap();
+        let opened_at = qso_manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        qso_manager
+            .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(15))
+            .await;
+        let qso = qso_manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            qso.metadata.stall_cycles, 1,
+            "precondition: threshold tripped"
+        );
+        let request = pancetta_qso::qso_manager::OffsetActionRequest::stall_detected(
+            qso_id,
+            pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: 1500.0 },
+            qso.metadata.advance_generation,
+        );
+        (
+            qso_id,
+            request,
+            qso.messages.last().unwrap().raw_text.clone(),
+        )
+    }
+
+    async fn drain_once(
+        op: &mut pancetta_qso::AutonomousOperator,
+        qso_manager: &pancetta_qso::QsoManager,
+        pending: &std::sync::Mutex<Vec<pancetta_qso::qso_manager::OffsetActionRequest>>,
+    ) {
+        drain_pending_qso_offset_requests(
+            op,
+            qso_manager,
+            pending,
+            &no_offsets(),
+            &auto_mode(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await;
+    }
+
+    /// PAN-182: the drain must not commit a stall switch while the frame that
+    /// raised it is still unreported — it requeues it, like a PTT-in-flight
+    /// refusal, so a late not-sent report can still revoke it.
+    #[tokio::test]
+    async fn a_stall_action_whose_trigger_has_not_aired_is_requeued_not_committed() {
+        let mut op = operator_with_live_allocator();
+        let qso_manager = manager_with_stall_threshold_one();
+        let (qso_id, request, _) = raised_stall_action(&qso_manager).await;
+        let pending = std::sync::Mutex::new(vec![request]);
+
+        drain_once(&mut op, &qso_manager, &pending).await;
+
+        {
+            let queued = pending.lock().unwrap();
+            assert_eq!(queued.len(), 1, "the held action is requeued, not dropped");
+            assert_eq!(queued[0].qso_id, qso_id);
+            assert!(queued[0].origin.raised_at_generation().is_some());
+        }
+        let qso = qso_manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(qso.metadata.frequency, 1500.0, "nothing committed");
+        assert_eq!(qso.metadata.stall_cycles, 1);
+    }
+
+    /// PAN-182: once the TX worker reports the trigger frame aired, the
+    /// requeued action commits on the next drain.
+    #[tokio::test]
+    async fn a_released_stall_action_commits_on_the_next_drain() {
+        let mut op = operator_with_live_allocator();
+        let qso_manager = manager_with_stall_threshold_one();
+        let (qso_id, request, text) = raised_stall_action(&qso_manager).await;
+        let pending = std::sync::Mutex::new(vec![request]);
+        drain_once(&mut op, &qso_manager, &pending).await;
+        assert_eq!(pending.lock().unwrap().len(), 1, "precondition: held");
+
+        assert!(
+            qso_manager
+                .confirm_stall_trigger_aired(
+                    qso_id,
+                    &text,
+                    &pancetta_qso::UnsentAttemptPayload {
+                        frequency_hz: 1500.0,
+                        remote_binding: Some((false, None)),
+                    },
+                    // After the rearm's own TX slot has played out.
+                    chrono::Utc::now() + chrono::Duration::minutes(2),
+                )
+                .await
+        );
+        drain_once(&mut op, &qso_manager, &pending).await;
+
+        assert!(pending.lock().unwrap().is_empty(), "the action committed");
+        let qso = qso_manager.get_qso(qso_id).await.unwrap();
+        assert_ne!(
+            qso.metadata.frequency, 1500.0,
+            "the QSO moved off the stalled offset"
+        );
+        assert_eq!(qso.metadata.stall_cycles, 0);
+    }
+
+    /// PAN-182: the engine re-raises a held action every slot; the requeued
+    /// copy and the re-raise coalesce per QSO, so holding never piles up.
+    #[tokio::test]
+    async fn a_requeued_stall_action_coalesces_with_its_re_raise() {
+        let mut op = operator_with_live_allocator();
+        let qso_manager = manager_with_stall_threshold_one();
+        let (qso_id, request, _) = raised_stall_action(&qso_manager).await;
+        let pending = std::sync::Mutex::new(vec![request.clone()]);
+        drain_once(&mut op, &qso_manager, &pending).await;
+        assert_eq!(pending.lock().unwrap().len(), 1, "precondition: held");
+
+        pending.lock().unwrap().push(request);
+        drain_once(&mut op, &qso_manager, &pending).await;
+
+        let queued = pending.lock().unwrap();
+        assert_eq!(queued.len(), 1, "one held request per QSO, never a pile-up");
+        assert_eq!(queued[0].qso_id, qso_id);
     }
 
     /// The operator's deliberate nudge is the request that survives coalescing

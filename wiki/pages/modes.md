@@ -40,6 +40,14 @@ periods, band dial tables, and offset regions are normative in the code and
   stays FT8 and is flagged in ADIF. `partner_freq` supplies the Fox's fixed
   receive location but is a generic split-TX field, not the Hound discriminator.
 
+The autonomous `SlotTicker` in `pancetta/src/coordinator/autonomous.rs` remembers
+the previous poll time. When it observes a mode change, a current-mode boundary
+in `(previous poll, current poll]` triggers one immediate decision tick, even if
+the old deadline is still ahead. This avoids skipping a boundary that passed
+inside the roughly 250 ms polling gap. The next deadline stays on the new mode's
+future UTC grid, with no catch-up burst. The ticker has no mode-switch timestamp,
+so a switch just before or just after that boundary receives the same recovery.
+
 ## Key invariant
 
 **`mode=FT8` must stay byte-identical** when FT4/FT2 are untouched — every path

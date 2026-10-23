@@ -5588,6 +5588,15 @@ impl super::ApplicationCoordinator {
                                                 Err(e) => debug!(target: "qso", "TxFrameNotSent: bad QSO id '{}': {}", qso_id, e),
                                             }
                                         }
+                                        crate::message_bus::QsoMessage::TxFrameSent { qso_id, message_text, aired, aired_at } => {
+                                            match qso_id.parse::<pancetta_qso::QsoId>() {
+                                                Ok(id) => {
+                                                    let released = qso_manager.confirm_stall_trigger_aired(id, &message_text, &aired, aired_at).await;
+                                                    debug!(target: "qso", "TX frame aired for QSO {} ('{}'): released held stall action: {}", qso_id, message_text, released);
+                                                }
+                                                Err(e) => debug!(target: "qso", "TxFrameSent: bad QSO id '{}': {}", qso_id, e),
+                                            }
+                                        }
                                         crate::message_bus::QsoMessage::ResendQso { qso_id } => {
                                             match qso_id.parse::<pancetta_qso::QsoId>() {
                                                 Ok(id) => {
@@ -11371,6 +11380,99 @@ mod respond_to_caller_admission_tests {
         )));
 
         coordinator
+    }
+
+    /// PAN-182: the Qso loop hands a `TxFrameSent` for a live QSO to
+    /// `confirm_stall_trigger_aired`, releasing the stall switch held on that
+    /// frame; a malformed id is dropped without disturbing the next message.
+    #[tokio::test]
+    async fn tx_frame_sent_releases_a_held_stall_switch() {
+        let mut coordinator = test_coordinator().await;
+        coordinator.config.write().await.station.callsign = "W1ABC".to_string();
+        coordinator
+            .config
+            .write()
+            .await
+            .autonomous
+            .qso_stall_switch_after = 1;
+        coordinator.tx_freq_mode.store(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        coordinator.start_qso_component().await.unwrap();
+        // See `tx_offset_action_needed_event_is_forwarded_to_pending_qso_offset_requests`:
+        // this clone must read the coordinator's live Auto mode too.
+        let mut manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        manager.set_tx_freq_mode_source(coordinator.tx_freq_mode.clone());
+        let id = manager
+            .respond_to_cq_manual("K1ABC".into(), 1500.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        let opened = manager
+            .get_qso(id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        manager
+            .rearm_manual_calls_at(opened + chrono::Duration::seconds(15))
+            .await;
+        let qso = manager.get_qso(id).await.unwrap();
+        let text = qso.messages.last().unwrap().raw_text.clone();
+        let origin = pancetta_qso::qso_manager::OffsetRelocationOrigin::StallDetected {
+            raised_at_generation: qso.metadata.advance_generation,
+        };
+        assert!(
+            matches!(
+                manager.apply_tx_offset_switch(id, 1800.0, origin).await,
+                Err(pancetta_qso::QsoManagerError::OffsetActionTriggerOutcomePending { .. })
+            ),
+            "precondition: the stall switch is held on the rearm's frame"
+        );
+
+        for qso_id in ["not-a-uuid".to_string(), id.to_string()] {
+            coordinator
+                .message_bus
+                .send_message(ComponentMessage::new(
+                    ComponentId::Ft8Transmitter,
+                    ComponentId::Qso,
+                    MessageType::QsoMessage(QsoMessage::TxFrameSent {
+                        qso_id,
+                        message_text: text.clone(),
+                        aired: pancetta_qso::UnsentAttemptPayload {
+                            frequency_hz: 1500.0,
+                            remote_binding: Some((false, None)),
+                        },
+                        // After the rearm's own TX slot has played out.
+                        aired_at: opened + chrono::Duration::minutes(2),
+                    }),
+                    Instant::now(),
+                ))
+                .await
+                .unwrap();
+        }
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match manager.apply_tx_offset_switch(id, 1800.0, origin).await {
+                Ok(applied) => {
+                    assert_eq!(applied, 1800.0);
+                    break;
+                }
+                Err(pancetta_qso::QsoManagerError::OffsetActionTriggerOutcomePending {
+                    ..
+                }) => {}
+                Err(e) => panic!("unexpected refusal: {e}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "QSO loop did not release the held switch"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     async fn check_tx_frame_not_sent(malformed_first: bool) {
