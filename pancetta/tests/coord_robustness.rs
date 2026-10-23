@@ -610,6 +610,7 @@ fn tx_pivot_target_carries_origin_and_client_identity() {
             tx_parity: Some(SlotParity::Even),
             origin: pancetta_lib::message_bus::TxOrigin::Remote,
             remote_client_key_id: Some("client-b".to_string()),
+            request_queued: true,
         },
     );
 
@@ -662,6 +663,7 @@ fn tx_pivot_target_pivots_on_an_authorization_only_change() {
             tx_parity: Some(SlotParity::Even),
             origin: pancetta_lib::message_bus::TxOrigin::Remote,
             remote_client_key_id: Some("client-b".to_string()),
+            request_queued: true,
         },
     );
 
@@ -716,6 +718,7 @@ fn tx_pivot_target_swaps_only_on_a_fresher_message() {
             tx_parity: Some(SlotParity::Even),
             origin: pancetta_lib::message_bus::TxOrigin::Local,
             remote_client_key_id: None,
+            request_queued: true,
         },
     );
 
@@ -760,6 +763,7 @@ fn tx_pivot_target_pivots_on_an_offset_only_change() {
             tx_parity: Some(SlotParity::Even),
             origin: pancetta_lib::message_bus::TxOrigin::Local,
             remote_client_key_id: None,
+            request_queued: true,
         },
     );
 

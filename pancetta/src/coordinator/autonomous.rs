@@ -1871,9 +1871,11 @@ impl super::ApplicationCoordinator {
             pancetta_qso::PriorityScorer::new(priority_weights, Box::new((*cached_lookup).clone())),
         );
 
-        let (_auto_tx, auto_rx) = self
+        // PAN-185: read through the durable inbox so a `TransmitComplete`
+        // parked behind a full channel still settles its self-CQ.
+        let auto_inbox = self
             .message_bus
-            .get_or_create_channel(ComponentId::Autonomous)
+            .durable_inbox(ComponentId::Autonomous)
             .await?;
         let message_bus = self.message_bus.clone();
         let display_feed_enabled = self.display_feed_enabled.clone();
@@ -3092,7 +3094,7 @@ impl super::ApplicationCoordinator {
 
                         _ = async {
                             loop {
-                                match auto_rx.try_recv() {
+                                match auto_inbox.try_recv() {
                                     Ok(message) => {
                                         match message.message_type {
                                             MessageType::DecodedMessage(decoded_msg) => {

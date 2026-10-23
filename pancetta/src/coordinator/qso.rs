@@ -2861,10 +2861,9 @@ impl super::ApplicationCoordinator {
 
         info!("Starting QSO component");
 
-        let (_qso_tx, qso_rx) = self
-            .message_bus
-            .get_or_create_channel(ComponentId::Qso)
-            .await?;
+        // PAN-185: read through the durable inbox so TX outcome reports
+        // parked behind a full channel still arrive.
+        let qso_inbox = self.message_bus.durable_inbox(ComponentId::Qso).await?;
         let message_bus = self.message_bus.clone();
         let display_feed_enabled = self.display_feed_enabled.clone();
         let pending_autonomous_cq_dispatch_failures =
@@ -3839,28 +3838,33 @@ impl super::ApplicationCoordinator {
                                         // payload here — see `LatestTxIntent`'s doc — computed
                                         // from the SAME `remote_origin`/`remote_client_key_id`
                                         // this exact event carries, so the intent can never
-                                        // disagree with the `TransmitRequest` sent moments
-                                        // below for the same event.
+                                        // disagree with the `TransmitRequest` sent below.
+                                        //
+                                        // PAN-185 (Codex 4244602501, the publish-before-send
+                                        // window): publish the intent as not queued, send the
+                                        // request checked, then settle: mark it queued once
+                                        // the bus accepted the request, withdraw it if not.
+                                        // Pivots ignore unqueued intents, so a pivot never
+                                        // targets a request the TX worker will never see.
+                                        let key = super::active_tx_qso_key(&qso_id.to_string());
+                                        let published = super::LatestTxIntent {
+                                            attempt_id,
+                                            message_text: text.clone(),
+                                            frequency_offset: frequency,
+                                            tx_parity,
+                                            origin: tx_origin,
+                                            remote_client_key_id: remote_client_key_id.clone(),
+                                            request_queued: false,
+                                        };
                                         if let Ok(mut m) = latest_tx_intent.write() {
-                                            m.insert(
-                                                super::active_tx_qso_key(&qso_id.to_string()),
-                                                super::LatestTxIntent {
-                                                    attempt_id,
-                                                    message_text: text.clone(),
-                                                    frequency_offset: frequency,
-                                                    tx_parity,
-                                                    origin: tx_origin,
-                                                    remote_client_key_id: remote_client_key_id
-                                                        .clone(),
-                                                },
-                                            );
+                                            m.insert(key.clone(), published.clone());
                                         }
                                         let tx_msg = ComponentMessage::new(
                                             ComponentId::Qso,
                                             ComponentId::Ft8Transmitter,
                                             MessageType::TransmitRequest {
                                                 attempt_id,
-                                                message_text: text,
+                                                message_text: text.clone(),
                                                 frequency_offset: frequency,
                                                 qso_id: Some(qso_id.to_string()),
                                                 tx_parity,
@@ -3869,8 +3873,38 @@ impl super::ApplicationCoordinator {
                                             },
                                             Instant::now(),
                                         );
-                                        if let Err(e) = tx_bus.send_message(tx_msg).await {
-                                            warn!("Failed to send auto-sequence TX: {}", e);
+                                        let queued = matches!(
+                                            tx_bus.send_message_checked(tx_msg).await,
+                                            Ok(true)
+                                        );
+                                        super::settle_tx_intent(
+                                            &latest_tx_intent,
+                                            &key,
+                                            &published,
+                                            queued,
+                                        );
+                                        if !queued {
+                                            warn!(
+                                                "auto-sequence TX for QSO {qso_id} never reached the TX worker; withdrawing its intent and reporting it unsent"
+                                            );
+                                            // Self-addressed: the Qso loop's own handler rolls
+                                            // back this attempt by id (a no-op for an opening
+                                            // or advance, PAN-183).
+                                            tx_bus
+                                                .send_message_durable(ComponentMessage::new(
+                                                    ComponentId::Qso,
+                                                    ComponentId::Qso,
+                                                    MessageType::QsoMessage(
+                                                        crate::message_bus::QsoMessage::TxFrameNotSent {
+                                                            qso_id: qso_id.to_string(),
+                                                            message_text: text,
+                                                            replaced: None,
+                                                            attempt_id,
+                                                        },
+                                                    ),
+                                                    Instant::now(),
+                                                ))
+                                                .await;
                                         }
                                     }
                                     Err(e) => {
@@ -4424,7 +4458,7 @@ impl super::ApplicationCoordinator {
                 consumer_ready.release();
 
                 while !shutdown.load(Ordering::Acquire) {
-                    match qso_rx.try_recv() {
+                    match qso_inbox.try_recv() {
                         Ok(message) => {
                             match message.message_type {
                                 // Decoded FT8 messages forwarded from the decoder
