@@ -90,19 +90,49 @@ async fn profile_with_adif_contest_id_stamps_it_on_the_wire() {
 
 /// Legacy-compat guard: `QsoMetadata` is persisted as JSON in SQLite, and
 /// every pre-PAN-52 row's `ContestInfo` lacks `adif_contest_id`. Those rows
-/// must keep deserializing, and a built-in profile slug in `contest_name`
-/// is never restored as the ADIF id.
+/// must keep deserializing, and — because ADIF import was the only
+/// production writer of `ContestInfo` before PAN-52 — their `contest_name`
+/// is an imported `CONTEST_ID` restored verbatim, even one that collides
+/// with a built-in profile slug (PR #502 review, Codex P2).
 #[test]
-fn contest_info_json_without_adif_contest_id_deserializes() {
-    let legacy = serde_json::json!({
-        "contest_name": "us-state-qso-party",
-        "category": "",
-        "serials": {"sent": null, "received": null},
-        "points": 0,
-        "multiplier": null,
-    });
-    let info: pancetta_qso::states::ContestInfo = serde_json::from_value(legacy)
-        .expect("pre-PAN-52 ContestInfo JSON must keep deserializing");
+fn contest_info_json_without_adif_contest_id_restores_imported_id() {
+    for imported in ["KS-QSO-PARTY", "us-state-qso-party"] {
+        let legacy = serde_json::json!({
+            "contest_name": imported,
+            "category": "",
+            "serials": {"sent": null, "received": null},
+            "points": 0,
+            "multiplier": null,
+        });
+        let info: pancetta_qso::states::ContestInfo = serde_json::from_value(legacy)
+            .expect("pre-PAN-52 ContestInfo JSON must keep deserializing");
+        assert_eq!(info.contest_name, imported);
+        assert_eq!(info.adif_contest_id.as_deref(), Some(imported));
+    }
+}
+
+/// An engaged family profile's row, written since PAN-52, round-trips its
+/// `null` `adif_contest_id` through JSON: the slug stays off the wire after
+/// a persist + reload.
+#[tokio::test]
+async fn engaged_family_profile_row_round_trips_without_contest_id() {
+    let manager = test_manager();
+    let qso_id = manager
+        .respond_to_cq_manual("K5TD".to_string(), 1203.0, None)
+        .await
+        .unwrap();
+    let profile = builtin_catalog()
+        .into_iter()
+        .find(|p| p.id == "us-state-qso-party")
+        .unwrap();
+    manager
+        .engage_contest_profile(qso_id, profile)
+        .await
+        .unwrap();
+    let progress = manager.get_qso(qso_id).await.unwrap();
+    let json = serde_json::to_string(&progress.metadata).unwrap();
+    let reloaded: pancetta_qso::states::QsoMetadata = serde_json::from_str(&json).unwrap();
+    let info = reloaded.contest_info.expect("contest info persisted");
     assert_eq!(info.contest_name, "us-state-qso-party");
     assert!(info.adif_contest_id.is_none());
 }

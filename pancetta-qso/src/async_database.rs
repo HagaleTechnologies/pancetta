@@ -2214,40 +2214,48 @@ mod tests {
     /// that `CONTEST_ID` from the startup DB→ADIF migration's export.
     #[tokio::test]
     async fn pre_pan52_imported_contest_id_survives_export() {
-        let adif = "<CALL:5>W1ABC <QSO_DATE:8>20250101 <TIME_ON:6>120000 <MODE:3>FT8 \
-                    <BAND:3>40M <CONTEST_ID:12>KS-QSO-PARTY <EOR>\n";
-        let processor = AdifProcessor::new();
-        let file = processor.parse_string(adif).unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let db = QsoDatabase::open(tmp.path().join("qso.db")).await.unwrap();
-        db.insert_adif_records(&processor, &file.records)
+        // The second id collides with a built-in profile slug; an imported
+        // value is still preserved verbatim (PR #502 review, Codex P2).
+        for imported in ["KS-QSO-PARTY", "us-state-qso-party"] {
+            let adif = format!(
+                "<CALL:5>W1ABC <QSO_DATE:8>20250101 <TIME_ON:6>120000 <MODE:3>FT8 \
+                 <BAND:3>40M <CONTEST_ID:{}>{imported} <EOR>\n",
+                imported.len()
+            );
+            let processor = AdifProcessor::new();
+            let file = processor.parse_string(&adif).unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let db = QsoDatabase::open(tmp.path().join("qso.db")).await.unwrap();
+            db.insert_adif_records(&processor, &file.records)
+                .await
+                .unwrap();
+            // Rewrite the row to its pre-PAN-52 shape: no `adif_contest_id` key.
+            sqlx::query(
+                "UPDATE qsos SET progress_data = \
+                 json_remove(progress_data, '$.metadata.contest_info.adif_contest_id')",
+            )
+            .execute(&db.pool)
             .await
             .unwrap();
-        // Rewrite the row to its pre-PAN-52 shape: no `adif_contest_id` key.
-        sqlx::query(
-            "UPDATE qsos SET progress_data = \
-             json_remove(progress_data, '$.metadata.contest_info.adif_contest_id')",
-        )
-        .execute(&db.pool)
-        .await
-        .unwrap();
-        let (key_type, contest_name): (Option<String>, String) = sqlx::query_as(
-            "SELECT json_type(progress_data, '$.metadata.contest_info.adif_contest_id'), \
-             json_extract(progress_data, '$.metadata.contest_info.contest_name') FROM qsos",
-        )
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
-        assert_eq!((key_type, contest_name.as_str()), (None, "KS-QSO-PARTY"));
+            let (key_type, contest_name): (Option<String>, String) = sqlx::query_as(
+                "SELECT json_type(progress_data, '$.metadata.contest_info.adif_contest_id'), \
+                 json_extract(progress_data, '$.metadata.contest_info.contest_name') FROM qsos",
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            assert_eq!((key_type, contest_name.as_str()), (None, imported));
 
-        let exported_path = tmp.path().join("qsos.adi");
-        db.export_to_adif(&exported_path).await.unwrap();
-        let exported = std::fs::read_to_string(&exported_path).unwrap();
-        assert!(
-            exported.contains("<CONTEST_ID:12>KS-QSO-PARTY"),
-            "a pre-PAN-52 imported row lost its CONTEST_ID on export: {exported}"
-        );
-        db.close().await;
+            let exported_path = tmp.path().join("qsos.adi");
+            db.export_to_adif(&exported_path).await.unwrap();
+            let exported = std::fs::read_to_string(&exported_path).unwrap();
+            let field = format!("<CONTEST_ID:{}>{imported}", imported.len());
+            assert!(
+                exported.contains(&field),
+                "a pre-PAN-52 imported row lost its CONTEST_ID on export: {exported}"
+            );
+            db.close().await;
+        }
     }
 
     /// PR #451 review (Codex P2): an imported (or replayed) row lands in its

@@ -813,18 +813,20 @@ where
     Option::<String>::deserialize(deserializer).map(Some)
 }
 
-/// The `adif_contest_id` of a pre-PAN-52 row (PR #502 review). Before
-/// PAN-52, ADIF import was the only production code that built a
-/// `ContestInfo`, and it stored the file's verbatim `CONTEST_ID` in
-/// `contest_name`, which export then stamped as `CONTEST_ID`. Restoring it
-/// keeps the upgraded index → export path lossless. A built-in contest
-/// profile's id is the internal slug PAN-52 keeps off the wire, so it is
-/// never restored.
+/// The `adif_contest_id` of a pre-PAN-52 row (PR #502 review): its
+/// `contest_name`, verbatim.
+///
+/// Before PAN-52, ADIF import was the only production code that persisted a
+/// `ContestInfo` — `engage_contest_profile` had no caller outside tests —
+/// and it stored the file's verbatim `CONTEST_ID` in `contest_name`, which
+/// export then stamped as `CONTEST_ID`. So every legacy row's
+/// `contest_name` is an imported `CONTEST_ID`, including one that happens
+/// to equal a built-in profile slug such as `us-state-qso-party`, and
+/// restoring it unconditionally keeps the upgraded index → export path
+/// lossless. Rows written since PAN-52 always carry the key, so the
+/// profile-slug exclusion lives in `engage_contest_profile`, never here.
 fn legacy_adif_contest_id(contest_name: &str) -> Option<String> {
-    let is_profile_slug = crate::contest::catalog::builtin_catalog()
-        .iter()
-        .any(|profile| profile.id == contest_name);
-    (!is_profile_slug).then(|| contest_name.to_string())
+    Some(contest_name.to_string())
 }
 
 impl From<ContestInfoRow> for ContestInfo {
