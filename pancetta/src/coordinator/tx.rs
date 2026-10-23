@@ -2930,6 +2930,67 @@ async fn report_transmit_complete(
     result
 }
 
+/// Report a frame whose audio played out, after PTT is released. Same as
+/// [`report_transmit_complete`]; on success it also tells the QSO engine the
+/// frame aired, with the offset and binding it aired on, so a stall offset
+/// action held on that frame can commit (PAN-182). Never called before or
+/// during key-down (PAN-202).
+async fn report_played_transmit_complete(
+    message_bus: &MessageBus,
+    success: bool,
+    message_text: String,
+    duration_ms: u64,
+    qso_id: Option<String>,
+    aired: pancetta_qso::UnsentAttemptPayload,
+) -> Result<()> {
+    let sent = success
+        .then(|| qso_id.clone())
+        .flatten()
+        .map(|id| (id, message_text.clone()));
+    let result =
+        report_transmit_complete(message_bus, success, message_text, duration_ms, qso_id).await;
+    if let Some((qso_id, message_text)) = sent {
+        report_frame_sent(message_bus, qso_id, message_text, aired).await;
+    }
+    result
+}
+
+/// PAN-182: tell the QSO engine `message_text` aired for `qso_id`.
+async fn report_frame_sent(
+    message_bus: &MessageBus,
+    qso_id: String,
+    message_text: String,
+    aired: pancetta_qso::UnsentAttemptPayload,
+) {
+    let _ = message_bus
+        .send_message(ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Qso,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameSent {
+                qso_id,
+                message_text,
+                aired,
+            }),
+            Instant::now(),
+        ))
+        .await;
+}
+
+/// The offset and binding a transmitted frame carried (PAN-182).
+fn aired_payload(
+    frequency_hz: f64,
+    origin: crate::message_bus::TxOrigin,
+    remote_client_key_id: Option<String>,
+) -> pancetta_qso::UnsentAttemptPayload {
+    pancetta_qso::UnsentAttemptPayload {
+        frequency_hz,
+        remote_binding: Some((
+            origin == crate::message_bus::TxOrigin::Remote,
+            remote_client_key_id,
+        )),
+    }
+}
+
 /// Pivot sources cleared from a refused frame or bundle, keyed by
 /// `active_tx_qso_key` (PAN-75).
 type PivotReplaced =
@@ -10165,12 +10226,17 @@ impl super::ApplicationCoordinator {
                                             // pending_self_cq_qsos and, if `success` is false,
                                             // never roll back the streak) or fabricating a
                                             // failure for a CQ that may have transmitted fine.
-                                            if let Err(e) = report_transmit_complete(
+                                            if let Err(e) = report_played_transmit_complete(
                                                 &message_bus,
                                                 success,
                                                 message_text.clone(),
                                                 duration_ms,
                                                 qso_id.clone(),
+                                                aired_payload(
+                                                    frequency_offset,
+                                                    origin,
+                                                    remote_client_key_id.clone(),
+                                                ),
                                             )
                                             .await
                                             {
@@ -10198,12 +10264,17 @@ impl super::ApplicationCoordinator {
                                         ptt_guard.disarm();
 
                                         // --- Step 10: Send TransmitComplete ---
-                                        if let Err(e) = report_transmit_complete(
+                                        if let Err(e) = report_played_transmit_complete(
                                             &message_bus,
                                             success,
                                             message_text,
                                             duration_ms,
                                             qso_id.clone(),
+                                            aired_payload(
+                                                frequency_offset,
+                                                origin,
+                                                remote_client_key_id.clone(),
+                                            ),
                                         )
                                         .await
                                         {
@@ -12719,15 +12790,22 @@ impl super::ApplicationCoordinator {
                                         // real values now, per item, rather than skipping
                                         // TransmitComplete entirely (leaking every bundle
                                         // item's pending_self_cq_qsos entry).
-                                        for (text, qso_id) in
-                                            item_texts.into_iter().zip(encoded_qso_ids_final)
+                                        for ((text, qso_id), item) in item_texts
+                                            .into_iter()
+                                            .zip(encoded_qso_ids_final)
+                                            .zip(&items)
                                         {
-                                            if let Err(e) = report_transmit_complete(
+                                            if let Err(e) = report_played_transmit_complete(
                                                 &message_bus,
                                                 success,
                                                 text,
                                                 duration_ms,
                                                 qso_id,
+                                                aired_payload(
+                                                    item.frequency_offset,
+                                                    item.origin,
+                                                    item.remote_client_key_id.clone(),
+                                                ),
                                             )
                                             .await
                                             {
@@ -12752,15 +12830,22 @@ impl super::ApplicationCoordinator {
                                     ptt_guard.disarm();
 
                                     // --- Step 10: Send TransmitComplete for each item ---
-                                    for (text, qso_id) in
-                                        item_texts.into_iter().zip(encoded_qso_ids_final)
+                                    for ((text, qso_id), item) in item_texts
+                                        .into_iter()
+                                        .zip(encoded_qso_ids_final)
+                                        .zip(&items)
                                     {
-                                        if let Err(e) = report_transmit_complete(
+                                        if let Err(e) = report_played_transmit_complete(
                                             &message_bus,
                                             success,
                                             text,
                                             duration_ms,
                                             qso_id,
+                                            aired_payload(
+                                                item.frequency_offset,
+                                                item.origin,
+                                                item.remote_client_key_id.clone(),
+                                            ),
                                         )
                                         .await
                                         {
@@ -21537,6 +21622,86 @@ mod report_transmit_complete_tests {
     #[tokio::test]
     async fn failed_qso_frame_also_notifies_qso() {
         check(false, Some("q1")).await;
+    }
+
+    /// PAN-182: a QSO frame that played out also tells the QSO engine it
+    /// aired, with the offset and binding it aired on, after the unchanged
+    /// Autonomous completion.
+    #[tokio::test]
+    async fn successful_transmit_complete_mirrors_tx_frame_sent_to_qso() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_, autonomous) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        let aired = aired_payload(
+            1500.0,
+            crate::message_bus::TxOrigin::Remote,
+            Some("peer".into()),
+        );
+        assert_eq!(
+            aired,
+            pancetta_qso::UnsentAttemptPayload {
+                frequency_hz: 1500.0,
+                remote_binding: Some((true, Some("peer".into()))),
+            }
+        );
+        report_played_transmit_complete(
+            &bus,
+            true,
+            "K1ABC N0CALL FN20".into(),
+            12_640,
+            Some("q1".into()),
+            aired.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            autonomous.try_recv().unwrap().message_type,
+            MessageType::TransmitComplete { success: true, ref message_text, duration_ms: 12_640, qso_id: Some(ref id) }
+                if id == "q1" && message_text == "K1ABC N0CALL FN20"
+        ));
+        assert!(autonomous.try_recv().is_err());
+        let msg = qso.try_recv().unwrap();
+        assert_eq!(msg.source, ComponentId::Ft8Transmitter);
+        assert!(matches!(
+            msg.message_type,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameSent { ref qso_id, ref message_text, aired: ref got })
+                if qso_id == "q1" && message_text == "K1ABC N0CALL FN20" && *got == aired
+        ));
+        assert!(qso.try_recv().is_err());
+    }
+
+    /// PAN-182: a frame that did not play out reports only the PAN-75
+    /// not-sent mirror, never `TxFrameSent`; an untracked frame (no QSO)
+    /// reports nothing to the QSO engine either way.
+    #[tokio::test]
+    async fn failed_transmit_complete_sends_no_tx_frame_sent() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_, autonomous) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_, qso) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        let aired = aired_payload(1500.0, crate::message_bus::TxOrigin::Local, None);
+        report_played_transmit_complete(
+            &bus,
+            false,
+            "K1ABC N0CALL FN20".into(),
+            0,
+            Some("q1".into()),
+            aired.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(autonomous.try_recv().is_ok());
+        assert!(matches!(
+            qso.try_recv().unwrap().message_type,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { ref qso_id, replaced: None, .. })
+                if qso_id == "q1"
+        ));
+        assert!(qso.try_recv().is_err());
+
+        report_played_transmit_complete(&bus, true, "CQ N0CALL FN20".into(), 0, None, aired)
+            .await
+            .unwrap();
+        assert!(autonomous.try_recv().is_ok());
+        assert!(qso.try_recv().is_err());
     }
 
     /// A pivot-duplicate's payload already aired via the pivot, so the QSO

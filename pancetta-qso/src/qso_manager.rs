@@ -618,6 +618,30 @@ pub enum QsoManagerError {
     )]
     OffsetActionStallRolledBack { qso_id: QsoId },
 
+    /// PAN-182: the frame whose emission raised this stall action has not
+    /// been reported by the TX worker yet — neither aired
+    /// ([`QsoManager::confirm_stall_trigger_aired`]) nor unsent (the PAN-75
+    /// rollback). Committing now could move the QSO on the strength of a
+    /// frame that never aired, and a later not-sent report could no longer
+    /// undo the move. Expected, not a fault — the caller re-queues the action
+    /// for its next drain tick rather than discarding it.
+    #[error(
+        "TX-offset action for QSO {qso_id} deferred — the stall attempt that \
+         raised it has not been reported aired or unsent yet"
+    )]
+    OffsetActionTriggerOutcomePending { qso_id: QsoId },
+
+    /// PAN-182: the stall action's trigger frame went unreported for
+    /// `STALL_TRIGGER_HOLD_SLOTS` slots (a frame dropped with no report, e.g.
+    /// on shutdown). The action is dropped rather than committed on unknown
+    /// evidence; the streak is untouched, so the detector's next raise arms a
+    /// fresh hold. Expected, not a fault.
+    #[error(
+        "TX-offset action for QSO {qso_id} dropped — the stall attempt that \
+         raised it was never reported aired or unsent"
+    )]
+    OffsetActionTriggerOutcomeExpired { qso_id: QsoId },
+
     /// PAN-131 (Codex round 13 on PR #350, P2): an operator `u` nudge was
     /// queued while its QSO sat in a nudge-eligible state, but the DX moved
     /// the QSO on before the once-per-slot drain committed it — into a state
@@ -650,6 +674,8 @@ impl QsoManagerError {
                 | QsoManagerError::OffsetActionHeld { .. }
                 | QsoManagerError::OffsetActionPttInFlight { .. }
                 | QsoManagerError::OffsetActionStallRolledBack { .. }
+                | QsoManagerError::OffsetActionTriggerOutcomePending { .. }
+                | QsoManagerError::OffsetActionTriggerOutcomeExpired { .. }
                 | QsoManagerError::OffsetActionNudgeSuperseded { .. }
         )
     }
@@ -1184,6 +1210,36 @@ const UNSENT_ATTEMPT_RETENTION_SLOTS: i64 = 4;
 const MAX_UNSENT_ATTEMPTS_PER_QSO: usize = 8;
 // Same tolerance the TX worker's pivot check uses for "same offset".
 const UNSENT_ATTEMPT_OFFSET_EPSILON_HZ: f64 = 0.5;
+// PAN-182: how long a stall action waits on its trigger frame's outcome
+// before the hold expires. Matches the ledger's retention: past it, a
+// not-sent report could no longer find the attempt to roll back anyway.
+const STALL_TRIGGER_HOLD_SLOTS: i64 = 4;
+
+fn stall_trigger_hold_expired(
+    emitted_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    slot_millis: i64,
+) -> bool {
+    now - emitted_at >= Duration::milliseconds(STALL_TRIGGER_HOLD_SLOTS * slot_millis)
+}
+
+// The pivot-safe "same frame" test shared by the not-sent rollback
+// (`KeepCallAttempt::carries`) and the aired release
+// (`PendingStallTrigger::aired_as`). A `None` binding is a wildcard.
+fn emission_carries(
+    frequency_hz: f64,
+    remote_origin: bool,
+    remote_client_key_id: &Option<String>,
+    payload: &UnsentAttemptPayload,
+) -> bool {
+    (frequency_hz - payload.frequency_hz).abs() < UNSENT_ATTEMPT_OFFSET_EPSILON_HZ
+        && payload
+            .remote_binding
+            .as_ref()
+            .is_none_or(|(origin, key_id)| {
+                remote_origin == *origin && remote_client_key_id == key_id
+            })
+}
 
 #[derive(Debug, Clone)]
 struct KeepCallAttempt {
@@ -1210,12 +1266,54 @@ struct KeepCallAttempt {
 
 impl KeepCallAttempt {
     fn carries(&self, payload: &UnsentAttemptPayload) -> bool {
-        (self.frequency_hz - payload.frequency_hz).abs() < UNSENT_ATTEMPT_OFFSET_EPSILON_HZ
-            && payload.remote_binding.as_ref().is_none_or(
-                |(remote_origin, remote_client_key_id)| {
-                    self.remote_origin == *remote_origin
-                        && self.remote_client_key_id == *remote_client_key_id
-                },
+        emission_carries(
+            self.frequency_hz,
+            self.remote_origin,
+            &self.remote_client_key_id,
+            payload,
+        )
+    }
+}
+
+// PAN-182: the keep-call emission whose outcome a raised stall action is
+// waiting on. `apply_tx_offset_switch` refuses a stall-origin commit while
+// one is recorded; it is released when the TX worker reports the frame
+// aired, re-pointed or cleared by the not-sent rollback, and cleared by
+// every stall reset.
+#[derive(Debug, Clone)]
+struct PendingStallTrigger {
+    emitted_at: DateTime<Utc>,
+    raw_text: String,
+    frequency_hz: f64,
+    remote_origin: bool,
+    remote_client_key_id: Option<String>,
+}
+
+impl PendingStallTrigger {
+    fn from_attempt(attempt: &KeepCallAttempt) -> Self {
+        Self {
+            emitted_at: attempt.emitted_at,
+            raw_text: attempt.raw_text.clone(),
+            frequency_hz: attempt.frequency_hz,
+            remote_origin: attempt.remote_origin,
+            remote_client_key_id: attempt.remote_client_key_id.clone(),
+        }
+    }
+
+    fn is_attempt(&self, attempt: &KeepCallAttempt) -> bool {
+        self.emitted_at == attempt.emitted_at && self.raw_text == attempt.raw_text
+    }
+
+    // Matches on the aired frame's offset and binding, not text alone: a
+    // pivot can air a same-text frame elsewhere while the trigger's own
+    // not-sent report is still on its way.
+    fn aired_as(&self, message_text: &str, aired: &UnsentAttemptPayload) -> bool {
+        self.raw_text == message_text
+            && emission_carries(
+                self.frequency_hz,
+                self.remote_origin,
+                &self.remote_client_key_id,
+                aired,
             )
     }
 }
@@ -1229,6 +1327,8 @@ struct KeepCallLedger {
     // stall action already raised is stale. Cleared when an action is raised
     // again or the streak resets.
     stall_action_revoked: bool,
+    // PAN-182: see `PendingStallTrigger`.
+    pending_stall_trigger: Option<PendingStallTrigger>,
 }
 
 /// Whether a failed TX could be matched to a recent, active keep-call emission.
@@ -1269,6 +1369,8 @@ impl ManualCallOutcome {
 /// The payload of a frame a TX pivot replaced (PAN-75). Text alone cannot
 /// tell that frame apart from the fresher same-text frame that aired in its
 /// place when the pivot changed only the offset or the remote binding.
+/// PAN-182 reuses it for the frame that aired, to release a held stall
+/// action only for the frame it was waiting on.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnsentAttemptPayload {
     pub frequency_hz: f64,
@@ -4048,6 +4150,7 @@ impl QsoManager {
                 attempt.tx_slot = None;
             }
             entry.stall_action_revoked = false;
+            entry.pending_stall_trigger = None;
         }
     }
 
@@ -4144,6 +4247,16 @@ impl QsoManager {
         if progress.metadata.last_call_at == Some(attempt.emitted_at) {
             progress.metadata.last_call_at = attempt.prev_last_call_at;
         }
+        // PAN-182: the frame a held stall action was waiting on never aired.
+        // Without an heir (below) nothing is left to wait on; the streak
+        // decrement and `stall_action_revoked` decide the action instead.
+        let trigger_rolled_back = entry
+            .pending_stall_trigger
+            .as_ref()
+            .is_some_and(|trigger| trigger.is_attempt(&attempt));
+        if trigger_rolled_back {
+            entry.pending_stall_trigger = None;
+        }
         if attempt.bumped_stall {
             // PAN-128 (the "heir" rule): a counted attempt and an uncounted
             // twin can feed the SAME own-parity TX slot (two rearms one
@@ -4157,7 +4270,15 @@ impl QsoManager {
                 .tx_slot
                 .and_then(|slot| entry.attempts.iter().rposition(|a| a.tx_slot == Some(slot)));
             match heir {
-                Some(index) => entry.attempts[index].bumped_stall = true,
+                Some(index) => {
+                    entry.attempts[index].bumped_stall = true;
+                    // PAN-182: the heir still carries the slot's count and
+                    // can still air, so a held action now waits on it.
+                    if trigger_rolled_back {
+                        entry.pending_stall_trigger =
+                            Some(PendingStallTrigger::from_attempt(&entry.attempts[index]));
+                    }
+                }
                 None => {
                     let threshold = self.config.timeouts.qso_stall_switch_after;
                     let was_at_threshold = progress.metadata.stall_cycles >= threshold;
@@ -4181,6 +4302,39 @@ impl QsoManager {
         UnsentAttemptRollback::RolledBack {
             call_count: progress.metadata.call_count,
         }
+    }
+
+    /// PAN-182: the TX worker reports a QSO frame that aired. If it is the
+    /// frame a raised stall action is waiting on — same text, same offset
+    /// and remote binding (see [`UnsentAttemptPayload`]) — release the hold
+    /// so the next drain can commit the action. Returns whether a hold was
+    /// released; any other frame leaves the ledger untouched.
+    pub async fn confirm_stall_trigger_aired(
+        &self,
+        qso_id: QsoId,
+        message_text: &str,
+        aired: &UnsentAttemptPayload,
+    ) -> bool {
+        let qsos = self.qsos.write().await;
+        if !qsos.get(&qso_id).is_some_and(|p| p.state.is_active()) {
+            return false;
+        }
+        let mut ledger = self
+            .keep_call_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = ledger.get_mut(&qso_id) else {
+            return false;
+        };
+        if !entry
+            .pending_stall_trigger
+            .as_ref()
+            .is_some_and(|trigger| trigger.aired_as(message_text, aired))
+        {
+            return false;
+        }
+        entry.pending_stall_trigger = None;
+        true
     }
 
     #[cfg(test)]
@@ -4455,6 +4609,34 @@ impl QsoManager {
                 qso_id,
                 offset_hz: old_off,
             });
+        }
+        // 4a. **Trigger frame's outcome unknown** (PAN-182). The frame whose
+        //    emission raised this stall action may still be waiting on the
+        //    TX worker, and the commit below erases the ledger evidence a
+        //    later not-sent report needs to undo the streak. Hold until the
+        //    worker reports the frame aired (`confirm_stall_trigger_aired`)
+        //    or unsent (`roll_back_replaced_attempt_at`, after which guard 2
+        //    refuses it as `OffsetActionStallRolledBack`). After
+        //    `STALL_TRIGGER_HOLD_SLOTS` with no report the action is dropped,
+        //    never committed; the still-standing streak re-raises it with a
+        //    fresh trigger. Scoped to stall origins: an operator `u` nudge is
+        //    never held. After guard 4, so a no-op still reports as one.
+        let pending_trigger_at = raised_at_generation.and_then(|_| {
+            self.keep_call_ledger
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&qso_id)
+                .and_then(|entry| entry.pending_stall_trigger.as_ref())
+                .map(|trigger| trigger.emitted_at)
+        });
+        if let Some(emitted_at) = pending_trigger_at {
+            return Err(
+                if stall_trigger_hold_expired(emitted_at, Utc::now(), self.rearm_slot_millis()) {
+                    QsoManagerError::OffsetActionTriggerOutcomeExpired { qso_id }
+                } else {
+                    QsoManagerError::OffsetActionTriggerOutcomePending { qso_id }
+                },
+            );
         }
         // 5. **Hold mode, re-validated inside this commit** (Codex round 10 on
         //    PR #350, thread on `autonomous.rs:988`; closed for real by
@@ -7915,6 +8097,7 @@ impl QsoManager {
                 )
                 .allows_auto_change();
 
+                let mut arm_stall_trigger = false;
                 if tx_auto
                     && progress.metadata.stall_cycles >= self.config.timeouts.qso_stall_switch_after
                 {
@@ -7948,7 +8131,20 @@ impl QsoManager {
                     // coordinator's drain coalesces per QSO per batch (round 7,
                     // finding 1), so this costs one retry per slot, not a
                     // pile-up.
-                    ledger.entry(qso_id).or_default().stall_action_revoked = false;
+                    let entry = ledger.entry(qso_id).or_default();
+                    entry.stall_action_revoked = false;
+                    // PAN-182: the commit waits on the frame that brought the
+                    // streak to the threshold (recorded below). A re-raise on
+                    // a later slot leaves that hold alone — its own
+                    // rollback cannot revoke the action, and re-arming the
+                    // hold every slot could keep it from ever releasing — and
+                    // only takes over an expired one.
+                    arm_stall_trigger = (counts_toward_stall
+                        && progress.metadata.stall_cycles
+                            == self.config.timeouts.qso_stall_switch_after)
+                        || entry.pending_stall_trigger.as_ref().is_some_and(|trigger| {
+                            stall_trigger_hold_expired(trigger.emitted_at, now, slot_millis)
+                        });
                     offset_actions_to_emit.push((
                         qso_id,
                         action,
@@ -7974,21 +8170,22 @@ impl QsoManager {
                     frequency: progress.metadata.frequency,
                 });
 
-                self.record_keep_call_attempt(
-                    &mut ledger,
-                    qso_id,
-                    KeepCallAttempt {
-                        emitted_at: now,
-                        raw_text,
-                        prev_last_call_at,
-                        bumped_stall: counts_toward_stall,
-                        tx_slot: Some(tx_slot),
-                        recorded_sent: true,
-                        frequency_hz: progress.metadata.frequency,
-                        remote_origin: progress.metadata.remote_origin,
-                        remote_client_key_id: progress.metadata.remote_client_key_id.clone(),
-                    },
-                );
+                let attempt = KeepCallAttempt {
+                    emitted_at: now,
+                    raw_text,
+                    prev_last_call_at,
+                    bumped_stall: counts_toward_stall,
+                    tx_slot: Some(tx_slot),
+                    recorded_sent: true,
+                    frequency_hz: progress.metadata.frequency,
+                    remote_origin: progress.metadata.remote_origin,
+                    remote_client_key_id: progress.metadata.remote_client_key_id.clone(),
+                };
+                if arm_stall_trigger {
+                    ledger.entry(qso_id).or_default().pending_stall_trigger =
+                        Some(PendingStallTrigger::from_attempt(&attempt));
+                }
+                self.record_keep_call_attempt(&mut ledger, qso_id, attempt);
                 to_recall.push((
                     qso_id,
                     message,
@@ -18682,6 +18879,34 @@ mod pan72_stall_detection_tests {
         }
     }
 
+    /// PAN-182: report the QSO's latest keep-call frame aired at
+    /// `frequency_hz` — what the TX worker's `TxFrameSent` does — releasing a
+    /// stall switch held on it, as must happen before the drain can commit.
+    async fn confirm_last_frame_aired(manager: &QsoManager, qso_id: QsoId, frequency_hz: f64) {
+        let text = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .messages
+            .last()
+            .unwrap()
+            .raw_text
+            .clone();
+        assert!(
+            manager
+                .confirm_stall_trigger_aired(
+                    qso_id,
+                    &text,
+                    &UnsentAttemptPayload {
+                        frequency_hz,
+                        remote_binding: Some((false, None)),
+                    },
+                )
+                .await,
+            "precondition: the stall switch was held on this frame"
+        );
+    }
+
     /// DX sends us a plain signal report — a genuine forward advance from
     /// `RespondingToCq` to `SendingReport` (their_report: None rung).
     async fn send_report(manager: &QsoManager, report: i8, text: &str) {
@@ -18844,6 +19069,10 @@ mod pan72_stall_detection_tests {
              intact — the QSO is still stalled and must be able to retry the \
              moment a slot frees up, not after another full threshold window"
         );
+
+        // PAN-182: the drain commits a stall switch only once its trigger
+        // frame (the slot-3 rearm's) has been reported aired.
+        confirm_last_frame_aired(&manager, qso_id, FREQ).await;
 
         // A relocation that actually commits is the thing that clears it.
         manager
@@ -20859,7 +21088,9 @@ mod pan72_stall_detection_tests {
             "precondition: the same pass raises the Switch, {events:?}"
         );
 
-        // The coordinator's drain commits the switch a moment later.
+        // The threshold-crossing CQ airs (PAN-182 releases the held switch)
+        // and the coordinator's drain commits the switch a moment later.
+        confirm_last_frame_aired(&manager, qso_id, FREQ).await;
         let new_offset = FREQ + 400.0;
         assert_eq!(
             manager
@@ -22296,7 +22527,9 @@ mod pan72_stall_detection_tests {
             manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
             2
         );
-        // The commit resets the streak AND must retire P's slot key.
+        // The commit (once P aired, PAN-182) resets the streak AND must
+        // retire P's slot key.
+        confirm_last_frame_aired(&manager, qso_id, FREQ).await;
         manager
             .apply_tx_offset_switch(qso_id, FREQ + 300.0, stall_origin(&manager, qso_id).await)
             .await
@@ -22522,6 +22755,442 @@ mod pan72_stall_detection_tests {
                 }
             }
         }
+    }
+
+    // PAN-182: a stall offset switch is held until the TX worker reports
+    // the frame that raised it — aired (`confirm_stall_trigger_aired`) or
+    // unsent (the PAN-75 rollback) — so a commit can no longer win the race
+    // against a late not-sent report and strand the QSO on an offset chosen
+    // from a frame that never aired.
+
+    /// Threshold 1, one silent rearm: the rearm's emission raises the
+    /// action and becomes its pending trigger. Returns the QSO, the
+    /// rearm's timestamp and the trigger frame's text.
+    async fn pan182_raise(manager: &QsoManager) -> (QsoId, DateTime<Utc>, String) {
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        let rearm_at = opened_at + Duration::seconds(15);
+        manager.rearm_manual_calls_at(rearm_at).await;
+        let qso = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            qso.metadata.stall_cycles, 1,
+            "precondition: the rearm tripped threshold 1"
+        );
+        (
+            qso_id,
+            rearm_at,
+            qso.messages.last().unwrap().raw_text.clone(),
+        )
+    }
+
+    fn pan182_threshold_one() -> QsoManager {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 1;
+        manager_auto(config)
+    }
+
+    fn aired_at(frequency_hz: f64) -> UnsentAttemptPayload {
+        UnsentAttemptPayload {
+            frequency_hz,
+            remote_binding: Some((false, None)),
+        }
+    }
+
+    #[tokio::test]
+    async fn pan182_stall_switch_refuses_to_commit_while_its_trigger_frame_is_unresolved() {
+        let manager = pan182_threshold_one();
+        let (qso_id, _, _) = pan182_raise(&manager).await;
+
+        let result = manager
+            .apply_tx_offset_switch(qso_id, FREQ + 300.0, stall_origin(&manager, qso_id).await)
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(QsoManagerError::OffsetActionTriggerOutcomePending { .. })
+            ),
+            "a stall switch must wait for its trigger frame's outcome, got {result:?}"
+        );
+        assert!(result.unwrap_err().is_expected_offset_action_refusal());
+        let qso = manager.get_qso(qso_id).await.unwrap();
+        assert!((qso.metadata.frequency - FREQ).abs() < f64::EPSILON);
+        assert_eq!(
+            qso.metadata.stall_cycles, 1,
+            "the held action keeps its streak"
+        );
+    }
+
+    #[tokio::test]
+    async fn pan182_aired_stall_trigger_releases_its_switch() {
+        let manager = pan182_threshold_one();
+        let (qso_id, _, text) = pan182_raise(&manager).await;
+
+        assert!(
+            manager
+                .confirm_stall_trigger_aired(qso_id, &text, &aired_at(FREQ))
+                .await,
+            "the trigger frame airing releases the hold"
+        );
+        let applied = manager
+            .apply_tx_offset_switch(qso_id, FREQ + 300.0, stall_origin(&manager, qso_id).await)
+            .await
+            .expect("a released stall switch commits");
+        let qso = manager.get_qso(qso_id).await.unwrap();
+        assert!((qso.metadata.frequency - applied).abs() < f64::EPSILON);
+        assert!((applied - (FREQ + 300.0)).abs() < f64::EPSILON);
+        assert_eq!(qso.metadata.stall_cycles, 0);
+    }
+
+    #[tokio::test]
+    async fn pan182_unsent_trigger_roll_back_still_revokes_and_keeps_the_qso_on_the_old_offset() {
+        let manager = pan182_threshold_one();
+        let (qso_id, rearm_at, text) = pan182_raise(&manager).await;
+
+        assert!(matches!(
+            manager
+                .roll_back_unsent_attempt_at(qso_id, &text, rearm_at + Duration::seconds(1))
+                .await,
+            UnsentAttemptRollback::RolledBack { .. }
+        ));
+        let result = manager
+            .apply_tx_offset_switch(qso_id, FREQ + 300.0, stall_origin(&manager, qso_id).await)
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(QsoManagerError::OffsetActionStallRolledBack { .. })
+            ),
+            "the rollback clears the trigger, so the revocation decides: got {result:?}"
+        );
+        let qso = manager.get_qso(qso_id).await.unwrap();
+        assert!((qso.metadata.frequency - FREQ).abs() < f64::EPSILON);
+        assert_eq!(qso.metadata.stall_cycles, 0);
+        assert!(
+            !manager
+                .confirm_stall_trigger_aired(qso_id, &text, &aired_at(FREQ))
+                .await,
+            "no trigger is left to release"
+        );
+    }
+
+    #[tokio::test]
+    async fn pan182_trigger_payload_mismatch_does_not_release_the_hold() {
+        let manager = pan182_threshold_one();
+        let (qso_id, _, text) = pan182_raise(&manager).await;
+
+        // A pivot aired the same text at another offset, or under another
+        // binding: neither is the trigger frame.
+        assert!(
+            !manager
+                .confirm_stall_trigger_aired(qso_id, &text, &aired_at(FREQ + 300.0))
+                .await
+        );
+        assert!(
+            !manager
+                .confirm_stall_trigger_aired(
+                    qso_id,
+                    &text,
+                    &UnsentAttemptPayload {
+                        frequency_hz: FREQ,
+                        remote_binding: Some((true, Some("peer".into()))),
+                    },
+                )
+                .await
+        );
+        assert!(
+            !manager
+                .confirm_stall_trigger_aired(qso_id, "CQ K5ARH EM12", &aired_at(FREQ))
+                .await
+        );
+        let result = manager
+            .apply_tx_offset_switch(qso_id, FREQ + 300.0, stall_origin(&manager, qso_id).await)
+            .await;
+        assert!(matches!(
+            result,
+            Err(QsoManagerError::OffsetActionTriggerOutcomePending { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn pan182_aged_unresolved_trigger_expires_instead_of_committing() {
+        let manager = pan182_threshold_one();
+        let (qso_id, _, _) = pan182_raise(&manager).await;
+        let slot_millis = manager.rearm_slot_millis();
+        manager
+            .keep_call_ledger
+            .lock()
+            .unwrap()
+            .get_mut(&qso_id)
+            .and_then(|entry| entry.pending_stall_trigger.as_mut())
+            .expect("the raise recorded a trigger")
+            .emitted_at = Utc::now() - Duration::milliseconds(5 * slot_millis);
+
+        let result = manager
+            .apply_tx_offset_switch(qso_id, FREQ + 300.0, stall_origin(&manager, qso_id).await)
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(QsoManagerError::OffsetActionTriggerOutcomeExpired { .. })
+            ),
+            "an unreported trigger expires to a drop, never a commit: got {result:?}"
+        );
+        assert!(result.unwrap_err().is_expected_offset_action_refusal());
+        let qso = manager.get_qso(qso_id).await.unwrap();
+        assert!((qso.metadata.frequency - FREQ).abs() < f64::EPSILON);
+        assert_eq!(
+            qso.metadata.stall_cycles, 1,
+            "the streak survives, so the next raise re-arms the hold"
+        );
+    }
+
+    #[test]
+    fn pan182_stall_trigger_hold_expires_at_four_slots() {
+        let emitted_at = Utc::now();
+        let slot = 15_000;
+        assert!(!stall_trigger_hold_expired(
+            emitted_at,
+            emitted_at + Duration::milliseconds(4 * slot - 1),
+            slot
+        ));
+        assert!(stall_trigger_hold_expired(
+            emitted_at,
+            emitted_at + Duration::milliseconds(4 * slot),
+            slot
+        ));
+    }
+
+    /// A re-raise only takes over a hold that has expired; the expired one
+    /// is replaced by the re-raising emission, which a report then resolves.
+    #[tokio::test]
+    async fn pan182_a_re_raise_re_arms_an_expired_hold() {
+        let manager = pan182_threshold_one();
+        let (qso_id, rearm_at, text) = pan182_raise(&manager).await;
+        let slot_millis = manager.rearm_slot_millis();
+
+        // Still fresh: a later re-raise leaves the threshold frame's hold.
+        let fresh = rearm_at + Duration::milliseconds(slot_millis);
+        manager.rearm_manual_calls_at(fresh).await;
+        let trigger_at = |manager: &QsoManager| {
+            manager
+                .keep_call_ledger
+                .lock()
+                .unwrap()
+                .get(&qso_id)
+                .and_then(|entry| entry.pending_stall_trigger.as_ref())
+                .map(|trigger| trigger.emitted_at)
+        };
+        assert_eq!(trigger_at(&manager), Some(rearm_at));
+
+        // Expired by the next re-raise: it takes over.
+        let late = rearm_at + Duration::milliseconds(4 * slot_millis);
+        manager.rearm_manual_calls_at(late).await;
+        assert_eq!(trigger_at(&manager), Some(late));
+        assert!(
+            manager
+                .confirm_stall_trigger_aired(qso_id, &text, &aired_at(FREQ))
+                .await
+        );
+        manager
+            .apply_tx_offset_switch(qso_id, FREQ + 300.0, stall_origin(&manager, qso_id).await)
+            .await
+            .expect("the re-armed hold released by its own frame airing");
+    }
+
+    #[tokio::test]
+    async fn pan182_commit_and_streak_resets_clear_the_pending_trigger() {
+        // A committed switch clears it.
+        let manager = pan182_threshold_one();
+        let (qso_id, _, text) = pan182_raise(&manager).await;
+        assert!(
+            manager
+                .confirm_stall_trigger_aired(qso_id, &text, &aired_at(FREQ))
+                .await
+        );
+        manager
+            .apply_tx_offset_switch(qso_id, FREQ + 300.0, stall_origin(&manager, qso_id).await)
+            .await
+            .expect("released switch commits");
+        assert!(
+            !manager
+                .confirm_stall_trigger_aired(qso_id, &text, &aired_at(FREQ))
+                .await,
+            "nothing is held after the commit"
+        );
+
+        // A genuine DX advance resets the streak and clears it too.
+        let manager = pan182_threshold_one();
+        let (qso_id, _, text) = pan182_raise(&manager).await;
+        send_report(&manager, -7, &format!("{OUR} {DX} -07")).await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            0
+        );
+        assert!(
+            !manager
+                .confirm_stall_trigger_aired(qso_id, &text, &aired_at(FREQ))
+                .await,
+            "a DX advance retires the hold with the streak"
+        );
+    }
+
+    /// PAN-128 twin: two rearms feed one own-parity slot, and only the first
+    /// carries its count. When that trigger frame is reported unsent the
+    /// twin inherits the count — and the hold, since it can still air.
+    #[tokio::test]
+    async fn pan182_rolled_back_trigger_with_a_surviving_heir_keeps_the_hold() {
+        use pancetta_core::slot::SlotParity;
+
+        let manager = pan182_threshold_one();
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, Some(SlotParity::Odd))
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        let x = next_own_ft8_slot(opened_at + Duration::seconds(15), SlotParity::Even);
+        // Trigger A (at FREQ, from the off-parity slot before x+30) trips
+        // threshold 1; a pivot then changes only the offset; twin B (at
+        // FREQ+100, inside x+30's late-start window) feeds the same slot
+        // uncounted and only re-raises.
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(16))
+            .await;
+        manager
+            .qsos
+            .write()
+            .await
+            .get_mut(&qso_id)
+            .unwrap()
+            .metadata
+            .frequency = FREQ + 100.0;
+        manager
+            .rearm_manual_calls_at(x + Duration::seconds(31))
+            .await;
+        let qso = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            qso.metadata.stall_cycles, 1,
+            "one own-parity slot, one count"
+        );
+        let text = qso.messages.last().unwrap().raw_text.clone();
+
+        assert!(matches!(
+            manager
+                .roll_back_replaced_attempt_at(
+                    qso_id,
+                    &text,
+                    Some(&aired_at(FREQ)),
+                    x + Duration::seconds(35)
+                )
+                .await,
+            UnsentAttemptRollback::RolledBack { .. }
+        ));
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1,
+            "the twin inherits the slot's count"
+        );
+        let result = manager
+            .apply_tx_offset_switch(qso_id, FREQ + 300.0, stall_origin(&manager, qso_id).await)
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(QsoManagerError::OffsetActionTriggerOutcomePending { .. })
+            ),
+            "the heir can still air, so the hold moves to it: got {result:?}"
+        );
+        assert!(
+            !manager
+                .confirm_stall_trigger_aired(qso_id, &text, &aired_at(FREQ))
+                .await,
+            "the rolled-back trigger's payload no longer releases anything"
+        );
+        assert!(
+            manager
+                .confirm_stall_trigger_aired(qso_id, &text, &aired_at(FREQ + 100.0))
+                .await,
+            "the heir airing releases the hold"
+        );
+        manager
+            .apply_tx_offset_switch(qso_id, FREQ + 300.0, stall_origin(&manager, qso_id).await)
+            .await
+            .expect("released by the heir");
+    }
+
+    /// An operator `u` nudge carries no stall evidence and is never held by
+    /// a stall trigger, even for the same QSO.
+    #[tokio::test]
+    async fn pan182_operator_nudge_is_not_held_by_a_pending_stall_trigger() {
+        let manager = pan182_threshold_one();
+        let (qso_id, _, _) = pan182_raise(&manager).await;
+        manager
+            .apply_tx_offset_switch(qso_id, FREQ + 300.0, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .expect("an operator nudge commits while a stall trigger is pending");
+    }
+
+    /// The ticket's scenario at the exact ordering that used to lose: the
+    /// coordinator's commit attempt lands BEFORE the TX worker's not-sent
+    /// report for the threshold-triggering frame. Before PAN-182 the commit
+    /// succeeded and erased the evidence the rollback needed, so the QSO
+    /// stayed on the new offset. Now the commit is refused while the
+    /// trigger is unresolved, and the late report revokes the action.
+    #[tokio::test]
+    async fn pan182_lost_race_commit_attempt_then_not_sent_report_never_moves_the_offset() {
+        let manager = pan182_threshold_one();
+        let (qso_id, rearm_at, text) = pan182_raise(&manager).await;
+        let origin = stall_origin(&manager, qso_id).await;
+
+        let early = manager
+            .apply_tx_offset_switch(qso_id, FREQ + 300.0, origin)
+            .await;
+        assert!(
+            matches!(
+                early,
+                Err(QsoManagerError::OffsetActionTriggerOutcomePending { .. })
+            ),
+            "the commit can no longer win the race: got {early:?}"
+        );
+        assert!(matches!(
+            manager
+                .roll_back_unsent_attempt_at(qso_id, &text, rearm_at + Duration::seconds(1))
+                .await,
+            UnsentAttemptRollback::RolledBack { .. }
+        ));
+        let requeued = manager
+            .apply_tx_offset_switch(qso_id, FREQ + 300.0, origin)
+            .await;
+        assert!(
+            matches!(
+                requeued,
+                Err(QsoManagerError::OffsetActionStallRolledBack { .. })
+            ),
+            "the requeued action dies on the revocation: got {requeued:?}"
+        );
+        let qso = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            qso.metadata.stall_cycles < 1,
+            "the stall count is back below the threshold"
+        );
+        assert!(
+            (qso.metadata.frequency - FREQ).abs() < f64::EPSILON,
+            "the QSO is not left on an offset chosen from a stall that never aired"
+        );
     }
 }
 
