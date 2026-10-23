@@ -424,7 +424,10 @@ silently by Step 0-dup, the backlog pivot-duplicate pass or a mid-TX
 duplicate drop. Backlog coalescing reports a failed completion to Autonomous,
 and to Autonomous only, for every QSO request it drops as terminal or excludes
 for parity or frequency; a request coalesced into a newer one for the same QSO
-stays silent because the newer one reports. A request the TX channel never
+stays silent because the newer one reports. An excluded request's failure can
+settle a self-CQ before the QSO's next rearm airs, the same trade-off the
+DX-parity hold already makes; staying silent instead would leave the self-CQ
+pending forever when no fresh request follows. A request the TX channel never
 accepted rolls back its ledger attempt through a self-addressed
 `TxFrameNotSent`. An F8 abort keeps the
 tombstone, so Step 0-dup later reports the replaced frame. Backlog coalescing
