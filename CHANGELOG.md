@@ -158,6 +158,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Autonomous cqdx.io spot reports now carry the frequency of the band the
+  decode was actually heard on when the station changes bands between a decode
+  and its slot-tick report (PAN-68) — the same captured-dial fix PAN-67 applied
+  to the TUI and PSKReporter. Each accumulated decode remembers the dial its
+  own audio window was captured on, so a band switch (by the operator or the
+  autonomous band-hopper) between the decode and the report no longer
+  publishes the spot under the new band's frequency.
+
 - The TX band-plan gate now sees split enabled at the radio's front panel or by
   another CAT client (PAN-206). The Hamlib poll loop reads split every 500 ms
   and refuses QSO TX and manual PTT outside the configured band plan. Rigs

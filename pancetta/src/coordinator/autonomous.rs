@@ -78,6 +78,27 @@ pub(crate) fn spot_publish_target(
     bridge.filter(|_| !replay_mode)
 }
 
+/// The absolute frequency (Hz) to report a cqdx spot at: the dial the
+/// decode's own audio window was captured on
+/// (`DecodedMessageInfo::captured_dial_hz`), plus the decode's
+/// intra-window audio tone offset.
+///
+/// PAN-68: falls back to `live_dial_hz` only when the message never got
+/// stamped (`None` — test scaffolding, simulator, pre-PAN-67 paths) or
+/// the stamp is the 0 Hz "not yet established" sentinel (see dsp.rs's
+/// `band_ref_dial_hz`/`cur_dial_hz`). For a live decode, re-reading the
+/// live atomic here reintroduces the race PAN-67 fixed for the TUI and
+/// PSKReporter: the operator (or the autonomous band-hopper itself) can
+/// switch bands between the decode landing in `slot_messages` and this
+/// slot tick, which would publish an old-band spot under the new band.
+fn spot_frequency_hz(msg: &pancetta_qso::DecodedMessageInfo, live_dial_hz: u64) -> u64 {
+    let dial_hz = match msg.captured_dial_hz {
+        Some(hz) if hz != 0 => hz,
+        _ => live_dial_hz,
+    };
+    dial_hz + msg.frequency_hz as u64
+}
+
 #[cfg(test)]
 mod replay_gate_tests {
     use super::*;
@@ -122,6 +143,54 @@ mod replay_gate_tests {
     async fn no_bridge_is_none_either_way() {
         assert!(spot_publish_target(None, false).is_none());
         assert!(spot_publish_target(None, true).is_none());
+    }
+}
+
+#[cfg(test)]
+mod spot_frequency_tests {
+    use super::spot_frequency_hz;
+    use pancetta_qso::DecodedMessageInfo;
+
+    fn decoded_info_at(freq_offset_hz: f64, captured_dial_hz: Option<u64>) -> DecodedMessageInfo {
+        DecodedMessageInfo {
+            callsign: Some("K1ABC".into()),
+            frequency_hz: freq_offset_hz,
+            snr: -10,
+            message_text: "CQ K1ABC FN42".into(),
+            slot_parity: None,
+            confidence: None,
+            time_offset_s: None,
+            decode_origin: None,
+            captured_dial_hz,
+        }
+    }
+
+    /// PAN-68: a decode from the old band's audio must report under the
+    /// old band even if the live dial has already moved to a new band by
+    /// the time the slot tick publishes the spot — the same race PAN-67
+    /// fixed for the TUI and PSKReporter.
+    #[test]
+    fn spot_frequency_uses_the_captured_dial_not_the_live_one() {
+        let old_band_decode = decoded_info_at(1500.0, Some(7_074_000));
+        assert_eq!(spot_frequency_hz(&old_band_decode, 14_074_000), 7_075_500);
+    }
+
+    #[test]
+    fn spot_frequency_falls_back_to_live_dial_when_uncaptured() {
+        let unstamped_decode = decoded_info_at(1500.0, None);
+        assert_eq!(spot_frequency_hz(&unstamped_decode, 14_074_000), 14_075_500);
+    }
+
+    /// Some(0) is dsp.rs's "not yet established" sentinel (0 = no rig /
+    /// pre-first-CAT-read), never a real 0 Hz dial — same as
+    /// psk_reporter round 3.
+    #[test]
+    fn spot_frequency_falls_back_to_live_dial_when_captured_is_zero() {
+        let zero_captured_decode = decoded_info_at(1500.0, Some(0));
+        assert_eq!(
+            spot_frequency_hz(&zero_captured_decode, 14_074_000),
+            14_075_500
+        );
     }
 }
 
@@ -2127,7 +2196,7 @@ impl super::ApplicationCoordinator {
                                         msg.callsign.as_ref().map(|call| pancetta_cqdx::SpotReport {
                                             callsign: call.clone(),
                                             grid: None,
-                                            frequency: dial_freq + msg.frequency_hz as u64,
+                                            frequency: spot_frequency_hz(msg, dial_freq),
                                             mode: "FT8".to_string(),
                                             snr: msg.snr,
                                             timestamp: chrono::Utc::now(),
@@ -3111,6 +3180,9 @@ impl super::ApplicationCoordinator {
                                                         .confidence_features
                                                         .as_ref()
                                                         .and_then(|c| c.decode_origin),
+                                                    // PAN-68: keep the decode's own window dial so the slot-tick
+                                                    // cqdx report never reads the live atomic for a heard-on band.
+                                                    captured_dial_hz: decoded_msg.captured_dial_hz,
                                                 });
                                             }
                                             // PAN-38: a dispatched self-CQ
@@ -4007,6 +4079,7 @@ mod classify_autonomous_opening_tests {
             confidence: None,
             time_offset_s: None,
             decode_origin: None,
+            captured_dial_hz: None,
         }
     }
 
@@ -4080,6 +4153,7 @@ mod plan_slot_transmissions_tests {
             confidence: None,
             time_offset_s: None,
             decode_origin: None,
+            captured_dial_hz: None,
         }
     }
 
@@ -4756,6 +4830,7 @@ mod drain_pending_qso_offset_requests_tests {
                 confidence: None,
                 time_offset_s: None,
                 decode_origin: None,
+                captured_dial_hz: None,
             }
         }
 
