@@ -11769,6 +11769,200 @@ mod respond_to_caller_admission_tests {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// PAN-185 scenario 1 through the running QSO loop: the keep-call
+    /// rearm's rollback was parked on the Qso inbox's durable lane (its
+    /// channel was full when the TX worker reported it). The loop still
+    /// applies it: the rearm's call, stall increment and Sent entry reverse.
+    #[tokio::test]
+    async fn pan185_qso_loop_applies_a_parked_tx_frame_not_sent() {
+        let mut coordinator = test_coordinator().await;
+        {
+            let mut cfg = coordinator.config.write().await;
+            cfg.station.callsign = "W1ABC".to_string();
+            cfg.station.grid_square = "FN42".to_string();
+        }
+        let (_tx_s, tx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        coordinator.start_qso_component().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        let id = manager
+            .respond_to_cq_manual("K1ABC".into(), 1500.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        let qso = id.to_string();
+        pan183_next_transmit_request(&tx, &qso).await;
+        let opened = manager
+            .get_qso(id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        manager
+            .rearm_manual_calls_at(opened + chrono::Duration::seconds(15))
+            .await;
+        let (rearm_text, rearm_id) = pan183_next_transmit_request(&tx, &qso).await;
+        let before = manager.get_qso(id).await.unwrap();
+        assert_eq!(before.metadata.call_count, 2);
+        assert_eq!(before.metadata.stall_cycles, 1);
+
+        coordinator.message_bus.park_for_test(ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Qso,
+            MessageType::QsoMessage(QsoMessage::TxFrameNotSent {
+                qso_id: qso.clone(),
+                message_text: rearm_text,
+                replaced: None,
+                attempt_id: rearm_id,
+            }),
+            Instant::now(),
+        ));
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let after = manager.get_qso(id).await.unwrap();
+            if after.metadata.call_count == 1 {
+                assert_eq!(
+                    after.metadata.stall_cycles, 0,
+                    "the rearm's stall increment"
+                );
+                assert_eq!(
+                    after
+                        .messages
+                        .iter()
+                        .filter(|m| m.direction == pancetta_qso::MessageDirection::Sent)
+                        .count(),
+                    1,
+                    "the rearm's Sent entry"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "QSO loop did not apply the parked rollback"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            coordinator.message_bus.durable_lane_len(ComponentId::Qso),
+            0
+        );
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// PAN-185: once the bus accepts a forwarded `TransmitRequest`, its
+    /// intent is marked queued (pivotable) and keeps its attempt id.
+    #[tokio::test]
+    async fn pan185_delivered_request_marks_its_intent_queued() {
+        let mut coordinator = test_coordinator().await;
+        {
+            let mut cfg = coordinator.config.write().await;
+            cfg.station.callsign = "W1ABC".to_string();
+            cfg.station.grid_square = "FN42".to_string();
+        }
+        let (_tx_s, tx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        coordinator.start_qso_component().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        let id = manager
+            .respond_to_cq_manual("K1ABC".into(), 1500.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        let (_, forwarded) = pan183_next_transmit_request(&tx, &id.to_string()).await;
+        let key = super::super::active_tx_qso_key(&id.to_string());
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let intent = coordinator
+                .latest_tx_intent
+                .read()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .expect("a delivered request keeps its intent");
+            assert_eq!(intent.attempt_id, forwarded);
+            if intent.request_queued {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the delivered request's intent was never marked queued"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// PAN-185 (Codex 4244560866): a request the TX worker's channel never
+    /// accepted leaves no pivotable intent behind, and the QSO engine rolls
+    /// back the attempt it recorded for it.
+    #[tokio::test]
+    async fn pan185_undelivered_request_withdraws_its_intent_and_rolls_back_its_attempt() {
+        let mut coordinator = test_coordinator().await;
+        {
+            let mut cfg = coordinator.config.write().await;
+            cfg.station.callsign = "W1ABC".to_string();
+            cfg.station.grid_square = "FN42".to_string();
+        }
+        let (tx_s, tx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        coordinator.start_qso_component().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        let id = manager
+            .respond_to_cq_manual("K1ABC".into(), 1500.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        let qso = id.to_string();
+        pan183_next_transmit_request(&tx, &qso).await;
+        let pre_resend = manager.get_qso(id).await.unwrap().metadata.call_count;
+        // The TX worker is not running here, so nothing drains the channel.
+        while tx_s
+            .try_send(ComponentMessage::new(
+                ComponentId::Ft8Transmitter,
+                ComponentId::Ft8Transmitter,
+                MessageType::AudioData(Vec::new()),
+                Instant::now(),
+            ))
+            .is_ok()
+        {}
+        manager.resend_last_tx(id).await.unwrap();
+        let key = super::super::active_tx_qso_key(&qso);
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let intent_gone = !coordinator
+                .latest_tx_intent
+                .read()
+                .unwrap()
+                .contains_key(&key);
+            let call_count = manager.get_qso(id).await.unwrap().metadata.call_count;
+            if intent_gone && call_count == pre_resend {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "undelivered request: intent_gone={intent_gone}, call_count={call_count} (want {pre_resend})"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     /// Drain the Tui channel (bounded crossbeam queue, not broadcast — a
     /// message sent before the consuming loop starts polling simply waits
     /// in the queue, so no readiness handshake is needed here), collecting

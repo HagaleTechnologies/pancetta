@@ -587,6 +587,69 @@ fn c20_no_new_window_is_ignored() {
 /// (this function) is the pure data source the TX worker's Step 4c reads
 /// `origin`/`remote_client_key_id` from before reassigning them atomically
 /// alongside `message_text`/`frequency_offset` — this pins that the pure
+/// PAN-185: an intent whose `TransmitRequest` is not confirmed queued is
+/// never a pivot target, however much it differs.
+#[test]
+fn tx_pivot_target_ignores_an_intent_whose_request_is_not_queued() {
+    use std::collections::HashMap;
+    let qid = "abc-123";
+    let mut latest: HashMap<String, LatestTxIntent> = HashMap::new();
+    latest.insert(
+        active_tx_qso_key(qid),
+        LatestTxIntent {
+            attempt_id: None,
+            message_text: "K5ARH W1AW 73".to_string(),
+            frequency_offset: 1600.0,
+            tx_parity: None,
+            origin: pancetta_lib::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
+            request_queued: false,
+        },
+    );
+    assert!(tx_pivot_target(
+        Some(qid),
+        "K5ARH W1AW RR73",
+        1500.0,
+        Some((pancetta_lib::message_bus::TxOrigin::Local, None)),
+        &latest,
+    )
+    .is_none());
+}
+
+/// PAN-185: the bundle pivot inherits the queued-only filter.
+#[test]
+fn pivot_bundle_items_ignores_unqueued_intents() {
+    use pancetta_lib::coordinator::pivot_bundle_items;
+    use pancetta_lib::message_bus::{TransmitRequestItem, TxOrigin};
+    use std::collections::HashMap;
+    let mut latest: HashMap<String, LatestTxIntent> = HashMap::new();
+    latest.insert(
+        active_tx_qso_key("qso-a"),
+        LatestTxIntent {
+            attempt_id: None,
+            message_text: "SM2LIY K5ARH 73".to_string(),
+            frequency_offset: 693.0,
+            tx_parity: None,
+            origin: TxOrigin::Local,
+            remote_client_key_id: None,
+            request_queued: false,
+        },
+    );
+    let items = vec![TransmitRequestItem {
+        attempt_id: None,
+        message_text: "SM2LIY K5ARH R-14".to_string(),
+        frequency_offset: 690.0,
+        qso_id: Some("qso-a".to_string()),
+        origin: TxOrigin::Local,
+        remote_client_key_id: None,
+    }];
+    let (pivoted, pivots) = pivot_bundle_items(items, &latest);
+    assert_eq!(pivoted.len(), 1);
+    assert_eq!(pivoted[0].message_text, "SM2LIY K5ARH R-14");
+    assert_eq!(pivoted[0].frequency_offset, 690.0);
+    assert!(pivots.is_empty());
+}
+
 /// function itself returns the fresher binding, not just the fresher text.
 #[test]
 fn tx_pivot_target_carries_origin_and_client_identity() {

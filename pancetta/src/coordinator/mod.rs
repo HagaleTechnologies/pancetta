@@ -3275,7 +3275,7 @@ mod pivot_duplicate_tests {
 
 #[cfg(test)]
 mod pivot_bundle_tests {
-    use super::{active_tx_qso_key, pivot_bundle_items, LatestTxIntent};
+    use super::{active_tx_qso_key, pivot_bundle_items, settle_tx_intent, LatestTxIntent};
     use crate::message_bus::TransmitRequestItem;
     use std::collections::HashMap;
 
@@ -3306,6 +3306,57 @@ mod pivot_bundle_tests {
             remote_client_key_id: None,
             request_queued: true,
         }
+    }
+
+    fn published(text: &str) -> LatestTxIntent {
+        LatestTxIntent {
+            request_queued: false,
+            ..intent(text, 1500.0)
+        }
+    }
+
+    /// PAN-185: a checked enqueue makes the published intent pivotable.
+    #[test]
+    fn settle_marks_the_published_intent_queued() {
+        let key = active_tx_qso_key("qso-a");
+        let map = std::sync::RwLock::new(HashMap::new());
+        let p = published("K1ABC N0CALL R-07");
+        map.write().unwrap().insert(key.clone(), p.clone());
+        settle_tx_intent(&map, &key, &p, true);
+        assert_eq!(
+            map.read().unwrap().get(&key),
+            Some(&LatestTxIntent {
+                request_queued: true,
+                ..p
+            })
+        );
+    }
+
+    /// PAN-185: a dropped request's intent is withdrawn, never left for a
+    /// pivot to target.
+    #[test]
+    fn settle_withdraws_the_published_intent_on_a_drop() {
+        let key = active_tx_qso_key("qso-a");
+        let map = std::sync::RwLock::new(HashMap::new());
+        let p = published("K1ABC N0CALL R-07");
+        map.write().unwrap().insert(key.clone(), p.clone());
+        settle_tx_intent(&map, &key, &p, false);
+        assert!(map.read().unwrap().get(&key).is_none());
+    }
+
+    /// PAN-185: a newer `MessageToSend` replaced the entry between publish
+    /// and settle; settling the older one leaves the newer one alone.
+    #[test]
+    fn settle_leaves_a_newer_intent_untouched() {
+        let key = active_tx_qso_key("qso-a");
+        let map = std::sync::RwLock::new(HashMap::new());
+        let older = published("K1ABC N0CALL R-07");
+        let newer = published("K1ABC N0CALL RR73");
+        map.write().unwrap().insert(key.clone(), newer.clone());
+        settle_tx_intent(&map, &key, &older, true);
+        assert_eq!(map.read().unwrap().get(&key), Some(&newer));
+        settle_tx_intent(&map, &key, &older, false);
+        assert_eq!(map.read().unwrap().get(&key), Some(&newer));
     }
 
     /// An item whose recorded intent differs from its current text gets both
