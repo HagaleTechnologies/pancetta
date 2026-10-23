@@ -680,6 +680,140 @@ impl RigConnState {
     }
 }
 
+/// PAN-206: result of reconciling one rig split observation with the TX gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SplitPollOutcome {
+    Changed(u64),
+    Unchanged,
+    /// The rig answered but cannot report split (unsupported verb, bad or
+    /// zero frequency). Best-effort: does not affect CAT-link health.
+    Unobservable,
+    /// A split read failed AND left the CAT link disconnected (timeout, EOF,
+    /// incomplete `s` reply). Counts as a failed poll so a persistent
+    /// split-read transport failure reaches `PollingFailed` and the TX hard
+    /// mute instead of being masked by the preceding frequency read.
+    LinkLost,
+    Skipped,
+}
+
+impl SplitPollOutcome {
+    /// Whether the enclosing poll tick still counts as a successful poll.
+    fn keeps_poll_ok(self) -> bool {
+        !matches!(self, SplitPollOutcome::LinkLost)
+    }
+}
+
+/// Separate from CAT-link health: an unsupported split read must not mute TX.
+#[derive(Debug, Default)]
+struct SplitReadHealth {
+    unobservable: bool,
+}
+
+impl SplitReadHealth {
+    /// Log once per unavailable episode; any successful read re-arms it.
+    fn note_outcome(&mut self, outcome: SplitPollOutcome) -> bool {
+        match outcome {
+            SplitPollOutcome::Unobservable => {
+                let first = !self.unobservable;
+                self.unobservable = true;
+                first
+            }
+            SplitPollOutcome::Changed(_) | SplitPollOutcome::Unchanged => {
+                self.unobservable = false;
+                false
+            }
+            // Link health is RigPollHealth's job; a dropped link says
+            // nothing about whether the rig supports split readback.
+            SplitPollOutcome::LinkLost | SplitPollOutcome::Skipped => false,
+        }
+    }
+}
+
+/// Reconcile the gate's split input without issuing any split commands.
+/// Best-effort, like S-meter reads: callers must NOT count Unobservable
+/// toward poll_ok / RigPollHealth, but MUST count LinkLost as a failed poll.
+/// A failed read preserves commanded state. Callers only invoke this while
+/// the rig reports Connected, so a post-failure Disconnected status means
+/// the split read itself broke the link.
+async fn reconcile_polled_split(
+    rig: &dyn pancetta_hamlib::RigControl,
+    split_tx_hz: &std::sync::atomic::AtomicU64,
+    in_flight: &std::sync::atomic::AtomicU32,
+    fence: &crate::message_bus::SplitObservationFence,
+) -> SplitPollOutcome {
+    let Some(revision) = fence.snapshot() else {
+        return SplitPollOutcome::Skipped;
+    };
+    if in_flight.load(Ordering::Acquire) != 0 {
+        return SplitPollOutcome::Skipped;
+    }
+    let previous = split_tx_hz.load(Ordering::Relaxed);
+    let tx_hz = match rig.get_split().await {
+        Err(_) => return split_read_failure(rig).await,
+        Ok((false, _)) => 0,
+        Ok((true, _)) => match rig.get_split_freq().await {
+            // Zero means simplex to the gate, not an unknown split frequency.
+            Ok(frequency) if frequency != 0 => frequency,
+            _ => return split_read_failure(rig).await,
+        },
+    };
+    // A split command may have been queued, applied, or retried during the
+    // CAT awaits. The fence also covers the gap before its consumer starts.
+    // Publishing under the same lock as command creation closes the final
+    // check/store race without taking any lock on the PTT enqueue path.
+    fence
+        .publish(revision, || {
+            if in_flight.load(Ordering::Acquire) != 0 {
+                return SplitPollOutcome::Skipped;
+            }
+            match split_tx_hz.compare_exchange(
+                previous,
+                tx_hz,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) if previous != tx_hz => SplitPollOutcome::Changed(tx_hz),
+                Ok(_) => SplitPollOutcome::Unchanged,
+                Err(_) => SplitPollOutcome::Skipped,
+            }
+        })
+        .unwrap_or(SplitPollOutcome::Skipped)
+}
+
+/// Classify a failed split read: unsupported readback on a live link, or a
+/// transport failure that dropped the link (rigctld clears its connected flag
+/// on timeout, EOF and incomplete replies).
+async fn split_read_failure(rig: &dyn pancetta_hamlib::RigControl) -> SplitPollOutcome {
+    match rig.get_status().await {
+        Ok(status) if status.connection_state == pancetta_hamlib::ConnectionState::Connected => {
+            SplitPollOutcome::Unobservable
+        }
+        _ => SplitPollOutcome::LinkLost,
+    }
+}
+
+/// Echo rig readback through the same display-only event as commanded split.
+async fn emit_split_status(
+    bus: &MessageBus,
+    display_feed_enabled: &std::sync::atomic::AtomicBool,
+    tx_hz: u64,
+) {
+    let message = ComponentMessage::new(
+        ComponentId::Hamlib,
+        ComponentId::Tui,
+        MessageType::SplitStatus { tx_hz },
+        Instant::now(),
+    );
+    let _ = bus.send_message(message).await;
+    super::remote_gateway::relay_to_gateway(
+        bus,
+        display_feed_enabled,
+        ComponentId::Hamlib,
+        MessageType::SplitStatus { tx_hz },
+    )
+    .await;
+}
+
 /// Consecutive failed 500 ms polls before the link counts as lost (5 s).
 pub(crate) const RIG_POLL_FAILED_THRESHOLD: u32 = 10;
 /// First poll-loop redial after this many failed polls (2 s).
@@ -699,6 +833,31 @@ pub(crate) enum RigPollTransition {
     /// The failure count just reached [`RIG_POLL_FAILED_THRESHOLD`]. Fires
     /// once per outage.
     PollingFailed,
+}
+
+/// PAN-206: startup split reconciliation can mark the link `PollingFailed`
+/// before this generation's poll loop has counted a single failure. Treat the
+/// first successful poll after that as a recovery from `PollingFailed`, so the
+/// hard mute clears (and the restore is announced) exactly as it would after
+/// ten counted failures.
+fn startup_aware_transition(
+    transition: RigPollTransition,
+    poll_ok: bool,
+    link_marked_failed: bool,
+) -> RigPollTransition {
+    match transition {
+        RigPollTransition::Steady if poll_ok && link_marked_failed => {
+            RigPollTransition::Recovered {
+                from_polling_failed: true,
+            }
+        }
+        RigPollTransition::Recovered {
+            from_polling_failed,
+        } => RigPollTransition::Recovered {
+            from_polling_failed: from_polling_failed || link_marked_failed,
+        },
+        other => other,
+    }
 }
 
 /// PAN-115: the poll loop's failure counting and redial schedule, pulled out of
@@ -1499,6 +1658,8 @@ impl super::ApplicationCoordinator {
         // handoff before CAT starts" -- see `deliver_pending_hamlib_state`'s
         // doc comment.
         let hamlib_command_in_flight_for_polling = self.hamlib_command_in_flight.clone();
+        let split_tx_hz_for_polling = self.split_tx_frequency_hz();
+        let split_tx_hz_for_startup = self.split_tx_frequency_hz();
         // PAN-19 round-15 review (Codex P1): "keep TX muted until restored
         // rig state is applied". The message loop's own SetFrequency/
         // SetSplit arms need to reach the pending slots directly -- on a
@@ -1707,6 +1868,7 @@ impl super::ApplicationCoordinator {
                     // PAN-115: failure counting + redial schedule (5 s to
                     // PollingFailed; redial 2 s backing off to 30 s).
                     let mut poll_health = RigPollHealth::new();
+                    let mut split_read_health = SplitReadHealth::default();
                     // C9 dial-poll band-change detection: the frequency this
                     // poll loop last *accepted* as the current dial. Seeded to
                     // the rig's already-read startup frequency so the first poll
@@ -1921,7 +2083,35 @@ impl super::ApplicationCoordinator {
                                             let _ = message_bus.send_message(swr_msg).await;
                                         }
                                     }
-                                    true
+                                    // PAN-206: every successful frequency poll also
+                                    // observes split. An unsupported read does not
+                                    // affect poll_ok or the CAT-link hard mute; a
+                                    // read that dropped the link fails this poll.
+                                    let outcome = reconcile_polled_split(
+                                        rig_for_polling.as_ref(),
+                                        &split_tx_hz_for_polling,
+                                        &hamlib_command_in_flight_for_polling,
+                                        &message_bus.split_observation_fence,
+                                    ).await;
+                                    // Note successes as well as failures so the
+                                    // one-time warning re-arms after recovery.
+                                    if split_read_health.note_outcome(outcome) {
+                                        warn!(
+                                            target: "rig.split",
+                                            "Rig cannot report split state — rig-side split changes are not observed; \
+                                             TX band check keeps pancetta's own split state"
+                                        );
+                                    }
+                                    if outcome == SplitPollOutcome::LinkLost {
+                                        debug!(
+                                            target: "rig.split",
+                                            "Split read dropped the CAT link — counting this poll as failed"
+                                        );
+                                    }
+                                    if let SplitPollOutcome::Changed(tx_hz) = outcome {
+                                        emit_split_status(&message_bus, &display_feed_enabled_poll, tx_hz).await;
+                                    }
+                                    outcome.keeps_poll_ok()
                                 } else {
                                     false
                                 }
@@ -1932,7 +2122,14 @@ impl super::ApplicationCoordinator {
                             false
                         };
 
-                        match poll_health.on_poll(poll_ok) {
+                        let link_marked_failed = rig_enabled
+                            && RigConnState::from_u8(rig_conn_state_poll.load(Ordering::Acquire))
+                                == RigConnState::PollingFailed;
+                        match startup_aware_transition(
+                            poll_health.on_poll(poll_ok),
+                            poll_ok,
+                            link_marked_failed,
+                        ) {
                             RigPollTransition::Steady => {}
                             RigPollTransition::Recovered {
                                 from_polling_failed,
@@ -2095,9 +2292,11 @@ impl super::ApplicationCoordinator {
                 // `ptt_safe_tx` signal that gates aborting an orphaned
                 // watchdog retained from a prior failed teardown.
                 let mut startup_ptt_off_succeeded = false;
+                let mut startup_connected = false;
                 match rig.connect().await {
                     Ok(_) => {
                         info!("Rig connected successfully");
+                        startup_connected = true;
                         match rig
                             .set_ptt(
                                 pancetta_hamlib::Vfo::Current,
@@ -2177,6 +2376,46 @@ impl super::ApplicationCoordinator {
                 // with a bounded timeout; send errors are harmless (timeout
                 // already elapsed).
                 let _ = initial_read_tx.send(());
+
+                // PAN-206: observe the rig's split before readiness is
+                // published below. The poll loop's first connected tick can
+                // be up to 500 ms away, and until then the gate would check
+                // a split the rig never reported. An unsupported read keeps
+                // today's behavior; the poll loop logs it once. A read that
+                // dropped the CAT link marks the link failed (TX hard mute)
+                // so readiness cannot let PTT key on an unobserved split;
+                // the poll loop clears it on its next successful poll.
+                if startup_connected {
+                    match reconcile_polled_split(
+                        rig.as_ref(),
+                        &split_tx_hz_for_startup,
+                        &hamlib_command_in_flight,
+                        &message_bus_for_connect.split_observation_fence,
+                    )
+                    .await
+                    {
+                        SplitPollOutcome::Changed(tx_hz) => {
+                            emit_split_status(
+                                &message_bus_for_connect,
+                                &display_feed_enabled,
+                                tx_hz,
+                            )
+                            .await;
+                        }
+                        SplitPollOutcome::LinkLost if rig_enabled => {
+                            rig_conn_state
+                                .store(RigConnState::PollingFailed.as_u8(), Ordering::Release);
+                            report_rig_error(
+                                &message_bus_for_connect,
+                                "Rig CAT link dropped while reading split at startup — \
+                                 TX inhibited until it reconnects"
+                                    .into(),
+                            )
+                            .await;
+                        }
+                        _ => {}
+                    }
+                }
 
                 // PAN-19 round-8 review (Codex P1, two findings addressed
                 // together at this one call site so neither reintroduces an
@@ -7404,6 +7643,639 @@ mod pan_59_reconnect_tests {
         assert_eq!(
             coordinator.hamlib_leaked_tx_inhibits, 0,
             "the leaked-inhibit debt must be cleared once repaid"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pan206_split_poll_tests {
+    use super::*;
+    use crate::message_bus::SplitObservationFence;
+    use anyhow::Result;
+    use pancetta_hamlib::{MockRig, MockRigConfig, Mode, PttState, RigControl, RigStatus, Vfo};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+
+    // These commands change only the mock radio. They deliberately bypass
+    // forward_split_change and the coordinator's atomic, like front-panel CAT.
+    async fn rig_side_split(rig: &MockRig, enabled: bool, frequency: u64) {
+        rig.set_split_freq(frequency).await.unwrap();
+        rig.set_split(enabled, Vfo::B).await.unwrap();
+    }
+
+    fn gate(split: &Arc<AtomicU64>) -> Option<String> {
+        let rx = Arc::new(AtomicU64::new(14_074_000));
+        let rf = super::super::tx::tx_rf_for_gate(&rx, split, 0.0).unwrap();
+        super::super::tx::tx_band_plan_mute_reason(
+            rf,
+            0.0,
+            &pancetta_config::BandPlanConfig::default(),
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn front_panel_split_enable_reaches_the_atomic_and_the_gate_refuses() {
+        let rig = MockRig::default();
+        let split = Arc::new(AtomicU64::new(0));
+        rig_side_split(&rig, true, 15_000_000).await;
+        assert_eq!(
+            reconcile_polled_split(
+                &rig,
+                &split,
+                &AtomicU32::new(0),
+                &SplitObservationFence::default()
+            )
+            .await,
+            SplitPollOutcome::Changed(15_000_000)
+        );
+        assert_eq!(split.load(Ordering::Relaxed), 15_000_000);
+        assert_eq!(
+            gate(&split).as_deref(),
+            Some("TX frequency 15000000 Hz is outside the configured amateur band plan")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn front_panel_split_clear_zeroes_the_atomic() {
+        let rig = MockRig::default();
+        let split = Arc::new(AtomicU64::new(15_000_000));
+        rig_side_split(&rig, false, 0).await;
+        assert_eq!(
+            reconcile_polled_split(
+                &rig,
+                &split,
+                &AtomicU32::new(0),
+                &SplitObservationFence::default()
+            )
+            .await,
+            SplitPollOutcome::Changed(0)
+        );
+        assert_eq!(split.load(Ordering::Relaxed), 0);
+        assert_eq!(gate(&split), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn in_band_rig_split_is_not_refused() {
+        let rig = MockRig::default();
+        let split = Arc::new(AtomicU64::new(0));
+        rig_side_split(&rig, true, 14_078_000).await;
+        assert_eq!(
+            reconcile_polled_split(
+                &rig,
+                &split,
+                &AtomicU32::new(0),
+                &SplitObservationFence::default()
+            )
+            .await,
+            SplitPollOutcome::Changed(14_078_000)
+        );
+        assert_eq!(gate(&split), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unobservable_rig_leaves_atomic_and_logs_once() {
+        let mut rig = MockRig::new(MockRigConfig {
+            split_read_supported: false,
+            ..Default::default()
+        });
+        // Callers reconcile only while the link reports Connected.
+        rig.connect().await.unwrap();
+        let split = AtomicU64::new(15_000_000);
+        let mut health = SplitReadHealth::default();
+        for should_log in [true, false, false] {
+            let outcome = reconcile_polled_split(
+                &rig,
+                &split,
+                &AtomicU32::new(0),
+                &SplitObservationFence::default(),
+            )
+            .await;
+            assert_eq!(outcome, SplitPollOutcome::Unobservable);
+            assert_eq!(health.note_outcome(outcome), should_log);
+            assert_eq!(split.load(Ordering::Relaxed), 15_000_000);
+        }
+        assert!(!health.note_outcome(SplitPollOutcome::Skipped));
+        assert!(!health.note_outcome(SplitPollOutcome::Unobservable));
+        rig.update_config(MockRigConfig::default());
+        rig_side_split(&rig, true, 14_078_000).await;
+        let outcome = reconcile_polled_split(
+            &rig,
+            &split,
+            &AtomicU32::new(0),
+            &SplitObservationFence::default(),
+        )
+        .await;
+        assert_eq!(outcome, SplitPollOutcome::Changed(14_078_000));
+        assert!(!health.note_outcome(outcome));
+        assert!(health.note_outcome(SplitPollOutcome::Unobservable));
+        assert!(!health.note_outcome(SplitPollOutcome::Unobservable));
+        assert!(!health.note_outcome(SplitPollOutcome::Unchanged));
+        assert!(health.note_outcome(SplitPollOutcome::Unobservable));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn in_flight_command_skips_reconcile() {
+        let split = AtomicU64::new(15_000_000);
+        assert_eq!(
+            reconcile_polled_split(
+                &MockRig::default(),
+                &split,
+                &AtomicU32::new(1),
+                &SplitObservationFence::default()
+            )
+            .await,
+            SplitPollOutcome::Skipped
+        );
+        assert_eq!(split.load(Ordering::Relaxed), 15_000_000);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agreeing_rig_reports_unchanged() {
+        let rig = MockRig::default();
+        rig_side_split(&rig, true, 15_000_000).await;
+        assert_eq!(
+            reconcile_polled_split(
+                &rig,
+                &AtomicU64::new(15_000_000),
+                &AtomicU32::new(0),
+                &SplitObservationFence::default()
+            )
+            .await,
+            SplitPollOutcome::Unchanged
+        );
+        rig_side_split(&rig, false, 0).await;
+        assert_eq!(
+            reconcile_polled_split(
+                &rig,
+                &AtomicU64::new(0),
+                &AtomicU32::new(0),
+                &SplitObservationFence::default()
+            )
+            .await,
+            SplitPollOutcome::Unchanged
+        );
+    }
+
+    struct SplitReadRig {
+        during_read: Box<dyn Fn() + Send + Sync>,
+        enabled: bool,
+        frequency: Option<u64>,
+        /// Reported by get_status; a failed split-frequency read clears it
+        /// when `drop_link_on_failure` is set (rigctld timeout/EOF behavior).
+        link_up: AtomicBool,
+        drop_link_on_failure: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl RigControl for SplitReadRig {
+        async fn connect(&self) -> Result<()> {
+            unimplemented!()
+        }
+        async fn disconnect(&self) -> Result<()> {
+            unimplemented!()
+        }
+        async fn get_status(&self) -> Result<RigStatus> {
+            Ok(RigStatus {
+                connection_state: if self.link_up.load(Ordering::Acquire) {
+                    pancetta_hamlib::ConnectionState::Connected
+                } else {
+                    pancetta_hamlib::ConnectionState::Disconnected
+                },
+                ..RigStatus::default()
+            })
+        }
+        async fn set_frequency(&self, _vfo: Vfo, _freq: u64) -> Result<()> {
+            unimplemented!()
+        }
+        async fn get_frequency(&self, _vfo: Vfo) -> Result<u64> {
+            unimplemented!()
+        }
+        async fn set_mode(&self, _vfo: Vfo, _mode: Mode, _width: Option<i32>) -> Result<()> {
+            unimplemented!()
+        }
+        async fn get_mode(&self, _vfo: Vfo) -> Result<(Mode, i32)> {
+            unimplemented!()
+        }
+        async fn set_vfo(&self, _vfo: Vfo) -> Result<()> {
+            unimplemented!()
+        }
+        async fn get_vfo(&self) -> Result<Vfo> {
+            unimplemented!()
+        }
+        async fn set_ptt(&self, _vfo: Vfo, _ptt: PttState) -> Result<()> {
+            unimplemented!()
+        }
+        async fn get_ptt(&self, _vfo: Vfo) -> Result<PttState> {
+            unimplemented!()
+        }
+        async fn set_power_level(&self, _level: f32) -> Result<()> {
+            unimplemented!()
+        }
+        async fn get_power_level(&self) -> Result<f32> {
+            unimplemented!()
+        }
+        async fn get_s_meter(&self) -> Result<i32> {
+            unimplemented!()
+        }
+        async fn get_swr(&self) -> Result<f32> {
+            unimplemented!()
+        }
+        async fn set_memory_channel(&self, _vfo: Vfo, _channel: i32) -> Result<()> {
+            unimplemented!()
+        }
+        async fn get_memory_channel(&self, _vfo: Vfo) -> Result<i32> {
+            unimplemented!()
+        }
+        async fn set_scan(&self, _vfo: Vfo, _enable: bool) -> Result<()> {
+            unimplemented!()
+        }
+        async fn get_info(&self) -> Result<String> {
+            unimplemented!()
+        }
+        async fn get_split(&self) -> Result<(bool, Vfo)> {
+            (self.during_read)();
+            Ok((self.enabled, Vfo::B))
+        }
+        async fn get_split_freq(&self) -> Result<u64> {
+            if self.frequency.is_none() && self.drop_link_on_failure {
+                self.link_up.store(false, Ordering::Release);
+            }
+            self.frequency
+                .ok_or_else(|| anyhow::anyhow!("split frequency unsupported"))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn split_on_but_freq_read_fails_is_unobservable() {
+        let rig = SplitReadRig {
+            link_up: AtomicBool::new(true),
+            drop_link_on_failure: false,
+            during_read: Box::new(|| {}),
+            enabled: true,
+            frequency: None,
+        };
+        let split = AtomicU64::new(15_000_000);
+        assert_eq!(
+            reconcile_polled_split(
+                &rig,
+                &split,
+                &AtomicU32::new(0),
+                &SplitObservationFence::default()
+            )
+            .await,
+            SplitPollOutcome::Unobservable
+        );
+        assert_eq!(split.load(Ordering::Relaxed), 15_000_000);
+    }
+
+    /// Codex P1 (PR #506): a split read that drops the CAT link (timeout,
+    /// EOF, incomplete `s` reply) is a link failure, not unsupported readback.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pan206_split_read_that_drops_the_link_is_link_lost() {
+        let rig = SplitReadRig {
+            link_up: AtomicBool::new(true),
+            drop_link_on_failure: true,
+            during_read: Box::new(|| {}),
+            enabled: true,
+            frequency: None,
+        };
+        let split = AtomicU64::new(15_000_000);
+        let outcome = reconcile_polled_split(
+            &rig,
+            &split,
+            &AtomicU32::new(0),
+            &SplitObservationFence::default(),
+        )
+        .await;
+        assert_eq!(outcome, SplitPollOutcome::LinkLost);
+        assert!(!outcome.keeps_poll_ok());
+        assert_eq!(split.load(Ordering::Relaxed), 15_000_000);
+        // Not an unsupported-readback episode: no "cannot report split" log.
+        assert!(!SplitReadHealth::default().note_outcome(outcome));
+    }
+
+    /// Codex P1 (PR #506, round 2): startup marks the link failed on
+    /// LinkLost; the poll loop must clear that on its first good poll even
+    /// though its own failure counter never reached the threshold.
+    #[test]
+    fn pan206_startup_link_failure_recovers_on_first_good_poll() {
+        assert_eq!(
+            startup_aware_transition(RigPollTransition::Steady, true, true),
+            RigPollTransition::Recovered {
+                from_polling_failed: true
+            }
+        );
+        assert_eq!(
+            startup_aware_transition(
+                RigPollTransition::Recovered {
+                    from_polling_failed: false
+                },
+                true,
+                true
+            ),
+            RigPollTransition::Recovered {
+                from_polling_failed: true
+            }
+        );
+        // Still failing, or never marked: unchanged.
+        assert_eq!(
+            startup_aware_transition(RigPollTransition::Steady, false, true),
+            RigPollTransition::Steady
+        );
+        assert_eq!(
+            startup_aware_transition(RigPollTransition::Steady, true, false),
+            RigPollTransition::Steady
+        );
+        assert_eq!(
+            startup_aware_transition(RigPollTransition::PollingFailed, false, true),
+            RigPollTransition::PollingFailed
+        );
+    }
+
+    #[test]
+    fn pan206_only_link_lost_fails_the_poll() {
+        assert!(SplitPollOutcome::Changed(15_000_000).keeps_poll_ok());
+        assert!(SplitPollOutcome::Unchanged.keeps_poll_ok());
+        assert!(SplitPollOutcome::Unobservable.keeps_poll_ok());
+        assert!(SplitPollOutcome::Skipped.keeps_poll_ok());
+        assert!(!SplitPollOutcome::LinkLost.keeps_poll_ok());
+    }
+
+    /// The finding's scenario: each tick the redialled link answers the
+    /// frequency read, then the split read drops it again. Counting the
+    /// split outcome into poll_ok must still reach PollingFailed (TX mute);
+    /// before the fix every such tick reset RigPollHealth.
+    #[test]
+    fn pan206_persistent_split_read_disconnects_reach_polling_failed() {
+        let mut health = RigPollHealth::new();
+        let mut transitions = Vec::new();
+        for _ in 0..RIG_POLL_FAILED_THRESHOLD {
+            let frequency_read_ok = true;
+            let poll_ok = frequency_read_ok && SplitPollOutcome::LinkLost.keeps_poll_ok();
+            transitions.push(health.on_poll(poll_ok));
+        }
+        assert_eq!(transitions.last(), Some(&RigPollTransition::PollingFailed));
+        assert_eq!(health.consecutive_failures(), RIG_POLL_FAILED_THRESHOLD);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn split_on_with_zero_frequency_never_clears_the_gate() {
+        let rig = SplitReadRig {
+            link_up: AtomicBool::new(true),
+            drop_link_on_failure: false,
+            during_read: Box::new(|| {}),
+            enabled: true,
+            frequency: Some(0),
+        };
+        let split = AtomicU64::new(15_000_000);
+        assert_eq!(
+            reconcile_polled_split(
+                &rig,
+                &split,
+                &AtomicU32::new(0),
+                &SplitObservationFence::default()
+            )
+            .await,
+            SplitPollOutcome::Unobservable
+        );
+        assert_eq!(split.load(Ordering::Relaxed), 15_000_000);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn command_started_during_read_skips_reconcile() {
+        let in_flight = Arc::new(AtomicU32::new(0));
+        let count = in_flight.clone();
+        let rig = SplitReadRig {
+            link_up: AtomicBool::new(true),
+            drop_link_on_failure: false,
+            during_read: Box::new(move || {
+                count.store(1, Ordering::Release);
+            }),
+            enabled: false,
+            frequency: None,
+        };
+        let split = AtomicU64::new(15_000_000);
+        assert_eq!(
+            reconcile_polled_split(&rig, &split, &in_flight, &SplitObservationFence::default())
+                .await,
+            SplitPollOutcome::Skipped
+        );
+        assert_eq!(split.load(Ordering::Relaxed), 15_000_000);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn commanded_split_changed_during_read_is_not_overwritten() {
+        let split = Arc::new(AtomicU64::new(14_078_000));
+        let commanded = split.clone();
+        let rig = SplitReadRig {
+            link_up: AtomicBool::new(true),
+            drop_link_on_failure: false,
+            during_read: Box::new(move || {
+                commanded.store(15_000_000, Ordering::Relaxed);
+            }),
+            enabled: false,
+            frequency: None,
+        };
+        assert_eq!(
+            reconcile_polled_split(
+                &rig,
+                &split,
+                &AtomicU32::new(0),
+                &SplitObservationFence::default()
+            )
+            .await,
+            SplitPollOutcome::Skipped
+        );
+        assert_eq!(split.load(Ordering::Relaxed), 15_000_000);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pan206_queued_split_cannot_be_erased_before_cat_application() {
+        let bus = MessageBus::new(8).unwrap();
+        let (_, commands) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let split = Arc::new(AtomicU64::new(0));
+        let rig = MockRig::default();
+        super::super::forward_split_change(&bus, ComponentId::Tui, &split, true, 15_000_000).await;
+        // The CAT consumer has not dequeued anything, so its in-flight count
+        // is still zero and the rig still reports simplex.
+        assert_eq!(
+            reconcile_polled_split(
+                &rig,
+                &split,
+                &AtomicU32::new(0),
+                &bus.split_observation_fence
+            )
+            .await,
+            SplitPollOutcome::Skipped
+        );
+        assert_eq!(split.load(Ordering::Relaxed), 15_000_000);
+        let command = commands.try_recv().unwrap();
+        rig_side_split(&rig, true, 15_000_000).await;
+        drop(command);
+        assert!(gate(&split).is_some());
+        assert_eq!(
+            reconcile_polled_split(
+                &rig,
+                &split,
+                &AtomicU32::new(0),
+                &bus.split_observation_fence
+            )
+            .await,
+            SplitPollOutcome::Unchanged
+        );
+        // Once the command is gone, genuine front-panel changes reconcile.
+        rig_side_split(&rig, false, 0).await;
+        assert_eq!(
+            reconcile_polled_split(
+                &rig,
+                &split,
+                &AtomicU32::new(0),
+                &bus.split_observation_fence
+            )
+            .await,
+            SplitPollOutcome::Changed(0)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pan206_command_completed_during_read_invalidates_even_the_same_frequency() {
+        let fence = Arc::new(SplitObservationFence::default());
+        let command_fence = fence.clone();
+        let rig = SplitReadRig {
+            link_up: AtomicBool::new(true),
+            drop_link_on_failure: false,
+            during_read: Box::new(move || {
+                drop(command_fence.begin_command());
+            }),
+            enabled: false,
+            frequency: None,
+        };
+        let split = AtomicU64::new(15_000_000);
+        assert_eq!(
+            reconcile_polled_split(&rig, &split, &AtomicU32::new(0), &fence).await,
+            SplitPollOutcome::Skipped
+        );
+        assert_eq!(split.load(Ordering::Relaxed), 15_000_000);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pan206_pending_message_clone_keeps_split_polling_fenced() {
+        let bus = MessageBus::new(8).unwrap();
+        let (_, commands) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let split = AtomicU64::new(0);
+        super::super::forward_split_change(&bus, ComponentId::Tui, &split, true, 15_000_000).await;
+        let command = commands.try_recv().unwrap();
+        let pending_retry = command.clone();
+        drop(command);
+        assert_eq!(
+            reconcile_polled_split(
+                &MockRig::default(),
+                &split,
+                &AtomicU32::new(0),
+                &bus.split_observation_fence
+            )
+            .await,
+            SplitPollOutcome::Skipped
+        );
+        drop(pending_retry);
+        assert!(bus.split_observation_fence.snapshot().is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pan206_dropped_split_releases_the_observation_fence() {
+        let bus = MessageBus::new(1).unwrap();
+        let (_, _commands) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        bus.send_message(ComponentMessage::new(
+            ComponentId::Tui,
+            ComponentId::Hamlib,
+            MessageType::AudioData(Vec::new()),
+            Instant::now(),
+        ))
+        .await
+        .unwrap();
+        let split = AtomicU64::new(15_000_000);
+        super::super::forward_split_change(&bus, ComponentId::Tui, &split, false, 0).await;
+        assert_eq!(split.load(Ordering::Relaxed), 15_000_000);
+        assert!(bus.split_observation_fence.snapshot().is_some());
+        assert_eq!(
+            reconcile_polled_split(
+                &MockRig::default(),
+                &split,
+                &AtomicU32::new(0),
+                &bus.split_observation_fence
+            )
+            .await,
+            SplitPollOutcome::Changed(0)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn emit_split_status_reaches_tui_and_gateway() {
+        let bus = crate::message_bus::MessageBus::new(8).unwrap();
+        let (_, tui) = bus.create_channel(ComponentId::Tui).await.unwrap();
+        let (_, gateway) = bus
+            .create_channel(ComponentId::RemoteGateway)
+            .await
+            .unwrap();
+        for tx_hz in [15_000_000, 0] {
+            emit_split_status(&bus, &AtomicBool::new(true), tx_hz).await;
+            for rx in [&tui, &gateway] {
+                let message = rx.try_recv().unwrap();
+                assert!(
+                    matches!(message.message_type, MessageType::SplitStatus { tx_hz: actual } if actual == tx_hz)
+                );
+                assert!(
+                    matches!(super::super::remote_gateway::translate::server_event_from_bus(&message.message_type),
+                    Some(pancetta_protocol::ServerEvent::Split { tx_hz: actual }) if actual == tx_hz)
+                );
+            }
+        }
+    }
+
+    /// Readiness is published right after the startup frequency read, while
+    /// the first connected poll tick can still be up to 500 ms away. The gate
+    /// must already see the rig's split by then. The disabled-rig path starts
+    /// a fresh simplex MockRig, so a split value left in the atomic stands in
+    /// for one the radio no longer has.
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn pan206_startup_reconciles_split_before_publishing_readiness() {
+        let mut coordinator = super::super::ApplicationCoordinator::new(
+            pancetta_config::Config::default(),
+            None,
+            true,  // no_audio
+            true,  // headless
+            false, // metrics
+            9090,
+            None, // no WAV
+            None, // no replay
+            None, // no test-tx
+            1500.0,
+            Arc::new(AtomicBool::new(false)),
+            Vec::new(),
+            std::env::temp_dir().join("pancetta-test-config.toml"),
+            true,
+        )
+        .await
+        .expect("coordinator creation should succeed");
+        let split = coordinator.split_tx_frequency_hz();
+        split.store(15_000_000, Ordering::Relaxed);
+
+        coordinator.start_hamlib_component().await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !coordinator
+            .hamlib_command_loop_ready
+            .load(Ordering::Acquire)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "Hamlib readiness was never published"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            split.load(Ordering::Relaxed),
+            0,
+            "readiness must not be published before the rig's split is observed"
         );
     }
 }

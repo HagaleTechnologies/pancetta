@@ -1026,6 +1026,59 @@ pub struct ComponentMetrics {
     pub custom_metrics: HashMap<String, f64>,
 }
 
+/// PAN-206: exclude split observations while an accepted command is queued,
+/// being applied, or retained for retry. The revision also invalidates a read
+/// when a command starts and finishes entirely during its CAT awaits.
+#[derive(Debug, Default)]
+pub(crate) struct SplitObservationFence {
+    state: parking_lot::Mutex<SplitObservationState>,
+}
+
+#[derive(Debug, Default)]
+struct SplitObservationState {
+    active: usize,
+    revision: u64,
+}
+
+impl SplitObservationFence {
+    pub(crate) fn begin_command(self: &Arc<Self>) -> Arc<SplitObservationGuard> {
+        let mut state = self.state.lock();
+        state.active += 1;
+        state.revision = state.revision.wrapping_add(1);
+        Arc::new(SplitObservationGuard {
+            fence: self.clone(),
+        })
+    }
+
+    pub(crate) fn snapshot(&self) -> Option<u64> {
+        let state = self.state.lock();
+        (state.active == 0).then_some(state.revision)
+    }
+
+    /// The callback only publishes an atomic value; never await or do CAT I/O
+    /// here. Command creation and publication cannot interleave under this lock.
+    pub(crate) fn publish<T>(&self, revision: u64, publish: impl FnOnce() -> T) -> Option<T> {
+        let state = self.state.lock();
+        if state.active != 0 || state.revision != revision {
+            return None;
+        }
+        Some(publish())
+    }
+}
+
+/// Cloned with the message, including pending-command retries. Only the last
+/// owner releases the fence, so a producer paused after enqueue is covered too.
+#[derive(Debug)]
+pub(crate) struct SplitObservationGuard {
+    fence: Arc<SplitObservationFence>,
+}
+
+impl Drop for SplitObservationGuard {
+    fn drop(&mut self) {
+        self.fence.state.lock().active -= 1;
+    }
+}
+
 /// Complete message with routing and timing information
 #[derive(Debug, Clone)]
 pub struct ComponentMessage {
@@ -1045,6 +1098,8 @@ pub struct ComponentMessage {
     pub hop_count: u8,
     /// Latency tracking timestamps
     pub latency_tracking: LatencyTracking,
+    /// Local split-poll lifetime guard; absent on every other message type.
+    pub(crate) split_observation_guard: Option<Arc<SplitObservationGuard>>,
 }
 
 /// Latency tracking for message bus performance monitoring
@@ -1084,6 +1139,7 @@ impl ComponentMessage {
             priority: 128, // Normal priority
             hop_count: 0,
             latency_tracking,
+            split_observation_guard: None,
         }
     }
 
@@ -1285,6 +1341,9 @@ pub enum SendIfOutcome {
 /// High-performance message bus for inter-component communication
 #[derive(Clone)]
 pub struct MessageBus {
+    /// Shared only by split-command producers and the split poll. PTT routing
+    /// never takes this lock (PAN-202).
+    pub(crate) split_observation_fence: Arc<SplitObservationFence>,
     /// Configuration
     config: MessageBusConfig,
     /// Component channels
@@ -1311,6 +1370,7 @@ impl MessageBus {
 
         Ok(Self {
             config,
+            split_observation_fence: Arc::new(SplitObservationFence::default()),
             channels: Arc::new(RwLock::new(HashMap::new())),
             rig_route: Arc::new(OnceLock::new()),
             message_counter: Arc::new(AtomicU64::new(0)),
@@ -1324,6 +1384,7 @@ impl MessageBus {
     pub fn with_config(config: MessageBusConfig) -> Result<Self> {
         Ok(Self {
             config,
+            split_observation_fence: Arc::new(SplitObservationFence::default()),
             channels: Arc::new(RwLock::new(HashMap::new())),
             rig_route: Arc::new(OnceLock::new()),
             message_counter: Arc::new(AtomicU64::new(0)),

@@ -601,8 +601,12 @@ pub(crate) async fn forward_split_change(
     enabled: bool,
     tx_frequency: u64,
 ) -> u64 {
+    // PAN-206: retain this owner through enqueue + record, and a second
+    // owner on the message through CAT application / pending retries. Polling
+    // must not replace a requested split with the rig's not-yet-applied state.
+    let observation_guard = bus.split_observation_fence.begin_command();
     let make = || {
-        ComponentMessage::new(
+        let mut message = ComponentMessage::new(
             source,
             ComponentId::Hamlib,
             MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
@@ -610,7 +614,9 @@ pub(crate) async fn forward_split_change(
                 tx_frequency,
             }),
             Instant::now(),
-        )
+        );
+        message.split_observation_guard = Some(observation_guard.clone());
+        message
     };
     match bus
         .send_message_retrying(make, &tx::SAFETY_SEND_RETRY_DELAYS)
@@ -5005,7 +5011,7 @@ pub(crate) mod audit_test_util {
                 std::process::id()
             ));
             let siblings: Vec<PathBuf> = (1..=4)
-                .map(|slot| p.with_extension(&format!("log.{slot}")))
+                .map(|slot| p.with_extension(format!("log.{slot}")))
                 .collect();
             std::fs::write(&p, "stale line\n").unwrap();
             for s in &siblings {
