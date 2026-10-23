@@ -21967,6 +21967,78 @@ mod report_transmit_complete_tests {
     async fn unkeyed_frame_only_notifies_autonomous() {
         check(false, None).await;
     }
+
+    /// PAN-185 SCRATCH REPRODUCTION (research only, reverted after running):
+    /// a full Qso channel at the moment of `report_frame_not_sent` silently
+    /// swallows the rollback report. `send_message`'s `Result` is `Ok(())`
+    /// even though nothing was enqueued, and the Qso receiver only ever sees
+    /// the pre-existing filler message that occupied the one slot.
+    #[tokio::test]
+    async fn pan185_repro_full_qso_channel_silently_drops_tx_frame_not_sent() {
+        let bus = MessageBus::new(1).unwrap();
+        let (_, autonomous) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (qso_tx, qso_rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+
+        // Fill the Qso channel's one slot with an unrelated filler message,
+        // simulating the channel being briefly full (e.g. backlogged behind
+        // a restarting Qso task that is not yet draining it).
+        let filler = ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Qso,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent {
+                qso_id: "filler".into(),
+                message_text: "FILLER".into(),
+                replaced: None,
+            }),
+            Instant::now(),
+        );
+        qso_tx.try_send(filler).unwrap();
+        let before = bus.get_statistics();
+
+        // report_transmit_complete (which report_frame_not_sent feeds into
+        // for the failed+qso_id case) still reports Ok(()) to its caller...
+        report_transmit_complete(
+            &bus,
+            false,
+            "K1ABC N0CALL FN20".into(),
+            0,
+            Some("q1".into()),
+        )
+        .await
+        .unwrap();
+
+        // ...Autonomous still gets its TransmitComplete (a different
+        // channel, not full)...
+        assert!(matches!(
+            autonomous.try_recv().unwrap().message_type,
+            MessageType::TransmitComplete { success: false, qso_id: Some(ref id), .. }
+                if id == "q1"
+        ));
+
+        // ...but the QSO engine never receives the TxFrameNotSent rollback:
+        // the receiver yields only the original filler, and the drop is
+        // silent — no error surfaced to report_transmit_complete's caller,
+        // and no retry.
+        let after = bus.get_statistics();
+        assert_eq!(
+            after.dropped_messages,
+            before.dropped_messages + 1,
+            "the bus's own accounting shows a drop happened"
+        );
+        let only_message = qso_rx.try_recv().unwrap();
+        assert!(
+            matches!(
+                only_message.message_type,
+                MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { ref qso_id, .. })
+                    if qso_id == "filler"
+            ),
+            "expected only the pre-existing filler; the q1 rollback was lost silently"
+        );
+        assert!(
+            qso_rx.try_recv().is_err(),
+            "the q1 TxFrameNotSent never arrived at all"
+        );
+    }
     #[tokio::test]
     async fn failed_qso_frame_also_notifies_qso() {
         check(false, Some("q1")).await;
