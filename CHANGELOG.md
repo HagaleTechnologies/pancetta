@@ -158,6 +158,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A keep-call frame that never airs now gives back its own call, stall count
+  and `Sent` timeline entry even when you resent the same message for that QSO
+  after it was queued (PAN-183). The TX worker used to hand back the newest
+  frame with the same text, so it reversed your resend instead and left the
+  failed frame's stall count, which could move the QSO to a new TX offset one
+  cycle early. Each queued frame now carries the ID of the call it accounts
+  for, and a frame that does not air reports that ID. The same fix covers
+  multi-TX bundle items abandoned when another operator takes control.
+
 - A manual call to a station you heard a few seconds earlier on another band
   or in another mode is no longer held for a cycle (PAN-146). The check before
   key-up that holds a call when the station was just heard transmitting on your

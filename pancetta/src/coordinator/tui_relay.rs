@@ -1393,6 +1393,7 @@ impl super::ApplicationCoordinator {
                                 ComponentId::Tui,
                                 ComponentId::Ft8Transmitter,
                                 MessageType::TransmitRequest {
+                                    attempt_id: None,
                                     message_text: text,
                                     frequency_offset,
                                     qso_id: None,
