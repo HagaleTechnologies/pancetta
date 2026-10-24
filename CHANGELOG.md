@@ -158,20 +158,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-<<<<<<< HEAD
 - Band Activity's own-TX rows and `tx-log.jsonl`'s `utc` now record when the
   audio output started playing each frame, including a mid-frame re-key,
   instead of when the TX worker queued its audio (PAN-71). When pancetta
   cannot confirm the start within 100 ms it keeps the old value and logs a
   warning.
-=======
+
 - A frame that never airs now gives back its call, stall count and `Sent`
   timeline entry even when the QSO engine is briefly backed up (PAN-185).
   Before, that correction could be lost and the frame stayed counted. An
   autonomous CQ whose frame was swapped for a fresher one and then refused no
   longer counts as a failed CQ before the replacement airs; it now settles
   once, on what actually aired.
->>>>>>> 861e1edaecd447e40e12e6aa3d5f034f274b410f
 
 - Autonomous cqdx.io spot reports now carry the frequency of the band the
   decode was actually heard on when the station changes bands between a decode
