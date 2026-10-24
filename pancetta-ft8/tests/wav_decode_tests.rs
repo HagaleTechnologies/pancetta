@@ -414,27 +414,8 @@ fn test_live_20m_wav() {
 /// path is broken).
 #[test]
 fn test_live_20m_wav_with_full_frame_coherent_reference_enabled() {
-    let wav_path = format!(
-        "{}/tests/fixtures/wav/basicft8/live_now.wav",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    if !std::path::Path::new(&wav_path).exists() {
-        eprintln!("Skipping: {} not found", wav_path);
+    let Some(samples) = load_live_now_samples() else {
         return;
-    }
-
-    let mut reader = hound::WavReader::open(&wav_path).unwrap();
-    let spec = reader.spec();
-    let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Int => {
-            let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
-            reader
-                .samples::<i32>()
-                .filter_map(|s| s.ok())
-                .map(|s| s as f32 / max)
-                .collect()
-        }
-        hound::SampleFormat::Float => reader.samples::<f32>().filter_map(|s| s.ok()).collect(),
     };
 
     let baseline_config = Ft8Config::default();
@@ -469,6 +450,79 @@ fn test_live_20m_wav_with_full_frame_coherent_reference_enabled() {
         baseline.len(),
         full_frame.len()
     );
+}
+
+/// PAN-168 smoke test: the full-frame path with per-block audio
+/// cancellation on (`coherent_subtract_full_frame_time_varying_enabled`,
+/// meaningful only under `coherent_subtract_full_frame_reference_enabled`)
+/// runs the real multi-signal decode path without panicking and without
+/// regressing recall against production defaults on the same fixture.
+#[test]
+fn test_live_20m_wav_with_full_frame_time_varying_cancellation_enabled() {
+    let Some(samples) = load_live_now_samples() else {
+        return;
+    };
+
+    let mut baseline_decoder = Ft8Decoder::new(Ft8Config::default()).unwrap();
+    let baseline = baseline_decoder.decode_window(&samples).unwrap_or_default();
+
+    let variant_config = Ft8Config {
+        coherent_subtract_full_frame_reference_enabled: true,
+        coherent_subtract_full_frame_time_varying_enabled: true,
+        ..Ft8Config::default()
+    };
+    let mut variant_decoder = Ft8Decoder::new(variant_config).unwrap();
+    let variant = variant_decoder.decode_window(&samples).unwrap_or_default();
+
+    eprintln!(
+        "baseline={} full_frame_time_varying_enabled={}",
+        baseline.len(),
+        variant.len()
+    );
+    for msg in &variant {
+        eprintln!(
+            "  [full_frame_tv] {:+.0} dB  {:.1} Hz  conf={:.2}  {}",
+            msg.snr_db, msg.frequency_offset, msg.confidence, msg.text
+        );
+    }
+
+    assert!(
+        variant.len() + 1 >= baseline.len(),
+        "enabling coherent_subtract_full_frame_time_varying_enabled (with \
+         coherent_subtract_full_frame_reference_enabled) regressed recall on \
+         live_now.wav: baseline={} variant={}",
+        baseline.len(),
+        variant.len()
+    );
+}
+
+/// `tests/fixtures/wav/basicft8/live_now.wav` as `f32` samples, for the
+/// full-frame smoke tests. `None` (after printing why) when the fixture is
+/// absent, so those tests skip instead of failing.
+fn load_live_now_samples() -> Option<Vec<f32>> {
+    let wav_path = format!(
+        "{}/tests/fixtures/wav/basicft8/live_now.wav",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    if !std::path::Path::new(&wav_path).exists() {
+        eprintln!("Skipping: {} not found", wav_path);
+        return None;
+    }
+
+    let mut reader = hound::WavReader::open(&wav_path).unwrap();
+    let spec = reader.spec();
+    let samples = match spec.sample_format {
+        hound::SampleFormat::Int => {
+            let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
+            reader
+                .samples::<i32>()
+                .filter_map(|s| s.ok())
+                .map(|s| s as f32 / max)
+                .collect()
+        }
+        hound::SampleFormat::Float => reader.samples::<f32>().filter_map(|s| s.ok()).collect(),
+    };
+    Some(samples)
 }
 
 #[test]
