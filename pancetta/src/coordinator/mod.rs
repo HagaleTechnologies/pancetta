@@ -467,6 +467,26 @@ pub fn is_band_change(old_hz: u64, new_hz: u64) -> bool {
     }
 }
 
+/// PAN-69: true when a decode's own captured dial is on a different ham
+/// band than the band pancetta currently believes it's on — the decode's
+/// audio window closed before a since-happened band switch (C9), but real
+/// CPU-bound decode work let it finish and reach the bus after that
+/// switch. Reuses [`is_band_change`] so this agrees exactly with whatever
+/// C9 would (or did) tear a QSO down for.
+///
+/// Fails open, matching [`is_band_change`]'s and PAN-146's
+/// `DxParityContext::observed_in`'s convention: an unknown captured dial
+/// (`None`/`Some(0)`, the DSP "not yet established" sentinel) or an
+/// unknown live dial (`0`, no rig / pre-first-CAT-read) never counts as
+/// stale — both sides are guarded explicitly here because
+/// `is_band_change`'s own `old_hz == 0` guard covers only one argument.
+pub fn is_stale_band_decode(captured_dial_hz: Option<u64>, live_dial_hz: u64) -> bool {
+    match captured_dial_hz {
+        Some(hz) if hz != 0 && live_dial_hz != 0 => is_band_change(hz, live_dial_hz),
+        _ => false,
+    }
+}
+
 /// Settle window (ms) after a pancetta-initiated frequency command during which
 /// the hamlib dial-poll loop suppresses its own C9 teardown.
 ///
@@ -3587,6 +3607,45 @@ mod pivot_bundle_tests {
 mod tests {
     use super::*;
     use pancetta_config::Config;
+
+    // ------------------------------------------------------------------
+    // PAN-69: stale-band decode rejection. The shared predicate's full
+    // semantic matrix — also the first direct tests of the
+    // `is_band_change` comparison family it reuses.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn stale_when_captured_dial_is_on_a_different_band() {
+        assert!(is_stale_band_decode(Some(7_074_000), 14_074_000)); // 40m vs 20m
+    }
+
+    #[test]
+    fn not_stale_when_captured_dial_is_on_the_same_band() {
+        assert!(!is_stale_band_decode(Some(14_074_200), 14_074_000)); // intra-20m nudge
+                                                                      // The case wsjtx_udp's shipped MHz-bucket version gets WRONG today:
+                                                                      // 28.5 -> 29.5 MHz is still Band10m (28.0-29.7 MHz).
+        assert!(!is_stale_band_decode(Some(28_500_000), 29_500_000));
+    }
+
+    #[test]
+    fn not_stale_when_captured_dial_is_unknown() {
+        assert!(!is_stale_band_decode(None, 14_074_000));
+        assert!(!is_stale_band_decode(Some(0), 14_074_000)); // DSP "not yet established" sentinel
+    }
+
+    #[test]
+    fn not_stale_when_live_dial_is_unknown() {
+        // No rig / pre-first-CAT-read: nothing to compare against, never drop.
+        assert!(!is_stale_band_decode(Some(7_074_000), 0));
+        assert!(!is_stale_band_decode(None, 0));
+    }
+
+    #[test]
+    fn stale_when_out_of_band_dials_differ_by_threshold() {
+        // Neither dial in a known ham band: is_band_change's >=100 kHz fallback.
+        assert!(is_stale_band_decode(Some(13_900_000), 14_100_000));
+        assert!(!is_stale_band_decode(Some(13_999_000), 14_005_000)); // small wobble
+    }
 
     // ------------------------------------------------------------------
     // Shared audit log (dispensa Q-0051 Phase B): constructed once at
