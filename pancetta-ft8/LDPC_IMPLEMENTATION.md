@@ -1,5 +1,11 @@
 # FT8 LDPC(174,91) Decoder Implementation
 
+> **Historical design note (PAN-110).** This file records design intent from
+> early development. Its SNR and accuracy statements are unmeasured targets,
+> not benchmark results. Measured decode performance, for the shipped
+> pipeline and for the native decoder alone, is in
+> [docs/decoder-comparison.md](../docs/decoder-comparison.md).
+
 ## Overview
 A complete, production-ready LDPC decoder for FT8's (174,91) error correction code has been implemented in `~/Code/pancetta/pancetta-ft8/src/decoder.rs`.
 

@@ -1940,9 +1940,11 @@ impl super::ApplicationCoordinator {
             pancetta_qso::PriorityScorer::new(priority_weights, Box::new((*cached_lookup).clone())),
         );
 
-        let (_auto_tx, auto_rx) = self
+        // PAN-185: read through the durable inbox so a `TransmitComplete`
+        // parked behind a full channel still settles its self-CQ.
+        let auto_inbox = self
             .message_bus
-            .get_or_create_channel(ComponentId::Autonomous)
+            .durable_inbox(ComponentId::Autonomous)
             .await?;
         let message_bus = self.message_bus.clone();
         let display_feed_enabled = self.display_feed_enabled.clone();
@@ -3161,7 +3163,7 @@ impl super::ApplicationCoordinator {
 
                         _ = async {
                             loop {
-                                match auto_rx.try_recv() {
+                                match auto_inbox.try_recv() {
                                     Ok(message) => {
                                         match message.message_type {
                                             MessageType::DecodedMessage(decoded_msg) => {
@@ -6987,6 +6989,52 @@ mod fq_f9_placement_feed_when_disabled_tests {
             out.push(m);
         }
         out
+    }
+
+    /// PAN-185: the Autonomous loop reads through its durable inbox, so a
+    /// `TransmitComplete` parked behind a full channel is still consumed.
+    #[tokio::test]
+    async fn pan185_autonomous_loop_drains_parked_transmit_complete() {
+        let mut coordinator = build_coordinator(false, true).await;
+        let (_tui_tx, _tui_rx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Tui)
+            .await
+            .expect("Tui channel should not already exist");
+        let (_ft8_tx, _ft8_rx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .expect("Ft8Transmitter channel should not already exist");
+        let (_qso_tx, _qso_rx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Qso)
+            .await
+            .expect("Qso channel should not already exist");
+        coordinator
+            .start_autonomous_component()
+            .await
+            .expect("start_autonomous_component must succeed");
+
+        coordinator.message_bus.park_for_test(ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Autonomous,
+            MessageType::TransmitComplete {
+                success: false,
+                message_text: "CQ N0CALL FN20".into(),
+                duration_ms: 0,
+                qso_id: Some("q1".into()),
+            },
+            Instant::now(),
+        ));
+        wait_for_next_slot_tick().await;
+        assert_eq!(
+            coordinator
+                .message_bus
+                .durable_lane_len(ComponentId::Autonomous),
+            0,
+            "the Autonomous loop must drain its durable lane"
+        );
     }
 
     #[tokio::test]

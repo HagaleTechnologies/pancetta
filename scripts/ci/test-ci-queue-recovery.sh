@@ -99,7 +99,8 @@ Dir.mktmpdir('pan150-queue-') do |dir|
                            'actor' => {'login' => 'maintainer'}, 'created_at' => s['now']}
           s['human_attach_race'] = false
         end
-        unless s['labels'].include?(label)
+        # A POST can exit 0 without the label becoming visible on the PR.
+        unless s['labels'].include?(label) || s['unattachable'].include?(label)
           s['labels'] << label
           s['timeline'] << {'event' => 'labeled', 'label' => {'name' => label},
                            'actor' => {'login' => 'github-actions[bot]'}, 'created_at' => s['now']}
@@ -110,6 +111,15 @@ Dir.mktmpdir('pan150-queue-') do |dir|
             args[5] == '--description' && args[7..8] == ['--repo', 'test/repo']
         # Creating the label definition does not attach it to the PR.
       elsif args.length == 7 && args[0..5] == ['pr', 'comment', '17', '--repo', 'test/repo', '--body']
+        # A maintainer can remove and re-attach the pause after the ownership read
+        # but before this comment exists, or the timeline can stop answering.
+        if s['reattach_before_comment']
+          s['timeline'] << {'event' => 'unlabeled', 'label' => {'name' => 'queue-needs-human-review'}}
+          s['timeline'] << {'event' => 'labeled', 'label' => {'name' => 'queue-needs-human-review'},
+                           'actor' => {'login' => 'maintainer'}, 'created_at' => s['now']}
+          s['reattach_before_comment'] = false
+        end
+        s['timeline_mode'] = 'error' if s['timeline_error_after_comment']
         if s['post_error']
           code = 1
         else
@@ -126,6 +136,18 @@ Dir.mktmpdir('pan150-queue-') do |dir|
         raise 'readback of unknown comment' unless comment
         code = 1 if s['readback_error']
         result = s['readback_missing_marker'] ? 'unmarked body' : comment['body']
+      elsif args.length == 6 && args[0..2] == ['api', '--method', 'PATCH'] &&
+            args[3].match?(%r{\Arepos/test/repo/issues/comments/[0-9]+\z}) &&
+            args[4] == '-f' && args[5].start_with?('body=')
+        id = args[3].split('/').last
+        comment = s['comments'].find { |c| c['id'].to_s == id }
+        raise 'edit of unknown comment' unless comment
+        if s['patch_error']
+          code = 1
+        else
+          comment['body'] = args[5].delete_prefix('body=')
+          s['mutations'] << "edit:#{id}"
+        end
       elsif args[0..2] == ['api', 'graphql', '-f'] &&
             args[4..9] == ['-f', 'owner=test', '-f', 'name=repo', '-F', 'pr=17'] &&
             args.length == 10 && args[3].include?('query(') && args[3].include?('isInMergeQueue')
@@ -154,7 +176,7 @@ Dir.mktmpdir('pan150-queue-') do |dir|
          'RETRY_LABEL' => retry_label, 'GITHUB_OUTPUT' => File.join(dir, 'output')}
   fresh = lambda do |overrides = {}|
     state = {'base' => 'main', 'rules' => 'present', 'arms' => 0,
-             'calls' => [], 'unexpected' => [], 'labels' => [], 'comments' => [],
+             'calls' => [], 'unexpected' => [], 'labels' => [], 'comments' => [], 'unattachable' => [],
              'timeline' => [], 'mutations' => [], 'armed' => false, 'queued' => false,
              'head' => head, 'now' => '2026-10-20T12:00:00Z'}.merge(overrides)
     File.write(state_path, JSON.generate(state))
@@ -217,6 +239,8 @@ Dir.mktmpdir('pan150-queue-') do |dir|
   handoff_state = lambda do |overrides = {}|
     fresh.call({'labels' => [retry_label, pause], 'timeline' => [label_event.call]}.merge(overrides))
   end
+  # The Retry step re-arms, but its retry-used label never becomes visible.
+  fallback_state = ->(o = {}) { fresh.call({'unattachable' => [retry_label]}.merge(o)) }
   failed_handoff = lambda do
     result = event.call
     raise 'handoff did not fail' unless result['steps.handoff.conclusion'] == 'failure'
@@ -404,6 +428,70 @@ Dir.mktmpdir('pan150-queue-') do |dir|
       if %w[disarm_error dequeue_error].include?(failure)
         raise 'marker published before safe disarm' unless marker_comments.call.empty?
       end
+    end
+  end
+  check.call('fallback handler-owned pause publishes verified clearable marker') do
+    fallback_state.call
+    result = event.call
+    raise 'fallback retry failed' unless result['steps.retry.conclusion'] == 'success'
+    raise 'missing pause or handled label' unless ([pause, attempt_label] - state.call['labels']).empty?
+    raise 'fallback left PR armed/queued' if state.call['armed'] || state.call['queued']
+    raise 'missing marker' unless marker_comments.call.length == 1
+    raise 'marker not read back' unless state.call['mutations'].include?('readback:1')
+    raise 'unchanged head stale' if stale.call(head[0, 12])
+    raise 'changed head not stale' unless stale.call('b' * 12)
+  end
+  [
+    ['human attach race', {'human_attach_race' => true}, 'success'],
+    ['unknown owner', {'timeline_mode' => 'error'}, 'failure'],
+    ['disarm unconfirmed', {'disarm_error' => true}, 'failure'],
+    ['pause not visible', {'unattachable' => [retry_label, pause]}, 'failure']
+  ].each do |name, overrides, conclusion|
+    check.call("fallback #{name} publishes no clearable marker") do
+      fallback_state.call(overrides)
+      result = event.call
+      raise 'wrong retry result' unless result['steps.retry.conclusion'] == conclusion
+      raise 'wrong handled result' unless state.call['labels'].include?(attempt_label) == (conclusion == 'success')
+      raise 'claimed clearable provenance' unless marker_comments.call.empty?
+      raise 'fallback comment not posted' if state.call['comments'].empty?
+      raise 'fallback pause stale' if stale.call('b' * 12)
+    end
+  end
+  %w[post_error missing_comment_id readback_error readback_missing_marker].each do |failure|
+    check.call("fallback #{failure} fails closed") do
+      fallback_state.call(failure => true)
+      result = event.call
+      raise 'unverified marker succeeded' unless result['steps.retry.conclusion'] == 'failure'
+      raise 'unverified marker marked handled' if state.call['labels'].include?(attempt_label)
+      raise 'lost pause' unless state.call['labels'].include?(pause)
+    end
+  end
+  # Codex P1 (PAN-152 review): admission trusts the newest bot marker when it is at
+  # or after the latest attachment, so a marker posted after a maintainer re-attached
+  # the pause would let the next push clear their pause.
+  [['fallback', fallback_state, 'steps.retry.conclusion'],
+   ['handoff', handoff_state, 'steps.handoff.conclusion']].each do |path, setup, key|
+    [
+      ['re-attachment during publication', {'reattach_before_comment' => true}],
+      ['unreadable ownership after publication', {'timeline_error_after_comment' => true}]
+    ].each do |name, overrides|
+      check.call("#{path} #{name} withdraws the clearable marker") do
+        setup.call(overrides)
+        result = event.call
+        raise 'raced publication succeeded' unless result[key] == 'failure'
+        raise 'raced publication marked handled' if state.call['labels'].include?(attempt_label)
+        raise 'lost pause' unless state.call['labels'].include?(pause)
+        raise 'clearable marker left behind' unless marker_comments.call.empty?
+        raise 'withdrawn comment missing' if state.call['comments'].empty?
+        raise 'human pause stale' if stale.call('b' * 12)
+      end
+    end
+    check.call("#{path} unconfirmed marker withdrawal fails closed") do
+      setup.call('reattach_before_comment' => true, 'patch_error' => true)
+      result = event.call
+      raise 'unconfirmed withdrawal succeeded' unless result[key] == 'failure'
+      raise 'unconfirmed withdrawal marked handled' if state.call['labels'].include?(attempt_label)
+      raise 'lost pause' unless state.call['labels'].include?(pause)
     end
   end
   check.call('moved head takes moot path without creating provenance') do

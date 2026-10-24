@@ -71,6 +71,7 @@ fn make_scorecard(score: f64, pass_rate: f64, snr50: f64) -> Scorecard {
         },
         regressions: RegressionFlags::default(),
         notes: String::new(),
+        provenance: None,
     }
 }
 

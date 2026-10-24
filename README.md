@@ -38,10 +38,14 @@ runs as happily over SSH on a headless box behind the radio as on a desktop.
 ## Why Pancetta
 
 - **A decoder measured against the real reference.** Against WSJT-X's `jt9` —
-  the decoder hams actually run — Pancetta needs **~2.1 dB more SNR** to
-  reach 50% recall on FT8, and **~3.95 dB more on FT4, where it caps at 78%
-  recall**, at a false-positive cost of 1 decode per 1,000 pure-noise
-  recordings (0.1%). In short: competitive, not yet class-leading. (An older
+  the decoder hams actually run — Pancetta's native decoder alone needs
+  **~2.1 dB more SNR** to reach 50% recall on FT8, and **~3.95 dB more on
+  FT4, where it caps at 78% recall**, at a false-positive cost of 1 decode
+  per 1,000 pure-noise recordings (0.1%). The shipped pipeline adds
+  ft8_lib's decodes to the native set: on the same synthetic FT8 corpus it
+  reaches 50% recall at about **−19.5 dB**, versus −19.3 dB for the
+  native decoder alone (measured on a CI-class x86-64 host; Pi and MiniPC
+  unmeasured). In short: competitive, not yet class-leading. (An older
   1,201-file comparison against `ft8_lib` showed +11.6% more decodes, but
   `ft8_lib` is not the bar operators care about.) Full numbers and caveats:
   [`docs/decoder-comparison.md`](docs/decoder-comparison.md).
@@ -289,7 +293,7 @@ after v0.9.6. Rows marked *Unreleased* are not in the v0.9.6 binary; see
 
 | Capability | State | Environment and limits | Evidence |
 |---|---|---|---|
-| FT8 decode | Radio-qualified | On air at the maintainer's station. Measured sensitivity vs WSJT-X: [decoder comparison](docs/decoder-comparison.md) | [FT8 tests](pancetta-ft8/tests/) |
+| FT8 decode | Radio-qualified | On air at the maintainer's station. Measured sensitivity of the shipped pipeline, and of the native decoder alone vs WSJT-X: [decoder comparison](docs/decoder-comparison.md) | [FT8 tests](pancetta-ft8/tests/) |
 | FT8 transmit, manual QSOs | Radio-qualified | Yaesu FTdx10 via `rigctld`: TX validated 2026-04-26 (clean ALC, PSKReporter spots across NA + EU); manual on-air QSOs since 2026-09 | [loopback QSO](pancetta/tests/loopback_qso.rs), [PTT](pancetta/tests/tx_ptt_integration.rs) |
 | Autonomous QSO loop | Integration-tested | Simulated band only; no on-air autonomous run recorded yet | [coordinator sim](pancetta/tests/coord_sim.rs) |
 | Several QSOs per slot (multi-stream TX) | Integration-tested | Simulated only | [loopback QSO](pancetta/tests/loopback_qso.rs) |

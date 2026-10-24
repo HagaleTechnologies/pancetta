@@ -13,8 +13,9 @@ use pancetta_research::metrics::{
     RefreshOffsetRegistry,
 };
 use pancetta_research::scorecard::{
-    BuildInfo, ConfigInfo, GitInfo, HarnessInfo, PairRecovery, PerWavFailure, PerWavRecord,
-    RegressionFlags, Scorecard, SnrBin, TierResult, TtfdDistribution, WindowTimingSummary,
+    BuildInfo, ConfigInfo, CorpusProvenance, GitInfo, HarnessInfo, HostCpu, PairRecovery,
+    PerWavFailure, PerWavRecord, Provenance, RegressionFlags, Scorecard, SnrBin, TierProbeSummary,
+    TierResult, TtfdDistribution, WindowTimingSummary,
 };
 use pancetta_research::truth::{FixtureCategory, FixtureTruth};
 use pancetta_research::Mode;
@@ -99,6 +100,12 @@ struct Args {
     /// from the 21 Costas symbols to the full 79-symbol frame. See
     /// `Ft8Config::coherent_subtract_full_frame_reference_enabled`.
     coherent_subtract_full_frame_reference_enabled: Option<bool>,
+    /// PAN-168 [A/B]: fit the full-frame path's audio-domain cancellation
+    /// per ~2-symbol block instead of once over the whole frame. Only has
+    /// any effect when `coherent_subtract_full_frame_reference_enabled` is
+    /// also on. See
+    /// `Ft8Config::coherent_subtract_full_frame_time_varying_enabled`.
+    coherent_subtract_full_frame_time_varying_enabled: Option<bool>,
     /// Decoder-TP-sensitivity Task W4.2/W4.3 [A/B]: subtract the
     /// time-varying fit at full scale (1.0) instead of the legacy 0.9
     /// hold-back. Only takes effect when `time_varying_subtraction_enabled`
@@ -286,6 +293,12 @@ struct Args {
     /// PAN-165: `--qso-partner-hz <HZ>` (requires `--budget-anchor
     /// receipt`): simulate an active QSO with a partner at HZ.
     qso_partner_hz: Option<f64>,
+    /// PAN-110: `--merge-ft8lib` (requires `--budget-anchor receipt`):
+    /// score production's merged ft8_lib + native decode set and record
+    /// the scorecard's `provenance` block.
+    merge_ft8lib: bool,
+    /// PAN-110: the `--effort` preset name as passed, for `provenance`.
+    effort_name: Option<String>,
 }
 
 impl Args {
@@ -330,6 +343,7 @@ impl Args {
         let mut per_candidate_freq_tracker_enabled: Option<bool> = None;
         let mut time_varying_subtraction_enabled: Option<bool> = None;
         let mut coherent_subtract_full_frame_reference_enabled: Option<bool> = None;
+        let mut coherent_subtract_full_frame_time_varying_enabled: Option<bool> = None;
         let mut full_scale_subtraction_enabled: Option<bool> = None;
         let mut llr_whitening: Option<bool> = None;
         let mut acceptance_gating: Option<bool> = None;
@@ -383,6 +397,7 @@ impl Args {
         let mut effort_name: Option<String> = None;
         let mut budget_anchor: Option<BudgetAnchor> = None;
         let mut qso_partner_hz: Option<f64> = None;
+        let mut merge_ft8lib = false;
         let mut iter = args;
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -588,6 +603,9 @@ impl Args {
                 }
                 "--coherent-subtract-full-frame-reference-enabled" => {
                     coherent_subtract_full_frame_reference_enabled = Some(true);
+                }
+                "--coherent-subtract-full-frame-time-varying-enabled" => {
+                    coherent_subtract_full_frame_time_varying_enabled = Some(true);
                 }
                 "--full-scale-subtraction-enabled" => {
                     full_scale_subtraction_enabled = Some(true);
@@ -944,6 +962,9 @@ impl Args {
                         ),
                     });
                 }
+                "--merge-ft8lib" => {
+                    merge_ft8lib = true;
+                }
                 "--qso-partner-hz" => {
                     let hz: f64 = iter
                         .next()
@@ -988,6 +1009,7 @@ impl Args {
                     eprintln!("  --per-candidate-freq-tracker-enabled: decoder-TP-sensitivity Task W3.6 [A/B] — re-test of the per-candidate frequency tracker as a consumer of the W3.3 matched-demod stage; requires --fine-sync-enabled to have any effect (default off). See Ft8Config::per_candidate_freq_tracker_enabled.");
                     eprintln!("  --time-varying-subtraction-enabled: decoder-TP-sensitivity Task W4.2/W4.3 [A/B] — per-block time-varying GFSK subtraction, replacing the legacy whole-signal fit; only observable when --max-passes >= 2 (default off). See Ft8Config::time_varying_subtraction_enabled.");
                     eprintln!("  --coherent-subtract-full-frame-reference-enabled: PAN-153 [A/B] — widen the coherent-subtraction rotor reference from the 21 Costas symbols to the full 79-symbol frame (default off). See Ft8Config::coherent_subtract_full_frame_reference_enabled.");
+                    eprintln!("  --coherent-subtract-full-frame-time-varying-enabled: PAN-168 [A/B] — fit the full-frame path's audio-domain cancellation per ~2-symbol block instead of once over the whole frame, absorbing fine_sync's residual carrier error; requires --coherent-subtract-full-frame-reference-enabled to have any effect (default off). See Ft8Config::coherent_subtract_full_frame_time_varying_enabled.");
                     eprintln!("  --full-scale-subtraction-enabled: decoder-TP-sensitivity Task W4.2/W4.3 [A/B] — subtract the time-varying fit at full scale (1.0) instead of the legacy 0.9 hold-back; requires --time-varying-subtraction-enabled to have any effect (default off, UNTESTED on weak signals). See Ft8Config::full_scale_subtraction_enabled.");
                     eprintln!("  --linear-power-averaging: decoder-TP-sensitivity Task W3.5 [A/B] — combine each symbol's two TIME_OSR sub-steps in linear power instead of dB; runs unconditionally on the always-active coarse-sync path, independent of --sync-time-interp-linear-power (default off). See Ft8Config::linear_power_averaging.");
                     eprintln!("  --llr-whitening / --no-llr-whitening: decoder-TP-sensitivity Task W1.4 [A/B] — force the divisive LLR whitening step on/off (production default: off, flipped by the W1.4 A/B result). See Ft8Config::llr_whitening_enabled.");
@@ -1009,7 +1031,8 @@ impl Args {
                     eprintln!("  --noise-manifest PATH: override the noise_1000 tier's manifest (default research/corpus/curated/noise/noise_1000.manifest.json).");
                     eprintln!("  --synth-ft4-manifest PATH: override the synth-ft4 tier's manifest (default research/corpus/synth/manifests/ft4_clean.manifest.json).");
                     eprintln!("  --effort <eco|standard|deep|max|auto|unlimited>: Task W3.3b [HARNESS] — construct the decoder's DecodeBudget from a real production effort preset (eco=1ms, standard=250ms, deep=1000ms, max=the protocol ceiling production applies to Max [FT8 2000ms, FT4 800ms], auto=1000ms [Fast-tier assumption; no live hardware probe here], unlimited=DecodeBudget::unlimited()) instead of always using an unlimited budget. Default (flag omitted): unlimited, byte-identical to every prior eval invocation. Mirrors pancetta/src/coordinator/effort.rs::preset_budget_ms.");
-                    eprintln!("  --budget-anchor <call|receipt>: PAN-165 [HARNESS] — record per-window decode timing in the fixtures and synth-pair-200 tiers' `window_timing` (synth-pair-200 also records `pair_recovery`). call: the deadline starts right before the native decode call (the pre-PAN-165 model). receipt: the deadline starts at window receipt and production's pre-native sequence runs under it first (waterfall, ft8_lib, plus the scoped fast-path with --qso-partner-hz); only the native call's decodes are scored. receipt cannot be combined with --ap-my-call, --ap-recent-calls, --ap-rolling-window, --chrono-replay-enabled, the chrono-replay tier or --two-stage. Default (flag omitted): no timing, scorecard unchanged.");
+                    eprintln!("  --budget-anchor <call|receipt>: PAN-165 [HARNESS] — record per-window decode timing in the fixtures and synth-pair-200 tiers' `window_timing` (synth-pair-200 also records `pair_recovery`). call: the deadline starts right before the native decode call (the pre-PAN-165 model). receipt: the deadline starts at window receipt and production's pre-native sequence runs under it first (waterfall, ft8_lib, plus the scoped fast-path with --qso-partner-hz); only the native call's decodes are scored. receipt cannot be combined with --ap-recent-calls, --ap-rolling-window, --chrono-replay-enabled, the chrono-replay tier or --two-stage; a bare --ap-my-call is passed to the native call as production does. Default (flag omitted): no timing, scorecard unchanged.");
+                    eprintln!("  --merge-ft8lib: PAN-110 [HARNESS] — requires --budget-anchor receipt. Scores what production delivers: ft8_lib's decodes, then each native decode with new text, then unresolved-hash-twin dedup (pancetta_ft8::merge, the coordinator's own code). synth tiers then record per-SNR native_decoded/ft8lib_decoded, real fp counts and window_timing, and the scorecard gains a provenance block (pipeline, effort/budget, host CPU and cgroup quota, hardware-tier probe, corpus manifest/config/WAV-set sha256). Run at most one synth tier per invocation.");
                     eprintln!("  --qso-partner-hz HZ: PAN-165 [HARNESS] — requires --budget-anchor receipt. Simulates an active QSO with a partner at HZ: runs production's scoped fast-path call (partner ±5 bins), then narrows the native call to the partner ±60 Hz with HZ as its relaxed-sync partner frequency (overrides --partner-freq-hz on that call).");
                     std::process::exit(0);
                 }
@@ -1019,19 +1042,35 @@ impl Args {
         let tiers: Vec<String> = tiers.context("--tier required")?;
         let mode = mode.context("--mode required")?;
         // PAN-165: `max` depends on `--mode`, which may come after `--effort`.
-        let effort_budget_ms = match effort_name {
-            Some(name) => effort_preset_budget_ms(&name, mode)?,
+        let effort_budget_ms = match effort_name.as_deref() {
+            Some(name) => effort_preset_budget_ms(name, mode)?,
             None => None,
         };
+        anyhow::ensure!(
+            !merge_ft8lib || budget_anchor == Some(BudgetAnchor::Receipt),
+            "--merge-ft8lib requires --budget-anchor receipt (the merge reproduces production's \
+             receipt-anchored window sequence)"
+        );
+        if merge_ft8lib {
+            let synth_tiers = tiers
+                .iter()
+                .filter(|t| matches!(t.as_str(), "synth-clean" | "synth-doppler" | "synth-ft4"))
+                .count();
+            anyhow::ensure!(
+                synth_tiers <= 1,
+                "--merge-ft8lib records one corpus in `provenance`; run one synth tier at a time"
+            );
+        }
         anyhow::ensure!(
             qso_partner_hz.is_none() || budget_anchor == Some(BudgetAnchor::Receipt),
             "--qso-partner-hz requires --budget-anchor receipt"
         );
         if budget_anchor == Some(BudgetAnchor::Receipt) {
             // These route `Ft8Decoder::decode_wav` off its plain path, which
-            // the receipt-anchored production sequence replaces.
+            // the receipt-anchored production sequence replaces. A bare
+            // `--ap-my-call` is allowed (PAN-110): production's native call
+            // carries the station callsign from start-up.
             let conflicts: Vec<&str> = [
-                (ap_my_call.is_some(), "--ap-my-call"),
                 (ap_recent_calls.is_some(), "--ap-recent-calls"),
                 (ap_rolling_window.is_some(), "--ap-rolling-window"),
                 (
@@ -1090,6 +1129,7 @@ impl Args {
             per_candidate_freq_tracker_enabled,
             time_varying_subtraction_enabled,
             coherent_subtract_full_frame_reference_enabled,
+            coherent_subtract_full_frame_time_varying_enabled,
             full_scale_subtraction_enabled,
             llr_whitening,
             acceptance_gating,
@@ -1143,6 +1183,8 @@ impl Args {
             effort_budget_ms,
             budget_anchor,
             qso_partner_hz,
+            merge_ft8lib,
+            effort_name,
         })
     }
 }
@@ -1429,14 +1471,29 @@ fn jt9_recovered(
     }))
 }
 
+/// PAN-110: per-SNR-bin counts that exist only when the decoder reports
+/// each backend's own texts (`--merge-ft8lib`).
+#[derive(Debug, Clone, Copy, Default)]
+struct SideCounts {
+    native_decoded: u32,
+    ft8lib_decoded: u32,
+    fp: u32,
+}
+
 fn run_synth_tier(
     decoder: &dyn DecoderUnderTest,
     workspace: &std::path::Path,
     manifest_path: &std::path::Path,
     fp_filter: Option<&pancetta_research::FpFilter>,
     mode: Mode,
+    timing_run: Option<WindowTimingRun>,
 ) -> anyhow::Result<TierResult> {
     let entries = load_synth_corpus(workspace, manifest_path)?;
+    // PAN-110: filled only from windows whose decoder reported per-backend
+    // texts; without them every bin keeps `fp: 0` and no side counts.
+    let mut side_bins: BTreeMap<i64, SideCounts> = BTreeMap::new();
+    let mut side_texts_seen = false;
+    let mut timings: Vec<WindowTiming> = Vec::new();
     // Group by snr_db bin.
     let mut bins: BTreeMap<i64, (u32, u32)> = BTreeMap::new(); // key = snr*10 to avoid float keys
                                                                // Task W0.2: parallel jt9-oracle bins, keyed identically, populated
@@ -1455,9 +1512,30 @@ fn run_synth_tier(
         let bin_key = (e.snr_db * 10.0).round() as i64;
         let bin = bins.entry(bin_key).or_insert((0, 0));
         bin.0 += 1; // attempts
-        match decoder.decode_wav(&e.wav_path) {
+        let decoded = decoder.decode_wav(&e.wav_path);
+        if timing_run.is_some() {
+            timings.extend(decoder.take_last_window_timing());
+        }
+        let side_texts = decoder.take_last_window_decoder_texts();
+        match decoded {
             Ok(mut decodes) => {
                 apply_fp_filter(fp_filter, &mut decodes);
+                // PAN-110: a merged set leads with ft8_lib's copies, which
+                // carry no decode time, so it has no meaningful TTFD.
+                let merged = side_texts.is_some();
+                if let Some(texts) = side_texts {
+                    side_texts_seen = true;
+                    let side = side_bins.entry(bin_key).or_default();
+                    let has = |t: &[String]| t.iter().any(|m| m.contains(&e.encoded_message));
+                    side.native_decoded += u32::from(has(&texts.native));
+                    side.ft8lib_decoded += u32::from(has(&texts.ft8lib));
+                    // Every synth WAV carries exactly one signal, so any
+                    // delivered decode that is not it is a false decode.
+                    side.fp += decodes
+                        .iter()
+                        .filter(|d| !d.message.contains(&e.encoded_message))
+                        .count() as u32;
+                }
                 if let Some(min_ttfd) = decodes
                     .iter()
                     .filter_map(|d| d.decode_time_into_window_s)
@@ -1465,6 +1543,7 @@ fn run_synth_tier(
                         None => Some(t),
                         Some(cur) => Some(cur.min(t)),
                     })
+                    .filter(|_| !merged)
                 {
                     per_wav_ttfd_s.push(min_ttfd);
                 }
@@ -1492,11 +1571,16 @@ fn run_synth_tier(
     }
     let mut by_snr: Vec<SnrBin> = bins
         .iter()
-        .map(|(k, (attempts, decoded))| SnrBin {
-            snr_db: (*k as f64) / 10.0,
-            attempts: *attempts,
-            decoded: *decoded,
-            fp: 0,
+        .map(|(k, (attempts, decoded))| {
+            let side = side_texts_seen.then(|| side_bins.get(k).copied().unwrap_or_default());
+            SnrBin {
+                snr_db: (*k as f64) / 10.0,
+                attempts: *attempts,
+                decoded: *decoded,
+                fp: side.map_or(0, |s| s.fp),
+                native_decoded: side.map(|s| s.native_decoded),
+                ft8lib_decoded: side.map(|s| s.ft8lib_decoded),
+            }
         })
         .collect();
     by_snr.sort_by(|a, b| a.snr_db.partial_cmp(&b.snr_db).unwrap());
@@ -1523,12 +1607,23 @@ fn run_synth_tier(
                 attempts: *attempts,
                 decoded: *decoded,
                 fp: 0,
+                native_decoded: None,
+                ft8lib_decoded: None,
             })
             .collect();
         curve.sort_by(|a, b| a.snr_db.partial_cmp(&b.snr_db).unwrap());
         let at_50 = first_threshold_db(&curve, 0.50);
         (curve, at_50)
     };
+
+    // PAN-110: the per-bin `fp` counts are the record. `false_positives_total`
+    // stays unset: `compare`'s FP hard gate reads it on every shared tier,
+    // and a merged synth run counts false decodes that other synth runs do not.
+    let tier_name = manifest_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("synth");
+    let window_timing = timing_run.and_then(|r| r.summarize(tier_name, &timings));
 
     Ok(TierResult {
         wavs_processed,
@@ -1538,8 +1633,125 @@ fn run_synth_tier(
         ttfd_distribution,
         jt9_snr_curve,
         jt9_snr_at_50pct_recovery_db,
+        window_timing,
         ..Default::default()
     })
+}
+
+/// PAN-110: the `not_modelled` list a `--merge-ft8lib` scorecard records —
+/// production stages between the native call and delivery that depend on
+/// station state or non-default config, so the benchmark leaves them out.
+const MERGE_NOT_MODELLED: &[&str] = &[
+    "fp_filter (station ADIF/cqdx/seed; cold start passes all)",
+    "cross_sequence_a7 (default off)",
+    "ap_eval_mode (default off)",
+    "scoped fast-path (no QSO partner)",
+    "recent-call AP pool (empty at start-up)",
+];
+
+/// PAN-110: the CPU model string: Linux `/proc/cpuinfo`, else macOS
+/// `sysctl`, else `"unknown"`.
+fn cpu_model() -> String {
+    let linux = std::fs::read_to_string("/proc/cpuinfo").ok().and_then(|s| {
+        s.lines()
+            .find(|l| l.starts_with("model name"))
+            .and_then(|l| l.split_once(':'))
+            .map(|(_, v)| v.trim().to_string())
+    });
+    linux
+        .or_else(|| {
+            std::process::Command::new("sysctl")
+                .args(["-n", "machdep.cpu.brand_string"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// PAN-110: the host the benchmark ran on, including production's own
+/// hardware-tier probe (what `Auto` effort would resolve to here).
+fn host_cpu() -> HostCpu {
+    let tier_probe = match pancetta_ft8::tier_probe::probe_hardware_tier(10) {
+        Ok(r) => Some(TierProbeSummary {
+            tier: r.tier.as_str().to_string(),
+            p95_ms: r.p95.as_millis() as u64,
+        }),
+        Err(e) => {
+            eprintln!("warning: hardware-tier probe failed ({e}); provenance omits it");
+            None
+        }
+    };
+    HostCpu {
+        model: cpu_model(),
+        logical_cpus: std::thread::available_parallelism().map_or(0, |n| n.get()),
+        cgroup_cpu_max: std::fs::read_to_string("/sys/fs/cgroup/cpu.max")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        rayon_threads: rayon::current_num_threads(),
+        tier_probe,
+    }
+}
+
+/// PAN-110: hash a synth corpus. The WAV-set hash is sha256 over each WAV's
+/// lower-case hex sha256 in manifest order, because the WAVs are
+/// regenerated locally and the manifest alone does not pin their bytes.
+fn corpus_provenance(
+    tier: &str,
+    workspace: &std::path::Path,
+    manifest_path: &std::path::Path,
+) -> anyhow::Result<CorpusProvenance> {
+    use sha2::{Digest, Sha256};
+    let entries = load_synth_corpus(workspace, manifest_path)?;
+    let mut set = Sha256::new();
+    for e in &entries {
+        let wav_sha = sha256_file(&e.wav_path)
+            .with_context(|| format!("hashing corpus WAV {}", e.wav_path.display()))?;
+        set.update(wav_sha.as_bytes());
+    }
+    let config_path = manifest_path
+        .to_str()
+        .and_then(|p| p.strip_suffix(".manifest.json"))
+        .map(|stem| std::path::PathBuf::from(format!("{stem}.config.json")))
+        .filter(|p| p.exists());
+    let config_sha256 = match config_path {
+        Some(p) => Some(sha256_file(&p)?),
+        None => None,
+    };
+    Ok(CorpusProvenance {
+        tier: tier.to_string(),
+        manifest: manifest_path
+            .strip_prefix(workspace)
+            .unwrap_or(manifest_path)
+            .display()
+            .to_string(),
+        manifest_sha256: sha256_file(manifest_path)?,
+        config_sha256,
+        wav_set_sha256: format!("{:x}", set.finalize()),
+        wav_count: entries.len(),
+    })
+}
+
+/// PAN-110: the scorecard `provenance` block for a `--merge-ft8lib` run.
+fn merge_provenance(args: &Args, corpus: Option<CorpusProvenance>) -> Provenance {
+    Provenance {
+        pipeline: "ft8lib+native-merge".to_string(),
+        budget_anchor: args
+            .budget_anchor
+            .map_or("none", BudgetAnchor::as_str)
+            .to_string(),
+        effort: args.effort_name.clone(),
+        budget_ms: args.effort_budget_ms,
+        ft8lib_available: pancetta_ft8::ft8lib_is_available(),
+        ap_my_call: args.ap_my_call.clone(),
+        not_modelled: MERGE_NOT_MODELLED.iter().map(|s| s.to_string()).collect(),
+        host_cpu: host_cpu(),
+        corpus,
+    }
 }
 
 /// hb-146 — synth-pair adversarial mutual-masking pair tier. Each WAV
@@ -2332,6 +2544,9 @@ fn build_decoder_from_args(args: &Args, protocol: pancetta_ft8::Protocol) -> Ft8
     if let Some(on) = args.coherent_subtract_full_frame_reference_enabled {
         d = d.with_coherent_subtract_full_frame_reference_enabled(on);
     }
+    if let Some(on) = args.coherent_subtract_full_frame_time_varying_enabled {
+        d = d.with_coherent_subtract_full_frame_time_varying_enabled(on);
+    }
     if let Some(on) = args.full_scale_subtraction_enabled {
         d = d.with_full_scale_subtraction_enabled(on);
     }
@@ -2506,6 +2721,10 @@ fn build_decoder_from_args(args: &Args, protocol: pancetta_ft8::Protocol) -> Ft8
     if let Some(hz) = args.qso_partner_hz {
         d = d.with_qso_partner_hz(hz);
     }
+    // PAN-110: only touched when --merge-ft8lib is passed.
+    if args.merge_ft8lib {
+        d = d.with_ft8lib_merge(true);
+    }
 
     d
 }
@@ -2540,6 +2759,10 @@ fn main() -> anyhow::Result<()> {
     };
     let decoder: Box<dyn DecoderUnderTest> = Box::new(build_decoder_from_args(&args, protocol));
     let timing_run = WindowTimingRun::from_args(&args);
+    // PAN-110: synth tiers record window timing only in `--merge-ft8lib`
+    // runs, so every other synth scorecard stays byte-identical.
+    let synth_timing_run = timing_run.filter(|_| args.merge_ft8lib);
+    let mut merge_corpus: Option<CorpusProvenance> = None;
 
     // hb-052: build FP filter from configured sources, if any.
     let fp_filter: Option<pancetta_research::FpFilter> = if args.fp_filter_baselines.is_some()
@@ -2697,12 +2920,16 @@ fn main() -> anyhow::Result<()> {
                     "synth manifest missing at {}; run `cargo run -p pancetta-research --bin gen-synth -- --config research/corpus/synth/manifests/clean.config.json --output research/corpus/synth/manifests/clean.manifest.json`",
                     manifest.display()
                 );
+                if args.merge_ft8lib {
+                    merge_corpus = Some(corpus_provenance("synth-clean", &workspace, &manifest)?);
+                }
                 let result = run_synth_tier(
                     decoder.as_ref(),
                     &workspace,
                     &manifest,
                     fp_filter_ref,
                     Mode::Ft8,
+                    synth_timing_run,
                 )?;
                 tiers.insert("synth-clean".to_string(), result);
             }
@@ -2714,12 +2941,16 @@ fn main() -> anyhow::Result<()> {
                     "doppler synth manifest missing at {}; run `cargo run --release -p pancetta-research --bin gen-synth -- --config research/corpus/synth/manifests/doppler.config.json --output research/corpus/synth/manifests/doppler.manifest.json`",
                     manifest.display()
                 );
+                if args.merge_ft8lib {
+                    merge_corpus = Some(corpus_provenance("synth-doppler", &workspace, &manifest)?);
+                }
                 let result = run_synth_tier(
                     decoder.as_ref(),
                     &workspace,
                     &manifest,
                     fp_filter_ref,
                     Mode::Ft8,
+                    synth_timing_run,
                 )?;
                 tiers.insert("synth-doppler".to_string(), result);
             }
@@ -2752,12 +2983,16 @@ fn main() -> anyhow::Result<()> {
                     "FT4 synth manifest missing at {}; run `cargo run --release -p pancetta-research --bin gen-synth -- --config research/corpus/synth/manifests/ft4_clean.config.json --output research/corpus/synth/manifests/ft4_clean.manifest.json`",
                     manifest.display()
                 );
+                if args.merge_ft8lib {
+                    merge_corpus = Some(corpus_provenance("synth-ft4", &workspace, &manifest)?);
+                }
                 let result = run_synth_tier(
                     decoder.as_ref(),
                     &workspace,
                     &manifest,
                     fp_filter_ref,
                     Mode::Ft4,
+                    synth_timing_run,
                 )?;
                 tiers.insert("synth-ft4".to_string(), result);
             }
@@ -2989,6 +3224,9 @@ fn main() -> anyhow::Result<()> {
         },
         regressions: RegressionFlags::default(),
         notes: format!("Decoder under test: {}", decoder.identity()),
+        provenance: args
+            .merge_ft8lib
+            .then(|| merge_provenance(&args, merge_corpus.take())),
     };
     populate_composite(&mut card, default_weights());
     // Preflight (WAV hashing + baseline-cache validation) and novel-
@@ -3151,6 +3389,236 @@ mod arg_tests {
         assert_eq!(args.budget_anchor, None);
         assert_eq!(args.qso_partner_hz, None);
         assert!(WindowTimingRun::from_args(&args).is_none());
+        assert!(!args.merge_ft8lib);
+    }
+
+    fn parse_tier(tier: &str, mode: &str, extra: &[&str]) -> anyhow::Result<Args> {
+        let base = ["--tier", tier, "--mode", mode, "--output", "/tmp/x.json"];
+        Args::parse_from(base.iter().chain(extra.iter()).map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn parse_requires_receipt_anchor_for_merge_ft8lib() {
+        let err = parse_tier("synth-clean", "ft8", &["--merge-ft8lib"]).unwrap_err();
+        assert!(err.to_string().contains("--budget-anchor receipt"), "{err}");
+        let err = parse_tier(
+            "synth-clean",
+            "ft8",
+            &["--merge-ft8lib", "--budget-anchor", "call"],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--budget-anchor receipt"), "{err}");
+    }
+
+    #[test]
+    fn parse_accepts_merge_ft8lib_on_synth_tiers_with_my_call() {
+        let receipt = [
+            "--budget-anchor",
+            "receipt",
+            "--merge-ft8lib",
+            "--ap-my-call",
+            "W1PAN",
+            "--effort",
+            "deep",
+        ];
+        for (tier, mode) in [("synth-clean", "ft8"), ("synth-ft4", "ft4")] {
+            let args = parse_tier(tier, mode, &receipt).unwrap();
+            assert!(args.merge_ft8lib, "{tier}");
+            assert_eq!(args.ap_my_call.as_deref(), Some("W1PAN"));
+            assert_eq!(args.effort_name.as_deref(), Some("deep"));
+        }
+        // Recent calls are still station state the benchmark does not model.
+        let err = parse_tier(
+            "synth-clean",
+            "ft8",
+            &["--budget-anchor", "receipt", "--ap-recent-calls", "K1ABC"],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--ap-recent-calls"), "{err}");
+        // One corpus per provenance block.
+        let err = parse_tier("synth-clean,synth-doppler", "ft8", &receipt).unwrap_err();
+        assert!(err.to_string().contains("one synth tier"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod merge_scoring_tests {
+    use super::*;
+    use pancetta_research::decoder::{Decode, DecoderTexts};
+    use std::collections::HashMap;
+
+    /// Returns canned decodes (and optionally per-backend texts) keyed by
+    /// the WAV's file name; no audio is read.
+    struct SideStub {
+        responses: HashMap<String, (Vec<&'static str>, DecoderTexts)>,
+        report_sides: bool,
+        last: std::sync::Mutex<Option<DecoderTexts>>,
+    }
+
+    impl DecoderUnderTest for SideStub {
+        fn mode(&self) -> Mode {
+            Mode::Ft8
+        }
+        fn identity(&self) -> String {
+            "side-stub".to_string()
+        }
+        fn decode_wav(&self, path: &std::path::Path) -> anyhow::Result<Vec<Decode>> {
+            let key = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            let (delivered, texts) = self.responses.get(key).cloned().unwrap_or_default();
+            if self.report_sides {
+                *self.last.lock().unwrap() = Some(texts);
+            }
+            Ok(delivered
+                .into_iter()
+                .map(|m| Decode {
+                    message: m.to_string(),
+                    freq_hz: 1500.0,
+                    dt_s: 0.0,
+                    snr_db: -20.0,
+                    crc_valid: true,
+                    decode_time_into_window_s: Some(1.0),
+                    soft_distance: None,
+                    hard_errors: None,
+                    coherence: None,
+                })
+                .collect())
+        }
+        fn config_snapshot(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn take_last_window_decoder_texts(&self) -> Option<DecoderTexts> {
+            self.last.lock().unwrap().take()
+        }
+    }
+
+    /// A two-bin manifest cut from the committed synth-clean manifest:
+    /// three WAVs at -20 dB and one at -19 dB.
+    fn small_manifest(dir: &std::path::Path) -> (PathBuf, Vec<(String, String, f64)>) {
+        let root = workspace_root().unwrap();
+        let full: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                root.join("research/corpus/synth/manifests/clean.manifest.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let entries: Vec<serde_json::Value> = full["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["snr_db"] == -20.0 || e["snr_db"] == -19.0)
+            .scan((0, 0), |(n20, n19), e| {
+                let keep = if e["snr_db"] == -20.0 {
+                    *n20 += 1;
+                    *n20 <= 3
+                } else {
+                    *n19 += 1;
+                    *n19 <= 1
+                };
+                Some(keep.then(|| e.clone()))
+            })
+            .flatten()
+            .collect();
+        let mut manifest = full.clone();
+        manifest["entries"] = serde_json::Value::Array(entries.clone());
+        let path = dir.join("small.manifest.json");
+        std::fs::write(&path, serde_json::to_string(&manifest).unwrap()).unwrap();
+        let summary = entries
+            .iter()
+            .map(|e| {
+                let wav = PathBuf::from(e["wav_path"].as_str().unwrap());
+                (
+                    wav.file_name().unwrap().to_str().unwrap().to_string(),
+                    e["encoded_message"].as_str().unwrap().to_string(),
+                    e["snr_db"].as_f64().unwrap(),
+                )
+            })
+            .collect();
+        (path, summary)
+    }
+
+    fn stub(entries: &[(String, String, f64)], report_sides: bool) -> SideStub {
+        let leak = |s: &str| -> &'static str { Box::leak(s.to_string().into_boxed_str()) };
+        let mut responses = HashMap::new();
+        // -20 dB WAV 0: both backends decode it, plus one false decode.
+        // -20 dB WAV 1: only the native decoder decodes it.
+        // -20 dB WAV 2: nothing.
+        // -19 dB WAV 0: only ft8_lib decodes it.
+        let mut at_minus_20 = 0usize;
+        for (wav, msg, snr) in entries {
+            let m = leak(msg);
+            let i = at_minus_20;
+            if *snr == -20.0 {
+                at_minus_20 += 1;
+            }
+            let (delivered, native, ft8lib) = match (*snr == -20.0, i) {
+                (true, 0) => (vec![m, "CQ ZZ9ZZZ AA00"], vec![m], vec![m]),
+                (true, 1) => (vec![m], vec![m], vec![]),
+                (true, _) => (vec![], vec![], vec![]),
+                (false, _) => (vec![m], vec![], vec![m]),
+            };
+            let texts = DecoderTexts {
+                native: native.iter().map(|s| s.to_string()).collect(),
+                ft8lib: ft8lib.iter().map(|s| s.to_string()).collect(),
+            };
+            responses.insert(wav.clone(), (delivered, texts));
+        }
+        SideStub {
+            responses,
+            report_sides,
+            last: std::sync::Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn synth_tier_counts_each_backend_and_false_decodes_when_sides_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manifest, entries) = small_manifest(dir.path());
+        let root = workspace_root().unwrap();
+        let decoder = stub(&entries, true);
+        let r = run_synth_tier(&decoder, &root, &manifest, None, Mode::Ft8, None).unwrap();
+        let b20 = &r.by_snr_db[0];
+        assert_eq!((b20.snr_db, b20.attempts, b20.decoded), (-20.0, 3, 2));
+        assert_eq!(b20.native_decoded, Some(2));
+        assert_eq!(b20.ft8lib_decoded, Some(1));
+        assert_eq!(b20.fp, 1);
+        let b19 = &r.by_snr_db[1];
+        assert_eq!((b19.snr_db, b19.attempts, b19.decoded), (-19.0, 1, 1));
+        assert_eq!(b19.native_decoded, Some(0));
+        assert_eq!(b19.ft8lib_decoded, Some(1));
+        assert_eq!(b19.fp, 0);
+        // Left unset so `compare`'s noise-tier FP gate cannot misfire on a
+        // merged synth run, and no TTFD from a set led by ft8_lib copies.
+        assert_eq!(r.false_positives_total, None);
+        assert!(r.ttfd_distribution.is_none());
+    }
+
+    #[test]
+    fn synth_tier_without_side_texts_keeps_fp_zero_and_omits_side_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manifest, entries) = small_manifest(dir.path());
+        let root = workspace_root().unwrap();
+        let decoder = stub(&entries, false);
+        let r = run_synth_tier(&decoder, &root, &manifest, None, Mode::Ft8, None).unwrap();
+        for b in &r.by_snr_db {
+            assert_eq!(b.fp, 0);
+            assert_eq!(b.native_decoded, None);
+            assert_eq!(b.ft8lib_decoded, None);
+        }
+        assert_eq!(r.by_snr_db[0].decoded, 2);
+        assert_eq!(r.false_positives_total, None);
+        assert!(
+            r.ttfd_distribution.is_some(),
+            "TTFD unchanged without --merge-ft8lib"
+        );
+        let json = serde_json::to_value(&r).unwrap();
+        assert!(
+            json["by_snr_db"][0].get("native_decoded").is_none(),
+            "{json}"
+        );
     }
 }
 
@@ -3164,6 +3632,8 @@ mod snr_interpolation_tests {
             attempts,
             decoded,
             fp: 0,
+            native_decoded: None,
+            ft8lib_decoded: None,
         }
     }
 
