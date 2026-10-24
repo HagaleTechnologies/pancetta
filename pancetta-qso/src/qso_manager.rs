@@ -5289,15 +5289,22 @@ impl QsoManager {
         // Detect a manual state regression: the DX sent an EARLIER-stage
         // message and `determine_state_transition` either backed us up the
         // ladder (rank decreased) or kept us in SendingReport on a repeated
-        // report. When the regression queues a re-send (`reply_to_emit`), used
+        // report that was already latched. First acquisition (None -> Some)
+        // is forward progress and keeps the watchdog reprieve (PAN-84).
+        // When the regression queues a re-send (`reply_to_emit`), used
         // to (a) count that re-send against the manual watchdog cap and (b)
         // gate the per-slot rearm so it does not double-send in the same slot;
         // a repeated report in SendingReport queues none, so neither applies
         // (PAN-129). Every regression cancels the C3 reprieve.
         let is_manual_regression = qso_initiated_by == CallInitiation::Manual
             && (Self::ladder_rank(&new_state) < Self::ladder_rank(&old_state)
-                || (matches!(old_state, QsoState::SendingReport { .. })
-                    && matches!(new_state, QsoState::SendingReport { .. })
+                || (matches!(
+                    old_state,
+                    QsoState::SendingReport {
+                        their_report: Some(_),
+                        ..
+                    }
+                ) && matches!(new_state, QsoState::SendingReport { .. })
                     && matches!(message.message_type, MessageType::SignalReport { .. })));
 
         let mut reply_to_emit: Option<MessageType> = None;
@@ -22337,7 +22344,6 @@ mod pan72_stall_detection_tests {
             "precondition: the DX answered without a report, got {:?}",
             opened.state
         );
-        let generation_before_stall = opened.metadata.advance_generation;
         let answered_at = opened.metadata.last_call_at.unwrap();
 
         // A silent slot: we re-send our report, the DX says nothing. Partial
@@ -22350,6 +22356,17 @@ mod pan72_stall_detection_tests {
             1,
             "precondition: one silent slot builds a partial stall streak"
         );
+
+        let (calls_before, generation_before) = {
+            let mut qsos = manager.qsos.write().await;
+            let progress = qsos.get_mut(&qso_id).unwrap();
+            // Exclude the reprieve inherited from the report-free answer.
+            progress.metadata.progressed_this_cycle = false;
+            (
+                progress.metadata.call_count,
+                progress.metadata.advance_generation,
+            )
+        };
 
         // ...and NOW the DX's report lands. This is the exchange's single most
         // load-bearing advance: our outbound becomes an R-report.
@@ -22372,12 +22389,94 @@ mod pan72_stall_detection_tests {
             "the DX's first report is forward progress — the partial stall \
              streak must reset, not carry into the established exchange"
         );
+        assert_eq!(
+            after.metadata.advance_generation,
+            generation_before + 1,
+            "the first report must advance the generation exactly once"
+        );
+        assert_eq!(
+            after.metadata.call_count, calls_before,
+            "the first report queues no reply and must not spend a call"
+        );
         assert!(
-            after.metadata.advance_generation > generation_before_stall,
-            "the None -> Some(_) report rung must bump advance_generation so a \
-             switch queued by an earlier rearm is recognized as stale at commit \
-             time (was {generation_before_stall}, now {})",
-            after.metadata.advance_generation
+            after.metadata.progressed_this_cycle,
+            "PAN-84: the first report must grant the manual watchdog reprieve"
+        );
+    }
+
+    /// PAN-84: first acquisition protects one watchdog pass without extending
+    /// the original deadline. Silence on the next pass still retires the QSO.
+    #[tokio::test]
+    async fn first_dx_report_grants_exactly_one_expired_watchdog_reprieve() {
+        let mut config = test_config();
+        config.timeouts.manual_call_watchdog_minutes = 1;
+        let manager = manager_auto(config);
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::CqResponse {
+                    calling_station: OUR.into(),
+                    responding_station: DX.into(),
+                    grid: Some("FN31".into()),
+                },
+                format!("{OUR} {DX} FN31"),
+                FREQ,
+                Some(-12.0),
+            )
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let first_call_at = now - Duration::minutes(2);
+        {
+            let mut qsos = manager.qsos.write().await;
+            let progress = qsos.get_mut(&qso_id).unwrap();
+            assert!(matches!(
+                progress.state,
+                QsoState::SendingReport {
+                    their_report: None,
+                    ..
+                }
+            ));
+            progress.metadata.first_call_at = Some(first_call_at);
+            progress.metadata.progressed_this_cycle = false;
+        }
+        send_report(&manager, -7, &format!("{OUR} {DX} -07")).await;
+        assert!(matches!(
+            manager.get_qso(qso_id).await.unwrap().state,
+            QsoState::SendingReport {
+                their_report: Some(-7),
+                ..
+            }
+        ));
+        let mut rx = manager.subscribe();
+
+        manager.check_timeouts_at(now).await;
+        let surviving = manager
+            .get_qso(qso_id)
+            .await
+            .expect("PAN-84: the first report must protect one expired watchdog pass");
+        assert!(!surviving.metadata.progressed_this_cycle);
+        assert_eq!(surviving.metadata.first_call_at, Some(first_call_at));
+        assert!(
+            drain(&mut rx).is_empty(),
+            "the reprieve must not emit a timeout"
+        );
+
+        manager.check_timeouts_at(now + Duration::seconds(5)).await;
+        assert!(manager.get_qso(qso_id).await.is_err());
+        assert!(
+            drain(&mut rx).iter().any(|event| matches!(
+                event,
+                QsoEvent::QsoFailed {
+                    qso_id: failed_id,
+                    reason: QsoFailureReason::Timeout,
+                    ..
+                } if *failed_id == qso_id
+            )),
+            "the next pass must retire the QSO with a timeout"
         );
     }
 
@@ -22413,18 +22512,37 @@ mod pan72_stall_detection_tests {
         );
         let generation_before = stalled.metadata.advance_generation;
 
-        // The DX repeats the same report — they never copied our R.
-        send_report(&manager, -7, &format!("{OUR} {DX} -07")).await;
+        // Neither an identical report nor a changed value advances the QSO
+        // after a report has already been latched.
+        for report in [-7, -3] {
+            manager
+                .qsos
+                .write()
+                .await
+                .get_mut(&qso_id)
+                .unwrap()
+                .metadata
+                .progressed_this_cycle = true;
+            send_report(&manager, report, &format!("{OUR} {DX} {report:03}")).await;
 
-        let after = manager.get_qso(qso_id).await.unwrap();
-        assert_eq!(
-            after.metadata.advance_generation, generation_before,
-            "a repeated report is the DX standing still, not an advance"
-        );
-        assert_eq!(
-            after.metadata.stall_cycles, 1,
-            "the stall evidence must survive a repeated report"
-        );
+            let after = manager.get_qso(qso_id).await.unwrap();
+            assert!(matches!(
+                after.state,
+                QsoState::SendingReport { their_report: Some(value), .. } if value == report
+            ));
+            assert_eq!(
+                after.metadata.advance_generation, generation_before,
+                "a repeated report is the DX standing still, not an advance"
+            );
+            assert_eq!(
+                after.metadata.stall_cycles, 1,
+                "the stall evidence must survive a repeated report"
+            );
+            assert!(
+                !after.metadata.progressed_this_cycle,
+                "a subsequent report must cancel the pending watchdog reprieve"
+            );
+        }
     }
 
     // ── PAN-128: one stall count per own-parity TX slot ──────────────────
