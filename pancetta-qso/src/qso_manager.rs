@@ -1364,6 +1364,53 @@ struct KeepCallLedger {
     stall_action_revoked: bool,
     // PAN-182: see `PendingStallTrigger`.
     pending_stall_trigger: Option<PendingStallTrigger>,
+    // PAN-83: the most recently reported aired frame for this QSO, in report
+    // order — airing order, since the TX worker reports as frames play out and
+    // `DurableInbox` yields in send order. Frame history, not stall evidence:
+    // no stall reset clears it, and `answered_frame_offset_hz` reads it.
+    last_aired: Option<AiredFrame>,
+}
+
+// PAN-83: a frame the TX worker reported aired for a QSO — where it went out
+// and when its playback finished (`TxFrameSent::aired_at`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AiredFrame {
+    offset_hz: f64,
+    aired_at: DateTime<Utc>,
+}
+
+/// PAN-83: the TX offset of the frame a reply answered, when the aired
+/// reports pin it down.
+///
+/// A QSO alternates slots, so a reply the DX sent in slot R answers what it
+/// decoded from us in slot R-1. `reply_parity` is the decoded frame's own slot
+/// parity; R is the latest slot of that parity starting at or before
+/// `received_at`, which holds whether the decode was processed inside R or
+/// just after it. The newest aired frame is the answered one only if it
+/// finished airing in `[R - slot, R + slot)`: not before R-1 began (an older
+/// frame), and not after R+1 began (our next frame, which cannot finish before
+/// R+1 + ~12.6 s; a late-started R-1 frame can finish just after R begins).
+/// `None` when there is no parity, no record, or no frame in that window —
+/// the R-1 frame never aired or its report has not arrived — and the caller
+/// falls back to the relocation's provenance.
+fn answered_frame_offset_hz(
+    last_aired: Option<AiredFrame>,
+    received_at: DateTime<Utc>,
+    reply_parity: Option<pancetta_core::slot::SlotParity>,
+    slot_ns: i64,
+) -> Option<f64> {
+    let reply_parity = reply_parity?;
+    let frame = last_aired?;
+    let slot = Duration::nanoseconds(slot_ns);
+    let cur = pancetta_core::slot::current_slot_start_with_period(received_at, slot_ns);
+    let reply_slot =
+        if pancetta_core::slot::SlotParity::of_with_period(cur, slot_ns) == reply_parity {
+            cur
+        } else {
+            cur - slot
+        };
+    (frame.aired_at >= reply_slot - slot && frame.aired_at < reply_slot + slot)
+        .then_some(frame.offset_hz)
 }
 
 /// Whether a failed TX could be matched to a recent, active keep-call emission.
@@ -4413,8 +4460,10 @@ impl QsoManager {
     /// waiting on — same text, same offset and remote binding (see
     /// [`UnsentAttemptPayload`]), reported no earlier than the start of the
     /// own-parity TX slot the trigger feeds — release the hold so the next
-    /// drain can commit the action. Returns whether a hold was released; any
-    /// other frame leaves the ledger untouched.
+    /// drain can commit the action. Every aired frame of an active QSO is
+    /// also recorded as its newest aired frame (PAN-83), which the known-good
+    /// crediting in `process_message_for_qso` reads. Returns whether a hold
+    /// was released.
     pub async fn confirm_stall_trigger_aired(
         &self,
         qso_id: QsoId,
@@ -4430,9 +4479,14 @@ impl QsoManager {
             .keep_call_ledger
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let Some(entry) = ledger.get_mut(&qso_id) else {
-            return false;
-        };
+        // PAN-83: record every aired frame of an active QSO, hold or no hold
+        // — arrival order is airing order, so the newest report is the frame
+        // the DX's next reply, if any, answered.
+        let entry = ledger.entry(qso_id).or_default();
+        entry.last_aired = Some(AiredFrame {
+            offset_hz: aired.frequency_hz,
+            aired_at,
+        });
         if !entry
             .pending_stall_trigger
             .as_ref()
@@ -4451,6 +4505,17 @@ impl QsoManager {
             .unwrap_or_else(|e| e.into_inner())
             .get(&qso_id)
             .map_or(0, |entry| entry.attempts.len())
+    }
+
+    /// PAN-83: the QSO's most recently reported aired frame, if any — what
+    /// `answered_frame_offset_hz` reads at crediting time.
+    #[cfg(test)]
+    fn last_aired_frame(&self, qso_id: QsoId) -> Option<AiredFrame> {
+        self.keep_call_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&qso_id)
+            .and_then(|entry| entry.last_aired)
     }
 
     /// Oldest first: each surviving ledger attempt's id and whether it holds
@@ -24071,6 +24136,310 @@ mod pan72_stall_detection_tests {
             .apply_tx_offset_switch(qso_id, nudged + 300.0, stall_origin(&manager, qso_id).await)
             .await
             .expect("a released stall switch commits");
+    }
+
+    /// PAN-83: every aired frame of an active QSO is recorded, whether or not
+    /// a PAN-182 hold was waiting on it — the crediting block reads the same
+    /// record, and most frames air with no hold pending at all.
+    #[tokio::test]
+    async fn confirm_stall_trigger_aired_records_every_aired_frame_even_without_a_hold() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let aired_at = Utc::now();
+        let released = manager
+            .confirm_stall_trigger_aired(
+                qso_id,
+                "aired",
+                &UnsentAttemptPayload {
+                    frequency_hz: FREQ,
+                    remote_binding: Some((false, None)),
+                },
+                aired_at,
+            )
+            .await;
+        assert!(
+            !released,
+            "precondition: no stall action was raised, so no hold exists to release"
+        );
+        assert_eq!(
+            manager.last_aired_frame(qso_id),
+            Some(AiredFrame {
+                offset_hz: FREQ,
+                aired_at
+            }),
+            "the frame must be recorded as the QSO's newest aired frame even \
+             though it released no hold"
+        );
+    }
+
+    /// PAN-83: the record keeps the most recently REPORTED frame, in arrival
+    /// order — not the one with the newest `aired_at`. The TX worker reports
+    /// as frames play out, so arrival order is airing order; a test (or a
+    /// wall-clock follow-up to a simulated-clock PAN-182 release) may report
+    /// an earlier-stamped frame later, and that later report is the fresher
+    /// knowledge.
+    #[tokio::test]
+    async fn confirm_stall_trigger_aired_keeps_the_most_recently_reported_frame() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let later_aired_at = Utc::now();
+        let earlier_aired_at = later_aired_at - Duration::seconds(10);
+        let payload = UnsentAttemptPayload {
+            frequency_hz: FREQ,
+            remote_binding: Some((false, None)),
+        };
+        manager
+            .confirm_stall_trigger_aired(qso_id, "aired", &payload, later_aired_at)
+            .await;
+        manager
+            .confirm_stall_trigger_aired(qso_id, "aired", &payload, earlier_aired_at)
+            .await;
+        assert_eq!(
+            manager.last_aired_frame(qso_id),
+            Some(AiredFrame {
+                offset_hz: FREQ,
+                aired_at: earlier_aired_at
+            }),
+            "the second report wins by arrival order, whatever its aired_at"
+        );
+    }
+
+    /// PAN-83: the aired-frame record is frame history, not stall evidence —
+    /// a forward advance (which runs `clear_recorded_stall_increments`) must
+    /// not clear it, or the next relocation's crediting would fall back to
+    /// provenance with the evidence it needs already discarded.
+    #[tokio::test]
+    async fn a_forward_advance_keeps_the_aired_frame_record() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let aired_at = Utc::now();
+        manager
+            .confirm_stall_trigger_aired(
+                qso_id,
+                "aired",
+                &UnsentAttemptPayload {
+                    frequency_hz: FREQ,
+                    remote_binding: Some((false, None)),
+                },
+                aired_at,
+            )
+            .await;
+        send_report(&manager, -7, &format!("{OUR} {DX} -07")).await;
+        assert_eq!(
+            manager.last_aired_frame(qso_id),
+            Some(AiredFrame {
+                offset_hz: FREQ,
+                aired_at
+            }),
+            "a forward advance resets stall bookkeeping, not the aired-frame \
+             record"
+        );
+    }
+
+    /// PAN-83: the TX worker's report is only meaningful for an active QSO —
+    /// one that has been cancelled (or otherwise gone terminal) records
+    /// nothing, so a stale in-flight report cannot pin crediting for a QSO
+    /// that no longer exists.
+    #[tokio::test]
+    async fn an_inactive_qso_records_no_aired_frame() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        manager.cancel_qso(qso_id).await.unwrap();
+        manager
+            .confirm_stall_trigger_aired(
+                qso_id,
+                "aired",
+                &UnsentAttemptPayload {
+                    frequency_hz: FREQ,
+                    remote_binding: Some((false, None)),
+                },
+                Utc::now(),
+            )
+            .await;
+        assert_eq!(
+            manager.last_aired_frame(qso_id),
+            None,
+            "a report for an inactive QSO must not be recorded"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pan83_answered_frame_tests {
+    //! PAN-83: `answered_frame_offset_hz` — the pure window that decides
+    //! whether a QSO's newest aired frame is the one a reply answered, using
+    //! fixed, slot-aligned timestamps (2026-10-24 12:00:00 UTC is a slot
+    //! boundary on both the FT8 15 s and the FT4 7.5 s grid).
+    use super::*;
+    use chrono::TimeZone;
+
+    const SLOT_NS: i64 = 15_000_000_000;
+
+    fn slot_aligned_reply_slot() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 10, 24, 12, 0, 0).unwrap()
+    }
+
+    fn aired(offset_hz: f64, aired_at: DateTime<Utc>) -> Option<AiredFrame> {
+        Some(AiredFrame {
+            offset_hz,
+            aired_at,
+        })
+    }
+
+    fn reply_parity(reply_slot: DateTime<Utc>, slot_ns: i64) -> pancetta_core::slot::SlotParity {
+        pancetta_core::slot::SlotParity::of_with_period(reply_slot, slot_ns)
+    }
+
+    #[test]
+    fn answered_frame_is_the_one_aired_in_the_slot_before_the_reply() {
+        let reply_slot = slot_aligned_reply_slot();
+        assert_eq!(
+            answered_frame_offset_hz(
+                aired(1500.0, reply_slot - Duration::seconds(2)),
+                reply_slot + Duration::seconds(13),
+                Some(reply_parity(reply_slot, SLOT_NS)),
+                SLOT_NS
+            ),
+            Some(1500.0),
+            "a frame that finished airing just before the reply's slot began \
+             is the frame the reply answered"
+        );
+    }
+
+    #[test]
+    fn answered_frame_survives_the_decode_being_processed_after_the_reply_slot_ends() {
+        let reply_slot = slot_aligned_reply_slot();
+        assert_eq!(
+            answered_frame_offset_hz(
+                aired(1500.0, reply_slot - Duration::seconds(2)),
+                reply_slot + Duration::seconds(17),
+                Some(reply_parity(reply_slot, SLOT_NS)),
+                SLOT_NS
+            ),
+            Some(1500.0),
+            "a decode processed just after the reply's slot ended still \
+             anchors on that slot, so its answered frame still counts"
+        );
+    }
+
+    #[test]
+    fn a_late_started_frame_that_finishes_inside_the_reply_slot_still_counts() {
+        let reply_slot = slot_aligned_reply_slot();
+        assert_eq!(
+            answered_frame_offset_hz(
+                aired(1500.0, reply_slot + Duration::seconds(1)),
+                reply_slot + Duration::seconds(16),
+                Some(reply_parity(reply_slot, SLOT_NS)),
+                SLOT_NS
+            ),
+            Some(1500.0),
+            "`aired_at` is stamped after playback, so a late-started R-1 \
+             frame can report just after R began — it is still the answered \
+             frame"
+        );
+    }
+
+    #[test]
+    fn a_frame_from_an_earlier_own_slot_does_not_count() {
+        let reply_slot = slot_aligned_reply_slot();
+        assert_eq!(
+            answered_frame_offset_hz(
+                aired(1500.0, reply_slot - Duration::seconds(17)),
+                reply_slot + Duration::seconds(13),
+                Some(reply_parity(reply_slot, SLOT_NS)),
+                SLOT_NS
+            ),
+            None,
+            "a frame from two of our own slots before the reply is too old to \
+             be the answered one"
+        );
+    }
+
+    #[test]
+    fn our_next_frame_after_the_reply_does_not_count() {
+        let reply_slot = slot_aligned_reply_slot();
+        assert_eq!(
+            answered_frame_offset_hz(
+                aired(1500.0, reply_slot + Duration::seconds(28)),
+                reply_slot + Duration::seconds(29),
+                Some(reply_parity(reply_slot, SLOT_NS)),
+                SLOT_NS
+            ),
+            None,
+            "a frame that aired in the slot AFTER the reply answered nothing \
+             the DX could have decoded in time"
+        );
+    }
+
+    #[test]
+    fn no_slot_parity_means_no_answer() {
+        let reply_slot = slot_aligned_reply_slot();
+        assert_eq!(
+            answered_frame_offset_hz(
+                aired(1500.0, reply_slot - Duration::seconds(2)),
+                reply_slot + Duration::seconds(13),
+                None,
+                SLOT_NS
+            ),
+            None,
+            "without the decode's slot parity there is no reply slot R to \
+             anchor the window on — fall back to provenance"
+        );
+    }
+
+    #[test]
+    fn no_aired_record_means_no_answer() {
+        let reply_slot = slot_aligned_reply_slot();
+        assert_eq!(
+            answered_frame_offset_hz(
+                None,
+                reply_slot + Duration::seconds(13),
+                Some(reply_parity(reply_slot, SLOT_NS)),
+                SLOT_NS
+            ),
+            None,
+            "no recorded aired frame pins the answer — fall back to provenance"
+        );
+    }
+
+    #[test]
+    fn the_window_scales_with_the_active_slot_length() {
+        // FT4: 7.5 s slots. 12:00:00 is also on the 7.5 s grid.
+        const FT4_SLOT_NS: i64 = 7_500_000_000;
+        let reply_slot = slot_aligned_reply_slot();
+        let parity = reply_parity(reply_slot, FT4_SLOT_NS);
+        assert_eq!(
+            answered_frame_offset_hz(
+                aired(1500.0, reply_slot - Duration::seconds(1)),
+                reply_slot + Duration::seconds(6),
+                Some(parity),
+                FT4_SLOT_NS
+            ),
+            Some(1500.0),
+            "one FT4 slot before the reply's slot — inside the scaled window"
+        );
+        assert_eq!(
+            answered_frame_offset_hz(
+                aired(1500.0, reply_slot - Duration::seconds(8)),
+                reply_slot + Duration::seconds(6),
+                Some(parity),
+                FT4_SLOT_NS
+            ),
+            None,
+            "more than one FT4 slot before the reply — outside the scaled window"
+        );
     }
 }
 
