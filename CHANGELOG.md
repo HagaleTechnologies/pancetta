@@ -158,11 +158,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+<<<<<<< HEAD
 - Band Activity's own-TX rows and `tx-log.jsonl`'s `utc` now record when the
   audio output started playing each frame, including a mid-frame re-key,
   instead of when the TX worker queued its audio (PAN-71). When pancetta
   cannot confirm the start within 100 ms it keeps the old value and logs a
   warning.
+=======
+- Stale-band decodes are now rejected by the QSO, autonomous, and WSJT-X
+  relay receive paths (PAN-69, from the PAN-67/PR #336 review): a decode
+  whose audio window closed before a band switch completed its CPU-bound
+  decode work after the switch, and could then make the QSO path answer a
+  station on the rig's new band via `maybe_answer_caller`, feed the
+  autonomous decision cycle's `slot_messages`, or reach
+  GridTracker/JTAlert tagged to a wrong-band Status dial. All three
+  consumers now drop such decodes through one shared band-edge predicate
+  (the same `is_band_change` comparison the C9 band-change teardown uses,
+  fail-open on unknown dials — a CAT-less station behaves exactly as
+  before). Unifying the relay also fixes a false positive: intra-band
+  multi-MHz retunes (e.g. 28.5 → 29.5 MHz, both 10m) no longer drop
+  valid WSJT-X-relay decodes.
+>>>>>>> 0077c5b6d9ae9f547c5e24724d9f3ad8aec8e7a8
 
 - Retuning within a band no longer reports stations heard before the retune at
   the new dial's frequency (PAN-70). The decoder used to keep audio buffered
