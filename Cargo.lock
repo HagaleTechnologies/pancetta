@@ -3166,6 +3166,7 @@ version = "0.9.6"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "async-trait",
  "atomic",
  "axum",
  "base64 0.23.1",
@@ -3218,6 +3219,7 @@ dependencies = [
  "tracing-subscriber",
  "tracing-test",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

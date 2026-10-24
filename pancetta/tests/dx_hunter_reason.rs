@@ -25,8 +25,9 @@ async fn decode(app: &mut App, lookup: &CachedStationLookup, call: &str) {
         slot_parity: None,
         is_directed_at_us: false,
         worked_before: lookup.is_duplicate(call, 14_074_000.0),
-        needed: lookup.is_needed_dxcc(call),
-        atno: lookup.is_atno(call),
+        // PAN-93: display surfaces read the cqdx verdict, never the guess.
+        needed: lookup.display_needed_atno(call).0,
+        atno: lookup.display_needed_atno(call).1,
         band_needed: lookup.is_dxcc_needed_on_band(call, 14_074_000.0),
         priority_score: Some(explained.score.as_display_u32()),
         priority_factors: Some(explained.factors),
@@ -93,4 +94,42 @@ async fn working_a_station_lowers_its_score_and_says_so() {
     assert!(app.dx_stations["JA1ABC"].priority_score < 4000);
     let card = render(&mut app, false, 130, 6);
     assert!(card.contains("already worked on 20M"), "{card}");
+}
+
+#[tokio::test]
+async fn unloaded_cqdx_list_reads_unknown_then_needed_after_it_loads() {
+    // PAN-93: with no cqdx list, the station is not marked needed and the
+    // reason says the list did not load; once it loads, both agree.
+    let lookup = CachedStationLookup::new();
+    // Germany already worked on 20M, so DA1ABC's headline is the needed
+    // entity, not "new entity on 20M".
+    lookup.record_worked("DL1XYZ", "20M");
+    let mut app = App::new(Config::default(), None).await.unwrap();
+    decode(&mut app, &lookup, "DA1ABC").await;
+    app.refresh_dx_need(Some(&lookup));
+    assert!(!app.dx_stations["DA1ABC"].needed); // no "+" while unknown
+    let card = render(&mut app, false, 130, 6);
+    assert!(
+        card.contains("maybe needed entity (cqdx list not loaded)"),
+        "{card}"
+    );
+    let overlay = render(&mut app, true, 120, 30);
+    assert!(
+        overlay.lines().any(|l| l.contains("needed entity")
+            && l.contains("unknown")
+            && l.contains("cqdx list not loaded")),
+        "{overlay}"
+    );
+
+    lookup.update_needed_dxcc(std::collections::HashSet::from(["DA".to_owned()]));
+    decode(&mut app, &lookup, "DA1ABC").await;
+    app.refresh_dx_need(Some(&lookup));
+    assert!(app.dx_stations["DA1ABC"].needed);
+    let overlay = render(&mut app, true, 120, 30);
+    assert!(
+        overlay.lines().any(|l| l.contains("needed entity")
+            && l.contains("yes")
+            && l.contains("cqdx needed list, all bands")),
+        "{overlay}"
+    );
 }

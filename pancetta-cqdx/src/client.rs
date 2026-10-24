@@ -203,14 +203,13 @@ impl CqdxClient {
     /// GET `/api/v1/entities/needed-grids` → `{"grids": ["JD15", "FN42", ...]}`.
     /// Returns the grid fields as-is (caller normalizes to the 4-char field).
     ///
-    /// Graceful degradation: this endpoint is a roadmap item and may not be
-    /// live on the cqdx.io server yet. A `404 Not Found` (endpoint absent) is
-    /// treated as "no needed-grids data" and returns an empty Vec rather than
-    /// an error — mirroring the "empty set = inert" contract of the
-    /// `needed_grids` priority set, so the rest of startup is unaffected.
-    /// Other failures (auth, 5xx, transport) still propagate as errors so the
-    /// caller can log them; the caller leaves the set empty on any error.
-    pub async fn fetch_needed_grids(&self) -> Result<Vec<String>> {
+    /// PAN-93: three outcomes stay distinct. `Ok(Some(vec![]))` means cqdx
+    /// answered "no grids needed". `Ok(None)` means the endpoint answered
+    /// `404 Not Found`: this roadmap endpoint is not offered by the server
+    /// yet, so the needed-grid status is unknown, not empty. Other failures
+    /// (auth, 5xx, transport) propagate as errors so the caller can record
+    /// the list as unavailable and retry.
+    pub async fn fetch_needed_grids(&self) -> Result<Option<Vec<String>>> {
         let url = format!("{}/api/v1/entities/needed-grids", self.base_url);
         debug!("Fetching needed grids from {}", url);
         let resp = self
@@ -219,14 +218,14 @@ impl CqdxClient {
             .bearer_auth(self.token.expose_secret())
             .send()
             .await?;
-        // Endpoint may not exist yet — treat 404 as "no data" rather than an error.
+        // Endpoint may not exist yet — a 404 means "not offered", not "none needed".
         if resp.status().as_u16() == 404 {
-            debug!("needed-grids endpoint not available (404); leaving grid set empty");
-            return Ok(Vec::new());
+            debug!("needed-grids endpoint not available (404); grid needs not offered");
+            return Ok(None);
         }
         let resp = self.check_status(resp).await?;
         let body: NeededGridsResponse = self.checked_json(resp).await?;
-        Ok(body.grids)
+        Ok(Some(body.grids))
     }
 
     /// Fetch live spot groups from the cqdx.io Durable Object snapshot.
@@ -259,7 +258,7 @@ impl CqdxClient {
 
     /// Fetch this operator's live authorization edges (dispensa Q-0043 —
     /// feeds pancetta's station-agent `tx_allow_list` auto-populate). Unlike
-    /// `fetch_needed_grids`, a 404 is NOT treated as "empty is fine" — it
+    /// `fetch_needed_grids`, a 404 is NOT treated as "not offered" — it
     /// propagates as a genuine error via `check_status`, since an
     /// accidentally-empty allow-list here would revoke every connected
     /// client rather than being a harmless missing-feature default.
@@ -655,15 +654,21 @@ mod tests {
 
         let client = test_client(&server.uri());
         let grids = client.fetch_needed_grids().await.unwrap();
-        assert_eq!(grids.len(), 3);
-        assert_eq!(grids[0], "JD15");
-        assert!(grids.contains(&"PM95".to_string()));
+        assert_eq!(
+            grids,
+            Some(vec![
+                "JD15".to_string(),
+                "FN42".to_string(),
+                "PM95".to_string()
+            ])
+        );
     }
 
     #[tokio::test]
     async fn test_fetch_needed_grids_404_graceful() {
         // The needed-grids endpoint is a roadmap item; a server that hasn't
-        // shipped it yet returns 404. We degrade to an empty Vec, not an error.
+        // shipped it yet returns 404. PAN-93: that is "not offered" (None),
+        // not an error and not an empty "no grids needed" answer.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/entities/needed-grids"))
@@ -673,7 +678,24 @@ mod tests {
 
         let client = test_client(&server.uri());
         let grids = client.fetch_needed_grids().await.unwrap();
-        assert!(grids.is_empty());
+        assert_eq!(grids, None);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_needed_grids_empty_is_some_empty() {
+        // PAN-93: a successful empty answer means "no grids needed".
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/entities/needed-grids"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "grids": [] })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let grids = client.fetch_needed_grids().await.unwrap();
+        assert_eq!(grids, Some(vec![]));
     }
 
     #[tokio::test]
@@ -826,7 +848,7 @@ mod tests {
         assert!(edges.is_empty());
     }
 
-    /// A 404 is a genuine error here, NOT treated as "empty is fine" the way
+    /// A 404 is a genuine error here, NOT treated as "not offered" the way
     /// `fetch_needed_grids` treats a missing endpoint — see this file's
     /// Global Constraints note on why that distinction matters for an
     /// allow-list-feeding endpoint.

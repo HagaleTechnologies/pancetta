@@ -365,9 +365,34 @@ loop stores the rig's current reading every tick, so it can revert a requested v
 command still sits in the queue. A key-time check in either window gates on a frequency the rig is
 not keyed on: FIFO order applies the queued command before the later `SetPtt`, and the
 pending/in-flight mute covers a command only once the Hamlib loop is applying it (or while it waits
-in a restart pending slot). Closing this needs a confirmed-RF source (the rig's split is never read
-back) or in-flight marking from the requested-value store through CAT application. That producer
-ordering predates PAN-118 and is follow-up scope.
+in a restart pending slot). PAN-209 subsequently moved split recording after confirmed channel
+acceptance; its accepted enqueue/store windows are documented in `remote-operation.md`.
+PAN-206 closes the rig-side split readback gap: every successful 500 ms Connected poll tick reads
+split with rigctld `s` and, when enabled, the TX frequency with `i`. It reconciles
+`split_tx_frequency_hz` and echoes `SplitStatus` to the existing TUI chip and remote display feed.
+`start_hamlib_component` (boot, supervisor restart, live rig-config reconnect) also runs one
+reconciliation after a successful startup connect and before it publishes command-loop readiness.
+When that read succeeds, a split already set at the radio is in the gate before the first poll
+tick. A failed startup connect, an unobservable or skipped read, and the poll loop's own redial
+leave the split to the next successful poll tick.
+The poll skips commands in flight and discards a read if the shared split changed during it.
+PAN-206 also gives `forward_split_change` a shared observation guard that lives through enqueue,
+recording, CAT application, and pending retries. The message carries a cloned owner, so polling
+cannot erase an accepted command while it is still queued. A revision invalidates reads that
+span a completed command, including repeated commands for the same frequency. Only split-command
+creation and poll publication take this short lock; PTT enqueue stays lock-free.
+Unsupported split readback is best-effort and does not count toward CAT `PollingFailed`: a read
+that fails while the link stays Connected preserves the previous split and logs once per
+unavailable episode, re-arming after recovery. A split read that drops the link (timeout, EOF,
+incomplete `s` reply) fails that poll tick, so a link that answers the frequency read but loses
+every split read still reaches `PollingFailed` and the TX hard mute. If the startup reconciliation
+itself drops the link, startup marks the link `PollingFailed` before publishing readiness, and the
+poll loop's first successful poll clears it as a normal recovery.
+Zero or malformed TX-frequency responses never clear a known split. Both `s` response lines are
+consumed under one connection lock so concurrent CAT traffic cannot consume half a reply.
+The gate still uses sampled state, not confirmed RF at key-time. FTdx10 confirmation of the read
+verbs remains an operator follow-up; no on-air validation was possible in the implementation
+container.
 
 **PAN-208: the occupied interval must fit inside one allowed range.** The gate first checked the
 low and high edges as two independent point queries. Point membership is OR across a

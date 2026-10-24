@@ -1190,6 +1190,7 @@ impl Sim {
                     confidence: None,
                     time_offset_s: None,
                     decode_origin: None,
+                    captured_dial_hz: None,
                 }
             })
             .collect();

@@ -310,7 +310,8 @@ fn create_dx_row<'a>(
     // (never worked on ANY band) already implies band-needed and a second
     // marker would be redundant noise. 2026-07-18, DX Hunter
     // per-band-needed gap.
-    let call_display = format_call_display(station, is_engaged);
+    let (needed, atno) = app.dx_need_flags_shown(&station.call_sign, station.needed, station.atno);
+    let call_display = format_call_display(station, atno, needed, is_engaged);
 
     // Staleness check for network-only spots
     let is_stale = if station.source != SpotSource::Local {
@@ -331,7 +332,7 @@ fn create_dx_row<'a>(
         Style::default()
             .fg(app.theme.selected_color())
             .add_modifier(Modifier::BOLD)
-    } else if station.atno {
+    } else if atno {
         // ATNO — the highest-value catch. Bold magenta + underline so it
         // stands apart from merely-notable (bold magenta) rows.
         Style::default()
@@ -343,7 +344,7 @@ fn create_dx_row<'a>(
             .add_modifier(Modifier::BOLD)
     } else if station.worked_before {
         Style::default().fg(app.theme.muted_color())
-    } else if station.needed {
+    } else if needed {
         // Needed DXCC (band-fill, not ATNO): bold accent.
         Style::default()
             .fg(app.theme.error_color())
@@ -518,11 +519,11 @@ fn create_dx_row<'a>(
 /// triangle, DX-watchlist diamond (#197), engaged dot, then the callsign.
 /// Factored out of `create_dx_row` so the glyph logic is unit-testable
 /// without a full ratatui `Row`.
-fn format_call_display(station: &DxStation, is_engaged: bool) -> String {
+fn format_call_display(station: &DxStation, atno: bool, needed: bool, is_engaged: bool) -> String {
     format!(
         "{}{}{}{}{}",
-        need_marker(station.atno, station.needed, station.is_notable),
-        if station.band_needed && !station.atno {
+        need_marker(atno, needed, station.is_notable),
+        if station.band_needed && !atno {
             "▲"
         } else {
             ""
@@ -652,6 +653,7 @@ mod tests {
             grid_needed: needed,
             state: Some("AR".into()),
             state_needed: needed,
+            ..Default::default()
         })));
     }
 
@@ -793,6 +795,7 @@ mod tests {
                 grid_needed: Some(true),
                 state: state.map(str::to_string),
                 state_needed: Some(true),
+                ..Default::default()
             })));
             let buf = render_buffer(&app, 100, 8);
             let output = text(&buf);
@@ -995,6 +998,42 @@ mod tests {
         assert_eq!(format_dx_snr(&SpotSource::Both, 12, Some(12)), "+12");
     }
 
+    #[tokio::test]
+    async fn needed_marker_follows_this_frames_cqdx_verdict() {
+        // PAN-93: a row stored before cqdx answered gains `+` once the list
+        // loads, and loses `+`/`!` once the list says not needed, without
+        // waiting for another decode. No verdict leaves the stored flags.
+        let mut app = App::new(crate::Config::default(), None).await.unwrap();
+        // (needed, atno) stored at decode time, verdict, expected marker.
+        for (needed, atno, verdict, marker) in [
+            (false, false, Some(true), "+"),
+            (true, false, Some(false), ""),
+            (true, true, Some(false), ""),
+            (true, true, Some(true), "!"),
+            (true, false, None, "+"),
+            (false, false, None, ""),
+        ] {
+            let mut station = make_test_station("JA1ABC");
+            station.needed = needed;
+            station.atno = atno;
+            app.dx_stations.insert(station.call_sign.clone(), station);
+            app.refresh_dx_need(Some(&Need(crate::dx_need::DxNeedStatus {
+                dxcc_needed: verdict,
+                ..Default::default()
+            })));
+            let output = text(&render_buffer(&app, 100, 8));
+            let shown = ["!", "+"]
+                .into_iter()
+                .find(|m| output.contains(&format!("{m}JA1ABC")))
+                .unwrap_or("");
+            assert!(output.contains("JA1ABC"), "{output}");
+            assert_eq!(
+                shown, marker,
+                "needed={needed} atno={atno} verdict={verdict:?}: {output}"
+            );
+        }
+    }
+
     #[test]
     fn need_marker_priority_and_stacking() {
         // Plain station — no marker.
@@ -1017,7 +1056,7 @@ mod tests {
         // need_marker's existing signature/tests untouched).
         let mut station = make_test_station("JA1ABC");
         station.watchlisted = true;
-        let call_display = format_call_display(&station, false);
+        let call_display = format_call_display(&station, station.atno, station.needed, false);
         assert!(
             call_display.contains('◇'),
             "expected watchlist glyph in {call_display}"
@@ -1027,7 +1066,7 @@ mod tests {
     #[test]
     fn watchlist_glyph_absent_when_not_watchlisted() {
         let station = make_test_station("W1XYZ");
-        let call_display = format_call_display(&station, false);
+        let call_display = format_call_display(&station, station.atno, station.needed, false);
         assert!(!call_display.contains('◇'));
     }
 

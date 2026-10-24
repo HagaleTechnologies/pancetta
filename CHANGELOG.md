@@ -165,6 +165,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer counts as a failed CQ before the replacement airs; it now settles
   once, on what actually aired.
 
+- Autonomous cqdx.io spot reports now carry the frequency of the band the
+  decode was actually heard on when the station changes bands between a decode
+  and its slot-tick report (PAN-68) — the same captured-dial fix PAN-67 applied
+  to the TUI and PSKReporter. Each accumulated decode remembers the dial its
+  own audio window was captured on, so a band switch (by the operator or the
+  autonomous band-hopper) between the decode and the report no longer
+  publishes the spot under the new band's frequency.
+
+- The TX band-plan gate now sees split enabled at the radio's front panel or by
+  another CAT client (PAN-206). The Hamlib poll loop reads split every 500 ms
+  and refuses QSO TX and manual PTT outside the configured band plan. Rigs
+  that cannot report split keep the previous behavior and log once per outage.
+
+- DX Hunter no longer marks stations needed when cqdx.io's needed list never
+  loaded. A failed cqdx.io start used to give every station outside your home
+  and logged prefixes a `+` and the reason "needed entity (cqdx list)", and an
+  empty answer from cqdx.io ("nothing needed") did the same. Now `+` appears
+  only for entities on a loaded list, and an empty answer means nothing is
+  needed. While the list is not loaded, the Why text reads "maybe needed
+  entity (cqdx list not loaded)", and a row scored before the list changed
+  reads "maybe needed entity (cqdx list changed)". While a configured cqdx.io
+  has not delivered its list, the readiness strip shows `⚠ CQDX NEEDS UNKNOWN`
+  (or `⚠ CQDX GRID NEEDS UNKNOWN` for the needed-grid list). After a failed
+  start pancetta now retries in the background instead of leaving cqdx.io off
+  until restart; a token problem still needs a fix and a restart. A
+  needed-grids 404 is recorded as not offered, not as "no grids needed".
+  Autonomous ranking during an outage is unchanged, and remote clients see
+  `needed` as false while the list is unknown (PAN-93).
+
+- Contest QSOs no longer stamp ADIF's `CONTEST_ID` field with pancetta's
+  internal profile slug (PAN-52). `CONTEST_ID` is now written from the engaged
+  contest profile's `adif_contest_id`, which must be a value from the ADIF
+  3.1.5 Contest_ID enumeration (e.g. `KS-QSO-PARTY`, `WFD`, `NAQP-CW`). The
+  built-in `us-state-qso-party` profile models the whole family of US state
+  QSO parties, for which no single valid ADIF id exists, so those QSOs log
+  with no `CONTEST_ID` at all — an absent field is legal, unambiguous ADIF,
+  unlike a slug no logbook service can interpret. Third-party ADIF imports
+  still re-export their original `CONTEST_ID` verbatim. Nothing calls
+  `engage_contest_profile` in production yet, so no previously exported ADIF
+  file is affected.
+
 - A keep-call frame that never airs now gives back its own call, stall count
   and `Sent` timeline entry even when you resent the same message for that QSO
   after it was queued (PAN-183). The TX worker used to hand back the newest

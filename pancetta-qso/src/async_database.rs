@@ -2139,9 +2139,9 @@ mod tests {
 
     /// PR #451 review (Codex P2): standard ADIF fields the index has no column
     /// or metadata field for (OPERATOR, TX_PWR, COUNTRY, DXCC, CQZ, ITUZ,
-    /// NOTES, the serial strings, serials with no CONTEST_ID, a TIME_OFF
-    /// with no QSO_DATE_OFF, a CW report, the BAND of a record with no FREQ,
-    /// the MODE behind a SUBMODE) survive import → index → export.
+    /// NOTES, the serial strings, a third-party CONTEST_ID with serials, a
+    /// TIME_OFF with no QSO_DATE_OFF, a CW report, the BAND of a record with
+    /// no FREQ, the MODE behind a SUBMODE) survive import → index → export.
     #[tokio::test]
     async fn imported_standard_fields_survive_index_and_export() {
         let adif = "<CALL:5>W1ABC <QSO_DATE:8>20250101 <TIME_ON:6>120000 <MODE:4>MFSK \
@@ -2149,6 +2149,7 @@ mod tests {
                     <COUNTRY:13>United States <DXCC:3>291 <CQZ:1>5 <ITUZ:1>8 \
                     <NOTES:13>first contact <STX_STRING:3>001 <SRX_STRING:5>123AB \
                     <RST_SENT:3>599 <RST_RCVD:3>5NN <STX:2>17 <SRX:3>342 \
+                    <CONTEST_ID:12>KS-QSO-PARTY \
                     <TIME_OFF:6>120130 <COMMENT:15>Worked portable <EOR>\n";
         let processor = AdifProcessor::new();
         let file = processor.parse_string(adif).unwrap();
@@ -2189,6 +2190,10 @@ mod tests {
             ("RST_RCVD", "5NN"),
             ("STX", "17"),
             ("SRX", "342"),
+            // PAN-52: a third-party CONTEST_ID (an ADIF-enumeration value
+            // here, but any verbatim string must round-trip) re-exports
+            // byte-identically through the index.
+            ("CONTEST_ID", "KS-QSO-PARTY"),
             ("TIME_OFF", "120130"),
             // A third-party comment exports as read, with no Pancetta
             // attribution appended.
@@ -2201,6 +2206,56 @@ mod tests {
             );
         }
         db.close().await;
+    }
+
+    /// PR #502 review (Codex P1): a row imported before PAN-52 holds its
+    /// file's `CONTEST_ID` only in `contest_name` — its persisted
+    /// `ContestInfo` has no `adif_contest_id` key. Upgrading must not drop
+    /// that `CONTEST_ID` from the startup DB→ADIF migration's export.
+    #[tokio::test]
+    async fn pre_pan52_imported_contest_id_survives_export() {
+        // The second id collides with a built-in profile slug; an imported
+        // value is still preserved verbatim (PR #502 review, Codex P2).
+        for imported in ["KS-QSO-PARTY", "us-state-qso-party"] {
+            let adif = format!(
+                "<CALL:5>W1ABC <QSO_DATE:8>20250101 <TIME_ON:6>120000 <MODE:3>FT8 \
+                 <BAND:3>40M <CONTEST_ID:{}>{imported} <EOR>\n",
+                imported.len()
+            );
+            let processor = AdifProcessor::new();
+            let file = processor.parse_string(&adif).unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let db = QsoDatabase::open(tmp.path().join("qso.db")).await.unwrap();
+            db.insert_adif_records(&processor, &file.records)
+                .await
+                .unwrap();
+            // Rewrite the row to its pre-PAN-52 shape: no `adif_contest_id` key.
+            sqlx::query(
+                "UPDATE qsos SET progress_data = \
+                 json_remove(progress_data, '$.metadata.contest_info.adif_contest_id')",
+            )
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            let (key_type, contest_name): (Option<String>, String) = sqlx::query_as(
+                "SELECT json_type(progress_data, '$.metadata.contest_info.adif_contest_id'), \
+                 json_extract(progress_data, '$.metadata.contest_info.contest_name') FROM qsos",
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            assert_eq!((key_type, contest_name.as_str()), (None, imported));
+
+            let exported_path = tmp.path().join("qsos.adi");
+            db.export_to_adif(&exported_path).await.unwrap();
+            let exported = std::fs::read_to_string(&exported_path).unwrap();
+            let field = format!("<CONTEST_ID:{}>{imported}", imported.len());
+            assert!(
+                exported.contains(&field),
+                "a pre-PAN-52 imported row lost its CONTEST_ID on export: {exported}"
+            );
+            db.close().await;
+        }
     }
 
     /// PR #451 review (Codex P2): an imported (or replayed) row lands in its

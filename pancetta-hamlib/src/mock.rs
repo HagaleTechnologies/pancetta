@@ -3,6 +3,7 @@
 //! This module provides a complete mock implementation of a transceiver
 //! that simulates realistic behavior without requiring actual hardware.
 
+use crate::error::HamlibError;
 use crate::models::{Band, Mode, RigCapabilities, Vfo};
 use crate::rig::{ConnectionState, PttState, RigControl, RigStatus};
 use anyhow::{anyhow, Result};
@@ -33,6 +34,8 @@ pub struct MockRigConfig {
     pub base_swr: f32,
     /// Supported frequency range
     pub frequency_range: (u64, u64),
+    /// Whether the rig can report its split state.
+    pub split_read_supported: bool,
     /// Memory channel count
     pub memory_channels: u32,
 }
@@ -49,6 +52,7 @@ impl Default for MockRigConfig {
             base_swr: 1.2,
             frequency_range: (1_800_000, 450_000_000),
             memory_channels: 100,
+            split_read_supported: true,
         }
     }
 }
@@ -79,6 +83,8 @@ struct MockRigState {
     scanning: bool,
     /// Split mode enabled.
     split_enabled: bool,
+    /// VFO selected for split transmission.
+    split_tx_vfo: Vfo,
     /// Split TX-VFO frequency in Hz (meaningful only when `split_enabled`).
     split_tx_freq: u64,
     /// Last operation time
@@ -114,6 +120,7 @@ impl Default for MockRigState {
             antenna: 1,
             scanning: false,
             split_enabled: false,
+            split_tx_vfo: Vfo::B,
             split_tx_freq: 0,
             last_operation: Instant::now(),
         }
@@ -453,15 +460,31 @@ impl RigControl for MockRig {
     }
 
     #[instrument(skip(self))]
-    async fn set_split(&self, enabled: bool, _tx_vfo: Vfo) -> Result<()> {
+    async fn set_split(&self, enabled: bool, tx_vfo: Vfo) -> Result<()> {
         self.simulate_delay().await;
         {
             let mut state = self.state.write();
             state.split_enabled = enabled;
+            state.split_tx_vfo = tx_vfo;
         }
         self.update_operation_time();
         debug!("Mock rig set split: {}", enabled);
         Ok(())
+    }
+
+    async fn get_split(&self) -> Result<(bool, Vfo)> {
+        if !self.config.split_read_supported {
+            return Err(HamlibError::not_supported("get_split", None, None).into());
+        }
+        let state = self.state.read();
+        Ok((state.split_enabled, state.split_tx_vfo))
+    }
+
+    async fn get_split_freq(&self) -> Result<u64> {
+        if !self.config.split_read_supported {
+            return Err(HamlibError::not_supported("get_split_freq", None, None).into());
+        }
+        Ok(self.state.read().split_tx_freq)
     }
 
     #[instrument(skip(self))]
@@ -1115,5 +1138,57 @@ mod tests {
         // Reset count
         rig.reset_operation_count();
         assert_eq!(rig.get_operation_count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod split_read_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_mock_rig_split_roundtrip() {
+        let rig = MockRig::default();
+        rig.set_split(true, Vfo::B).await.unwrap();
+        rig.set_split_freq(15_000_000).await.unwrap();
+        assert_eq!(rig.get_split().await.unwrap(), (true, Vfo::B));
+        assert_eq!(rig.get_split_freq().await.unwrap(), 15_000_000);
+        rig.set_split(false, Vfo::A).await.unwrap();
+        assert_eq!(rig.get_split().await.unwrap(), (false, Vfo::A));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_mock_rig_split_read_unsupported() {
+        let rig = MockRig::new(MockRigConfig {
+            split_read_supported: false,
+            ..Default::default()
+        });
+        assert!(rig
+            .get_split()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Feature not supported"));
+        assert!(rig
+            .get_split_freq()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Feature not supported"));
+        rig.set_split(true, Vfo::B).await.unwrap();
+        rig.set_split_freq(15_000_000).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn simulate_rig_side_split_changes_reported_state_without_set_split() {
+        let rig = MockRig::default();
+        let before = rig.get_operation_count();
+        {
+            let mut state = rig.state.write();
+            state.split_enabled = true;
+            state.split_tx_freq = 15_000_000;
+        }
+        assert_eq!(rig.get_split().await.unwrap(), (true, Vfo::B));
+        assert_eq!(rig.get_split_freq().await.unwrap(), 15_000_000);
+        assert_eq!(rig.get_operation_count(), before);
     }
 }

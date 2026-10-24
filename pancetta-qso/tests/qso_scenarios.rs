@@ -266,6 +266,7 @@ async fn scenario_08_dx_busy_with_third_party_autonomous() {
             confidence: None,
             time_offset_s: None,
             decode_origin: None,
+            captured_dial_hz: None,
         }],
         &NullDxEvaluator,
         busy_now,

@@ -163,9 +163,10 @@ pub struct DecodedMessageView {
     /// Defaults to `false` in test fixtures and legacy paths.
     #[serde(default)]
     pub worked_before: bool,
-    /// `true` if this station's DXCC entity is still needed (from cqdx.io's
-    /// needed set, via the same `CachedStationLookup` the scorer uses).
-    /// Inert (always false) when cqdx is unconfigured. Test-default false.
+    /// `true` only when the station's cqdx.io needed list has loaded and
+    /// names this entity (via the same `CachedStationLookup` the scorer
+    /// uses); false when not needed or unknown, including when cqdx is
+    /// unconfigured (PAN-93). Test-default false.
     #[serde(default)]
     pub needed: bool,
     /// `true` if the entity is an ATNO (all-time new one — never worked on
@@ -464,7 +465,11 @@ pub struct DxStation {
     pub distance: Option<f64>,
     pub bearing: Option<f64>,
     pub worked_before: bool,
-    /// DXCC entity still needed (cqdx needed set). Inert when cqdx is off.
+    /// True only when the station's cqdx.io needed list has loaded and
+    /// names this entity; false when not needed or unknown (PAN-93). Drives
+    /// the `+` marker and station card flag, and also feeds the TUI's
+    /// network-spot rescoring, which only runs while the list is loaded
+    /// (cqdx spots wait for it).
     pub needed: bool,
     /// Entity is an ATNO (all-time new one). Subset of `needed`.
     pub atno: bool,
@@ -2742,6 +2747,20 @@ impl App {
     /// The exact DX-row key, including its original case/hash rendering.
     pub fn dx_need_for(&self, key: &str) -> Option<&crate::dx_need::DxNeedStatus> {
         self.dx_need.get(key)
+    }
+
+    /// PAN-93: `(needed, atno)` as the row at `key` shows them (`+`/`!`, the
+    /// station card's `needed`/`ATNO★`). This frame's cqdx verdict, when there
+    /// is one, wins over the flags stored at decode or spot time, so both
+    /// follow a list that loads or changes between decodes, as the Why view
+    /// does. ATNO is a subset of needed, so a "not needed" verdict clears it
+    /// too; a newly needed ATNO waits for the next decode. With no verdict
+    /// for the row, the stored flags stand.
+    pub fn dx_need_flags_shown(&self, key: &str, needed: bool, atno: bool) -> (bool, bool) {
+        match self.dx_need_for(key).and_then(|need| need.dxcc_needed) {
+            Some(listed) => (listed, atno && listed),
+            None => (needed, atno),
+        }
     }
 
     /// Called when the radio reports its actual frequency (via hamlib/rigctld).
@@ -5498,6 +5517,7 @@ mod tests {
                 grid_needed: grid.map(|_| !worked || hz != 14_074_000.0),
                 state: state.map(str::to_string),
                 state_needed: state.map(|_| !worked),
+                ..Default::default()
             }
         }
     }

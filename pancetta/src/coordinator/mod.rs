@@ -635,8 +635,12 @@ pub(crate) async fn forward_split_change(
     enabled: bool,
     tx_frequency: u64,
 ) -> u64 {
+    // PAN-206: retain this owner through enqueue + record, and a second
+    // owner on the message through CAT application / pending retries. Polling
+    // must not replace a requested split with the rig's not-yet-applied state.
+    let observation_guard = bus.split_observation_fence.begin_command();
     let make = || {
-        ComponentMessage::new(
+        let mut message = ComponentMessage::new(
             source,
             ComponentId::Hamlib,
             MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
@@ -644,7 +648,9 @@ pub(crate) async fn forward_split_change(
                 tx_frequency,
             }),
             Instant::now(),
-        )
+        );
+        message.split_observation_guard = Some(observation_guard.clone());
+        message
     };
     match bus
         .send_message_retrying(make, &tx::SAFETY_SEND_RETRY_DELAYS)
@@ -2531,30 +2537,33 @@ impl ApplicationCoordinator {
             .map(|b| b.with_operating_frequency(self.operating_frequency_hz.clone()))
             {
                 drop(config);
+                // PAN-93: the bridge registers and its poller runs whether or
+                // not this first attempt succeeds. Whatever did not load is
+                // marked unavailable on the lookup (readiness strip) and the
+                // poller retries it; spot polling waits for the needed list.
+                let bridge = std::sync::Arc::new(bridge);
                 match bridge.startup().await {
-                    Ok(()) => {
-                        info!("cqdx.io integration initialized");
-                        let poller_handle = bridge.spawn_spot_poller(
-                            self.shutdown_signal.clone(),
-                            self.last_decode_timestamp.clone(),
-                            None,
-                            None, // TUI tx — set up later in pipeline if available
-                        );
-                        // Wrap the JoinHandle<()> into JoinHandle<Result<()>> for named_task_handles
-                        let wrapped = tokio::spawn(async move {
-                            poller_handle
-                                .await
-                                .map_err(|e| anyhow::anyhow!("cqdx poller join error: {}", e))?;
-                            Ok(())
-                        });
-                        self.named_task_handles
-                            .push((ComponentId::DxCluster, wrapped));
-                        self.cqdx_bridge = Some(std::sync::Arc::new(bridge));
-                    }
-                    Err(e) => {
-                        warn!("cqdx.io startup failed, running in degraded mode: {}", e);
-                    }
+                    Ok(()) => info!("cqdx.io integration initialized"),
+                    Err(e) => warn!(
+                        "cqdx.io startup incomplete ({e}); needed lists unavailable, retrying in the background"
+                    ),
                 }
+                let poller_handle = bridge.spawn_spot_poller(
+                    self.shutdown_signal.clone(),
+                    self.last_decode_timestamp.clone(),
+                    None,
+                    None, // TUI tx — set up later in pipeline if available
+                );
+                // Wrap the JoinHandle<()> into JoinHandle<Result<()>> for named_task_handles
+                let wrapped = tokio::spawn(async move {
+                    poller_handle
+                        .await
+                        .map_err(|e| anyhow::anyhow!("cqdx poller join error: {}", e))?;
+                    Ok(())
+                });
+                self.named_task_handles
+                    .push((ComponentId::DxCluster, wrapped));
+                self.cqdx_bridge = Some(bridge);
             } else {
                 drop(config);
                 info!("cqdx.io integration not configured, running in degraded mode");
@@ -5088,7 +5097,7 @@ pub(crate) mod audit_test_util {
                 std::process::id()
             ));
             let siblings: Vec<PathBuf> = (1..=4)
-                .map(|slot| p.with_extension(&format!("log.{slot}")))
+                .map(|slot| p.with_extension(format!("log.{slot}")))
                 .collect();
             std::fs::write(&p, "stale line\n").unwrap();
             for s in &siblings {

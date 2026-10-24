@@ -21,6 +21,7 @@ pub struct DxRow {
     pub distance_km: Option<f64>,
     pub bearing: Option<f64>,
     pub worked_before: bool,
+    /// True only when the station's cqdx.io needed list has loaded and names this entity; false when not needed or unknown.
     pub needed: bool,
     pub atno: bool,
     pub priority: u32,
@@ -123,6 +124,7 @@ pub struct DecodedView {
     pub slot_parity: Option<SlotParity>,
     pub is_directed_at_us: bool,
     pub worked_before: bool,
+    /// True only when the station's cqdx.io needed list has loaded and names this entity; false when not needed or unknown.
     pub needed: bool,
     pub atno: bool,
     pub priority_score: Option<u32>,

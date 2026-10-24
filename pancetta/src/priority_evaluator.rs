@@ -3,6 +3,7 @@
 //! Bridges `pancetta_qso::PriorityScorer` with the QSO database for
 //! duplicate checking and DXCC need lookups.
 
+use chrono::{DateTime, Utc};
 use pancetta_qso::priority::WorkedStationLookup;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
@@ -101,6 +102,68 @@ pub fn default_excluded_dxcc_prefixes(
     out
 }
 
+/// PAN-93: one needed verdict. `Unknown` when its cqdx list has not loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NeedStatus {
+    Needed,
+    NotNeeded,
+    Unknown,
+}
+
+/// PAN-93: whether a cqdx.io needed list has answered this session, kept
+/// apart from the list so "nothing is needed" and "no answer" differ.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum NeedListAvailability {
+    /// `[network.cqdx]` is off. The default for a fresh lookup.
+    #[default]
+    NotConfigured,
+    /// The client is built; the first fetch has not finished.
+    Loading,
+    /// cqdx.io does not offer this list yet (needed-grids answers 404).
+    NotOffered,
+    /// cqdx.io answered. `band` is the per-band scope, `None` for all bands.
+    Loaded {
+        fetched_at: DateTime<Utc>,
+        band: Option<String>,
+    },
+    /// No answer this session. `retrying` is false when only a config fix
+    /// and restart can help.
+    Unavailable {
+        since: DateTime<Utc>,
+        error: String,
+        retrying: bool,
+    },
+}
+
+/// PAN-93: a cqdx.io needed list and its availability under one lock, so a
+/// reader never sees a new list with an old availability.
+#[derive(Debug, Default)]
+struct NeedList {
+    entries: HashSet<String>,
+    availability: NeedListAvailability,
+}
+
+impl NeedList {
+    fn is_loaded(&self) -> bool {
+        matches!(self.availability, NeedListAvailability::Loaded { .. })
+    }
+
+    /// No-op once loaded: a failed refresh keeps the last answer (D7).
+    /// Keeps `since` from an earlier failure so the outage start survives.
+    fn mark_failed(&mut self, error: &str, retrying: bool) {
+        let since = match &self.availability {
+            NeedListAvailability::Loaded { .. } => return,
+            NeedListAvailability::Unavailable { since, .. } => *since,
+            _ => Utc::now(),
+        };
+        self.availability = NeedListAvailability::Unavailable {
+            since,
+            error: error.to_string(),
+            retrying,
+        };
+    }
+}
+
 /// Cached station lookup that holds a snapshot of worked stations.
 ///
 /// Refreshed periodically by the coordinator. The `PriorityScorer` calls
@@ -124,14 +187,18 @@ pub struct CachedStationLookup {
     worked_grids_on_band: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     /// Callsigns where a recent QSO attempt failed.
     recent_failures: Arc<RwLock<HashSet<String>>>,
-    /// DXCC entities still needed.
-    needed_dxcc: Arc<RwLock<HashSet<String>>>,
+    /// DXCC entity prefixes cqdx.io lists as still needed, with whether
+    /// cqdx has answered at all (PAN-93). An empty `Loaded` list means
+    /// "nothing needed"; anything but `Loaded` means "unknown".
+    needed_dxcc: Arc<RwLock<NeedList>>,
     /// DXCC entity prefixes that are ATNO (all-time new ones — never worked
-    /// on any band). A strict subset of `needed_dxcc`; populated from
-    /// cqdx.io's `atno` flag. Empty/inert when cqdx is unconfigured.
+    /// on any band). A strict subset of `needed_dxcc`'s entries; written by
+    /// the same cqdx answer from its `atno` flag. Empty/inert until a cqdx
+    /// list loads, so `!` is never shown for an unknown status.
     needed_atno: Arc<RwLock<HashSet<String>>>,
-    /// Grid squares still needed for award tracking.
-    needed_grids: Arc<RwLock<HashSet<String>>>,
+    /// 4-char grid squares cqdx.io lists as still needed for award
+    /// tracking, with the list's availability (PAN-93).
+    needed_grids: Arc<RwLock<NeedList>>,
     /// Rarity scores from cqdx.io, keyed by uppercase callsign.
     rarity_scores: Arc<RwLock<HashMap<String, f64>>>,
     /// Rarity scores from cqdx.io, re-indexed by resolved DXCC entity name
@@ -150,8 +217,10 @@ pub struct CachedStationLookup {
     network_snr: Arc<RwLock<HashMap<String, (u32, i32)>>>,
     /// Network last-seen timestamps: callsign -> unix timestamp.
     network_last_seen: Arc<RwLock<HashMap<String, i64>>>,
-    /// Phase-5 hardening #2: callsign-prefix exclusions used when
-    /// `needed_dxcc` is empty (cqdx unavailable). Populated from:
+    /// Phase-5 hardening #2: callsign-prefix exclusions the scorer's
+    /// `is_needed_dxcc` uses only while the cqdx needed-entity list is
+    /// unknown (not loaded). Display surfaces never use them (PAN-93).
+    /// Populated from:
     ///
     /// - operator's own callsign (home DXCC)
     /// - ADIF CALL field of prior QSOs (already-worked DXCCs)
@@ -190,9 +259,9 @@ impl CachedStationLookup {
             worked_dxcc_on_band: Arc::new(RwLock::new(HashMap::new())),
             worked_grids_on_band: Arc::new(RwLock::new(HashMap::new())),
             recent_failures: Arc::new(RwLock::new(HashSet::new())),
-            needed_dxcc: Arc::new(RwLock::new(HashSet::new())),
+            needed_dxcc: Arc::new(RwLock::new(NeedList::default())),
             needed_atno: Arc::new(RwLock::new(HashSet::new())),
-            needed_grids: Arc::new(RwLock::new(HashSet::new())),
+            needed_grids: Arc::new(RwLock::new(NeedList::default())),
             rarity_scores: Arc::new(RwLock::new(HashMap::new())),
             rarity_by_entity: Arc::new(RwLock::new(HashMap::new())),
             notable_callsigns: Arc::new(RwLock::new(HashSet::new())),
@@ -207,8 +276,9 @@ impl CachedStationLookup {
     }
 
     /// Phase-5 hardening #2: install the set of callsign-prefix
-    /// exclusions used when `needed_dxcc` is empty (cqdx unavailable
-    /// or hasn't populated). Operator typically seeds this with:
+    /// exclusions the scorer uses while the cqdx needed-entity list is
+    /// unknown (cqdx unavailable or not yet loaded). Operator typically
+    /// seeds this with:
     ///
     ///   - their own home DXCC prefixes (e.g. K, W, N, AA-AK for US)
     ///   - prefixes derived from worked QSOs in their ADIF
@@ -412,20 +482,140 @@ impl CachedStationLookup {
         *self.recent_failures.write() = callsigns;
     }
 
+    /// Install an all-bands cqdx needed-entity answer fetched now.
     pub fn update_needed_dxcc(&self, patterns: HashSet<String>) {
-        *self.needed_dxcc.write() = patterns;
+        self.update_needed_dxcc_for_band(patterns, None, Utc::now());
+    }
+
+    /// PAN-93: install a cqdx needed-entity answer and mark the list
+    /// `Loaded` under one lock. `band` is the per-band scope cqdx answered
+    /// for, `None` for all bands. An empty `patterns` means "nothing needed".
+    pub fn update_needed_dxcc_for_band(
+        &self,
+        patterns: HashSet<String>,
+        band: Option<String>,
+        fetched_at: DateTime<Utc>,
+    ) {
+        let mut list = self.needed_dxcc.write();
+        list.entries = patterns;
+        list.availability = NeedListAvailability::Loaded { fetched_at, band };
     }
 
     /// Install the set of ATNO ("all-time new one") DXCC prefixes. Should
-    /// be a subset of the `needed_dxcc` set. Uppercase enforced. Replaces
-    /// the prior set on each call.
+    /// be a subset of the `needed_dxcc` set and written by the same cqdx
+    /// answer. Uppercase enforced. Replaces the prior set on each call.
     pub fn update_needed_atno(&self, prefixes: HashSet<String>) {
         let upper: HashSet<String> = prefixes.into_iter().map(|p| p.to_uppercase()).collect();
         *self.needed_atno.write() = upper;
     }
 
+    /// Install a cqdx needed-grid answer (4-char uppercase squares) and
+    /// mark the list `Loaded`. An empty set means "no grids needed".
     pub fn update_needed_grids(&self, grids: HashSet<String>) {
-        *self.needed_grids.write() = grids;
+        let mut list = self.needed_grids.write();
+        list.entries = grids;
+        list.availability = NeedListAvailability::Loaded {
+            fetched_at: Utc::now(),
+            band: None,
+        };
+    }
+
+    /// PAN-93: the cqdx client is built and the first fetch is under way.
+    /// Moves each list to `Loading` only from `NotConfigured`.
+    pub fn set_need_lists_loading(&self) {
+        for list in [&self.needed_dxcc, &self.needed_grids] {
+            let mut list = list.write();
+            if list.availability == NeedListAvailability::NotConfigured {
+                list.availability = NeedListAvailability::Loading;
+            }
+        }
+    }
+
+    /// PAN-93: the needed-entity list could not be fetched. A no-op once a
+    /// list has loaded (the last answer is kept; its age shows staleness).
+    pub fn mark_dxcc_need_list_failed(&self, error: &str, retrying: bool) {
+        self.needed_dxcc.write().mark_failed(error, retrying);
+    }
+
+    /// PAN-93: the needed-grid list could not be fetched. A no-op once loaded.
+    pub fn mark_grid_need_list_failed(&self, error: &str, retrying: bool) {
+        self.needed_grids.write().mark_failed(error, retrying);
+    }
+
+    /// PAN-93: apply one failure to both needed lists.
+    pub fn mark_need_lists_unavailable(&self, error: &str, retrying: bool) {
+        self.mark_dxcc_need_list_failed(error, retrying);
+        self.mark_grid_need_list_failed(error, retrying);
+    }
+
+    /// PAN-93: cqdx.io does not offer the needed-grid list (404). A no-op
+    /// once a grid list has loaded.
+    pub fn mark_grid_need_list_not_offered(&self) {
+        let mut list = self.needed_grids.write();
+        if !list.is_loaded() {
+            list.availability = NeedListAvailability::NotOffered;
+        }
+    }
+
+    /// PAN-93: the needed-entity list's availability, scope and age.
+    pub fn dxcc_need_list(&self) -> NeedListAvailability {
+        self.needed_dxcc.read().availability.clone()
+    }
+
+    /// PAN-93: the needed-grid list's availability.
+    pub fn grid_need_list(&self) -> NeedListAvailability {
+        self.needed_grids.read().availability.clone()
+    }
+
+    /// PAN-93: cqdx.io's verdict for this station's entity. `Unknown` for
+    /// the unresolved hash placeholder or while no list has loaded, with or
+    /// without exclusions; a loaded empty list is `NotNeeded` for everyone.
+    pub fn needed_dxcc_status(&self, callsign: &str) -> NeedStatus {
+        let Some(upper) = resolved_identity(callsign) else {
+            return NeedStatus::Unknown;
+        };
+        let list = self.needed_dxcc.read();
+        if !list.is_loaded() {
+            return NeedStatus::Unknown;
+        }
+        if list
+            .entries
+            .iter()
+            .any(|prefix| upper.starts_with(prefix.as_str()))
+        {
+            NeedStatus::Needed
+        } else {
+            NeedStatus::NotNeeded
+        }
+    }
+
+    /// PAN-93: cqdx.io's verdict for a grid's 4-char square. `Unknown` while
+    /// no grid list has loaded (including a 404 "not offered") or when the
+    /// grid is too short to name a square.
+    pub fn needed_grid_status(&self, grid: &str) -> NeedStatus {
+        let list = self.needed_grids.read();
+        if !list.is_loaded() {
+            return NeedStatus::Unknown;
+        }
+        // The DX's decoded grid may be 4 or 6 chars; the cqdx-populated set
+        // is stored as 4-char uppercase fields (see CqdxBridge normalization).
+        let Some(field) = grid.trim().get(..4) else {
+            return NeedStatus::Unknown;
+        };
+        if list.entries.contains(&field.to_uppercase()) {
+            NeedStatus::Needed
+        } else {
+            NeedStatus::NotNeeded
+        }
+    }
+
+    /// PAN-93: `(needed, atno)` for display and wire surfaces (`+`/`!`, the
+    /// station card, `CqdxSpotInfo`, the remote `DecodedView`). Never true
+    /// while the list is unknown: the scorer's home/logged-prefix guess in
+    /// `is_needed_dxcc` is not shown as a cqdx claim.
+    pub fn display_needed_atno(&self, callsign: &str) -> (bool, bool) {
+        let needed = self.needed_dxcc_status(callsign) == NeedStatus::Needed;
+        (needed, needed && self.is_atno(callsign))
     }
 
     pub fn update_rarity_scores(&self, scores: HashMap<String, f64>) {
@@ -564,10 +754,23 @@ impl pancetta_tui::dx_need::DxNeedLookup for CachedStationLookup {
             .as_deref()
             .filter(|_| state_available && eligible)
             .map(|code| self.is_state_needed(code));
+        let dxcc_needed = match self.needed_dxcc_status(&call) {
+            NeedStatus::Needed => Some(true),
+            NeedStatus::NotNeeded => Some(false),
+            NeedStatus::Unknown => None,
+        };
+        let dxcc_list = match self.dxcc_need_list() {
+            NeedListAvailability::Loaded { fetched_at, band } if dxcc_needed.is_some() => {
+                Some(pancetta_tui::dx_need::NeedListSource { band, fetched_at })
+            }
+            _ => None,
+        };
         DxNeedStatus {
             grid_needed,
             state,
             state_needed,
+            dxcc_needed,
+            dxcc_list,
         }
     }
 }
@@ -623,32 +826,26 @@ impl WorkedStationLookup for CachedStationLookup {
         let Some(upper) = resolved_identity(callsign) else {
             return false;
         };
-
-        let needed = self.needed_dxcc.read();
-        if needed.is_empty() {
-            // Phase-5 hardening #2: when cqdx hasn't supplied a needed
-            // set, fall back to the "all-except-excluded" default.
-            // Excluded = operator's home DXCC + already-worked DXCCs
-            // (set by the coordinator at startup). This stops the
-            // autonomous operator from scoring every CQ at ~needed
-            // (which inflates every callsign to >threshold), while
-            // still letting non-home / new-DXCC calls through.
-            let excluded = self.excluded_dxcc_prefixes.read();
-            if excluded.is_empty() {
-                // No exclusions configured either — preserve the
-                // historical "everything is needed" behavior so
-                // existing tests / dev setups don't regress.
-                return true;
+        match self.needed_dxcc_status(&upper) {
+            // cqdx-loaded list (empty means "nothing needed"): prefix match.
+            NeedStatus::Needed => true,
+            NeedStatus::NotNeeded => false,
+            // Phase-5 hardening #2 guess, scoring only (PAN-93): display
+            // surfaces use `display_needed_atno` and never show this. While
+            // the cqdx list is unknown, fall back to "all-except-excluded".
+            // Excluded = operator's home DXCC + already-worked DXCCs (set by
+            // the coordinator at startup). This stops the autonomous
+            // operator from scoring every CQ at ~needed while still letting
+            // non-home / new-DXCC calls through. With no exclusions either,
+            // keep the historical "everything is needed" scoring default.
+            NeedStatus::Unknown => {
+                let excluded = self.excluded_dxcc_prefixes.read();
+                excluded.is_empty()
+                    || !excluded
+                        .iter()
+                        .any(|prefix| upper.starts_with(prefix.as_str()))
             }
-            // "Needed" = NOT in excluded prefix set.
-            return !excluded
-                .iter()
-                .any(|prefix| upper.starts_with(prefix.as_str()));
         }
-        // cqdx-populated `needed` set: prefix-match as before.
-        needed
-            .iter()
-            .any(|prefix| upper.starts_with(prefix.as_str()))
     }
 
     fn is_atno(&self, callsign: &str) -> bool {
@@ -732,21 +929,11 @@ impl WorkedStationLookup for CachedStationLookup {
     }
 
     fn is_needed_grid(&self, grid: &str) -> bool {
-        let needed = self.needed_grids.read();
-        // When the needed set is empty (no grid data available from cqdx.io),
-        // return false — "unknown" means "no bonus" rather than inflating all
-        // scores with the needed_grid weight.
-        if needed.is_empty() {
-            return false;
-        }
-        // Compare on the 4-char Maidenhead field, uppercased. The DX's
-        // decoded grid may be 4 or 6 chars; the cqdx-populated set is stored
-        // as 4-char fields (see CqdxBridge::startup normalization).
-        let trimmed = grid.trim();
-        if trimmed.len() < 4 {
-            return false;
-        }
-        needed.contains(&trimmed[..4].to_uppercase())
+        // Scoring policy over the PAN-93 verdict: only a loaded cqdx list
+        // naming the square adds the needed_grid weight. `Unknown` (no list,
+        // 404 "not offered", short grid) means "no bonus" rather than
+        // inflating every score; display surfaces read `needed_grid_status`.
+        self.needed_grid_status(grid) == NeedStatus::Needed
     }
 
     fn rarity(&self, callsign: &str) -> f64 {
@@ -785,7 +972,35 @@ mod tests {
 
     #[tokio::test]
     async fn display_adapter_gates_availability_and_reuses_grid_predicate() {
-        use pancetta_tui::dx_need::DxNeedLookup;
+        use pancetta_tui::dx_need::{DxNeedLookup, NeedListSource};
+        let l = CachedStationLookup::new();
+        // PAN-93: dxcc_needed is None until a list loads, then Some(true/false)
+        // with its source.
+        assert_eq!(
+            l.lookup_need("JA1ABC", None, None, 14_074_000.0)
+                .dxcc_needed,
+            None
+        );
+        assert_eq!(
+            l.lookup_need("JA1ABC", None, None, 14_074_000.0).dxcc_list,
+            None
+        );
+        let at = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        l.update_needed_dxcc_for_band(HashSet::from(["JA".into()]), Some("20M".into()), at);
+        let s = l.lookup_need("JA1ABC", None, None, 14_074_000.0);
+        assert_eq!(s.dxcc_needed, Some(true));
+        assert_eq!(
+            s.dxcc_list,
+            Some(NeedListSource {
+                band: Some("20M".into()),
+                fetched_at: at
+            })
+        );
+        assert_eq!(
+            l.lookup_need("DL1ABC", None, None, 14_074_000.0)
+                .dxcc_needed,
+            Some(false)
+        );
         let l = CachedStationLookup::new();
         assert!(l.is_grid_needed_on_band("EM34", 14_074_000.0));
         assert_eq!(
@@ -1243,21 +1458,168 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_needed_no_exclusions_keeps_all_needed_default() {
-        // Phase-5 hardening #2: with neither cqdx data nor exclusions,
-        // preserve historical "everything is needed" behavior (no
-        // regression for dev / tests that depended on this).
+    fn unloaded_dxcc_list_reports_unknown_not_needed() {
+        // PAN-93 Gherkin scenario 1: no cqdx answer → "unknown", with or
+        // without exclusions.
         let lookup = CachedStationLookup::new();
-        assert!(lookup.is_needed_dxcc("K1ABC"));
-        assert!(lookup.is_needed_dxcc("JA1XYZ"));
-        assert!(lookup.is_needed_dxcc("3Y/B1234"));
+        assert_eq!(lookup.dxcc_need_list(), NeedListAvailability::NotConfigured);
+        for call in ["K1ABC", "JA1XYZ", "3Y/B1234"] {
+            assert_eq!(lookup.needed_dxcc_status(call), NeedStatus::Unknown);
+        }
+        lookup.set_excluded_dxcc_prefixes(HashSet::from(["K".to_string()]));
+        assert_eq!(lookup.needed_dxcc_status("JA1XYZ"), NeedStatus::Unknown);
+        assert_eq!(lookup.display_needed_atno("JA1XYZ"), (false, false));
+    }
+
+    #[test]
+    fn unloaded_grid_list_reports_unknown_not_not_needed() {
+        // PAN-93 Gherkin scenario 2.
+        let lookup = CachedStationLookup::new();
+        assert_eq!(lookup.needed_grid_status("FN42"), NeedStatus::Unknown);
+        lookup.mark_grid_need_list_not_offered();
+        assert_eq!(lookup.grid_need_list(), NeedListAvailability::NotOffered);
+        assert_eq!(lookup.needed_grid_status("FN42"), NeedStatus::Unknown);
+    }
+
+    #[test]
+    fn empty_loaded_dxcc_list_means_nothing_needed() {
+        // PAN-93 / P04: a successful empty answer is not "everything needed".
+        let lookup = CachedStationLookup::new();
+        lookup.set_excluded_dxcc_prefixes(HashSet::from(["K".to_string()]));
+        lookup.update_needed_dxcc(HashSet::new());
+        assert_eq!(lookup.needed_dxcc_status("JA1XYZ"), NeedStatus::NotNeeded);
+        assert!(!lookup.is_needed_dxcc("JA1XYZ"));
+        assert_eq!(lookup.display_needed_atno("JA1XYZ"), (false, false));
+    }
+
+    #[test]
+    fn empty_loaded_grid_list_is_confirmed_not_needed() {
+        let lookup = CachedStationLookup::new();
+        lookup.update_needed_grids(HashSet::new());
+        assert_eq!(lookup.needed_grid_status("FN42"), NeedStatus::NotNeeded);
+        assert!(!lookup.is_needed_grid("FN42"));
+    }
+
+    #[test]
+    fn loaded_lists_report_needed_and_not_needed_with_scope() {
+        let lookup = CachedStationLookup::new();
+        let at = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        lookup.update_needed_dxcc_for_band(HashSet::from(["JA".into()]), Some("20M".into()), at);
+        assert_eq!(lookup.needed_dxcc_status("JA1ABC"), NeedStatus::Needed);
+        assert_eq!(lookup.needed_dxcc_status("<JA1ABC>"), NeedStatus::Needed);
+        assert_eq!(lookup.needed_dxcc_status("DL1ABC"), NeedStatus::NotNeeded);
+        assert_eq!(
+            lookup.dxcc_need_list(),
+            NeedListAvailability::Loaded {
+                fetched_at: at,
+                band: Some("20M".into())
+            }
+        );
+        lookup.update_needed_atno(HashSet::from(["JA".into()]));
+        assert_eq!(lookup.display_needed_atno("JA1ABC"), (true, true));
+        assert_eq!(lookup.display_needed_atno("DL1ABC"), (false, false));
+        lookup.update_needed_grids(HashSet::from(["FN42".into()]));
+        assert_eq!(lookup.needed_grid_status("fn42ab"), NeedStatus::Needed);
+        assert_eq!(lookup.needed_grid_status("JO62"), NeedStatus::NotNeeded);
+        assert_eq!(lookup.needed_grid_status("FN"), NeedStatus::Unknown);
+        assert!(lookup.is_needed_grid("FN42"));
+        assert!(!lookup.is_needed_grid("JO62"));
+    }
+
+    #[test]
+    fn failure_after_a_load_keeps_the_last_answer() {
+        let lookup = CachedStationLookup::new();
+        lookup.update_needed_dxcc(HashSet::from(["JA".into()]));
+        lookup.mark_dxcc_need_list_failed("HTTP request failed", true);
+        assert!(matches!(
+            lookup.dxcc_need_list(),
+            NeedListAvailability::Loaded { .. }
+        ));
+        assert_eq!(lookup.needed_dxcc_status("JA1ABC"), NeedStatus::Needed);
+        lookup.update_needed_grids(HashSet::new());
+        lookup.mark_grid_need_list_failed("Server error: 503", true);
+        lookup.mark_grid_need_list_not_offered();
+        assert!(matches!(
+            lookup.grid_need_list(),
+            NeedListAvailability::Loaded { .. }
+        ));
+    }
+
+    #[test]
+    fn failure_before_any_load_is_unavailable_and_keeps_its_first_time() {
+        let lookup = CachedStationLookup::new();
+        lookup.set_need_lists_loading();
+        lookup.mark_need_lists_unavailable("HTTP request failed", true);
+        let NeedListAvailability::Unavailable { since: first, .. } = lookup.dxcc_need_list() else {
+            panic!("expected Unavailable, got {:?}", lookup.dxcc_need_list());
+        };
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        lookup.mark_dxcc_need_list_failed("Authentication failed", false);
+        assert_eq!(
+            lookup.dxcc_need_list(),
+            NeedListAvailability::Unavailable {
+                since: first,
+                error: "Authentication failed".into(),
+                retrying: false,
+            }
+        );
+        assert!(matches!(
+            lookup.grid_need_list(),
+            NeedListAvailability::Unavailable { retrying: true, .. }
+        ));
+        assert_eq!(lookup.needed_dxcc_status("JA1ABC"), NeedStatus::Unknown);
+        assert_eq!(lookup.needed_grid_status("FN42"), NeedStatus::Unknown);
+    }
+
+    #[test]
+    fn loading_does_not_downgrade_a_loaded_list() {
+        let lookup = CachedStationLookup::new();
+        lookup.set_need_lists_loading();
+        assert_eq!(lookup.dxcc_need_list(), NeedListAvailability::Loading);
+        assert_eq!(lookup.grid_need_list(), NeedListAvailability::Loading);
+        lookup.update_needed_dxcc(HashSet::from(["JA".into()]));
+        lookup.mark_grid_need_list_failed("Server error: 503", true);
+        lookup.set_need_lists_loading();
+        assert!(matches!(
+            lookup.dxcc_need_list(),
+            NeedListAvailability::Loaded { .. }
+        ));
+        assert!(matches!(
+            lookup.grid_need_list(),
+            NeedListAvailability::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn hash_placeholder_is_unknown_and_never_scored_needed() {
+        let lookup = CachedStationLookup::new();
+        assert_eq!(lookup.needed_dxcc_status("<...>"), NeedStatus::Unknown);
+        assert!(!lookup.is_needed_dxcc("<...>"));
+        lookup.update_needed_dxcc(HashSet::from(["<".into()]));
+        assert_eq!(lookup.needed_dxcc_status("<...>"), NeedStatus::Unknown);
+        assert!(!lookup.is_needed_dxcc("<...>"));
+    }
+
+    #[test]
+    fn test_empty_needed_no_exclusions_keeps_all_needed_default() {
+        // Phase-5 hardening #2: scoring guess while the cqdx list is
+        // unknown. With neither cqdx data nor exclusions, the scorer keeps
+        // the historical "everything is needed" guess, but the verdict
+        // reported to display surfaces is "unknown" (PAN-93).
+        let lookup = CachedStationLookup::new();
+        for call in ["K1ABC", "JA1XYZ", "3Y/B1234"] {
+            assert!(lookup.is_needed_dxcc(call));
+            assert_eq!(lookup.needed_dxcc_status(call), NeedStatus::Unknown);
+        }
     }
 
     #[test]
     fn test_empty_needed_with_exclusions_all_except_home() {
-        // Phase-5 hardening #2: with US prefixes excluded and no
-        // cqdx-populated needed set, "needed" becomes "anything
-        // outside US". Mirrors the operator's typical configuration.
+        // Phase-5 hardening #2: scoring guess while the cqdx list is
+        // unknown. With US prefixes excluded and no cqdx-loaded needed
+        // list, the scorer's "needed" becomes "anything outside US"; the
+        // reported verdict stays "unknown" (PAN-93). Mirrors the
+        // operator's typical configuration.
         let lookup = CachedStationLookup::new();
         let mut excluded = HashSet::new();
         for p in [
@@ -1278,6 +1640,9 @@ mod tests {
         assert!(lookup.is_needed_dxcc("DL5XYZ"));
         assert!(lookup.is_needed_dxcc("VK2DEF"));
         assert!(lookup.is_needed_dxcc("3Y/B1234"));
+        for call in ["K5ARH", "JA1ABC", "DL5XYZ"] {
+            assert_eq!(lookup.needed_dxcc_status(call), NeedStatus::Unknown);
+        }
     }
 
     #[test]
@@ -1416,12 +1781,13 @@ mod tests {
 
     #[test]
     fn test_needed_grids_empty_set_is_inert() {
-        // No cqdx grid data loaded: nothing is "needed" — preserves the
-        // historical behavior so the needed_grid weight doesn't inflate
-        // every score.
+        // Scoring guess while the cqdx grid list is unknown: nothing is
+        // "needed", so the needed_grid weight doesn't inflate every score.
+        // The reported verdict is "unknown", not "not needed" (PAN-93).
         let lookup = CachedStationLookup::new();
         assert!(!lookup.is_needed_grid("FN42"));
         assert!(!lookup.is_needed_grid("JD15"));
+        assert_eq!(lookup.needed_grid_status("FN42"), NeedStatus::Unknown);
     }
 
     #[test]
