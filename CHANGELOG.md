@@ -158,6 +158,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+<<<<<<< HEAD
 - Stale-band decodes are now rejected by the QSO, autonomous, and WSJT-X
   relay receive paths (PAN-69, from the PAN-67/PR #336 review): a decode
   whose audio window closed before a band switch completed its CPU-bound
@@ -171,6 +172,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before). Unifying the relay also fixes a false positive: intra-band
   multi-MHz retunes (e.g. 28.5 → 29.5 MHz, both 10m) no longer drop
   valid WSJT-X-relay decodes.
+=======
+- Retuning within a band no longer reports stations heard before the retune at
+  the new dial's frequency (PAN-70). The decoder used to keep audio buffered
+  on the old dial across an intra-band retune and label the whole window with
+  the new dial, so a station was shown and uploaded off by the retune delta.
+  Any change between two known dial readings, even 1 Hz, now discards the
+  in-flight audio as a band change already did, so retuning can skip a decode
+  window while the receiver refills.
+>>>>>>> 57191959ac2a274918a6dbd68afe010e3f830f6e
 
 - A frame that never airs now gives back its call, stall count and `Sent`
   timeline entry even when the QSO engine is briefly backed up (PAN-185).
