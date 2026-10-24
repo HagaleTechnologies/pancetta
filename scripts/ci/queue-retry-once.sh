@@ -211,7 +211,79 @@ if GH_TOKEN="$MERGE_TOKEN" gh pr merge "$PR" --repo "${REPO}" --auto --squash --
       gh pr comment "$PR" --repo "${REPO}" --body "Merge-group CI failed for this revision (commit \`$HEAD_SHA12\`), and neither the retry-tracking label nor the human-review pause label could be recorded, despite auto-merge itself being disarmed. This needs urgent human attention -- the one-retry bound cannot be relied on for this head until this is fixed by hand. $NO_MORE_RETRIES_MARKER" || true
       exit 1
     else
-      gh pr comment "$PR" --repo "${REPO}" --body "Merge-group CI failed for this revision (commit \`$HEAD_SHA12\`), and the retry-tracking label could not be recorded. Disarmed and attached queue-needs-human-review rather than risk retrying unboundedly -- this needs a human: push a fix, or remove the pause and manually run \`gh pr merge --auto --squash\` once the labeling problem is resolved. $NO_MORE_RETRIES_MARKER" || true
+      # PAN-152: admission's needs_human_is_stale() clears a pause on a later
+      # head only through a bot-authored queue-needs-human-review marker. Claim
+      # that provenance only when the latest labeling event is ours, applying
+      # the second-failure handoff's ownership rules: a maintainer can attach
+      # the label between this step's opening label read and the idempotent
+      # POST above, and a marker must never make their pause clearable.
+      # Prints the latest pause attachment as actor<TAB>created_at.
+      latest_pause_attachment() {
+        local raw
+        raw=$(gh api --paginate --slurp "repos/${REPO}/issues/${PR}/timeline" 2>/dev/null) &&
+          printf '%s' "$raw" | jq -er '
+            if type == "array" and all(.[]; type == "array" and all(.[]; type == "object"))
+            then (add // []) else error("invalid timeline pages") end |
+            [.[] | select(.event == "labeled" and .label.name == "queue-needs-human-review")] |
+            last |
+            select(.actor.login | type == "string" and length > 0) |
+            select(.created_at | type == "string") |
+            select(.created_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) |
+            select(.created_at | . == (fromdateiso8601 | todateiso8601)) |
+            [.actor.login, .created_at] | @tsv' 2>/dev/null
+      }
+      pause_owner=unknown
+      if label_info=$(latest_pause_attachment); then
+        if [ "$(cut -f1 <<< "$label_info")" = "github-actions[bot]" ]; then
+          pause_owner=handler
+        else
+          pause_owner=external
+        fi
+      fi
+      pause_marker="$NO_MORE_RETRIES_MARKER"
+      if [ "$pause_owner" = "handler" ]; then
+        pause_marker="<!-- queue-retry-handler:queue-needs-human-review sha=$HEAD_SHA12 -->"
+      fi
+      pause_text="Merge-group CI failed for this revision (commit \`$HEAD_SHA12\`), and the retry-tracking label could not be recorded. Disarmed and attached queue-needs-human-review rather than risk retrying unboundedly -- this needs a human: push a fix, or remove the pause and manually run \`gh pr merge --auto --squash\` once the labeling problem is resolved."
+      comment_url=$(gh pr comment "$PR" --repo "${REPO}" --body "$pause_text $pause_marker" 2>/dev/null) || comment_url=""
+      if [ "$pause_owner" = "unknown" ]; then
+        echo "::error::Could not establish queue-needs-human-review's current owner for PR #$PR (commit $HEAD_SHA12). Keeping the pause without a staleness marker; remove it by hand once a fix is pushed."
+        exit 1
+      elif [ "$pause_owner" = "handler" ]; then
+        comment_id=$(printf '%s' "$comment_url" | grep -oE '[0-9]+$' || echo "")
+        # Codex P1 (PAN-152 review): the ownership read above is a snapshot.
+        # A maintainer can remove and re-attach the pause before this comment
+        # exists, and admission trusts the newest bot marker when it is at or
+        # after the latest attachment, so it would make their pause clearable.
+        # Re-read it now that the comment exists; on any change, or if it is
+        # now unreadable, rewrite the marker to the inert one and fail. Not
+        # covered: a re-attachment the timeline does not show yet, or one within
+        # the same second as this comment (admission compares whole seconds).
+        current_attachment=$(latest_pause_attachment) || current_attachment=""
+        if [ "$current_attachment" != "$label_info" ]; then
+          withdrawn_body=""
+          if [ -n "$comment_id" ] &&
+             gh api --method PATCH "repos/${REPO}/issues/comments/${comment_id}" -f "body=$pause_text $NO_MORE_RETRIES_MARKER" >/dev/null 2>&1; then
+            withdrawn_body=$(gh api "repos/${REPO}/issues/comments/${comment_id}" --jq '.body' 2>/dev/null || echo "")
+          fi
+          if [ -z "$withdrawn_body" ] || [[ "$withdrawn_body" == *"$pause_marker"* ]]; then
+            echo "::error::queue-needs-human-review on PR #$PR changed hands, or became unreadable, while this step recorded its provenance, and the clearable marker could not be confirmed withdrawn. Remove the queue-needs-human-review sha=$HEAD_SHA12 marker from this handler's comment by hand, or a later push can clear that pause."
+            exit 1
+          fi
+          echo "::error::queue-needs-human-review on PR #$PR changed hands, or became unreadable, while this step recorded its provenance. Replaced the clearable marker with the inert one so a later push cannot clear that pause; it now stays until removed by hand."
+          exit 1
+        fi
+        # Verify this exact comment, as the handoff does: without it a later
+        # fix push cannot prove this pause stale.
+        posted_body=""
+        if [ -n "$comment_id" ]; then
+          posted_body=$(gh api "repos/${REPO}/issues/comments/${comment_id}" --jq '.body' 2>/dev/null || echo "")
+        fi
+        if [[ "$posted_body" != *"$pause_marker"* ]]; then
+          echo "::error::Could not confirm the queue-needs-human-review provenance marker was recorded for PR #$PR (commit $HEAD_SHA12) -- a later fix push cannot prove this pause stale without it. Keeping the pause and failing this step."
+          exit 1
+        fi
+      fi
     fi
   else
     gh pr comment "$PR" --repo "${REPO}" --body "Merge-group CI failed for this revision (commit \`$HEAD_SHA12\`) -- automatically re-armed auto-merge for one retry. If this fails again for the same commit, it will NOT retry again; it needs a human to look. [Run]($RUN_URL)" || true
