@@ -261,6 +261,8 @@ The `u` nudge picked up two of its own: the Hold gate is hoisted above the activ
 - *Count stalls only after EVERY TX gate permits the frame.* Round 2 closed the `TxPolicy` hard mute, but a `remote_origin` QSO's frames are additionally armed-TX gated in the TX worker. An arm expiry or explicit remote disarm drops every rearmed frame while `TxPolicy` still reads `Full`, and the detector counted that self-inflicted silence as DX silence. `QsoManager::set_remote_tx_permitted_source` (mirroring `set_tx_policy_source`) shares the predicate, consulted only for QSOs that are actually `remote_origin` and defaulting to "permitted" so nothing else changes. Read-only evidence, never a gate: the fail-CLOSED armed-TX check stays in the TX worker, and since `remote_tx_permitted` denies on a poisoned lock a poisoned arm also stops the counting.
 - *Count stalls on the active mode's slot cadence.* The rearm gate hardcoded 15 s — FT8's period alone — while `qso_stall_switch_after` is documented in slots, so under FT4 (7.5 s) a threshold of 4 took ~60 s / 8 real slots and under FT2 (3.2 s) far worse, often letting the ordinary QSO watchdog win first. The gate moved to millisecond resolution so 7.5 s is expressible, and the period comes from the coordinator's **shared** `active_slot_ns` atomic — injected via `QsoManager::set_active_slot_ns_source`, mirroring `set_tx_policy_source`, and defaulting to FT8's 15 s so unwired callers are unchanged. The first cut derived it from the *cloned* `QsoManagerConfig::active_mode` string instead, which was wrong in a way the re-review caught: `QsoManager::start()` runs `timeout_check_loop` on a `clone()` and `Clone` copies `config` by value, while `set_active_mode` (the Shift+M handler) mutates only the coordinator's own binding — so a runtime switch into FT4/FT2 never retuned the cadence at all, and a switch FT4 → FT8 left the loop on 7.5 s for what was by then a genuine FT8 QSO, breaking the byte-identity invariant in that sequence. Reading `active_slot_ns` (which `try_switch_operating_mode` rewrites on every switch, from `Protocol::slot_ns()`) also removes the duplicated 15_000 / 7_500 / 3_200 lookup table: one source of slot truth, already correct for a build without the `ft2` feature, tracked live in both directions.
 
+**Round-10 review hardening (Codex on PR #350; the PAN-79 item-2 follow-up).** Round 2 closed the `TxPolicy` hard mute, but the TX worker's own pre-PTT Hamlib hard mute (`tx_hard_mute_reason`) also keeps every rearmed frame off the air, and none of it was visible to `QsoManager`: a supervisor-restart window (PAN-5, designed to span multiple slots), the command loop not yet ready, an undelivered pending frequency/split command, an in-flight rig command, and (since PAN-115) a lost rig CAT link or dead audio output. A Hamlib supervisor restart could therefore accumulate 2+ bogus stall cycles on an established QSO and move it off a known-good offset, the outcome round 2's fix existed to prevent, through a narrower trigger. `QsoManager::set_hamlib_hard_muted_source` now shares the predicate. It is read-only evidence, consulted in `rearm_manual_calls_at`'s `frame_reaches_the_air` check and never a TX gate: the fail-CLOSED pre-PTT check stays in the TX worker. `start_qso_component` wires it from the same atomics that gate reads, and it defaults to "not muted" so unwired callers are unchanged. PAN-79 item 1 (the no-op relocation) is round 3's `OffsetActionNoOp` refusal above; item 2 is this entry. The fix landed inside PR #350 under a `(PAN-72)` trailer, so this entry records its PAN-79 attribution. `a_hamlib_restart_window_accumulates_no_stall_cycles_or_offset_actions` (`coordinator/qso.rs`) pins the join end to end: a real `tx_restart_inhibit` window on the watch-published manager counts no stall cycles and raises no offset action, and counting resumes when the window clears.
+
 **PAN-140 (2026-09-12): first live on-air exercise found a real in-flight-PTT race.** Working W6M, a stall-switch committed 2.8s into an already-in-flight 12.64s transmission — `rearm_manual_calls_at`'s `stall_cycles` increment/threshold check has no guard against a PTT already keyed for the current slot, so the supersede path aborted the audio and re-keyed at the new frequency 2.8s late into the slot, garbling both frames (and with zero operator-visible log trace either way). Fixed in two commits (PR #369): a top-of-loop pre-check + re-queue in `drain_pending_qso_offset_requests`, then — after Codex's single review round caught that the pre-check's own `.await` for `apply_tx_offset_switch`'s write lock reopens the identical window — a real `ptt_active: Arc<AtomicBool>` (`QsoManager::set_ptt_active_source`, mirroring `set_tx_freq_mode_source`) re-checked INSIDE that write lock, immediately before the existing Hold recheck. New `OffsetActionPttInFlight` error, re-queued (not discarded, unlike Hold). Two sibling findings from the same live session, tracked separately: PAN-141 (a manually-latched TX parity can go stale before key-up against a fast-cycling pileup DX that changes callers — and therefore parity — in the gap) and PAN-142 (no operator-visible indicator during the two-strike frequency-drift confirm window, `maybe_confirm_frequency_drift_at`).
 
 Separately, the autonomous collision-listen jitter (`process_collision_listen`) **holds while a QSO is active** (`active_qso_count>0`) — it only ever seeded the next CQ/opening offset, and only fires from a collision-LISTEN slot (a slot we listened on without transmitting), the "new information" precondition for changing TX frequency.
@@ -388,6 +390,10 @@ Single TX and bundles also re-run the gate synchronously just before Step 4d-arm
 between the post-wait gate and `SetPtt` for faults that land in it. No mid-transmission abort: a fault
 that starts while PTT is already keyed is still ended by the existing PTT watchdog.
 
+The stall detector sees both causes too. The round-10 `hamlib_hard_muted` wiring (see "TX-frequency
+hold + adaptive stall escape") reads them, so a dead link or audio device stops the stall clock
+instead of tripping a spurious offset switch.
+
 ## Out-of-band TX is hard-refused by the band-plan gate (PAN-118), 2026-10-14
 
 The configured band plan (`[rig.frequency.band_plan]`) was display-only: it fed exactly one consumer,
@@ -512,8 +518,25 @@ A pivoted frame or multi-TX bundle refused before it airs (pre-PTT hard mute,
 liveness or arm recheck, disarm, pre-slot clock jump) clears its pivot tombstones, so the
 request that produced each pivoted frame stays queued and accounts for
 itself; the worker reports the replaced frame to the QSO engine instead.
-Autonomous still gets a failed completion for the pivoted payload, as on Step
-0-dup; correlating it with the queued request's eventual outcome is PAN-185. An F8 abort keeps the
+
+Pivot ownership rule (PAN-185): the tombstone decides which request reports
+the QSO's outcome to Autonomous, so a tracked self-CQ settles exactly once. A
+pivot targets only an intent whose `TransmitRequest` the bus confirmed queued
+(`LatestTxIntent::request_queued`: the QSO forwarder publishes the intent
+unqueued, sends the request checked, then marks it queued or withdraws it).
+A refused pivot (tombstone cleared) sends Autonomous nothing; the queued
+request reports its own outcome when it airs, is refused, or is discarded. A
+keyed pivot (tombstone kept) reports, and the request it absorbed is dropped
+silently by Step 0-dup, the backlog pivot-duplicate pass or a mid-TX
+duplicate drop. Backlog coalescing reports a failed completion to Autonomous,
+and to Autonomous only, for every QSO request it drops as terminal or excludes
+for parity or frequency; a request coalesced into a newer one for the same QSO
+stays silent because the newer one reports. An excluded request's failure can
+settle a self-CQ before the QSO's next rearm airs, the same trade-off the
+DX-parity hold already makes; staying silent instead would leave the self-CQ
+pending forever when no fresh request follows. A request the TX channel never
+accepted rolls back its ledger attempt through a self-addressed
+`TxFrameNotSent`. An F8 abort keeps the
 tombstone, so Step 0-dup later reports the replaced frame. Backlog coalescing
 consumes pivot duplicates before it picks the newest request per QSO, so a
 duplicate superseded in the backlog still reports its replaced frame. Since PAN-136,
@@ -604,8 +627,20 @@ tick its re-call reached the cap, so the cap-reaching frame never aired and an
 unsent report for it found no active QSO. Retirement on the call cap now lands
 up to four slots after the last call.
 
-Rollback reports are best-effort bus messages; a full or missing QSO channel
-loses them (follow-up: PAN-185).
+Rollback reports travel the bus's durable tier (PAN-185):
+`send_message_durable` parks `TxFrameNotSent`, `TxFrameSent` and
+`TransmitComplete` on a bus-owned lane when the Qso or Autonomous channel is
+full, and those loops read the lane through their `DurableInbox`. A parked
+report keeps its place behind the channel backlog that preceded it — the
+inbox yields it once that backlog has been read, before anything sent later,
+so ordinary traffic refilling a freed slot cannot starve it past the
+retention window below. The lane belongs to the bus, so it survives a
+restart of either
+component; after a Qso restart the parked reports name QSOs the new manager
+never had and are no-ops. Limits: a lane holds at most 4096 messages
+(`DURABLE_LANE_CAPACITY`; past that the report is dropped, logged and
+counted), and a rollback still finds nothing once it is processed more than
+four slots after the attempt (the unsent-attempt retention window).
 
 Shutdown aborts deliberately send no rollback. The TX and QSO loops stop on the
 same global flag, and shutdown persists no active-QSO state. Adding a bus await
@@ -649,7 +684,8 @@ early. The id now travels with the frame:
   rolls back the replaced attempt. A `Replace` or `Bundle` supersede re-keys or
   re-enqueues the new request under that request's own id.
 - Every `TxFrameNotSent` carries the failed frame's id, or the replaced frame's
-  on a pivot. Autonomous-facing `TransmitComplete` is unchanged (PAN-185).
+  on a pivot. Autonomous-facing `TransmitComplete` correlates on `qso_id`
+  under the pivot ownership rule above (PAN-185).
 
 The same mechanism closes two PR #419 review threads. An identity-conflict
 supersede reported abandoned bundle items without their binding, so a

@@ -3614,7 +3614,7 @@ enum NudgeOutcome {
 /// parameter to read here even by accident.
 ///
 /// `dial_hz == 0` means no rig / no CAT read has landed yet (see
-/// `dsp.rs`'s `band_ref_dial_hz`/`cur_dial_hz`) — falls back to the same
+/// `dsp.rs`'s `last_known_dial_hz`/`cur_dial_hz`) — falls back to the same
 /// 14.074 MHz default the removed live-atomic seed used, so a headless or
 /// pre-first-read decode still enriches against a real band instead of
 /// stamping 0.0 MHz and feeding 0 Hz into the worked/needed lookups

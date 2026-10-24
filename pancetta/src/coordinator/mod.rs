@@ -142,6 +142,35 @@ pub struct LatestTxIntent {
     /// PAN-183: the intent's ledger attempt, adopted with the payload by a
     /// key-time pivot so the pivoted frame reports its own attempt.
     pub attempt_id: Option<pancetta_qso::TxAttemptId>,
+    /// PAN-185: the `TransmitRequest` that carries this payload is confirmed
+    /// enqueued on the TX worker's channel. Pivots ignore an intent until it
+    /// is.
+    pub request_queued: bool,
+}
+
+/// PAN-185: settle the intent the QSO forwarder published for `key` once
+/// its `TransmitRequest`'s checked send returned. `queued` marks it
+/// pivotable; otherwise it is withdrawn. A newer intent that replaced
+/// `published` in the meantime is left untouched, and a poisoned lock is
+/// skipped like every other writer of the map.
+pub(crate) fn settle_tx_intent(
+    map: &std::sync::RwLock<HashMap<String, LatestTxIntent>>,
+    key: &str,
+    published: &LatestTxIntent,
+    queued: bool,
+) {
+    if let Ok(mut m) = map.write() {
+        if m.get(key) != Some(published) {
+            return;
+        }
+        if queued {
+            if let Some(intent) = m.get_mut(key) {
+                intent.request_queued = true;
+            }
+        } else {
+            m.remove(key);
+        }
+    }
 }
 
 /// Smallest offset difference (Hz) [`tx_pivot_target`] treats as a genuine
@@ -193,6 +222,9 @@ pub const PIVOT_OFFSET_EPSILON_HZ: f64 = 0.5;
 /// `coord_robustness` tests); passing a bundle-level binding instead of the
 /// item's own would manufacture spurious pivots (a `Local` item in a
 /// `Remote` bundle would never match its own `Local` intent).
+/// PAN-185: an intent whose `request_queued` is false is ignored, so a pivot
+/// only ever targets a payload whose producing request the TX worker will
+/// see (and which then reports its own outcome if the pivot is refused).
 pub fn tx_pivot_target(
     qso_id: Option<&str>,
     current_text: &str,
@@ -201,7 +233,9 @@ pub fn tx_pivot_target(
     latest: &HashMap<String, LatestTxIntent>,
 ) -> Option<LatestTxIntent> {
     let id = qso_id?;
-    let intent = latest.get(&active_tx_qso_key(id))?;
+    let intent = latest
+        .get(&active_tx_qso_key(id))
+        .filter(|i| i.request_queued)?;
     let same_text = intent.message_text == current_text;
     let same_offset =
         (intent.frequency_offset - current_frequency_offset).abs() < PIVOT_OFFSET_EPSILON_HZ;
@@ -464,6 +498,26 @@ pub fn is_band_change(old_hz: u64, new_hz: u64) -> bool {
         // jump still triggers teardown but a small nudge near a band edge does
         // not.
         _ => old_hz.abs_diff(new_hz) >= BAND_CHANGE_HZ_THRESHOLD,
+    }
+}
+
+/// PAN-69: true when a decode's own captured dial is on a different ham
+/// band than the band pancetta currently believes it's on — the decode's
+/// audio window closed before a since-happened band switch (C9), but real
+/// CPU-bound decode work let it finish and reach the bus after that
+/// switch. Reuses [`is_band_change`] so this agrees exactly with whatever
+/// C9 would (or did) tear a QSO down for.
+///
+/// Fails open, matching [`is_band_change`]'s and PAN-146's
+/// `DxParityContext::observed_in`'s convention: an unknown captured dial
+/// (`None`/`Some(0)`, the DSP "not yet established" sentinel) or an
+/// unknown live dial (`0`, no rig / pre-first-CAT-read) never counts as
+/// stale — both sides are guarded explicitly here because
+/// `is_band_change`'s own `old_hz == 0` guard covers only one argument.
+pub fn is_stale_band_decode(captured_dial_hz: Option<u64>, live_dial_hz: u64) -> bool {
+    match captured_dial_hz {
+        Some(hz) if hz != 0 && live_dial_hz != 0 => is_band_change(hz, live_dial_hz),
+        _ => false,
     }
 }
 
@@ -3250,7 +3304,7 @@ mod pivot_duplicate_tests {
 
 #[cfg(test)]
 mod pivot_bundle_tests {
-    use super::{active_tx_qso_key, pivot_bundle_items, LatestTxIntent};
+    use super::{active_tx_qso_key, pivot_bundle_items, settle_tx_intent, LatestTxIntent};
     use crate::message_bus::TransmitRequestItem;
     use std::collections::HashMap;
 
@@ -3279,7 +3333,59 @@ mod pivot_bundle_tests {
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
             remote_client_key_id: None,
+            request_queued: true,
         }
+    }
+
+    fn published(text: &str) -> LatestTxIntent {
+        LatestTxIntent {
+            request_queued: false,
+            ..intent(text, 1500.0)
+        }
+    }
+
+    /// PAN-185: a checked enqueue makes the published intent pivotable.
+    #[test]
+    fn settle_marks_the_published_intent_queued() {
+        let key = active_tx_qso_key("qso-a");
+        let map = std::sync::RwLock::new(HashMap::new());
+        let p = published("K1ABC N0CALL R-07");
+        map.write().unwrap().insert(key.clone(), p.clone());
+        settle_tx_intent(&map, &key, &p, true);
+        assert_eq!(
+            map.read().unwrap().get(&key),
+            Some(&LatestTxIntent {
+                request_queued: true,
+                ..p
+            })
+        );
+    }
+
+    /// PAN-185: a dropped request's intent is withdrawn, never left for a
+    /// pivot to target.
+    #[test]
+    fn settle_withdraws_the_published_intent_on_a_drop() {
+        let key = active_tx_qso_key("qso-a");
+        let map = std::sync::RwLock::new(HashMap::new());
+        let p = published("K1ABC N0CALL R-07");
+        map.write().unwrap().insert(key.clone(), p.clone());
+        settle_tx_intent(&map, &key, &p, false);
+        assert!(map.read().unwrap().get(&key).is_none());
+    }
+
+    /// PAN-185: a newer `MessageToSend` replaced the entry between publish
+    /// and settle; settling the older one leaves the newer one alone.
+    #[test]
+    fn settle_leaves_a_newer_intent_untouched() {
+        let key = active_tx_qso_key("qso-a");
+        let map = std::sync::RwLock::new(HashMap::new());
+        let older = published("K1ABC N0CALL R-07");
+        let newer = published("K1ABC N0CALL RR73");
+        map.write().unwrap().insert(key.clone(), newer.clone());
+        settle_tx_intent(&map, &key, &older, true);
+        assert_eq!(map.read().unwrap().get(&key), Some(&newer));
+        settle_tx_intent(&map, &key, &older, false);
+        assert_eq!(map.read().unwrap().get(&key), Some(&newer));
     }
 
     /// An item whose recorded intent differs from its current text gets both
@@ -3587,6 +3693,45 @@ mod pivot_bundle_tests {
 mod tests {
     use super::*;
     use pancetta_config::Config;
+
+    // ------------------------------------------------------------------
+    // PAN-69: stale-band decode rejection. The shared predicate's full
+    // semantic matrix — also the first direct tests of the
+    // `is_band_change` comparison family it reuses.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn stale_when_captured_dial_is_on_a_different_band() {
+        assert!(is_stale_band_decode(Some(7_074_000), 14_074_000)); // 40m vs 20m
+    }
+
+    #[test]
+    fn not_stale_when_captured_dial_is_on_the_same_band() {
+        assert!(!is_stale_band_decode(Some(14_074_200), 14_074_000)); // intra-20m nudge
+                                                                      // The case wsjtx_udp's shipped MHz-bucket version gets WRONG today:
+                                                                      // 28.5 -> 29.5 MHz is still Band10m (28.0-29.7 MHz).
+        assert!(!is_stale_band_decode(Some(28_500_000), 29_500_000));
+    }
+
+    #[test]
+    fn not_stale_when_captured_dial_is_unknown() {
+        assert!(!is_stale_band_decode(None, 14_074_000));
+        assert!(!is_stale_band_decode(Some(0), 14_074_000)); // DSP "not yet established" sentinel
+    }
+
+    #[test]
+    fn not_stale_when_live_dial_is_unknown() {
+        // No rig / pre-first-CAT-read: nothing to compare against, never drop.
+        assert!(!is_stale_band_decode(Some(7_074_000), 0));
+        assert!(!is_stale_band_decode(None, 0));
+    }
+
+    #[test]
+    fn stale_when_out_of_band_dials_differ_by_threshold() {
+        // Neither dial in a known ham band: is_band_change's >=100 kHz fallback.
+        assert!(is_stale_band_decode(Some(13_900_000), 14_100_000));
+        assert!(!is_stale_band_decode(Some(13_999_000), 14_005_000)); // small wobble
+    }
 
     // ------------------------------------------------------------------
     // Shared audit log (dispensa Q-0051 Phase B): constructed once at

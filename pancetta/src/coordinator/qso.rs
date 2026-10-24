@@ -2861,10 +2861,9 @@ impl super::ApplicationCoordinator {
 
         info!("Starting QSO component");
 
-        let (_qso_tx, qso_rx) = self
-            .message_bus
-            .get_or_create_channel(ComponentId::Qso)
-            .await?;
+        // PAN-185: read through the durable inbox so TX outcome reports
+        // parked behind a full channel still arrive.
+        let qso_inbox = self.message_bus.durable_inbox(ComponentId::Qso).await?;
         let message_bus = self.message_bus.clone();
         let display_feed_enabled = self.display_feed_enabled.clone();
         let pending_autonomous_cq_dispatch_failures =
@@ -3839,28 +3838,33 @@ impl super::ApplicationCoordinator {
                                         // payload here — see `LatestTxIntent`'s doc — computed
                                         // from the SAME `remote_origin`/`remote_client_key_id`
                                         // this exact event carries, so the intent can never
-                                        // disagree with the `TransmitRequest` sent moments
-                                        // below for the same event.
+                                        // disagree with the `TransmitRequest` sent below.
+                                        //
+                                        // PAN-185 (Codex 4244602501, the publish-before-send
+                                        // window): publish the intent as not queued, send the
+                                        // request checked, then settle: mark it queued once
+                                        // the bus accepted the request, withdraw it if not.
+                                        // Pivots ignore unqueued intents, so a pivot never
+                                        // targets a request the TX worker will never see.
+                                        let key = super::active_tx_qso_key(&qso_id.to_string());
+                                        let published = super::LatestTxIntent {
+                                            attempt_id,
+                                            message_text: text.clone(),
+                                            frequency_offset: frequency,
+                                            tx_parity,
+                                            origin: tx_origin,
+                                            remote_client_key_id: remote_client_key_id.clone(),
+                                            request_queued: false,
+                                        };
                                         if let Ok(mut m) = latest_tx_intent.write() {
-                                            m.insert(
-                                                super::active_tx_qso_key(&qso_id.to_string()),
-                                                super::LatestTxIntent {
-                                                    attempt_id,
-                                                    message_text: text.clone(),
-                                                    frequency_offset: frequency,
-                                                    tx_parity,
-                                                    origin: tx_origin,
-                                                    remote_client_key_id: remote_client_key_id
-                                                        .clone(),
-                                                },
-                                            );
+                                            m.insert(key.clone(), published.clone());
                                         }
                                         let tx_msg = ComponentMessage::new(
                                             ComponentId::Qso,
                                             ComponentId::Ft8Transmitter,
                                             MessageType::TransmitRequest {
                                                 attempt_id,
-                                                message_text: text,
+                                                message_text: text.clone(),
                                                 frequency_offset: frequency,
                                                 qso_id: Some(qso_id.to_string()),
                                                 tx_parity,
@@ -3869,8 +3873,38 @@ impl super::ApplicationCoordinator {
                                             },
                                             Instant::now(),
                                         );
-                                        if let Err(e) = tx_bus.send_message(tx_msg).await {
-                                            warn!("Failed to send auto-sequence TX: {}", e);
+                                        let queued = matches!(
+                                            tx_bus.send_message_checked(tx_msg).await,
+                                            Ok(true)
+                                        );
+                                        super::settle_tx_intent(
+                                            &latest_tx_intent,
+                                            &key,
+                                            &published,
+                                            queued,
+                                        );
+                                        if !queued {
+                                            warn!(
+                                                "auto-sequence TX for QSO {qso_id} never reached the TX worker; withdrawing its intent and reporting it unsent"
+                                            );
+                                            // Self-addressed: the Qso loop's own handler rolls
+                                            // back this attempt by id (a no-op for an opening
+                                            // or advance, PAN-183).
+                                            tx_bus
+                                                .send_message_durable(ComponentMessage::new(
+                                                    ComponentId::Qso,
+                                                    ComponentId::Qso,
+                                                    MessageType::QsoMessage(
+                                                        crate::message_bus::QsoMessage::TxFrameNotSent {
+                                                            qso_id: qso_id.to_string(),
+                                                            message_text: text,
+                                                            replaced: None,
+                                                            attempt_id,
+                                                        },
+                                                    ),
+                                                    Instant::now(),
+                                                ))
+                                                .await;
                                         }
                                     }
                                     Err(e) => {
@@ -4424,153 +4458,170 @@ impl super::ApplicationCoordinator {
                 consumer_ready.release();
 
                 while !shutdown.load(Ordering::Acquire) {
-                    match qso_rx.try_recv() {
+                    match qso_inbox.try_recv() {
                         Ok(message) => {
                             match message.message_type {
                                 // Decoded FT8 messages forwarded from the decoder
                                 MessageType::DecodedMessage(ref decoded_msg) => {
-                                    let raw_text = decoded_msg.text.clone();
-                                    let frequency = decoded_msg.frequency_offset;
-                                    let snr = decoded_msg.snr_db;
+                                    // PAN-69: a decode whose window closed on a
+                                    // since-left band must not create or advance
+                                    // a QSO — it would be answered on the rig's
+                                    // CURRENT band, against a station never
+                                    // heard there. Drop before any of the arm
+                                    // body (auto-73, process_message, dedup,
+                                    // maybe_answer_caller, dx-activity record).
+                                    if super::is_stale_band_decode(
+                                        decoded_msg.captured_dial_hz,
+                                        operating_frequency_hz.load(Ordering::Relaxed),
+                                    ) {
+                                        debug!(
+                                            target: "qso",
+                                            "Dropping decode captured on a prior band (band switch happened mid-decode)"
+                                        );
+                                    } else {
+                                        let raw_text = decoded_msg.text.clone();
+                                        let frequency = decoded_msg.frequency_offset;
+                                        let snr = decoded_msg.snr_db;
 
-                                    // PAN-51: classify directly from the decoder's own
-                                    // typed Ft8Message.standard_type instead of
-                                    // re-parsing the rendered text — see
-                                    // ft8_message_to_qso_type's doc comment.
-                                    let msg_type = ft8_message_to_qso_type(
-                                        &decoded_msg.message,
-                                        &raw_text,
-                                        &our_callsign,
-                                    );
-                                    {
-                                        // item-2-auto-73: a directed RR73/RRR from
-                                        // a station we just MANUALLY completed with
-                                        // means they didn't copy our 73 — bounded
-                                        // auto-re-send. Detect before process_message
-                                        // moves the parsed type. The map/window/cap
-                                        // gating lives in the helper.
-                                        maybe_auto_resend_73(
-                                            &msg_type,
+                                        // PAN-51: classify directly from the decoder's own
+                                        // typed Ft8Message.standard_type instead of
+                                        // re-parsing the rendered text — see
+                                        // ft8_message_to_qso_type's doc comment.
+                                        let msg_type = ft8_message_to_qso_type(
+                                            &decoded_msg.message,
+                                            &raw_text,
                                             &our_callsign,
-                                            frequency,
-                                            decoded_msg.slot_parity,
-                                            &qso_manager,
-                                            &recent_manual_completions,
-                                            &tx_policy,
-                                            &message_bus,
-                                            &remote_tx_arm_for_auto73,
-                                        )
-                                        .await;
-
-                                        // process_message advances any active
-                                        // QSO — runs unconditionally for every
-                                        // decode so the state machine always
-                                        // sees the latest copy.
-                                        // Use the parity-carrying entry point: this
-                                        // is a live decode, so `slot_parity` is a
-                                        // real observation, letting a
-                                        // provisionally-latched QSO (e.g. answered
-                                        // from a DX-cluster/DX-Hunter spot before any
-                                        // live decode existed) refine its `tx_parity`
-                                        // to the true opposite-of-DX value on first
-                                        // contact — see
-                                        // `QsoMetadata::tx_parity_provisional`.
-                                        if let Err(e) = qso_manager
-                                            .process_message_with_parity(
-                                                msg_type.clone(),
-                                                raw_text.clone(),
-                                                frequency,
-                                                Some(snr),
-                                                decoded_msg.slot_parity,
-                                            )
-                                            .await
+                                        );
                                         {
-                                            debug!("QSO process_message error: {}", e);
-                                        }
-
-                                        // Per-slot dedup gate for always-answer
-                                        // creation. Derive the slot key from the
-                                        // decode timestamp (floor(unix_secs/15)).
-                                        let decode_slot_key =
-                                            caller_creation_slot_key(decoded_msg.timestamp);
-
-                                        // Refresh the dedup set when the slot
-                                        // changes (new 15-second window).
-                                        if decode_slot_key != caller_dedup.0 {
-                                            caller_dedup.0 = decode_slot_key;
-                                            caller_dedup.1.clear();
-                                        }
-
-                                        // Peek at the caller's base callsign
-                                        // without consuming msg_type — we only
-                                        // need it to key the dedup set.
-                                        let caller_base = classify_caller_answer(
-                                            &msg_type,
-                                            &our_callsign,
-                                        )
-                                        .map(|a| {
-                                            pancetta_qso::exchange::base_callsign(&a.their_call)
-                                        });
-
-                                        // Always-answer-callers (#39): if a
-                                        // station is calling US and no QSO
-                                        // with them is already in progress,
-                                        // come back to them — independent of
-                                        // the autonomous toggle, gated by TX
-                                        // policy / parity / capacity.
-                                        //
-                                        // Skip if we already attempted creation
-                                        // for this station in this slot (Part B
-                                        // of duplicate-QSO fix).
-                                        let skip_creation = caller_base
-                                            .as_deref()
-                                            .is_some_and(|base| caller_dedup.1.contains(base));
-
-                                        if skip_creation {
-                                            debug!(
-                                                target: "qso",
-                                                "Per-slot dedup: skipping maybe_answer_caller for {} (slot {})",
-                                                caller_base.as_deref().unwrap_or("?"),
-                                                decode_slot_key,
-                                            );
-                                        } else {
-                                            // Record the attempt BEFORE the
-                                            // async call so that a second
-                                            // decode arriving while we await
-                                            // would also be suppressed if this
-                                            // loop were ever concurrent (it
-                                            // isn't today, but is defensive).
-                                            if let Some(ref base) = caller_base {
-                                                caller_dedup.1.insert(base.clone());
-                                            }
-                                            let _admission = qso_admission.lock().await;
-                                            maybe_answer_caller(
+                                            // item-2-auto-73: a directed RR73/RRR from
+                                            // a station we just MANUALLY completed with
+                                            // means they didn't copy our 73 — bounded
+                                            // auto-re-send. Detect before process_message
+                                            // moves the parsed type. The map/window/cap
+                                            // gating lives in the helper.
+                                            maybe_auto_resend_73(
                                                 &msg_type,
                                                 &our_callsign,
                                                 frequency,
                                                 decoded_msg.slot_parity,
-                                                snr,
                                                 &qso_manager,
+                                                &recent_manual_completions,
                                                 &tx_policy,
-                                                auto_answer_max_concurrent,
                                                 &message_bus,
-                                                &fox_mode,
-                                                &fox_max_streams,
-                                                &fox_admitted_qsos,
+                                                &remote_tx_arm_for_auto73,
                                             )
                                             .await;
-                                        }
 
-                                        // #41: record what this sender is
-                                        // doing on the band so the QSO panel
-                                        // can show whether the DX we're
-                                        // calling is busy / CQing / on us.
-                                        record_dx_activity(
-                                            &dx_activity,
-                                            &msg_type,
-                                            &our_callsign,
-                                            chrono::Utc::now(),
-                                        );
+                                            // process_message advances any active
+                                            // QSO — runs unconditionally for every
+                                            // decode so the state machine always
+                                            // sees the latest copy.
+                                            // Use the parity-carrying entry point: this
+                                            // is a live decode, so `slot_parity` is a
+                                            // real observation, letting a
+                                            // provisionally-latched QSO (e.g. answered
+                                            // from a DX-cluster/DX-Hunter spot before any
+                                            // live decode existed) refine its `tx_parity`
+                                            // to the true opposite-of-DX value on first
+                                            // contact — see
+                                            // `QsoMetadata::tx_parity_provisional`.
+                                            if let Err(e) = qso_manager
+                                                .process_message_with_parity(
+                                                    msg_type.clone(),
+                                                    raw_text.clone(),
+                                                    frequency,
+                                                    Some(snr),
+                                                    decoded_msg.slot_parity,
+                                                )
+                                                .await
+                                            {
+                                                debug!("QSO process_message error: {}", e);
+                                            }
+
+                                            // Per-slot dedup gate for always-answer
+                                            // creation. Derive the slot key from the
+                                            // decode timestamp (floor(unix_secs/15)).
+                                            let decode_slot_key =
+                                                caller_creation_slot_key(decoded_msg.timestamp);
+
+                                            // Refresh the dedup set when the slot
+                                            // changes (new 15-second window).
+                                            if decode_slot_key != caller_dedup.0 {
+                                                caller_dedup.0 = decode_slot_key;
+                                                caller_dedup.1.clear();
+                                            }
+
+                                            // Peek at the caller's base callsign
+                                            // without consuming msg_type — we only
+                                            // need it to key the dedup set.
+                                            let caller_base =
+                                                classify_caller_answer(&msg_type, &our_callsign)
+                                                    .map(|a| {
+                                                        pancetta_qso::exchange::base_callsign(
+                                                            &a.their_call,
+                                                        )
+                                                    });
+
+                                            // Always-answer-callers (#39): if a
+                                            // station is calling US and no QSO
+                                            // with them is already in progress,
+                                            // come back to them — independent of
+                                            // the autonomous toggle, gated by TX
+                                            // policy / parity / capacity.
+                                            //
+                                            // Skip if we already attempted creation
+                                            // for this station in this slot (Part B
+                                            // of duplicate-QSO fix).
+                                            let skip_creation = caller_base
+                                                .as_deref()
+                                                .is_some_and(|base| caller_dedup.1.contains(base));
+
+                                            if skip_creation {
+                                                debug!(
+                                                    target: "qso",
+                                                    "Per-slot dedup: skipping maybe_answer_caller for {} (slot {})",
+                                                    caller_base.as_deref().unwrap_or("?"),
+                                                    decode_slot_key,
+                                                );
+                                            } else {
+                                                // Record the attempt BEFORE the
+                                                // async call so that a second
+                                                // decode arriving while we await
+                                                // would also be suppressed if this
+                                                // loop were ever concurrent (it
+                                                // isn't today, but is defensive).
+                                                if let Some(ref base) = caller_base {
+                                                    caller_dedup.1.insert(base.clone());
+                                                }
+                                                let _admission = qso_admission.lock().await;
+                                                maybe_answer_caller(
+                                                    &msg_type,
+                                                    &our_callsign,
+                                                    frequency,
+                                                    decoded_msg.slot_parity,
+                                                    snr,
+                                                    &qso_manager,
+                                                    &tx_policy,
+                                                    auto_answer_max_concurrent,
+                                                    &message_bus,
+                                                    &fox_mode,
+                                                    &fox_max_streams,
+                                                    &fox_admitted_qsos,
+                                                )
+                                                .await;
+                                            }
+
+                                            // #41: record what this sender is
+                                            // doing on the band so the QSO panel
+                                            // can show whether the DX we're
+                                            // calling is busy / CQing / on us.
+                                            record_dx_activity(
+                                                &dx_activity,
+                                                &msg_type,
+                                                &our_callsign,
+                                                chrono::Utc::now(),
+                                            );
+                                        }
                                     }
                                 }
 
@@ -11735,6 +11786,200 @@ mod respond_to_caller_admission_tests {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// PAN-185 scenario 1 through the running QSO loop: the keep-call
+    /// rearm's rollback was parked on the Qso inbox's durable lane (its
+    /// channel was full when the TX worker reported it). The loop still
+    /// applies it: the rearm's call, stall increment and Sent entry reverse.
+    #[tokio::test]
+    async fn pan185_qso_loop_applies_a_parked_tx_frame_not_sent() {
+        let mut coordinator = test_coordinator().await;
+        {
+            let mut cfg = coordinator.config.write().await;
+            cfg.station.callsign = "W1ABC".to_string();
+            cfg.station.grid_square = "FN42".to_string();
+        }
+        let (_tx_s, tx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        coordinator.start_qso_component().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        let id = manager
+            .respond_to_cq_manual("K1ABC".into(), 1500.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        let qso = id.to_string();
+        pan183_next_transmit_request(&tx, &qso).await;
+        let opened = manager
+            .get_qso(id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        manager
+            .rearm_manual_calls_at(opened + chrono::Duration::seconds(15))
+            .await;
+        let (rearm_text, rearm_id) = pan183_next_transmit_request(&tx, &qso).await;
+        let before = manager.get_qso(id).await.unwrap();
+        assert_eq!(before.metadata.call_count, 2);
+        assert_eq!(before.metadata.stall_cycles, 1);
+
+        coordinator.message_bus.park_for_test(ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Qso,
+            MessageType::QsoMessage(QsoMessage::TxFrameNotSent {
+                qso_id: qso.clone(),
+                message_text: rearm_text,
+                replaced: None,
+                attempt_id: rearm_id,
+            }),
+            Instant::now(),
+        ));
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let after = manager.get_qso(id).await.unwrap();
+            if after.metadata.call_count == 1 {
+                assert_eq!(
+                    after.metadata.stall_cycles, 0,
+                    "the rearm's stall increment"
+                );
+                assert_eq!(
+                    after
+                        .messages
+                        .iter()
+                        .filter(|m| m.direction == pancetta_qso::MessageDirection::Sent)
+                        .count(),
+                    1,
+                    "the rearm's Sent entry"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "QSO loop did not apply the parked rollback"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            coordinator.message_bus.durable_lane_len(ComponentId::Qso),
+            0
+        );
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// PAN-185: once the bus accepts a forwarded `TransmitRequest`, its
+    /// intent is marked queued (pivotable) and keeps its attempt id.
+    #[tokio::test]
+    async fn pan185_delivered_request_marks_its_intent_queued() {
+        let mut coordinator = test_coordinator().await;
+        {
+            let mut cfg = coordinator.config.write().await;
+            cfg.station.callsign = "W1ABC".to_string();
+            cfg.station.grid_square = "FN42".to_string();
+        }
+        let (_tx_s, tx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        coordinator.start_qso_component().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        let id = manager
+            .respond_to_cq_manual("K1ABC".into(), 1500.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        let (_, forwarded) = pan183_next_transmit_request(&tx, &id.to_string()).await;
+        let key = super::super::active_tx_qso_key(&id.to_string());
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let intent = coordinator
+                .latest_tx_intent
+                .read()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .expect("a delivered request keeps its intent");
+            assert_eq!(intent.attempt_id, forwarded);
+            if intent.request_queued {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the delivered request's intent was never marked queued"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// PAN-185 (Codex 4244560866): a request the TX worker's channel never
+    /// accepted leaves no pivotable intent behind, and the QSO engine rolls
+    /// back the attempt it recorded for it.
+    #[tokio::test]
+    async fn pan185_undelivered_request_withdraws_its_intent_and_rolls_back_its_attempt() {
+        let mut coordinator = test_coordinator().await;
+        {
+            let mut cfg = coordinator.config.write().await;
+            cfg.station.callsign = "W1ABC".to_string();
+            cfg.station.grid_square = "FN42".to_string();
+        }
+        let (tx_s, tx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        coordinator.start_qso_component().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        let id = manager
+            .respond_to_cq_manual("K1ABC".into(), 1500.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        let qso = id.to_string();
+        pan183_next_transmit_request(&tx, &qso).await;
+        let pre_resend = manager.get_qso(id).await.unwrap().metadata.call_count;
+        // The TX worker is not running here, so nothing drains the channel.
+        while tx_s
+            .try_send(ComponentMessage::new(
+                ComponentId::Ft8Transmitter,
+                ComponentId::Ft8Transmitter,
+                MessageType::AudioData(Vec::new()),
+                Instant::now(),
+            ))
+            .is_ok()
+        {}
+        manager.resend_last_tx(id).await.unwrap();
+        let key = super::super::active_tx_qso_key(&qso);
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let intent_gone = !coordinator
+                .latest_tx_intent
+                .read()
+                .unwrap()
+                .contains_key(&key);
+            let call_count = manager.get_qso(id).await.unwrap().metadata.call_count;
+            if intent_gone && call_count == pre_resend {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "undelivered request: intent_gone={intent_gone}, call_count={call_count} (want {pre_resend})"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     /// Drain the Tui channel (bounded crossbeam queue, not broadcast — a
     /// message sent before the consuming loop starts polling simply waits
     /// in the queue, so no readiness handshake is needed here), collecting
@@ -12102,6 +12347,171 @@ mod respond_to_caller_admission_tests {
             "a stall-detected request must carry the QSO's advance generation \
              so a DX advance landing before the once-per-slot drain invalidates \
              it (PAN-72 finding 8)"
+        );
+    }
+
+    /// PAN-79 item 2, coordinator-level pin: the round-2 `TxPolicy` gate and
+    /// the round-10 `hamlib_hard_muted` wiring (`start_qso_component`'s
+    /// "Fix E" block) must together mean that a Hamlib supervisor-restart
+    /// window — a designed multi-slot TX inhibition (AGENTS.md: "TX stays
+    /// inhibited throughout a Hamlib restart window") — never accumulates
+    /// stall evidence on an established QSO, and that counting resumes the
+    /// moment the window clears.
+    ///
+    /// Drives the REAL `start_qso_component` wiring. The manager comes from
+    /// `qso_manager_watch`, the Autonomous task's own consumption path: the
+    /// `qso_manager_for_supervisor` clone is taken before the `set_*_source`
+    /// calls and still carries the unwired `|| false` default, so the test
+    /// above (which drives that clone) cannot see this wiring at all. The
+    /// mute is raised on the coordinator's own `tx_restart_inhibit` atomic,
+    /// exactly as the supervisor's restart teardown does. The unit-level
+    /// companion (`a_hamlib_hard_muted_rearm_does_not_count_as_a_stall_cycle`
+    /// in pancetta-qso) proves the gate through an injected stub; this test
+    /// proves the production closure actually reads the coordinator's live
+    /// state.
+    #[tokio::test]
+    async fn a_hamlib_restart_window_accumulates_no_stall_cycles_or_offset_actions() {
+        let mut coordinator = test_coordinator().await;
+        coordinator.config.write().await.station.callsign = "K1TEST".to_string();
+        coordinator
+            .config
+            .write()
+            .await
+            .autonomous
+            .qso_stall_switch_after = 2;
+        // Auto TX-freq mode -- the silence-driven stall detector only fires
+        // there.
+        coordinator.tx_freq_mode.store(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        coordinator.start_qso_component().await.unwrap();
+        // Mirror `autonomous.rs`'s consumption path: `send_replace` runs
+        // AFTER every `set_*_source`, so this clone carries the real
+        // `hamlib_hard_muted` closure (see
+        // `qso_manager_watch_publishes_a_clone_with_injected_sources_not_defaults`).
+        let manager = coordinator
+            .qso_manager_watch
+            .subscribe()
+            .borrow()
+            .clone()
+            .expect("start_qso_component must publish a manager onto the watch channel");
+
+        // Readiness probe, as in the forwarder test above: the forwarder
+        // subscribes asynchronously, so wait until a seeded QSO lands in
+        // `active_tx_qsos` before relying on the offset-request mailbox.
+        let mut ready = false;
+        for i in 0..20 {
+            let probe_call = format!("K9RD{i}");
+            let probe_id = manager
+                .respond_to_cq_manual(probe_call.clone(), 1500.0, None)
+                .await
+                .expect("seeding a readiness-probe QSO");
+            let key = crate::coordinator::active_tx_qso_key(&probe_id.to_string());
+            for _ in 0..30 {
+                if coordinator.active_tx_qsos.read().unwrap().contains(&key) {
+                    ready = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            if ready {
+                break;
+            }
+        }
+        assert!(
+            ready,
+            "readiness probe: real forwarder never populated active_tx_qsos"
+        );
+
+        let qso_id = manager
+            .respond_to_cq_manual("K9RST".to_string(), 1501.0, None)
+            .await
+            .expect("seeding the stalling QSO");
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        // Raise the restart window on the coordinator's own atomic -- the one
+        // the wiring's closure reads and the supervisor's teardown raises.
+        coordinator
+            .tx_restart_inhibit
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+
+        // Four muted rearms, twice the threshold, two slots apart so each
+        // would feed a distinct own-parity TX slot (PAN-128).
+        for slot in [15i64, 45, 75, 105] {
+            manager
+                .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(slot))
+                .await;
+        }
+
+        let muted = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            muted.metadata.stall_cycles, 0,
+            "a Hamlib restart window keys nothing, so the DX's silence is not \
+             stall evidence (PAN-79 item 2)"
+        );
+        assert_eq!(
+            muted.metadata.last_call_at,
+            Some(opened_at),
+            "a muted rearm must not spend any attempt bookkeeping"
+        );
+        for _ in 0..100 {
+            assert!(
+                !coordinator
+                    .pending_qso_offset_requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|req| req.qso_id == qso_id),
+                "no TxOffsetActionNeeded may be raised during a Hamlib restart window"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // The window clears (the Hamlib restart path's decrement in
+        // production). Two more rearms cross the threshold of 2: counting
+        // resumes from zero, so the earlier zero was the mute, not a dead
+        // detector.
+        coordinator
+            .tx_restart_inhibit
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        manager
+            .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(135))
+            .await;
+        manager
+            .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(165))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            2,
+            "once the restart window clears, each unanswered rearm counts again"
+        );
+
+        let mut found = false;
+        for _ in 0..100 {
+            if coordinator
+                .pending_qso_offset_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|req| req.qso_id == qso_id)
+            {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            found,
+            "after the restart window clears, a genuine stall must still raise \
+             TxOffsetActionNeeded into pending_qso_offset_requests"
         );
     }
 
@@ -14504,5 +14914,70 @@ mod remote_controller_change_tests {
         }
         assert!(h.manager.has_active_qso_with("K4LOC").await);
         assert!(!h.manager.has_active_qso_with("K3CCC").await);
+    }
+}
+
+// ------------------------------------------------------------------
+// PAN-69: wiring pins for the DecodedMessage handler's stale-band
+// gate. These exercise the shared predicate with the exact fixture
+// shape the handler receives — a directed decode whose captured dial
+// no longer matches the live band must be dropped before
+// maybe_answer_caller can create a QSO on the new band.
+// ------------------------------------------------------------------
+#[cfg(test)]
+mod pan69_stale_band_tests {
+    use pancetta_ft8::{DecodedMessage, Ft8Message};
+
+    /// A synthetic directed decode — the shape the QSO handler's
+    /// `MessageType::DecodedMessage` arm receives. `captured_dial_hz`
+    /// starts `None`, exactly like `DecodedMessage::new` leaves it (and
+    /// like test scaffolding that never went through the decoder's
+    /// stamping site).
+    fn directed_decode() -> DecodedMessage {
+        let mut msg = DecodedMessage::new(
+            Ft8Message {
+                from_callsign: Some("W1AW".to_string()),
+                to_callsign: Some("K5ARH".to_string()),
+                ..Ft8Message::default()
+            },
+            -10.0,  // snr_db
+            0.9,    // confidence
+            1500.0, // frequency_offset
+            0.05,   // time_offset
+        );
+        msg.text = "K5ARH W1AW FN31".to_string();
+        msg
+    }
+
+    #[test]
+    fn directed_decode_from_a_prior_band_is_stale_for_the_qso_handler() {
+        // Old-band decode (40m) arriving after a switch to 20m must be dropped
+        // before maybe_answer_caller can create a QSO on the new band.
+        let mut msg = directed_decode();
+        msg.captured_dial_hz = Some(7_074_000);
+        assert!(crate::coordinator::is_stale_band_decode(
+            msg.captured_dial_hz,
+            14_074_000
+        ));
+    }
+
+    #[test]
+    fn fresh_decode_and_unknown_dial_decodes_are_never_dropped_by_the_qso_handler() {
+        let mut msg = directed_decode();
+        msg.captured_dial_hz = Some(14_074_000); // same band  -> admitted
+        assert!(!crate::coordinator::is_stale_band_decode(
+            msg.captured_dial_hz,
+            14_074_000
+        ));
+        msg.captured_dial_hz = None; // no CAT     -> admitted (fail open)
+        assert!(!crate::coordinator::is_stale_band_decode(
+            msg.captured_dial_hz,
+            14_074_000
+        ));
+        msg.captured_dial_hz = Some(7_074_000); // live unknown -> admitted
+        assert!(!crate::coordinator::is_stale_band_decode(
+            msg.captured_dial_hz,
+            0
+        ));
     }
 }

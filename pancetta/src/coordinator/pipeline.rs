@@ -56,8 +56,16 @@ pub(crate) async fn forward_or_drop_async<T>(
 pub(crate) const DECODE_FORWARD_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// One accumulated FT8/FT4 audio window handed from the DSP stage to the
-/// decoder, tagged with the dial frequency the audio was actually captured
-/// on (`dsp.rs`'s `band_ref_dial_hz`, Hz, 0 = unknown).
+/// decoder, tagged with `dial_hz`: the dial the DSP read in the audio batch
+/// that completed the window (`dsp.rs`'s `cur_dial_hz`, Hz, 0 = unknown),
+/// fixed when the window is built.
+///
+/// PAN-70: the DSP flushes its buffered audio whenever an established
+/// nonzero dial reading changes to a different nonzero value, even by 1 Hz
+/// within a band, so a window never holds audio the DSP saw on a different
+/// known dial. The guarantee is per DSP observation, not per sample: audio
+/// batches carry no dial tag, so audio queued before a retune, CAT readback
+/// latency, and a move away and back between two reads are not detected.
 ///
 /// PAN-67: decoding is real CPU work (FFT+LDPC) with a genuine wall-clock
 /// gap between window-close and relay. A prior design read the *live*

@@ -501,6 +501,14 @@ tested.
     lookup table redundant: it is already the authoritative live slot length (it also correctly
     reports 15 s for a `mode=FT2` config on a build without the `ft2` feature, where the decoder
     really is running FT8 timing — the table said 3.2 s there).
+- **Amended by PAN-79 (Codex round 10 on PR #350).** A stall now counts only after EVERY TX gate
+  permits the frame. Round 2's `TxPolicy` gate and round 7's remote-arm gate are joined by
+  `QsoManager::set_hamlib_hard_muted_source`, which shares the TX worker's own pre-PTT Hamlib hard
+  mute (`tx_hard_mute_reason`: restart window, command loop not ready, undelivered pending
+  frequency/split, in-flight rig command, and PAN-115's dead link/audio) read-only with
+  `rearm_manual_calls_at`'s `frame_reaches_the_air` check. `start_qso_component` wires it from the
+  gate's own atomics, and it defaults to "not muted" for unwired callers. It is never a TX gate;
+  the fail-CLOSED check stays in the TX worker.
 - **Amended by PAN-130 (Codex round 12 on PR #350, P2).** A `Switch` now resolves against the
   drain's own `get_qso` read of `metadata.frequency` (`current_hz`) instead of the queued
   `avoid_hz`, which is used only as a fallback when the QSO is gone — the same fallback the
