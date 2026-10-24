@@ -495,6 +495,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Before the first waterfall lands, adaptive TX-offset relocation (stall
+  switches, occupied-target reverts, `u` nudges) now searches the same 25 Hz
+  candidate grid as the spectral path, with the same window, `avoid` and batch
+  exclusions, instead of its own 75 Hz grid. A narrow `[hound]` region that held
+  no 75 Hz point (1130–1155 Hz, say) is no longer refused before the waterfall
+  and honored after it. Picks made with a waterfall are unchanged, and so is
+  the first CQ pick after a start (200 Hz) (PAN-80).
+
 - Published decode-sensitivity figures (FEATURES.md, README.md,
   `pancetta-ft8` docs) now come from the shipped pipeline — ft8_lib plus the
   native decoder, merged, under the receipt-anchored per-window budget —

@@ -3,6 +3,82 @@
 
 # TX scheduling
 
+## One candidate set for both TX-offset resolution paths (PAN-80, 2026-10-24)
+
+`AutonomousOperator::allocate_smart_frequency_in_range` resolves every adaptive
+TX-offset relocation (a stall `Switch`, an occupied-target `Revert`, a `u`
+nudge) through one of two paths: spectral ranking once a waterfall has landed,
+or the no-snapshot fallback before that (a fresh start, an Autonomous-task
+restart). Each path used to build and filter its own candidate grid. Twice on
+PR #350 a constraint was added to the spectral path only: round 2 bound the
+Hound window there while the fallback only clamped its result into the
+window, and round 3 bound the `avoid_hz`/`also_avoid_hz` exclusions there
+while the fallback ignored them until `allocate_cq_frequency_excluding`
+re-implemented them. Round 3 closed the known gap, but nothing stopped a third
+constraint kind from repeating it.
+
+The grids themselves also disagreed. The spectral path stepped
+`FrequencyAllocatorConfig::step_hz` (25 Hz) over the configured `range`; the
+fallback stepped a hardcoded 75 Hz over a hardcoded (200, 2800). A valid
+`[hound]` window such as (1130, 1155) holds 1150 on the 25 Hz grid and no point
+on the 75 Hz one, so the same `Switch` was honored or refused depending only on
+whether a waterfall had landed. A `step_hz` or `range` other than the default
+bound only the spectral path.
+
+The resolution now builds one `frequency::TxOffsetConstraints` (window,
+`avoid_hz`, `also_avoid_hz`, `min_separation_hz`, with today's inclusive-window
+and `>=` separation rules), and both paths take their candidates from
+`frequency::admissible_candidates`, the only candidate-grid loop in the
+allocation code. It steps `step_hz` from `range.0` over the `sweep_bounds`
+widening (PAN-72 round 6) and keeps only what the constraints admit. Then:
+
+- with a snapshot, `SmartFrequencyAllocator::rank_admissible_candidates` scores
+  the candidates with the unchanged seven-term score, the CQ-mode live-spot
+  boost applies as before, and the best is taken;
+- without one, `FrequencyAllocator::clearance_pick` applies the unchanged
+  clearance formula (distance to the nearest own QSO minus 20 per observed
+  decode within 100 Hz);
+- one tail follows both: no candidate returns `avoid_hz` unchanged (the signal
+  `apply_tx_offset_switch` refuses as `OffsetActionNoOp`), and with no
+  `avoid_hz` the unconstrained `allocate_cq_frequency` pick is clamped into the
+  window.
+
+A future constraint kind goes into `TxOffsetConstraints` and binds on both
+paths by construction. `allocate_cq_frequency_excluding` and
+`rank_candidates_in_range` are deleted; `rank_candidates` and
+`rank_candidates_with_parity` (the placement instrument, `sim.rs`) are
+unconstrained wrappers over `rank_admissible_candidates`.
+
+- **Spectral picks are unchanged.** Scoring is per candidate, so filtering
+  before scoring gives the same scores as filtering after, and the stable sort
+  over the ascending grid keeps tie order. The boost re-sorts in place as before.
+- **The fallback joins the configured grid.** This is the one intended behavior
+  change: narrow windows the 75 Hz grid could not represent are searched,
+  `step_hz`/`range` bind on the fallback, and with own QSOs or observed
+  decodes the clearance pick can land on a 25 Hz point between two old 75 Hz
+  ones. Fresh-start picks do not move: with no own QSO every clearance is
+  `f64::MAX`, so the first grid point (200 on both grids) wins.
+- **The last resort keeps its own grid.** `allocate_cq_frequency` still scans
+  the legacy allocator's (200, 2800) at 75 Hz, now through the generator with
+  no constraints, so its picks are identical and the clamp still dominates.
+- **Rejected: share only the predicate.** Keeping two grids leaves the
+  window-membership divergence above in place.
+- **Rejected: unify the scoring too.** The two layers read different evidence
+  (own/observed frequencies versus the snapshot and slot-aware decode
+  history), and merging them would change what a pick means. The clearance
+  saturation with no own QSO is left as it is; changing it is a scoring policy
+  change that needs on-air validation.
+- **Tests.** `pancetta-qso` `autonomous::tests::pan80_*`: the spectral picks
+  pinned across window/avoid/batch/DX/parity/own/live-spot cases, both-path
+  exhaustion, the clamped last resort, Hold precedence, the fresh-start floor,
+  the narrow-window, `step_hz` and `range` cases on the fallback, and
+  `pan80_every_non_exhaustion_pick_satisfies_the_constraints`, which checks
+  360 combinations against an independently computed grid and predicate.
+  `frequency::tests` covers the predicate edges, the generator's grid,
+  widening and filtering, and `ranked_output_is_unchanged_by_the_generator_rewiring`
+  compares the new ranking field for field with a frozen copy of the old scan.
+  No on-air run: the loopback suite and these unit tests are the evidence.
+
 ## DX-parity evidence is scoped to band and slot grid (PAN-146, 2026-10-21)
 
 PAN-141's pre-PTT hold reads the DX's newest fresh sighting in

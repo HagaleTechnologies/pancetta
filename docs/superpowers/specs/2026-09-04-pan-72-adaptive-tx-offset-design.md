@@ -526,6 +526,14 @@ tested.
   `Revert` back onto it. `tx_equals_rx` is now `partner_freq.is_none()`: the decode frequency
   decides only after a switch on an unanswered `CallingCq`. Stall-triggered outcomes are
   unchanged.
+- **Amended by PAN-80.** Rounds 2 and 3 above each added a constraint to the spectral branch
+  first and the no-snapshot fallback second, and the fallback kept its own 75 Hz grid.
+  `allocate_smart_frequency_in_range` now builds one `frequency::TxOffsetConstraints` (window,
+  `avoid_hz`, `also_avoid_hz`, `min_separation_hz`), and both paths take their candidates from
+  `frequency::admissible_candidates` over the configured 25 Hz grid: the spectral branch scores
+  them (`rank_admissible_candidates`, picks unchanged), the fallback applies the unchanged
+  clearance formula (`FrequencyAllocator::clearance_pick`), and one tail returns `avoid_hz` on
+  exhaustion. `allocate_cq_frequency_excluding` is gone. See `docs/DECISIONS/tx-scheduling.md`.
 
 ## Manual "nudge" keystroke — `pancetta-tui`
 

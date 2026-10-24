@@ -223,10 +223,9 @@ pub struct PlacementSnapshot {
 /// PAN-72 (Codex round 6 on PR #350, finding 3). A caller-supplied window (the
 /// Hound calling/response region) is operator configuration and may legitimately
 /// reach outside the allocator's range; used only as a post-hoc filter it
-/// emptied the candidate list instead of being searched. Both scans — the ranked
-/// spectral one here and [`crate::autonomous::FrequencyAllocator::allocate_cq_frequency_excluding`]'s
-/// legacy fallback — take their bounds from this one function so they can never
-/// disagree about what "the searchable range" is.
+/// emptied the candidate list instead of being searched. Every candidate grid
+/// takes its bounds from this one function, via [`admissible_candidates`]
+/// (PAN-80), so no two scans can disagree about what "the searchable range" is.
 ///
 /// Two properties matter:
 ///
@@ -257,6 +256,92 @@ pub(crate) fn sweep_bounds(
         cfg_lo
     };
     (start, cfg_hi.max(hi))
+}
+
+/// Every hard constraint one TX-offset resolution must honor.
+///
+/// PAN-80. Twice on PR #350 (round 2: the Hound window; round 3: the
+/// `avoid_hz`/`also_avoid_hz` batch exclusions) a constraint was added to the
+/// spectral-ranked branch of
+/// [`crate::autonomous::AutonomousOperator::allocate_smart_frequency_in_range`]
+/// and missed on its no-snapshot fallback, because each path enumerated and
+/// filtered its own candidates. Both paths now take their candidates from
+/// [`admissible_candidates`] filtered by this one type, so a new constraint
+/// kind belongs here and binds on both paths at once.
+///
+/// - `window`: inclusive `[lo, hi]` Hz bounds (the Hound calling/response
+///   region), already sanitized by the caller;
+/// - `avoid_hz`: the offset being abandoned;
+/// - `also_avoid_hz`: offsets already handed to other QSOs in the same batch;
+/// - `separation_hz`: the distance every exclusion is enforced at, with
+///   today's `>=` rule (an offset exactly `separation_hz` away is admitted).
+///
+/// `None` / empty leaves that dimension unconstrained.
+#[derive(Debug, Clone)]
+pub(crate) struct TxOffsetConstraints {
+    pub(crate) window: Option<(f64, f64)>,
+    pub(crate) avoid_hz: Option<f64>,
+    pub(crate) also_avoid_hz: Vec<f64>,
+    pub(crate) separation_hz: f64,
+}
+
+impl TxOffsetConstraints {
+    /// No window and no exclusions. `separation_hz` is 0.0, which is inert
+    /// because there is nothing to separate from.
+    pub(crate) fn unconstrained() -> Self {
+        Self {
+            window: None,
+            avoid_hz: None,
+            also_avoid_hz: Vec::new(),
+            separation_hz: 0.0,
+        }
+    }
+
+    /// `true` if a TX offset of `hz` satisfies every constraint.
+    pub(crate) fn admits(&self, hz: f64) -> bool {
+        self.window.is_none_or(|(lo, hi)| hz >= lo && hz <= hi)
+            && self
+                .avoid_hz
+                .is_none_or(|avoid| (hz - avoid).abs() >= self.separation_hz)
+            && self
+                .also_avoid_hz
+                .iter()
+                .all(|&other| (hz - other).abs() >= self.separation_hz)
+    }
+}
+
+/// The candidate TX offsets a resolution may consider, in ascending order.
+///
+/// PAN-80: this is the only candidate-grid loop in the allocation code. Both
+/// resolution paths (spectral scoring and the no-snapshot clearance pick) and
+/// the unconstrained instrument ranking get their candidates here, so grid
+/// bounds, grid granularity and hard constraints cannot differ between them.
+///
+/// The grid starts at `range.0` and steps by `step_hz` over
+/// [`sweep_bounds`]`(range, step_hz, bounds_window)`; only offsets
+/// `constraints` admits are kept. `bounds_window` only widens the sweep, and
+/// the resolution paths pass `constraints.window` for it. A non-positive or
+/// non-finite `step_hz` yields no candidates rather than a loop that never
+/// advances.
+pub(crate) fn admissible_candidates(
+    range: (f64, f64),
+    step_hz: f64,
+    bounds_window: Option<(f64, f64)>,
+    constraints: &TxOffsetConstraints,
+) -> Vec<f64> {
+    if !(step_hz.is_finite() && step_hz > 0.0) {
+        return Vec::new();
+    }
+    let (min_f, max_f) = sweep_bounds(range, step_hz, bounds_window);
+    let mut candidates = Vec::new();
+    let mut freq = min_f;
+    while freq <= max_f {
+        if constraints.admits(freq) {
+            candidates.push(freq);
+        }
+        freq += step_hz;
+    }
+    candidates
 }
 
 /// Stateless frequency allocator. Given spectral + decode data, returns ranked candidates.
@@ -318,72 +403,67 @@ impl SmartFrequencyAllocator {
         dx_target_hz: Option<f64>,
         target_parity: Option<TimeSlot>,
     ) -> Vec<FrequencyCandidate> {
-        self.rank_candidates_in_range(
+        self.rank_admissible_candidates(
             spectral,
             history,
             own_frequencies,
             dx_target_hz,
             target_parity,
-            None,
+            &TxOffsetConstraints::unconstrained(),
         )
     }
 
-    /// [`Self::rank_candidates_with_parity`] over a candidate grid that is
-    /// guaranteed to COVER `window`, even where `window` reaches outside
-    /// [`FrequencyAllocatorConfig::range`].
+    /// The spectral scoring layer over the shared candidate set: every offset
+    /// [`admissible_candidates`] yields for `constraints`, scored, sorted by
+    /// score descending.
     ///
-    /// PAN-72 (Codex round 6 on PR #350, finding 3). The Hound response region
-    /// is operator configuration and may legitimately sit above the allocator's
-    /// own range (`200–2800 Hz` by default) — `2850–2900 Hz`, say. Callers used
-    /// to hand that window down only as a FILTER over candidates already
-    /// generated from `config.range`, so such a region emptied the ranked list
-    /// outright: every post-QSY Hound stall switch and `u` nudge resolved back
-    /// to `avoid_hz` and was refused as a no-op, with the configured region
-    /// never actually searched.
-    ///
-    /// The sweep is WIDENED, never narrowed, and stays anchored to
-    /// `config.range.0` — every offset this scan produced before is still
-    /// produced, bit for bit, so a window inside the configured range ranks
-    /// exactly as it did. See [`sweep_bounds`].
-    pub fn rank_candidates_in_range(
+    /// PAN-80. The grid is generated over `constraints.window` as well as
+    /// [`FrequencyAllocatorConfig::range`] (the round-6 widening, see
+    /// [`sweep_bounds`]) and hard-filtered by `constraints` before scoring.
+    /// Scoring is per candidate, so filtering first gives the same scores as
+    /// the old score-then-filter order; the sort is stable over the ascending
+    /// grid, so equal scores also keep the same order.
+    pub(crate) fn rank_admissible_candidates(
         &self,
         spectral: &SpectralSnapshot,
         history: &DecodeHistory,
         own_frequencies: &[f64],
         dx_target_hz: Option<f64>,
         target_parity: Option<TimeSlot>,
-        window: Option<(f64, f64)>,
+        constraints: &TxOffsetConstraints,
     ) -> Vec<FrequencyCandidate> {
-        let step = self.config.step_hz;
-        let (min_f, max_f) = sweep_bounds(self.config.range, step, window);
-        let mut candidates = Vec::new();
+        let grid = admissible_candidates(
+            self.config.range,
+            self.config.step_hz,
+            constraints.window,
+            constraints,
+        );
+        let mut candidates: Vec<FrequencyCandidate> = grid
+            .into_iter()
+            .map(|freq| {
+                let score = self.score_candidate(
+                    freq,
+                    spectral,
+                    history,
+                    own_frequencies,
+                    dx_target_hz,
+                    target_parity,
+                );
+                let noise = spectral.power_near(freq, 25.0);
+                let clear = history.is_clear_both_slots(freq, 50.0);
+                let clear_first = history.activity_near_in_slot(freq, 50.0, TimeSlot::First) == 0;
+                let clear_second = history.activity_near_in_slot(freq, 50.0, TimeSlot::Second) == 0;
 
-        let mut freq = min_f;
-        while freq <= max_f {
-            let score = self.score_candidate(
-                freq,
-                spectral,
-                history,
-                own_frequencies,
-                dx_target_hz,
-                target_parity,
-            );
-            let noise = spectral.power_near(freq, 25.0);
-            let clear = history.is_clear_both_slots(freq, 50.0);
-            let clear_first = history.activity_near_in_slot(freq, 50.0, TimeSlot::First) == 0;
-            let clear_second = history.activity_near_in_slot(freq, 50.0, TimeSlot::Second) == 0;
-
-            candidates.push(FrequencyCandidate {
-                offset_hz: freq,
-                score,
-                clear_both_slots: clear,
-                clear_first,
-                clear_second,
-                noise_floor: noise,
-            });
-
-            freq += step;
-        }
+                FrequencyCandidate {
+                    offset_hz: freq,
+                    score,
+                    clear_both_slots: clear,
+                    clear_first,
+                    clear_second,
+                    noise_floor: noise,
+                }
+            })
+            .collect();
 
         candidates.sort_by(|a, b| {
             b.score
@@ -979,5 +1059,308 @@ mod tests {
             "Expected no peak 200 Hz away from the real peak location, got {}",
             shifted
         );
+    }
+
+    // --- PAN-80: the shared candidate generator ---
+
+    fn pan80_constraints(
+        window: Option<(f64, f64)>,
+        avoid_hz: Option<f64>,
+        also_avoid_hz: &[f64],
+        separation_hz: f64,
+    ) -> TxOffsetConstraints {
+        TxOffsetConstraints {
+            window,
+            avoid_hz,
+            also_avoid_hz: also_avoid_hz.to_vec(),
+            separation_hz,
+        }
+    }
+
+    #[test]
+    fn tx_offset_constraints_admits_both_window_edges() {
+        let c = pan80_constraints(Some((1000.0, 1100.0)), None, &[], 75.0);
+        assert!(c.admits(1000.0), "the lower edge is inside the window");
+        assert!(c.admits(1100.0), "the upper edge is inside the window");
+        assert!(!c.admits(999.9));
+        assert!(!c.admits(1100.1));
+    }
+
+    #[test]
+    fn tx_offset_constraints_admits_exactly_the_separation_from_avoid() {
+        let c = pan80_constraints(None, Some(1500.0), &[], 75.0);
+        assert!(c.admits(1425.0), "|hz - avoid| == separation admits");
+        assert!(c.admits(1575.0), "|hz - avoid| == separation admits");
+        assert!(!c.admits(1425.1));
+        assert!(!c.admits(1500.0));
+    }
+
+    #[test]
+    fn tx_offset_constraints_admits_enforces_every_also_avoid_entry() {
+        let c = pan80_constraints(None, None, &[1000.0, 2000.0], 75.0);
+        assert!(!c.admits(1050.0), "too close to the first entry");
+        assert!(!c.admits(1950.0), "too close to the second entry");
+        assert!(c.admits(1075.0));
+        assert!(c.admits(1500.0));
+        assert!(c.admits(1925.0));
+    }
+
+    #[test]
+    fn tx_offset_constraints_admits_everything_when_unconstrained() {
+        let c = TxOffsetConstraints::unconstrained();
+        for hz in [-1.0, 0.0, 200.0, 1500.0, 2800.0, 5000.0] {
+            assert!(c.admits(hz), "{hz} must be admitted");
+        }
+        // Each dimension is independently optional.
+        assert!(pan80_constraints(None, None, &[], 75.0).admits(1500.0));
+        assert!(pan80_constraints(Some((1000.0, 2000.0)), None, &[], 75.0).admits(1500.0));
+        assert!(pan80_constraints(None, Some(200.0), &[], 75.0).admits(1500.0));
+    }
+
+    /// The separation rule is today's `>=` on both resolution paths, so a
+    /// zero separation is satisfied by the avoided offset itself. Keeping it
+    /// is what keeps a `min_separation_hz = 0` configuration's picks unchanged.
+    #[test]
+    fn tx_offset_constraints_admits_zero_separation_keeps_the_ge_rule() {
+        let c = pan80_constraints(None, Some(1500.0), &[1000.0], 0.0);
+        assert!(c.admits(1500.0));
+        assert!(c.admits(1000.0));
+        assert!(c.admits(1499.0));
+    }
+
+    #[test]
+    fn admissible_candidates_is_the_anchored_ascending_grid() {
+        let config = FrequencyAllocatorConfig::default();
+        let grid = admissible_candidates(
+            config.range,
+            config.step_hz,
+            None,
+            &TxOffsetConstraints::unconstrained(),
+        );
+        assert_eq!(grid.first(), Some(&200.0));
+        assert_eq!(grid.last(), Some(&2800.0));
+        assert_eq!(grid.len(), 105, "(2800 - 200) / 25 + 1");
+        assert!(
+            grid.windows(2).all(|w| w[1] - w[0] == 25.0),
+            "strictly ascending in whole 25 Hz steps"
+        );
+    }
+
+    #[test]
+    fn admissible_candidates_widens_bounds_but_filters_by_window() {
+        let range = (200.0, 2800.0);
+        let unconstrained = TxOffsetConstraints::unconstrained();
+
+        // Above the range: the grid reaches the window...
+        let widened = admissible_candidates(range, 25.0, Some((2850.0, 2900.0)), &unconstrained);
+        assert_eq!(widened.first(), Some(&200.0), "still anchored at range.0");
+        assert_eq!(widened.last(), Some(&2900.0));
+        // ...and the window keeps only what is inside it.
+        let above = pan80_constraints(Some((2850.0, 2900.0)), None, &[], 75.0);
+        assert_eq!(
+            admissible_candidates(range, 25.0, above.window, &above),
+            vec![2850.0, 2875.0, 2900.0]
+        );
+
+        // Below the floor: the grid walks down in whole steps, to 125.
+        let lowered = admissible_candidates(range, 25.0, Some((140.0, 500.0)), &unconstrained);
+        assert_eq!(lowered.first(), Some(&125.0), "200 - ceil(60/25)*25");
+        let below = pan80_constraints(Some((140.0, 500.0)), None, &[], 75.0);
+        let survivors = admissible_candidates(range, 25.0, below.window, &below);
+        assert_eq!(survivors.first(), Some(&150.0), "125 is below the window");
+        assert_eq!(survivors.last(), Some(&500.0));
+        assert!(survivors.iter().all(|&hz| (140.0..=500.0).contains(&hz)));
+    }
+
+    #[test]
+    fn admissible_candidates_applies_every_constraint_kind_at_once() {
+        let window = (1000.0, 2000.0);
+        let (avoid, also, sep) = (1500.0, [1100.0, 1800.0], 75.0);
+        let c = pan80_constraints(Some(window), Some(avoid), &also, sep);
+        let got = admissible_candidates((200.0, 2800.0), 25.0, c.window, &c);
+
+        // Independent oracle: the 25 Hz grid from 200, filtered by hand.
+        let expected: Vec<f64> = (0..=104)
+            .map(|i| 200.0 + 25.0 * i as f64)
+            .filter(|&hz| hz >= window.0 && hz <= window.1)
+            .filter(|&hz| (hz - avoid).abs() >= sep)
+            .filter(|&hz| also.iter().all(|&o| (hz - o).abs() >= sep))
+            .collect();
+        assert_eq!(got, expected);
+        assert!(!got.contains(&1500.0) && !got.contains(&1100.0) && !got.contains(&1800.0));
+        assert!(got.contains(&1425.0) && got.contains(&1575.0));
+    }
+
+    #[test]
+    fn admissible_candidates_empty_when_constraints_are_unsatisfiable() {
+        let between = pan80_constraints(Some((2110.0, 2115.0)), None, &[], 75.0);
+        assert!(
+            admissible_candidates((200.0, 2800.0), 25.0, between.window, &between).is_empty(),
+            "no grid point lies in a 5 Hz window between 2100 and 2125"
+        );
+        let impossible = pan80_constraints(None, Some(1500.0), &[], 10_000.0);
+        assert!(admissible_candidates((200.0, 2800.0), 25.0, None, &impossible).is_empty());
+    }
+
+    /// The pre-PAN-80 ranked scan, frozen verbatim as the oracle for the
+    /// generator rewiring: its own loop over the `sweep_bounds`-widened grid,
+    /// every point scored, then sorted, with no hard filtering.
+    fn pre_pan80_ranking(
+        allocator: &SmartFrequencyAllocator,
+        spectral: &SpectralSnapshot,
+        history: &DecodeHistory,
+        own_frequencies: &[f64],
+        dx_target_hz: Option<f64>,
+        target_parity: Option<TimeSlot>,
+        window: Option<(f64, f64)>,
+    ) -> Vec<FrequencyCandidate> {
+        let step = allocator.config.step_hz;
+        let (min_f, max_f) = sweep_bounds(allocator.config.range, step, window);
+        let mut candidates = Vec::new();
+        let mut freq = min_f;
+        while freq <= max_f {
+            candidates.push(FrequencyCandidate {
+                offset_hz: freq,
+                score: allocator.score_candidate(
+                    freq,
+                    spectral,
+                    history,
+                    own_frequencies,
+                    dx_target_hz,
+                    target_parity,
+                ),
+                clear_both_slots: history.is_clear_both_slots(freq, 50.0),
+                clear_first: history.activity_near_in_slot(freq, 50.0, TimeSlot::First) == 0,
+                clear_second: history.activity_near_in_slot(freq, 50.0, TimeSlot::Second) == 0,
+                noise_floor: spectral.power_near(freq, 25.0),
+            });
+            freq += step;
+        }
+        candidates.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        candidates
+    }
+
+    /// Every field of every candidate, floats by bit pattern.
+    fn pan80_fingerprint(
+        candidates: &[FrequencyCandidate],
+    ) -> Vec<(u64, u64, bool, bool, bool, u32)> {
+        candidates
+            .iter()
+            .map(|c| {
+                (
+                    c.offset_hz.to_bits(),
+                    c.score.to_bits(),
+                    c.clear_both_slots,
+                    c.clear_first,
+                    c.clear_second,
+                    c.noise_floor.to_bits(),
+                )
+            })
+            .collect()
+    }
+
+    /// A waterfall with a strong carrier near 1000 Hz and a busy history
+    /// around 1600 Hz in the First slot, so noise, neighbor, occupancy,
+    /// parity, DX and own-penalty terms all vary across the grid.
+    fn pan80_textured_inputs() -> (SpectralSnapshot, DecodeHistory) {
+        let mut power_bins = vec![0.05f32; 140];
+        for bin in power_bins.iter_mut().skip(40).take(5) {
+            *bin = 0.9;
+        }
+        let spectral = SpectralSnapshot {
+            power_bins,
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        };
+        let mut history = empty_history();
+        history.push_cycle(
+            [1575.0, 1600.0, 1600.0, 1650.0]
+                .into_iter()
+                .map(|frequency_hz| DecodeRecord {
+                    frequency_hz,
+                    time_slot: TimeSlot::First,
+                })
+                .collect(),
+        );
+        (spectral, history)
+    }
+
+    /// The PAN-80 rewiring changes no ranked output. Unconstrained, the
+    /// instrument ranking equals the old scan field for field. Constrained,
+    /// filtering before scoring equals the old scan filtered afterwards, in
+    /// the same order.
+    #[test]
+    fn ranked_output_is_unchanged_by_the_generator_rewiring() {
+        let allocator = SmartFrequencyAllocator::new(FrequencyAllocatorConfig::default());
+        let (spectral, history) = pan80_textured_inputs();
+        let own = [1500.0];
+        let (dx, parity) = (Some(1000.0), Some(TimeSlot::Second));
+
+        let unconstrained =
+            allocator.rank_candidates_with_parity(&spectral, &history, &own, dx, parity);
+        let old = pre_pan80_ranking(&allocator, &spectral, &history, &own, dx, parity, None);
+        assert_eq!(unconstrained.len(), 105);
+        assert_eq!(pan80_fingerprint(&unconstrained), pan80_fingerprint(&old));
+
+        for (constraints, len) in [
+            (
+                pan80_constraints(Some((1000.0, 2700.0)), None, &[], 75.0),
+                69,
+            ),
+            (
+                pan80_constraints(Some((2850.0, 2900.0)), None, &[], 75.0),
+                3,
+            ),
+            (
+                pan80_constraints(
+                    Some((1000.0, 2700.0)),
+                    Some(1600.0),
+                    &[1100.0, 2000.0],
+                    75.0,
+                ),
+                54, // 69 in the window, minus 5 within 75 Hz of each exclusion
+            ),
+        ] {
+            let got = allocator.rank_admissible_candidates(
+                &spectral,
+                &history,
+                &own,
+                dx,
+                parity,
+                &constraints,
+            );
+            let window = constraints.window.unwrap();
+            let old_then_filtered: Vec<FrequencyCandidate> = pre_pan80_ranking(
+                &allocator,
+                &spectral,
+                &history,
+                &own,
+                dx,
+                parity,
+                Some(window),
+            )
+            .into_iter()
+            .filter(|c| {
+                let hz = c.offset_hz;
+                hz >= window.0
+                    && hz <= window.1
+                    && constraints.avoid_hz.is_none_or(|a| (hz - a).abs() >= 75.0)
+                    && constraints
+                        .also_avoid_hz
+                        .iter()
+                        .all(|&o| (hz - o).abs() >= 75.0)
+            })
+            .collect();
+            assert_eq!(got.len(), len, "{constraints:?}");
+            assert_eq!(
+                pan80_fingerprint(&got),
+                pan80_fingerprint(&old_then_filtered),
+                "{constraints:?}"
+            );
+        }
     }
 }
