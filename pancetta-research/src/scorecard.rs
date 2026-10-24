@@ -22,6 +22,77 @@ pub struct Scorecard {
     pub composite: CompositeInfo,
     pub regressions: RegressionFlags,
     pub notes: String,
+    /// PAN-110: what a `--merge-ft8lib` run measured and where: the
+    /// production pipeline it reproduces, the host CPU and the corpus
+    /// hashes. Absent from every other scorecard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Provenance>,
+}
+
+/// PAN-110: provenance of a production-pipeline (`--merge-ft8lib`)
+/// benchmark, recorded so a published decode-quality figure can be traced
+/// to the pipeline, commit (`git`), host and corpus that produced it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Provenance {
+    /// Always `"ft8lib+native-merge"`: ft8_lib's decodes, then new native
+    /// texts, then hash-twin dedup, as `pancetta/src/coordinator/ft8.rs`.
+    pub pipeline: String,
+    /// `--budget-anchor` (always `"receipt"` for this pipeline).
+    pub budget_anchor: String,
+    /// `--effort` preset name, if one was passed.
+    pub effort: Option<String>,
+    /// Per-window budget the preset resolved to (`None` = unlimited).
+    pub budget_ms: Option<u64>,
+    /// Whether the ft8_lib FFI backend was compiled in for this run.
+    pub ft8lib_available: bool,
+    /// `--ap-my-call`, the only AP input production has at cold start.
+    pub ap_my_call: Option<String>,
+    /// Production stages this run does not reproduce.
+    pub not_modelled: Vec<String>,
+    pub host_cpu: HostCpu,
+    /// The synth corpus scored, when the run included a synth tier.
+    pub corpus: Option<CorpusProvenance>,
+}
+
+/// PAN-110: the CPU a benchmark ran on.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct HostCpu {
+    /// CPU model string (`/proc/cpuinfo` `model name`, or macOS
+    /// `machdep.cpu.brand_string`); `"unknown"` when neither is readable.
+    pub model: String,
+    /// `std::thread::available_parallelism()`.
+    pub logical_cpus: usize,
+    /// `/sys/fs/cgroup/cpu.max` (`"<quota> <period>"`), when present.
+    pub cgroup_cpu_max: Option<String>,
+    /// rayon's worker-pool size for the run.
+    pub rayon_threads: usize,
+    /// `pancetta_ft8::tier_probe::probe_hardware_tier(10)`, the probe
+    /// production runs to resolve the `Auto` effort preset.
+    pub tier_probe: Option<TierProbeSummary>,
+}
+
+/// PAN-110: the hardware-tier probe's verdict on the benchmark host.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct TierProbeSummary {
+    pub tier: String,
+    pub p95_ms: u64,
+}
+
+/// PAN-110: which synth corpus a benchmark scored, by content hash.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CorpusProvenance {
+    /// Tier name (`synth-clean`, `synth-ft4`, …).
+    pub tier: String,
+    /// Manifest path, relative to the workspace root.
+    pub manifest: String,
+    pub manifest_sha256: String,
+    /// sha256 of the generator config next to the manifest, when present.
+    pub config_sha256: Option<String>,
+    /// sha256 over each WAV's lower-case hex sha256, in manifest order.
+    /// The WAVs are regenerated, not committed, so the manifest hash alone
+    /// does not pin the audio.
+    pub wav_set_sha256: String,
+    pub wav_count: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -355,6 +426,14 @@ pub struct SnrBin {
     pub attempts: u32,
     pub decoded: u32,
     pub fp: u32,
+    /// PAN-110: of `attempts`, how many the native decoder alone recovered.
+    /// Recorded only by `--merge-ft8lib` runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_decoded: Option<u32>,
+    /// PAN-110: of `attempts`, how many ft8_lib alone recovered. Recorded
+    /// only by `--merge-ft8lib` runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ft8lib_decoded: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -541,6 +620,42 @@ mod tests {
     fn tier_result_without_pair_recovery_serializes_without_the_key() {
         let json = serde_json::to_value(TierResult::default()).unwrap();
         assert!(json.get("pair_recovery").is_none(), "{json}");
+    }
+
+    /// PAN-110: scorecards written before `provenance` and the per-side
+    /// SNR-bin counts existed still load.
+    #[test]
+    fn scorecard_without_provenance_or_side_counts_still_deserializes() {
+        let json = serde_json::json!({
+            "schema_version": 1,
+            "generated_at": "2026-07-01T00:00:00Z",
+            "mode": "ft8",
+            "git": {"branch": "main", "head_sha": "abc", "main_merge_base": "abc", "dirty": false},
+            "build": {"rustc_version": "rustc", "release": true, "features": []},
+            "harness": {"harness_version": "0", "host": "h", "cores_used": 1, "elapsed_seconds": 1.0},
+            "config": {"decoder": {}, "seed": 0, "tiers_run": ["synth-clean"]},
+            "tiers": {"synth-clean": {"wavs_processed": 1, "by_snr_db": [
+                {"snr_db": -20.0, "attempts": 1, "decoded": 0, "fp": 0}
+            ]}},
+            "composite": {"weights": {}, "score": 0.0},
+            "regressions": {
+                "fixture_regression": false,
+                "false_positive_introduced": false,
+                "snr_curve_regression_db": 0.0
+            },
+            "notes": ""
+        });
+        let card: Scorecard = serde_json::from_value(json).expect("old scorecard loads");
+        assert!(card.provenance.is_none());
+        let bin = &card.tiers["synth-clean"].by_snr_db[0];
+        assert_eq!(bin.native_decoded, None);
+        assert_eq!(bin.ft8lib_decoded, None);
+        // And re-serialises without the new keys.
+        let out = serde_json::to_value(&card).unwrap();
+        assert!(out.get("provenance").is_none(), "{out}");
+        assert!(out["tiers"]["synth-clean"]["by_snr_db"][0]
+            .get("native_decoded")
+            .is_none());
     }
 
     #[test]

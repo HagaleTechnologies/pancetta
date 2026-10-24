@@ -70,6 +70,23 @@ pub trait DecoderUnderTest: Send + Sync {
     fn take_last_window_timing(&self) -> Option<WindowTiming> {
         None
     }
+    /// PAN-110: the native and ft8_lib decode texts behind the most recent
+    /// `decode_wav` call's merged result, cleared on read. The default
+    /// returns `None`; the research `Ft8Decoder` records them only when
+    /// built with [`Ft8Decoder::with_ft8lib_merge`].
+    fn take_last_window_decoder_texts(&self) -> Option<DecoderTexts> {
+        None
+    }
+}
+
+/// PAN-110: each backend's own decode texts for one window, before
+/// production's ft8_lib-first merge combined them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DecoderTexts {
+    /// Texts the native decoder produced.
+    pub native: Vec<String>,
+    /// Texts the ft8_lib FFI decoder produced.
+    pub ft8lib: Vec<String>,
 }
 
 /// PAN-165: where a harness decode window's `DecodeBudget` deadline starts.
@@ -270,6 +287,13 @@ pub struct Ft8Decoder {
     /// PAN-165: timing of the last `decode_wav`, for
     /// `take_last_window_timing`.
     last_window_timing: Mutex<Option<WindowTiming>>,
+    /// PAN-110: under `BudgetAnchor::Receipt`, return production's merged
+    /// decode set (ft8_lib first, then new native texts, then hash-twin
+    /// dedup) instead of the native call's decodes alone.
+    merge_ft8lib: bool,
+    /// PAN-110: per-backend texts of the last merged `decode_wav`, for
+    /// `take_last_window_decoder_texts`.
+    last_window_decoder_texts: Mutex<Option<DecoderTexts>>,
     /// Used only so `config_snapshot` is stable across calls.
     _scratch: Mutex<()>,
 }
@@ -302,6 +326,8 @@ impl Ft8Decoder {
             budget_anchor: None,
             qso_partner_hz: None,
             last_window_timing: Mutex::new(None),
+            merge_ft8lib: false,
+            last_window_decoder_texts: Mutex::new(None),
             _scratch: Mutex::new(()),
         }
     }
@@ -678,9 +704,22 @@ impl Ft8Decoder {
     /// PAN-165: choose the timing model for the budget deadline and start
     /// recording per-window timing (read it with `take_last_window_timing`).
     /// `BudgetAnchor::Receipt` works only on the plain decode path: no
-    /// chrono replay, rolling window, AP context or two-stage decoding.
+    /// chrono replay, rolling window, two-stage decoding, or AP context
+    /// beyond a `my_call` (PAN-110).
     pub fn with_budget_anchor(mut self, anchor: BudgetAnchor) -> Self {
         self.budget_anchor = Some(anchor);
+        self
+    }
+
+    /// PAN-110: under `BudgetAnchor::Receipt`, score what production
+    /// delivers rather than the native call alone: ft8_lib's decodes, then
+    /// each native decode with new text
+    /// ([`pancetta_ft8::merge::merge_ft8lib_first`]), then
+    /// [`pancetta_ft8::merge::drop_unresolved_hash_twins`]. Each backend's
+    /// own texts are kept for `take_last_window_decoder_texts`. Has no
+    /// effect without the receipt anchor.
+    pub fn with_ft8lib_merge(mut self, on: bool) -> Self {
+        self.merge_ft8lib = on;
         self
     }
 
@@ -710,6 +749,23 @@ impl Ft8Decoder {
             .last_window_timing
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = timing;
+    }
+
+    fn store_window_decoder_texts(&self, texts: Option<DecoderTexts>) {
+        *self
+            .last_window_decoder_texts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = texts;
+    }
+
+    /// PAN-110: the AP context a receipt-anchored decode may carry. Only a
+    /// `my_call` is allowed: production's recent-call pool is empty at
+    /// start-up and its active-QSO entries need a live QSO, so any other
+    /// AP input would model a station state, not the shipped defaults.
+    fn receipt_ap_context_is_my_call_only(&self) -> bool {
+        self.ap_context.as_ref().is_none_or(|ctx| {
+            ctx.recent_calls.is_empty() && ctx.active_qso.is_none() && ctx.active_qsos.is_empty()
+        })
     }
 
     /// Run one native decode call under a budget anchored right before it
@@ -746,12 +802,19 @@ impl Ft8Decoder {
     /// window receipt: waterfall generation, the scoped fast-path call
     /// (only with a QSO partner), the ft8_lib FFI call, then the native
     /// call. Only the native call's decodes are returned (PAN-165
-    /// Decision 6); the other calls run for their timing cost.
+    /// Decision 6); the other calls run for their timing cost. With
+    /// [`Self::with_ft8lib_merge`] (PAN-110) the ft8_lib decodes are kept
+    /// and merged as production merges them, and both sides' texts are
+    /// returned too.
     fn decode_receipt_anchored(
         &self,
         decoder: &mut pancetta_ft8::Ft8Decoder,
         samples: &[f32],
-    ) -> anyhow::Result<(Vec<pancetta_ft8::DecodedMessage>, WindowTiming)> {
+    ) -> anyhow::Result<(
+        Vec<pancetta_ft8::DecodedMessage>,
+        WindowTiming,
+        Option<DecoderTexts>,
+    )> {
         let anchor = Instant::now();
         let budget = self.decode_budget_from(anchor);
 
@@ -782,7 +845,7 @@ impl Ft8Decoder {
         };
 
         let ft8lib_start = Instant::now();
-        let _ =
+        let ft8lib_messages =
             pancetta_ft8::Ft8Decoder::decode_window_ft8lib_protocol(samples, self.config.protocol);
         let ft8lib_ms = duration_ms(ft8lib_start.elapsed());
 
@@ -790,11 +853,15 @@ impl Ft8Decoder {
             Some(hz) => (qso_filter_bin_range(hz), Some(hz)),
             None => (None, self.partner_freq_hz),
         };
+        // PAN-110: production passes its AP context (my_call, recent calls,
+        // active QSOs) to this call; `decode_wav` admits only a my_call here.
+        let default_ap = pancetta_ft8::ApContext::default();
+        let ap_context = self.ap_context.as_ref().unwrap_or(&default_ap);
         let native_start = Instant::now();
-        let (messages, report) = decoder
+        let (native_messages, report) = decoder
             .decode_window_with_ap_scoped_partner_budgeted(
                 samples,
-                &pancetta_ft8::ApContext::default(),
+                ap_context,
                 freq_bin_range,
                 partner_freq_hz,
                 budget,
@@ -814,7 +881,17 @@ impl Ft8Decoder {
             passes_run: report.passes_run,
             budget_exhausted: report.budget_exhausted,
         };
-        Ok((messages, timing))
+        if !self.merge_ft8lib {
+            return Ok((native_messages, timing, None));
+        }
+        let texts = DecoderTexts {
+            native: native_messages.iter().map(|m| m.text.clone()).collect(),
+            ft8lib: ft8lib_messages.iter().map(|m| m.text.clone()).collect(),
+        };
+        let merged = pancetta_ft8::merge::merge_ft8lib_first(ft8lib_messages, native_messages);
+        let (delivered, _) =
+            pancetta_ft8::merge::drop_unresolved_hash_twins(merged.messages, self.config.protocol);
+        Ok((delivered, timing, Some(texts)))
     }
 
     /// Decoder-TP-sensitivity Task W1.4 [A/B]: master switch for the
@@ -1146,15 +1223,17 @@ impl DecoderUnderTest for Ft8Decoder {
         // PAN-165: never let a failed call leave the previous window's
         // timing behind for `take_last_window_timing`.
         self.store_window_timing(None);
+        self.store_window_decoder_texts(None);
         let receipt_anchored = self.budget_anchor == Some(BudgetAnchor::Receipt);
         anyhow::ensure!(
             !receipt_anchored
                 || (self.chrono_replay_state.is_none()
                     && self.rolling_window.is_none()
-                    && self.ap_context.is_none()
+                    && self.receipt_ap_context_is_my_call_only()
                     && self.two_stage_first_config.is_none()),
             "budget anchor `receipt` reproduces production's plain decode path and cannot be \
-             combined with chrono replay, a rolling window, an AP context or two-stage decoding"
+             combined with chrono replay, a rolling window, an AP context beyond my_call or \
+             two-stage decoding"
         );
         // Load WAV via hound; pancetta-ft8 expects mono f32 samples at 12 kHz
         // (FT8's canonical decode rate). The fixture and recording WAVs are
@@ -1205,10 +1284,11 @@ impl DecoderUnderTest for Ft8Decoder {
                 .with_dt_priors(h.clone() as std::sync::Arc<dyn pancetta_ft8::DtPriorLookup>);
         }
         let raw = if receipt_anchored {
-            let (messages, timing) = self
+            let (messages, timing, texts) = self
                 .decode_receipt_anchored(&mut decoder, &samples)
                 .with_context(|| format!("decoding {}", path.display()))?;
             self.store_window_timing(Some(timing));
+            self.store_window_decoder_texts(texts);
             messages
         } else if let Some(state) = self.chrono_replay_state.clone() {
             // Chronological-replay tier (2026-06-01): build ApContext.recent_calls
@@ -1464,6 +1544,13 @@ impl DecoderUnderTest for Ft8Decoder {
 
     fn take_last_window_timing(&self) -> Option<WindowTiming> {
         self.last_window_timing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
+    fn take_last_window_decoder_texts(&self) -> Option<DecoderTexts> {
+        self.last_window_decoder_texts
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
@@ -1777,14 +1864,119 @@ mod tests {
 
     #[test]
     fn receipt_anchor_refuses_a_non_plain_decode_path() {
+        let recent_call_ctx = pancetta_ft8::ApContext {
+            my_call: pancetta_ft8::MyCallAp::new("W1PAN"),
+            recent_calls: vec![pancetta_ft8::RecentCallAp::new("K1ABC", 0.0).unwrap()],
+            active_qso: None,
+            active_qsos: Vec::new(),
+        };
+        let refused = [
+            Ft8Decoder::with_default_config()
+                .with_budget_anchor(BudgetAnchor::Receipt)
+                .with_rolling_window(8),
+            Ft8Decoder::with_default_config()
+                .with_budget_anchor(BudgetAnchor::Receipt)
+                .with_ap_context(recent_call_ctx),
+            Ft8Decoder::with_default_config()
+                .with_budget_anchor(BudgetAnchor::Receipt)
+                .with_two_stage(true),
+        ];
+        for decoder in refused {
+            let err = decoder
+                .decode_wav(&fixture("generated/ft8_cq.wav"))
+                .unwrap_err();
+            assert!(err.to_string().contains("receipt"), "{err}");
+            assert_eq!(decoder.take_last_window_timing(), None);
+        }
+    }
+
+    #[test]
+    fn receipt_anchor_accepts_a_my_call_only_ap_context() {
+        let ctx = pancetta_ft8::ApContext {
+            my_call: pancetta_ft8::MyCallAp::new("W1PAN"),
+            recent_calls: Vec::new(),
+            active_qso: None,
+            active_qsos: Vec::new(),
+        };
         let decoder = Ft8Decoder::with_default_config()
             .with_budget_anchor(BudgetAnchor::Receipt)
-            .with_rolling_window(8);
-        let err = decoder
+            .with_ap_context(ctx);
+        let decodes = decoder
             .decode_wav(&fixture("generated/ft8_cq.wav"))
-            .unwrap_err();
-        assert!(err.to_string().contains("receipt"), "{err}");
-        assert_eq!(decoder.take_last_window_timing(), None);
+            .expect("a my_call-only AP context is production's cold-start context");
+        assert!(!decodes.is_empty());
+        assert!(decoder.take_last_window_timing().is_some());
+    }
+
+    fn fixture_samples(rel: &str) -> Vec<f32> {
+        let mut reader = hound::WavReader::open(fixture(rel)).expect("fixture opens");
+        match reader.spec().sample_format {
+            hound::SampleFormat::Int => reader
+                .samples::<i16>()
+                .map(|s| s.unwrap() as f32 / 32768.0)
+                .collect(),
+            hound::SampleFormat::Float => reader.samples::<f32>().map(|s| s.unwrap()).collect(),
+        }
+    }
+
+    /// PAN-110: the merged mode returns exactly what the shared production
+    /// merge makes of the two backends' decodes for the same window.
+    #[test]
+    fn receipt_anchor_ft8lib_merge_equals_the_shared_production_merge() {
+        let rel = "generated/ft8_cq.wav";
+        let decoder = Ft8Decoder::with_default_config()
+            .with_budget_anchor(BudgetAnchor::Receipt)
+            .with_ft8lib_merge(true);
+        let merged: Vec<String> = decoder
+            .decode_wav(&fixture(rel))
+            .expect("merged decode should not error")
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+
+        let samples = fixture_samples(rel);
+        let ft8lib = pancetta_ft8::Ft8Decoder::decode_window_ft8lib_protocol(
+            &samples,
+            pancetta_ft8::Protocol::Ft8,
+        );
+        let mut native_decoder =
+            pancetta_ft8::Ft8Decoder::new(pancetta_ft8::Ft8Config::default()).unwrap();
+        let (native, _) = native_decoder
+            .decode_window_with_ap_scoped_partner_budgeted(
+                &samples,
+                &pancetta_ft8::ApContext::default(),
+                None,
+                None,
+                pancetta_ft8::DecodeBudget::unlimited(),
+            )
+            .unwrap();
+        let expected_texts = DecoderTexts {
+            native: native.iter().map(|m| m.text.clone()).collect(),
+            ft8lib: ft8lib.iter().map(|m| m.text.clone()).collect(),
+        };
+        let (expected, _) = pancetta_ft8::merge::drop_unresolved_hash_twins(
+            pancetta_ft8::merge::merge_ft8lib_first(ft8lib, native).messages,
+            pancetta_ft8::Protocol::Ft8,
+        );
+        let expected: Vec<String> = expected.into_iter().map(|m| m.text).collect();
+
+        assert!(!merged.is_empty());
+        assert_eq!(merged, expected);
+        assert_eq!(
+            decoder.take_last_window_decoder_texts(),
+            Some(expected_texts)
+        );
+        // Taken, not peeked.
+        assert_eq!(decoder.take_last_window_decoder_texts(), None);
+    }
+
+    #[test]
+    fn without_ft8lib_merge_no_decoder_texts_are_recorded() {
+        let decoder = Ft8Decoder::with_default_config().with_budget_anchor(BudgetAnchor::Receipt);
+        decoder
+            .decode_wav(&fixture("generated/ft8_cq.wav"))
+            .expect("decode should not error");
+        assert_eq!(decoder.take_last_window_decoder_texts(), None);
     }
 
     #[test]

@@ -466,6 +466,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Published decode-sensitivity figures (FEATURES.md, README.md,
+  `pancetta-ft8` docs) now come from the shipped pipeline — ft8_lib plus the
+  native decoder, merged, under the receipt-anchored per-window budget —
+  measured by `eval --merge-ft8lib` and committed as
+  `research/scorecards/pan110-*.json`. The unmeasured ">95% at -20 dB" claim
+  is gone, native-only curves are labelled as such, and `Max` is described
+  as the receipt-anchored per-slot ceiling rather than unlimited (PAN-110).
+
 - `[network.reliability.retry]` now controls per-QSO upload retries
   (PAN-57) and is validated: `max_attempts` must be at least 1,
   `backoff_multiplier` finite and at least 1.0, `jitter_factor` finite and
