@@ -8,6 +8,7 @@ sources:
   - docs/DECISIONS/config-and-platform.md
   - pancetta-config/src/network.rs
   - pancetta/src/coordinator/effort.rs
+  - pancetta/src/coordinator/dsp.rs
 verified:
   commit: eac7aab
   date: 2026-07-07
@@ -53,3 +54,13 @@ version as `toolchain:`.** Bump the channel and all of those inputs in one PR. A
 pinned compiler, because rustup's override wins, but that job downloads a second
 toolchain and its rust-cache key churns. See
 [Exact Rust toolchain pin](../../docs/DECISIONS/config-and-platform.md#exact-rust-toolchain-pin-pan-56-2026-10-21).
+
+DSP gotcha (PAN-70): **any change between two known dial readings, even 1 Hz
+within a band, discards the DSP's in-flight audio**, because each decode window
+carries one dial snapshot. A 0 read is "unknown" and changes nothing, and only a
+band change also resets the waterfall noise floor. The guarantee covers
+transitions the DSP observes between reads. Audio batches carry no dial tag,
+so queued audio and a retune and return between two reads are not caught.
+Retuning can cost a decode window. Don't add a deadband without measured CAT
+jitter. See
+[Dial-change in-flight-window flush](../../docs/DECISIONS/config-and-platform.md#dial-change-in-flight-window-flush-pan-70-2026-10-24).

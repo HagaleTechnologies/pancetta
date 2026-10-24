@@ -57,7 +57,7 @@ for full license text.
 ## Features
 
 ### Core Capabilities
-- **High-Performance Decoding**: >95% decode accuracy at SNR -20dB
+- **Decode performance**: Measured decode performance (shipped pipeline and native-only curves): [docs/decoder-comparison.md](../docs/decoder-comparison.md)
 - **Real-Time Processing**: 12.64-second window processing with sub-second latency
 - **Parallel Processing**: Support for 50+ simultaneous decode candidates
 - **Zero-Allocation Hot Path**: Memory-efficient processing for real-time constraints
@@ -188,7 +188,7 @@ let decoder = Ft8Decoder::with_message_handler(
 - **Real-time Factor**: ~0.1x (processes 12.64s audio in ~1.3s on modern hardware)
 - **Memory Usage**: <10MB peak memory for complex scenarios
 - **Decode Throughput**: 50+ simultaneous candidates
-- **Weak Signal Performance**: -20dB SNR with >95% accuracy
+- **Weak Signal Performance**: Measured decode performance (shipped pipeline and native-only curves): [docs/decoder-comparison.md](../docs/decoder-comparison.md)
 
 ### Optimization Features
 

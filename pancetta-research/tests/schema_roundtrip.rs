@@ -58,6 +58,7 @@ fn sample_scorecard() -> Scorecard {
         },
         regressions: RegressionFlags::default(),
         notes: "Smoke test scorecard.".to_string(),
+        provenance: None,
     }
 }
 

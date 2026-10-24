@@ -45,6 +45,28 @@
   `QsoCompleted` for a frame the TX worker rejects. Closing this window
   requires supersede and insert under one guard. (Surfaced by PAN-138, 2026-10-20.)
 
+- **Supersede abandonment still sends Autonomous an early failure.** A
+  single-frame `Replace`/`NotViable` supersede and a multi-TX abandoned item
+  (`report_abandoned_bundle_item`) report a failed `TransmitComplete` for the
+  abandoned frame even when the superseding request later airs, so a tracked
+  self-CQ can settle as failed first. The pivot ownership rule does not cover
+  supersedes: a superseding request a supersede drops is not reported, so
+  making these exactly-once needs its own audit of those drops.
+  (Surfaced by PAN-185, 2026-10-23.)
+
+- **A mid-TX pivot-duplicate drop keeps its tombstone and skips the
+  replaced-frame rollback.** `IncomingDuringTx::Drop` discards a queued
+  request whose payload is already airing through a pivot, but it neither
+  clears the `pivoted_once` tombstone nor rolls back the frame the pivot
+  replaced, so that frame stays counted. Its Autonomous behaviour already
+  matches the ownership rule. (Surfaced by PAN-185, 2026-10-23.)
+
+- **An auto-sequence request the TX channel never accepted sends Autonomous
+  no completion.** The QSO forwarder withdraws the intent and rolls back the
+  engine's ledger attempt, but tells Autonomous nothing, because an older
+  queued request for the QSO may still own its outcome. Only reachable when
+  the 10,000-message TX channel is full. (Surfaced by PAN-185, 2026-10-23.)
+
 - **Supervisor coverage:** the restartable set includes Dsp/Ft8Decoder (PAN-4, using retained
   `DecodePipelineHandles`), Hamlib/StationAgent (PAN-5, with pre-restart teardown) and
   Ft8Transmitter (PAN-119, cheap restart relying on `PttGuard`'s `Drop` for PTT release). Audio

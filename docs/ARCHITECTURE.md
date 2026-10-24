@@ -269,16 +269,19 @@ sync candidates ranked by sync score
 
 Each of S2-S7 is checkpointed at its entry: if `DecodeBudget::has_time()` is
 false, the stage is skipped (recorded in `DecodeBudgetReport.stages` for
-telemetry) rather than run. **Tests, CI, and the research harness always use
-`DecodeBudget::unlimited()`** — no stage is ever skipped on the eval path, so
-recall measurements stay deterministic and comparable across runs.
+telemetry) rather than run. **Tests and CI use `DecodeBudget::unlimited()`;
+the research harness does too unless `--effort`/`--budget-anchor` is passed**
+— so default recall measurements stay deterministic and comparable across
+runs. `eval --budget-anchor receipt --merge-ft8lib` (PAN-110) instead scores
+the shipped pipeline: ft8_lib plus the native decoder, merged by
+`pancetta_ft8::merge`, under a deadline anchored at window receipt.
 
 In production, the coordinator publishes a real wall-clock budget together
 with the decoder config it was derived with, as one `DecodeWindowConfig` behind
 one lock that the FT8 loop reads once per window (PAN-164), from the
 operator's **decode-effort preset**
 (`[decoder]` config section, or the live `e` TUI key): `Eco` (1ms, floor-only),
-`Standard` (250ms), `Deep` (1000ms), `Max` (0/unlimited), or `Auto` (derived
+`Standard` (250ms), `Deep` (1000ms), `Max` (the protocol ceiling: 2000 ms FT8 / 800 ms FT4, anchored at window receipt), or `Auto` (derived
 from the probed hardware tier — see `pancetta/src/coordinator/effort.rs`).
 This mapping **subsumes** the older per-hardware-tier `Ft8Config` field
 rewrites (`apply_tier` no longer touches `Ft8Config` directly).

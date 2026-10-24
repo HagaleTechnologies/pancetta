@@ -158,11 +158,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+<<<<<<< HEAD
 - Band Activity's own-TX rows and `tx-log.jsonl`'s `utc` now record when the
   audio output started playing each frame, including a mid-frame re-key,
   instead of when the TX worker queued its audio (PAN-71). When pancetta
   cannot confirm the start within 100 ms it keeps the old value and logs a
   warning.
+=======
+- Retuning within a band no longer reports stations heard before the retune at
+  the new dial's frequency (PAN-70). The decoder used to keep audio buffered
+  on the old dial across an intra-band retune and label the whole window with
+  the new dial, so a station was shown and uploaded off by the retune delta.
+  Any change between two known dial readings, even 1 Hz, now discards the
+  in-flight audio as a band change already did, so retuning can skip a decode
+  window while the receiver refills.
+
+- A frame that never airs now gives back its call, stall count and `Sent`
+  timeline entry even when the QSO engine is briefly backed up (PAN-185).
+  Before, that correction could be lost and the frame stayed counted. An
+  autonomous CQ whose frame was swapped for a fresher one and then refused no
+  longer counts as a failed CQ before the replacement airs; it now settles
+  once, on what actually aired.
+>>>>>>> 57191959ac2a274918a6dbd68afe010e3f830f6e
 
 - Autonomous cqdx.io spot reports now carry the frequency of the band the
   decode was actually heard on when the station changes bands between a decode
@@ -471,6 +488,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Q in the composer.
 
 ### Changed
+
+- Published decode-sensitivity figures (FEATURES.md, README.md,
+  `pancetta-ft8` docs) now come from the shipped pipeline — ft8_lib plus the
+  native decoder, merged, under the receipt-anchored per-window budget —
+  measured by `eval --merge-ft8lib` and committed as
+  `research/scorecards/pan110-*.json`. The unmeasured ">95% at -20 dB" claim
+  is gone, native-only curves are labelled as such, and `Max` is described
+  as the receipt-anchored per-slot ceiling rather than unlimited (PAN-110).
 
 - `[network.reliability.retry]` now controls per-QSO upload retries
   (PAN-57) and is validated: `max_attempts` must be at least 1,
