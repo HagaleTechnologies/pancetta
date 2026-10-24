@@ -57,6 +57,50 @@ WSJT-X must be installed locally for `baseline` to find `jt9`. On macOS,
 the default expected path is `/Applications/wsjtx.app/Contents/MacOS/jt9`;
 override with `--jt9-path /path/to/jt9` if needed.
 
+### Linux without root
+
+On Ubuntu 24.04, extract WSJT-X and its runtime libraries locally. This
+recipe uses Ubuntu's WSJT-X 2.7.0~rc3 package. The wrapper gives jt9 a scratch
+working directory because it writes `decoded.txt`, `jt9_wisdom.dat` and
+`timer.out` there. Run one baseline process at a time with this wrapper.
+
+```bash
+mkdir -p /tmp/pan154-jt9/debs /tmp/pan154-jt9-work /tmp/jt9-wsjtx-2.7.0-rc3
+(cd /tmp/pan154-jt9/debs && apt-get download wsjtx libfftw3-single3 libgfortran5 libqt5core5t64 \
+  libdouble-conversion3 libpcre2-16-0 libicu74 libb2-1)
+for d in /tmp/pan154-jt9/debs/*.deb; do
+  dpkg-deb -x "$d" /tmp/pan154-jt9/root
+done
+cat > /tmp/jt9-wsjtx-2.7.0-rc3/jt9 <<'SH'
+#!/bin/sh
+export LD_LIBRARY_PATH=/tmp/pan154-jt9/root/usr/lib/x86_64-linux-gnu
+cd /tmp/pan154-jt9-work && exec /tmp/pan154-jt9/root/usr/bin/jt9 "$@"
+SH
+chmod +x /tmp/jt9-wsjtx-2.7.0-rc3/jt9
+/tmp/jt9-wsjtx-2.7.0-rc3/jt9 --help
+cargo run --release -p pancetta-research --bin baseline -- \
+  --tier synth --mode ft4 \
+  --synth-manifest research/corpus/synth/manifests/ft4_clean.manifest.json \
+  --jt9-path /tmp/jt9-wsjtx-2.7.0-rc3/jt9
+```
+
+To classify every native FT4 jt9-truth miss after generating the WAVs and
+baseline cache:
+
+```bash
+cargo run --release -p pancetta-research --bin ft4-candidate-split -- \
+  --manifest research/corpus/synth/manifests/ft4_clean.manifest.json \
+  --baseline-dir research/baselines/ft4 --cap-lifted-recheck 1000000 \
+  --output /tmp/ft4-candidate-split.json
+```
+
+The scorecard uses the unbudgeted native decoder and reports candidates
+admitted to its decode loop. It does not measure the merged production
+pipeline. Missing jt9 caches, invalid WAVs and failed coordinate calibration
+abort the run. If a raised cap still binds and no gated candidate appears,
+the recheck reports an inconclusive sub-label and count. Raise the cap to
+determine whether the candidate is absent above the sync threshold.
+
 ## Why this is local-only
 
 The full corpus (~7.5 GB of operator recordings in `~/.pancetta/recordings/`)

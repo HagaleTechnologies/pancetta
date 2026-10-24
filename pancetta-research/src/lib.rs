@@ -45,3 +45,5 @@ pub use callsign_priors::{CallsignPriorSet, PriorSourceMask, BUNDLED_COMMON_ACTI
 
 pub mod tier_slots;
 pub use tier_slots::{is_heavy_tier, SlotGuard, TierSlotPool, DEFAULT_POOL_DIR};
+
+pub mod candidate_split;
