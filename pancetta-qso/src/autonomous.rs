@@ -3947,6 +3947,359 @@ mod tests {
         );
     }
 
+    // --- PAN-80: one candidate generator for both resolution paths ---
+
+    /// An Auto-mode operator (Hold would short-circuit every allocation) with
+    /// no spectral snapshot yet, i.e. on the no-spectral fallback path.
+    fn pan80_auto_operator(config: AutonomousConfig) -> AutonomousOperator {
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        op
+    }
+
+    fn pan80_enabled_config() -> AutonomousConfig {
+        AutonomousConfig {
+            enabled: true,
+            ..AutonomousConfig::default()
+        }
+    }
+
+    /// A flat, silent waterfall over the default allocation range: the noise
+    /// and neighbor terms score every candidate identically (20 + 15), so the
+    /// picks below are decided by occupancy, center bias, DX proximity and the
+    /// own-frequency penalty alone.
+    fn pan80_flat_snapshot() -> SpectralSnapshot {
+        SpectralSnapshot {
+            power_bins: vec![0.0f32; 140],
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        }
+    }
+
+    /// Two decodes in the First slot at 1200 Hz and two in the Second slot at
+    /// 1300 Hz: inside the window (1150, 1350) every candidate is busy in
+    /// exactly one slot, so the TX parity decides which half wins.
+    fn pan80_split_slot_history() -> Vec<DecodeRecord> {
+        let at = |frequency_hz, time_slot| DecodeRecord {
+            frequency_hz,
+            time_slot,
+        };
+        vec![
+            at(1200.0, TimeSlot::First),
+            at(1200.0, TimeSlot::First),
+            at(1300.0, TimeSlot::Second),
+            at(1300.0, TimeSlot::Second),
+        ]
+    }
+
+    /// PAN-80 characterization: the spectral-ranked branch's exact picks
+    /// across every constraint kind it takes. PAN-80 moves the hard filter
+    /// ahead of scoring and routes the grid through the shared generator; none
+    /// of these values may move.
+    #[test]
+    fn pan80_spectral_picks_pinned_across_a_constraint_matrix() {
+        use pancetta_core::slot::SlotParity;
+
+        #[derive(Default)]
+        struct Case {
+            name: &'static str,
+            history: Vec<DecodeRecord>,
+            own_hz: Option<f64>,
+            live_spots: &'static [(f64, f64)],
+            dx_target_hz: Option<f64>,
+            parity: Option<SlotParity>,
+            avoid_hz: Option<f64>,
+            also_avoid_hz: &'static [f64],
+            window: Option<(f64, f64)>,
+            expected: f64,
+        }
+
+        let cases = vec![
+            // Center bias peaks at center_bias_hz (10 at 1500).
+            Case {
+                name: "unconstrained",
+                expected: 1500.0,
+                ..Case::default()
+            },
+            // An empty history is clear in both slots (+30), so parity cannot
+            // move the center-bias pick.
+            Case {
+                name: "unconstrained, Even parity",
+                parity: Some(SlotParity::Even),
+                expected: 1500.0,
+                ..Case::default()
+            },
+            // 1425 and 1575 tie on center bias (75 Hz from 1500 each); the
+            // stable sort keeps ascending grid order, so 1425.
+            Case {
+                name: "avoid the center",
+                avoid_hz: Some(1500.0),
+                expected: 1425.0,
+                ..Case::default()
+            },
+            // A window inside the range changes nothing.
+            Case {
+                name: "avoid the center, in-range window",
+                avoid_hz: Some(1500.0),
+                window: Some((1000.0, 2700.0)),
+                expected: 1425.0,
+                ..Case::default()
+            },
+            // Above the range every candidate is >= 1300 Hz from center, so
+            // center bias is 0 for all three; the tie keeps grid order.
+            Case {
+                name: "avoid the center, window above 2800",
+                avoid_hz: Some(1500.0),
+                window: Some((2850.0, 2900.0)),
+                expected: 2850.0,
+                ..Case::default()
+            },
+            // also_avoid binds exactly like avoid: the 1425/1575 tie again.
+            Case {
+                name: "batch exclusion on the natural best",
+                also_avoid_hz: &[1500.0],
+                expected: 1425.0,
+                ..Case::default()
+            },
+            // 1425 is taken by the batch; 1575 is exactly 75 Hz from 1500 and
+            // has the best remaining center bias.
+            Case {
+                name: "avoid the center, batch takes 1425",
+                avoid_hz: Some(1500.0),
+                also_avoid_hz: &[1425.0],
+                expected: 1575.0,
+                ..Case::default()
+            },
+            // DX proximity +8 at 1200 (200 Hz from the DX) plus center bias
+            // 7.69 beats 1500's center bias of 10.
+            Case {
+                name: "pounce, dx 1000",
+                dx_target_hz: Some(1000.0),
+                expected: 1200.0,
+                ..Case::default()
+            },
+            // avoid 1200 removes 1150..1250; 1125 is the in-proximity point
+            // closest to center (8 + 7.12 > 1500's 10).
+            Case {
+                name: "pounce, dx 1000, avoid the proximity best",
+                dx_target_hz: Some(1000.0),
+                avoid_hz: Some(1200.0),
+                expected: 1125.0,
+                ..Case::default()
+            },
+            // Slot-blind: 1250 sees all four decodes, every other point two;
+            // among the two-decode points 1350 is closest to center.
+            Case {
+                name: "split-slot history, no parity",
+                history: pan80_split_slot_history(),
+                avoid_hz: Some(1500.0),
+                window: Some((1150.0, 1350.0)),
+                expected: 1350.0,
+                ..Case::default()
+            },
+            // Even -> First: 1275..1350 are clear in our TX slot (+26), the
+            // 1200 cluster is not (+4); 1350 has the best center bias.
+            Case {
+                name: "split-slot history, Even parity",
+                history: pan80_split_slot_history(),
+                parity: Some(SlotParity::Even),
+                avoid_hz: Some(1500.0),
+                window: Some((1150.0, 1350.0)),
+                expected: 1350.0,
+                ..Case::default()
+            },
+            // Odd -> Second: now 1150..1225 are the clear-in-our-slot half
+            // (+26) and the 1300 cluster scores +4; 1225 is closest to center.
+            Case {
+                name: "split-slot history, Odd parity",
+                history: pan80_split_slot_history(),
+                parity: Some(SlotParity::Odd),
+                avoid_hz: Some(1500.0),
+                window: Some((1150.0, 1350.0)),
+                expected: 1225.0,
+                ..Case::default()
+            },
+            // The own-frequency -50 penalty covers 1450..1550 (< 75 Hz); the
+            // 1425/1575 tie resolves to grid order.
+            Case {
+                name: "own QSO at the center",
+                own_hz: Some(1500.0),
+                expected: 1425.0,
+                ..Case::default()
+            },
+            // A rare live spot at 1700 boosts 1575 (125 Hz away) by 0.18 but
+            // not 1425 (275 Hz away), breaking the tie the other way.
+            Case {
+                name: "avoid the center, live spot at 1700",
+                live_spots: &[(1700.0, 0.9)],
+                avoid_hz: Some(1500.0),
+                expected: 1575.0,
+                ..Case::default()
+            },
+            // Every in-window point is within 75 Hz of the avoid: exhausted,
+            // so avoid comes back unchanged.
+            Case {
+                name: "window inside the avoid's separation",
+                avoid_hz: Some(1500.0),
+                window: Some((1450.0, 1550.0)),
+                expected: 1500.0,
+                ..Case::default()
+            },
+            // No grid point lies inside a 5 Hz window: exhausted.
+            Case {
+                name: "window between two grid points",
+                avoid_hz: Some(1500.0),
+                window: Some((2110.0, 2115.0)),
+                expected: 1500.0,
+                ..Case::default()
+            },
+        ];
+
+        for case in cases {
+            let mut op = pan80_auto_operator(pan80_enabled_config());
+            op.update_spectral(pan80_flat_snapshot());
+            if !case.history.is_empty() {
+                op.decode_history.push_cycle(case.history);
+            }
+            if let Some(own) = case.own_hz {
+                op.frequency_allocator_mut()
+                    .register_qso_frequency("own", own);
+            }
+            op.update_live_spots(case.live_spots);
+
+            let got = op.allocate_smart_frequency_in_range(
+                case.dx_target_hz,
+                case.parity,
+                case.avoid_hz,
+                case.also_avoid_hz,
+                case.window,
+            );
+            assert_eq!(
+                got.to_bits(),
+                case.expected.to_bits(),
+                "{}: expected {}, got {got}",
+                case.name,
+                case.expected
+            );
+        }
+    }
+
+    /// PAN-80: when the constraints leave no candidate, BOTH paths return
+    /// `avoid_hz` bit for bit — the signal `apply_tx_offset_switch`'s no-op
+    /// guard refuses.
+    #[test]
+    fn pan80_exhaustion_returns_avoid_bit_identically_on_both_paths() {
+        const AVOID: f64 = 1500.0;
+        const WINDOW: (f64, f64) = (2110.0, 2115.0);
+
+        let mut op = pan80_auto_operator(pan80_enabled_config());
+        let fallback =
+            op.allocate_smart_frequency_in_range(None, None, Some(AVOID), &[], Some(WINDOW));
+        assert_eq!(
+            fallback.to_bits(),
+            AVOID.to_bits(),
+            "no snapshot: got {fallback}"
+        );
+
+        op.update_spectral(pan80_flat_snapshot());
+        let ranked =
+            op.allocate_smart_frequency_in_range(None, None, Some(AVOID), &[], Some(WINDOW));
+        assert_eq!(
+            ranked.to_bits(),
+            AVOID.to_bits(),
+            "with snapshot: got {ranked}"
+        );
+    }
+
+    /// PAN-80: with no `avoid_hz` to signal with, an exhausted resolution
+    /// still owes an answer — the unconstrained legacy pick clamped into the
+    /// window, identically with and without a snapshot.
+    #[test]
+    fn pan80_avoid_none_last_resort_is_the_clamped_legacy_pick() {
+        const WINDOW: (f64, f64) = (2110.0, 2115.0);
+
+        for own_hz in [None, Some(300.0)] {
+            let mut op = pan80_auto_operator(pan80_enabled_config());
+            if let Some(own) = own_hz {
+                op.frequency_allocator_mut()
+                    .register_qso_frequency("own", own);
+            }
+            // Fresh: the legacy pick is its grid floor 200, clamped up to 2110.
+            // Own QSO at 300: the legacy pick is 2750 (farthest from 300),
+            // clamped down to 2115.
+            let expected = match own_hz {
+                None => 2110.0,
+                Some(_) => 2115.0,
+            };
+            assert_eq!(
+                op.frequency_allocator()
+                    .allocate_cq_frequency()
+                    .clamp(WINDOW.0, WINDOW.1),
+                expected,
+                "test premise: the clamped legacy pick"
+            );
+
+            let fallback =
+                op.allocate_smart_frequency_in_range(None, None, None, &[], Some(WINDOW));
+            assert_eq!(fallback, expected, "no snapshot, own {own_hz:?}");
+
+            op.update_spectral(pan80_flat_snapshot());
+            let ranked = op.allocate_smart_frequency_in_range(None, None, None, &[], Some(WINDOW));
+            assert_eq!(ranked, expected, "with snapshot, own {own_hz:?}");
+        }
+    }
+
+    /// PAN-80: Hold mode returns the operator's offset before any constraint,
+    /// candidate grid or snapshot is consulted — including constraints that
+    /// would exclude that very offset.
+    #[test]
+    fn pan80_hold_mode_ignores_every_constraint() {
+        use pancetta_core::slot::SlotParity;
+
+        let config = AutonomousConfig {
+            enabled: true,
+            tx_offset_hz: 1234.0,
+            ..AutonomousConfig::default()
+        };
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Hold.as_u8(),
+        )));
+        let hold_hz = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        op.set_tx_offset_hold_source(hold_hz.clone());
+
+        let resolve = |op: &AutonomousOperator, pinned: f64| {
+            op.allocate_smart_frequency_in_range(
+                Some(1000.0),
+                Some(SlotParity::Odd),
+                Some(pinned),
+                &[pinned],
+                Some((2850.0, 2900.0)),
+            )
+        };
+
+        assert_eq!(resolve(&op, 1234.0), 1234.0, "no snapshot, config offset");
+        op.update_spectral(pan80_flat_snapshot());
+        assert_eq!(resolve(&op, 1234.0), 1234.0, "with snapshot, config offset");
+        hold_hz.store(2137, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(resolve(&op, 2137.0), 2137.0, "with snapshot, parked offset");
+    }
+
+    /// PAN-80: on a fresh start (no own, no observed, no snapshot, no
+    /// constraints) the fallback picks the floor of its grid, 200 Hz. 200 is
+    /// the first point of both the legacy 75 Hz grid and the configured 25 Hz
+    /// one, so unifying the grids must not move it.
+    #[test]
+    fn pan80_fallback_fresh_start_pick_is_the_grid_floor() {
+        let op = pan80_auto_operator(pan80_enabled_config());
+        assert_eq!(
+            op.allocate_smart_frequency_in_range(None, None, None, &[], None),
+            200.0
+        );
+    }
+
     #[test]
     fn allocate_smart_frequency_hard_excludes_even_when_avoid_hz_scores_best() {
         // Codex review (PR #276, round 6): `own_frequencies`' -50 soft
