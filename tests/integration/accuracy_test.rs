@@ -112,7 +112,7 @@ async fn test_decoder_accuracy() -> Result<()> {
     }
     
     // Verify accuracy requirements
-    // Should achieve >95% accuracy at -20dB SNR for strong signals
+    // Require more than 50% of the synthetic -20 dB signals to decode
     if let Some((decoded, total)) = snr_accuracy.get(&-20) {
         let snr_20_accuracy = (*decoded as f64 / *total as f64) * 100.0;
         assert!(
