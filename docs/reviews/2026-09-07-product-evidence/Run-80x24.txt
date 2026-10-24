@@ -1,0 +1,24 @@
+Pancetta TUI | N0CALL | AA00aa | 14.074 MHz 20M | FT8  TX: DISABLED — RX ONLY
+QSO: (none in progress)
+┌TX Placement──────────────────────────────────────────────────────────────────┐
+│Waiting for TX-placement data (first autonomous tick pending)…                │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌Callers───────────────────────────────────────────────────────────────────────┐
+│Call                     Msg                      SNR  Freq  Age  Flags       │
+│                         No one calling                                       │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+ (no callers)
+┌QSO Status────────────────────────────────────────────────────────────────────┐
+│Status: STANDBY  Call: ---                                                    │
+│TX: Never                                                                     │
+│Monitoring for calls...                                                       │
+└──────────────────────────────────────────────────────────────────────────────┘
+▶ NOW: (idle)   ⋯ QUEUED: (none)
+AUD DSP FT8 | Level: 0.0% | S:--- | Dev: Default | Msgs: 0 | DX: 0 | REVIEW FIXT
+Space:Call/Reply | Arrows:TX | =/-:Band | g:TX-policy | d:Audio | ?:Help | q:Qui
