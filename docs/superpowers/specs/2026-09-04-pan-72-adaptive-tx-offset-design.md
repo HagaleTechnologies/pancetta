@@ -526,7 +526,14 @@ tested.
   `Revert` back onto it. `tx_equals_rx` is now `partner_freq.is_none()`: the decode frequency
   decides only after a switch on an unanswered `CallingCq`. Stall-triggered outcomes are
   unchanged.
-<<<<<<< HEAD
+- **Amended by PAN-80.** Rounds 2 and 3 above each added a constraint to the spectral branch
+  first and the no-snapshot fallback second, and the fallback kept its own 75 Hz grid.
+  `allocate_smart_frequency_in_range` now builds one `frequency::TxOffsetConstraints` (window,
+  `avoid_hz`, `also_avoid_hz`, `min_separation_hz`), and both paths take their candidates from
+  `frequency::admissible_candidates` over the configured 25 Hz grid: the spectral branch scores
+  them (`rank_admissible_candidates`, picks unchanged), the fallback applies the unchanged
+  clearance formula (`FrequencyAllocator::clearance_pick`), and one tail returns `avoid_hz` on
+  exhaustion. `allocate_cq_frequency_excluding` is gone. See `docs/DECISIONS/tx-scheduling.md`.
 - **Amended by PAN-83 (2026-10-24).** On a split, a grace-window advance credits the offset of
   the frame the TX worker reported aired in our slot just before the reply's slot
   (`TxFrameSent` → `confirm_stall_trigger_aired` → `answered_frame_offset_hz`, anchored on the
@@ -537,16 +544,6 @@ tested.
   it; a frame that aired on the new offset before the reply still credits the new offset.
   Chained relocations credit the frame that actually aired, so the first offset of a chain is
   not used as an anchor.
-=======
-- **Amended by PAN-80.** Rounds 2 and 3 above each added a constraint to the spectral branch
-  first and the no-snapshot fallback second, and the fallback kept its own 75 Hz grid.
-  `allocate_smart_frequency_in_range` now builds one `frequency::TxOffsetConstraints` (window,
-  `avoid_hz`, `also_avoid_hz`, `min_separation_hz`), and both paths take their candidates from
-  `frequency::admissible_candidates` over the configured 25 Hz grid: the spectral branch scores
-  them (`rank_admissible_candidates`, picks unchanged), the fallback applies the unchanged
-  clearance formula (`FrequencyAllocator::clearance_pick`), and one tail returns `avoid_hz` on
-  exhaustion. `allocate_cq_frequency_excluding` is gone. See `docs/DECISIONS/tx-scheduling.md`.
->>>>>>> 8da5a1e764baab4c09e9fa77df0ce1d692af1cca
 
 ## Manual "nudge" keystroke — `pancetta-tui`
 
