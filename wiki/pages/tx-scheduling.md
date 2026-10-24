@@ -58,6 +58,14 @@ fixes, including the open double-PTT-for-73 bug — see that doc and
   The frequency allocator itself had 4 independent scoring bugs (mislabeled
   spectral axis, wall-clock-vs-decode parity stamping, a scoring floor that
   clamped the wrong way, and a dead own-frequency registry) fixed 2026-07-18.
+- **Known-good crediting reads aired frames, not just provenance** (PAN-83):
+  after a relocation, a grace-window advance on a split credits the offset of
+  the frame that aired in our slot just before the reply's — the TX worker's
+  `TxFrameSent` report, recorded per QSO in `KeepCallLedger::last_aired`. Tests
+  that want the aired-frame path must go through `process_message_with_parity`
+  and report the aired frame in the reply's preceding slot (see
+  `reply_window_now` in `pan72_stall_detection_tests`); `process_message`
+  without parity exercises the provenance fallback.
 - **The double-PTT-for-73 bug** (open since 2026-07-17) was root-caused and
   fixed 2026-07-18: `coordinator/tx.rs`'s Step-4c late pivot rewrote an
   in-flight frame's text to the freshest intent without consuming it, so the

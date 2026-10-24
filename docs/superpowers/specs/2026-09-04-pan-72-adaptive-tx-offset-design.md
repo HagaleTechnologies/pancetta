@@ -526,6 +526,16 @@ tested.
   `Revert` back onto it. `tx_equals_rx` is now `partner_freq.is_none()`: the decode frequency
   decides only after a switch on an unanswered `CallingCq`. Stall-triggered outcomes are
   unchanged.
+- **Amended by PAN-83 (2026-10-24).** On a split, a grace-window advance credits the offset of
+  the frame the TX worker reported aired in our slot just before the reply's slot
+  (`TxFrameSent` → `confirm_stall_trigger_aired` → `answered_frame_offset_hz`, anchored on the
+  decode's observed slot parity and the live `active_slot_ns`).
+  `PreSwitchOffset::operator_forced` is the fallback when no such frame is on record (no report
+  in the reply's window, no decoded parity). The Tx=Rx decode-frequency rule is unchanged. A
+  nudge committed after our frame aired now credits the old offset and a later stall `Revert`s to
+  it; a frame that aired on the new offset before the reply still credits the new offset.
+  Chained relocations credit the frame that actually aired, so the first offset of a chain is
+  not used as an anchor.
 
 ## Manual "nudge" keystroke — `pancetta-tui`
 
