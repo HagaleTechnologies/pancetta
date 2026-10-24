@@ -298,16 +298,11 @@ pub enum MessageType {
         queued: Vec<TxItem>,
     },
 
-    /// Pushed once per keyed TX frame (#172) — Band Activity's own-TX
-    /// history. Emitted from `log_tx_frame` at Step 7 (after the slot-
-    /// boundary wait, once the actual audio-start instant is known),
-    /// separately from — not alongside — `TxQueueStatus`'s NOW-SENDING
-    /// push at Step 5; the two are decoupled so this event's `timestamp`
-    /// reflects when audio actually started, not when PTT was asserted
-    /// (see `log_tx_frame`'s doc comment in `coordinator/tx.rs`). `qso_id:
-    /// None` means a CQ/manual frame, matching `TxItem`'s existing
-    /// convention — every keyed frame is logged regardless of origin
-    /// (#172 scope: all TX, not just QSO-related).
+    /// Band Activity's own-TX history, emitted at Step 7 after authorized
+    /// audio enqueue. The timestamp is the audio thread's report of the
+    /// callback taking the first sample, or the enqueue instant if playback
+    /// cannot be confirmed within 100 ms (PAN-71). It matches the durable
+    /// TX-log record. `qso_id: None` includes CQ/manual frames.
     TxFrameLogged {
         text: String,
         freq_hz: f64,
@@ -432,6 +427,9 @@ pub enum MessageType {
         samples: Vec<f32>,
         sample_rate: u32,
         flush_first: bool,
+        /// Settled by the audio thread when the callback takes the first sample,
+        /// or when the buffer cannot play. Tune uses `None` because it logs no frame.
+        playback_started: Option<PlaybackStartAck>,
     },
 
     /// PAN-135: discard every TX sample still buffered for output, then
@@ -1245,6 +1243,103 @@ struct ComponentChannel {
     last_heartbeat: Arc<RwLock<Option<Instant>>>,
 }
 
+/// Shared, first-settle-wins sender used by the two in-band acknowledgements.
+#[derive(Clone)]
+struct AckSlot<T>(Arc<std::sync::Mutex<Option<oneshot::Sender<T>>>>);
+
+impl<T> AckSlot<T> {
+    fn new(sender: oneshot::Sender<T>) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Some(sender))))
+    }
+
+    fn settle(&self, value: T) {
+        let sender = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(sender) = sender {
+            let _ = sender.send(value);
+        }
+    }
+}
+
+/// What the TX worker observed for one audio buffer (PAN-71).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackStartState {
+    /// The audio thread observed the callback take the first sample at this time.
+    Started(chrono::DateTime<chrono::Utc>),
+    /// The buffer could not be queued, was discarded, or lost its output stream.
+    NotStarted,
+    /// Every copy of the unsettled acknowledgement was dropped.
+    Dropped,
+    /// The bounded wait expired; the waiter remains usable.
+    Pending,
+}
+
+/// Playback confirmation carried with the samples through the Audio FIFO.
+/// Clones share one settlement. Only the audio thread settles it, never the
+/// real-time callback, because the shared slot takes a mutex.
+#[derive(Clone)]
+pub struct PlaybackStartAck {
+    slot: AckSlot<Option<chrono::DateTime<chrono::Utc>>>,
+}
+
+impl PlaybackStartAck {
+    /// Create an acknowledgement and its bounded waiter.
+    pub fn new() -> (Self, PlaybackStartWaiter) {
+        let (tx, rx) = oneshot::channel();
+        (
+            Self {
+                slot: AckSlot::new(tx),
+            },
+            PlaybackStartWaiter { rx, settled: None },
+        )
+    }
+
+    /// Report the audio thread's observation time. Later settlements do nothing.
+    pub fn started(&self, at: chrono::DateTime<chrono::Utc>) {
+        self.slot.settle(Some(at));
+    }
+
+    /// Report that this buffer's first sample will not be played.
+    pub fn not_started(&self) {
+        self.slot.settle(None);
+    }
+}
+
+impl std::fmt::Debug for PlaybackStartAck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlaybackStartAck").finish_non_exhaustive()
+    }
+}
+
+/// The TX worker's half of a [`PlaybackStartAck`].
+pub struct PlaybackStartWaiter {
+    rx: oneshot::Receiver<Option<chrono::DateTime<chrono::Utc>>>,
+    settled: Option<PlaybackStartState>,
+}
+
+impl PlaybackStartWaiter {
+    /// Wait at most `max`. A pending waiter can be polled again; a settled one
+    /// keeps returning its first result without polling the completed channel.
+    pub async fn wait_for(&mut self, max: Duration) -> PlaybackStartState {
+        if let Some(state) = self.settled {
+            return state;
+        }
+        let state = match tokio::time::timeout(max, &mut self.rx).await {
+            Ok(Ok(Some(at))) => PlaybackStartState::Started(at),
+            Ok(Ok(None)) => PlaybackStartState::NotStarted,
+            Ok(Err(_)) => PlaybackStartState::Dropped,
+            Err(_) => PlaybackStartState::Pending,
+        };
+        if state != PlaybackStartState::Pending {
+            self.settled = Some(state);
+        }
+        state
+    }
+}
+
 /// What a [`DeliveryAckWaiter`] observed (PAN-135).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AckState {
@@ -1266,7 +1361,7 @@ pub enum AckState {
 /// `Dropped` at once instead of waiting out its timeout.
 #[derive(Clone)]
 pub struct DeliveryAck {
-    slot: Arc<std::sync::Mutex<Option<oneshot::Sender<bool>>>>,
+    slot: AckSlot<bool>,
 }
 
 impl DeliveryAck {
@@ -1275,7 +1370,7 @@ impl DeliveryAck {
         let (tx, rx) = oneshot::channel();
         (
             Self {
-                slot: Arc::new(std::sync::Mutex::new(Some(tx))),
+                slot: AckSlot::new(tx),
             },
             DeliveryAckWaiter { rx, settled: None },
         )
@@ -1283,14 +1378,7 @@ impl DeliveryAck {
 
     /// Settle the ack. Later calls, on this or any clone, are no-ops.
     pub fn complete(&self, applied: bool) {
-        let sender = self
-            .slot
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        if let Some(sender) = sender {
-            let _ = sender.send(applied);
-        }
+        self.slot.settle(applied);
     }
 }
 
@@ -2049,6 +2137,65 @@ mod tests {
     ];
 
     /// Hazard pin: plain send_message keeps the PAN-38 best-effort contract.
+    #[tokio::test]
+    async fn pan71_playback_start_ack_reports_the_settled_instant() {
+        let (ack, mut waiter) = PlaybackStartAck::new();
+        let at = chrono::Utc::now();
+        ack.clone().started(at);
+        ack.not_started();
+        assert_eq!(
+            waiter.wait_for(Duration::from_millis(10)).await,
+            PlaybackStartState::Started(at)
+        );
+        assert_eq!(
+            waiter.wait_for(Duration::ZERO).await,
+            PlaybackStartState::Started(at)
+        );
+    }
+
+    #[tokio::test]
+    async fn pan71_playback_start_ack_reports_not_started() {
+        let (ack, mut waiter) = PlaybackStartAck::new();
+        ack.not_started();
+        assert_eq!(
+            waiter.wait_for(Duration::from_millis(10)).await,
+            PlaybackStartState::NotStarted
+        );
+    }
+
+    #[tokio::test]
+    async fn pan71_playback_start_ack_dropped_with_its_message_is_observed_immediately() {
+        let (ack, mut waiter) = PlaybackStartAck::new();
+        let message = MessageType::AudioOutput {
+            samples: vec![],
+            sample_rate: 12_000,
+            flush_first: false,
+            playback_started: Some(ack),
+        };
+        drop(message);
+        let before = Instant::now();
+        assert_eq!(
+            waiter.wait_for(Duration::from_secs(2)).await,
+            PlaybackStartState::Dropped
+        );
+        assert!(before.elapsed() < Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn pan71_playback_start_waiter_reports_pending_then_stays_usable() {
+        let (ack, mut waiter) = PlaybackStartAck::new();
+        assert_eq!(
+            waiter.wait_for(Duration::from_millis(1)).await,
+            PlaybackStartState::Pending
+        );
+        let at = chrono::Utc::now();
+        ack.started(at);
+        assert_eq!(
+            waiter.wait_for(Duration::from_millis(10)).await,
+            PlaybackStartState::Started(at)
+        );
+    }
+
     #[tokio::test]
     async fn pan135_send_message_still_swallows_a_full_channel_drop() {
         let bus = MessageBus::new(1).unwrap();

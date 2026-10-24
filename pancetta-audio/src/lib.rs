@@ -40,7 +40,8 @@ pub use device::*;
 pub use error::*;
 pub use latency::*;
 pub use manager::{
-    AudioCommand, AudioManager, AudioManagerConfig, AudioManagerStats, AudioMessage,
+    AudioCommand, AudioManager, AudioManagerConfig, AudioManagerStats, AudioMessage, OutputMark,
+    QueuedOutput,
 };
 pub use message_bus_integration::*;
 pub use processor::*;

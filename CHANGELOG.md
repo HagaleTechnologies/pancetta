@@ -158,6 +158,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Band Activity's own-TX rows and `tx-log.jsonl`'s `utc` now record when the
+  audio output started playing each frame, including a mid-frame re-key,
+  instead of when the TX worker queued its audio (PAN-71). When pancetta
+  cannot confirm the start within 100 ms it keeps the old value and logs a
+  warning.
+
 - Stale-band decodes are now rejected by the QSO, autonomous, and WSJT-X
   relay receive paths (PAN-69, from the PAN-67/PR #336 review): a decode
   whose audio window closed before a band switch completed its CPU-bound

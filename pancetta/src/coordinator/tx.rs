@@ -18,7 +18,8 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, span, warn, Level};
 
 use crate::message_bus::{
-    AckState, ComponentId, ComponentMessage, DeliveryAck, MessageBus, MessageType, SendIfOutcome,
+    AckState, ComponentId, ComponentMessage, DeliveryAck, MessageBus, MessageType,
+    PlaybackStartAck, PlaybackStartState, PlaybackStartWaiter, SendIfOutcome,
 };
 
 use super::tx_log::{TxFrameLog, TxFrameRecord, TX_LOG_ACK_WAIT};
@@ -2861,15 +2862,37 @@ async fn send_tx_status(message_bus: &MessageBus, active: bool) {
     }
 }
 
+/// PAN-71: bounded playback confirmation before the existing TX-log wait.
+/// Step 8 still times playback from enqueue, so this does not extend key-down.
+pub(crate) const TX_PLAYBACK_START_WAIT: Duration = Duration::from_millis(100);
+
+/// Use the audio thread's playback-start report, falling back to the enqueue
+/// instant if confirmation is unavailable. Called only after authorized enqueue.
+async fn frame_log_instant(
+    waiter: &mut PlaybackStartWaiter,
+    enqueued_at: chrono::DateTime<chrono::Utc>,
+    text: &str,
+) -> chrono::DateTime<chrono::Utc> {
+    match waiter.wait_for(TX_PLAYBACK_START_WAIT).await {
+        PlaybackStartState::Started(at) => at,
+        PlaybackStartState::Pending => {
+            warn!("TX audio start not confirmed within {} ms for '{text}'; logging the frame at its enqueue time", TX_PLAYBACK_START_WAIT.as_millis());
+            enqueued_at
+        }
+        PlaybackStartState::NotStarted => {
+            warn!("TX audio for '{text}' was not played (queue error, flushed, or output stream replaced); logging the frame at its enqueue time");
+            enqueued_at
+        }
+        PlaybackStartState::Dropped => {
+            debug!("TX audio playback-start ack dropped for '{text}' (no audio thread); logging the frame at its enqueue time");
+            enqueued_at
+        }
+    }
+}
+
 /// Log one actually-keyed frame for Band Activity's own-TX history (#172).
-///
-/// `timestamp` must be captured AFTER Step 6's slot-boundary wait, not at
-/// Step 5's PTT-key time — Step 6's `duration_until` collapses to a no-op
-/// once `target_slot` is already past (the late-but-viable cursor-skip
-/// case), so a timestamp taken there is `target_slot` on an on-time key and
-/// the true late instant on a late-but-viable one. Stamping at Step 5
-/// instead would show every late-started frame at its nominal slot
-/// boundary even though the audio actually went out seconds later.
+/// The caller supplies the playback-start instant from `frame_log_instant`,
+/// or its enqueue-time fallback, also used by the durable TX-log record.
 async fn log_tx_frame(
     message_bus: &MessageBus,
     text: String,
@@ -2907,8 +2930,8 @@ fn tx_log_dial_hz(
 /// Push a richer TX-queue snapshot (NOW-SENDING + QUEUED) to the TUI.
 /// Best-effort, observation-only: never touches PTT/audio/scheduling.
 ///
-/// Does NOT emit `TxFrameLogged` — that fires separately, at Step 7, once
-/// the actual audio-start instant is known (see [`log_tx_frame`]). This
+/// Does NOT emit `TxFrameLogged`: that fires separately at Step 7 after
+/// playback confirmation or its bounded fallback (see [`log_tx_frame`]). This
 /// function's "NOW-SENDING" snapshot legitimately reflects Step 5 (PTT
 /// asserted now); Band Activity's history needs the later, more accurate
 /// timestamp instead.
@@ -10033,6 +10056,8 @@ impl super::ApplicationCoordinator {
                                         // Round-9 review: denied frames must never appear in Band Activity
                                         // as genuine own-transmissions. Log only on Enqueued, so dropped
                                         // audio cannot appear as an aired frame either.
+                                        let (playback_ack, mut playback_waiter) =
+                                            PlaybackStartAck::new();
                                         let audio_msg = ComponentMessage::new(
                                             ComponentId::Ft8Transmitter,
                                             ComponentId::Audio,
@@ -10044,6 +10069,7 @@ impl super::ApplicationCoordinator {
                                                 // content (Task 2/3). `false` on the normal first
                                                 // pass keeps that path byte-identical.
                                                 flush_first: is_rekey,
+                                                playback_started: Some(playback_ack),
                                             },
                                             Instant::now(),
                                         );
@@ -10066,19 +10092,17 @@ impl super::ApplicationCoordinator {
                                             matches!(outcome, Ok(SendIfOutcome::Enqueued));
                                         match outcome {
                                             Ok(SendIfOutcome::Enqueued) => {
-                                                // Band Activity's own-TX history logs the actual
-                                                // audio-start instant here, not Step 5's PTT-key
-                                                // time — see `log_tx_frame`'s doc comment. Runs
-                                                // AFTER authorized enqueue (PAN-134 / round-9 review): a
-                                                // denied frame must never appear in Band Activity
-                                                // as a genuine own-transmission.
-                                                // PAN-122: the durable TX-log record is written
-                                                // first, with the same timestamp, directly (never
-                                                // via the best-effort bus) and only now that the
-                                                // audio is enqueued. The wait is bounded by
-                                                // TX_LOG_ACK_WAIT so a stalled disk never delays
-                                                // Step 8's abort polling by more than that.
-                                                let tx_logged_at = chrono::Utc::now();
+                                                // PAN-71: report the callback's first sample, with a bounded
+                                                // wait and enqueue-time fallback. Only authorized, enqueued
+                                                // frames are logged (PAN-134). The durable record precedes
+                                                // the TUI event and uses the same instant (PAN-122).
+                                                let enqueued_utc = chrono::Utc::now();
+                                                let tx_logged_at = frame_log_instant(
+                                                    &mut playback_waiter,
+                                                    enqueued_utc,
+                                                    &message_text,
+                                                )
+                                                .await;
                                                 let _ = tx_frame_log
                                                     .append(
                                                         vec![TxFrameRecord::new(
@@ -12843,6 +12867,8 @@ impl super::ApplicationCoordinator {
                                     // Round-9 review: denied frames must never appear in Band Activity
                                     // as genuine own-transmissions. Log only on Enqueued, so dropped
                                     // audio cannot appear as an aired frame either.
+                                    let (playback_ack, mut playback_waiter) =
+                                        PlaybackStartAck::new();
                                     let audio_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Audio,
@@ -12850,6 +12876,7 @@ impl super::ApplicationCoordinator {
                                             samples: audio_out,
                                             sample_rate,
                                             flush_first: false,
+                                            playback_started: Some(playback_ack),
                                         },
                                         Instant::now(),
                                     );
@@ -12872,13 +12899,22 @@ impl super::ApplicationCoordinator {
                                         matches!(outcome, Ok(SendIfOutcome::Enqueued));
                                     match outcome {
                                         Ok(SendIfOutcome::Enqueued) => {
-                                            // Band Activity's own-TX history logs the actual
-                                            // audio-start instant here, not Step 5's PTT-key
-                                            // time — see `log_tx_frame`'s doc comment. Every
-                                            // bundle item is keyed concurrently in this same
-                                            // slot, so all of them share this one timestamp.
-                                            // Runs only AFTER authorized enqueue (PAN-134 / round-9 review).
-                                            let tx_logged_at = chrono::Utc::now();
+                                            // PAN-71: report the callback's first sample, with a bounded
+                                            // wait and enqueue-time fallback. Only authorized, enqueued
+                                            // frames are logged (PAN-134). The durable record precedes
+                                            // the TUI event and uses the same instant (PAN-122).
+                                            let enqueued_utc = chrono::Utc::now();
+                                            let bundle_text = items
+                                                .iter()
+                                                .map(|item| item.message_text.as_str())
+                                                .collect::<Vec<_>>()
+                                                .join(" | ");
+                                            let tx_logged_at = frame_log_instant(
+                                                &mut playback_waiter,
+                                                enqueued_utc,
+                                                &bundle_text,
+                                            )
+                                            .await;
                                             // PAN-122: one durable TX-log batch (one fsync)
                                             // for every item, written before the TUI events
                                             // with the same timestamp; bounded wait, as in
@@ -13376,6 +13412,8 @@ impl super::ApplicationCoordinator {
                                             samples: tone_samples,
                                             sample_rate,
                                             flush_first: false,
+                                            // Tune logs no frame.
+                                            playback_started: None,
                                         },
                                         Instant::now(),
                                     );
@@ -25828,5 +25866,400 @@ mod pan183_attempt_identity_tests {
             Some(TxAttemptId(1))
         );
         assert!(qso.try_recv().is_err());
+    }
+}
+#[cfg(test)]
+mod pan71_playback_start_tests {
+    use super::super::tx_log::{tx_log_path, RotationPolicy, WriterGate};
+    use super::pan115_worker_gate_tests::{request, worker_harness, worker_harness_with, Harness};
+    use super::*;
+    use crate::message_bus::{RigControlMessage, TransmitRequestItem, TxOrigin};
+    use pancetta_config::Config;
+    use std::sync::{Arc, Mutex};
+
+    const TEXT: &str = "CQ N0CALL FN20";
+    const REPLACEMENT: &str = "CQ N0CALL EM12";
+
+    #[derive(Clone, Copy)]
+    enum Behaviour {
+        StartAfter(Duration),
+        NotStarted,
+        Drop,
+        Hold,
+    }
+
+    #[derive(Clone, Debug)]
+    struct Seen {
+        received_at: chrono::DateTime<chrono::Utc>,
+        flush_first: bool,
+        started_at: Option<chrono::DateTime<chrono::Utc>>,
+    }
+
+    struct FakeAudio {
+        seen: Arc<Mutex<Vec<Seen>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for FakeAudio {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn spawn_fake_audio_thread(h: &Harness, behaviour: Behaviour) -> FakeAudio {
+        let (_, rx) = h
+            .coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Audio)
+            .await
+            .unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = seen.clone();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                while let Ok(msg) = rx.try_recv() {
+                    if let MessageType::AudioOutput {
+                        playback_started,
+                        flush_first,
+                        ..
+                    } = msg.message_type
+                    {
+                        let ack = playback_started.expect("logged frame must carry an ack");
+                        let received_at = chrono::Utc::now();
+                        let started_at = if let Behaviour::StartAfter(d) = behaviour {
+                            Some(received_at + chrono::Duration::from_std(d).unwrap())
+                        } else {
+                            None
+                        };
+                        captured.lock().unwrap().push(Seen {
+                            received_at,
+                            flush_first,
+                            started_at,
+                        });
+                        match behaviour {
+                            Behaviour::StartAfter(d) => {
+                                sleep(d).await;
+                                ack.started(started_at.unwrap());
+                            }
+                            Behaviour::NotStarted => ack.not_started(),
+                            Behaviour::Drop => drop(ack),
+                            Behaviour::Hold => held.push(ack),
+                        }
+                    }
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        });
+        FakeAudio { seen, task }
+    }
+
+    async fn await_event(h: &Harness, wanted: &str) -> chrono::DateTime<chrono::Utc> {
+        let deadline = Instant::now() + Duration::from_secs(45);
+        loop {
+            while let Ok(msg) = h.tui_rx.try_recv() {
+                if let MessageType::TxFrameLogged {
+                    text, timestamp, ..
+                } = msg.message_type
+                {
+                    if text == wanted {
+                        return timestamp;
+                    }
+                }
+            }
+            assert!(Instant::now() < deadline, "no TxFrameLogged for {wanted}");
+            sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    fn tx_log_lines(h: &Harness) -> Vec<TxFrameRecord> {
+        let path = tx_log_path(h.coordinator.pancetta_home_override.as_deref());
+        match std::fs::read_to_string(path) {
+            Ok(contents) => contents
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => panic!("reading TX log: {e}"),
+        }
+    }
+
+    async fn await_tx_log_lines(h: &Harness, n: usize, within: Duration) -> Vec<TxFrameRecord> {
+        let deadline = Instant::now() + within;
+        loop {
+            let lines = tx_log_lines(h);
+            if lines.len() >= n || Instant::now() >= deadline {
+                return lines;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn first_pass_frame_is_stamped_at_the_reported_playback_start() {
+        let h = worker_harness().await;
+        let audio =
+            spawn_fake_audio_thread(&h, Behaviour::StartAfter(Duration::from_millis(37))).await;
+        request(&h, TEXT).await;
+        let at = await_event(&h, TEXT).await;
+        let seen = audio.seen.lock().unwrap()[0].clone();
+        assert!(!seen.flush_first);
+        assert_eq!(Some(at), seen.started_at);
+        assert!(at > seen.received_at);
+        let lines = tx_log_lines(&h);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].utc, at);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rekeyed_frame_is_stamped_at_the_replacement_audios_playback_start() {
+        // Auto picks the NEXT slot on each request. Pin parity so the
+        // replacement can re-key this slot within the normal 3000 ms cap.
+        let mut config = Config::default();
+        config.station.tx_self_parity = pancetta_config::station::TxSelfParity::Even;
+        let h = worker_harness_with(config, |_| {}).await;
+        let audio =
+            spawn_fake_audio_thread(&h, Behaviour::StartAfter(Duration::from_millis(37))).await;
+        request(&h, TEXT).await;
+        let first = await_event(&h, TEXT).await;
+        request(&h, REPLACEMENT).await;
+        let second = await_event(&h, REPLACEMENT).await;
+        let seen = audio.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[1].flush_first, "exercise an actual mid-frame re-key");
+        assert_eq!(Some(second), seen[1].started_at);
+        assert!(second > seen[1].received_at);
+        assert!(second > first);
+        let lines = tx_log_lines(&h);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1].text, REPLACEMENT);
+        assert_eq!(lines[1].utc, second);
+    }
+
+    async fn assert_fallback(behaviour: Behaviour) {
+        let h = worker_harness().await;
+        let audio = spawn_fake_audio_thread(&h, behaviour).await;
+        request(&h, TEXT).await;
+        let at = await_event(&h, TEXT).await;
+        let observed = chrono::Utc::now();
+        let seen = audio.seen.lock().unwrap()[0].clone();
+        assert!(at <= seen.received_at + chrono::Duration::milliseconds(5));
+        if matches!(behaviour, Behaviour::Hold) {
+            assert!(observed - at >= chrono::Duration::milliseconds(98));
+        } else {
+            assert!(
+                observed - seen.received_at
+                    < chrono::Duration::from_std(TX_PLAYBACK_START_WAIT).unwrap()
+            );
+        }
+        assert_eq!(tx_log_lines(&h)[0].utc, at);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unconfirmed_playback_start_falls_back_to_the_enqueue_instant_after_the_bound() {
+        assert_fallback(Behaviour::Hold).await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn not_started_report_falls_back_to_the_enqueue_instant_without_waiting() {
+        assert_fallback(Behaviour::NotStarted).await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_ack_falls_back_to_the_enqueue_instant_without_waiting() {
+        assert_fallback(Behaviour::Drop).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bundle_items_share_the_reported_playback_start() {
+        let h = worker_harness().await;
+        let audio =
+            spawn_fake_audio_thread(&h, Behaviour::StartAfter(Duration::from_millis(37))).await;
+        h.coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Autonomous,
+                ComponentId::Ft8Transmitter,
+                MessageType::MultiTransmitRequest {
+                    items: [TEXT, REPLACEMENT]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, text)| TransmitRequestItem {
+                            attempt_id: None,
+                            message_text: text.to_owned(),
+                            frequency_offset: 1000.0 + i as f64 * 600.0,
+                            qso_id: None,
+                            origin: TxOrigin::Local,
+                            remote_client_key_id: None,
+                        })
+                        .collect(),
+                    tx_parity: None,
+                    origin: TxOrigin::Local,
+                    remote_client_key_id: None,
+                },
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+        let first = await_event(&h, TEXT).await;
+        let second = await_event(&h, REPLACEMENT).await;
+        let seen = audio.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(Some(first), seen[0].started_at);
+        assert_eq!(first, second);
+        let lines = tx_log_lines(&h);
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().all(|r| r.utc == first));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frame_log_instant_started_uses_reported_time() {
+        let (ack, mut waiter) = PlaybackStartAck::new();
+        let fallback = chrono::Utc::now();
+        let at = fallback + chrono::Duration::milliseconds(37);
+        ack.started(at);
+        assert_eq!(frame_log_instant(&mut waiter, fallback, TEXT).await, at);
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frame_log_instant_not_started_uses_fallback() {
+        let (ack, mut waiter) = PlaybackStartAck::new();
+        let fallback = chrono::Utc::now();
+        ack.not_started();
+        assert_eq!(
+            frame_log_instant(&mut waiter, fallback, TEXT).await,
+            fallback
+        );
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frame_log_instant_dropped_uses_fallback() {
+        let (ack, mut waiter) = PlaybackStartAck::new();
+        let fallback = chrono::Utc::now();
+        drop(ack);
+        assert_eq!(
+            frame_log_instant(&mut waiter, fallback, TEXT).await,
+            fallback
+        );
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frame_log_instant_pending_uses_fallback_after_bound() {
+        let (_ack, mut waiter) = PlaybackStartAck::new();
+        let fallback = chrono::Utc::now();
+        let before = Instant::now();
+        assert_eq!(
+            frame_log_instant(&mut waiter, fallback, TEXT).await,
+            fallback
+        );
+        assert!(before.elapsed() >= TX_PLAYBACK_START_WAIT);
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_playback_start_ack_never_holds_ptt_past_playback() {
+        let gate = WriterGate::closed();
+        let writer_gate = gate.clone();
+        let h = worker_harness_with(Config::default(), move |c| {
+            let path = tx_log_path(c.pancetta_home_override.as_deref());
+            c.tx_frame_log = Some(Arc::new(TxFrameLog::open_gated(
+                path,
+                RotationPolicy::default(),
+                writer_gate,
+            )));
+        })
+        .await;
+        let (_, audio_rx) = h
+            .coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Audio)
+            .await
+            .unwrap();
+
+        request(&h, TEXT).await;
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let mut ptt_on = false;
+        let mut ptt_off_after_on = false;
+        let mut ptt_off_at = None;
+        let mut audio = None;
+        let mut held = Vec::new();
+        let mut completed = None;
+        while completed.is_none() && Instant::now() < deadline {
+            while let Ok(msg) = audio_rx.try_recv() {
+                if let MessageType::AudioOutput {
+                    samples,
+                    sample_rate,
+                    playback_started,
+                    ..
+                } = msg.message_type
+                {
+                    held.push(playback_started.expect("frame ack"));
+                    let len = Duration::from_secs_f64(samples.len() as f64 / sample_rate as f64);
+                    audio.get_or_insert((Instant::now(), len));
+                }
+            }
+            while let Ok(msg) = h.hamlib_rx.try_recv() {
+                if let MessageType::RigControl(RigControlMessage::SetPtt { state }) =
+                    msg.message_type
+                {
+                    if state {
+                        ptt_on = true;
+                    } else if ptt_on {
+                        ptt_off_after_on = true;
+                        ptt_off_at.get_or_insert(Instant::now());
+                    }
+                }
+            }
+            while let Ok(msg) = h.autonomous_rx.try_recv() {
+                if let MessageType::TransmitComplete {
+                    success,
+                    message_text,
+                    ..
+                } = msg.message_type
+                {
+                    if message_text == TEXT {
+                        completed = Some(success);
+                    }
+                }
+            }
+            while h.tui_rx.try_recv().is_ok() {}
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let off_deadline = Instant::now() + Duration::from_secs(2);
+        while !ptt_off_after_on && Instant::now() < off_deadline {
+            while let Ok(msg) = h.hamlib_rx.try_recv() {
+                if let MessageType::RigControl(RigControlMessage::SetPtt { state: false }) =
+                    msg.message_type
+                {
+                    if ptt_on {
+                        ptt_off_after_on = true;
+                        ptt_off_at.get_or_insert(Instant::now());
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            completed,
+            Some(true),
+            "the frame completes while the writer is blocked"
+        );
+        assert!(ptt_on, "PTT keyed");
+        assert!(ptt_off_after_on, "PTT released while the writer is blocked");
+        // PR #468 review: the full TX_LOG_ACK_WAIT spent waiting on the blocked
+        // writer must not be added to key-down after the audio ends.
+        let (audio_at, audio_len) = audio.expect("audio enqueued");
+        let ptt_off_at = ptt_off_at.expect("PTT-off observed in the playback loop");
+        let overhang = ptt_off_at.saturating_duration_since(audio_at + audio_len);
+        assert!(
+            overhang < TX_LOG_ACK_WAIT - Duration::from_millis(50),
+            "PTT stayed keyed {overhang:?} past the audio (log wait leaked into playback)"
+        );
+        assert!(
+            tx_log_lines(&h).is_empty(),
+            "the blocked writer wrote nothing"
+        );
+
+        gate.open();
+        let lines = await_tx_log_lines(&h, 1, Duration::from_secs(5)).await;
+        assert_eq!(
+            lines.len(),
+            1,
+            "the queued record lands once the disk responds"
+        );
+        assert_eq!(lines[0].text, TEXT);
     }
 }

@@ -930,7 +930,7 @@ Each line:
 | Field | Meaning |
 |---|---|
 | `v` | Record schema version, `1`. |
-| `utc` | When the frame's audio was handed to the audio output (RFC 3339, UTC). The same instant as the TUI Band Activity row. |
+| `utc` | When the audio output started playing the frame: the instant pancetta's audio thread saw the output callback take the frame's first sample (RFC 3339, UTC). If pancetta cannot confirm that within 100 ms, or the audio was not played, it is the moment the audio was handed to the audio output, and the app log has a WARN line saying so. The same instant as the TUI Band Activity row. |
 | `mode` | `"FT8"`, `"FT4"` or `"FT2"`. |
 | `dial_hz` | Effective TX dial in Hz, split-aware (the split dial when split is active, otherwise the RX dial). `null` when no dial is known yet (rig not reporting, rig-less dev modes). |
 | `offset_hz` | Audio offset in Hz. RF = `dial_hz + offset_hz`. |
@@ -944,6 +944,9 @@ mid-frame still leaves the record, and a mid-slot re-key with fresher text
 adds a second record. Frames refused before PTT, denied at the last
 authorization check, or whose audio could not be enqueued get no record. The
 items of a multi-TX bundle each get a line and share one `utc`.
+A frame whose audio pancetta saw discarded before it played (for example a
+re-key while the output device had stalled) still gets a record, stamped
+when its audio was handed to the output; the app log's `WARN` line names it.
 
 Durability: each append is one `write_all` followed by `sync_data`, so a
 record survives a pancetta crash immediately afterwards, and an fsync is

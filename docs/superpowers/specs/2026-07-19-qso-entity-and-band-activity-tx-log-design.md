@@ -101,6 +101,11 @@ Step 6 completes, which is exactly `target_slot` when on-time and the true late 
 late — correct in both cases. No filtering by `qso_id` — per the "log all our TX, including CQ"
 scope decision, every keyed frame is logged regardless of origin.
 
+PAN-71 supersedes the timestamp source described above: it is now the audio
+thread's report of the output callback taking the frame's first sample, with a
+100 ms bound and an enqueue-instant fallback when playback is unconfirmed or
+not started. The durable TX-log record uses the same instant.
+
 `pancetta/src/coordinator/tui_relay.rs` gets a new arm translating this into
 `TuiMessage::TxFrameLogged { text, freq_hz, qso_id, timestamp }`, and `tui_runner.rs` routes it to
 a new `App::add_tx_frame(...)` — same shape as the existing #165 `QsoHistoryEntry` wiring

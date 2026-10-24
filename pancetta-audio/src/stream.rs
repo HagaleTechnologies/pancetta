@@ -625,6 +625,7 @@ impl AudioStreamManager {
 /// Body of the cpal output callback: record a heartbeat for the coordinator's
 /// output watchdog (PAN-115), then drain queued TX samples into `data` and
 /// zero-fill whatever the ring buffer could not supply.
+/// Drain and pop also publish ring positions and play marks using only atomics.
 pub(crate) fn fill_output_buffer(
     consumer: &mut AudioConsumer,
     shared: &AudioCommShared,
@@ -695,6 +696,33 @@ impl StreamStatistics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fill_output_buffer_reports_a_buffer_whose_first_sample_lands_mid_callback() {
+        let (mut p, mut c) = crate::audio_comm_pair(64, 8);
+        p.push_audio_slice(&[0.1; 3]);
+        p.shared.arm_play_mark(4);
+        p.push_audio_slice(&[0.9; 3]);
+        let mut out = [0.0; 8];
+        fill_output_buffer(&mut c, &p.shared, &mut out);
+        assert_eq!(p.shared.play_mark_state(4), crate::OutputMarkState::Played);
+        assert_eq!(out, [0.1, 0.1, 0.1, 0.9, 0.9, 0.9, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn fill_output_buffer_reports_discarded_when_it_services_a_pending_flush_first() {
+        let (mut p, mut c) = crate::audio_comm_pair(64, 8);
+        p.shared.arm_play_mark(1);
+        p.push_audio_slice(&[0.9; 3]);
+        p.shared.request_flush();
+        let mut out = [1.0; 8];
+        fill_output_buffer(&mut c, &p.shared, &mut out);
+        assert_eq!(
+            p.shared.play_mark_state(1),
+            crate::OutputMarkState::Discarded
+        );
+        assert_eq!(out, [0.0; 8]);
+    }
 
     #[test]
     fn fill_output_buffer_records_a_heartbeat_and_zero_fills_underrun() {
