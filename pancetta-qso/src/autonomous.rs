@@ -769,90 +769,66 @@ impl FrequencyAllocator {
 
     /// Find a clear frequency for a new CQ, avoiding own QSOs and busy areas.
     ///
-    /// Unconstrained form of [`Self::allocate_cq_frequency_excluding`]: with no
-    /// exclusions and no window the scan can never come up empty, so the
+    /// The clearance pick over this allocator's own grid (its
+    /// `allocation_range`, stepping by its `min_separation_hz`) with no
+    /// constraints. It is the last resort of
+    /// [`AutonomousOperator::allocate_smart_frequency_in_range`] when the
+    /// constraints leave nothing and there is no `avoid_hz` to return. The
     /// `unwrap_or_else` arm is reachable only for a degenerate allocation range
-    /// (`min > max`, i.e. the scan loop never runs) — which is exactly the
-    /// `center` this method returned before the scan was factored out.
+    /// (`min > max`, so the grid is empty), where it returns the clamped
+    /// midpoint.
     pub fn allocate_cq_frequency(&self) -> f64 {
         let (min_f, max_f) = self.allocation_range;
-        self.allocate_cq_frequency_excluding(&[], self.min_separation_hz, None)
+        let grid = crate::frequency::admissible_candidates(
+            self.allocation_range,
+            self.min_separation_hz,
+            None,
+            &crate::frequency::TxOffsetConstraints::unconstrained(),
+        );
+        self.clearance_pick(&grid)
             .unwrap_or_else(|| ((min_f + max_f) / 2.0).clamp(min_f, max_f))
     }
 
-    /// [`Self::allocate_cq_frequency`]'s scan with the caller's hard exclusions
-    /// and optional `[lo, hi]` window applied, or `None` when they leave no
-    /// candidate at all.
+    /// The no-spectral scoring layer: the candidate with the most clearance,
+    /// or `None` for an empty slice.
     ///
-    /// PAN-72 (Codex round 3 on PR #350, finding 1). This scan is the
-    /// no-spectral-snapshot fallback for
-    /// [`AutonomousOperator::allocate_smart_frequency_in_range`] — the path
-    /// EVERY resolution takes until the first waterfall lands (a fresh start,
-    /// or an Autonomous-task restart). It used to be exclusion-blind, so on
-    /// that path a stall relocation could hand back the very offset it was
-    /// asked to avoid, and two `Switch` requests drained in the same batch both
-    /// got the identical deterministic answer — collapsing two TX streams onto
-    /// one offset, which makes the TX coalescer omit one of them. The
-    /// exclusions are enforced with `separation_hz`, the caller's own
-    /// separation (`FrequencyAllocatorConfig::min_separation_hz`), so the
-    /// fallback and the ranked branch exclude by exactly the same rule rather
-    /// than two independently-chosen constants.
+    /// Clearance is the distance to the nearest own QSO minus 20 per observed
+    /// decode within 100 Hz; a strict `>` keeps the first candidate on a tie.
+    /// With no own QSO every clearance is `f64::MAX` (the observed penalty is
+    /// absorbed), so the first candidate wins.
     ///
-    /// `separation_hz` governs only the exclusions; the candidate grid still
-    /// steps by this allocator's own `min_separation_hz`, unchanged.
-    ///
-    /// PAN-72 (Codex round 6 on PR #350, finding 3): `range_hz` now WIDENS the
-    /// scan when it reaches outside `allocation_range`, rather than only
-    /// filtering a fixed 200–2800 Hz sweep down. A Hound response region above
-    /// 2800 Hz is valid operator configuration and used to empty this scan (and
-    /// the ranked branch above it) outright, so every post-QSY stall switch and
-    /// `u` nudge resolved back to `avoid_hz` and was refused as a no-op. See
-    /// [`crate::frequency::sweep_bounds`], which both scans share so they can
-    /// never disagree about what is searchable.
-    pub fn allocate_cq_frequency_excluding(
-        &self,
-        exclude_hz: &[f64],
-        separation_hz: f64,
-        range_hz: Option<(f64, f64)>,
-    ) -> Option<f64> {
-        let step = self.min_separation_hz;
-        let (min_f, max_f) = crate::frequency::sweep_bounds(self.allocation_range, step, range_hz);
-
+    /// PAN-80: this is the formula the old no-snapshot fallback scan applied,
+    /// unchanged. That scan also built its own 75 Hz grid and re-implemented
+    /// the window and exclusion filters. Candidates now come
+    /// from [`crate::frequency::admissible_candidates`], the generator the
+    /// spectral layer uses too, so a constraint cannot bind on one path only.
+    pub(crate) fn clearance_pick(&self, candidates: &[f64]) -> Option<f64> {
         let mut best: Option<f64> = None;
         let mut best_clearance = f64::NEG_INFINITY;
 
-        let mut freq = min_f;
-        while freq <= max_f {
-            let in_window = range_hz.is_none_or(|(lo, hi)| freq >= lo && freq <= hi);
-            let clear_of_exclusions = exclude_hz
+        for &freq in candidates {
+            let min_dist_own = self
+                .own_frequencies
+                .values()
+                .map(|&f| (f - freq).abs())
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or(f64::MAX);
+
+            let nearby_count = self
+                .observed_frequencies
                 .iter()
-                .all(|&other| (freq - other).abs() >= separation_hz);
-            if in_window && clear_of_exclusions {
-                let min_dist_own = self
-                    .own_frequencies
-                    .values()
-                    .map(|&f| (f - freq).abs())
-                    .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                    .unwrap_or(f64::MAX);
+                .filter(|&&f| (f - freq).abs() < 100.0)
+                .count();
 
-                let nearby_count = self
-                    .observed_frequencies
-                    .iter()
-                    .filter(|&&f| (f - freq).abs() < 100.0)
-                    .count();
-
-                // Clearance score: distance from own QSOs, penalize busy areas
-                let clearance = min_dist_own - (nearby_count as f64 * 20.0);
-                if clearance > best_clearance {
-                    best_clearance = clearance;
-                    best = Some(freq);
-                }
+            // Clearance score: distance from own QSOs, penalize busy areas
+            let clearance = min_dist_own - (nearby_count as f64 * 20.0);
+            if clearance > best_clearance {
+                best_clearance = clearance;
+                best = Some(freq);
             }
-
-            freq += step;
         }
 
-        best.map(|hz| hz.clamp(min_f, max_f))
+        best
     }
 
     /// Get all own frequencies currently allocated.
@@ -1843,17 +1819,18 @@ impl AutonomousOperator {
     /// the soft `own_frequencies` score penalty: that penalty is documented
     /// as "effectively eliminates this candidate" but is not guaranteed to on
     /// a crowded band — the same reason `avoid_hz` was promoted from soft to
-    /// hard in Codex round 6 on PR #276. When the exclusions empty the ranked
-    /// list, the fallback still returns `avoid_hz` unchanged so the caller's
+    /// hard in Codex round 6 on PR #276. When the exclusions leave no
+    /// candidate, the allocator returns `avoid_hz` unchanged so the caller's
     /// existing "no valid relocation → skip the switch" path fires.
     ///
-    /// Both exclusion sets bind on BOTH resolution paths (Codex round 3 on PR
-    /// #350, finding 1). They originally applied only inside the
-    /// `self.spectral_snapshot.is_some()` branch, leaving the no-snapshot
-    /// fallback — every resolution until the first waterfall lands — free to
-    /// hand two same-batch `Switch` actions the identical deterministic offset;
-    /// [`FrequencyAllocator::allocate_cq_frequency_excluding`] now enforces the
-    /// same exclusions there, with the same `min_separation_hz`.
+    /// Both exclusion sets bind on BOTH resolution paths. They originally
+    /// applied only inside the `self.spectral_snapshot.is_some()` branch,
+    /// leaving the no-snapshot fallback — every resolution until the first
+    /// waterfall lands — free to hand two same-batch `Switch` actions the
+    /// identical deterministic offset (Codex round 3 on PR #350, finding 1).
+    /// Since PAN-80 both paths take their candidates from one generator
+    /// filtered by one [`crate::frequency::TxOffsetConstraints`], see
+    /// [`Self::allocate_smart_frequency_in_range`].
     pub fn allocate_smart_frequency_avoiding(
         &self,
         dx_target_hz: Option<f64>,
@@ -1888,7 +1865,7 @@ impl AutonomousOperator {
     /// `[lo, hi]` Hz window.
     ///
     /// PAN-72 (Codex round 2 on PR #350, finding 1). The general allocation
-    /// range is the whole `FrequencyAllocatorConfig::range` (300–2800 Hz by
+    /// range is the whole `FrequencyAllocatorConfig::range` (200–2800 Hz by
     /// default), which is the right search space for a normal QSO but NOT for a
     /// **Hound**: the Hound procedure pins our TX into the low calling region
     /// while we are calling the Fox, and into the response region once the Fox
@@ -1902,19 +1879,30 @@ impl AutonomousOperator {
     /// treated as "no constraint" instead of panicking in `f64::clamp` or
     /// filtering every candidate away.
     ///
-    /// Two paths have to honor the window, not just the ranked one:
-    /// - the spectral branch filters candidates to the window alongside the
-    ///   existing `avoid_hz`/`also_avoid_hz` hard exclusions, and when that
-    ///   empties the list it returns `avoid_hz` unchanged — the caller's
-    ///   established "no valid relocation" signal;
-    /// - the legacy fallback (taken when no spectral snapshot has landed yet)
-    ///   filters its own scan to the window, and to the same hard exclusions,
-    ///   via [`FrequencyAllocator::allocate_cq_frequency_excluding`] (round 3,
-    ///   finding 1). Only if THAT comes up empty does the old
-    ///   clamp-the-unconstrained-pick behavior apply, and only when there is no
-    ///   `avoid_hz` to return as the "no valid relocation" signal — the clamped
-    ///   edge is still inside the region the Fox listens in, which is the
-    ///   property that actually matters in that last-resort case.
+    /// PAN-80: one candidate set, two scoring layers, one exhaustion tail.
+    /// The window, `avoid_hz`, `also_avoid_hz` and `min_separation_hz` form one
+    /// [`crate::frequency::TxOffsetConstraints`], and both paths take their
+    /// candidates from [`crate::frequency::admissible_candidates`] over the
+    /// configured grid (`FrequencyAllocatorConfig::range` stepping `step_hz`,
+    /// widened to cover the window). Before PAN-80 each path built and
+    /// filtered its own grid, and PR #350 twice added a constraint to the
+    /// spectral path only (round 2: the window; round 3: the exclusions). A
+    /// new constraint kind now goes into `TxOffsetConstraints` and binds on
+    /// both paths.
+    ///
+    /// - With a spectral snapshot, the candidates are scored by
+    ///   `SmartFrequencyAllocator::rank_admissible_candidates`, nudged by the
+    ///   CQ-mode live-spot boost, and the best is taken.
+    /// - Without one (a fresh start, an Autonomous-task restart, or simply
+    ///   before the first waterfall, so not a rare path), the same candidates
+    ///   go through [`FrequencyAllocator::clearance_pick`].
+    /// - If no candidate survives on either path, `avoid_hz` is returned
+    ///   unchanged: the caller's "no valid relocation" signal, which
+    ///   `apply_tx_offset_switch` refuses as a no-op. With no `avoid_hz` to
+    ///   signal with (a fresh CQ pick, not a relocation) an answer is still
+    ///   owed, so the unconstrained [`FrequencyAllocator::allocate_cq_frequency`]
+    ///   pick is clamped into the window — the clamped edge is still inside the
+    ///   region the Fox listens in.
     pub fn allocate_smart_frequency_in_range(
         &self,
         dx_target_hz: Option<f64>,
@@ -1941,6 +1929,29 @@ impl AutonomousOperator {
             return self.config.tx_offset_hz;
         }
 
+        // Every hard constraint on this resolution, for both paths below.
+        //
+        // - The Hound window (PAN-72 round 2, finding 1) is what the grid is
+        //   GENERATED over as well as filtered by (round 6, finding 3): a
+        //   response region above the allocator's own range would otherwise
+        //   empty the candidates and turn every switch into a refused no-op.
+        // - `avoid_hz` is a HARD exclusion, not the soft -50 penalty
+        //   `own_frequencies` scoring applies (Codex review, PR #276 round 6):
+        //   score_candidate's "effectively eliminates this candidate" is
+        //   aspirational, and on a crowded or noisy band the penalized offset
+        //   can still outrank every alternative.
+        // - `also_avoid_hz` (offsets already handed to OTHER QSOs earlier in
+        //   the same coordinator drain batch) gets the identical hard
+        //   treatment (PAN-72 round 1, finding 1) — see
+        //   `allocate_smart_frequency_avoiding`'s doc comment.
+        let config = self.smart_allocator.config();
+        let constraints = crate::frequency::TxOffsetConstraints {
+            window: range_hz,
+            avoid_hz,
+            also_avoid_hz: also_avoid_hz.to_vec(),
+            separation_hz: config.min_separation_hz,
+        };
+
         let own_freqs: Vec<f64> = self
             .frequency_allocator
             .own_frequencies()
@@ -1952,116 +1963,58 @@ impl AutonomousOperator {
         // opposite of the DX's own observed slot — same convention as the
         // `tx_parity = cq.slot_parity.map(|p| p.opposite())` this operator
         // already latches for the actual transmission, see `decide()`'s
-        // pounce arm) into the `TimeSlot` `rank_candidates_with_parity`
-        // scores against. `None` (e.g. a self-CQ, which can commit to
-        // either slot) degrades to the slot-blind scoring `rank_candidates`
-        // already provided.
+        // pounce arm) into the `TimeSlot` the spectral layer scores against.
+        // `None` (e.g. a self-CQ, which can commit to either slot) degrades
+        // to the slot-blind scoring `rank_candidates` already provided.
         let target_slot = target_parity.map(|p| match p {
             pancetta_core::slot::SlotParity::Even => TimeSlot::First,
             pancetta_core::slot::SlotParity::Odd => TimeSlot::Second,
         });
 
-        if let Some(ref spectral) = self.spectral_snapshot {
-            // Round 6, finding 3: the window is what the candidate grid is
-            // GENERATED over, not merely filtered by afterwards — a Hound
-            // response region above the allocator's own range would otherwise
-            // empty the list and turn every switch into a refused no-op.
-            let mut candidates = self.smart_allocator.rank_candidates_in_range(
-                spectral,
-                &self.decode_history,
-                &own_freqs,
-                dx_target_hz,
-                target_slot,
-                range_hz,
-            );
+        let pick = match self.spectral_snapshot {
+            Some(ref spectral) => {
+                let mut candidates = self.smart_allocator.rank_admissible_candidates(
+                    spectral,
+                    &self.decode_history,
+                    &own_freqs,
+                    dx_target_hz,
+                    target_slot,
+                    &constraints,
+                );
 
-            // When calling CQ, prefer frequencies near rare DX spots.
-            if dx_target_hz.is_none() && !self.live_spot_frequencies.is_empty() {
-                Self::apply_live_spot_rarity_boost(&mut candidates, &self.live_spot_frequencies);
+                // When calling CQ, prefer frequencies near rare DX spots.
+                if dx_target_hz.is_none() && !self.live_spot_frequencies.is_empty() {
+                    Self::apply_live_spot_rarity_boost(
+                        &mut candidates,
+                        &self.live_spot_frequencies,
+                    );
+                }
+
+                candidates.first().map(|best| best.offset_hz)
             }
-
-            // Codex review (PR #276, round 6): `avoid_hz` needs a HARD
-            // exclusion, not the soft -50 penalty `own_frequencies` scoring
-            // applies (score_candidate's comment "effectively eliminates
-            // this candidate" is aspirational, not guaranteed — on a
-            // crowded/noisy band the penalized offset can still outrank
-            // every alternative). Filtering the ranked list directly, only
-            // for this specific avoid_hz, keeps the shared own_frequencies
-            // soft-penalty semantics unchanged for its original callers
-            // (own-QSO separation).
-            //
-            // PAN-72 finding 1: `also_avoid_hz` (offsets already handed to
-            // OTHER QSOs earlier in the same coordinator drain batch) gets the
-            // identical hard treatment — see
-            // `allocate_smart_frequency_avoiding`'s doc comment.
-            let min_separation_hz = self.smart_allocator.config().min_separation_hz;
-            let excluded: Vec<_> = candidates
-                .iter()
-                .filter(|c| {
-                    // PAN-72 round 2 finding 1: the Hound region window, when
-                    // the caller supplied one, is as hard a constraint as the
-                    // avoid exclusions below.
-                    range_hz.is_none_or(|(lo, hi)| c.offset_hz >= lo && c.offset_hz <= hi)
-                        && avoid_hz
-                            .is_none_or(|avoid| (c.offset_hz - avoid).abs() >= min_separation_hz)
-                        && also_avoid_hz
-                            .iter()
-                            .all(|&other| (c.offset_hz - other).abs() >= min_separation_hz)
-                })
-                .cloned()
-                .collect();
-
-            if let Some(best) = excluded.first() {
-                return best.offset_hz;
+            None => {
+                let candidates = crate::frequency::admissible_candidates(
+                    config.range,
+                    config.step_hz,
+                    constraints.window,
+                    &constraints,
+                );
+                self.frequency_allocator.clearance_pick(&candidates)
             }
+        };
 
-            // Codex review (PR #277, round 3): if the hard exclusion above
-            // filters out every ranked candidate (e.g. min_separation_hz
-            // configured larger than the available spectral spread), there
-            // is genuinely no frequency that honors the exclusion. Don't
-            // fall through to the legacy `allocate_cq_frequency()` below
-            // (avoid_hz-blind, could reselect exactly the abandoned
-            // frequency) — and don't pick a "farthest available"
-            // compromise either (round 2's fix), since that still openly
-            // violates the configured separation the caller asked for.
-            // Return `avoid` itself unchanged: the caller (the
-            // no-response-streak switch path in `decide_at`) treats a
-            // no-op result as "no valid relocation" and skips the switch
-            // entirely, matching the existing "stale occupancy data" skip
-            // path rather than committing to a frequency that isn't
-            // actually excluded.
-            if let Some(avoid) = avoid_hz {
-                return avoid;
-            }
-        }
-
-        // Fallback: legacy allocator, taken whenever no spectral snapshot has
-        // landed yet (a fresh start, an Autonomous-task restart, or simply
-        // before the first waterfall) — so this is not a rare path.
-        //
-        // PAN-72 (Codex round 3 on PR #350, finding 1): it honors the SAME hard
-        // exclusions and window the ranked branch above does. Left
-        // exclusion-blind, its determinism was the bug: every caller in a batch
-        // ranks against the same stale own-frequency map, so two queued
-        // `Switch` requests both received the identical offset (the TX
-        // coalescer then omits one stream), and a stall relocation could be
-        // handed straight back the offset it was told to avoid.
-        let min_separation_hz = self.smart_allocator.config().min_separation_hz;
-        let mut exclusions: Vec<f64> = Vec::with_capacity(also_avoid_hz.len() + 1);
-        exclusions.extend_from_slice(also_avoid_hz);
-        exclusions.extend(avoid_hz);
-        if let Some(hz) = self.frequency_allocator.allocate_cq_frequency_excluding(
-            &exclusions,
-            min_separation_hz,
-            range_hz,
-        ) {
+        if let Some(hz) = pick {
             return hz;
         }
 
-        // The exclusions (or a window disjoint from the allocation range) left
-        // no candidate. Mirror the ranked branch exactly rather than inventing
-        // a fallback behavior: return `avoid_hz` unchanged, the caller's
-        // established "no valid relocation → skip the switch" signal.
+        // No candidate honors the constraints (e.g. min_separation_hz larger
+        // than the available spread, or a window between two grid points).
+        // Return `avoid_hz` itself unchanged, the same on both paths: the
+        // caller treats the no-op as "no valid relocation" and skips the
+        // switch, rather than committing to an offset the constraints exclude
+        // (Codex review, PR #277 round 3). Neither the old avoid-blind legacy
+        // pick nor a "farthest available" compromise (round 2) is acceptable
+        // here: both can openly violate the separation the caller asked for.
         if let Some(avoid) = avoid_hz {
             return avoid;
         }
@@ -4297,6 +4250,261 @@ mod tests {
         assert_eq!(
             op.allocate_smart_frequency_in_range(None, None, None, &[], None),
             200.0
+        );
+    }
+
+    /// PAN-80: a 25 Hz-wide Hound window holds exactly one point of the
+    /// configured grid (1150). The no-snapshot fallback used to scan its own
+    /// 75 Hz grid, which has no point in the window, so the same `Switch` was
+    /// refused or honored depending only on whether a waterfall had landed.
+    #[test]
+    fn pan80_fallback_searches_the_same_grid_as_the_ranked_branch() {
+        const WINDOW: (f64, f64) = (1130.0, 1155.0);
+        const AVOID: f64 = 250.0;
+
+        let mut op = pan80_auto_operator(pan80_enabled_config());
+        let fallback =
+            op.allocate_smart_frequency_in_range(None, None, Some(AVOID), &[], Some(WINDOW));
+        assert_eq!(
+            fallback, 1150.0,
+            "the fallback must find the in-window grid point"
+        );
+
+        op.update_spectral(pan80_flat_snapshot());
+        let ranked =
+            op.allocate_smart_frequency_in_range(None, None, Some(AVOID), &[], Some(WINDOW));
+        assert_eq!(ranked, fallback, "both paths search the same grid");
+    }
+
+    /// PAN-80: `FrequencyAllocatorConfig::step_hz` binds on the fallback.
+    /// At 10 Hz the window (1061, 1089) holds 1070 and 1080; the old 75 Hz
+    /// fallback grid had no point in it. The two scoring layers then choose
+    /// differently from the same candidates: the clearance pick takes the
+    /// first (no own QSO, so every candidate's clearance is equal), the
+    /// spectral score takes 1080 (closer to the 1500 Hz center).
+    #[test]
+    fn pan80_fallback_honors_configured_step_hz() {
+        const WINDOW: (f64, f64) = (1061.0, 1089.0);
+        const AVOID: f64 = 1500.0;
+
+        let mut config = pan80_enabled_config();
+        config.frequency.step_hz = 10.0;
+        let mut op = pan80_auto_operator(config);
+        let fallback =
+            op.allocate_smart_frequency_in_range(None, None, Some(AVOID), &[], Some(WINDOW));
+        assert_eq!(fallback, 1070.0, "first 10 Hz grid point inside the window");
+
+        op.update_spectral(pan80_flat_snapshot());
+        let ranked =
+            op.allocate_smart_frequency_in_range(None, None, Some(AVOID), &[], Some(WINDOW));
+        assert_eq!(
+            ranked, 1080.0,
+            "the in-window 10 Hz point closest to center"
+        );
+    }
+
+    /// PAN-80: `FrequencyAllocatorConfig::range` binds on the fallback: its
+    /// fresh-start pick is the configured floor, not the old hardcoded 200.
+    #[test]
+    fn pan80_fallback_uses_the_configured_range() {
+        let mut config = pan80_enabled_config();
+        config.frequency.range = (1000.0, 2000.0);
+        let op = pan80_auto_operator(config);
+        assert_eq!(
+            op.allocate_smart_frequency_in_range(None, None, None, &[], None),
+            1000.0
+        );
+    }
+
+    /// PAN-80's recurrence check. Over every combination of window, avoid,
+    /// batch exclusions, separation, own QSO and snapshot, every pick is
+    /// either a point of the configured grid that satisfies every constraint,
+    /// or, only when no such point exists, the exhaustion signal (`avoid_hz`
+    /// unchanged) or the clamped legacy last resort. Both the grid and the
+    /// constraints are recomputed here independently of the production code.
+    #[test]
+    fn pan80_every_non_exhaustion_pick_satisfies_the_constraints() {
+        let windows = [
+            None,
+            Some((1000.0, 2700.0)),
+            Some((1130.0, 1155.0)),
+            Some((2850.0, 2900.0)),
+            Some((2110.0, 2115.0)),
+        ];
+        let avoids = [None, Some(1500.0), Some(225.0)];
+        let batches: [&[f64]; 3] = [&[], &[1425.0], &[1150.0, 1600.0, 2875.0]];
+        let separations = [75.0, 400.0];
+        let owns = [None, Some(2000.0)];
+
+        let mut checked = 0;
+        for window in windows {
+            for avoid in avoids {
+                for batch in batches {
+                    for separation in separations {
+                        for own in owns {
+                            for with_snapshot in [false, true] {
+                                let mut config = pan80_enabled_config();
+                                config.frequency.min_separation_hz = separation;
+                                let mut op = pan80_auto_operator(config);
+                                if let Some(own) = own {
+                                    op.frequency_allocator_mut()
+                                        .register_qso_frequency("own", own);
+                                }
+                                if with_snapshot {
+                                    op.update_spectral(pan80_flat_snapshot());
+                                }
+                                let pick = op.allocate_smart_frequency_in_range(
+                                    None, None, avoid, batch, window,
+                                );
+
+                                let satisfies = |hz: f64| {
+                                    window.is_none_or(|(lo, hi)| lo <= hz && hz <= hi)
+                                        && avoid.is_none_or(|a| (hz - a).abs() >= separation)
+                                        && batch.iter().all(|&b| (hz - b).abs() >= separation)
+                                };
+                                // The default 25 Hz grid from 200, reaching up
+                                // to the window when it lies above 2800.
+                                let ceiling = window.map_or(2800.0, |(_, hi)| hi.max(2800.0));
+                                let admissible: Vec<f64> = (0..)
+                                    .map(|k| 200.0 + 25.0 * k as f64)
+                                    .take_while(|&hz| hz <= ceiling)
+                                    .filter(|&hz| satisfies(hz))
+                                    .collect();
+
+                                let scenario = format!(
+                                    "window {window:?}, avoid {avoid:?}, batch {batch:?}, \
+                                     separation {separation}, own {own:?}, \
+                                     snapshot {with_snapshot}: got {pick}"
+                                );
+                                if !admissible.is_empty() {
+                                    assert!(
+                                        admissible.contains(&pick),
+                                        "a real pick must be an admissible grid point; {scenario}"
+                                    );
+                                } else if let Some(avoid) = avoid {
+                                    assert_eq!(
+                                        pick.to_bits(),
+                                        avoid.to_bits(),
+                                        "exhaustion must return avoid_hz; {scenario}"
+                                    );
+                                } else {
+                                    let legacy = op.frequency_allocator().allocate_cq_frequency();
+                                    let expected =
+                                        window.map_or(legacy, |(lo, hi)| legacy.clamp(lo, hi));
+                                    assert_eq!(pick, expected, "clamped last resort; {scenario}");
+                                }
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 5 * 3 * 3 * 2 * 2 * 2);
+    }
+
+    /// PAN-80: one exhaustion tail serves both paths, so two unrelated ways of
+    /// running out of candidates return `avoid_hz` bit for bit, with and
+    /// without a snapshot.
+    #[test]
+    fn pan80_shared_exhaustion_tail_is_singular() {
+        // (separation, avoid, window): a window between two grid points, and
+        // a separation no offset can honor.
+        let scenarios = [
+            (75.0, 1500.0, Some((2110.0, 2115.0))),
+            (10_000.0, 1000.0, None),
+        ];
+        for (separation, avoid, window) in scenarios {
+            for with_snapshot in [false, true] {
+                let mut config = pan80_enabled_config();
+                config.frequency.min_separation_hz = separation;
+                let mut op = pan80_auto_operator(config);
+                if with_snapshot {
+                    op.update_spectral(pan80_flat_snapshot());
+                }
+                let pick =
+                    op.allocate_smart_frequency_in_range(None, None, Some(avoid), &[], window);
+                assert_eq!(
+                    pick.to_bits(),
+                    avoid.to_bits(),
+                    "separation {separation}, window {window:?}, snapshot {with_snapshot}: got {pick}"
+                );
+            }
+        }
+    }
+
+    /// PAN-80: the no-snapshot scoring layer is the old scan's clearance
+    /// formula, unchanged (`min_dist_own - 20 * observed within 100 Hz`,
+    /// strict `>` so the first candidate wins a tie), now over a supplied
+    /// candidate slice.
+    #[test]
+    fn pan80_clearance_pick_formula_unchanged() {
+        let legacy_grid: Vec<f64> = (0..=34).map(|k| 200.0 + 75.0 * k as f64).collect();
+        let mut alloc = FrequencyAllocator::new(75.0, (200.0, 2800.0));
+        assert_eq!(alloc.clearance_pick(&[]), None, "no candidates, no pick");
+
+        // No own QSO: every clearance is f64::MAX (the observed penalty is
+        // absorbed), so the first candidate wins even where it is busy.
+        alloc.observed_frequencies = vec![200.0, 210.0];
+        assert_eq!(alloc.clearance_pick(&[200.0, 1000.0]), Some(200.0));
+        assert_eq!(alloc.clearance_pick(&legacy_grid), Some(200.0));
+
+        // Own QSO at 1500: the farthest candidate wins (200 is 1300 Hz away,
+        // 2750 only 1250).
+        alloc.observed_frequencies.clear();
+        alloc.register_qso_frequency("q1", 1500.0);
+        assert_eq!(alloc.clearance_pick(&legacy_grid), Some(200.0));
+        assert_eq!(
+            alloc.allocate_cq_frequency(),
+            200.0,
+            "the last resort is the same pick over the legacy grid"
+        );
+
+        // Equal clearance: slice order decides.
+        assert_eq!(alloc.clearance_pick(&[1400.0, 1600.0]), Some(1400.0));
+        assert_eq!(alloc.clearance_pick(&[1600.0, 1400.0]), Some(1600.0));
+
+        // One observed decode within 100 Hz of 1400 costs it 20.
+        alloc.observed_frequencies = vec![1390.0];
+        assert_eq!(alloc.clearance_pick(&[1400.0, 1600.0]), Some(1600.0));
+    }
+
+    /// PAN-80: the spectral scoring layer returns its candidates score
+    /// descending, with equal scores left in ascending grid order — the tie
+    /// break that keeps filter-then-score picks identical to the old
+    /// score-then-filter ones.
+    #[test]
+    fn pan80_rank_admissible_candidates_sorts_desc_stable() {
+        let allocator =
+            SmartFrequencyAllocator::new(crate::frequency::FrequencyAllocatorConfig::default());
+        let history = DecodeHistory::new(4);
+        let spectral = pan80_flat_snapshot();
+        let rank = |constraints: &crate::frequency::TxOffsetConstraints| {
+            allocator.rank_admissible_candidates(&spectral, &history, &[], None, None, constraints)
+        };
+        let offsets = |c: &[FrequencyCandidate]| c.iter().map(|c| c.offset_hz).collect::<Vec<_>>();
+
+        // Center bias is symmetric about 1500, so each pair ties.
+        let window_only = crate::frequency::TxOffsetConstraints {
+            window: Some((1400.0, 1600.0)),
+            avoid_hz: None,
+            also_avoid_hz: Vec::new(),
+            separation_hz: 75.0,
+        };
+        let ranked = rank(&window_only);
+        assert_eq!(
+            offsets(&ranked),
+            vec![1500.0, 1475.0, 1525.0, 1450.0, 1550.0, 1425.0, 1575.0, 1400.0, 1600.0]
+        );
+        assert!(ranked.windows(2).all(|w| w[0].score >= w[1].score));
+
+        let avoiding = crate::frequency::TxOffsetConstraints {
+            avoid_hz: Some(1500.0),
+            ..window_only
+        };
+        assert_eq!(
+            offsets(&rank(&avoiding)),
+            vec![1425.0, 1575.0, 1400.0, 1600.0]
         );
     }
 

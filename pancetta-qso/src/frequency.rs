@@ -223,10 +223,9 @@ pub struct PlacementSnapshot {
 /// PAN-72 (Codex round 6 on PR #350, finding 3). A caller-supplied window (the
 /// Hound calling/response region) is operator configuration and may legitimately
 /// reach outside the allocator's range; used only as a post-hoc filter it
-/// emptied the candidate list instead of being searched. Both scans — the ranked
-/// spectral one here and [`crate::autonomous::FrequencyAllocator::allocate_cq_frequency_excluding`]'s
-/// legacy fallback — take their bounds from this one function so they can never
-/// disagree about what "the searchable range" is.
+/// emptied the candidate list instead of being searched. Every candidate grid
+/// takes its bounds from this one function, via [`admissible_candidates`]
+/// (PAN-80), so no two scans can disagree about what "the searchable range" is.
 ///
 /// Two properties matter:
 ///
@@ -404,47 +403,40 @@ impl SmartFrequencyAllocator {
         dx_target_hz: Option<f64>,
         target_parity: Option<TimeSlot>,
     ) -> Vec<FrequencyCandidate> {
-        self.rank_candidates_in_range(
+        self.rank_admissible_candidates(
             spectral,
             history,
             own_frequencies,
             dx_target_hz,
             target_parity,
-            None,
+            &TxOffsetConstraints::unconstrained(),
         )
     }
 
-    /// [`Self::rank_candidates_with_parity`] over a candidate grid that is
-    /// guaranteed to COVER `window`, even where `window` reaches outside
-    /// [`FrequencyAllocatorConfig::range`].
+    /// The spectral scoring layer over the shared candidate set: every offset
+    /// [`admissible_candidates`] yields for `constraints`, scored, sorted by
+    /// score descending.
     ///
-    /// PAN-72 (Codex round 6 on PR #350, finding 3). The Hound response region
-    /// is operator configuration and may legitimately sit above the allocator's
-    /// own range (`200–2800 Hz` by default) — `2850–2900 Hz`, say. Callers used
-    /// to hand that window down only as a FILTER over candidates already
-    /// generated from `config.range`, so such a region emptied the ranked list
-    /// outright: every post-QSY Hound stall switch and `u` nudge resolved back
-    /// to `avoid_hz` and was refused as a no-op, with the configured region
-    /// never actually searched.
-    ///
-    /// The sweep is WIDENED, never narrowed, and stays anchored to
-    /// `config.range.0` — every offset this scan produced before is still
-    /// produced, bit for bit, so a window inside the configured range ranks
-    /// exactly as it did. See [`sweep_bounds`].
-    pub fn rank_candidates_in_range(
+    /// PAN-80. The grid is generated over `constraints.window` as well as
+    /// [`FrequencyAllocatorConfig::range`] (the round-6 widening, see
+    /// [`sweep_bounds`]) and hard-filtered by `constraints` before scoring.
+    /// Scoring is per candidate, so filtering first gives the same scores as
+    /// the old score-then-filter order; the sort is stable over the ascending
+    /// grid, so equal scores also keep the same order.
+    pub(crate) fn rank_admissible_candidates(
         &self,
         spectral: &SpectralSnapshot,
         history: &DecodeHistory,
         own_frequencies: &[f64],
         dx_target_hz: Option<f64>,
         target_parity: Option<TimeSlot>,
-        window: Option<(f64, f64)>,
+        constraints: &TxOffsetConstraints,
     ) -> Vec<FrequencyCandidate> {
         let grid = admissible_candidates(
             self.config.range,
             self.config.step_hz,
-            window,
-            &TxOffsetConstraints::unconstrained(),
+            constraints.window,
+            constraints,
         );
         let mut candidates: Vec<FrequencyCandidate> = grid
             .into_iter()
@@ -1210,9 +1202,9 @@ mod tests {
         assert!(admissible_candidates((200.0, 2800.0), 25.0, None, &impossible).is_empty());
     }
 
-    /// The pre-PAN-80 ranking, frozen verbatim as the oracle for the
-    /// generator rewiring: its own `while` loop over `sweep_bounds`, scored
-    /// and sorted exactly as `rank_candidates_in_range` did.
+    /// The pre-PAN-80 ranked scan, frozen verbatim as the oracle for the
+    /// generator rewiring: its own loop over the `sweep_bounds`-widened grid,
+    /// every point scored, then sorted, with no hard filtering.
     fn pre_pan80_ranking(
         allocator: &SmartFrequencyAllocator,
         spectral: &SpectralSnapshot,
@@ -1297,39 +1289,77 @@ mod tests {
         (spectral, history)
     }
 
+    /// The PAN-80 rewiring changes no ranked output. Unconstrained, the
+    /// instrument ranking equals the old scan field for field. Constrained,
+    /// filtering before scoring equals the old scan filtered afterwards, in
+    /// the same order.
     #[test]
-    fn rank_candidates_in_range_output_is_unchanged_by_the_rewiring() {
+    fn ranked_output_is_unchanged_by_the_generator_rewiring() {
         let allocator = SmartFrequencyAllocator::new(FrequencyAllocatorConfig::default());
         let (spectral, history) = pan80_textured_inputs();
         let own = [1500.0];
+        let (dx, parity) = (Some(1000.0), Some(TimeSlot::Second));
 
-        for (window, len) in [
-            (None, 105),
-            (Some((1000.0, 2700.0)), 105),
-            (Some((2850.0, 2900.0)), 109),
+        let unconstrained =
+            allocator.rank_candidates_with_parity(&spectral, &history, &own, dx, parity);
+        let old = pre_pan80_ranking(&allocator, &spectral, &history, &own, dx, parity, None);
+        assert_eq!(unconstrained.len(), 105);
+        assert_eq!(pan80_fingerprint(&unconstrained), pan80_fingerprint(&old));
+
+        for (constraints, len) in [
+            (
+                pan80_constraints(Some((1000.0, 2700.0)), None, &[], 75.0),
+                69,
+            ),
+            (
+                pan80_constraints(Some((2850.0, 2900.0)), None, &[], 75.0),
+                3,
+            ),
+            (
+                pan80_constraints(
+                    Some((1000.0, 2700.0)),
+                    Some(1600.0),
+                    &[1100.0, 2000.0],
+                    75.0,
+                ),
+                54, // 69 in the window, minus 5 within 75 Hz of each exclusion
+            ),
         ] {
-            let got = allocator.rank_candidates_in_range(
+            let got = allocator.rank_admissible_candidates(
                 &spectral,
                 &history,
                 &own,
-                Some(1000.0),
-                Some(TimeSlot::Second),
-                window,
+                dx,
+                parity,
+                &constraints,
             );
-            let expected = pre_pan80_ranking(
+            let window = constraints.window.unwrap();
+            let old_then_filtered: Vec<FrequencyCandidate> = pre_pan80_ranking(
                 &allocator,
                 &spectral,
                 &history,
                 &own,
-                Some(1000.0),
-                Some(TimeSlot::Second),
-                window,
-            );
-            assert_eq!(got.len(), len, "window {window:?}");
+                dx,
+                parity,
+                Some(window),
+            )
+            .into_iter()
+            .filter(|c| {
+                let hz = c.offset_hz;
+                hz >= window.0
+                    && hz <= window.1
+                    && constraints.avoid_hz.is_none_or(|a| (hz - a).abs() >= 75.0)
+                    && constraints
+                        .also_avoid_hz
+                        .iter()
+                        .all(|&o| (hz - o).abs() >= 75.0)
+            })
+            .collect();
+            assert_eq!(got.len(), len, "{constraints:?}");
             assert_eq!(
                 pan80_fingerprint(&got),
-                pan80_fingerprint(&expected),
-                "window {window:?}"
+                pan80_fingerprint(&old_then_filtered),
+                "{constraints:?}"
             );
         }
     }
