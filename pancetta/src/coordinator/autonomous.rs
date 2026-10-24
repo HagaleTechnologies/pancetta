@@ -3167,25 +3167,40 @@ impl super::ApplicationCoordinator {
                                     Ok(message) => {
                                         match message.message_type {
                                             MessageType::DecodedMessage(decoded_msg) => {
-                                                slot_messages.push(pancetta_qso::DecodedMessageInfo {
-                                                    callsign: decoded_msg.message.from_callsign.clone(),
-                                                    frequency_hz: decoded_msg.frequency_offset,
-                                                    snr: decoded_msg.snr_db as i32,
-                                                    message_text: decoded_msg.text.clone(),
-                                                    slot_parity: decoded_msg.slot_parity,
-                                                    // hb-103 (Batch 32): plumb through for the
-                                                    // content-score TX gate in autonomous.decide().
-                                                    confidence: Some(decoded_msg.confidence),
-                                                    time_offset_s: Some(decoded_msg.time_offset),
-                                                    // hb-247 (Batch 81): v3 lateness term source.
-                                                    decode_origin: decoded_msg
-                                                        .confidence_features
-                                                        .as_ref()
-                                                        .and_then(|c| c.decode_origin),
-                                                    // PAN-68: keep the decode's own window dial so the slot-tick
-                                                    // cqdx report never reads the live atomic for a heard-on band.
-                                                    captured_dial_hz: decoded_msg.captured_dial_hz,
-                                                });
+                                                // PAN-69: drop at push time — a decode captured on a since-left
+                                                // band must not enter slot_messages at all: every consumer of the
+                                                // list (slot-activity stats, frequency allocator occupancy, decode
+                                                // history, pending_cqs, collision-listen, plan_slot_transmissions)
+                                                // treats a stale decode as equally untrustworthy.
+                                                if crate::coordinator::is_stale_band_decode(
+                                                    decoded_msg.captured_dial_hz,
+                                                    operating_frequency_hz.load(Ordering::Relaxed),
+                                                ) {
+                                                    debug!(
+                                                        "Autonomous: dropping decode captured on a prior band \
+                                                         (band switch happened mid-decode)"
+                                                    );
+                                                } else {
+                                                    slot_messages.push(pancetta_qso::DecodedMessageInfo {
+                                                        callsign: decoded_msg.message.from_callsign.clone(),
+                                                        frequency_hz: decoded_msg.frequency_offset,
+                                                        snr: decoded_msg.snr_db as i32,
+                                                        message_text: decoded_msg.text.clone(),
+                                                        slot_parity: decoded_msg.slot_parity,
+                                                        // hb-103 (Batch 32): plumb through for the
+                                                        // content-score TX gate in autonomous.decide().
+                                                        confidence: Some(decoded_msg.confidence),
+                                                        time_offset_s: Some(decoded_msg.time_offset),
+                                                        // hb-247 (Batch 81): v3 lateness term source.
+                                                        decode_origin: decoded_msg
+                                                            .confidence_features
+                                                            .as_ref()
+                                                            .and_then(|c| c.decode_origin),
+                                                        // PAN-68: keep the decode's own window dial so the slot-tick
+                                                        // cqdx report never reads the live atomic for a heard-on band.
+                                                        captured_dial_hz: decoded_msg.captured_dial_hz,
+                                                    });
+                                                }
                                             }
                                             // PAN-38: a dispatched self-CQ
                                             // failed downstream (radio/CAT
@@ -6893,6 +6908,40 @@ mod fq_f9_placement_feed_when_disabled_tests {
         msg.text = "CQ W1AW FN31".to_string();
         msg.slot_parity = Some(SlotParity::Even);
         msg
+    }
+
+    // ------------------------------------------------------------------
+    // PAN-69: wiring pins for the DecodedMessage handler's stale-band
+    // gate, same in-module pattern as qso.rs. The fixture's
+    // `captured_dial_hz = None` is exactly what the fail-open guard
+    // below pins: a decode with no captured dial must keep flowing.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn cq_decode_from_a_prior_band_is_stale_for_the_autonomous_handler() {
+        let mut msg = cq_decoded_message();
+        msg.captured_dial_hz = Some(7_074_000);
+        assert!(crate::coordinator::is_stale_band_decode(
+            msg.captured_dial_hz,
+            14_074_000
+        ));
+    }
+
+    #[test]
+    fn unknown_dial_cq_decodes_still_feed_the_slot_messages_cycle() {
+        // cq_decoded_message() leaves captured_dial_hz = None (no CAT /
+        // test fixture): fail open — this is what the existing harness test
+        // disabled_feed_emits_placement_update_but_never_dispatches sends
+        // through the REAL loop, and it must keep flowing.
+        let msg = cq_decoded_message();
+        assert!(!crate::coordinator::is_stale_band_decode(
+            msg.captured_dial_hz,
+            14_074_000
+        ));
+        assert!(!crate::coordinator::is_stale_band_decode(
+            Some(7_074_000),
+            0
+        ));
     }
 
     async fn build_coordinator(autonomous_enabled: bool, headless: bool) -> ApplicationCoordinator {

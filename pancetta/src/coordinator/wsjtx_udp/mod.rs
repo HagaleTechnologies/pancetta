@@ -237,7 +237,17 @@ impl super::ApplicationCoordinator {
                     match wsjtx_rx.try_recv() {
                         Ok(message) => {
                             if let MessageType::DecodedMessage(decoded) = message.message_type {
-                                if is_stale_band_decode(decoded.captured_dial_hz, last_band) {
+                                // PAN-69: unified with the QSO/autonomous
+                                // receive paths on the shared band-edge
+                                // predicate (`is_band_change` semantics,
+                                // live dial read at the gate) — an
+                                // intra-band multi-MHz retune (10m/6m) is
+                                // NOT a band switch, so it must not drop a
+                                // valid decode.
+                                if crate::coordinator::is_stale_band_decode(
+                                    decoded.captured_dial_hz,
+                                    state.operating_frequency_hz.load(Ordering::Relaxed),
+                                ) {
                                     debug!(
                                         "WSJT-X UDP: dropping decode captured on a prior \
                                          band (band switch happened mid-decode)"
@@ -929,29 +939,17 @@ fn band_changed(dial_hz: u64, last_band: Option<u64>) -> Option<u64> {
     }
 }
 
-/// PAN-67 review round 5 (folded into PAN-69's broader stale-band-rejection
-/// scope): true when a decode's own captured band differs from the band
-/// this WSJT-X relay currently believes it's on (`last_band`, kept in sync
-/// by the `band_changed` sampler above).
-///
-/// Decoding is real CPU work with a wall-clock gap after window-close, so a
-/// band switch mid-decode can otherwise land an old-band decode in the
-/// ring right after `Clear` already invalidated it for the new band —
-/// GridTracker/JTAlert would then interpret its offset against the NEW
-/// Status dial, and with `allow_tx_initiation` on, a Reply could match that
-/// retained entry and send `StartQso` on the wrong band.
-///
-/// Never treats an unknown value as stale: `captured_dial_hz` of `None` or
-/// `0` (dsp.rs's "not yet established" sentinel) and `current_band` of
-/// `None` (no rig sample yet) both fall through to "not stale" — there's
-/// nothing concrete to compare against, and a live decode should never be
-/// silently dropped on a false positive.
-fn is_stale_band_decode(captured_dial_hz: Option<u64>, current_band: Option<u64>) -> bool {
-    match (captured_dial_hz, current_band) {
-        (Some(hz), Some(band)) if hz != 0 => band_of(hz) != band,
-        _ => false,
-    }
-}
+// PAN-67 review round 5, unified by PAN-69: stale-band decode rejection
+// here uses the SHARED coordinator predicate
+// (`super::is_stale_band_decode`, `is_band_change` band-edge semantics,
+// live dial read at the gate) — the same check the QSO and autonomous
+// receive paths use, so all three consumers agree exactly on what "a
+// different band" means. Decoding is real CPU work with a wall-clock gap
+// after window-close, so a band switch mid-decode can otherwise land an
+// old-band decode in the ring right after `Clear` already invalidated it
+// for the new band — GridTracker/JTAlert would then interpret its offset
+// against the NEW Status dial, and with `allow_tx_initiation` on, a Reply
+// could match that retained entry and send `StartQso` on the wrong band.
 
 /// Rebuild a retained `Decode` for Replay(7): every field verbatim except
 /// `New`, forced to `false` (protocol notes §4 IN Replay: "re-emitting
@@ -1874,26 +1872,61 @@ mod decode_tests {
 
     /// PAN-67 review round 5 (folded into PAN-69): a decode captured on the
     /// OLD band before a switch must not be treated as belonging to the
-    /// current band just because it arrives after the switch.
+    /// current band just because it arrives after the switch. PAN-69
+    /// unified this onto the shared coordinator predicate — assertions are
+    /// dial Hz now, not MHz buckets.
     #[test]
     fn is_stale_band_decode_true_when_captured_band_differs_from_current() {
-        assert!(is_stale_band_decode(Some(7_074_000), Some(14)));
+        assert!(crate::coordinator::is_stale_band_decode(
+            Some(7_074_000),
+            14_074_000
+        ));
     }
 
     #[test]
     fn is_stale_band_decode_false_when_captured_band_matches_current() {
-        assert!(!is_stale_band_decode(Some(14_074_000), Some(14)));
+        assert!(!crate::coordinator::is_stale_band_decode(
+            Some(14_074_000),
+            14_074_000
+        ));
     }
 
     #[test]
     fn is_stale_band_decode_false_when_captured_is_unknown() {
-        assert!(!is_stale_band_decode(None, Some(14)));
-        assert!(!is_stale_band_decode(Some(0), Some(14)));
+        assert!(!crate::coordinator::is_stale_band_decode(None, 14_074_000));
+        assert!(!crate::coordinator::is_stale_band_decode(
+            Some(0),
+            14_074_000
+        ));
     }
 
     #[test]
     fn is_stale_band_decode_false_when_current_band_is_unknown() {
-        assert!(!is_stale_band_decode(Some(7_074_000), None));
+        assert!(!crate::coordinator::is_stale_band_decode(
+            Some(7_074_000),
+            0
+        ));
+    }
+
+    #[test]
+    fn is_stale_band_decode_false_for_intra_10m_mhz_bucket_crossing() {
+        // 28.5 -> 29.5 MHz is still Band10m (28.0-29.7 MHz). The old
+        // MHz-bucket predicate returned TRUE here and dropped a valid
+        // decode after an intra-band retune.
+        assert!(!crate::coordinator::is_stale_band_decode(
+            Some(28_500_000),
+            29_500_000
+        ));
+    }
+
+    #[test]
+    fn is_stale_band_decode_false_when_live_dial_unknown() {
+        // Old signature had Option<u64> current_band (None = no sample);
+        // the unified predicate's equivalent unknown is live dial 0.
+        assert!(!crate::coordinator::is_stale_band_decode(
+            Some(7_074_000),
+            0
+        ));
     }
 
     #[test]
