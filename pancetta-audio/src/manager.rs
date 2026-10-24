@@ -6,12 +6,28 @@
 
 use crate::{
     AudioCommShared, AudioConsumer, AudioDeviceInfo, AudioDeviceManager, AudioError, AudioProducer,
-    AudioStreamManager, LatencyMeasurer, LinearResampler, StreamConfig,
+    AudioStreamManager, LatencyMeasurer, LinearResampler, OutputMarkState, StreamConfig,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
+
+/// Identifies the first sample of a TX buffer in one output-ring generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputMark {
+    generation: u64,
+    mark: u64,
+}
+
+/// Result of queueing audio with playback-start tracking (PAN-71).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueuedOutput {
+    /// Whether the requested flush completed within its bounded wait.
+    pub flush_completed: bool,
+    /// Absent when the buffer was empty or the ring was full.
+    pub mark: Option<OutputMark>,
+}
 
 /// Main audio manager that coordinates all audio components
 pub struct AudioManager {
@@ -35,6 +51,7 @@ pub struct AudioManager {
 
     /// Producer half for sending TX audio to the output stream
     output_producer: Option<AudioProducer>,
+    output_generation: u64,
 
     /// Shutdown signal
     shutdown: Arc<AtomicBool>,
@@ -169,6 +186,7 @@ impl AudioManager {
             latency_monitor,
             converter,
             output_producer,
+            output_generation: 1,
             shutdown: Arc::new(AtomicBool::new(false)),
             config,
             stats: AudioManagerStats::default(),
@@ -219,6 +237,7 @@ impl AudioManager {
             // Grab the freshly-created consumer and output producer from the stream manager
             self.consumer = stream.take_consumer();
             self.shared = stream.get_shared();
+            self.output_generation += 1;
             self.output_producer = stream.take_output_producer();
 
             info!("Audio stream started successfully");
@@ -399,6 +418,19 @@ impl AudioManager {
         input_rate: u32,
         flush_first: bool,
     ) -> Result<bool, AudioError> {
+        self.queue_output_marked(samples, input_rate, flush_first)
+            .map(|queued| queued.flush_completed)
+    }
+
+    /// Queue audio and track its first sample, without reading a clock in the callback.
+    /// Only one mark is tracked per ring; inspect the previous mark before queueing again.
+    pub fn queue_output_marked(
+        &mut self,
+        samples: &[f32],
+        input_rate: u32,
+        flush_first: bool,
+    ) -> Result<QueuedOutput, AudioError> {
+        let generation = self.output_generation;
         let producer = self
             .output_producer
             .as_mut()
@@ -438,7 +470,14 @@ impl AudioManager {
             samples.to_vec()
         };
 
-        let written = producer.push_audio_slice(&output_samples);
+        let mark = if !output_samples.is_empty() && producer.vacant_len() > 0 {
+            let mark = producer.pushed_total() + 1;
+            producer.shared.arm_play_mark(mark);
+            Some(OutputMark { generation, mark })
+        } else {
+            None
+        };
+        let written = Self::push_marked_output(producer, &output_samples, mark);
         if written < output_samples.len() {
             warn!(
                 "Output buffer overrun: {}/{} samples written",
@@ -451,7 +490,43 @@ impl AudioManager {
             "Queued {} TX audio samples for output (rate {}->{}Hz, flush_first={})",
             written, input_rate, self.config.sample_rate, flush_first
         );
-        Ok(flush_completed)
+        Ok(QueuedOutput {
+            flush_completed,
+            mark,
+        })
+    }
+
+    // Keep the no-mark decision and the write coupled even if the callback
+    // frees ring space between the capacity check and the push.
+    fn push_marked_output(
+        producer: &mut AudioProducer,
+        samples: &[f32],
+        mark: Option<OutputMark>,
+    ) -> usize {
+        if mark.is_some() {
+            producer.push_audio_slice(samples)
+        } else {
+            // Retrying a previously full ring could write samples without a
+            // mark if the callback freed space in the meantime. Refuse that
+            // write and preserve the normal overrun accounting instead.
+            producer
+                .shared
+                .dropped_samples
+                .fetch_add(samples.len() as u64, Ordering::Relaxed);
+            0
+        }
+    }
+
+    /// A replaced output ring can never play an old generation's mark.
+    pub fn output_mark_state(&self, mark: OutputMark) -> OutputMarkState {
+        if mark.generation != self.output_generation {
+            return OutputMarkState::Discarded;
+        }
+        self.output_producer
+            .as_ref()
+            .map_or(OutputMarkState::Discarded, |producer| {
+                producer.shared.play_mark_state(mark.mark)
+            })
     }
 
     /// Get list of available input devices
@@ -602,6 +677,7 @@ impl AudioManager {
         // against the freshly-opened device.
         self.consumer = stream.take_consumer();
         self.shared = stream.get_shared();
+        self.output_generation += 1;
         self.output_producer = stream.take_output_producer();
         self.stream = Some(stream);
 
@@ -742,6 +818,111 @@ pub enum AudioCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_output_marked_reports_played_after_the_callback_pops_the_buffer() {
+        let mut manager = AudioManager::new().expect("device-free construction");
+        let mut consumer = manager
+            .stream
+            .as_mut()
+            .unwrap()
+            .take_output_consumer()
+            .unwrap();
+        let queued = manager
+            .queue_output_marked(&[0.9; 8], 48_000, false)
+            .unwrap();
+        let mark = queued.mark.unwrap();
+        assert!(queued.flush_completed);
+        assert_eq!(manager.output_mark_state(mark), OutputMarkState::Waiting);
+        consumer.pop_audio_slice(&mut [0.0; 2]);
+        assert_eq!(manager.output_mark_state(mark), OutputMarkState::Played);
+    }
+
+    #[test]
+    fn queue_output_marked_reports_discarded_when_an_unserviced_flush_is_serviced_late() {
+        let mut manager = AudioManager::new().expect("device-free construction");
+        let mut consumer = manager
+            .stream
+            .as_mut()
+            .unwrap()
+            .take_output_consumer()
+            .unwrap();
+        let queued = manager
+            .queue_output_marked(&[0.9; 8], 48_000, true)
+            .unwrap();
+        assert!(!queued.flush_completed);
+        let mark = queued.mark.unwrap();
+        consumer.drain_pending_flush();
+        assert_eq!(manager.output_mark_state(mark), OutputMarkState::Discarded);
+    }
+
+    #[test]
+    fn queue_output_marked_returns_no_mark_for_an_empty_buffer() {
+        let mut manager = AudioManager::new().expect("device-free construction");
+        assert_eq!(
+            manager
+                .queue_output_marked(&[], 12_000, false)
+                .unwrap()
+                .mark,
+            None
+        );
+    }
+
+    #[test]
+    fn unmarked_full_ring_write_stays_discarded_if_callback_frees_space_before_push() {
+        let (mut producer, mut consumer) = crate::audio_comm_pair(4, 8);
+        producer.push_audio_slice(&[0.1; 4]);
+        assert_eq!(producer.vacant_len(), 0);
+        // queue_output_marked has decided no mark can be armed. Simulate
+        // the callback draining the old frame before the subsequent push.
+        let mark = None;
+        consumer.pop_audio_slice(&mut [0.0; 4]);
+        assert_eq!(
+            AudioManager::push_marked_output(&mut producer, &[0.9; 4], mark),
+            0
+        );
+        assert_eq!(consumer.audio_samples_available(), 0);
+        assert_eq!(producer.shared.dropped_samples(), 4);
+    }
+
+    #[test]
+    fn queue_output_marked_returns_no_mark_when_the_ring_is_full() {
+        let mut manager = AudioManager::new().expect("device-free construction");
+        let capacity = manager.output_producer.as_ref().unwrap().vacant_len();
+        manager
+            .queue_output_marked(&vec![0.1; capacity], 48_000, false)
+            .unwrap();
+        assert_eq!(
+            manager
+                .queue_output_marked(&[0.9; 8], 48_000, false)
+                .unwrap()
+                .mark,
+            None
+        );
+    }
+
+    #[test]
+    fn a_mark_from_an_earlier_output_generation_reads_discarded() {
+        let mut manager = AudioManager::new().expect("device-free construction");
+        let mark = manager
+            .queue_output_marked(&[0.9; 8], 48_000, false)
+            .unwrap()
+            .mark
+            .unwrap();
+        manager.output_generation += 1;
+        assert_eq!(manager.output_mark_state(mark), OutputMarkState::Discarded);
+    }
+
+    #[test]
+    fn queue_output_confirming_flush_still_returns_only_the_flush_result() {
+        let mut manager = AudioManager::new().expect("device-free construction");
+        assert!(manager
+            .queue_output_confirming_flush(&[0.9; 8], 48_000, false)
+            .unwrap());
+        assert!(!manager
+            .queue_output_confirming_flush(&[], 48_000, true)
+            .unwrap());
+    }
 
     #[test]
     fn test_audio_manager_creation() {

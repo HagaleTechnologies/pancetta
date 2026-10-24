@@ -6,6 +6,49 @@
 
 use std::time::{Duration, Instant};
 
+/// One outstanding buffer mark. The TX worker normally waits for each ack
+/// before sending again; replacement settles any still-waiting old mark.
+/// All clock reads and ack settlement run on the audio thread, never the callback.
+pub(crate) struct PlaybackStartWatch<M: Copy> {
+    pending: Option<(M, crate::message_bus::PlaybackStartAck)>,
+}
+
+impl<M: Copy> PlaybackStartWatch<M> {
+    pub(crate) fn new() -> Self {
+        Self { pending: None }
+    }
+
+    pub(crate) fn arm(
+        &mut self,
+        mark: M,
+        ack: crate::message_bus::PlaybackStartAck,
+        state: impl FnOnce(M) -> pancetta_audio::OutputMarkState,
+        now: impl FnOnce() -> chrono::DateTime<chrono::Utc>,
+    ) {
+        self.poll(state, now);
+        if let Some((_, previous)) = self.pending.take() {
+            previous.not_started();
+        }
+        self.pending = Some((mark, ack));
+    }
+
+    pub(crate) fn poll(
+        &mut self,
+        state: impl FnOnce(M) -> pancetta_audio::OutputMarkState,
+        now: impl FnOnce() -> chrono::DateTime<chrono::Utc>,
+    ) {
+        let Some((mark, ack)) = self.pending.as_ref() else {
+            return;
+        };
+        match state(*mark) {
+            pancetta_audio::OutputMarkState::Waiting => return,
+            pancetta_audio::OutputMarkState::Played => ack.started(now()),
+            pancetta_audio::OutputMarkState::Discarded => ack.not_started(),
+        }
+        self.pending = None;
+    }
+}
+
 /// Capped-exponential backoff for repeated `reopen_devices` attempts after a
 /// `process_audio` error. The first call after construction (or after a
 /// [`reset`](Self::reset)) returns [`Duration::ZERO`] — a StreamError should
@@ -427,5 +470,109 @@ mod tests {
         w.rebaseline(ms(t0, 20));
         assert_eq!(w.observe(0, ms(t0, 21)), OutputEdge::None);
         assert!(!w.is_alive(ms(t0, 21)));
+    }
+}
+
+#[cfg(test)]
+mod pan71_playback_watch_tests {
+    use super::*;
+    use crate::message_bus::{PlaybackStartAck, PlaybackStartState};
+    use pancetta_audio::OutputMarkState;
+
+    #[tokio::test]
+    async fn watch_reports_started_at_the_observation_instant() {
+        let (ack, mut waiter) = PlaybackStartAck::new();
+        let mut watch = PlaybackStartWatch::new();
+        watch.arm(7, ack, |_| OutputMarkState::Waiting, chrono::Utc::now);
+        watch.poll(|_| OutputMarkState::Waiting, chrono::Utc::now);
+        assert_eq!(
+            waiter.wait_for(Duration::from_millis(1)).await,
+            PlaybackStartState::Pending
+        );
+        let at = chrono::Utc::now();
+        watch.poll(
+            |m| {
+                assert_eq!(m, 7);
+                OutputMarkState::Played
+            },
+            || at,
+        );
+        assert_eq!(
+            waiter.wait_for(Duration::from_millis(10)).await,
+            PlaybackStartState::Started(at)
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_never_reads_the_clock_while_waiting() {
+        let (ack, mut waiter) = PlaybackStartAck::new();
+        let mut watch = PlaybackStartWatch::new();
+        watch.arm(
+            7,
+            ack,
+            |_| OutputMarkState::Waiting,
+            || panic!("clock read"),
+        );
+        watch.poll(|_| OutputMarkState::Waiting, || panic!("clock read"));
+        assert_eq!(
+            waiter.wait_for(Duration::from_millis(1)).await,
+            PlaybackStartState::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_reports_not_started_for_a_discarded_mark() {
+        let (ack, mut waiter) = PlaybackStartAck::new();
+        let mut watch = PlaybackStartWatch::new();
+        watch.arm(7, ack, |_| OutputMarkState::Waiting, chrono::Utc::now);
+        watch.poll(|_| OutputMarkState::Discarded, || panic!("clock read"));
+        assert_eq!(
+            waiter.wait_for(Duration::from_millis(10)).await,
+            PlaybackStartState::NotStarted
+        );
+    }
+
+    #[tokio::test]
+    async fn arming_a_new_mark_settles_a_still_waiting_one_as_not_started() {
+        let (ack, mut waiter) = PlaybackStartAck::new();
+        let mut watch = PlaybackStartWatch::new();
+        watch.arm(7, ack, |_| OutputMarkState::Waiting, chrono::Utc::now);
+        let (next, _) = PlaybackStartAck::new();
+        watch.arm(
+            8,
+            next,
+            |_| OutputMarkState::Waiting,
+            || panic!("clock read"),
+        );
+        assert_eq!(
+            waiter.wait_for(Duration::from_millis(10)).await,
+            PlaybackStartState::NotStarted
+        );
+    }
+
+    #[tokio::test]
+    async fn arming_a_new_mark_settles_an_already_played_one_as_started() {
+        let (ack, mut waiter) = PlaybackStartAck::new();
+        let mut watch = PlaybackStartWatch::new();
+        watch.arm(7, ack, |_| OutputMarkState::Waiting, chrono::Utc::now);
+        let (next, _) = PlaybackStartAck::new();
+        let at = chrono::Utc::now();
+        watch.arm(8, next, |_| OutputMarkState::Played, || at);
+        assert_eq!(
+            waiter.wait_for(Duration::from_millis(10)).await,
+            PlaybackStartState::Started(at)
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_watch_reports_dropped() {
+        let (ack, mut waiter) = PlaybackStartAck::new();
+        let mut watch = PlaybackStartWatch::new();
+        watch.arm(7, ack, |_| OutputMarkState::Waiting, chrono::Utc::now);
+        drop(watch);
+        assert_eq!(
+            waiter.wait_for(Duration::from_millis(10)).await,
+            PlaybackStartState::Dropped
+        );
     }
 }

@@ -158,6 +158,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Band Activity's own-TX rows and `tx-log.jsonl`'s `utc` now record when the
+  audio output started playing each frame, including a mid-frame re-key,
+  instead of when the TX worker queued its audio (PAN-71). When pancetta
+  cannot confirm the start within 100 ms it keeps the old value and logs a
+  warning.
+
 - Autonomous cqdx.io spot reports now carry the frequency of the band the
   decode was actually heard on when the station changes bands between a decode
   and its slot-tick report (PAN-68) — the same captured-dial fix PAN-67 applied
