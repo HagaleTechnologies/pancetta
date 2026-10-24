@@ -125,6 +125,7 @@ async fn b1_autonomous_yields_to_busy_dx() {
                 confidence: None,
                 time_offset_s: None,
                 decode_origin: None,
+                captured_dial_hz: None,
             },
             DecodedMessageInfo {
                 message_text: "CQ VB7F DO33".to_string(),
@@ -135,6 +136,7 @@ async fn b1_autonomous_yields_to_busy_dx() {
                 confidence: None,
                 time_offset_s: None,
                 decode_origin: None,
+                captured_dial_hz: None,
             },
         ],
         &AlwaysWorthIt,

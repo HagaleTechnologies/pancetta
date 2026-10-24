@@ -139,6 +139,9 @@ pub struct LatestTxIntent {
     pub origin: crate::message_bus::TxOrigin,
     /// Paired with `origin` — see its doc.
     pub remote_client_key_id: Option<String>,
+    /// PAN-183: the intent's ledger attempt, adopted with the payload by a
+    /// key-time pivot so the pivoted frame reports its own attempt.
+    pub attempt_id: Option<pancetta_qso::TxAttemptId>,
 }
 
 /// Smallest offset difference (Hz) [`tx_pivot_target`] treats as a genuine
@@ -334,6 +337,8 @@ pub fn pivot_bundle_items(
                 // replaced ATOMICALLY with the payload, never left stale.
                 item.origin = intent.origin;
                 item.remote_client_key_id = intent.remote_client_key_id;
+                // PAN-183: the item now keys the intent's attempt.
+                item.attempt_id = intent.attempt_id;
                 pivots.push((key, item.message_text.clone(), item.frequency_offset));
             }
             item
@@ -596,8 +601,12 @@ pub(crate) async fn forward_split_change(
     enabled: bool,
     tx_frequency: u64,
 ) -> u64 {
+    // PAN-206: retain this owner through enqueue + record, and a second
+    // owner on the message through CAT application / pending retries. Polling
+    // must not replace a requested split with the rig's not-yet-applied state.
+    let observation_guard = bus.split_observation_fence.begin_command();
     let make = || {
-        ComponentMessage::new(
+        let mut message = ComponentMessage::new(
             source,
             ComponentId::Hamlib,
             MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
@@ -605,7 +614,9 @@ pub(crate) async fn forward_split_change(
                 tx_frequency,
             }),
             Instant::now(),
-        )
+        );
+        message.split_observation_guard = Some(observation_guard.clone());
+        message
     };
     match bus
         .send_message_retrying(make, &tx::SAFETY_SEND_RETRY_DELAYS)
@@ -2492,30 +2503,33 @@ impl ApplicationCoordinator {
             .map(|b| b.with_operating_frequency(self.operating_frequency_hz.clone()))
             {
                 drop(config);
+                // PAN-93: the bridge registers and its poller runs whether or
+                // not this first attempt succeeds. Whatever did not load is
+                // marked unavailable on the lookup (readiness strip) and the
+                // poller retries it; spot polling waits for the needed list.
+                let bridge = std::sync::Arc::new(bridge);
                 match bridge.startup().await {
-                    Ok(()) => {
-                        info!("cqdx.io integration initialized");
-                        let poller_handle = bridge.spawn_spot_poller(
-                            self.shutdown_signal.clone(),
-                            self.last_decode_timestamp.clone(),
-                            None,
-                            None, // TUI tx — set up later in pipeline if available
-                        );
-                        // Wrap the JoinHandle<()> into JoinHandle<Result<()>> for named_task_handles
-                        let wrapped = tokio::spawn(async move {
-                            poller_handle
-                                .await
-                                .map_err(|e| anyhow::anyhow!("cqdx poller join error: {}", e))?;
-                            Ok(())
-                        });
-                        self.named_task_handles
-                            .push((ComponentId::DxCluster, wrapped));
-                        self.cqdx_bridge = Some(std::sync::Arc::new(bridge));
-                    }
-                    Err(e) => {
-                        warn!("cqdx.io startup failed, running in degraded mode: {}", e);
-                    }
+                    Ok(()) => info!("cqdx.io integration initialized"),
+                    Err(e) => warn!(
+                        "cqdx.io startup incomplete ({e}); needed lists unavailable, retrying in the background"
+                    ),
                 }
+                let poller_handle = bridge.spawn_spot_poller(
+                    self.shutdown_signal.clone(),
+                    self.last_decode_timestamp.clone(),
+                    None,
+                    None, // TUI tx — set up later in pipeline if available
+                );
+                // Wrap the JoinHandle<()> into JoinHandle<Result<()>> for named_task_handles
+                let wrapped = tokio::spawn(async move {
+                    poller_handle
+                        .await
+                        .map_err(|e| anyhow::anyhow!("cqdx poller join error: {}", e))?;
+                    Ok(())
+                });
+                self.named_task_handles
+                    .push((ComponentId::DxCluster, wrapped));
+                self.cqdx_bridge = Some(bridge);
             } else {
                 drop(config);
                 info!("cqdx.io integration not configured, running in degraded mode");
@@ -2655,6 +2669,7 @@ impl ApplicationCoordinator {
                     crate::message_bus::ComponentId::Coordinator,
                     crate::message_bus::ComponentId::Ft8Transmitter,
                     crate::message_bus::MessageType::TransmitRequest {
+                        attempt_id: None,
                         message_text: test_tx_text.clone(),
                         frequency_offset: offset,
                         qso_id: None,
@@ -3241,6 +3256,7 @@ mod pivot_bundle_tests {
 
     fn item(qso_id: Option<&str>, text: &str, freq: f64) -> TransmitRequestItem {
         TransmitRequestItem {
+            attempt_id: None,
             message_text: text.to_string(),
             frequency_offset: freq,
             qso_id: qso_id.map(|s| s.to_string()),
@@ -3257,6 +3273,7 @@ mod pivot_bundle_tests {
 
     fn intent(text: &str, freq: f64) -> LatestTxIntent {
         LatestTxIntent {
+            attempt_id: None,
             message_text: text.to_string(),
             frequency_offset: freq,
             tx_parity: None,
@@ -4994,7 +5011,7 @@ pub(crate) mod audit_test_util {
                 std::process::id()
             ));
             let siblings: Vec<PathBuf> = (1..=4)
-                .map(|slot| p.with_extension(&format!("log.{slot}")))
+                .map(|slot| p.with_extension(format!("log.{slot}")))
                 .collect();
             std::fs::write(&p, "stale line\n").unwrap();
             for s in &siblings {

@@ -198,6 +198,34 @@ fn slot_parity_for_receipt(
     pancetta_core::slot::SlotParity::of_with_period(slot_start, slot_ns)
 }
 
+/// Translate a tagged decode into the shape [`pancetta_qso::CrossTimeState`]
+/// records. `slot_ns` is the period this window's `slot_parity` was
+/// computed on (the decode loop's per-iteration `slot_ns`).
+///
+/// PAN-146: carries the band and slot grid of the observation so the TX
+/// worker's DX-parity gate can ignore a parity heard on another band or
+/// mode. The dial comes from the message's own `captured_dial_hz` (PAN-67),
+/// never a live re-read.
+fn cross_time_decode_record(
+    decoded_msg: &pancetta_ft8::DecodedMessage,
+    slot_ns: i64,
+) -> pancetta_qso::DecodeRecord {
+    pancetta_qso::DecodeRecord {
+        from_callsign: decoded_msg.message.from_callsign.clone(),
+        to_callsign: decoded_msg.message.to_callsign.clone(),
+        text: decoded_msg.text.clone(),
+        frequency_hz: decoded_msg.frequency_offset,
+        time_offset_s: decoded_msg.time_offset,
+        slot_parity: decoded_msg.slot_parity.map(|p| match p {
+            pancetta_core::slot::SlotParity::Even => 0u8,
+            pancetta_core::slot::SlotParity::Odd => 1u8,
+        }),
+        at: decoded_msg.timestamp,
+        captured_dial_hz: decoded_msg.captured_dial_hz.unwrap_or(0),
+        slot_ns,
+    }
+}
+
 /// I-16: sanitize a human-facing decoded string before it crosses the
 /// message-bus boundary into the TUI / QSO state machine / ADIF log.
 ///
@@ -1593,9 +1621,11 @@ impl super::ApplicationCoordinator {
                         // Update shared cross-slot state (hb-048 / hb-057 /
                         // hb-173 substrate). Runs post-FP-filter so the three
                         // downstream tables never ingest decodes the continuity
-                        // filter judged false. The container is SHIPPED-INFRA
-                        // — no consumer reads from it yet; downstream
-                        // hypotheses will hook in here in future sessions.
+                        // filter judged false. The decoder-side hypotheses
+                        // don't read these tables yet; the TX worker's PAN-141
+                        // DX-parity gate reads `a7_recent_calls`, scoped by
+                        // the band and slot grid each record carries
+                        // (PAN-146).
                         //
                         // Same live-read rationale as `fp_filter_snapshot`
                         // above — one read per window, not per message.
@@ -1606,15 +1636,8 @@ impl super::ApplicationCoordinator {
                                 pancetta_core::slot::SlotParity::Even => 0u8,
                                 pancetta_core::slot::SlotParity::Odd => 1u8,
                             });
-                            cross_time_state.record_decode(&pancetta_qso::DecodeRecord {
-                                from_callsign: decoded_msg.message.from_callsign.clone(),
-                                to_callsign: decoded_msg.message.to_callsign.clone(),
-                                text: decoded_msg.text.clone(),
-                                frequency_hz: decoded_msg.frequency_offset,
-                                time_offset_s: decoded_msg.time_offset,
-                                slot_parity: parity_u8,
-                                at: decoded_msg.timestamp,
-                            });
+                            cross_time_state
+                                .record_decode(&cross_time_decode_record(decoded_msg, slot_ns));
 
                             // hb-237: cross-sequence A7 cache populate.
                             // Only when the master flag is on, only for
@@ -2404,6 +2427,36 @@ mod slot_parity_for_receipt_tests {
         // different (correct) parity. A stale-cache bug would keep
         // returning `ft8_parity` for both.
         assert_ne!(ft8_parity, ft4_parity);
+    }
+}
+
+#[cfg(test)]
+mod cross_time_decode_record_tests {
+    use super::cross_time_decode_record;
+    use pancetta_core::slot::SlotParity;
+    use pancetta_ft8::{DecodedMessage, Ft8Message};
+
+    /// PAN-146: the record carries the window's captured dial and slot grid.
+    #[test]
+    fn carries_captured_dial_and_slot_grid() {
+        let mut d = DecodedMessage::new(Ft8Message::default(), -10.0, 0.5, 1500.0, 0.1);
+        d.message.from_callsign = Some("5Z4VJ".to_string());
+        d.slot_parity = Some(SlotParity::Odd);
+        d.captured_dial_hz = Some(21_074_000);
+        let rec = cross_time_decode_record(&d, 7_500_000_000);
+        assert_eq!(rec.slot_parity, Some(1));
+        assert_eq!(rec.captured_dial_hz, 21_074_000);
+        assert_eq!(rec.slot_ns, 7_500_000_000);
+    }
+
+    /// A message with no captured dial records the unknown-0 sentinel.
+    #[test]
+    fn missing_captured_dial_records_unknown_sentinel() {
+        let d = DecodedMessage::new(Ft8Message::default(), -10.0, 0.5, 1500.0, 0.1);
+        assert_eq!(
+            cross_time_decode_record(&d, 15_000_000_000).captured_dial_hz,
+            0
+        );
     }
 }
 

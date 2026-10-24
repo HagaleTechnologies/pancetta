@@ -12,7 +12,11 @@ pub enum Headline {
     NewEntityOnBand {
         band: String,
     },
-    NeededEntity,
+    /// `known` is cqdx's loaded needed-entity verdict; None while the list
+    /// is not loaded (PAN-93).
+    NeededEntity {
+        known: Option<bool>,
+    },
     Notable,
     SpecialEvent,
     NewGrid {
@@ -31,7 +35,12 @@ impl Headline {
             Self::InvalidCallsign => "callsign looks invalid".into(),
             Self::AllTimeNew => "all-time new entity".into(),
             Self::NewEntityOnBand { band } => format!("new entity on {band}"),
-            Self::NeededEntity => "needed entity (cqdx list)".into(),
+            Self::NeededEntity { known } => match known {
+                Some(true) => "needed entity (cqdx list)",
+                Some(false) => "maybe needed entity (cqdx list changed)",
+                None => "maybe needed entity (cqdx list not loaded)",
+            }
+            .into(),
             Self::Notable => "notable station (cqdx)".into(),
             Self::SpecialEvent => "special-event callsign".into(),
             Self::NewGrid {
@@ -64,7 +73,9 @@ impl Headline {
         Some(match self {
             Self::InvalidCallsign => PriorityTier::Suspect,
             Self::AllTimeNew => PriorityTier::Atno,
-            Self::NewEntityOnBand { .. } | Self::NeededEntity => PriorityTier::PerBandDxccNew,
+            Self::NewEntityOnBand { .. } | Self::NeededEntity { .. } => {
+                PriorityTier::PerBandDxccNew
+            }
             Self::Notable | Self::SpecialEvent => PriorityTier::SpecialStation,
             Self::NewGrid { .. } => PriorityTier::PerBandGridNew,
             Self::NoAwardNeed => PriorityTier::Standard,
@@ -180,7 +191,9 @@ pub fn reason_for(
             PriorityTier::PerBandDxccNew if f.dxcc_new_on_band => {
                 Headline::NewEntityOnBand { band: band.clone() }
             }
-            PriorityTier::PerBandDxccNew => Headline::NeededEntity,
+            PriorityTier::PerBandDxccNew => Headline::NeededEntity {
+                known: need.and_then(|n| n.dxcc_needed),
+            },
             PriorityTier::SpecialStation if f.notable => Headline::Notable,
             PriorityTier::SpecialStation => Headline::SpecialEvent,
             PriorityTier::PerBandGridNew => Headline::NewGrid {
@@ -309,6 +322,49 @@ pub fn focused(app: &App, now: DateTime<Utc>) -> FocusedReason<'_> {
     }
 }
 
+/// PAN-93: the "needed entity" row's value and source. The value is what the
+/// score used; the source names the cqdx list's scope and age, says when the
+/// list has changed since the score, or says the score used the
+/// home/logged-prefix guess because the list is not loaded.
+fn needed_entity_row(
+    scored_needed: bool,
+    need: Option<&DxNeedStatus>,
+    now: DateTime<Utc>,
+) -> (String, String) {
+    let yes_no = |v: bool| if v { "yes" } else { "no" };
+    match need.and_then(|n| n.dxcc_needed) {
+        None => (
+            "unknown".into(),
+            if scored_needed {
+                "cqdx list not loaded; scored as needed (not a home or logged prefix)"
+            } else {
+                "cqdx list not loaded; scored as not needed (home or logged prefix)"
+            }
+            .into(),
+        ),
+        Some(listed) if listed != scored_needed => (
+            yes_no(scored_needed).into(),
+            format!(
+                "scored before the cqdx list changed (now {})",
+                yes_no(listed)
+            ),
+        ),
+        Some(listed) => {
+            let source = need.and_then(|n| n.dxcc_list.as_ref()).map_or_else(
+                || "cqdx needed list".to_string(),
+                |list| {
+                    format!(
+                        "cqdx needed list, {}, {} old",
+                        list.band.as_deref().unwrap_or("all bands"),
+                        age_text(now.signed_duration_since(list.fetched_at).num_seconds())
+                    )
+                },
+            );
+            (yes_no(listed).into(), source)
+        }
+    }
+}
+
 /// Logical lines; the overlay wraps and scrolls them at the available width.
 pub struct WhyDetail {
     pub lines: Vec<String>,
@@ -364,12 +420,9 @@ pub fn detail_for(
                 _ => suffix.as_str().into(),
             },
         );
+        let (needed_value, needed_source) = needed_entity_row(f.needed_dxcc, need, now);
         let inputs = [
-            (
-                "needed entity".into(),
-                yes_no(f.needed_dxcc),
-                "cqdx needed list",
-            ),
+            ("needed entity".into(), needed_value, needed_source.as_str()),
             (
                 format!("entity new on {band}"),
                 yes_no(f.dxcc_new_on_band),
@@ -474,6 +527,7 @@ pub fn detail_for(
 mod tests {
     use super::*;
     use crate::app::{RankedBy, SpotSource};
+    use crate::dx_need::NeedListSource;
     use chrono::Duration;
     use pancetta_qso::priority::{
         NullLookup, PriorityScorer, PriorityWeights, WorkedStationLookup,
@@ -532,7 +586,10 @@ mod tests {
         let cases = [
             (PriorityTier::Suspect, "callsign looks invalid"),
             (PriorityTier::Atno, "all-time new entity"),
-            (PriorityTier::PerBandDxccNew, "needed entity (cqdx list)"),
+            (
+                PriorityTier::PerBandDxccNew,
+                "maybe needed entity (cqdx list not loaded)",
+            ),
             (PriorityTier::SpecialStation, "special-event callsign"),
             (
                 PriorityTier::PerBandGridNew,
@@ -664,6 +721,112 @@ mod tests {
             .headline
             .text()
             .contains("may be new"));
+    }
+    #[test]
+    fn needed_entity_headline_is_hedged_unless_cqdx_confirms() {
+        let mut s = station("K1ABC");
+        set_tier(&mut s, PriorityTier::PerBandDxccNew);
+        factors(&mut s).needed_dxcc = true;
+        for (dxcc_needed, expected) in [
+            (None, "maybe needed entity (cqdx list not loaded)"),
+            (Some(false), "maybe needed entity (cqdx list changed)"),
+            (Some(true), "needed entity (cqdx list)"),
+        ] {
+            let need = DxNeedStatus {
+                dxcc_needed,
+                ..Default::default()
+            };
+            assert_eq!(reason_for(&s, Some(&need), now()).headline.text(), expected);
+        }
+        assert_eq!(
+            reason_for(&s, None, now()).headline.text(),
+            "maybe needed entity (cqdx list not loaded)"
+        );
+    }
+    #[test]
+    fn needed_entity_detail_row_names_value_and_provenance() {
+        let list = |band: Option<&str>, age: Duration| NeedListSource {
+            band: band.map(str::to_owned),
+            fetched_at: now() - age,
+        };
+        let row = |scored: bool, need: Option<&DxNeedStatus>| {
+            let mut s = station("K1ABC");
+            set_tier(&mut s, PriorityTier::PerBandDxccNew);
+            factors(&mut s).needed_dxcc = scored;
+            detail_for(&s, need, now())
+                .lines
+                .into_iter()
+                .find(|line| line.starts_with("  needed entity "))
+                .unwrap()
+        };
+        let expect =
+            |value: &str, source: &str| format!("  {:<32}  {value:<10} {source}", "needed entity");
+        // (dxcc_needed, dxcc_list, f.needed_dxcc) → (value, source)
+        for (dxcc_needed, dxcc_list, scored, value, source) in [
+            (
+                Some(true),
+                Some(list(Some("20M"), Duration::minutes(4))),
+                true,
+                "yes",
+                "cqdx needed list, 20M, 4m old",
+            ),
+            (
+                Some(false),
+                Some(list(None, Duration::hours(2))),
+                false,
+                "no",
+                "cqdx needed list, all bands, 2h old",
+            ),
+            (
+                Some(false),
+                Some(list(Some("20M"), Duration::minutes(4))),
+                true,
+                "yes",
+                "scored before the cqdx list changed (now no)",
+            ),
+            (
+                Some(true),
+                Some(list(Some("20M"), Duration::minutes(4))),
+                false,
+                "no",
+                "scored before the cqdx list changed (now yes)",
+            ),
+            (Some(true), None, true, "yes", "cqdx needed list"),
+            (
+                None,
+                None,
+                true,
+                "unknown",
+                "cqdx list not loaded; scored as needed (not a home or logged prefix)",
+            ),
+            (
+                None,
+                None,
+                false,
+                "unknown",
+                "cqdx list not loaded; scored as not needed (home or logged prefix)",
+            ),
+        ] {
+            let need = DxNeedStatus {
+                dxcc_needed,
+                dxcc_list,
+                ..Default::default()
+            };
+            assert_eq!(row(scored, Some(&need)), expect(value, source));
+        }
+        // No need provider at all reads the same as a list that is not loaded.
+        for (scored, source) in [
+            (
+                true,
+                "cqdx list not loaded; scored as needed (not a home or logged prefix)",
+            ),
+            (
+                false,
+                "cqdx list not loaded; scored as not needed (home or logged prefix)",
+            ),
+        ] {
+            assert_eq!(row(scored, None), expect("unknown", source));
+        }
     }
     #[test]
     fn cautions_in_order_and_merged_across_scorings() {
@@ -865,7 +1028,7 @@ mod tests {
             "network reports",
         ];
         let sources = [
-            "cqdx needed list",
+            "cqdx list not loaded",
             "your log",
             "cqdx",
             "cqdx",

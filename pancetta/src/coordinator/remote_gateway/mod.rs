@@ -251,11 +251,10 @@ async fn handle_bus_msg(
             let (worked_before, needed, atno) = match call {
                 Some(c) if !c.is_empty() => {
                     let freq = dial_hz + decoded.frequency_offset;
-                    (
-                        lookup.is_duplicate(c, freq),
-                        lookup.is_needed_dxcc(c),
-                        lookup.is_atno(c),
-                    )
+                    // PAN-93: `needed` only from a loaded cqdx list; never
+                    // the scorer's guess while the list is unknown.
+                    let (needed, atno) = lookup.display_needed_atno(c);
+                    (lookup.is_duplicate(c, freq), needed, atno)
                 }
                 _ => (false, false, false),
             };
@@ -934,6 +933,48 @@ mod server_tests {
             }
             other => panic!("expected two Spectrum events, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn decoded_view_needed_is_false_while_cqdx_list_unknown() {
+        // PAN-93: the remote `needed` bool is true only when cqdx's loaded
+        // list names the entity, never the scorer's guess while unknown.
+        let (evt_tx, mut rx) = broadcast::channel::<ServerEvent>(16);
+        let snapshot = RwLock::new(empty_snapshot());
+        let op_freq = AtomicU64::new(14_074_000);
+        let lookup = crate::priority_evaluator::CachedStationLookup::new();
+        let spectrum_seq = AtomicU64::new(0);
+        let msg = MessageType::DecodedMessage(pancetta_ft8::DecodedMessage::new(
+            pancetta_ft8::Ft8Message {
+                from_callsign: Some("JA1ABC".into()),
+                ..Default::default()
+            },
+            -10.0,
+            1.0,
+            1500.0,
+            0.0,
+        ));
+        let mut needed_after = Vec::new();
+        for loaded in [false, true] {
+            if loaded {
+                lookup.update_needed_dxcc(std::collections::HashSet::from(["JA".to_owned()]));
+            }
+            handle_bus_msg(
+                &msg,
+                &op_freq,
+                &lookup,
+                "K5ARH",
+                &evt_tx,
+                &snapshot,
+                &spectrum_seq,
+            )
+            .await;
+            match rx.recv().await.unwrap() {
+                ServerEvent::Decoded { decoded } => needed_after.push(decoded.needed),
+                other => panic!("expected Decoded, got {other:?}"),
+            }
+        }
+        assert_eq!(needed_after, vec![false, true]);
     }
 
     #[tokio::test]

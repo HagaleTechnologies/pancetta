@@ -1393,6 +1393,7 @@ impl super::ApplicationCoordinator {
                                 ComponentId::Tui,
                                 ComponentId::Ft8Transmitter,
                                 MessageType::TransmitRequest {
+                                    attempt_id: None,
                                     message_text: text,
                                     frequency_offset,
                                     qso_id: None,
@@ -3648,16 +3649,15 @@ fn worked_before_for(
 }
 
 /// Compute `(needed, atno)` for a callsign against the same
-/// `CachedStationLookup` the autonomous scorer consults. Both inert
-/// (false) when cqdx supplies no needed set, or the callsign is absent.
-/// `atno` implies `needed`.
+/// `CachedStationLookup` the autonomous scorer consults. `needed` only when
+/// cqdx's loaded list names the entity; false while the list is unknown
+/// (PAN-93), or the callsign is absent. `atno` implies `needed`.
 fn needed_atno_for(
     lookup: &crate::priority_evaluator::CachedStationLookup,
     callsign: Option<&str>,
 ) -> (bool, bool) {
-    use pancetta_qso::priority::WorkedStationLookup;
     match callsign {
-        Some(c) if !c.is_empty() => (lookup.is_needed_dxcc(c), lookup.is_atno(c)),
+        Some(c) if !c.is_empty() => lookup.display_needed_atno(c),
         _ => (false, false),
     }
 }
@@ -4141,6 +4141,28 @@ where
 
 #[cfg(test)]
 mod tui_relay_tests {
+    #[test]
+    fn needed_atno_for_reports_unknown_as_not_needed() {
+        // PAN-93: no cqdx list loaded → not shown as needed, even though the
+        // scorer's no-exclusions guess would call every station needed.
+        let lookup = crate::priority_evaluator::CachedStationLookup::new();
+        assert_eq!(
+            super::needed_atno_for(&lookup, Some("JA1ABC")),
+            (false, false)
+        );
+        lookup.update_needed_dxcc(std::collections::HashSet::from(["JA".to_owned()]));
+        lookup.update_needed_atno(std::collections::HashSet::from(["JA".to_owned()]));
+        assert_eq!(
+            super::needed_atno_for(&lookup, Some("JA1ABC")),
+            (true, true)
+        );
+        assert_eq!(
+            super::needed_atno_for(&lookup, Some("DL1ABC")),
+            (false, false)
+        );
+        assert_eq!(super::needed_atno_for(&lookup, None), (false, false));
+    }
+
     #[tokio::test]
     async fn gridless_decodes_keep_grid_rank_but_refresh_live_history() {
         use pancetta_qso::priority::WorkedStationLookup;
@@ -5797,6 +5819,31 @@ mod tui_relay_tests {
     /// PAN-118, manual-PTT path: a key-up is refused with the exact
     /// operator-facing status while the effective TX dial sits outside the
     /// configured amateur band plan (15.000 MHz is inside no allocation).
+    #[test]
+    fn pan206_polled_out_of_band_split_refuses_manual_ptt() {
+        assert_eq!(
+            ptt_band_plan_refusal(
+                &Arc::new(std::sync::atomic::AtomicU64::new(14_074_000)),
+                &Arc::new(std::sync::atomic::AtomicU64::new(15_000_000)),
+                &pancetta_config::BandPlanConfig::default(),
+            )
+            .as_deref(),
+            Some("Can't key PTT — TX dial 15000000 Hz is outside the configured amateur band plan"),
+        );
+    }
+
+    #[test]
+    fn pan206_in_band_polled_split_allows_manual_ptt() {
+        assert_eq!(
+            ptt_band_plan_refusal(
+                &Arc::new(std::sync::atomic::AtomicU64::new(14_074_000)),
+                &Arc::new(std::sync::atomic::AtomicU64::new(14_078_000)),
+                &pancetta_config::BandPlanConfig::default(),
+            ),
+            None,
+        );
+    }
+
     #[test]
     fn ptt_band_plan_refusal_names_the_out_of_band_dial() {
         assert_eq!(

@@ -257,6 +257,17 @@ pub struct DecodedMessageInfo {
     /// origin 7 saturates at the max penalty by design). `None` for
     /// pre-hb-247 paths and test scaffolding.
     pub decode_origin: Option<u8>,
+    /// PAN-68: dial frequency (Hz) the audio window that produced this
+    /// decode was captured on, threaded from
+    /// `pancetta_ft8::DecodedMessage::captured_dial_hz` at the
+    /// coordinator's decode-copy site. `None` for messages from test
+    /// scaffolding, the deterministic simulator, and any path without a
+    /// DSP dial capture. Consumers that need "what band was this decode
+    /// heard on" (cqdx spot reporting) MUST prefer this over a live dial
+    /// re-read — the slot-tick report path can run after a band switch,
+    /// and a live re-read would label the decode under the new band (the
+    /// race PAN-67 fixed for the TUI and PSKReporter).
+    pub captured_dial_hz: Option<u64>,
 }
 
 /// Result of a collision check on a listen slot.
@@ -3184,6 +3195,7 @@ mod tests {
             confidence: None,
             time_offset_s: None,
             decode_origin: None,
+            captured_dial_hz: None,
         }];
 
         let result = detector.check_for_collision(&messages);
@@ -3202,6 +3214,7 @@ mod tests {
             confidence: None,
             time_offset_s: None,
             decode_origin: None,
+            captured_dial_hz: None,
         }];
 
         let result = detector.check_for_collision(&messages);
@@ -3219,6 +3232,7 @@ mod tests {
             confidence: None,
             time_offset_s: None,
             decode_origin: None,
+            captured_dial_hz: None,
         }
     }
 
@@ -3311,6 +3325,7 @@ mod tests {
             confidence: None,
             time_offset_s: None,
             decode_origin: None,
+            captured_dial_hz: None,
         }];
         let actions = op.process_collision_listen(&messages);
 
@@ -3356,6 +3371,7 @@ mod tests {
                 confidence: None,
                 time_offset_s: None,
                 decode_origin: None,
+                captured_dial_hz: None,
             }];
             op.process_collision_listen(&messages);
 
@@ -3407,6 +3423,7 @@ mod tests {
             confidence: None,
             time_offset_s: None,
             decode_origin: None,
+            captured_dial_hz: None,
         }];
         let actions = op.process_collision_listen(&messages);
 
@@ -4596,6 +4613,7 @@ mod tests {
                 confidence: None,
                 time_offset_s: None,
                 decode_origin: None,
+                captured_dial_hz: None,
             }],
             &NullDxEvaluator,
         );
@@ -5168,6 +5186,7 @@ mod tests {
                 confidence: None,
                 time_offset_s: None,
                 decode_origin: None,
+                captured_dial_hz: None,
             }],
             &NullDxEvaluator,
         );
@@ -5534,6 +5553,7 @@ mod tests {
             confidence: None,
             time_offset_s: None,
             decode_origin: None,
+            captured_dial_hz: None,
         }];
         let evaluator = NullDxEvaluator; // returns 0.5, above our 0.3 threshold
         op.feed_decoded_messages(&messages, &evaluator);
@@ -5581,6 +5601,7 @@ mod tests {
             confidence: None,
             time_offset_s: None,
             decode_origin: None,
+            captured_dial_hz: None,
         }];
         op.feed_decoded_messages(&messages, &NullDxEvaluator);
 
@@ -5625,6 +5646,7 @@ mod tests {
             confidence: None,
             time_offset_s: None,
             decode_origin: None,
+            captured_dial_hz: None,
         }];
         op.feed_decoded_messages(&messages, &NullDxEvaluator);
 
@@ -5673,6 +5695,7 @@ mod tests {
             confidence: Some(0.1),
             time_offset_s: Some(12.0),
             decode_origin: None,
+            captured_dial_hz: None,
         }];
         op.feed_decoded_messages(&messages, &NullDxEvaluator);
 
@@ -5723,6 +5746,7 @@ mod tests {
                 confidence: Some(0.5),
                 time_offset_s: Some(4.0),
                 decode_origin: origin,
+                captured_dial_hz: None,
             }]
         };
         let responded = |actions: &[OperatorAction]| {
@@ -5782,6 +5806,7 @@ mod tests {
             confidence: Some(0.95),
             time_offset_s: Some(1.0),
             decode_origin: None,
+            captured_dial_hz: None,
         }];
         op.feed_decoded_messages(&messages, &NullDxEvaluator);
 
@@ -6151,6 +6176,7 @@ mod tests {
             confidence: None,
             time_offset_s: None,
             decode_origin: None,
+            captured_dial_hz: None,
         }];
         let evaluator = NullDxEvaluator;
         op.feed_decoded_messages(&messages, &evaluator);
@@ -6198,6 +6224,7 @@ mod tests {
             confidence: None,
             time_offset_s: None,
             decode_origin: None,
+            captured_dial_hz: None,
         }];
         let evaluator = NullDxEvaluator;
         op.feed_decoded_messages(&messages, &evaluator);
@@ -6281,6 +6308,7 @@ mod tests {
             confidence: None,
             time_offset_s: None,
             decode_origin: None,
+            captured_dial_hz: None,
         }
     }
 
@@ -6448,6 +6476,7 @@ mod tests {
                 confidence: None,
                 time_offset_s: None,
                 decode_origin: None,
+                captured_dial_hz: None,
             }],
             &evaluator,
         );
@@ -6501,6 +6530,7 @@ mod tests {
                 confidence: None,
                 time_offset_s: None,
                 decode_origin: None,
+                captured_dial_hz: None,
             }],
             &evaluator,
         );
@@ -6557,6 +6587,7 @@ mod tests {
                 confidence: None,
                 time_offset_s: None,
                 decode_origin: None,
+                captured_dial_hz: None,
             }],
             &evaluator,
         );
@@ -6791,6 +6822,7 @@ mod dx_busy_tests {
             confidence: None,
             time_offset_s: None,
             decode_origin: None,
+            captured_dial_hz: None,
         }
     }
 

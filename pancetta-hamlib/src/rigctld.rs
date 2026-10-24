@@ -152,6 +152,31 @@ impl RigctldClient {
                         return Ok(String::new());
                     }
 
+                    // PAN-206: `s` has two response lines. Keep the socket
+                    // locked until both are consumed, including raw `s` calls,
+                    // so a concurrent CAT command cannot steal the VFO line.
+                    if command.trim() == "s" {
+                        let mut vfo = String::new();
+                        let result = timeout(
+                            Duration::from_millis(self.config.command_timeout_ms),
+                            conn.reader.read_line(&mut vfo),
+                        )
+                        .await;
+                        match result {
+                            Ok(Ok(n)) if n > 0 => {
+                                response.push('\n');
+                                response.push_str(vfo.trim());
+                            }
+                            _ => {
+                                // A late/partial line must not become the next
+                                // command's response. The poll loop redials.
+                                *conn_guard = None;
+                                self.state.write().await.connected = false;
+                                return Err(anyhow!("Incomplete rigctld split response"));
+                            }
+                        }
+                    }
+
                     debug!("Rigctld response: {}", response);
                     Ok(response)
                 }
@@ -297,7 +322,7 @@ impl RigctldClient {
     ///
     /// The standard read/write pairs of the above (so the escape hatch can
     /// read what it can already set and vice versa) — `M` (set_mode), `t`
-    /// (get_ptt), `v` (get_vfo).
+    /// (get_ptt), `v` (get_vfo), `s` (get_split_vfo), `i` (get_split_freq).
     ///
     /// The antenna verbs the escape hatch was documented for — `y` (get_ant),
     /// `Y` (set_ant), `\get_ant`, `\set_ant`.
@@ -309,9 +334,11 @@ impl RigctldClient {
         "f",
         "F",
         "I",
+        "i",
         "m",
         "M",
         "S",
+        "s",
         "t",
         "T",
         "v",
@@ -384,6 +411,34 @@ impl RigctldClient {
             Vfo::Current => "currVFO",
             _ => "currVFO",
         }
+    }
+
+    /// Parse the flag and TX VFO returned by rigctld's `s` command.
+    fn parse_split_vfo_response(flag_line: &str, vfo_line: &str) -> Result<(bool, Vfo)> {
+        let enabled = match flag_line.trim() {
+            "1" => true,
+            "0" => false,
+            other => {
+                return Err(anyhow!(
+                    "rigctld: could not parse split flag from '{other}'"
+                ))
+            }
+        };
+        let vfo = match vfo_line.trim() {
+            "VFOA" => Vfo::A,
+            "VFOB" => Vfo::B,
+            _ => Vfo::Current,
+        };
+        Ok((enabled, vfo))
+    }
+
+    /// Zero is the coordinator's simplex sentinel, never a valid split dial.
+    fn parse_split_freq_response(response: &str) -> Result<u64> {
+        let frequency = Self::parse_frequency(response)?;
+        if frequency == 0 {
+            return Err(anyhow!("rigctld: split TX frequency must be positive"));
+        }
+        Ok(frequency)
     }
 
     /// Format the rigctld short-form command to set split mode + TX VFO.
@@ -755,6 +810,25 @@ impl RigControl for RigctldClient {
         Ok(())
     }
 
+    async fn get_split(&self) -> Result<(bool, Vfo)> {
+        // NOTE: `s` is Hamlib's standard get_split_vfo short form, returning
+        // flag then TX VFO. Awaiting FTdx10 OPERATOR-CONFIRM(split-read).
+        // Read once, without retry warnings: the coordinator logs unavailable
+        // split readback once per episode and retries on the next poll tick.
+        let response = self.send_command("s").await?;
+        let (flag, vfo) = response
+            .split_once('\n')
+            .ok_or_else(|| anyhow!("Missing rigctld split VFO response"))?;
+        Self::parse_split_vfo_response(flag, vfo)
+    }
+
+    async fn get_split_freq(&self) -> Result<u64> {
+        // NOTE: `i` is Hamlib's standard get_split_freq short form.
+        // Awaiting FTdx10 OPERATOR-CONFIRM(split-read), as above.
+        let response = self.send_command("i").await?;
+        Self::parse_split_freq_response(&response)
+    }
+
     #[instrument(skip(self))]
     async fn set_split_freq(&self, tx_freq: u64) -> Result<()> {
         // OPERATOR-CONFIRM(split): exact short-form verified on-air (FTdx10).
@@ -778,6 +852,8 @@ mod allow_list_tests {
             "f",
             "F 14074000",
             "I 14090000",
+            "s",
+            "i",
             "m",
             "S 1 VFOB",
             "S 0 VFOA",
@@ -869,5 +945,130 @@ mod split_tests {
         assert_eq!(RigctldClient::split_command(true, Vfo::B), "S 1 VFOB");
         assert_eq!(RigctldClient::split_command(false, Vfo::A), "S 0 VFOA");
         assert_eq!(RigctldClient::split_freq_command(14_090_000), "I 14090000");
+    }
+}
+
+#[cfg(test)]
+mod split_read_tests {
+    use super::*;
+
+    async fn connected_client() -> (Arc<RigctldClient>, TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let client = Arc::new(RigctldClient::new(RigctldConfig {
+            command_timeout_ms: 1_000,
+            ..Default::default()
+        }));
+        let (reader, writer) = tokio::io::split(client_stream);
+        *client.conn.lock().await = Some(RigctldConnection {
+            reader: BufReader::new(reader),
+            writer,
+        });
+        client.state.write().await.connected = true;
+        (client, server_stream)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn split_response_is_consumed_before_a_concurrent_frequency_query() {
+        let (client, server) = connected_client().await;
+        let (reader, mut writer) = tokio::io::split(server);
+        let mut reader = BufReader::new(reader);
+        let (first_line_tx, first_line_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let mut command = String::new();
+            reader.read_line(&mut command).await.unwrap();
+            assert_eq!(command, "s\n");
+            writer.write_all(b"1\n").await.unwrap();
+            first_line_tx.send(()).unwrap();
+            command.clear();
+            assert!(
+                timeout(Duration::from_millis(20), reader.read_line(&mut command))
+                    .await
+                    .is_err(),
+                "another command must not consume the pending VFO line"
+            );
+            writer.write_all(b"VFOB\n").await.unwrap();
+            reader.read_line(&mut command).await.unwrap();
+            assert_eq!(command, "f\n");
+            writer.write_all(b"14074000\n").await.unwrap();
+        });
+        let split_client = client.clone();
+        let split_task = tokio::spawn(async move { split_client.get_split().await });
+        first_line_rx.await.unwrap();
+        assert_eq!(
+            client.get_frequency(Vfo::Current).await.unwrap(),
+            14_074_000
+        );
+        assert_eq!(split_task.await.unwrap().unwrap(), (true, Vfo::B));
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsupported_split_does_not_retry_or_consume_the_next_response() {
+        let (client, server) = connected_client().await;
+        let server_task = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server);
+            let mut reader = BufReader::new(reader);
+            for (expected, reply) in [("s\n", "RPRT -11\n"), ("f\n", "14074000\n")] {
+                let mut command = String::new();
+                reader.read_line(&mut command).await.unwrap();
+                assert_eq!(command, expected);
+                writer.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        assert!(client.get_split().await.is_err());
+        assert_eq!(
+            client.get_frequency(Vfo::Current).await.unwrap(),
+            14_074_000
+        );
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn incomplete_split_response_disconnects_instead_of_reusing_a_partial_reply() {
+        let (client, mut server) = connected_client().await;
+        let server_task = tokio::spawn(async move {
+            let mut command = String::new();
+            let mut reader = BufReader::new(&mut server);
+            reader.read_line(&mut command).await.unwrap();
+            assert_eq!(command, "s\n");
+            server.write_all(b"1\n").await.unwrap();
+        });
+        assert!(client.get_split().await.is_err());
+        assert!(!client.state.read().await.connected);
+        assert!(client.conn.lock().await.is_none());
+        server_task.await.unwrap();
+    }
+
+    #[test]
+    fn parse_split_vfo_response() {
+        for (flag, vfo, expected) in [
+            ("1", "VFOB", (true, Vfo::B)),
+            ("0", "VFOA", (false, Vfo::A)),
+            ("1", "Mem", (true, Vfo::Current)),
+            (" 1 ", " VFOB ", (true, Vfo::B)),
+        ] {
+            assert_eq!(
+                RigctldClient::parse_split_vfo_response(flag, vfo).unwrap(),
+                expected
+            );
+        }
+        for flag in ["x", "", "2", "RPRT -1"] {
+            assert!(RigctldClient::parse_split_vfo_response(flag, "VFOB").is_err());
+        }
+    }
+
+    #[test]
+    fn parse_split_freq_response() {
+        assert_eq!(
+            RigctldClient::parse_split_freq_response("15000000").unwrap(),
+            15_000_000
+        );
+        for response in ["abc", "", "0", "-1"] {
+            assert!(RigctldClient::parse_split_freq_response(response).is_err());
+        }
     }
 }

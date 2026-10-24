@@ -184,6 +184,12 @@ struct WavRecorder {
     /// only overestimate; it is re-measured from disk before any eviction.
     total_bytes: u64,
     max_bytes: u64,
+    /// Test seam (PAN-211): a one-shot action run at the top of eviction
+    /// iteration `.0` (counted from 0), after the at-cap measurement and
+    /// before that iteration's re-measure. Stands in for the NAS offload
+    /// moving a file out mid-eviction.
+    #[cfg(test)]
+    eviction_hook: Option<(usize, Box<dyn FnOnce() + Send>)>,
 }
 
 impl WavRecorder {
@@ -204,6 +210,8 @@ impl WavRecorder {
             dir,
             total_bytes,
             max_bytes,
+            #[cfg(test)]
+            eviction_hook: None,
         })
     }
 
@@ -261,36 +269,26 @@ impl WavRecorder {
             return;
         }
 
-        // The running total only overestimates (external removals aren't
-        // seen), so re-measure before trusting it to evict anything.
-        // At the cap, re-measure before deleting anything: external removals
-        // (the NAS offload) aren't tracked, so the running total only
-        // overestimates. If the scan is partial or fails, the real size is
-        // unknown. Skip this window rather than evict from a stale estimate,
-        // and retry on the next one.
-        if self.total_bytes >= self.max_bytes {
-            match Self::dir_size(&self.dir) {
-                Ok((measured, true)) => self.total_bytes = measured,
-                Ok((_, false)) => {
-                    warn!(
-                        "WAV recorder: partial re-measure of {}, skipping write",
-                        self.dir.display()
-                    );
-                    return;
-                }
-                Err(e) => {
-                    warn!(
-                        "WAV recorder: cannot re-measure {}: {}, skipping write",
-                        self.dir.display(),
-                        e
-                    );
-                    return;
-                }
-            }
+        // External removals (the NAS offload) aren't tracked, so the running
+        // total only overestimates. At the cap, re-measure before deleting
+        // anything, and again before every further deletion: the offload can
+        // keep moving files out mid-eviction (PAN-211). If a scan is partial
+        // or fails, the real size is unknown. Skip this window rather than
+        // evict from a stale estimate, and retry on the next one.
+        if self.total_bytes >= self.max_bytes && !self.remeasure() {
+            return;
         }
 
         // Enforce cap by deleting oldest files
         while self.total_bytes >= self.max_bytes {
+            #[cfg(test)]
+            self.run_eviction_hook();
+            if !self.remeasure() {
+                return;
+            }
+            if self.total_bytes < self.max_bytes {
+                break;
+            }
             if !self.delete_oldest() {
                 warn!("WAV recorder: cannot free space, skipping write");
                 return;
@@ -331,6 +329,48 @@ impl WavRecorder {
             Err(e) => {
                 warn!("WAV recorder: create error: {}", e);
             }
+        }
+    }
+
+    /// Replace the running estimate with a fresh scan of `dir`. Returns
+    /// false, leaving the estimate as-is, when the real size is unknown (a
+    /// partial scan or an unreadable directory).
+    fn remeasure(&mut self) -> bool {
+        match Self::dir_size(&self.dir) {
+            Ok((measured, true)) => {
+                self.total_bytes = measured;
+                true
+            }
+            Ok((_, false)) => {
+                warn!(
+                    "WAV recorder: partial re-measure of {}, skipping write",
+                    self.dir.display()
+                );
+                false
+            }
+            Err(e) => {
+                warn!(
+                    "WAV recorder: cannot re-measure {}: {}, skipping write",
+                    self.dir.display(),
+                    e
+                );
+                false
+            }
+        }
+    }
+
+    /// Fire [`Self::eviction_hook`] once its iteration comes up.
+    #[cfg(test)]
+    fn run_eviction_hook(&mut self) {
+        let Some((skip, _)) = self.eviction_hook.as_mut() else {
+            return;
+        };
+        if *skip > 0 {
+            *skip -= 1;
+            return;
+        }
+        if let Some((_, action)) = self.eviction_hook.take() {
+            action();
         }
     }
 
@@ -1835,6 +1875,132 @@ mod wav_recorder_tests {
             "estimate reset to {}",
             rec.total_bytes
         );
+    }
+
+    /// Name `write_window` gives the window recorded at [`ts`] with no band.
+    fn new_wav() -> String {
+        format!("ft8_{}.wav", ts().format("%Y%m%d_%H%M%S"))
+    }
+
+    fn sorted(names: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        v.sort();
+        v
+    }
+
+    /// Arm the recorder to run `action` at the top of eviction iteration
+    /// `iteration`, after the at-cap measurement.
+    fn at_eviction(
+        rec: &mut WavRecorder,
+        iteration: usize,
+        action: impl FnOnce() + Send + 'static,
+    ) {
+        rec.eviction_hook = Some((iteration, Box::new(action)));
+    }
+
+    /// The NAS offload's move: rename `name` out of `dir` into `nas`.
+    fn offload(dir: &std::path::Path, nas: &std::path::Path, name: &str) -> impl FnOnce() + Send {
+        let (from, to) = (dir.join(name), nas.join(name));
+        move || std::fs::rename(from, to).unwrap()
+    }
+
+    /// PAN-211: at exactly the cap, the offload moves `b` out after the
+    /// at-cap measurement. The real size is now under the cap, so nothing
+    /// may be deleted.
+    #[test]
+    fn offload_move_after_measurement_at_exact_cap_deletes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nas = tempfile::tempdir().unwrap();
+        seed(tmp.path(), &["ft8_a.wav", "ft8_b.wav", "ft8_c.wav"]);
+        let mut rec = WavRecorder::open(tmp.path().to_path_buf(), 3 * FILE).unwrap();
+        at_eviction(&mut rec, 0, offload(tmp.path(), nas.path(), "ft8_b.wav"));
+
+        rec.write_window(&tone(), &ts(), 0);
+
+        assert!(rec.eviction_hook.is_none(), "offload move never ran");
+        assert_eq!(wav_names(nas.path()), sorted(&["ft8_b.wav"]));
+        assert_eq!(
+            wav_names(tmp.path()),
+            sorted(&["ft8_a.wav", "ft8_c.wav", &new_wav()]),
+            "evicted for bytes the offload already removed"
+        );
+    }
+
+    /// PAN-211: over the cap by one file, the offload moves `b` out after the
+    /// at-cap measurement. One deletion (`a`) covers the real overflow; `c`
+    /// must not die to pay for `b`'s bytes.
+    #[test]
+    fn offload_move_after_measurement_deletes_only_the_real_overflow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nas = tempfile::tempdir().unwrap();
+        seed(
+            tmp.path(),
+            &["ft8_a.wav", "ft8_b.wav", "ft8_c.wav", "ft8_d.wav"],
+        );
+        let mut rec = WavRecorder::open(tmp.path().to_path_buf(), 3 * FILE).unwrap();
+        at_eviction(&mut rec, 0, offload(tmp.path(), nas.path(), "ft8_b.wav"));
+
+        rec.write_window(&tone(), &ts(), 0);
+
+        assert!(rec.eviction_hook.is_none(), "offload move never ran");
+        assert_eq!(wav_names(nas.path()), sorted(&["ft8_b.wav"]));
+        assert_eq!(
+            wav_names(tmp.path()),
+            sorted(&["ft8_c.wav", "ft8_d.wav", &new_wav()]),
+            "over-evicted: paid for bytes the offload already removed"
+        );
+    }
+
+    /// PAN-211: the offload moves `b` out after the recorder has already
+    /// deleted `a`. The real size is then under the cap, so the second
+    /// deletion must not happen.
+    #[test]
+    fn offload_move_between_deletions_stops_the_next_deletion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nas = tempfile::tempdir().unwrap();
+        seed(
+            tmp.path(),
+            &["ft8_a.wav", "ft8_b.wav", "ft8_c.wav", "ft8_d.wav"],
+        );
+        let mut rec = WavRecorder::open(tmp.path().to_path_buf(), 3 * FILE).unwrap();
+        at_eviction(&mut rec, 1, offload(tmp.path(), nas.path(), "ft8_b.wav"));
+
+        rec.write_window(&tone(), &ts(), 0);
+
+        assert!(rec.eviction_hook.is_none(), "offload move never ran");
+        assert_eq!(wav_names(nas.path()), sorted(&["ft8_b.wav"]));
+        assert_eq!(
+            wav_names(tmp.path()),
+            sorted(&["ft8_c.wav", "ft8_d.wav", &new_wav()]),
+            "over-evicted: paid for bytes the offload already removed"
+        );
+    }
+
+    /// A partial re-measure between deletions is as conservative as one at
+    /// the cap: stop deleting, skip the write, and keep the last estimate.
+    #[cfg(unix)]
+    #[test]
+    fn partial_remeasure_between_deletions_stops_and_skips_the_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(
+            tmp.path(),
+            &["ft8_a.wav", "ft8_b.wav", "ft8_c.wav", "ft8_d.wav"],
+        );
+        let mut rec = WavRecorder::open(tmp.path().to_path_buf(), 3 * FILE).unwrap();
+        let dir = tmp.path().to_path_buf();
+        at_eviction(&mut rec, 1, move || {
+            std::os::unix::fs::symlink("ft8_loop.wav", dir.join("ft8_loop.wav")).unwrap();
+        });
+
+        rec.write_window(&tone(), &ts(), 0);
+
+        assert!(rec.eviction_hook.is_none(), "fault never injected");
+        assert_eq!(
+            wav_names(tmp.path()),
+            sorted(&["ft8_b.wav", "ft8_c.wav", "ft8_d.wav", "ft8_loop.wav"]),
+            "deleted or wrote past a partial re-measure"
+        );
+        assert_eq!(rec.total_bytes, 3 * FILE, "last estimate not kept");
     }
 }
 

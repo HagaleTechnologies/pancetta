@@ -3,6 +3,7 @@
 //! This module provides the main rig control interface with safe wrappers
 //! around hamlib functionality, including connection management, error recovery,
 //! and timeout handling.
+use crate::error::HamlibError;
 use crate::models::{Mode, RigModelType, Vfo};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -206,9 +207,104 @@ pub trait RigControl: Send + Sync {
         Ok(())
     }
 
+    /// Read whether split is enabled and which VFO transmits.
+    /// Unsupported backends must report an error, never invent simplex state.
+    async fn get_split(&self) -> Result<(bool, Vfo)> {
+        Err(HamlibError::not_supported("get_split", None, None).into())
+    }
+
+    /// Read the split TX-VFO frequency in Hz, meaningful when split is enabled.
+    async fn get_split_freq(&self) -> Result<u64> {
+        Err(HamlibError::not_supported("get_split_freq", None, None).into())
+    }
+
     /// Set the transmit-VFO frequency (Hz) used while split is enabled.
     /// Default impl is a no-op for rigs/mocks that do not model split.
     async fn set_split_freq(&self, _tx_freq: u64) -> Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod split_default_tests {
+    use super::*;
+
+    struct DefaultOnlyRig;
+
+    #[async_trait]
+    impl RigControl for DefaultOnlyRig {
+        async fn connect(&self) -> Result<()> {
+            unimplemented!()
+        }
+        async fn disconnect(&self) -> Result<()> {
+            unimplemented!()
+        }
+        async fn get_status(&self) -> Result<RigStatus> {
+            unimplemented!()
+        }
+        async fn set_frequency(&self, _vfo: Vfo, _freq: u64) -> Result<()> {
+            unimplemented!()
+        }
+        async fn get_frequency(&self, _vfo: Vfo) -> Result<u64> {
+            unimplemented!()
+        }
+        async fn set_mode(&self, _vfo: Vfo, _mode: Mode, _width: Option<i32>) -> Result<()> {
+            unimplemented!()
+        }
+        async fn get_mode(&self, _vfo: Vfo) -> Result<(Mode, i32)> {
+            unimplemented!()
+        }
+        async fn set_vfo(&self, _vfo: Vfo) -> Result<()> {
+            unimplemented!()
+        }
+        async fn get_vfo(&self) -> Result<Vfo> {
+            unimplemented!()
+        }
+        async fn set_ptt(&self, _vfo: Vfo, _ptt: PttState) -> Result<()> {
+            unimplemented!()
+        }
+        async fn get_ptt(&self, _vfo: Vfo) -> Result<PttState> {
+            unimplemented!()
+        }
+        async fn set_power_level(&self, _level: f32) -> Result<()> {
+            unimplemented!()
+        }
+        async fn get_power_level(&self) -> Result<f32> {
+            unimplemented!()
+        }
+        async fn get_s_meter(&self) -> Result<i32> {
+            unimplemented!()
+        }
+        async fn get_swr(&self) -> Result<f32> {
+            unimplemented!()
+        }
+        async fn set_memory_channel(&self, _vfo: Vfo, _channel: i32) -> Result<()> {
+            unimplemented!()
+        }
+        async fn get_memory_channel(&self, _vfo: Vfo) -> Result<i32> {
+            unimplemented!()
+        }
+        async fn set_scan(&self, _vfo: Vfo, _enable: bool) -> Result<()> {
+            unimplemented!()
+        }
+        async fn get_info(&self) -> Result<String> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn default_split_read_fails_closed() {
+        assert!(DefaultOnlyRig
+            .get_split()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Feature not supported"));
+        assert!(DefaultOnlyRig
+            .get_split_freq()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Feature not supported"));
     }
 }
