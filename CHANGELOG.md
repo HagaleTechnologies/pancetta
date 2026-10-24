@@ -158,13 +158,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-<<<<<<< HEAD
 - Band Activity's own-TX rows and `tx-log.jsonl`'s `utc` now record when the
   audio output started playing each frame, including a mid-frame re-key,
   instead of when the TX worker queued its audio (PAN-71). When pancetta
   cannot confirm the start within 100 ms it keeps the old value and logs a
   warning.
-=======
+
 - Retuning within a band no longer reports stations heard before the retune at
   the new dial's frequency (PAN-70). The decoder used to keep audio buffered
   on the old dial across an intra-band retune and label the whole window with
@@ -179,7 +178,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   autonomous CQ whose frame was swapped for a fresher one and then refused no
   longer counts as a failed CQ before the replacement airs; it now settles
   once, on what actually aired.
->>>>>>> 57191959ac2a274918a6dbd68afe010e3f830f6e
 
 - Autonomous cqdx.io spot reports now carry the frequency of the band the
   decode was actually heard on when the station changes bands between a decode
