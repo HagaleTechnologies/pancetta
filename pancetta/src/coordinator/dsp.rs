@@ -850,9 +850,7 @@ impl super::ApplicationCoordinator {
                                     "DSP: dial change {} Hz -> {} Hz within the band — \
                                      discarded {} in-flight samples so no window mixes \
                                      two dials",
-                                    flush.previous_hz,
-                                    cur_dial_hz,
-                                    flush.discarded_samples
+                                    flush.previous_hz, cur_dial_hz, flush.discarded_samples
                                 );
                             }
                         }
@@ -861,7 +859,7 @@ impl super::ApplicationCoordinator {
                         // station-wide mode (Shift+M) since the audio now
                         // buffered was captured, the buffered samples are the
                         // wrong frame geometry for the new mode's decoder —
-                        // flush and resize, mirroring the band-change guard
+                        // flush and resize, mirroring the dial-change guard
                         // immediately above.
                         let cur_mode_u8 = active_protocol_mode.load(Ordering::Relaxed);
                         if mode_flush_decision(cached_mode_u8, cur_mode_u8) {
@@ -1016,10 +1014,10 @@ impl super::ApplicationCoordinator {
                             next_window_time = reanchored;
                             if matches!(jump, pancetta_core::slot_clock::WallClockJump::Forward(_))
                             {
-                                // Same flush as a band change (above): the
-                                // buffer spans the jump. `bin_history` (the
-                                // waterfall noise floor) is kept — the band
-                                // did not change.
+                                // Same flush as an intra-band dial change
+                                // (above): the buffer spans the jump.
+                                // `bin_history` (the waterfall noise floor) is
+                                // kept — the band did not change.
                                 ft8_buffer.clear();
                                 last_live_wf_samples = 0;
                             }
@@ -1433,7 +1431,9 @@ mod dial_change_state_tests {
     fn repeated_one_hertz_steps_flush_each_time() {
         let mut st = CaptureState::seeded(M20);
         for step in 1..=5u64 {
-            let flush = st.batch(step as f32, M20 + step).expect("each step flushes");
+            let flush = st
+                .batch(step as f32, M20 + step)
+                .expect("each step flushes");
             assert_eq!(flush.previous_hz, M20 + step - 1);
             assert!(st.ft8_buffer.is_empty());
             assert_eq!(st.last_known_dial_hz, M20 + step);
@@ -1662,7 +1662,11 @@ mod dial_change_signal_tests {
     fn unchanged_dial_decodes_under_capture_dial() {
         let (_, emitted) = slot1_run(DIAL_A);
         assert_eq!(emitted.len(), 1, "one window at the slot-1 deadline");
-        assert!(emitted[0].heard("K5ARH"), "control must decode: {:?}", emitted[0].texts);
+        assert!(
+            emitted[0].heard("K5ARH"),
+            "control must decode: {:?}",
+            emitted[0].texts
+        );
         assert_eq!(emitted[0].window.dial_hz, DIAL_A);
     }
 
