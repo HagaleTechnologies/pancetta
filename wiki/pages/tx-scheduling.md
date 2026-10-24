@@ -65,6 +65,11 @@ fixes, including the open double-PTT-for-73 bug — see that doc and
   later. Fixed with a worker-local consume-once tombstone
   (`is_pivot_duplicate`, `coordinator/mod.rs`) — see
   `docs/qso-tx-deep-review-2026-07-18.md` for the full mechanism.
+- **Pivot ownership (PAN-185):** a pivot only targets an intent whose request
+  is confirmed queued (`request_queued`), and the tombstone decides who tells
+  Autonomous: a refused pivot stays silent and its queued request reports; a
+  keyed pivot reports and its absorbed request drops silently. See
+  `docs/DECISIONS/tx-scheduling.md`.
 
 ## Why it is shaped this way
 
