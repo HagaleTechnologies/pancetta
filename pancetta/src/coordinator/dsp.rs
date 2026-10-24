@@ -106,36 +106,100 @@ fn band_for_freq_hz(hz: u64) -> Option<&'static str> {
     })
 }
 
-/// Decide whether the in-flight FT8 audio window must be flushed because the
-/// rig dial moved to a different band, and what the new band baseline is.
+/// Decide whether the in-flight audio window must be flushed because the rig
+/// dial moved, and what the new reference dial is (PAN-70).
 ///
-/// `band_ref_hz` is the dial frequency the audio currently buffered was
-/// captured on (0 = not yet established). `cur_dial_hz` is the dial frequency
-/// read this iteration (0 = no rig / not yet polled).
+/// `last_known_hz` is the last nonzero dial reading the DSP observed — the
+/// dial the audio buffered since the last flush is attributed to (0 = not yet
+/// established). `current_hz` is the dial read this iteration (0 = no rig /
+/// not yet polled).
 ///
-/// Returns `(new_band_ref_hz, should_flush)`:
-///   - When `band_ref_hz == 0`, the baseline is seeded to `cur_dial_hz` and no
-///     flush is requested (there is no prior band to have decoded on).
-///   - When the dial crossed into a different band (per [`super::is_band_change`])
-///     the buffer must be flushed and the baseline advances to `cur_dial_hz`.
-///   - Intra-band fine-tuning and a `cur_dial_hz == 0` read leave the baseline
-///     and buffer untouched.
-fn band_flush_decision(band_ref_hz: u64, cur_dial_hz: u64) -> (u64, bool) {
-    if band_ref_hz == 0 {
-        // Seed the baseline on the first real dial read; nothing to flush yet.
-        return (cur_dial_hz, false);
+/// Returns `(new_last_known_hz, should_flush)`:
+///   - A `current_hz == 0` read keeps the reference and the buffer: an
+///     unknown reading is not evidence that the dial moved.
+///   - When `last_known_hz == 0`, the reference seeds to `current_hz` and no
+///     flush is requested (there is no prior dial to have captured on).
+///   - Any other inequality, however small and whether or not it crosses a
+///     band edge, flushes and advances the reference. A window may only carry
+///     one dial snapshot, so audio buffered on the old dial must never be
+///     emitted under the new one.
+///
+/// The comparison is exact on purpose: no deadband. See
+/// `docs/DECISIONS/config-and-platform.md` (PAN-70) for the rejected 100 Hz
+/// tolerance and the accepted decode loss while the operator tunes.
+fn dial_flush_decision(last_known_hz: u64, current_hz: u64) -> (u64, bool) {
+    if current_hz == 0 {
+        return (last_known_hz, false);
     }
-    if cur_dial_hz != 0 && super::is_band_change(band_ref_hz, cur_dial_hz) {
-        return (cur_dial_hz, true);
+    if last_known_hz == 0 {
+        return (current_hz, false);
     }
-    (band_ref_hz, false)
+    (current_hz, current_hz != last_known_hz)
+}
+
+/// What [`apply_dial_change`] discarded when an observed dial change flushed
+/// the capture buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DialFlush {
+    /// The reference dial the discarded audio was attributed to.
+    previous_hz: u64,
+    /// Samples cleared from the capture buffer, including the batch that
+    /// exposed the change.
+    discarded_samples: usize,
+    /// The move also crossed a band edge (per [`super::is_band_change`]), so
+    /// the waterfall noise-floor history was cleared too.
+    band_changed: bool,
+}
+
+/// Apply this batch's dial reading to the DSP capture state (PAN-70).
+///
+/// Called once per audio batch, after the batch is appended to `ft8_buffer`
+/// and before the waterfall row or decode window is built. On an observed
+/// change between two known dials ([`dial_flush_decision`]) it clears every
+/// buffered sample — the batch that exposed the change included, since its
+/// acquisition dial is unknown — and restarts the waterfall sample cursor.
+/// `bin_history` (the waterfall noise floor) is cleared only when the move
+/// crosses a band edge, judged against the OLD reference; an intra-band nudge
+/// keeps the floor warm. The reference always advances to the decision's
+/// result.
+///
+/// The guarantee covers DSP-observed transitions only: audio batches carry no
+/// dial tag, so audio queued upstream before a retune, CAT readback latency,
+/// and an A→B→A move that completes between two reads are not detected.
+fn apply_dial_change(
+    cur_dial_hz: u64,
+    last_known_dial_hz: &mut u64,
+    ft8_buffer: &mut Vec<f32>,
+    last_live_wf_samples: &mut usize,
+    bin_history: &mut Vec<std::collections::VecDeque<f32>>,
+) -> Option<DialFlush> {
+    let previous_hz = *last_known_dial_hz;
+    let (new_ref, flush) = dial_flush_decision(previous_hz, cur_dial_hz);
+    *last_known_dial_hz = new_ref;
+    if !flush {
+        return None;
+    }
+    let band_changed = super::is_band_change(previous_hz, cur_dial_hz);
+    let discarded_samples = ft8_buffer.len();
+    ft8_buffer.clear();
+    *last_live_wf_samples = 0;
+    if band_changed {
+        // A new band's spectrum must not be judged against the old band's
+        // noise floor.
+        bin_history.clear();
+    }
+    Some(DialFlush {
+        previous_hz,
+        discarded_samples,
+        band_changed,
+    })
 }
 
 /// Decide whether the in-flight FT8 audio window must be flushed because the
 /// active operating mode changed (the operator cycled FT8/FT4/FT2 live).
 ///
 /// `cached_mode`/`cur_mode` are `pancetta_config::OperatingMode::as_u8()`
-/// values. Unlike [`band_flush_decision`] there is no "unknown baseline"
+/// values. Unlike [`dial_flush_decision`] there is no "unknown baseline"
 /// case — the DSP thread always starts with a real mode read from config at
 /// spawn time, so a simple inequality is the whole decision.
 fn mode_flush_decision(cached_mode: u8, cur_mode: u8) -> bool {
@@ -653,19 +717,18 @@ impl super::ApplicationCoordinator {
             let mut batch_count: u64 = 0;
             let _waiting_for_boundary = true;
 
-            // Band-change phantom-decode guard: the dial frequency that the
-            // audio currently accumulating in `ft8_buffer` was captured on.
-            // When the operator (or the autonomous engine) switches bands, the
-            // shared `operating_frequency_hz` atomic flips synchronously, but
-            // `ft8_buffer` still holds up to a full window of OLD-band audio. If
-            // we emitted that in-flight window the decoder would report old-band
-            // stations as if they were heard on the new band (phantom decodes).
-            // We detect the switch here and flush the in-flight audio so the
-            // next emitted window is built entirely from new-band samples.
-            // 0 = not yet established (no rig / pre-first-read); `is_band_change`
-            // treats an `old_hz == 0` baseline as "no change", so the first
-            // non-zero dial read simply seeds the baseline.
-            let mut band_ref_dial_hz: u64 = 0;
+            // Dial-change guard (PAN-70): the last nonzero dial reading, i.e.
+            // the dial the audio accumulating in `ft8_buffer` is attributed
+            // to. When the operator (or the autonomous engine) retunes, the
+            // shared `operating_frequency_hz` atomic flips, but `ft8_buffer`
+            // still holds up to a full window of audio from the OLD dial. A
+            // window carries one dial snapshot, so emitting that mixed audio
+            // would report old-dial stations at the new dial (phantom decodes
+            // on a band change, frequencies off by the retune delta within a
+            // band). `apply_dial_change` flushes on every observed change
+            // between two known dials. 0 = not yet established (no rig /
+            // pre-first-read); the first nonzero read seeds it.
+            let mut last_known_dial_hz: u64 = 0;
 
             // WAV recorder for decoder validation (PAN-125): present only
             // when `[audio.recording] auto_record = true` resolved to a
@@ -759,36 +822,44 @@ impl super::ApplicationCoordinator {
                             }
                         }
 
-                        // Band-change guard: if the dial frequency moved to a
-                        // different band since the audio now buffered was
-                        // captured, discard the in-flight window. Otherwise the
-                        // old band's last window would decode into the new band
-                        // as phantom stations. The next full window (~12.64 s
-                        // later) rebuilds entirely from new-band audio.
+                        // Dial-change guard (PAN-70): if the dial moved since
+                        // the audio now buffered was captured — across a band
+                        // edge or by 1 Hz within a band — discard the in-flight
+                        // audio, this batch included, so no window mixes two
+                        // dials under one label. This one read is also the
+                        // snapshot the emitted `DecodeWindow` carries.
                         let cur_dial_hz = operating_frequency_hz.load(Ordering::Relaxed);
-                        let (new_ref, flush) = band_flush_decision(band_ref_dial_hz, cur_dial_hz);
-                        if flush {
-                            info!(
-                                target: "operator.override",
-                                "DSP: band change {} Hz -> {} Hz — flushing {} in-flight \
-                                 samples to avoid phantom decodes on the new band",
-                                band_ref_dial_hz,
-                                cur_dial_hz,
-                                ft8_buffer.len()
-                            );
-                            ft8_buffer.clear();
-                            last_live_wf_samples = 0;
-                            // Reset the live-waterfall noise-floor history so the
-                            // new band's spectrum isn't biased by the old band's.
-                            bin_history.clear();
+                        if let Some(flush) = apply_dial_change(
+                            cur_dial_hz,
+                            &mut last_known_dial_hz,
+                            &mut ft8_buffer,
+                            &mut last_live_wf_samples,
+                            &mut bin_history,
+                        ) {
+                            if flush.band_changed {
+                                info!(
+                                    target: "operator.override",
+                                    "DSP: band change {} Hz -> {} Hz — flushing {} in-flight \
+                                     samples to avoid phantom decodes on the new band",
+                                    flush.previous_hz,
+                                    cur_dial_hz,
+                                    flush.discarded_samples
+                                );
+                            } else {
+                                debug!(
+                                    "DSP: dial change {} Hz -> {} Hz within the band — \
+                                     discarded {} in-flight samples so no window mixes \
+                                     two dials",
+                                    flush.previous_hz, cur_dial_hz, flush.discarded_samples
+                                );
+                            }
                         }
-                        band_ref_dial_hz = new_ref;
 
                         // Mode-change guard: if the operator cycled the
                         // station-wide mode (Shift+M) since the audio now
                         // buffered was captured, the buffered samples are the
                         // wrong frame geometry for the new mode's decoder —
-                        // flush and resize, mirroring the band-change guard
+                        // flush and resize, mirroring the dial-change guard
                         // immediately above.
                         let cur_mode_u8 = active_protocol_mode.load(Ordering::Relaxed);
                         if mode_flush_decision(cached_mode_u8, cur_mode_u8) {
@@ -943,10 +1014,10 @@ impl super::ApplicationCoordinator {
                             next_window_time = reanchored;
                             if matches!(jump, pancetta_core::slot_clock::WallClockJump::Forward(_))
                             {
-                                // Same flush as a band change (above): the
-                                // buffer spans the jump. `bin_history` (the
-                                // waterfall noise floor) is kept — the band
-                                // did not change.
+                                // Same flush as an intra-band dial change
+                                // (above): the buffer spans the jump.
+                                // `bin_history` (the waterfall noise floor) is
+                                // kept — the band did not change.
                                 ft8_buffer.clear();
                                 last_live_wf_samples = 0;
                             }
@@ -998,17 +1069,13 @@ impl super::ApplicationCoordinator {
                                 &dsp_to_ft8_tx,
                                 super::pipeline::DecodeWindow {
                                     samples: window,
-                                    // `cur_dial_hz` (read above for the band-change
-                                    // guard), not `band_ref_dial_hz` — the latter is
-                                    // deliberately frozen across intra-band retuning
-                                    // (see `band_flush_decision`) and would stamp
-                                    // every subsequent window with a stale
-                                    // sub-frequency forever after the operator
-                                    // fine-tunes within the same band (PAN-67 review
-                                    // round 1 finding 1). `cur_dial_hz` is re-read
-                                    // fresh every audio batch, so it tracks the dial
-                                    // right up to window-close regardless of whether
-                                    // the move crossed a band edge.
+                                    // `cur_dial_hz`: this batch's dial read, the
+                                    // same one the dial-change guard above just
+                                    // checked (PAN-67 round 1). Because that guard
+                                    // flushes on every observed change between two
+                                    // known dials (PAN-70), no sample in this window
+                                    // was appended while the DSP read a different
+                                    // known dial. 0 still means unknown.
                                     dial_hz: cur_dial_hz,
                                 },
                                 super::pipeline::DECODE_FORWARD_TIMEOUT,
@@ -1137,48 +1204,542 @@ fn rolling_median(samples: &[f32]) -> f32 {
 }
 
 #[cfg(test)]
-mod band_flush_tests {
-    use super::band_flush_decision;
+mod dial_flush_tests {
+    use super::dial_flush_decision;
+    use crate::coordinator::is_band_change;
 
     // Representative dial frequencies (Hz).
     const M20: u64 = 14_074_000; // 20 m FT8
     const M40: u64 = 7_074_000; // 40 m FT8
-    const M20_NUDGE: u64 = 14_076_000; // small intra-band QSY
+    /// Mid-20 m reference, so ±100 kHz stays inside the band (14.000–14.350 MHz).
+    const M20_MID: u64 = 14_175_000;
+    /// Intra-band retune magnitudes (Hz) PAN-70 must flush on, in either
+    /// direction — including the 1/50/99 Hz moves a 100 Hz deadband would keep.
+    const INTRA_BAND_DELTAS: [u64; 7] = [1, 50, 99, 100, 2_000, 16_000, 100_000];
 
     #[test]
-    fn seeds_baseline_on_first_real_read_without_flushing() {
-        let (new_ref, flush) = band_flush_decision(0, M20);
-        assert_eq!(new_ref, M20, "baseline seeds to the first dial read");
-        assert!(!flush, "seeding must not flush — there is no prior band");
+    fn unknown_reads_before_any_dial_keep_the_unknown_reference() {
+        assert_eq!(dial_flush_decision(0, 0), (0, false));
     }
 
     #[test]
-    fn cross_band_move_flushes_and_advances_baseline() {
-        let (new_ref, flush) = band_flush_decision(M20, M40);
-        assert!(flush, "20 m -> 40 m must flush the in-flight window");
-        assert_eq!(new_ref, M40, "baseline advances to the new band");
+    fn seeds_reference_on_first_real_read_without_flushing() {
+        let (new_ref, flush) = dial_flush_decision(0, M20);
+        assert_eq!(new_ref, M20, "reference seeds to the first dial read");
+        assert!(!flush, "seeding must not flush — there is no prior dial");
     }
 
     #[test]
-    fn intra_band_fine_tune_holds_buffer() {
-        let (new_ref, flush) = band_flush_decision(M20, M20_NUDGE);
-        assert!(!flush, "small intra-band QSY must not flush");
-        assert_eq!(new_ref, M20, "baseline unchanged on intra-band move");
+    fn cross_band_move_flushes_and_advances_reference() {
+        for (from, to) in [(M20, M40), (M40, M20)] {
+            let (new_ref, flush) = dial_flush_decision(from, to);
+            assert!(flush, "{from} -> {to} must flush the in-flight window");
+            assert_eq!(new_ref, to, "reference advances to the new dial");
+        }
+    }
+
+    /// PAN-70: replaces `intra_band_fine_tune_holds_buffer`. Every intra-band
+    /// move, however small, flushes — otherwise the buffered old-dial audio is
+    /// emitted under the new dial and reported off by the retune delta.
+    #[test]
+    fn every_intra_band_delta_flushes_and_advances_reference() {
+        for delta in INTRA_BAND_DELTAS {
+            for to in [M20_MID + delta, M20_MID - delta] {
+                assert!(
+                    !is_band_change(M20_MID, to),
+                    "fixture premise: {M20_MID} -> {to} stays inside 20 m"
+                );
+                let (new_ref, flush) = dial_flush_decision(M20_MID, to);
+                assert!(flush, "intra-band move {M20_MID} -> {to} must flush");
+                assert_eq!(new_ref, to, "reference advances to {to}");
+            }
+        }
+    }
+
+    /// Exact comparison applies outside the band table too, including a move
+    /// small enough that `is_band_change`'s out-of-band threshold ignores it.
+    #[test]
+    fn unequal_out_of_band_dials_flush() {
+        const OOB: u64 = 12_000_000; // between 30 m and 20 m
+        for to in [OOB + 1, OOB - 1, OOB + 500_000, M20] {
+            let (new_ref, flush) = dial_flush_decision(OOB, to);
+            assert!(flush, "{OOB} -> {to} must flush");
+            assert_eq!(new_ref, to);
+        }
+        let (new_ref, flush) = dial_flush_decision(M20, OOB);
+        assert!(flush, "leaving the band table must flush");
+        assert_eq!(new_ref, OOB);
     }
 
     #[test]
     fn zero_current_read_is_ignored_once_seeded() {
         // A transient 0 read (rig dropped out) must not flush or reset.
-        let (new_ref, flush) = band_flush_decision(M20, 0);
+        let (new_ref, flush) = dial_flush_decision(M20, 0);
         assert!(!flush, "a 0 dial read must not flush");
-        assert_eq!(new_ref, M20, "baseline survives a transient 0 read");
+        assert_eq!(new_ref, M20, "reference survives a transient 0 read");
     }
 
     #[test]
     fn same_frequency_holds_buffer() {
-        let (new_ref, flush) = band_flush_decision(M20, M20);
+        let (new_ref, flush) = dial_flush_decision(M20, M20);
         assert!(!flush);
         assert_eq!(new_ref, M20);
+    }
+}
+
+/// PAN-70: the capture-state effects of an observed dial change, exercised
+/// through [`super::apply_dial_change`] — the same helper the DSP loop calls
+/// after appending each batch.
+#[cfg(test)]
+mod dial_change_state_tests {
+    use super::{apply_dial_change, DialFlush};
+    use std::collections::VecDeque;
+
+    const M20: u64 = 14_074_000;
+    const M40: u64 = 7_074_000;
+    /// Samples in one simulated audio batch.
+    const BATCH: usize = 1_200;
+
+    /// The worker-local state `apply_dial_change` mutates.
+    struct CaptureState {
+        last_known_dial_hz: u64,
+        ft8_buffer: Vec<f32>,
+        last_live_wf_samples: usize,
+        bin_history: Vec<VecDeque<f32>>,
+    }
+
+    impl CaptureState {
+        /// A buffer of distinguishable old samples, a nonzero waterfall cursor
+        /// and a warm per-bin noise-floor history, attributed to `dial_hz`.
+        fn seeded(dial_hz: u64) -> Self {
+            Self {
+                last_known_dial_hz: dial_hz,
+                ft8_buffer: (0..10_000).map(|i| i as f32 * 1e-4).collect(),
+                last_live_wf_samples: 7_500,
+                bin_history: (0..4)
+                    .map(|bin| (0..6).map(|row| (bin * 10 + row) as f32).collect())
+                    .collect(),
+            }
+        }
+
+        /// One loop iteration: append a batch (marked with `marker`), then
+        /// apply this batch's dial read — production order.
+        fn batch(&mut self, marker: f32, cur_dial_hz: u64) -> Option<DialFlush> {
+            self.ft8_buffer.extend(std::iter::repeat_n(marker, BATCH));
+            apply_dial_change(
+                cur_dial_hz,
+                &mut self.last_known_dial_hz,
+                &mut self.ft8_buffer,
+                &mut self.last_live_wf_samples,
+                &mut self.bin_history,
+            )
+        }
+    }
+
+    #[test]
+    fn intra_band_change_discards_audio_and_keeps_noise_floor() {
+        let mut st = CaptureState::seeded(M20);
+        let history_before = st.bin_history.clone();
+        let buffered = st.ft8_buffer.len();
+
+        let flush = st.batch(9.0, M20 + 1);
+
+        assert_eq!(
+            flush,
+            Some(DialFlush {
+                previous_hz: M20,
+                discarded_samples: buffered + BATCH,
+                band_changed: false,
+            })
+        );
+        assert!(
+            st.ft8_buffer.is_empty(),
+            "no old-dial sample, nor the batch that exposed the change, may survive"
+        );
+        assert_eq!(st.last_live_wf_samples, 0, "waterfall cursor restarts");
+        assert_eq!(st.last_known_dial_hz, M20 + 1, "reference advances");
+        assert_eq!(
+            st.bin_history, history_before,
+            "an intra-band nudge keeps the noise-floor history"
+        );
+    }
+
+    #[test]
+    fn cross_band_change_also_clears_noise_floor() {
+        let mut st = CaptureState::seeded(M20);
+        let flush = st.batch(9.0, M40).expect("a band change flushes");
+        assert!(flush.band_changed);
+        assert_eq!(flush.previous_hz, M20);
+        assert!(st.ft8_buffer.is_empty());
+        assert_eq!(st.last_live_wf_samples, 0);
+        assert_eq!(st.last_known_dial_hz, M40);
+        assert!(st.bin_history.is_empty(), "a new band starts a fresh floor");
+    }
+
+    #[test]
+    fn equal_and_unknown_reads_leave_state_untouched() {
+        for cur in [M20, 0] {
+            let mut st = CaptureState::seeded(M20);
+            let history_before = st.bin_history.clone();
+            let buffered = st.ft8_buffer.len();
+            assert_eq!(st.batch(9.0, cur), None, "dial read {cur} must not flush");
+            assert_eq!(st.ft8_buffer.len(), buffered + BATCH, "audio retained");
+            assert_eq!(st.last_live_wf_samples, 7_500, "cursor retained");
+            assert_eq!(st.last_known_dial_hz, M20, "reference retained");
+            assert_eq!(st.bin_history, history_before, "history retained");
+        }
+    }
+
+    #[test]
+    fn first_known_read_seeds_without_flushing() {
+        let mut st = CaptureState::seeded(0);
+        let buffered = st.ft8_buffer.len();
+        assert_eq!(st.batch(9.0, M20), None);
+        assert_eq!(st.last_known_dial_hz, M20);
+        assert_eq!(st.ft8_buffer.len(), buffered + BATCH);
+    }
+
+    /// A→B then B again: the flush happens once, and audio accumulated on B
+    /// afterwards is kept (the reference really advanced).
+    #[test]
+    fn repeated_new_dial_keeps_new_audio() {
+        let mut st = CaptureState::seeded(M20);
+        assert!(st.batch(1.0, M20 + 2_000).is_some());
+        assert!(st.batch(2.0, M20 + 2_000).is_none());
+        assert!(st.batch(3.0, M20 + 2_000).is_none());
+        assert_eq!(st.ft8_buffer.len(), 2 * BATCH);
+        assert!(st.ft8_buffer[..BATCH].iter().all(|&s| s == 2.0));
+        assert!(st.ft8_buffer[BATCH..].iter().all(|&s| s == 3.0));
+    }
+
+    /// A→B→A: returning to the old dial is itself a change; the B audio must
+    /// not be emitted under A.
+    #[test]
+    fn return_to_previous_dial_flushes_again() {
+        let mut st = CaptureState::seeded(M20);
+        assert!(st.batch(1.0, M20 + 50).is_some());
+        assert!(st.batch(2.0, M20 + 50).is_none());
+        let back = st.batch(3.0, M20).expect("B -> A flushes");
+        assert_eq!(back.previous_hz, M20 + 50);
+        assert_eq!(back.discarded_samples, 2 * BATCH);
+        assert!(st.ft8_buffer.is_empty());
+        assert_eq!(st.last_known_dial_hz, M20);
+    }
+
+    /// A VFO knob turned 1 Hz per batch flushes on every step.
+    #[test]
+    fn repeated_one_hertz_steps_flush_each_time() {
+        let mut st = CaptureState::seeded(M20);
+        for step in 1..=5u64 {
+            let flush = st
+                .batch(step as f32, M20 + step)
+                .expect("each step flushes");
+            assert_eq!(flush.previous_hz, M20 + step - 1);
+            assert!(st.ft8_buffer.is_empty());
+            assert_eq!(st.last_known_dial_hz, M20 + step);
+        }
+    }
+
+    /// A→0→B: the unknown read holds everything; B is compared against A.
+    #[test]
+    fn unknown_read_between_different_dials_flushes_on_arrival() {
+        let mut st = CaptureState::seeded(M20);
+        let buffered = st.ft8_buffer.len();
+        assert!(st.batch(1.0, 0).is_none());
+        assert_eq!(st.ft8_buffer.len(), buffered + BATCH);
+        let flush = st.batch(2.0, M20 + 99).expect("A -> 0 -> B flushes at B");
+        assert_eq!(flush.previous_hz, M20);
+        assert_eq!(flush.discarded_samples, buffered + 2 * BATCH);
+        assert!(st.ft8_buffer.is_empty());
+        assert_eq!(st.last_known_dial_hz, M20 + 99);
+    }
+
+    /// A→0→A: an unknown read in between is not a change.
+    #[test]
+    fn unknown_read_between_same_dial_keeps_audio() {
+        let mut st = CaptureState::seeded(M20);
+        let buffered = st.ft8_buffer.len();
+        assert!(st.batch(1.0, 0).is_none());
+        assert!(st.batch(2.0, M20).is_none());
+        assert_eq!(st.ft8_buffer.len(), buffered + 2 * BATCH);
+        assert_eq!(st.last_known_dial_hz, M20);
+    }
+}
+
+/// PAN-70 end-to-end regression with real FT8 audio: a complete message
+/// captured on one dial must never be decoded from a window labelled with a
+/// later, different dial. Built from the PAN-70 research reproduction and
+/// `anchored_slice_tests::synthetic_boundary_signal_reports_dt_near_zero`.
+///
+/// Each test drives audio through the production per-batch order — append a
+/// batch, read the live dial atomic once, [`super::apply_dial_change`], then
+/// the emit gate with the real [`super::boundary_anchored_slice`], the real
+/// FT8 timing constants and slot scheduler, and the real decoder. Times are
+/// explicit sample indices; nothing sleeps and no rig is involved.
+#[cfg(test)]
+mod dial_change_signal_tests {
+    use super::{apply_dial_change, boundary_anchored_slice};
+    use crate::coordinator::pipeline::DecodeWindow;
+    use crate::coordinator::{derive_dsp_timing, WINDOW_LEAD_SECS};
+    use pancetta_ft8::{Ft8Config, Ft8Decoder, Ft8Encoder, Ft8Modulator};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const SR: usize = 12_000;
+    /// 0.1 s of 12 kHz audio per loop iteration.
+    const BATCH: usize = SR / 10;
+    /// Capture start (s past the epoch): 2 s before the slot-1 boundary at
+    /// 105 s, the layout `anchored_slice_tests` validates.
+    const START_SECS: f64 = 103.0;
+    /// Slot boundaries (UTC-aligned multiples of 15 s).
+    const SLOT1_SECS: f64 = 105.0;
+    const SLOT2_SECS: f64 = 120.0;
+    /// The dial the slot-1 message is transmitted and captured on.
+    const DIAL_A: u64 = 14_074_000;
+    /// Retune observed in the batch ending 14.8 s into the capture, i.e.
+    /// 12.8 s after the slot-1 boundary: after the 12.64 s message has ended
+    /// and before the 13 s decode deadline.
+    const RETUNE_AT_SAMPLE: usize = 14 * SR + 8 * BATCH;
+
+    fn utc(secs: f64) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::<chrono::Utc>::UNIX_EPOCH
+            + chrono::Duration::nanoseconds((secs * 1_000_000_000.0).round() as i64)
+    }
+
+    /// `text` modulated at 2000 Hz audio (+500 Hz over the 1500 Hz base).
+    fn message_audio(text: &str) -> Vec<f32> {
+        let symbols = Ft8Encoder::new()
+            .encode_message(text, None)
+            .expect("fixture message encodes");
+        Ft8Modulator::new_default()
+            .expect("modulator")
+            .modulate_symbols(&symbols, 500.0)
+            .expect("fixture message modulates")
+    }
+
+    /// Silence from `START_SECS` lasting `len` samples, with each message
+    /// starting exactly on its slot boundary.
+    fn session_audio(len: usize, messages: &[(f64, &str)]) -> Vec<f32> {
+        let mut audio = vec![0.0f32; len];
+        for &(boundary_secs, text) in messages {
+            let msg = message_audio(text);
+            let at = ((boundary_secs - START_SECS) * SR as f64).round() as usize;
+            audio[at..at + msg.len()].copy_from_slice(&msg);
+        }
+        audio
+    }
+
+    struct Emitted {
+        window: DecodeWindow,
+        texts: Vec<String>,
+    }
+
+    impl Emitted {
+        fn heard(&self, call: &str) -> bool {
+            self.texts.iter().any(|t| t.contains(call))
+        }
+    }
+
+    /// The DSP worker's capture state, driven batch by batch.
+    struct Capture {
+        live_dial_hz: AtomicU64,
+        last_known_dial_hz: u64,
+        ft8_buffer: Vec<f32>,
+        last_live_wf_samples: usize,
+        bin_history: Vec<std::collections::VecDeque<f32>>,
+        next_window_time: chrono::DateTime<chrono::Utc>,
+        decoder: Ft8Decoder,
+    }
+
+    impl Capture {
+        /// Capture already seeded on `seed_dial_hz`, before `START_SECS`.
+        fn new(seed_dial_hz: u64) -> Self {
+            let timing = Self::timing();
+            Self {
+                live_dial_hz: AtomicU64::new(seed_dial_hz),
+                last_known_dial_hz: seed_dial_hz,
+                ft8_buffer: Vec::new(),
+                last_live_wf_samples: 0,
+                bin_history: Vec::new(),
+                next_window_time: pancetta_core::slot::next_phase_with_period(
+                    utc(START_SECS),
+                    timing.decode_phase,
+                    timing.slot_ns,
+                ),
+                decoder: Ft8Decoder::new(Ft8Config::default()).expect("decoder"),
+            }
+        }
+
+        fn timing() -> crate::coordinator::DspTiming {
+            derive_dsp_timing(&pancetta_ft8::ProtocolParams::from_protocol(
+                pancetta_ft8::Protocol::Ft8,
+            ))
+        }
+
+        /// One DSP loop iteration ending at absolute sample `end`: append the
+        /// batch, read the live dial once, apply the dial change, then emit
+        /// if the buffer and the deadline allow.
+        fn step(&mut self, batch: &[f32], end: usize) -> Option<Emitted> {
+            let timing = Self::timing();
+            self.ft8_buffer.extend_from_slice(batch);
+            let cur_dial_hz = self.live_dial_hz.load(Ordering::Relaxed);
+            apply_dial_change(
+                cur_dial_hz,
+                &mut self.last_known_dial_hz,
+                &mut self.ft8_buffer,
+                &mut self.last_live_wf_samples,
+                &mut self.bin_history,
+            );
+            let now = utc(START_SECS + end as f64 / SR as f64);
+            if self.ft8_buffer.len() < timing.window_samples || now < self.next_window_time {
+                return None;
+            }
+            let slot_boundary = self.next_window_time - timing.decode_phase;
+            let (start, len) = boundary_anchored_slice(
+                self.ft8_buffer.len(),
+                now,
+                slot_boundary,
+                SR,
+                timing.window_samples,
+                WINDOW_LEAD_SECS,
+            );
+            let window = DecodeWindow {
+                samples: self.ft8_buffer[start..start + len].to_vec(),
+                dial_hz: cur_dial_hz,
+            };
+            if self.ft8_buffer.len() > timing.overlap_samples {
+                let excess = self.ft8_buffer.len() - timing.overlap_samples;
+                self.ft8_buffer.drain(..excess);
+                self.last_live_wf_samples = self.ft8_buffer.len();
+            }
+            self.next_window_time = pancetta_core::slot::next_phase_with_period(
+                now,
+                timing.decode_phase,
+                timing.slot_ns,
+            );
+            let texts = self
+                .decoder
+                .decode_window(&window.samples)
+                .expect("decode_window must not error on the fixture")
+                .into_iter()
+                .map(|m| m.text)
+                .collect();
+            Some(Emitted { window, texts })
+        }
+
+        /// Feed `audio` in 0.1 s batches, publishing `dial_at(batch_end)` to
+        /// the live atomic before each batch's read (the Hamlib poll's
+        /// store). Returns every emitted window.
+        fn run(&mut self, audio: &[f32], dial_at: impl Fn(usize) -> u64) -> Vec<Emitted> {
+            assert_eq!(audio.len() % BATCH, 0, "fixture uses whole batches");
+            let mut emitted = Vec::new();
+            for (i, batch) in audio.chunks(BATCH).enumerate() {
+                let end = (i + 1) * BATCH;
+                self.live_dial_hz.store(dial_at(end), Ordering::Relaxed);
+                emitted.extend(self.step(batch, end));
+            }
+            emitted
+        }
+    }
+
+    /// Slot 1 only: capture through the 13 s deadline (15 s of audio).
+    fn slot1_run(new_dial_hz: u64) -> (Capture, Vec<Emitted>) {
+        let audio = session_audio(15 * SR, &[(SLOT1_SECS, "CQ K5ARH EM12")]);
+        let mut cap = Capture::new(DIAL_A);
+        let emitted = cap.run(&audio, |end| {
+            if end >= RETUNE_AT_SAMPLE {
+                new_dial_hz
+            } else {
+                DIAL_A
+            }
+        });
+        (cap, emitted)
+    }
+
+    /// Control: with the dial unchanged the fixture decodes at the 13 s
+    /// deadline under the capture dial, so the retune cases below cannot pass
+    /// merely because the fixture never decodes.
+    #[test]
+    fn unchanged_dial_decodes_under_capture_dial() {
+        let (_, emitted) = slot1_run(DIAL_A);
+        assert_eq!(emitted.len(), 1, "one window at the slot-1 deadline");
+        assert!(
+            emitted[0].heard("K5ARH"),
+            "control must decode: {:?}",
+            emitted[0].texts
+        );
+        assert_eq!(emitted[0].window.dial_hz, DIAL_A);
+    }
+
+    /// THE PAN-70 CASE: a complete message on DIAL_A, then an intra-band
+    /// retune observed after the message ends but before the deadline. The
+    /// old audio is discarded, so it can't be emitted under the new dial.
+    /// Pre-PAN-70 this decoded K5ARH labelled with the new dial, i.e.
+    /// reported off by exactly the retune delta.
+    #[test]
+    fn intra_band_retune_never_labels_old_audio_with_new_dial() {
+        for delta in [1i64, -50, 16_000, -1_000, 100_000] {
+            let new_dial = DIAL_A.checked_add_signed(delta).expect("dial in range");
+            assert!(
+                !crate::coordinator::is_band_change(DIAL_A, new_dial),
+                "fixture premise: {delta:+} Hz stays inside 20 m"
+            );
+            let (cap, emitted) = slot1_run(new_dial);
+            for w in &emitted {
+                assert!(
+                    !(w.heard("K5ARH") && w.window.dial_hz != DIAL_A),
+                    "Δ{delta:+}: old-dial K5ARH emitted under dial {}",
+                    w.window.dial_hz
+                );
+            }
+            // Only batches appended after the one that exposed the retune
+            // remain: nothing captured on DIAL_A survived.
+            assert_eq!(
+                cap.ft8_buffer.len(),
+                15 * SR - RETUNE_AT_SAMPLE,
+                "Δ{delta:+}: pre-retune samples survived the flush"
+            );
+            assert_eq!(cap.last_known_dial_hz, new_dial);
+        }
+    }
+
+    /// After the flush, a clean message on the new dial in the next slot is
+    /// decoded under the new dial once enough new audio has accumulated, and
+    /// a window already built keeps its snapshot when the live dial moves on.
+    #[test]
+    fn new_dial_signal_decodes_after_flush_with_stable_snapshot() {
+        const DIAL_B: u64 = DIAL_A + 16_000;
+        let audio = session_audio(
+            30 * SR,
+            &[(SLOT1_SECS, "CQ K5ARH EM12"), (SLOT2_SECS, "CQ K2BBB EM12")],
+        );
+        let mut cap = Capture::new(DIAL_A);
+        let emitted = cap.run(&audio, |end| {
+            if end >= RETUNE_AT_SAMPLE {
+                DIAL_B
+            } else {
+                DIAL_A
+            }
+        });
+
+        assert!(!emitted.is_empty(), "the new dial must produce a window");
+        for w in &emitted {
+            assert_eq!(w.window.dial_hz, DIAL_B, "every window follows the retune");
+            assert!(!w.heard("K5ARH"), "old-dial audio emitted under {DIAL_B}");
+        }
+        let recovered = emitted
+            .iter()
+            .find(|w| w.heard("K2BBB"))
+            .expect("the clean new-dial message must decode after the flush");
+
+        // The live dial moves on after the window was built: the next batch
+        // flushes the buffer, but the built window keeps its snapshot.
+        let snapshot = recovered.window.clone();
+        cap.live_dial_hz.store(DIAL_B + 1, Ordering::Relaxed);
+        let more = cap.step(&[0.0; BATCH], 30 * SR + BATCH);
+        assert!(more.is_none());
+        assert!(cap.ft8_buffer.is_empty(), "the later retune flushed again");
+        assert_eq!(recovered.window.dial_hz, DIAL_B, "snapshot unchanged");
+        assert_eq!(recovered.window.samples, snapshot.samples);
     }
 }
 

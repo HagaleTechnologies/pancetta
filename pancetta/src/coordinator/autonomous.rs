@@ -86,7 +86,7 @@ pub(crate) fn spot_publish_target(
 /// PAN-68: falls back to `live_dial_hz` only when the message never got
 /// stamped (`None` — test scaffolding, simulator, pre-PAN-67 paths) or
 /// the stamp is the 0 Hz "not yet established" sentinel (see dsp.rs's
-/// `band_ref_dial_hz`/`cur_dial_hz`). For a live decode, re-reading the
+/// `last_known_dial_hz`/`cur_dial_hz`). For a live decode, re-reading the
 /// live atomic here reintroduces the race PAN-67 fixed for the TUI and
 /// PSKReporter: the operator (or the autonomous band-hopper itself) can
 /// switch bands between the decode landing in `slot_messages` and this

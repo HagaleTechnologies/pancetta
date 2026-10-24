@@ -216,7 +216,7 @@ async fn handle_socket(mut socket: WebSocket, state: GatewayState) {
 /// frequency the decode's own audio window was captured on
 /// (`DecodedMessage::captured_dial_hz`), falling back to `live_dial_hz` when
 /// unstamped (`None`) or still at the "not yet established" sentinel
-/// (`Some(0)` — see `dsp.rs`'s `band_ref_dial_hz`/`cur_dial_hz`).
+/// (`Some(0)` — see `dsp.rs`'s `last_known_dial_hz`/`cur_dial_hz`).
 ///
 /// PAN-67 review round 4: reloading `op_freq` live here would reintroduce
 /// the same race already fixed for the TUI and PSKReporter — decoding is

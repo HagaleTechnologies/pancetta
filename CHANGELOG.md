@@ -158,6 +158,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Retuning within a band no longer reports stations heard before the retune at
+  the new dial's frequency (PAN-70). The decoder used to keep audio buffered
+  on the old dial across an intra-band retune and label the whole window with
+  the new dial, so a station was shown and uploaded off by the retune delta.
+  Any change between two known dial readings, even 1 Hz, now discards the
+  in-flight audio as a band change already did, so retuning can skip a decode
+  window while the receiver refills.
+
 - A frame that never airs now gives back its call, stall count and `Sent`
   timeline entry even when the QSO engine is briefly backed up (PAN-185).
   Before, that correction could be lost and the frame stayed counted. An

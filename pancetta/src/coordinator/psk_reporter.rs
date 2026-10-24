@@ -214,7 +214,7 @@ impl super::ApplicationCoordinator {
 /// operator's new band.
 ///
 /// PAN-67 review round 3: `Some(0)` means "not yet established" (see
-/// `dsp.rs`'s `band_ref_dial_hz`/`cur_dial_hz`, 0 = no rig / pre-first-read),
+/// `dsp.rs`'s `last_known_dial_hz`/`cur_dial_hz`, 0 = no rig / pre-first-read),
 /// never a real 0 Hz dial — treated the same as `None`, matching
 /// `tui_relay.rs`'s `decode_view_dial_mhz` zero-sentinel handling.
 fn spot_frequency_hz(decoded_msg: &pancetta_ft8::DecodedMessage, live_dial_hz: u64) -> u64 {
@@ -262,7 +262,7 @@ mod psk_reporter_tests {
     /// PAN-67 review round 3: a window that closed before the first CAT
     /// read stamps `captured_dial_hz` as `Some(0)`, not `None` — 0 is a
     /// real "not yet established" sentinel (see `dsp.rs`'s
-    /// `band_ref_dial_hz`/`cur_dial_hz`), not a legitimate 0 Hz dial.
+    /// `last_known_dial_hz`/`cur_dial_hz`), not a legitimate 0 Hz dial.
     /// `unwrap_or` alone treats `Some(0)` as a real value and would
     /// publish the reception near the bare audio tone offset.
     #[test]
