@@ -470,6 +470,7 @@ mod tests {
             },
             regressions: RegressionFlags::default(),
             notes: String::new(),
+            provenance: None,
         }
     }
 

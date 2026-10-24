@@ -666,6 +666,35 @@ pub struct Ft8Config {
     /// flag in this struct that names a specific default-off tradeoff.
     pub coherent_subtract_full_frame_reference_enabled: bool,
 
+    /// PAN-168 [A/B]: fit the full-frame path's audio-domain cancellation
+    /// (`subtract_reconstructed_signal_at_known_position`) per ~2-symbol
+    /// block via `Ft8Decoder::time_varying_complex_amplitude`, instead of
+    /// one constant amplitude/phase over the whole 79-symbol frame.
+    ///
+    /// The whole-frame fit is anchored at `base_frequency + df_hz` from
+    /// `fine_sync::refine`, and that estimate is not precise enough for a
+    /// 12.64 s constant fit: a 0.05 Hz carrier error leaves 79% of a clean
+    /// signal's energy in `residual_audio`, and 0.116 Hz (fine_sync's
+    /// measured -18 dB median) leaves 95%. fine_sync's median error is
+    /// already 0.047 Hz at -10 dB, so strong masking signals are affected,
+    /// not only weak ones. Fitting per ~0.32 s block keeps a clean signal's
+    /// leftover at or below 4.4% out to a 0.5 Hz error.
+    ///
+    /// Cost: each block averages ~40x less signal, so at an exact carrier
+    /// on a weak signal it leaves more behind than the whole-frame fit
+    /// (mean 4.8% vs 1.1% at -18 dB, 16% vs 1.8% at -24 dB) -- the same
+    /// variance-for-robustness trade `full_scale_subtraction_enabled`'s doc
+    /// describes for `subtract_signal`. Subtracts at the same fixed 0.9
+    /// scale as the whole-frame fit; `full_scale_subtraction_enabled` does
+    /// NOT apply to this path.
+    ///
+    /// Only has any effect when `coherent_subtract_full_frame_reference_enabled`
+    /// is also `true` (FT8 only, the same protocol gate). Measurements:
+    /// `research/experiments/2026-10-21-pan-168-full-frame-time-varying-cancellation.md`.
+    /// Default **false**: needs its own `compare` A/B on the real-signal
+    /// tiers before flipping.
+    pub coherent_subtract_full_frame_time_varying_enabled: bool,
+
     /// Coherent iterative-subtract multi-pass. After
     /// pass 1 (regular + cross-cycle), each decoded message's signal is
     /// subtracted from the complex spectrogram via ML projection
@@ -1999,6 +2028,7 @@ impl Default for Ft8Config {
             // A/B confirms.
             coherent_subtract_mrc_threshold: 0.0,
             coherent_subtract_full_frame_reference_enabled: false,
+            coherent_subtract_full_frame_time_varying_enabled: false,
             // hb-082: residual sync threshold uses production `min_sync_score`
             // until the A/B confirms a lower value is better.
             residual_min_sync_score: None,
@@ -5748,6 +5778,14 @@ impl Ft8Decoder {
     /// for a weaker overlapping candidate. Use the real GFSK reference
     /// (`Self::reconstruction_iq_pair`, below) instead, matching the
     /// modulator that actually shaped the over-the-air signal.
+    ///
+    /// PAN-168: by default (`time_varying == false`) the fit is one
+    /// constant amplitude/phase over the whole frame. With
+    /// `time_varying == true` it is per ~2-symbol block instead
+    /// (`Self::time_varying_complex_amplitude`), which absorbs the residual
+    /// carrier error `fine_sync::refine` leaves in `base_frequency`. See
+    /// `Ft8Config::coherent_subtract_full_frame_time_varying_enabled`.
+    #[allow(clippy::too_many_arguments)]
     fn subtract_reconstructed_signal_at_known_position(
         residual_audio: &mut [f32],
         tone_symbols: &[u8],
@@ -5756,6 +5794,7 @@ impl Ft8Decoder {
         tone_spacing: f64,
         base_frequency: f64,
         symbol0_start_sample: f64,
+        time_varying: bool,
     ) {
         let total_len = tone_symbols.len() * sps;
         let start_signed = symbol0_start_sample.round() as isize;
@@ -5769,6 +5808,29 @@ impl Ft8Decoder {
 
         let (recon_i, recon_q) =
             Self::reconstruction_iq_pair(tone_symbols, pp, base_frequency, sps, tone_spacing);
+
+        // PAN-168: per-block fit (see
+        // `Ft8Config::coherent_subtract_full_frame_time_varying_enabled`).
+        // Same alignment convention as the whole-frame loop below, so it
+        // indexes exactly the range that loop does.
+        if time_varying {
+            let (amp_i_t, amp_q_t) = Self::time_varying_complex_amplitude(
+                residual_audio,
+                recon_start,
+                &recon_i,
+                &recon_q,
+                recon_offset,
+                signal_len,
+                sps,
+            );
+            let scale = 0.9;
+            for i in 0..signal_len {
+                let subtracted =
+                    amp_i_t[i] * recon_i[recon_offset + i] + amp_q_t[i] * recon_q[recon_offset + i];
+                residual_audio[recon_start + i] -= (subtracted * scale) as f32;
+            }
+            return;
+        }
 
         // Full 2x2 least-squares for amplitude and phase -- identical
         // math to `subtract_signal`'s own fallback path, just anchored
@@ -8279,7 +8341,10 @@ impl Ft8Decoder {
             // `subtract_reconstructed_signal_at_known_position`'s single
             // whole-79-symbol-frame least-squares fit (no per-symbol
             // mechanism to absorb a residual frequency error, unlike the
-            // spectrogram's per-symbol rotor projection), that rotating
+            // spectrogram's per-symbol rotor projection -- unless
+            // `coherent_subtract_full_frame_time_varying_enabled` is on
+            // (PAN-168), which fits per block and so absorbs the residual
+            // `df_hz` error this fine correction leaves), that rotating
             // phase drives the fitted amplitude toward zero and leaves the
             // signal in `residual_audio` to corrupt later full-frame
             // candidates' fine_sync/extraction. `shift_samples` (consumed
@@ -8317,7 +8382,10 @@ impl Ft8Decoder {
                 // over the whole 79-symbol (12.64s) reference -- unlike
                 // the spectrogram's per-symbol rotor projection, it has no
                 // per-symbol mechanism to absorb a residual frequency
-                // error. Reconstructing at the coarse `base_frequency`
+                // error (unless `coherent_subtract_full_frame_time_varying_
+                // enabled` is on -- PAN-168 -- which fits per block and so
+                // absorbs the residual `df_hz` error this fine correction
+                // leaves). Reconstructing at the coarse `base_frequency`
                 // when the true carrier sits `df_hz` away makes the
                 // reference's phase continuously rotate over the full
                 // frame (many full cycles for even a fraction of a Hz),
@@ -8458,6 +8526,9 @@ impl Ft8Decoder {
             // to avoid a continuously-rotating reference over 79 symbols,
             // while the rotor must stay in the coarse basis to match
             // `subtract_decode_coherent`'s own spectrogram projection.
+            // With `coherent_subtract_full_frame_time_varying_enabled` on
+            // (PAN-168) the fit is per block instead, which also absorbs
+            // the residual `df_hz` error the fine correction leaves.
             if ft8_full_frame_capable {
                 Self::subtract_reconstructed_signal_at_known_position(
                     residual_audio,
@@ -8467,6 +8538,8 @@ impl Ft8Decoder {
                     tone_spacing,
                     audio_anchor_frequency,
                     audio_anchor_start_sample,
+                    self.config
+                        .coherent_subtract_full_frame_time_varying_enabled,
                 );
             }
             subtracted_candidates.push(candidate);
@@ -22084,6 +22157,244 @@ mod w42_time_varying_subtraction_tests {
              ({ratio_db:.2} dB apart) — if this ever fails, the static fixture HAS started \
              discriminating the mechanism and the diagnosis in Finding #2 should be revisited"
         );
+    }
+}
+
+// ============================================================================
+// PAN-168: per-block (time-varying) audio-domain cancellation for the
+// full-frame coherent-subtraction path. See
+// `Ft8Config::coherent_subtract_full_frame_time_varying_enabled`.
+// ============================================================================
+#[cfg(test)]
+#[cfg(feature = "transmit")]
+mod pan168_full_frame_time_varying_tests {
+    use super::*;
+    use crate::encoder::Ft8Encoder;
+    use crate::modulator::{Ft8Modulator, PulseShape};
+    use rand::{rngs::StdRng, RngExt, SeedableRng};
+
+    const F0: f64 = 1500.0;
+    const START: usize = 6000;
+    /// 15 s, not `crate::WINDOW_SAMPLES` (12.64 s = exactly one frame):
+    /// leaves room to place the frame anywhere, including off either edge.
+    const BUF_LEN: usize = 15 * SAMPLE_RATE as usize;
+    const DF_SWEEP_HZ: [f64; 11] = [
+        -0.5, -0.3, -0.2, -0.116, -0.05, 0.0, 0.05, 0.116, 0.2, 0.3, 0.5,
+    ];
+
+    fn symbols() -> [u8; NUM_SYMBOLS] {
+        let mut enc = Ft8Encoder::new();
+        enc.encode_message("CQ K5ARH EM10", None).unwrap()
+    }
+
+    /// Real GFSK (BT=2.0) frame whose true carrier is `F0 + df`, symbol 0
+    /// at `start` (may be negative or run past the buffer end).
+    fn signal_at(symbols: &[u8; NUM_SYMBOLS], df: f64, start: isize) -> Vec<f32> {
+        let mut m = Ft8Modulator::with_pulse_shape(
+            SAMPLE_RATE,
+            F0 + df,
+            1.0,
+            PulseShape::Gaussian { bt: 2.0 },
+        )
+        .unwrap();
+        let s = m.modulate_symbols(symbols, 0.0).unwrap();
+        let mut buf = vec![0.0f32; BUF_LEN];
+        for (i, &v) in s.iter().enumerate() {
+            let j = start + i as isize;
+            if j >= 0 && (j as usize) < BUF_LEN {
+                buf[j as usize] = v;
+            }
+        }
+        buf
+    }
+
+    /// Seeded Box-Muller AWGN at the WSJT-X SNR convention
+    /// (`docs/decoder-comparison.md`, synth-clean):
+    /// sigma = signal_rms / 10^(snr/20) * sqrt(6000/2500).
+    /// `signal_rms` is taken over the nominal 79-symbol frame length.
+    fn add_awgn_at_wsjtx_snr(audio: &mut [f32], signal: &[f32], snr_db: f64, seed: u64) {
+        let pp = ProtocolParams::ft8();
+        let frame_len = (NUM_SYMBOLS * pp.samples_per_symbol(SAMPLE_RATE)) as f64;
+        let energy: f64 = signal.iter().map(|&s| (s as f64) * (s as f64)).sum();
+        let signal_rms = (energy / frame_len).sqrt();
+        let sigma = signal_rms / 10f64.powf(snr_db / 20.0) * (6000.0f64 / 2500.0).sqrt();
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut i = 0;
+        while i < audio.len() {
+            let u1: f64 = rng.random::<f64>().max(1e-12);
+            let u2: f64 = rng.random::<f64>();
+            let r = (-2.0 * u1.ln()).sqrt();
+            let theta = 2.0 * std::f64::consts::PI * u2;
+            audio[i] += (r * theta.cos() * sigma) as f32;
+            i += 1;
+            if i < audio.len() {
+                audio[i] += (r * theta.sin() * sigma) as f32;
+                i += 1;
+            }
+        }
+    }
+
+    fn cancel(audio: &mut [f32], symbols: &[u8], start: f64, time_varying: bool) {
+        let pp = ProtocolParams::ft8();
+        let sps = pp.samples_per_symbol(SAMPLE_RATE);
+        Ft8Decoder::subtract_reconstructed_signal_at_known_position(
+            audio,
+            symbols,
+            &pp,
+            sps,
+            pp.tone_spacing,
+            F0,
+            start,
+            time_varying,
+        );
+    }
+
+    /// Share of the signal's energy left behind:
+    /// ‖signal − (before − after)‖² / ‖signal‖². Counts both un-removed
+    /// signal and any noise the fit wrongly subtracts.
+    fn residual_fraction(signal: &[f32], before: &[f32], after: &[f32]) -> f64 {
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        for ((&s, &b), &a) in signal.iter().zip(before).zip(after) {
+            let removed = b as f64 - a as f64;
+            let left = s as f64 - removed;
+            num += left * left;
+            den += (s as f64) * (s as f64);
+        }
+        num / den.max(1e-30)
+    }
+
+    /// Clean signal at `F0 + df`, cancelled at the nominal `F0`.
+    fn clean_residual(symbols: &[u8; NUM_SYMBOLS], df: f64, time_varying: bool) -> f64 {
+        let signal = signal_at(symbols, df, START as isize);
+        let mut after = signal.clone();
+        cancel(&mut after, symbols, START as f64, time_varying);
+        residual_fraction(&signal, &signal, &after)
+    }
+
+    /// Signal at `F0 + df` in seeded AWGN at `snr_db`, cancelled at `F0`.
+    fn noisy_residual(
+        symbols: &[u8; NUM_SYMBOLS],
+        df: f64,
+        snr_db: f64,
+        seed: u64,
+        time_varying: bool,
+    ) -> f64 {
+        let signal = signal_at(symbols, df, START as isize);
+        let mut before = signal.clone();
+        add_awgn_at_wsjtx_snr(&mut before, &signal, snr_db, seed);
+        let mut after = before.clone();
+        cancel(&mut after, symbols, START as f64, time_varying);
+        residual_fraction(&signal, &before, &after)
+    }
+
+    #[test]
+    fn full_frame_time_varying_defaults_off() {
+        assert!(
+            !Ft8Config::default().coherent_subtract_full_frame_time_varying_enabled,
+            "PAN-168: coherent_subtract_full_frame_time_varying_enabled must stay default-off \
+             until its own compare A/B on the real-signal tiers says otherwise"
+        );
+    }
+
+    /// RED companion (like `legacy_path_fails_the_same_residual_bound`):
+    /// the whole-frame fit leaves most of a clean signal behind under a
+    /// carrier error fine_sync routinely leaves. The per-block tests below
+    /// are only evidence because this one holds.
+    #[test]
+    fn whole_frame_fit_collapses_under_residual_carrier_error() {
+        let syms = symbols();
+        for df in [-0.116, -0.05, 0.05, 0.116] {
+            let r = clean_residual(&syms, df, false);
+            assert!(
+                r > 0.5,
+                "whole-frame fit at df={df:+.3} Hz left only {r:.4} of the signal; \
+                 the PAN-168 failure no longer reproduces"
+            );
+        }
+    }
+
+    #[test]
+    fn per_block_fit_absorbs_residual_carrier_error_on_a_clean_signal() {
+        let syms = symbols();
+        for df in DF_SWEEP_HZ {
+            let r = clean_residual(&syms, df, true);
+            let bound = if df.abs() <= 0.2 { 0.03 } else { 0.08 };
+            assert!(
+                r < bound,
+                "per-block fit at df={df:+.3} Hz left {r:.4} of the signal (bound {bound})"
+            );
+        }
+    }
+
+    /// `df = 0.116` Hz is fine_sync's measured median carrier error at
+    /// -18 dB (PAN-168 plan, Current State §2).
+    #[test]
+    fn per_block_fit_absorbs_residual_carrier_error_at_minus_18_db() {
+        let syms = symbols();
+        let seeds = 0x168_0000u64..0x168_0008u64;
+        let n = seeds.clone().count() as f64;
+        let mut per_block = 0.0;
+        let mut whole = 0.0;
+        for seed in seeds {
+            per_block += noisy_residual(&syms, 0.116, -18.0, seed, true);
+            whole += noisy_residual(&syms, 0.116, -18.0, seed, false);
+        }
+        let (per_block, whole) = (per_block / n, whole / n);
+        assert!(
+            per_block < 0.10,
+            "per-block mean residual {per_block:.4} at -18 dB, df=0.116 Hz (bound 0.10)"
+        );
+        assert!(
+            whole > 0.5,
+            "whole-frame mean residual {whole:.4} at -18 dB, df=0.116 Hz; expected the \
+             PAN-168 collapse (> 0.5)"
+        );
+    }
+
+    #[test]
+    fn per_block_fit_matches_whole_frame_at_exact_carrier() {
+        let syms = symbols();
+        let per_block = clean_residual(&syms, 0.0, true);
+        let whole = clean_residual(&syms, 0.0, false);
+        assert!(
+            per_block < 0.02 && whole < 0.02,
+            "at an exact carrier both fits should leave ~1% (the fixed 0.9 scale): \
+             per-block {per_block:.4}, whole-frame {whole:.4}"
+        );
+        assert!(
+            (per_block - whole).abs() < 0.005,
+            "per-block {per_block:.4} vs whole-frame {whole:.4} at an exact carrier"
+        );
+    }
+
+    #[test]
+    fn per_block_fit_respects_buffer_edges() {
+        let syms = symbols();
+        // Frame begins before the buffer; tail clipped; and an overlap of
+        // only 1000 samples, shorter than one 2-symbol (3840-sample) window.
+        for start in [
+            -5000isize,
+            (BUF_LEN - 20_000) as isize,
+            (BUF_LEN - 1000) as isize,
+        ] {
+            let signal = signal_at(&syms, 0.116, start);
+            let mut after = signal.clone();
+            cancel(&mut after, &syms, start as f64, true);
+            let first = start.max(0) as usize;
+            assert!(
+                signal[..first]
+                    .iter()
+                    .zip(&after[..first])
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "start={start}: samples before the frame were modified"
+            );
+            let r = residual_fraction(&signal, &signal, &after);
+            assert!(
+                r < 0.08,
+                "start={start}: per-block fit left {r:.4} of the overlapping signal"
+            );
+        }
     }
 }
 

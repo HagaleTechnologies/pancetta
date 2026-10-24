@@ -1186,6 +1186,9 @@ async fn interruptible_sleep_or_supersede(
                     in_flight_origin,
                     in_flight_remote_client_key_id,
                 ) {
+                    // Silent to Autonomous: the keyed pivoted frame owns the
+                    // QSO's outcome (ownership rule: `report_unaired_frame`,
+                    // PAN-185).
                     IncomingDuringTx::Drop => {}
                     // PAN-73 round 2: not a match for any in-flight QSO —
                     // requeue rather than discard (see IncomingDuringTx::Requeue).
@@ -2934,7 +2937,8 @@ async fn send_tx_queue_status(
 /// same flag and its in-memory accounting is discarded at exit.
 /// Returns the Autonomous send result to preserve callers' error handling.
 /// `attempt_id` is the frame's own ledger attempt (PAN-183), echoed on the
-/// QSO-engine mirror only; Autonomous correlates on `qso_id` (PAN-185).
+/// QSO-engine mirror only; Autonomous correlates on `qso_id`. Both halves
+/// travel the durable tier (PAN-185).
 async fn report_transmit_complete(
     message_bus: &MessageBus,
     success: bool,
@@ -2997,15 +3001,16 @@ async fn report_played_transmit_complete(
 }
 
 /// PAN-182: tell the QSO engine `message_text` aired for `qso_id`, stamped
-/// with the post-playback report time.
+/// with the post-playback report time. Durable (PAN-185): a full Qso channel
+/// parks the report on the Qso inbox's lane instead of dropping it.
 async fn report_frame_sent(
     message_bus: &MessageBus,
     qso_id: String,
     message_text: String,
     aired: pancetta_qso::UnsentAttemptPayload,
 ) {
-    let _ = message_bus
-        .send_message(ComponentMessage::new(
+    message_bus
+        .send_message_durable(ComponentMessage::new(
             ComponentId::Ft8Transmitter,
             ComponentId::Qso,
             MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameSent {
@@ -3049,6 +3054,8 @@ type PivotReplaced = std::collections::HashMap<String, ReplacedFrame>;
 /// A bundle refused before it aired: clear the tombstones its Step 4b pivot
 /// inserted and return the frames those pivots replaced, so each item's
 /// failure rolls back the replaced frame (see [`report_unaired_frame`]).
+/// Clearing a tombstone hands the QSO's Autonomous outcome to the queued
+/// request that produced the pivoted payload (ownership rule, PAN-185).
 fn unwind_bundle_pivots(
     keys: &[String],
     pivoted_once: &mut std::collections::HashMap<String, (String, f64)>,
@@ -3072,13 +3079,23 @@ fn take_bundle_replaced(
     qso_id.and_then(|id| replaced.remove(&super::active_tx_qso_key(id)))
 }
 
-/// A frame that never aired after Step 4c may have pivoted to it. Then the
-/// request that produced `message_text` is still queued and accounts for
-/// itself, so the QSO engine instead rolls back the frame the pivot
-/// replaced (`pivot_replaced`), which never aired either (PAN-75).
-/// Autonomous gets the usual failed completion either way (follow-up:
-/// PAN-185). `attempt_id` is the unaired frame's own attempt, reported only
-/// when no pivot replaced it; a pivot reports the replaced frame's (PAN-183).
+/// A frame that never aired after Step 4c may have pivoted to it.
+///
+/// Pivot ownership rule (PAN-185): the pivot tombstone (`pivoted_once`)
+/// decides which request reports the QSO's outcome to Autonomous, so a
+/// tracked self-CQ settles exactly once.
+/// - Tombstone kept (the pivoted frame keyed): the frame reports, and the
+///   queued request whose payload it absorbed is dropped silently (Step
+///   0-dup, the backlog pivot-duplicate pass, mid-TX `IncomingDuringTx::Drop`).
+/// - Tombstone cleared (the pivoted frame was refused before air): the frame
+///   sends Autonomous nothing. The request that produced the pivoted payload
+///   is still queued (its intent was only pivotable once queued) and reports
+///   its own outcome.
+///
+/// Either way the QSO engine rolls back the frame the pivot replaced
+/// (`pivot_replaced`), which never aired as itself (PAN-75). `attempt_id` is
+/// the unaired frame's own attempt, reported only when no pivot replaced it;
+/// a pivot reports the replaced frame's (PAN-183).
 async fn report_unaired_frame(
     message_bus: &MessageBus,
     message_text: String,
@@ -3090,9 +3107,6 @@ async fn report_unaired_frame(
         return report_transmit_complete(message_bus, false, message_text, 0, qso_id, attempt_id)
             .await;
     }
-    let result =
-        report_transmit_complete_to_autonomous(message_bus, false, message_text, 0, qso_id.clone())
-            .await;
     if let (Some(qso_id), Some((replaced_text, replaced, replaced_attempt_id))) =
         (qso_id, pivot_replaced)
     {
@@ -3105,12 +3119,14 @@ async fn report_unaired_frame(
         )
         .await;
     }
-    result
+    Ok(())
 }
 
 /// PAN-75: tell the QSO engine `message_text` never aired for `qso_id`.
 /// `replaced` carries the payload of a frame a pivot replaced; `attempt_id`
 /// the unaired frame's own ledger attempt, which decides the match (PAN-183).
+/// Durable (PAN-185): a full Qso channel parks the report on the Qso inbox's
+/// lane instead of dropping it.
 async fn report_frame_not_sent(
     message_bus: &MessageBus,
     qso_id: String,
@@ -3118,8 +3134,8 @@ async fn report_frame_not_sent(
     replaced: Option<pancetta_qso::UnsentAttemptPayload>,
     attempt_id: Option<pancetta_qso::TxAttemptId>,
 ) {
-    let _ = message_bus
-        .send_message(ComponentMessage::new(
+    message_bus
+        .send_message_durable(ComponentMessage::new(
             ComponentId::Ft8Transmitter,
             ComponentId::Qso,
             MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent {
@@ -3134,23 +3150,17 @@ async fn report_frame_not_sent(
 }
 
 /// Step 0-dup: this request's payload already aired through an earlier
-/// request's pivot. Autonomous gets the usual failed completion. The QSO
-/// engine keeps this request's attempt and instead rolls back the frame the
-/// pivot replaced (`pivoted_from`: its text and payload), which never aired
-/// as itself (PAN-75). The payload tells the two apart when the pivot changed
-/// only the offset or the remote binding.
+/// request's pivot. Autonomous gets nothing: the pivoted frame keyed and
+/// already reported (ownership rule: [`report_unaired_frame`], PAN-185). The
+/// QSO engine keeps this request's attempt and instead rolls back the frame
+/// the pivot replaced (`pivoted_from`: its text and payload), which never
+/// aired as itself (PAN-75). The payload tells the two apart when the pivot
+/// changed only the offset or the remote binding.
 async fn report_pivot_duplicate_dropped(
     message_bus: &MessageBus,
-    message_text: String,
     qso_id: Option<String>,
     pivoted_from: Option<ReplacedFrame>,
 ) {
-    if let Err(e) =
-        report_transmit_complete_to_autonomous(message_bus, false, message_text, 0, qso_id.clone())
-            .await
-    {
-        warn!("Failed to send TransmitComplete: {}", e);
-    }
     if let (Some(qso_id), Some((pivoted_from_text, replaced, replaced_attempt_id))) =
         (qso_id, pivoted_from)
     {
@@ -3165,7 +3175,10 @@ async fn report_pivot_duplicate_dropped(
     }
 }
 
-/// The Autonomous half of [`report_transmit_complete`] alone.
+/// The Autonomous half of [`report_transmit_complete`] alone. Durable
+/// (PAN-185): a full Autonomous channel parks the completion so a tracked
+/// self-CQ always settles. Always `Ok(())`: the bus logs and counts a drop,
+/// as `send_message` did.
 async fn report_transmit_complete_to_autonomous(
     message_bus: &MessageBus,
     success: bool,
@@ -3174,7 +3187,7 @@ async fn report_transmit_complete_to_autonomous(
     qso_id: Option<String>,
 ) -> Result<()> {
     message_bus
-        .send_message(ComponentMessage::new(
+        .send_message_durable(ComponentMessage::new(
             ComponentId::Ft8Transmitter,
             ComponentId::Autonomous,
             MessageType::TransmitComplete {
@@ -3185,7 +3198,8 @@ async fn report_transmit_complete_to_autonomous(
             },
             Instant::now(),
         ))
-        .await
+        .await;
+    Ok(())
 }
 
 /// PAN-38 round 4 (Codex): report a failed `TransmitComplete` for a
@@ -5838,6 +5852,11 @@ pub struct CoalesceOutcome {
     /// How many requests were dropped because their `qso_id` is no longer in
     /// the active set (terminal / cancelled / completed-past-grace QSO).
     pub dropped_terminal: usize,
+    /// The entries counted in `dropped_terminal` (PAN-185). The caller
+    /// reports each to Autonomous as a failed completion: a pivot can leave
+    /// a QSO's queued request as the one that owns a tracked self-CQ's
+    /// outcome, and dropping it silently would leave that self-CQ pending.
+    pub dropped_terminal_entries: Vec<CoalesceEntry>,
     /// How many distinct streams were dropped because the retained set hit
     /// either the operator-configured concurrent-QSO cap
     /// (`max_concurrent_qsos`, QSO-keyed streams only) or the hard
@@ -5888,6 +5907,10 @@ pub struct CoalesceOutcome {
     /// close-together streams. Same "exclude, don't coerce, it retries
     /// individually next cycle" semantics as `parity_excluded` above.
     pub freq_excluded: usize,
+    /// The entries counted in `parity_excluded` and `freq_excluded`
+    /// (PAN-185). Reported to Autonomous only, like `dropped_terminal_entries`;
+    /// their ledger accounting is unchanged.
+    pub excluded_entries: Vec<CoalesceEntry>,
 }
 
 impl CoalesceOutcome {
@@ -6152,6 +6175,7 @@ pub fn coalesce_transmit_requests_with_fox_priority(
         // Drop terminal-QSO requests (None is never gated).
         if !qso_is_live(entry.qso_id.as_deref()) {
             outcome.dropped_terminal += 1;
+            outcome.dropped_terminal_entries.push(entry);
             continue;
         }
         match entry.qso_id.as_deref() {
@@ -6225,6 +6249,7 @@ pub fn coalesce_transmit_requests_with_fox_priority(
                     entry.qso_id, entry.tx_parity, anchor
                 );
                 outcome.parity_excluded += 1;
+                outcome.excluded_entries.push(entry);
             } else {
                 kept.push(entry);
             }
@@ -6271,6 +6296,7 @@ pub fn coalesce_transmit_requests_with_fox_priority(
                 entry.qso_id, entry.frequency_offset, pancetta_qso::MIN_TX_SEPARATION_HZ
             );
             outcome.freq_excluded += 1;
+            outcome.excluded_entries.push(entry);
         } else {
             qso_survivors.push(entry);
         }
@@ -6322,6 +6348,7 @@ pub fn coalesce_transmit_requests_with_fox_priority(
                 entry.qso_id, entry.frequency_offset, pancetta_qso::MIN_TX_SEPARATION_HZ
             );
             outcome.freq_excluded += 1;
+            outcome.excluded_entries.push(entry);
         } else {
             kept.push(entry);
         }
@@ -6478,6 +6505,8 @@ pub(crate) async fn coalesce_backlog_into(
                         pivoted_once,
                     )
                 {
+                    // Silent to Autonomous: the pivoted frame keyed and
+                    // reported (ownership rule: `report_unaired_frame`).
                     let replaced = entry.qso_id.as_deref().and_then(|id| {
                         let key = super::active_tx_qso_key(id);
                         pivoted_once.remove(&key);
@@ -6495,13 +6524,7 @@ pub(crate) async fn coalesce_backlog_into(
                     "dropping stale TX for '{}' before coalescing — already sent via pivot",
                     entry.message_text
                 );
-                report_pivot_duplicate_dropped(
-                    message_bus,
-                    entry.message_text,
-                    entry.qso_id,
-                    replaced,
-                )
-                .await;
+                report_pivot_duplicate_dropped(message_bus, entry.qso_id, replaced).await;
             }
         }
     }
@@ -6700,6 +6723,28 @@ pub(crate) async fn coalesce_backlog_into(
         }
     }
 
+    // PAN-185: a terminal or parity/frequency-excluded QSO request may be the
+    // one that owns a tracked self-CQ's outcome (a refused pivot leaves it as
+    // the owner, see `report_unaired_frame`), so Autonomous hears a failed
+    // completion for each. Autonomous only: their ledger accounting is
+    // unchanged (no `TxFrameNotSent`). A request coalesced into a newer one
+    // for the same QSO stays silent; the newer one reports.
+    for entry in outcome
+        .dropped_terminal_entries
+        .iter()
+        .chain(&outcome.excluded_entries)
+        .filter(|e| e.qso_id.is_some())
+    {
+        let _ = report_transmit_complete_to_autonomous(
+            message_bus,
+            false,
+            entry.message_text.clone(),
+            0,
+            entry.qso_id.clone(),
+        )
+        .await;
+    }
+
     // A bundle has only one remote identity and therefore one consent channel.
     // Keep the first retained remote channel and defer the other, preserving
     // its identity for the next worker pass and the final key-time check.
@@ -6736,8 +6781,8 @@ pub(crate) async fn coalesce_backlog_into(
     // Every drained request belonged to an ended QSO (rare: needs ≥2 queued
     // requests, all terminal). Hand back an empty MultiTransmitRequest; the
     // multi-TX arm's "empty after dropping stale items" branch consumes and
-    // skips it without keying PTT. These QSOs already transitioned terminal, so
-    // there is no live state machine awaiting a TransmitComplete.
+    // skips it without keying PTT. These QSOs already transitioned terminal;
+    // their Autonomous completions were reported above (PAN-185).
     if outcome.retained.is_empty() {
         return MessageType::MultiTransmitRequest {
             items: Vec::new(),
@@ -7289,8 +7334,10 @@ fn item_rebound_by_supersede(
 /// rollback cannot land on a newer same-text attempt at another offset or
 /// authority (PAN-75). The item's own ledger attempt decides the match when
 /// it has one, so a folded bundle binding cannot miss or mis-pick it
-/// (PAN-183). Autonomous gets the usual failed completion (follow-up:
-/// PAN-185).
+/// (PAN-183). Autonomous gets the usual failed completion, even when the
+/// superseding request later airs: supersede abandonment is outside the
+/// pivot ownership rule (gap recorded in
+/// docs/DECISIONS/2026-07-development-phases-and-gaps.md, PAN-185).
 async fn report_abandoned_bundle_item(
     message_bus: &MessageBus,
     item: &crate::message_bus::TransmitRequestItem,
@@ -7832,7 +7879,10 @@ impl super::ApplicationCoordinator {
                 // a second time. Worker-local (this loop is the single
                 // consumer; no concurrent access), so a plain `HashMap`
                 // suffices — no new `Arc`/lock. See `is_pivot_duplicate`
-                // (coordinator/mod.rs) for the pure membership check.
+                // (coordinator/mod.rs) for the pure membership check. The
+                // tombstone also decides which request reports the QSO's
+                // outcome to Autonomous (ownership rule:
+                // `report_unaired_frame`, PAN-185).
                 let mut pivoted_once: std::collections::HashMap<String, (String, f64)> =
                     std::collections::HashMap::new();
                 // PAN-75: the text and payload each tombstoned pivot replaced.
@@ -8144,6 +8194,9 @@ impl super::ApplicationCoordinator {
                                     // drop (no PTT, no schedule), and clear the tombstone so
                                     // a genuinely later legitimate re-send of the same text
                                     // (e.g. a keep-call rearm) is never wrongly suppressed.
+                                    // Autonomous hears nothing: the pivoted frame keyed and
+                                    // reported (ownership rule: `report_unaired_frame`,
+                                    // PAN-185).
                                     if super::is_pivot_duplicate(
                                         qso_id.as_deref(),
                                         &message_text,
@@ -8174,7 +8227,6 @@ impl super::ApplicationCoordinator {
                                         });
                                         report_pivot_duplicate_dropped(
                                             &message_bus,
-                                            message_text,
                                             qso_id.clone(),
                                             replaced,
                                         )
@@ -8993,7 +9045,10 @@ impl super::ApplicationCoordinator {
                                         // Round-6 review (Codex P2): tracks the
                                         // `pivoted_once` key Step 4c inserts below (if it
                                         // pivots this cycle) so Step 4d-arm's denial branch
-                                        // can remove it — see that branch for why.
+                                        // can remove it — see that branch for why. Every
+                                        // `pivoted_this_key.take()` refusal hands the QSO's
+                                        // Autonomous outcome to the queued request
+                                        // (ownership rule: `report_unaired_frame`, PAN-185).
                                         let mut pivoted_this_key: Option<String> = None;
 
                                         // --- Step 4c: late pivot to the freshest message ---
@@ -10591,7 +10646,6 @@ impl super::ApplicationCoordinator {
                                                     });
                                                 report_pivot_duplicate_dropped(
                                                     &message_bus,
-                                                    item.message_text.clone(),
                                                     item.qso_id.clone(),
                                                     replaced,
                                                 )
@@ -19327,7 +19381,7 @@ mod coalesce_tests {
         use std::sync::Arc;
 
         let bus = MessageBus::new(16).unwrap();
-        let (_, _autonomous_rx) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_, autonomous_rx) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
         let (_, qso_rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
         let (backlog_tx, backlog_rx) = crossbeam_channel::unbounded();
         let active_tx_qsos = Arc::new(std::sync::RwLock::new(liveset(&["qso-a"])));
@@ -19391,6 +19445,137 @@ mod coalesce_tests {
             MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { ref message_text, replaced: Some(ref payload), .. })
                 if message_text == "K1ABC N0CALL -07" && *payload == replaced
         ));
+        // PAN-185: the pivoted frame keyed and reported; the absorbed
+        // duplicate tells Autonomous nothing.
+        assert!(autonomous_rx.try_recv().is_err());
+    }
+
+    fn entry_parity(
+        text: &str,
+        qso_id: &str,
+        freq: f64,
+        parity: pancetta_core::slot::SlotParity,
+    ) -> CoalesceEntry {
+        CoalesceEntry {
+            tx_parity: Some(parity),
+            ..entry_freq(text, Some(qso_id), freq)
+        }
+    }
+
+    /// PAN-185: the coalescer hands back the entries it dropped as terminal
+    /// or excluded for parity/frequency; a request coalesced into a newer one
+    /// for the same QSO is in neither.
+    #[test]
+    fn pan185_coalescer_returns_terminal_and_excluded_entries() {
+        use pancetta_core::slot::SlotParity;
+        let live = liveset(&["a", "b", "c"]);
+        let out = coalesce_transmit_requests_with_fox_priority(
+            vec![
+                entry_parity("A1", "a", 1000.0, SlotParity::Even),
+                entry_freq("T", Some("t"), 1300.0),
+                entry_parity("B", "b", 1600.0, SlotParity::Odd),
+                entry_freq("C", Some("c"), 1010.0),
+                entry_parity("A2", "a", 1000.0, SlotParity::Even),
+            ],
+            UNBOUNDED,
+            live_in(&live),
+            |_| false,
+        );
+        assert_eq!(texts(&out.retained), vec!["A2"]);
+        assert_eq!(out.coalesced, 1);
+        assert_eq!(texts(&out.dropped_terminal_entries), vec!["T"]);
+        assert_eq!(out.dropped_terminal, 1);
+        assert_eq!(texts(&out.excluded_entries), vec!["B", "C"]);
+        assert_eq!((out.parity_excluded, out.freq_excluded), (1, 1));
+    }
+
+    /// PAN-185 (Codex 4244602505): a terminal QSO's queued request (what a
+    /// refused pivot leaves behind) and an excluded one each tell Autonomous
+    /// once; the coalesced older frame stays silent, and nothing reaches the
+    /// QSO engine's ledger.
+    #[tokio::test]
+    async fn pan185_backlog_reports_terminal_and_excluded_entries_to_autonomous_only() {
+        use crate::message_bus::MessageBus;
+        use pancetta_core::slot::SlotParity;
+        use std::sync::Arc;
+
+        let bus = MessageBus::new(16).unwrap();
+        let (_, autonomous_rx) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (_, qso_rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
+        let (backlog_tx, backlog_rx) = crossbeam_channel::unbounded();
+        let active_tx_qsos = Arc::new(std::sync::RwLock::new(liveset(&["a", "b"])));
+        let arm = Arc::new(std::sync::Mutex::new(pancetta_agent::arm::ArmState::new()));
+        let request = |text: &str, qso: &str, hz: f64, parity: Option<SlotParity>| {
+            MessageType::TransmitRequest {
+                attempt_id: None,
+                message_text: text.to_string(),
+                frequency_offset: hz,
+                qso_id: Some(qso.to_string()),
+                tx_parity: parity,
+                origin: crate::message_bus::TxOrigin::Local,
+                remote_client_key_id: None,
+            }
+        };
+        for message_type in [
+            request("T", "t", 1300.0, None),
+            request("B", "b", 1600.0, Some(SlotParity::Odd)),
+            request("A2", "a", 1000.0, Some(SlotParity::Even)),
+        ] {
+            backlog_tx
+                .send(ComponentMessage::new(
+                    ComponentId::Ft8Transmitter,
+                    ComponentId::Ft8Transmitter,
+                    message_type,
+                    Instant::now(),
+                ))
+                .unwrap();
+        }
+        let audit_tmp = audit_tmp();
+        let audit_log = pancetta_agent::audit::AuditLog::new(audit_tmp.path());
+        let display_feed_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let backlog_inbox = super::TxInbox::new(backlog_rx.clone(), Default::default());
+        let result = coalesce_backlog_into(
+            request("A1", "a", 1000.0, Some(SlotParity::Even)),
+            &backlog_inbox,
+            &bus,
+            &active_tx_qsos,
+            &Arc::new(std::sync::RwLock::new(HashSet::new())),
+            UNBOUNDED,
+            &arm,
+            &audit_log,
+            &display_feed_enabled,
+            None,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            MessageType::TransmitRequest { ref message_text, .. } if message_text == "A2"
+        ));
+        let mut reported: Vec<(String, String)> =
+            std::iter::from_fn(|| autonomous_rx.try_recv().ok())
+                .map(|m| match m.message_type {
+                    MessageType::TransmitComplete {
+                        success: false,
+                        message_text,
+                        qso_id: Some(id),
+                        ..
+                    } => (id, message_text),
+                    other => panic!("expected a failed TransmitComplete, got {other:?}"),
+                })
+                .collect();
+        reported.sort();
+        assert_eq!(
+            reported,
+            vec![
+                ("b".to_string(), "B".to_string()),
+                ("t".to_string(), "T".to_string())
+            ]
+        );
+        assert!(
+            qso_rx.try_recv().is_err(),
+            "terminal and excluded frames keep their ledger accounting"
+        );
     }
 
     // ── PAN-76: Fox-admitted streams keep their slots after Fox mode is off ──
@@ -21612,6 +21797,7 @@ mod pan115_worker_gate_tests {
                 tx_parity: None,
                 origin: TxOrigin::Local,
                 remote_client_key_id: None,
+                request_queued: true,
             },
         );
     }
@@ -21649,19 +21835,18 @@ mod pan115_worker_gate_tests {
         assert!(!h.coordinator.ptt_active.load(Ordering::Acquire));
     }
 
+    /// Every item here pivoted before it was refused, so (PAN-185 ownership
+    /// rule) Autonomous hears nothing from the refusal: the requests that
+    /// produced the pivoted payloads report their own outcomes.
     async fn assert_relocation_refusal(h: &Harness, expected: &[(&str, f64)], diagnostic: &str) {
         let expected_ids: std::collections::HashSet<_> =
             expected.iter().map(|(id, _)| (*id).to_string()).collect();
         let deadline = Instant::now() + Duration::from_secs(5);
-        let mut completed = std::collections::HashSet::new();
         let mut unaired = std::collections::HashSet::new();
         let mut queue_cleared = false;
         let mut saw_diagnostic = false;
         while Instant::now() < deadline
-            && (completed != expected_ids
-                || unaired != expected_ids
-                || !queue_cleared
-                || !saw_diagnostic)
+            && (unaired != expected_ids || !queue_cleared || !saw_diagnostic)
         {
             assert!(
                 !h.hamlib_rx.try_iter().any(|msg| is_ptt_on(&msg)),
@@ -21669,13 +21854,14 @@ mod pan115_worker_gate_tests {
             );
             for msg in h.autonomous_rx.try_iter() {
                 if let MessageType::TransmitComplete {
-                    success,
                     qso_id: Some(qso_id),
                     ..
                 } = msg.message_type
                 {
-                    assert!(!success);
-                    assert!(completed.insert(qso_id), "one completion per unaired frame");
+                    assert!(
+                        !expected_ids.contains(&qso_id),
+                        "a pivot-refused frame must not report to Autonomous: {qso_id}"
+                    );
                 }
             }
             for msg in h.qso_rx.try_iter() {
@@ -21719,7 +21905,6 @@ mod pan115_worker_gate_tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(completed, expected_ids);
         assert_eq!(unaired, expected_ids);
         assert!(queue_cleared, "refusal must clear the queue display");
         assert!(
@@ -21769,9 +21954,188 @@ mod pan115_worker_gate_tests {
         // A leaked tombstone would suppress it before it can pivot to 1800.
         mirror_intent(&h, &id_text, "CQ W5AU FN20", 1800.0);
         request_qso(&h, &id_text, 1550.0).await;
+        let (completions, ptt_on) =
+            qso_completions(&h, &[&id_text], 1, Duration::from_secs(60)).await;
         assert!(
-            await_ptt_on(&h, Duration::from_secs(40)).await,
+            ptt_on,
             "refusal must unwind the pivot tombstone so the fresh request can key"
+        );
+        assert_eq!(
+            completions,
+            vec![vec![true]],
+            "the producing request's outcome is the QSO's only one (PAN-185)"
+        );
+    }
+
+    /// Every `TransmitComplete` for each of `ids` until each has `count` (or
+    /// `within` elapses), then a settle window that would catch a duplicate;
+    /// and whether any PTT-on reached Hamlib.
+    async fn qso_completions(
+        h: &Harness,
+        ids: &[&str],
+        count: usize,
+        within: Duration,
+    ) -> (Vec<Vec<bool>>, bool) {
+        let mut completions = vec![Vec::new(); ids.len()];
+        let mut ptt_on = false;
+        let mut drain = |completions: &mut Vec<Vec<bool>>| {
+            ptt_on |= h.hamlib_rx.try_iter().any(|msg| is_ptt_on(&msg));
+            while h.tui_rx.try_recv().is_ok() {}
+            for msg in h.autonomous_rx.try_iter() {
+                if let MessageType::TransmitComplete {
+                    success,
+                    qso_id: Some(qso_id),
+                    ..
+                } = msg.message_type
+                {
+                    if let Some(slot) = ids.iter().position(|id| *id == qso_id) {
+                        completions[slot].push(success);
+                    }
+                }
+            }
+        };
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline && completions.iter().any(|c| c.len() < count) {
+            drain(&mut completions);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        drain(&mut completions);
+        (completions, ptt_on)
+    }
+
+    /// PAN-185 scenario 2: a self-CQ frame X pivots to a fresher queued
+    /// intent and waits at the PTT gate while a relocation is queued on it;
+    /// the request R that produced the intent is enqueued meanwhile (after X
+    /// left the coalescer, as in production). `before_release` runs while X
+    /// is still held; then the gate opens and the relocation lands, so X is
+    /// refused after its pivot. Returns the QSO id.
+    async fn refuse_pivoted_self_cq_with_queued_request(
+        h: &Harness,
+        before_release: impl FnOnce(&Harness),
+    ) -> String {
+        let (manager, id) = relocation_manager(h).await;
+        let id_text = id.to_string();
+        mirror_intent(h, &id_text, "CQ W5AU FN20", 1550.0);
+        let held = h.coordinator.ptt_sync_gate.lock().await;
+        let mut switching = Box::pin(manager.apply_tx_offset_switch(
+            id,
+            1800.0,
+            pancetta_qso::qso_manager::OffsetRelocationOrigin::OperatorForced,
+        ));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                switching.as_mut(),
+                cx
+            )))
+            .await
+            .is_pending()
+        );
+        request_qso(h, &id_text, 1500.0).await;
+        wait_for_ptt_gate(h).await;
+        request_qso(h, &id_text, 1550.0).await;
+        before_release(h);
+        drop(held);
+        switching.await.unwrap();
+        id_text
+    }
+
+    /// Wait for X's refusal (the replaced 1500 Hz frame's rollback reaches
+    /// the QSO engine) and assert Autonomous heard nothing meanwhile.
+    async fn await_silent_pivot_refusal(h: &Harness, id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            for msg in h.autonomous_rx.try_iter() {
+                if let MessageType::TransmitComplete {
+                    qso_id: Some(qso_id),
+                    ..
+                } = msg.message_type
+                {
+                    assert_ne!(
+                        qso_id, id,
+                        "no completion for the self-CQ while its queued request is pending"
+                    );
+                }
+            }
+            let rolled_back = h.qso_rx.try_iter().any(|msg| {
+                matches!(
+                    msg.message_type,
+                    MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { ref qso_id, replaced: Some(ref p), .. })
+                        if qso_id == id && p.frequency_hz == 1500.0
+                )
+            });
+            if rolled_back {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the pivoted frame was never refused"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// PAN-185 scenario 2: the pivot is refused, then the queued request airs.
+    /// Autonomous sees exactly one outcome for the self-CQ: the aired one.
+    #[tokio::test]
+    async fn pan185_pivot_refused_self_cq_settles_once_when_the_queued_request_airs() {
+        let h = worker_harness().await;
+        let id = refuse_pivoted_self_cq_with_queued_request(&h, |_| {}).await;
+        await_silent_pivot_refusal(&h, &id).await;
+        let (completions, ptt_on) = qso_completions(&h, &[&id], 1, Duration::from_secs(60)).await;
+        assert!(ptt_on, "the queued request must key");
+        assert_eq!(completions, vec![vec![true]]);
+    }
+
+    /// PAN-185 scenario 2: the pivot is refused, then the queued request is
+    /// refused too (the rig link dropped). One outcome: the failure.
+    #[tokio::test]
+    async fn pan185_pivot_refused_self_cq_settles_once_when_the_queued_request_is_refused() {
+        let h = worker_harness().await;
+        let id = refuse_pivoted_self_cq_with_queued_request(&h, |h| {
+            h.coordinator
+                .rig_conn_state
+                .store(RigConnState::PollingFailed.as_u8(), Ordering::Release);
+        })
+        .await;
+        await_silent_pivot_refusal(&h, &id).await;
+        let mut diagnostics = Vec::new();
+        let mut completions = Vec::new();
+        let mut ptt_on = false;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline && completions.is_empty() {
+            ptt_on |= h.hamlib_rx.try_iter().any(|msg| is_ptt_on(&msg));
+            for msg in h.tui_rx.try_iter() {
+                if let MessageType::DiagnosticEvent { text, .. } = msg.message_type {
+                    diagnostics.push(text);
+                }
+            }
+            for msg in h.autonomous_rx.try_iter() {
+                if let MessageType::TransmitComplete {
+                    success,
+                    qso_id: Some(qso_id),
+                    ..
+                } = msg.message_type
+                {
+                    if qso_id == id {
+                        completions.push(success);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (more, more_ptt) = qso_completions(&h, &[&id], 0, Duration::ZERO).await;
+        completions.extend(more.concat());
+        assert_eq!(completions, vec![false]);
+        assert!(
+            !ptt_on && !more_ptt,
+            "no PTT keying while the rig is disconnected"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.contains("TX blocked (rig is disconnected)")),
+            "the queued request must be refused by the hard mute, got {diagnostics:?}"
         );
     }
 
@@ -21913,6 +22277,16 @@ mod pan115_worker_gate_tests {
             ids.iter().cloned().collect(),
             "both tombstones must be unwound"
         );
+        // PAN-185: the producing requests own each QSO's outcome; the
+        // refused pivots reported nothing, so each QSO completes once.
+        let (completions, _) = qso_completions(
+            &h,
+            &[ids[0].as_str(), ids[1].as_str()],
+            1,
+            Duration::from_secs(60),
+        )
+        .await;
+        assert_eq!(completions, vec![vec![true], vec![true]]);
     }
 
     #[tokio::test]
@@ -22304,6 +22678,183 @@ mod report_transmit_complete_tests {
     async fn unkeyed_frame_only_notifies_autonomous() {
         check(false, None).await;
     }
+
+    fn qso_filler() -> ComponentMessage {
+        ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Qso,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent {
+                qso_id: "filler".into(),
+                message_text: "FILLER".into(),
+                replaced: None,
+                attempt_id: None,
+            }),
+            Instant::now(),
+        )
+    }
+    fn autonomous_complete(success: bool, qso_id: &str) -> ComponentMessage {
+        ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Autonomous,
+            MessageType::TransmitComplete {
+                success,
+                message_text: "K1ABC N0CALL FN20".into(),
+                duration_ms: 0,
+                qso_id: Some(qso_id.into()),
+            },
+            Instant::now(),
+        )
+    }
+
+    /// PAN-185 scenario 1: a manual QSO's keep-call frame the TX worker
+    /// dropped before it aired, reported while the QSO component's channel
+    /// is full. The rollback parks on the Qso inbox's durable lane and comes
+    /// out right after the message that filled the channel.
+    #[tokio::test]
+    async fn pan185_full_qso_channel_still_delivers_tx_frame_not_sent() {
+        let bus = MessageBus::new(1).unwrap();
+        let (_, autonomous) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let qso = bus.durable_inbox(ComponentId::Qso).await.unwrap();
+        let (qso_tx, _) = bus.get_or_create_channel(ComponentId::Qso).await.unwrap();
+        qso_tx.try_send(qso_filler()).unwrap();
+        let before = bus.get_statistics();
+
+        report_transmit_complete(
+            &bus,
+            false,
+            "K1ABC N0CALL FN20".into(),
+            0,
+            Some("q1".into()),
+            Some(pancetta_qso::TxAttemptId(7)),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            autonomous.try_recv().unwrap().message_type,
+            MessageType::TransmitComplete { success: false, qso_id: Some(ref id), .. }
+                if id == "q1"
+        ));
+        assert!(matches!(
+            qso.try_recv().unwrap().message_type,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { ref qso_id, .. })
+                if qso_id == "filler"
+        ));
+        assert!(matches!(
+            qso.try_recv().unwrap().message_type,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { ref qso_id, ref message_text, attempt_id: Some(pancetta_qso::TxAttemptId(7)), replaced: None })
+                if qso_id == "q1" && message_text == "K1ABC N0CALL FN20"
+        ));
+        assert!(qso.try_recv().is_err());
+        let after = bus.get_statistics();
+        assert_eq!(after.parked_messages, before.parked_messages + 1);
+        assert_eq!(after.dropped_messages, before.dropped_messages);
+    }
+
+    /// PAN-185: a played frame's `TxFrameSent` (PAN-182) parks the same way.
+    #[tokio::test]
+    async fn pan185_full_qso_channel_still_delivers_tx_frame_sent() {
+        let bus = MessageBus::new(1).unwrap();
+        let (_, autonomous) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let qso = bus.durable_inbox(ComponentId::Qso).await.unwrap();
+        let (qso_tx, _) = bus.get_or_create_channel(ComponentId::Qso).await.unwrap();
+        qso_tx.try_send(qso_filler()).unwrap();
+        let aired = aired_payload(1500.0, crate::message_bus::TxOrigin::Local, None);
+        report_played_transmit_complete(
+            &bus,
+            true,
+            "K1ABC N0CALL FN20".into(),
+            12_640,
+            Some("q1".into()),
+            aired.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(autonomous.try_recv().is_ok());
+        assert!(matches!(
+            qso.try_recv().unwrap().message_type,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { ref qso_id, .. })
+                if qso_id == "filler"
+        ));
+        assert!(matches!(
+            qso.try_recv().unwrap().message_type,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameSent { ref qso_id, ref message_text, aired: ref got, .. })
+                if qso_id == "q1" && message_text == "K1ABC N0CALL FN20" && *got == aired
+        ));
+        assert!(qso.try_recv().is_err());
+        assert_eq!(bus.get_statistics().dropped_messages, 0);
+    }
+
+    /// PAN-185: a full Autonomous channel parks the completion, so a tracked
+    /// self-CQ still settles.
+    #[tokio::test]
+    async fn pan185_full_autonomous_channel_still_delivers_transmit_complete() {
+        let bus = MessageBus::new(1).unwrap();
+        let autonomous = bus.durable_inbox(ComponentId::Autonomous).await.unwrap();
+        let (auto_tx, _) = bus
+            .get_or_create_channel(ComponentId::Autonomous)
+            .await
+            .unwrap();
+        auto_tx
+            .try_send(autonomous_complete(true, "first"))
+            .unwrap();
+        report_transmit_complete(
+            &bus,
+            true,
+            "K1ABC N0CALL FN20".into(),
+            0,
+            Some("q1".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            autonomous.try_recv().unwrap().message_type,
+            MessageType::TransmitComplete { qso_id: Some(ref id), .. } if id == "first"
+        ));
+        assert!(matches!(
+            autonomous.try_recv().unwrap().message_type,
+            MessageType::TransmitComplete { success: true, qso_id: Some(ref id), .. } if id == "q1"
+        ));
+        assert!(autonomous.try_recv().is_err());
+        assert_eq!(bus.get_statistics().dropped_messages, 0);
+    }
+
+    /// PAN-185: parked completions for one QSO come out in send order, so a
+    /// later frame's completion cannot overtake an earlier one.
+    #[tokio::test]
+    async fn pan185_autonomous_completions_keep_their_order_when_parked() {
+        let bus = MessageBus::new(1).unwrap();
+        let autonomous = bus.durable_inbox(ComponentId::Autonomous).await.unwrap();
+        let (auto_tx, _) = bus
+            .get_or_create_channel(ComponentId::Autonomous)
+            .await
+            .unwrap();
+        auto_tx
+            .try_send(autonomous_complete(true, "first"))
+            .unwrap();
+        report_transmit_complete_to_autonomous(&bus, false, "A".into(), 0, Some("q1".into()))
+            .await
+            .unwrap();
+        assert_eq!(bus.durable_lane_len(ComponentId::Autonomous), 1);
+        report_transmit_complete_to_autonomous(&bus, true, "B".into(), 0, Some("q1".into()))
+            .await
+            .unwrap();
+        assert_eq!(bus.durable_lane_len(ComponentId::Autonomous), 2);
+        let got: Vec<(bool, String)> = std::iter::from_fn(|| autonomous.try_recv().ok())
+            .filter_map(|m| match m.message_type {
+                MessageType::TransmitComplete {
+                    success,
+                    message_text,
+                    qso_id: Some(id),
+                    ..
+                } if id == "q1" => Some((success, message_text)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(got, vec![(false, "A".to_string()), (true, "B".to_string())]);
+    }
     #[tokio::test]
     async fn failed_qso_frame_also_notifies_qso() {
         check(false, Some("q1")).await;
@@ -22395,6 +22946,8 @@ mod report_transmit_complete_tests {
 
     /// A pivot-duplicate's payload already aired via the pivot, so the QSO
     /// engine must roll back the frame the pivot replaced, never this one.
+    /// Autonomous hears nothing: the pivoted frame keyed and already reported
+    /// (PAN-185 ownership rule).
     #[tokio::test]
     async fn pivot_duplicate_drop_rolls_back_the_replaced_frame() {
         let bus = MessageBus::new(16).unwrap();
@@ -22406,16 +22959,11 @@ mod report_transmit_complete_tests {
         };
         report_pivot_duplicate_dropped(
             &bus,
-            "K1ABC N0CALL R-07".into(),
             Some("q1".into()),
             Some(("K1ABC N0CALL FN20".into(), replaced.clone(), None)),
         )
         .await;
-        assert!(matches!(
-            autonomous.try_recv().unwrap().message_type,
-            MessageType::TransmitComplete { success: false, qso_id: Some(ref id), ref message_text, .. }
-                if id == "q1" && message_text == "K1ABC N0CALL R-07"
-        ));
+        assert!(autonomous.try_recv().is_err());
         assert!(matches!(
             qso.try_recv().unwrap().message_type,
             MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { attempt_id: _, ref qso_id, ref message_text, replaced: Some(ref payload) })
@@ -22424,9 +22972,8 @@ mod report_transmit_complete_tests {
         assert!(qso.try_recv().is_err());
 
         // No recorded pivot source: nothing reaches the QSO engine.
-        report_pivot_duplicate_dropped(&bus, "K1ABC N0CALL R-07".into(), Some("q1".into()), None)
-            .await;
-        assert!(autonomous.try_recv().is_ok());
+        report_pivot_duplicate_dropped(&bus, Some("q1".into()), None).await;
+        assert!(autonomous.try_recv().is_err());
         assert!(qso.try_recv().is_err());
     }
 
@@ -22547,7 +23094,9 @@ mod report_transmit_complete_tests {
 
     /// A pivoted frame refused before PTT: its producing request is still
     /// queued, so the QSO engine rolls back the replaced frame instead
-    /// (Codex P2 on PR #418). Without a pivot it rolls back this frame.
+    /// (Codex P2 on PR #418), and Autonomous hears nothing from this frame:
+    /// the queued request reports its own outcome (PAN-185). Without a pivot
+    /// it rolls back this frame and reports to Autonomous as usual.
     #[tokio::test]
     async fn unaired_pivoted_frame_rolls_back_the_replaced_frame() {
         let bus = MessageBus::new(16).unwrap();
@@ -22566,11 +23115,7 @@ mod report_transmit_complete_tests {
         )
         .await
         .unwrap();
-        assert!(matches!(
-            autonomous.try_recv().unwrap().message_type,
-            MessageType::TransmitComplete { success: false, qso_id: Some(ref id), ref message_text, .. }
-                if id == "q1" && message_text == "K1ABC N0CALL R-07"
-        ));
+        assert!(autonomous.try_recv().is_err());
         assert!(matches!(
             qso.try_recv().unwrap().message_type,
             MessageType::QsoMessage(crate::message_bus::QsoMessage::TxFrameNotSent { attempt_id: _, ref qso_id, ref message_text, replaced: Some(ref payload) })
@@ -23272,7 +23817,10 @@ mod pan136_bundle_binding_worker_tests {
 
     /// Dial on 20m, `qa` and `qb` live, and (optionally) a fresher intent for
     /// `qa` at its own 1000 Hz offset carrying `(text, origin, client key)`.
-    fn setup(h: &Harness, intent: Option<(&str, TxOrigin, Option<&str>)>) {
+    /// Returns the intent's producing `TransmitRequest`, which [`collect`]
+    /// enqueues behind the bundle as the QSO forwarder does in production
+    /// (PAN-185: a refused pivot leaves that request to report the outcome).
+    fn setup(h: &Harness, intent: Option<(&str, TxOrigin, Option<&str>)>) -> Option<MessageType> {
         h.coordinator
             .operating_frequency_hz
             .store(14_074_000, Ordering::Relaxed);
@@ -23291,9 +23839,19 @@ mod pan136_bundle_binding_worker_tests {
                     tx_parity: None,
                     origin,
                     remote_client_key_id: key.map(str::to_string),
+                    request_queued: true,
                 },
             );
         }
+        intent.map(|(text, origin, key)| MessageType::TransmitRequest {
+            attempt_id: None,
+            message_text: text.to_string(),
+            frequency_offset: 1000.0,
+            qso_id: Some("qa".to_string()),
+            tx_parity: None,
+            origin,
+            remote_client_key_id: key.map(str::to_string),
+        })
     }
 
     /// A two-item bundle whose items carry the bundle's own binding, sent
@@ -23333,8 +23891,21 @@ mod pan136_bundle_binding_worker_tests {
     }
 
     /// Drain every receiver until a `TransmitComplete` has arrived for each
-    /// of `texts` (or `within` elapses).
-    async fn collect(h: &Harness, texts: &[&str], within: Duration) -> Collected {
+    /// of `texts` (or `within` elapses). `producing` is enqueued once every
+    /// other text has completed, i.e. after the bundle was handled. A second
+    /// completion for the same text fails the test (PAN-185 exactly-once).
+    async fn collect(
+        h: &Harness,
+        texts: &[&str],
+        within: Duration,
+        mut producing: Option<MessageType>,
+    ) -> Collected {
+        let producing_slot = producing.as_ref().and_then(|m| match m {
+            MessageType::TransmitRequest { message_text, .. } => {
+                texts.iter().position(|t| t == message_text)
+            }
+            _ => None,
+        });
         let mut c = Collected {
             completions: vec![None; texts.len()],
             ptt_on: false,
@@ -23369,19 +23940,44 @@ mod pan136_bundle_binding_worker_tests {
                 } = msg.message_type
                 {
                     if let Some(slot) = texts.iter().position(|t| *t == message_text) {
-                        if c.completions[slot].is_none() {
-                            c.completions[slot] = Some(success);
-                        }
+                        assert!(
+                            c.completions[slot].is_none(),
+                            "a second completion for '{message_text}'"
+                        );
+                        c.completions[slot] = Some(success);
                     }
                 }
             }
         };
-        while Instant::now() < deadline && c.completions.iter().any(|d| d.is_none()) {
+        let send = |message_type: MessageType| {
+            h.coordinator
+                .message_bus
+                .send_message(ComponentMessage::new(
+                    ComponentId::Qso,
+                    ComponentId::Ft8Transmitter,
+                    message_type,
+                    Instant::now(),
+                ))
+        };
+        while Instant::now() < deadline
+            && (producing.is_some() || c.completions.iter().any(|d| d.is_none()))
+        {
             drain(&mut c);
+            let others_done = c
+                .completions
+                .iter()
+                .enumerate()
+                .all(|(slot, d)| Some(slot) == producing_slot || d.is_some());
+            if others_done {
+                if let Some(message_type) = producing.take() {
+                    send(message_type).await.unwrap();
+                }
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        // Anything the worker emitted alongside the last completion.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Anything the worker emitted alongside the last completion, and
+        // time for a duplicate to show up.
+        tokio::time::sleep(Duration::from_secs(1)).await;
         drain(&mut c);
         c
     }
@@ -23424,9 +24020,9 @@ mod pan136_bundle_binding_worker_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn local_bundle_item_rebound_to_unarmed_client_is_denied() {
         let h = worker_harness().await;
-        setup(&h, Some((QA_TEXT, TxOrigin::Remote, Some("client-B"))));
+        let producing = setup(&h, Some((QA_TEXT, TxOrigin::Remote, Some("client-B"))));
         send_bundle(&h, TxOrigin::Local, None).await;
-        let c = collect(&h, &[QA_TEXT, QB_TEXT], Duration::from_secs(50)).await;
+        let c = collect(&h, &[QA_TEXT, QB_TEXT], Duration::from_secs(90), producing).await;
         assert!(
             !c.ptt_on,
             "a bundle carrying a frame re-bound to an unarmed client must not key"
@@ -23446,12 +24042,18 @@ mod pan136_bundle_binding_worker_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn local_bundle_item_pivoting_to_unarmed_remote_text_is_denied() {
         let h = worker_harness().await;
-        setup(
+        let producing = setup(
             &h,
             Some(("SM2LIY K5ARH 73", TxOrigin::Remote, Some("client-B"))),
         );
         send_bundle(&h, TxOrigin::Local, None).await;
-        let c = collect(&h, &["SM2LIY K5ARH 73", QB_TEXT], Duration::from_secs(50)).await;
+        let c = collect(
+            &h,
+            &["SM2LIY K5ARH 73", QB_TEXT],
+            Duration::from_secs(90),
+            producing,
+        )
+        .await;
         assert!(
             !c.ptt_on,
             "a bundle whose item pivoted to an unarmed client's text must not key"
@@ -23463,9 +24065,9 @@ mod pan136_bundle_binding_worker_tests {
     async fn armed_clients_bundle_holds_item_rebound_to_another_client() {
         let h = worker_harness().await;
         let heartbeat = arm_client(&h, "client-A");
-        setup(&h, Some((QA_TEXT, TxOrigin::Remote, Some("client-B"))));
+        let producing = setup(&h, Some((QA_TEXT, TxOrigin::Remote, Some("client-B"))));
         send_bundle(&h, TxOrigin::Remote, Some("client-A")).await;
-        let c = collect(&h, &[QA_TEXT, QB_TEXT], Duration::from_secs(50)).await;
+        let c = collect(&h, &[QA_TEXT, QB_TEXT], Duration::from_secs(90), producing).await;
         heartbeat.abort();
         assert!(c.ptt_on, "client A's own frame must still key");
         assert_eq!(
@@ -23511,9 +24113,9 @@ mod pan136_bundle_binding_worker_tests {
     async fn local_bundle_item_rebound_to_armed_client_keys_under_it() {
         let h = worker_harness().await;
         let heartbeat = arm_client(&h, "client-B");
-        setup(&h, Some((QA_TEXT, TxOrigin::Remote, Some("client-B"))));
+        let producing = setup(&h, Some((QA_TEXT, TxOrigin::Remote, Some("client-B"))));
         send_bundle(&h, TxOrigin::Local, None).await;
-        let c = collect(&h, &[QA_TEXT, QB_TEXT], Duration::from_secs(50)).await;
+        let c = collect(&h, &[QA_TEXT, QB_TEXT], Duration::from_secs(90), producing).await;
         heartbeat.abort();
         assert!(
             c.ptt_on,
@@ -23526,9 +24128,9 @@ mod pan136_bundle_binding_worker_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remote_bundle_without_pivot_is_still_denied_unarmed() {
         let h = worker_harness().await;
-        setup(&h, None);
+        let producing = setup(&h, None);
         send_bundle(&h, TxOrigin::Remote, Some("client-B")).await;
-        let c = collect(&h, &[QA_TEXT, QB_TEXT], Duration::from_secs(50)).await;
+        let c = collect(&h, &[QA_TEXT, QB_TEXT], Duration::from_secs(50), producing).await;
         assert!(!c.ptt_on, "an unarmed Remote bundle must not key");
         assert!(
             c.diagnostics.iter().any(|d| d
@@ -24977,6 +25579,7 @@ mod pan183_attempt_identity_tests {
                 origin: crate::message_bus::TxOrigin::Local,
                 remote_client_key_id: None,
                 attempt_id: Some(TxAttemptId(9)),
+                request_queued: true,
             },
         );
         let (pivoted, pivots) = super::super::pivot_bundle_items(items, &latest);
@@ -25201,7 +25804,6 @@ mod pan183_attempt_identity_tests {
         // is rolled back.
         report_pivot_duplicate_dropped(
             &bus,
-            "K1A N0CALL R-07".into(),
             Some("qa".into()),
             Some((
                 "K1A N0CALL FN20".into(),

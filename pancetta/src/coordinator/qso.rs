@@ -2861,10 +2861,9 @@ impl super::ApplicationCoordinator {
 
         info!("Starting QSO component");
 
-        let (_qso_tx, qso_rx) = self
-            .message_bus
-            .get_or_create_channel(ComponentId::Qso)
-            .await?;
+        // PAN-185: read through the durable inbox so TX outcome reports
+        // parked behind a full channel still arrive.
+        let qso_inbox = self.message_bus.durable_inbox(ComponentId::Qso).await?;
         let message_bus = self.message_bus.clone();
         let display_feed_enabled = self.display_feed_enabled.clone();
         let pending_autonomous_cq_dispatch_failures =
@@ -3839,28 +3838,33 @@ impl super::ApplicationCoordinator {
                                         // payload here — see `LatestTxIntent`'s doc — computed
                                         // from the SAME `remote_origin`/`remote_client_key_id`
                                         // this exact event carries, so the intent can never
-                                        // disagree with the `TransmitRequest` sent moments
-                                        // below for the same event.
+                                        // disagree with the `TransmitRequest` sent below.
+                                        //
+                                        // PAN-185 (Codex 4244602501, the publish-before-send
+                                        // window): publish the intent as not queued, send the
+                                        // request checked, then settle: mark it queued once
+                                        // the bus accepted the request, withdraw it if not.
+                                        // Pivots ignore unqueued intents, so a pivot never
+                                        // targets a request the TX worker will never see.
+                                        let key = super::active_tx_qso_key(&qso_id.to_string());
+                                        let published = super::LatestTxIntent {
+                                            attempt_id,
+                                            message_text: text.clone(),
+                                            frequency_offset: frequency,
+                                            tx_parity,
+                                            origin: tx_origin,
+                                            remote_client_key_id: remote_client_key_id.clone(),
+                                            request_queued: false,
+                                        };
                                         if let Ok(mut m) = latest_tx_intent.write() {
-                                            m.insert(
-                                                super::active_tx_qso_key(&qso_id.to_string()),
-                                                super::LatestTxIntent {
-                                                    attempt_id,
-                                                    message_text: text.clone(),
-                                                    frequency_offset: frequency,
-                                                    tx_parity,
-                                                    origin: tx_origin,
-                                                    remote_client_key_id: remote_client_key_id
-                                                        .clone(),
-                                                },
-                                            );
+                                            m.insert(key.clone(), published.clone());
                                         }
                                         let tx_msg = ComponentMessage::new(
                                             ComponentId::Qso,
                                             ComponentId::Ft8Transmitter,
                                             MessageType::TransmitRequest {
                                                 attempt_id,
-                                                message_text: text,
+                                                message_text: text.clone(),
                                                 frequency_offset: frequency,
                                                 qso_id: Some(qso_id.to_string()),
                                                 tx_parity,
@@ -3869,8 +3873,38 @@ impl super::ApplicationCoordinator {
                                             },
                                             Instant::now(),
                                         );
-                                        if let Err(e) = tx_bus.send_message(tx_msg).await {
-                                            warn!("Failed to send auto-sequence TX: {}", e);
+                                        let queued = matches!(
+                                            tx_bus.send_message_checked(tx_msg).await,
+                                            Ok(true)
+                                        );
+                                        super::settle_tx_intent(
+                                            &latest_tx_intent,
+                                            &key,
+                                            &published,
+                                            queued,
+                                        );
+                                        if !queued {
+                                            warn!(
+                                                "auto-sequence TX for QSO {qso_id} never reached the TX worker; withdrawing its intent and reporting it unsent"
+                                            );
+                                            // Self-addressed: the Qso loop's own handler rolls
+                                            // back this attempt by id (a no-op for an opening
+                                            // or advance, PAN-183).
+                                            tx_bus
+                                                .send_message_durable(ComponentMessage::new(
+                                                    ComponentId::Qso,
+                                                    ComponentId::Qso,
+                                                    MessageType::QsoMessage(
+                                                        crate::message_bus::QsoMessage::TxFrameNotSent {
+                                                            qso_id: qso_id.to_string(),
+                                                            message_text: text,
+                                                            replaced: None,
+                                                            attempt_id,
+                                                        },
+                                                    ),
+                                                    Instant::now(),
+                                                ))
+                                                .await;
                                         }
                                     }
                                     Err(e) => {
@@ -4424,7 +4458,7 @@ impl super::ApplicationCoordinator {
                 consumer_ready.release();
 
                 while !shutdown.load(Ordering::Acquire) {
-                    match qso_rx.try_recv() {
+                    match qso_inbox.try_recv() {
                         Ok(message) => {
                             match message.message_type {
                                 // Decoded FT8 messages forwarded from the decoder
@@ -11728,6 +11762,200 @@ mod respond_to_caller_admission_tests {
                 break;
             }
             assert!(Instant::now() < deadline, "QSO loop did not apply rollback");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// PAN-185 scenario 1 through the running QSO loop: the keep-call
+    /// rearm's rollback was parked on the Qso inbox's durable lane (its
+    /// channel was full when the TX worker reported it). The loop still
+    /// applies it: the rearm's call, stall increment and Sent entry reverse.
+    #[tokio::test]
+    async fn pan185_qso_loop_applies_a_parked_tx_frame_not_sent() {
+        let mut coordinator = test_coordinator().await;
+        {
+            let mut cfg = coordinator.config.write().await;
+            cfg.station.callsign = "W1ABC".to_string();
+            cfg.station.grid_square = "FN42".to_string();
+        }
+        let (_tx_s, tx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        coordinator.start_qso_component().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        let id = manager
+            .respond_to_cq_manual("K1ABC".into(), 1500.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        let qso = id.to_string();
+        pan183_next_transmit_request(&tx, &qso).await;
+        let opened = manager
+            .get_qso(id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        manager
+            .rearm_manual_calls_at(opened + chrono::Duration::seconds(15))
+            .await;
+        let (rearm_text, rearm_id) = pan183_next_transmit_request(&tx, &qso).await;
+        let before = manager.get_qso(id).await.unwrap();
+        assert_eq!(before.metadata.call_count, 2);
+        assert_eq!(before.metadata.stall_cycles, 1);
+
+        coordinator.message_bus.park_for_test(ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Qso,
+            MessageType::QsoMessage(QsoMessage::TxFrameNotSent {
+                qso_id: qso.clone(),
+                message_text: rearm_text,
+                replaced: None,
+                attempt_id: rearm_id,
+            }),
+            Instant::now(),
+        ));
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let after = manager.get_qso(id).await.unwrap();
+            if after.metadata.call_count == 1 {
+                assert_eq!(
+                    after.metadata.stall_cycles, 0,
+                    "the rearm's stall increment"
+                );
+                assert_eq!(
+                    after
+                        .messages
+                        .iter()
+                        .filter(|m| m.direction == pancetta_qso::MessageDirection::Sent)
+                        .count(),
+                    1,
+                    "the rearm's Sent entry"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "QSO loop did not apply the parked rollback"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            coordinator.message_bus.durable_lane_len(ComponentId::Qso),
+            0
+        );
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// PAN-185: once the bus accepts a forwarded `TransmitRequest`, its
+    /// intent is marked queued (pivotable) and keeps its attempt id.
+    #[tokio::test]
+    async fn pan185_delivered_request_marks_its_intent_queued() {
+        let mut coordinator = test_coordinator().await;
+        {
+            let mut cfg = coordinator.config.write().await;
+            cfg.station.callsign = "W1ABC".to_string();
+            cfg.station.grid_square = "FN42".to_string();
+        }
+        let (_tx_s, tx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        coordinator.start_qso_component().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        let id = manager
+            .respond_to_cq_manual("K1ABC".into(), 1500.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        let (_, forwarded) = pan183_next_transmit_request(&tx, &id.to_string()).await;
+        let key = super::super::active_tx_qso_key(&id.to_string());
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let intent = coordinator
+                .latest_tx_intent
+                .read()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .expect("a delivered request keeps its intent");
+            assert_eq!(intent.attempt_id, forwarded);
+            if intent.request_queued {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the delivered request's intent was never marked queued"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// PAN-185 (Codex 4244560866): a request the TX worker's channel never
+    /// accepted leaves no pivotable intent behind, and the QSO engine rolls
+    /// back the attempt it recorded for it.
+    #[tokio::test]
+    async fn pan185_undelivered_request_withdraws_its_intent_and_rolls_back_its_attempt() {
+        let mut coordinator = test_coordinator().await;
+        {
+            let mut cfg = coordinator.config.write().await;
+            cfg.station.callsign = "W1ABC".to_string();
+            cfg.station.grid_square = "FN42".to_string();
+        }
+        let (tx_s, tx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        coordinator.start_qso_component().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        let id = manager
+            .respond_to_cq_manual("K1ABC".into(), 1500.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        let qso = id.to_string();
+        pan183_next_transmit_request(&tx, &qso).await;
+        let pre_resend = manager.get_qso(id).await.unwrap().metadata.call_count;
+        // The TX worker is not running here, so nothing drains the channel.
+        while tx_s
+            .try_send(ComponentMessage::new(
+                ComponentId::Ft8Transmitter,
+                ComponentId::Ft8Transmitter,
+                MessageType::AudioData(Vec::new()),
+                Instant::now(),
+            ))
+            .is_ok()
+        {}
+        manager.resend_last_tx(id).await.unwrap();
+        let key = super::super::active_tx_qso_key(&qso);
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let intent_gone = !coordinator
+                .latest_tx_intent
+                .read()
+                .unwrap()
+                .contains_key(&key);
+            let call_count = manager.get_qso(id).await.unwrap().metadata.call_count;
+            if intent_gone && call_count == pre_resend {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "undelivered request: intent_gone={intent_gone}, call_count={call_count} (want {pre_resend})"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         coordinator

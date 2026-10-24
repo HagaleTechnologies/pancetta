@@ -142,6 +142,35 @@ pub struct LatestTxIntent {
     /// PAN-183: the intent's ledger attempt, adopted with the payload by a
     /// key-time pivot so the pivoted frame reports its own attempt.
     pub attempt_id: Option<pancetta_qso::TxAttemptId>,
+    /// PAN-185: the `TransmitRequest` that carries this payload is confirmed
+    /// enqueued on the TX worker's channel. Pivots ignore an intent until it
+    /// is.
+    pub request_queued: bool,
+}
+
+/// PAN-185: settle the intent the QSO forwarder published for `key` once
+/// its `TransmitRequest`'s checked send returned. `queued` marks it
+/// pivotable; otherwise it is withdrawn. A newer intent that replaced
+/// `published` in the meantime is left untouched, and a poisoned lock is
+/// skipped like every other writer of the map.
+pub(crate) fn settle_tx_intent(
+    map: &std::sync::RwLock<HashMap<String, LatestTxIntent>>,
+    key: &str,
+    published: &LatestTxIntent,
+    queued: bool,
+) {
+    if let Ok(mut m) = map.write() {
+        if m.get(key) != Some(published) {
+            return;
+        }
+        if queued {
+            if let Some(intent) = m.get_mut(key) {
+                intent.request_queued = true;
+            }
+        } else {
+            m.remove(key);
+        }
+    }
 }
 
 /// Smallest offset difference (Hz) [`tx_pivot_target`] treats as a genuine
@@ -193,6 +222,9 @@ pub const PIVOT_OFFSET_EPSILON_HZ: f64 = 0.5;
 /// `coord_robustness` tests); passing a bundle-level binding instead of the
 /// item's own would manufacture spurious pivots (a `Local` item in a
 /// `Remote` bundle would never match its own `Local` intent).
+/// PAN-185: an intent whose `request_queued` is false is ignored, so a pivot
+/// only ever targets a payload whose producing request the TX worker will
+/// see (and which then reports its own outcome if the pivot is refused).
 pub fn tx_pivot_target(
     qso_id: Option<&str>,
     current_text: &str,
@@ -201,7 +233,9 @@ pub fn tx_pivot_target(
     latest: &HashMap<String, LatestTxIntent>,
 ) -> Option<LatestTxIntent> {
     let id = qso_id?;
-    let intent = latest.get(&active_tx_qso_key(id))?;
+    let intent = latest
+        .get(&active_tx_qso_key(id))
+        .filter(|i| i.request_queued)?;
     let same_text = intent.message_text == current_text;
     let same_offset =
         (intent.frequency_offset - current_frequency_offset).abs() < PIVOT_OFFSET_EPSILON_HZ;
@@ -3250,7 +3284,7 @@ mod pivot_duplicate_tests {
 
 #[cfg(test)]
 mod pivot_bundle_tests {
-    use super::{active_tx_qso_key, pivot_bundle_items, LatestTxIntent};
+    use super::{active_tx_qso_key, pivot_bundle_items, settle_tx_intent, LatestTxIntent};
     use crate::message_bus::TransmitRequestItem;
     use std::collections::HashMap;
 
@@ -3279,7 +3313,59 @@ mod pivot_bundle_tests {
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
             remote_client_key_id: None,
+            request_queued: true,
         }
+    }
+
+    fn published(text: &str) -> LatestTxIntent {
+        LatestTxIntent {
+            request_queued: false,
+            ..intent(text, 1500.0)
+        }
+    }
+
+    /// PAN-185: a checked enqueue makes the published intent pivotable.
+    #[test]
+    fn settle_marks_the_published_intent_queued() {
+        let key = active_tx_qso_key("qso-a");
+        let map = std::sync::RwLock::new(HashMap::new());
+        let p = published("K1ABC N0CALL R-07");
+        map.write().unwrap().insert(key.clone(), p.clone());
+        settle_tx_intent(&map, &key, &p, true);
+        assert_eq!(
+            map.read().unwrap().get(&key),
+            Some(&LatestTxIntent {
+                request_queued: true,
+                ..p
+            })
+        );
+    }
+
+    /// PAN-185: a dropped request's intent is withdrawn, never left for a
+    /// pivot to target.
+    #[test]
+    fn settle_withdraws_the_published_intent_on_a_drop() {
+        let key = active_tx_qso_key("qso-a");
+        let map = std::sync::RwLock::new(HashMap::new());
+        let p = published("K1ABC N0CALL R-07");
+        map.write().unwrap().insert(key.clone(), p.clone());
+        settle_tx_intent(&map, &key, &p, false);
+        assert!(map.read().unwrap().get(&key).is_none());
+    }
+
+    /// PAN-185: a newer `MessageToSend` replaced the entry between publish
+    /// and settle; settling the older one leaves the newer one alone.
+    #[test]
+    fn settle_leaves_a_newer_intent_untouched() {
+        let key = active_tx_qso_key("qso-a");
+        let map = std::sync::RwLock::new(HashMap::new());
+        let older = published("K1ABC N0CALL R-07");
+        let newer = published("K1ABC N0CALL RR73");
+        map.write().unwrap().insert(key.clone(), newer.clone());
+        settle_tx_intent(&map, &key, &older, true);
+        assert_eq!(map.read().unwrap().get(&key), Some(&newer));
+        settle_tx_intent(&map, &key, &older, false);
+        assert_eq!(map.read().unwrap().get(&key), Some(&newer));
     }
 
     /// An item whose recorded intent differs from its current text gets both
