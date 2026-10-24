@@ -21704,14 +21704,29 @@ mod pan72_stall_detection_tests {
             .last_call_at
             .unwrap();
 
-        // Two silent rearm cycles: the second re-sends our CQ at FREQ and
-        // trips the stall threshold.
-        manager
-            .rearm_manual_calls_at(opened_at + Duration::seconds(15))
-            .await;
-        manager
-            .rearm_manual_calls_at(opened_at + Duration::seconds(30))
-            .await;
+        // Two silent rearm cycles on DISTINCT own-parity TX slots (slots 1
+        // and 3): PAN-128 counts one stall per own-parity slot, so the old
+        // +15/+30 pair can collapse onto the same slot — leaving no armed
+        // PAN-182 trigger to release and making the commit below pass or
+        // fail on real wall-clock phase. The slot-3 rearm re-sends our CQ
+        // at FREQ and trips the stall threshold.
+        for slot in [1i64, 3] {
+            manager
+                .rearm_manual_calls_at(opened_at + Duration::seconds(15 * slot))
+                .await;
+        }
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            2,
+            "precondition: two silent rearm cycles on distinct own-parity \
+             slots must trip the stall threshold"
+        );
+
+        // PAN-182: the threshold-tripping rearm armed a pending stall
+        // trigger; the drain may commit the switch only once that frame's
+        // outcome is known. Report it aired (what the TX worker's
+        // `TxFrameSent` does) so the commit below is genuinely allowed.
+        confirm_last_frame_aired(&manager, qso_id, FREQ).await;
 
         let new_offset = FREQ + 400.0;
         assert_eq!(
@@ -21745,14 +21760,30 @@ mod pan72_stall_detection_tests {
             .unwrap();
 
         let after = manager.get_qso(qso_id).await.unwrap();
-        assert_eq!(
-            after.state.their_callsign(),
-            Some(CALLER),
-            "precondition: the pre-switch answer establishes the QSO"
+        assert!(
+            matches!(
+                &after.state,
+                QsoState::WaitingForReport { their_callsign, frequency, .. }
+                    if their_callsign == CALLER && *frequency == new_offset
+            ),
+            "the pre-switch answer must establish the QSO in WaitingForReport \
+             carrying our (new) TX offset, got {:?}",
+            after.state
+        );
+        assert!(
+            after.metadata.pre_switch_offset.is_none(),
+            "the establishing advance must consume the pre-switch grace in \
+             the same breath — from here on the caller is judged by the plain \
+             established relevance gate"
         );
         assert_eq!(
             after.metadata.frequency, new_offset,
             "precondition: we are now TX-ing on the new offset"
+        );
+        assert_eq!(
+            after.state.frequency(),
+            Some(new_offset),
+            "the state's own TX frequency must sit on the new offset too"
         );
         assert_eq!(
             after.metadata.partner_freq,
@@ -21774,6 +21805,59 @@ mod pan72_stall_detection_tests {
             Some(FREQ),
             "the decoder hint must resolve to the caller's actual frequency \
              ({FREQ} Hz), not the new TX offset ({new_offset} Hz)"
+        );
+
+        // PAN-82: the grace is consumed, so the caller's NEXT frame is
+        // judged by the established relevance gate alone — the latched
+        // `partner_freq` (the vacated offset) is now the RX baseline. The
+        // caller, who never moved, rogers our report with their R-report
+        // still on FREQ. It must route to this QSO alone and advance it
+        // immediately: no sleep, no extra drift sightings, and (absent the
+        // latch above) no two-sighting `maybe_confirm_frequency_drift_at`
+        // relatch to wait for. Without the latch this frame sat 400 Hz
+        // outside the 100 Hz established gate and the exchange went deaf.
+        let report = MessageType::ReportAck {
+            from_station: CALLER.into(),
+            to_station: OUR.into(),
+            report: -7,
+        };
+        assert_eq!(
+            manager.find_qsos_for_message(&report, FREQ).await,
+            vec![qso_id],
+            "after the grace is consumed, the caller's R-report at the \
+             vacated offset must still route to this QSO via the latched \
+             partner_freq baseline"
+        );
+        manager
+            .process_message(report, format!("{OUR} {CALLER} R-07"), FREQ, Some(-15.0))
+            .await
+            .unwrap();
+
+        let confirmed = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(
+                &confirmed.state,
+                QsoState::WaitingForConfirmation { their_callsign, .. } if their_callsign == CALLER
+            ),
+            "the caller's R-report must advance the rescued QSO to \
+             WaitingForConfirmation, got {:?}",
+            confirmed.state
+        );
+        assert_eq!(
+            confirmed.metadata.partner_freq,
+            Some(FREQ),
+            "the advance must keep the latched RX baseline on the offset the \
+             caller is actually replying from"
+        );
+        assert_eq!(
+            confirmed.metadata.frequency, new_offset,
+            "our TX offset must stay on the post-switch value — the rescue \
+             must not undo the switch"
+        );
+        assert_eq!(
+            confirmed.state.frequency(),
+            Some(new_offset),
+            "the state's own TX frequency must stay on the post-switch value"
         );
     }
 
@@ -21855,13 +21939,26 @@ mod pan72_stall_detection_tests {
             .last_call_at
             .unwrap();
 
-        // Stall out on FREQ; the threshold-crossing rearm re-sends there.
-        manager
-            .rearm_manual_calls_at(opened_at + Duration::seconds(15))
-            .await;
-        manager
-            .rearm_manual_calls_at(opened_at + Duration::seconds(30))
-            .await;
+        // Stall out on FREQ across DISTINCT own-parity TX slots (slots 1 and
+        // 3, per PAN-128's one-count-per-own-parity-slot rule — a +15/+30
+        // pair can resolve to the same slot and leave no armed PAN-182
+        // trigger); the threshold-crossing rearm re-sends there.
+        for slot in [1i64, 3] {
+            manager
+                .rearm_manual_calls_at(opened_at + Duration::seconds(15 * slot))
+                .await;
+        }
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            2,
+            "precondition: two silent rearm cycles on distinct own-parity \
+             slots must trip the stall threshold"
+        );
+
+        // PAN-182: release the trigger the threshold rearm armed before the
+        // stall-origin switch may commit.
+        confirm_last_frame_aired(&manager, qso_id, FREQ).await;
+
         let new_offset = FREQ + 400.0;
         manager
             .apply_tx_offset_switch(qso_id, new_offset, stall_origin(&manager, qso_id).await)
