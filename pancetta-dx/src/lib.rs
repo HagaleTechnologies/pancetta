@@ -58,12 +58,13 @@ pub mod qrz_xml;
 pub mod qso_upload;
 #[cfg(test)]
 mod test_support;
+pub mod upload_outbox;
 
 pub use network_error::NetworkError;
 pub use qrz_xml::{QrzLookup, QrzXmlClient};
 pub use qso_upload::{
-    ClubLogClient, EqslClient, LotwClient as LotwUploadClient, QrzInsertOutcome, QrzLogbookClient,
-    QsoUploadOutcome,
+    upload_failure_class_for_status, ClubLogClient, EqslClient, LotwClient as LotwUploadClient,
+    QrzInsertOutcome, QrzLogbookClient, QsoUploadOutcome, UploadFailureClass,
 };
 
 use chrono::{DateTime, Utc};
@@ -92,6 +93,17 @@ pub enum DxError {
     #[error("External service error: {0}")]
     ExternalService(String),
 
+    /// An online-logbook upload failed; `class` says whether a retry can
+    /// help (PAN-57). Displays exactly like `ExternalService`, so log lines
+    /// do not change.
+    #[error("External service error: {message}")]
+    Upload {
+        /// Whether a retry can help.
+        class: UploadFailureClass,
+        /// Operator-facing text (status and body prefix, never a credential).
+        message: String,
+    },
+
     #[error("Configuration error: {0}")]
     Configuration(String),
 
@@ -118,6 +130,27 @@ pub enum DxError {
 
     #[error("Format error: {0}")]
     Format(#[from] std::fmt::Error),
+}
+
+impl DxError {
+    /// Whether a retry of the failed upload can help (PAN-57).
+    pub fn upload_failure_class(&self) -> UploadFailureClass {
+        match self {
+            DxError::Upload { class, .. } => *class,
+            DxError::ResponseTooLarge { .. } => UploadFailureClass::RecordRejected,
+            // Network, Parse, Io, …: retrying never loses data.
+            _ => UploadFailureClass::Transient,
+        }
+    }
+
+    /// The operator-facing failure text: the message alone for `Upload`,
+    /// otherwise `Display`.
+    pub fn upload_failure_text(&self) -> String {
+        match self {
+            DxError::Upload { message, .. } => message.clone(),
+            other => other.to_string(),
+        }
+    }
 }
 
 /// Every `reqwest` failure enters `DxError` here, so none keeps its request

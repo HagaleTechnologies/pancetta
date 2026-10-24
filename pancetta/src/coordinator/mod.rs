@@ -40,6 +40,8 @@ pub mod station_agent;
 mod tier;
 mod tui_relay;
 mod tx;
+mod tx_log;
+pub(crate) mod upload_outbox;
 mod util;
 mod wav_playback;
 pub(crate) mod wsjtx_udp;
@@ -50,6 +52,7 @@ pub use tx::{
     tx_rf_for_gate, tx_signal_span_hz, CoalesceEntry, CoalesceOutcome, TxSchedule,
 };
 
+pub use effort::DecodeWindowConfig;
 pub use qso::compute_manual_tx_offset;
 
 // PAN-51: the decode-path message classifier. Re-exported so the loopback
@@ -136,6 +139,9 @@ pub struct LatestTxIntent {
     pub origin: crate::message_bus::TxOrigin,
     /// Paired with `origin` — see its doc.
     pub remote_client_key_id: Option<String>,
+    /// PAN-183: the intent's ledger attempt, adopted with the payload by a
+    /// key-time pivot so the pivoted frame reports its own attempt.
+    pub attempt_id: Option<pancetta_qso::TxAttemptId>,
 }
 
 /// Smallest offset difference (Hz) [`tx_pivot_target`] treats as a genuine
@@ -180,11 +186,13 @@ pub const PIVOT_OFFSET_EPSILON_HZ: f64 = 0.5;
 /// frame, and a text/offset-only comparison would leave a request already
 /// sitting in the worker's pre-PTT wait keyed against its STALE
 /// authorization even though `latest_tx_intent` already holds the fresh
-/// one. `None` preserves the original text/offset-only comparison for
-/// callers with no real per-item identity to compare (the multi-TX bundle
-/// path's [`pivot_bundle_items`] — `TransmitRequestItem` carries no
-/// identity at all yet; see PAN-136) rather than manufacturing spurious
-/// pivots there.
+/// one. Both production callers pass `Some`: single-TX Step 4c and, since
+/// PAN-136, [`pivot_bundle_items`] (each `TransmitRequestItem` now carries
+/// its own binding). `None` keeps the original text/offset-only comparison
+/// for callers with no binding to compare (today only the
+/// `coord_robustness` tests); passing a bundle-level binding instead of the
+/// item's own would manufacture spurious pivots (a `Local` item in a
+/// `Remote` bundle would never match its own `Local` intent).
 pub fn tx_pivot_target(
     qso_id: Option<&str>,
     current_text: &str,
@@ -286,6 +294,15 @@ pub fn is_pivot_duplicate(
 /// unchanged and is never reported as a pivot — mirroring `tx_pivot_target`'s
 /// exact "differs → `Some`" semantics.
 ///
+/// PAN-136: each item's own `origin`/`remote_client_key_id` is compared too,
+/// exactly like single-TX Step 4c, so an authorization-ONLY rebind (identical
+/// text and offset, different binding) is a pivot as well (round-5 semantics,
+/// see [`tx_pivot_target`]) and plants the same consume-once tombstone. On a
+/// pivot the binding is replaced ATOMICALLY with the payload (round-4
+/// semantics, see [`LatestTxIntent`]), never left stale. The bundle-level
+/// gate binding is then re-folded by the TX worker's Step 4b-rebind (see
+/// [`bundle_identity_conflict_mask`] and [`fold_bundle_identity`]).
+///
 /// Returns `(all_items_with_pivots_applied, list_of_what_was_pivoted)`.
 pub fn pivot_bundle_items(
     items: Vec<crate::message_bus::TransmitRequestItem>,
@@ -302,9 +319,9 @@ pub fn pivot_bundle_items(
                 item.qso_id.as_deref(),
                 &item.message_text,
                 item.frequency_offset,
-                // `TransmitRequestItem` carries no identity to compare yet
-                // (PAN-136) — preserve the original text/offset-only check.
-                None,
+                // PAN-136: the item's own binding, exactly like single-TX
+                // Step 4c — an authorization-only rebind is a pivot too.
+                Some((item.origin, item.remote_client_key_id.as_deref())),
                 latest,
             ) {
                 // `tx_pivot_target` only returns `Some` when `qso_id` is
@@ -316,12 +333,94 @@ pub fn pivot_bundle_items(
                 );
                 item.message_text = intent.message_text;
                 item.frequency_offset = intent.frequency_offset;
+                // Round-4 semantics (see `LatestTxIntent`): the binding is
+                // replaced ATOMICALLY with the payload, never left stale.
+                item.origin = intent.origin;
+                item.remote_client_key_id = intent.remote_client_key_id;
+                // PAN-183: the item now keys the intent's attempt.
+                item.attempt_id = intent.attempt_id;
                 pivots.push((key, item.message_text.clone(), item.frequency_offset));
             }
             item
         })
         .collect();
     (pivoted_items, pivots)
+}
+
+/// PAN-136: the binding a multi-TX bundle is gated under, folded from its
+/// items' own bindings. Any `Remote` item makes the bundle `Remote` (the arm
+/// gate covers the whole summed waveform; fail-safe), and the client key is
+/// the first `Remote` item's that has one. This is the coalescer's original
+/// fold, shared so the coalescer and the TX worker's post-pivot re-fold cannot
+/// drift. It does not detect conflicting bindings; callers remove those first
+/// (the coalescer's arm/channel partitions, or [`bundle_identity_conflict_mask`]).
+pub fn fold_bundle_identity<'a>(
+    items: impl IntoIterator<Item = &'a crate::message_bus::TransmitRequestItem>,
+) -> (crate::message_bus::TxOrigin, Option<String>) {
+    let remote: Vec<&crate::message_bus::TransmitRequestItem> = items
+        .into_iter()
+        .filter(|it| it.origin == crate::message_bus::TxOrigin::Remote)
+        .collect();
+    if remote.is_empty() {
+        return (crate::message_bus::TxOrigin::Local, None);
+    }
+    (
+        crate::message_bus::TxOrigin::Remote,
+        remote.iter().find_map(|it| it.remote_client_key_id.clone()),
+    )
+}
+
+/// PAN-136: whether two bindings may not share one bundle-level gate. Both
+/// `Remote` and bound differently: two station-agent clients, or the WSJT-X
+/// UDP channel (`None`) against a station-agent client (PAN-98, independent
+/// consent). `Local` never conflicts.
+pub fn remote_identities_conflict(
+    a: (crate::message_bus::TxOrigin, Option<&str>),
+    b: (crate::message_bus::TxOrigin, Option<&str>),
+) -> bool {
+    a.0 == crate::message_bus::TxOrigin::Remote
+        && b.0 == crate::message_bus::TxOrigin::Remote
+        && a.1 != b.1
+}
+
+/// PAN-136: after a key-time bundle pivot, which live items must be held out
+/// of this bundle because their (possibly just re-bound) remote binding
+/// conflicts with the bundle's anchor binding. The anchor is `admitted` — the
+/// binding the bundle was dequeued with, which the coalescer checked against
+/// one arm snapshot — when a live item still carries it; otherwise the first
+/// live `Remote` item in bundle order (the coalescer's own "keep the first
+/// remote channel" rule). Preferring the admitted binding means a peer that
+/// re-binds one QSO cannot displace frames the arm already admitted. A held
+/// item's own fresh request is still queued, so it gets full per-entry
+/// admission next cycle. Not-live items are never flagged and never anchor;
+/// `Local` items never conflict.
+pub fn bundle_identity_conflict_mask(
+    items: &[crate::message_bus::TransmitRequestItem],
+    live: &[bool],
+    admitted: (crate::message_bus::TxOrigin, Option<&str>),
+) -> Vec<bool> {
+    let remote = crate::message_bus::TxOrigin::Remote;
+    let live_remote = || {
+        items
+            .iter()
+            .zip(live)
+            .filter(move |(it, &l)| l && it.origin == remote)
+            .map(|(it, _)| (it.origin, it.remote_client_key_id.as_deref()))
+    };
+    let anchor = if admitted.0 == remote && live_remote().any(|b| b == admitted) {
+        Some(admitted)
+    } else {
+        live_remote().next()
+    };
+    items
+        .iter()
+        .zip(live)
+        .map(|(it, &l)| {
+            l && anchor.is_some_and(|a| {
+                remote_identities_conflict(a, (it.origin, it.remote_client_key_id.as_deref()))
+            })
+        })
+        .collect()
 }
 
 /// Threshold (Hz) for treating a same-band (or out-of-band) dial move as a
@@ -502,8 +601,12 @@ pub(crate) async fn forward_split_change(
     enabled: bool,
     tx_frequency: u64,
 ) -> u64 {
+    // PAN-206: retain this owner through enqueue + record, and a second
+    // owner on the message through CAT application / pending retries. Polling
+    // must not replace a requested split with the rig's not-yet-applied state.
+    let observation_guard = bus.split_observation_fence.begin_command();
     let make = || {
-        ComponentMessage::new(
+        let mut message = ComponentMessage::new(
             source,
             ComponentId::Hamlib,
             MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
@@ -511,7 +614,9 @@ pub(crate) async fn forward_split_change(
                 tx_frequency,
             }),
             Instant::now(),
-        )
+        );
+        message.split_observation_guard = Some(observation_guard.clone());
+        message
     };
     match bus
         .send_message_retrying(make, &tx::SAFETY_SEND_RETRY_DELAYS)
@@ -622,41 +727,24 @@ pub enum ModeSwitchError {
 /// slip through and run under the new mode's timing. Narrow, low-severity
 /// residual window; not a full closure of the race.
 ///
-/// Ordering: the fallible step (`ft8_config.try_write()`) happens BEFORE any
+/// Ordering: the fallible step (`decode_window.try_write()`) happens BEFORE any
 /// atomic store, so a failure here leaves every consumer (DSP, decode, TX,
 /// QSO) seeing the OLD mode consistently — never a torn state where some
 /// consumers see new atomics but the decoder config is still old.
 pub fn try_switch_operating_mode(
     new_mode: pancetta_config::OperatingMode,
     active_tx_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
-    ft8_config: &std::sync::Arc<tokio::sync::RwLock<pancetta_ft8::Ft8Config>>,
+    decode_window: &std::sync::Arc<tokio::sync::RwLock<DecodeWindowConfig>>,
     active_protocol_mode: &std::sync::Arc<std::sync::atomic::AtomicU8>,
     active_slot_ns: &std::sync::Arc<std::sync::atomic::AtomicI64>,
     active_decode_phase_ns: &std::sync::Arc<std::sync::atomic::AtomicI64>,
-    // PAN-157 round 3 review finding: a station already on the `Max`
-    // effort preset that switches protocol (e.g. FT8 -> FT4) must not
-    // carry FT8's `max_decode_passes = 2` override into FT4, where the
-    // coherent-subtraction machinery is FT8-79-symbol-specific — a
-    // second pass just repeats the full decode against an unchanged
-    // residual, wasting time under FT4's tighter 800ms slot budget.
-    // `apply_effort_overrides` itself now gates its `Max` arm on
-    // `config.protocol == Protocol::Ft8`, but that gate only re-fires
-    // when apply_effort_overrides is CALLED — a bare protocol switch
-    // previously never called it at all, leaving a stale FT8-era
-    // override in place. Re-run it here, right after the protocol
-    // write, using the CURRENT effort/tier atomics, so a protocol
-    // switch alone (no effort-preset change) also re-evaluates the
-    // override under the new protocol.
+    // PAN-157 round 3 review finding: a protocol switch while already
+    // on `Max` must re-evaluate the FT8-only multipass override under the
+    // new protocol, using the CURRENT effort/tier atomics —
+    // `DecodeWindowConfig::switch_protocol` does it against the budget
+    // already published, which a mode switch never changes.
     current_decode_effort: &std::sync::Arc<std::sync::atomic::AtomicU8>,
     resolved_hardware_tier: &std::sync::Arc<std::sync::atomic::AtomicU8>,
-    // Round-12-of-PAN-157 review finding: a mode switch never touches
-    // `decode_effort_budget_ms` — it stays at whatever it held before
-    // (possibly an explicit startup `[decoder].budget_ms` override
-    // smaller than the FT8 ceiling). Passing a guessed `None`/`Some`
-    // here would be wrong; read the atomic fresh so the override
-    // decision always matches the budget this station will ACTUALLY
-    // run under, which this function does not and must not change.
-    decode_effort_budget_ms: &std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<(), ModeSwitchError> {
     use std::sync::atomic::Ordering;
 
@@ -668,18 +756,16 @@ pub fn try_switch_operating_mode(
     }
 
     let new_protocol = protocol_from_mode(new_mode);
-    let mut cfg_guard = ft8_config
+    let mut window_guard = decode_window
         .try_write()
         .map_err(|_| ModeSwitchError::ConfigLockBusy)?;
-    cfg_guard.protocol = new_protocol;
     let effort =
         pancetta_config::DecodeEffort::from_u8(current_decode_effort.load(Ordering::Acquire));
     let tier = pancetta_ft8::tier_probe::HardwareTier::from_u8(
         resolved_hardware_tier.load(Ordering::Acquire),
     );
-    let effective_budget_ms = decode_effort_budget_ms.load(Ordering::Acquire);
-    effort::apply_effort_overrides(effort, tier, effective_budget_ms, &mut cfg_guard);
-    drop(cfg_guard);
+    window_guard.switch_protocol(new_protocol, effort, tier);
+    drop(window_guard);
 
     let timing = derive_dsp_timing(&pancetta_ft8::ProtocolParams::from_protocol(new_protocol));
     let decode_phase_ns = timing
@@ -1328,20 +1414,6 @@ pub struct ApplicationCoordinator {
     /// byte-identical to the prior hardcoded `Duration::seconds(13)`.
     active_decode_phase_ns: Arc<std::sync::atomic::AtomicI64>,
 
-    /// Operator/preset-configured decode wall-time effort budget in
-    /// milliseconds (decoder-speed-overhaul Task 12). `0` is the unlimited
-    /// sentinel — the decode loop then falls back to the mode-aware
-    /// ceiling (`decode_budget_ceiling_ms`) alone. Read once per window at
-    /// both decode call sites in `ft8.rs`. Seeded from `[decoder]`
-    /// (`effort` mapped via `effort::preset_budget_ms`, or the explicit
-    /// `budget_ms` override when set) at coordinator startup (assuming
-    /// `HardwareTier::Fast` before the tier is known) and re-seeded by
-    /// `tier::initialize` once the real hardware tier resolves — see
-    /// `effort.rs` (Task 14). A live-reload/TUI-cycle call site landing
-    /// later should re-seed through `effort::seed_effort_budget` too (see
-    /// that module's doc comment).
-    decode_effort_budget_ms: Arc<std::sync::atomic::AtomicU64>,
-
     /// Wall-clock time (ms) the most recently completed decode window spent
     /// in the budgeted decode call(s) — decoder-speed-overhaul Task 12
     /// metrics. `0` until the first window completes. Written by the FT8
@@ -1350,9 +1422,7 @@ pub struct ApplicationCoordinator {
 
     /// Whether the most recently completed decode window ran out of its
     /// [`pancetta_ft8::DecodeBudget`] before all optional work finished
-    /// (decoder-speed-overhaul Task 12 metrics). Always `false` while
-    /// `decode_effort_budget_ms == 0` (unlimited) — this task alone can
-    /// never flip it. Written by the FT8 decode loop, read by the TUI
+    /// (decoder-speed-overhaul Task 12 metrics). Written by the FT8 decode loop, read by the TUI
     /// relay's periodic `PipelineHealth` push.
     decode_last_budget_exhausted: Arc<AtomicBool>,
 
@@ -1361,8 +1431,8 @@ pub struct ApplicationCoordinator {
     /// `from_u8`. Seeded from `[decoder].effort` at startup; from this task
     /// onward it is also the state the TUI's `e` keybinding cycles
     /// (Eco → Standard → Deep → Max → Auto → Eco) via
-    /// `effort::cycle_decode_effort`, which also re-derives and writes
-    /// `decode_effort_budget_ms` for the new preset.
+    /// `effort::cycle_decode_effort`, which also re-derives and publishes
+    /// the new preset's budget into `decode_window`.
     current_decode_effort: Arc<std::sync::atomic::AtomicU8>,
 
     /// Best-known hardware tier (decoder-speed-overhaul Task 15), encoded
@@ -1436,9 +1506,19 @@ pub struct ApplicationCoordinator {
     /// not handled yet. Owned here so a supervised worker restart keeps them.
     pub(crate) tx_requeue: tx::TxRequeue,
 
+    /// PAN-122: the durable local TX log (`~/.pancetta/tx-log.jsonl`). Created
+    /// by the first `start_transmitter_component` and reused on every
+    /// supervisor restart, so the file never has two writers. `None` until then.
+    pub(crate) tx_frame_log: Option<Arc<tx_log::TxFrameLog>>,
+
     /// Test handshake after waveform construction, immediately before the gate wait.
     #[cfg(test)]
     tx_before_ptt_gate: Arc<tokio::sync::Notify>,
+
+    /// PAN-202 test seam: parks the TX worker between its last pre-PTT gate
+    /// and the key-down when armed.
+    #[cfg(test)]
+    pub(crate) key_down_probe: Arc<tx::KeyDownProbe>,
 
     /// Epoch-ms timestamp of the most recent PTT-on (updated alongside
     /// `ptt_active` going true). Unlike the boolean, this survives past
@@ -1522,6 +1602,21 @@ pub struct ApplicationCoordinator {
     /// `component_status` lock, so the relay's OS thread can read it.
     pub(crate) degraded_summary: Arc<std::sync::Mutex<Option<String>>>,
 
+    /// PAN-57: the one process-wide pending-upload worker for ClubLog, QRZ
+    /// Logbook, eQSL and cqdx.io uploads. Started by the first
+    /// `start_qso_component` that has an upload destination and reused on
+    /// every Qso restart, so the queue file never has two writers.
+    pub(crate) upload_outbox: Option<upload_outbox::UploadOutboxHandle>,
+
+    /// PAN-57: the upload worker's task, awaited by `shutdown` so runtime
+    /// teardown never cancels it while it drains and saves the queue.
+    pub(crate) upload_outbox_task: Option<tokio::task::JoinHandle<()>>,
+
+    /// PAN-57: the upload worker's readiness view, read by the TUI relay's
+    /// readiness snapshot (`readiness::ReadinessSources`). A std mutex for
+    /// the same reason as `degraded_summary`.
+    pub(crate) upload_health: Arc<std::sync::Mutex<upload_outbox::UploadHealth>>,
+
     /// Command channel into the dedicated audio thread for **live device
     /// switching**. The TUI `SelectDevice` handler sends an
     /// [`AudioReopenRequest`](crate::coordinator::audio::AudioReopenRequest)
@@ -1561,12 +1656,17 @@ pub struct ApplicationCoordinator {
     /// the prior env-var probe.
     pub(crate) scoped_fast_path: Arc<AtomicBool>,
 
-    /// hb-216 S2 — shared decoder config the FT8 thread reads on each
-    /// window iteration. The tier probe may rewrite Slow-tier presets
-    /// (`max_decode_passes=1`, `osd_depth=Some(1)`) once it classifies
-    /// the host; the FT8 thread rebuilds its decoder when the
-    /// `(max_decode_passes, osd_depth)` tuple changes.
-    pub(crate) ft8_config: Arc<RwLock<Ft8Config>>,
+    /// hb-216 S2 / PAN-164 — the per-window decode budget (milliseconds,
+    /// `0` = the protocol ceiling; decoder-speed-overhaul Task 12) and the
+    /// decoder config derived with it, published together as ONE
+    /// [`DecodeWindowConfig`] behind one lock. Seeded at startup from
+    /// `[decoder]` (assuming `HardwareTier::Fast`), re-published by
+    /// `tier::initialize` once the real tier resolves, by the TUI effort
+    /// cycle and (protocol only) by `try_switch_operating_mode`. The FT8
+    /// thread reads it with ONE `try_read()` per window, so the budget and
+    /// the decoder fields it uses always come from the same publish, and
+    /// rebuilds its decoder when a `DecoderRebuildKey` field changes.
+    pub(crate) decode_window: Arc<RwLock<DecodeWindowConfig>>,
 
     /// Non-fatal config-load warnings (e.g. a `pancetta.toml` that existed but
     /// failed to parse and was silently reverted to defaults). Surfaced to the
@@ -1681,6 +1781,18 @@ pub struct ApplicationCoordinator {
     /// one -- `send` would see `receiver_count() == 0` and discard the value
     /// instead of storing it, leaving every later subscriber seeded `None`.
     pub(crate) qso_manager_watch: tokio::sync::watch::Sender<Option<pancetta_qso::QsoManager>>,
+
+    /// PAN-42: `true` once the QSO component's task has finished its startup
+    /// worked-history seed and is about to drain `ComponentId::Qso` (or has
+    /// exited without getting there). The `--replay` feeder
+    /// (`replay.rs`) waits on this before its slot-boundary pre-roll, so
+    /// replayed audio never reaches the decoder while the QSO engine is
+    /// still rebuilding history from a large `qsos.adi`. Written only through
+    /// `replay::QsoConsumerReadyGuard` (released on every exit path); never
+    /// reset to `false`, so a Qso restart does not re-gate a running feed.
+    /// `send_replace` semantics for the same zero-receiver reason as
+    /// `qso_manager_watch` above.
+    pub(crate) qso_consumer_ready: tokio::sync::watch::Sender<bool>,
 }
 
 #[cfg(feature = "pancetta-hamlib")]
@@ -1995,8 +2107,8 @@ impl ApplicationCoordinator {
 
         // Snapshot [decoder] before config is moved into the Arc<RwLock>
         // (decoder-speed-overhaul Task 14). `effort` + an optional explicit
-        // `budget_ms` override drive the `decode_effort_budget_ms` atomic
-        // seeded below; `budget_ms` always wins over the preset when set.
+        // `budget_ms` override drive the decode budget published into
+        // `decode_window` below; `budget_ms` always wins over the preset when set.
         let decoder_effort_init = config.decoder.effort;
         let decoder_budget_override_init = config.decoder.budget_ms;
 
@@ -2040,47 +2152,31 @@ impl ApplicationCoordinator {
         // Costas) in FT4 mode, not just retunes the slot grid. Without this the
         // decoder would run FT8 geometry against FT4 audio. mode=FT8 →
         // protocol=Ft8, byte-identical to the previous `Ft8Config::default()`.
-        let mut ft8_config_init = Ft8Config {
-            protocol: active_protocol,
-            ..Ft8Config::default()
-        };
-        // PAN-156: apply the initial decode-effort preset's Ft8Config
-        // overrides before the config is shared, assuming
-        // `HardwareTier::Fast` until the probe resolves (same convention
-        // `decode_effort_budget_ms`'s own initial seed below uses).
-        // `tier::initialize` re-applies this once the real tier is known
-        // (mirroring how it re-seeds `decode_effort_budget_ms`), and
-        // `tui_relay.rs`'s `CycleDecodeEffort` handler re-applies it on
-        // every live preset switch — so this seeds the starting point
-        // only.
-        effort::apply_effort_overrides(
-            decoder_effort_init,
-            pancetta_ft8::tier_probe::HardwareTier::Fast,
-            decoder_budget_override_init.unwrap_or_else(|| {
-                effort::preset_budget_ms(
-                    decoder_effort_init,
-                    pancetta_ft8::tier_probe::HardwareTier::Fast,
-                )
-            }),
-            &mut ft8_config_init,
+        //
+        // decoder-speed-overhaul Task 14 / PAN-156 / PAN-164: publish the
+        // initial budget and the effort preset's Ft8Config overrides
+        // together, before the window is shared, assuming
+        // `HardwareTier::Fast` until the tier is known — the same
+        // "innocent until proven otherwise" convention `tier::initialize`
+        // already uses for `scoped_fast_path`. `tier::initialize`
+        // re-publishes with the real tier on both the synchronous
+        // cache-hit path and the async probe-completion path, and
+        // `tui_relay.rs`'s `CycleDecodeEffort` handler on every live
+        // preset switch — so this seeds the starting point only.
+        let mut decode_window_init = DecodeWindowConfig::new(
+            Ft8Config {
+                protocol: active_protocol,
+                ..Ft8Config::default()
+            },
+            0,
         );
-        let ft8_config = Arc::new(RwLock::new(ft8_config_init));
-
-        // decoder-speed-overhaul Task 14: seed `decode_effort_budget_ms` with
-        // an initial value before the hardware tier is known, assuming
-        // `HardwareTier::Fast` — the same "innocent until proven otherwise"
-        // convention `tier::initialize` already uses for `scoped_fast_path`
-        // (which also defaults to the fast-tier assumption until a cache hit
-        // or background probe resolves the real tier). `tier::initialize`
-        // re-seeds this atomic with the real tier on both the synchronous
-        // cache-hit path and the async probe-completion path.
-        let decode_effort_budget_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
         effort::seed_effort_budget(
             decoder_effort_init,
             decoder_budget_override_init,
             pancetta_ft8::tier_probe::HardwareTier::Fast,
-            &decode_effort_budget_ms,
+            &mut decode_window_init,
         );
+        let decode_window = Arc::new(RwLock::new(decode_window_init));
         // decoder-speed-overhaul Task 15: the operator's current decode-effort
         // preset, so the TUI's `e` cycle key has a starting point that
         // matches `[decoder].effort` rather than always starting from Auto.
@@ -2088,7 +2184,7 @@ impl ApplicationCoordinator {
             decoder_effort_init.as_u8(),
         ));
         // Assume Fast until the tier probe resolves (same convention as the
-        // `decode_effort_budget_ms` seed just above); `tier::initialize`
+        // `decode_window` seed just above); `tier::initialize`
         // re-seeds this with the real tier on both the cache-hit and
         // background-probe-completion paths.
         let resolved_hardware_tier = Arc::new(std::sync::atomic::AtomicU8::new(
@@ -2097,10 +2193,9 @@ impl ApplicationCoordinator {
         let scoped_fast_path = tier::initialize(
             decoder_effort_init,
             decoder_budget_override_init,
-            decode_effort_budget_ms.clone(),
             current_decode_effort.clone(),
             resolved_hardware_tier.clone(),
-            ft8_config.clone(),
+            decode_window.clone(),
         )
         .await;
 
@@ -2225,10 +2320,6 @@ impl ApplicationCoordinator {
             active_decode_phase_ns: Arc::new(std::sync::atomic::AtomicI64::new(
                 active_decode_phase_ns_init,
             )),
-            // Seeded above (Task 14) from `[decoder]` effort/budget_ms and the
-            // assumed-then-probed hardware tier; re-seeded on tier-probe
-            // completion by `tier::initialize`.
-            decode_effort_budget_ms,
             decode_last_elapsed_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             decode_last_budget_exhausted: Arc::new(AtomicBool::new(false)),
             current_decode_effort,
@@ -2242,8 +2333,11 @@ impl ApplicationCoordinator {
             ptt_sync_gate: Arc::new(tokio::sync::Mutex::new(())),
             relocation_epochs: Arc::new(pancetta_qso::qso_manager::TxRelocationEpochs::default()),
             tx_requeue: tx::TxRequeue::default(),
+            tx_frame_log: None,
             #[cfg(test)]
             tx_before_ptt_gate: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            key_down_probe: Arc::new(tx::KeyDownProbe::default()),
             last_ptt_on_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             // C9 dedup anchor — no pancetta-initiated frequency command yet.
             last_freq_command: Arc::new(std::sync::Mutex::new(None)),
@@ -2283,6 +2377,9 @@ impl ApplicationCoordinator {
             ptt_off_unconfirmed: Arc::new(AtomicBool::new(false)),
             ptt_off_confirmations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             degraded_summary: Arc::new(std::sync::Mutex::new(None)),
+            upload_outbox: None,
+            upload_outbox_task: None,
+            upload_health: Arc::new(std::sync::Mutex::new(Default::default())),
             audio_reopen_tx: None,
             hamlib_reconnect_tx,
             hamlib_reconnect_rx: Some(hamlib_reconnect_rx),
@@ -2290,7 +2387,10 @@ impl ApplicationCoordinator {
                 crate::coordinator::hamlib::RigConnState::default().as_u8(),
             )),
             scoped_fast_path,
-            ft8_config,
+            // Seeded above (Task 14 / PAN-164) from `[decoder]`
+            // effort/budget_ms and the assumed-then-probed hardware tier;
+            // re-published on tier-probe completion by `tier::initialize`.
+            decode_window,
             config_warnings,
             active_tx_qsos: Arc::new(std::sync::RwLock::new(HashSet::new())),
             fox_admitted_qsos: Arc::new(std::sync::RwLock::new(HashSet::new())),
@@ -2319,6 +2419,7 @@ impl ApplicationCoordinator {
             wsjtx_qso_events_rx: None,
             qso_manager_for_supervisor: None,
             qso_manager_watch: tokio::sync::watch::channel(None).0,
+            qso_consumer_ready: tokio::sync::watch::channel(false).0,
         };
 
         info!("Application Coordinator initialized with ID: {}", id);
@@ -2402,30 +2503,33 @@ impl ApplicationCoordinator {
             .map(|b| b.with_operating_frequency(self.operating_frequency_hz.clone()))
             {
                 drop(config);
+                // PAN-93: the bridge registers and its poller runs whether or
+                // not this first attempt succeeds. Whatever did not load is
+                // marked unavailable on the lookup (readiness strip) and the
+                // poller retries it; spot polling waits for the needed list.
+                let bridge = std::sync::Arc::new(bridge);
                 match bridge.startup().await {
-                    Ok(()) => {
-                        info!("cqdx.io integration initialized");
-                        let poller_handle = bridge.spawn_spot_poller(
-                            self.shutdown_signal.clone(),
-                            self.last_decode_timestamp.clone(),
-                            None,
-                            None, // TUI tx — set up later in pipeline if available
-                        );
-                        // Wrap the JoinHandle<()> into JoinHandle<Result<()>> for named_task_handles
-                        let wrapped = tokio::spawn(async move {
-                            poller_handle
-                                .await
-                                .map_err(|e| anyhow::anyhow!("cqdx poller join error: {}", e))?;
-                            Ok(())
-                        });
-                        self.named_task_handles
-                            .push((ComponentId::DxCluster, wrapped));
-                        self.cqdx_bridge = Some(std::sync::Arc::new(bridge));
-                    }
-                    Err(e) => {
-                        warn!("cqdx.io startup failed, running in degraded mode: {}", e);
-                    }
+                    Ok(()) => info!("cqdx.io integration initialized"),
+                    Err(e) => warn!(
+                        "cqdx.io startup incomplete ({e}); needed lists unavailable, retrying in the background"
+                    ),
                 }
+                let poller_handle = bridge.spawn_spot_poller(
+                    self.shutdown_signal.clone(),
+                    self.last_decode_timestamp.clone(),
+                    None,
+                    None, // TUI tx — set up later in pipeline if available
+                );
+                // Wrap the JoinHandle<()> into JoinHandle<Result<()>> for named_task_handles
+                let wrapped = tokio::spawn(async move {
+                    poller_handle
+                        .await
+                        .map_err(|e| anyhow::anyhow!("cqdx poller join error: {}", e))?;
+                    Ok(())
+                });
+                self.named_task_handles
+                    .push((ComponentId::DxCluster, wrapped));
+                self.cqdx_bridge = Some(bridge);
             } else {
                 drop(config);
                 info!("cqdx.io integration not configured, running in degraded mode");
@@ -2565,6 +2669,7 @@ impl ApplicationCoordinator {
                     crate::message_bus::ComponentId::Coordinator,
                     crate::message_bus::ComponentId::Ft8Transmitter,
                     crate::message_bus::MessageType::TransmitRequest {
+                        attempt_id: None,
                         message_text: test_tx_text.clone(),
                         frequency_offset: offset,
                         qso_id: None,
@@ -2713,6 +2818,9 @@ impl ApplicationCoordinator {
     ///   into a demo process.
     /// - Clock-skew monitor (`coordinator/clock_monitor.rs`) — not started, so
     ///   no SNTP query leaves a replay.
+    /// - Local TX log (`tx.rs`, `ensure_tx_frame_log`) — `~/.pancetta/tx-log.jsonl`
+    ///   is not opened. Replay starts no Hamlib, so no frame is really
+    ///   transmitted.
     /// - WAV recording (`dsp.rs`'s `resolve_wav_recording`, which also gates
     ///   `audio.rs`'s raw 48 kHz diagnostic capture) — never enabled, even
     ///   with `[audio.recording] auto_record = true`, so a replayed window
@@ -2752,14 +2860,6 @@ impl ApplicationCoordinator {
     /// (from this task onward) written by `try_switch_operating_mode`.
     pub(crate) fn active_decode_phase_ns(&self) -> Arc<std::sync::atomic::AtomicI64> {
         self.active_decode_phase_ns.clone()
-    }
-
-    /// Decode wall-time effort budget atomic in milliseconds (`0` =
-    /// unlimited). Decoder-speed-overhaul Task 12 plumbing: read every
-    /// window at both decode call sites in `ft8.rs`; Task 14 is the first
-    /// writer (config/TUI-driven effort presets).
-    pub(crate) fn decode_effort_budget_ms(&self) -> Arc<std::sync::atomic::AtomicU64> {
-        self.decode_effort_budget_ms.clone()
     }
 
     /// Operator-facing decode-effort preset atomic (decoder-speed-overhaul
@@ -3156,14 +3256,24 @@ mod pivot_bundle_tests {
 
     fn item(qso_id: Option<&str>, text: &str, freq: f64) -> TransmitRequestItem {
         TransmitRequestItem {
+            attempt_id: None,
             message_text: text.to_string(),
             frequency_offset: freq,
             qso_id: qso_id.map(|s| s.to_string()),
+            origin: crate::message_bus::TxOrigin::Local,
+            remote_client_key_id: None,
         }
+    }
+
+    fn bound(mut it: TransmitRequestItem, key: Option<&str>) -> TransmitRequestItem {
+        it.origin = crate::message_bus::TxOrigin::Remote;
+        it.remote_client_key_id = key.map(str::to_string);
+        it
     }
 
     fn intent(text: &str, freq: f64) -> LatestTxIntent {
         LatestTxIntent {
+            attempt_id: None,
             message_text: text.to_string(),
             frequency_offset: freq,
             tx_parity: None,
@@ -3299,6 +3409,176 @@ mod pivot_bundle_tests {
                 "SM2LIY K5ARH 73".to_string(),
                 693.0
             )]
+        );
+    }
+
+    /// PAN-136: the coordinator-level fold reproduces the coalescer's
+    /// original inline fold exactly, including its `find_map` edge (the key
+    /// is the first `Remote` item that HAS one, not the first `Remote`
+    /// item's).
+    #[test]
+    fn pan136_fold_bundle_identity_matches_the_coalescer_rule() {
+        use super::fold_bundle_identity;
+        use crate::message_bus::TxOrigin::{Local, Remote};
+        let l = item(None, "CQ K5ARH EM10", 900.0);
+        let a = bound(
+            item(Some("qa"), "SM2LIY K5ARH R-14", 1000.0),
+            Some("client-A"),
+        );
+        let b = bound(
+            item(Some("qb"), "C6AVD K5ARH EM10", 1600.0),
+            Some("client-B"),
+        );
+        let w = bound(item(Some("qw"), "K1ABC K5ARH -10", 2000.0), None);
+        assert_eq!(
+            fold_bundle_identity([] as [&TransmitRequestItem; 0]),
+            (Local, None)
+        );
+        assert_eq!(fold_bundle_identity([&l]), (Local, None));
+        // Any Remote item makes the bundle Remote; key = first Remote item that HAS one.
+        assert_eq!(
+            fold_bundle_identity([&l, &b, &a]),
+            (Remote, Some("client-B".into()))
+        );
+        assert_eq!(
+            fold_bundle_identity([&w, &a]),
+            (Remote, Some("client-A".into()))
+        );
+        assert_eq!(fold_bundle_identity([&l, &w]), (Remote, None));
+    }
+
+    /// PAN-136: the shared conflict predicate has supersede's original truth
+    /// table.
+    #[test]
+    fn pan136_remote_identities_conflict_truth_table() {
+        use super::remote_identities_conflict as c;
+        use crate::message_bus::TxOrigin::{Local, Remote};
+        assert!(c((Remote, Some("a")), (Remote, Some("b"))));
+        assert!(c((Remote, None), (Remote, Some("a")))); // WSJT-X UDP vs station agent (PAN-98)
+        assert!(!c((Remote, Some("a")), (Remote, Some("a"))));
+        assert!(!c((Remote, None), (Remote, None)));
+        assert!(!c((Local, None), (Remote, Some("a"))));
+    }
+
+    /// PAN-136: identical text and offset, but the intent is now bound to a
+    /// remote client: that is a pivot (tombstoned like any other), and the
+    /// item takes the intent's binding with it.
+    #[test]
+    fn pan136_authorization_only_rebind_is_a_bundle_pivot() {
+        let mut latest = HashMap::new();
+        let mut i = intent("C6AVD K5ARH EM10", 1728.0);
+        i.origin = crate::message_bus::TxOrigin::Remote;
+        i.remote_client_key_id = Some("client-B".to_string());
+        latest.insert(active_tx_qso_key("qso-a"), i);
+        let items = vec![item(Some("qso-a"), "C6AVD K5ARH EM10", 1728.0)]; // Local item
+        let (pivoted, pivots) = pivot_bundle_items(items, &latest);
+        assert_eq!(
+            pivots,
+            vec![(
+                active_tx_qso_key("qso-a"),
+                "C6AVD K5ARH EM10".to_string(),
+                1728.0
+            )]
+        );
+        assert_eq!(pivoted[0].origin, crate::message_bus::TxOrigin::Remote);
+        assert_eq!(pivoted[0].remote_client_key_id.as_deref(), Some("client-B"));
+    }
+
+    /// PAN-136: a text pivot replaces the binding atomically with the payload.
+    #[test]
+    fn pan136_text_pivot_carries_the_intents_binding() {
+        let mut latest = HashMap::new();
+        let mut i = intent("SM2LIY K5ARH 73", 693.0);
+        i.origin = crate::message_bus::TxOrigin::Remote;
+        i.remote_client_key_id = Some("client-B".to_string());
+        latest.insert(active_tx_qso_key("qso-a"), i);
+        let items = vec![bound(
+            item(Some("qso-a"), "SM2LIY K5ARH R-14", 693.0),
+            Some("client-A"),
+        )];
+        let (pivoted, pivots) = pivot_bundle_items(items, &latest);
+        assert_eq!(
+            pivots,
+            vec![(
+                active_tx_qso_key("qso-a"),
+                "SM2LIY K5ARH 73".to_string(),
+                693.0
+            )]
+        );
+        assert_eq!(pivoted[0].message_text, "SM2LIY K5ARH 73");
+        assert_eq!(pivoted[0].origin, crate::message_bus::TxOrigin::Remote);
+        assert_eq!(pivoted[0].remote_client_key_id.as_deref(), Some("client-B"));
+    }
+
+    /// PAN-136: an item whose own binding matches its intent's is still not a
+    /// pivot, and a manual (`qso_id: None`) item in the same bundle is never
+    /// pivoted: comparing each item's OWN binding manufactures no spurious
+    /// pivots.
+    #[test]
+    fn pan136_same_binding_is_still_not_a_pivot() {
+        let mut latest = HashMap::new();
+        let mut i = intent("SM2LIY K5ARH R-14", 1000.0);
+        i.origin = crate::message_bus::TxOrigin::Remote;
+        i.remote_client_key_id = Some("client-A".to_string());
+        latest.insert(active_tx_qso_key("qa"), i);
+        latest.insert(active_tx_qso_key("ql"), intent("C6AVD K5ARH EM10", 1600.0));
+        let items = vec![
+            bound(
+                item(Some("qa"), "SM2LIY K5ARH R-14", 1000.0),
+                Some("client-A"),
+            ),
+            item(Some("ql"), "C6AVD K5ARH EM10", 1600.0),
+            item(None, "CQ K5ARH EM10", 900.0),
+        ];
+        let (pivoted, pivots) = pivot_bundle_items(items, &latest);
+        assert!(pivots.is_empty(), "no spurious pivots: {pivots:?}");
+        assert_eq!(pivoted[0].origin, crate::message_bus::TxOrigin::Remote);
+        assert_eq!(pivoted[0].remote_client_key_id.as_deref(), Some("client-A"));
+        assert_eq!(pivoted[1].origin, crate::message_bus::TxOrigin::Local);
+        assert_eq!(pivoted[2].origin, crate::message_bus::TxOrigin::Local);
+    }
+
+    /// PAN-136: the post-pivot conflict hold anchors on the admitted binding
+    /// while a live item still carries it, otherwise on the first live
+    /// `Remote` item; not-live and `Local` items are never flagged.
+    #[test]
+    fn pan136_conflict_mask_prefers_the_admitted_binding() {
+        use super::bundle_identity_conflict_mask as mask;
+        use crate::message_bus::TxOrigin::{Local, Remote};
+        let l = item(None, "CQ K5ARH EM10", 900.0);
+        let a = bound(
+            item(Some("qa"), "SM2LIY K5ARH R-14", 1000.0),
+            Some("client-A"),
+        );
+        let b = bound(
+            item(Some("qb"), "C6AVD K5ARH EM10", 1600.0),
+            Some("client-B"),
+        );
+        let w = bound(item(Some("qw"), "K1ABC K5ARH -10", 2000.0), None);
+        let items = vec![l, b, a, w];
+        // Admitted binding A is still carried by a live item: it anchors, even though B comes first.
+        assert_eq!(
+            mask(&items, &[true; 4], (Remote, Some("client-A"))),
+            vec![false, true, false, true]
+        );
+        // Local bundle (no admitted Remote binding): the first live Remote item anchors.
+        assert_eq!(
+            mask(&items, &[true; 4], (Local, None)),
+            vec![false, false, true, true]
+        );
+        // Not-live items are never flagged and never anchor.
+        assert_eq!(
+            mask(&items, &[true, false, true, true], (Local, None)),
+            vec![false, false, false, true]
+        );
+        // Admitted binding no longer carried by any live item: fall back to first live Remote.
+        assert_eq!(
+            mask(
+                &items,
+                &[true, true, false, true],
+                (Remote, Some("client-A"))
+            ),
+            vec![false, false, false, true]
         );
     }
 }
@@ -4242,7 +4522,10 @@ mod tests {
         let active_tx_qsos = Arc::new(std::sync::RwLock::new(std::collections::HashSet::from([
             "W1ABC-14074000".to_string(),
         ])));
-        let ft8_config = Arc::new(tokio::sync::RwLock::new(Ft8Config::default()));
+        let decode_window = Arc::new(tokio::sync::RwLock::new(DecodeWindowConfig::new(
+            Ft8Config::default(),
+            0,
+        )));
         let active_protocol_mode = Arc::new(std::sync::atomic::AtomicU8::new(
             pancetta_config::OperatingMode::Ft8.as_u8(),
         ));
@@ -4254,18 +4537,16 @@ mod tests {
         let resolved_hardware_tier = Arc::new(std::sync::atomic::AtomicU8::new(
             pancetta_ft8::tier_probe::HardwareTier::Fast.as_u8(),
         ));
-        let decode_effort_budget_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let result = try_switch_operating_mode(
             pancetta_config::OperatingMode::Ft4,
             &active_tx_qsos,
-            &ft8_config,
+            &decode_window,
             &active_protocol_mode,
             &active_slot_ns,
             &active_decode_phase_ns,
             &current_decode_effort,
             &resolved_hardware_tier,
-            &decode_effort_budget_ms,
         );
 
         assert!(matches!(result, Err(ModeSwitchError::QsosActive(1))));
@@ -4280,7 +4561,10 @@ mod tests {
     #[tokio::test]
     async fn try_switch_operating_mode_succeeds_when_idle() {
         let active_tx_qsos = Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
-        let ft8_config = Arc::new(tokio::sync::RwLock::new(Ft8Config::default()));
+        let decode_window = Arc::new(tokio::sync::RwLock::new(DecodeWindowConfig::new(
+            Ft8Config::default(),
+            0,
+        )));
         let active_protocol_mode = Arc::new(std::sync::atomic::AtomicU8::new(
             pancetta_config::OperatingMode::Ft8.as_u8(),
         ));
@@ -4292,18 +4576,16 @@ mod tests {
         let resolved_hardware_tier = Arc::new(std::sync::atomic::AtomicU8::new(
             pancetta_ft8::tier_probe::HardwareTier::Fast.as_u8(),
         ));
-        let decode_effort_budget_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let result = try_switch_operating_mode(
             pancetta_config::OperatingMode::Ft4,
             &active_tx_qsos,
-            &ft8_config,
+            &decode_window,
             &active_protocol_mode,
             &active_slot_ns,
             &active_decode_phase_ns,
             &current_decode_effort,
             &resolved_hardware_tier,
-            &decode_effort_budget_ms,
         );
 
         assert!(result.is_ok());
@@ -4313,7 +4595,7 @@ mod tests {
         );
         assert_eq!(active_slot_ns.load(Ordering::Relaxed), 7_500_000_000);
         assert_eq!(
-            ft8_config.read().await.protocol,
+            decode_window.read().await.ft8().protocol,
             pancetta_ft8::Protocol::Ft4
         );
     }
@@ -4324,11 +4606,14 @@ mod tests {
     #[tokio::test]
     async fn switching_away_from_ft8_clears_the_ft8_only_multipass_override() {
         let active_tx_qsos = Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
-        let ft8_config = Arc::new(tokio::sync::RwLock::new(Ft8Config {
-            max_decode_passes: 2,
-            time_varying_subtraction_enabled: true,
-            ..Ft8Config::default()
-        }));
+        let decode_window = Arc::new(tokio::sync::RwLock::new(DecodeWindowConfig::new(
+            Ft8Config {
+                max_decode_passes: 2,
+                time_varying_subtraction_enabled: true,
+                ..Ft8Config::default()
+            },
+            0,
+        )));
         let active_protocol_mode = Arc::new(std::sync::atomic::AtomicU8::new(
             pancetta_config::OperatingMode::Ft8.as_u8(),
         ));
@@ -4340,22 +4625,21 @@ mod tests {
         let resolved_hardware_tier = Arc::new(std::sync::atomic::AtomicU8::new(
             pancetta_ft8::tier_probe::HardwareTier::Fast.as_u8(),
         ));
-        let decode_effort_budget_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let result = try_switch_operating_mode(
             pancetta_config::OperatingMode::Ft4,
             &active_tx_qsos,
-            &ft8_config,
+            &decode_window,
             &active_protocol_mode,
             &active_slot_ns,
             &active_decode_phase_ns,
             &current_decode_effort,
             &resolved_hardware_tier,
-            &decode_effort_budget_ms,
         );
 
         assert!(result.is_ok());
-        let cfg = ft8_config.read().await;
+        let guard = decode_window.read().await;
+        let cfg = guard.ft8();
         assert_eq!(cfg.protocol, pancetta_ft8::Protocol::Ft4);
         assert_eq!(
             cfg.max_decode_passes, 1,
@@ -4368,8 +4652,8 @@ mod tests {
     }
 
     /// Round-12 review finding regression: a mode switch never touches
-    /// `decode_effort_budget_ms`, so a station on `Max` with an explicit,
-    /// too-small `[decoder].budget_ms` already active in that atomic
+    /// the published budget, so a station on `Max` with an explicit,
+    /// too-small `[decoder].budget_ms` already published
     /// (simulated here directly, as a live config-loaded station would
     /// have it) must NOT get the multipass override re-enabled just by
     /// switching (back) into FT8 — the guessed-`None` bug would have
@@ -4377,10 +4661,15 @@ mod tests {
     #[tokio::test]
     async fn switching_into_ft8_honors_an_already_bounded_budget_atomic() {
         let active_tx_qsos = Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
-        let ft8_config = Arc::new(tokio::sync::RwLock::new(Ft8Config {
-            protocol: pancetta_ft8::Protocol::Ft4,
-            ..Ft8Config::default()
-        }));
+        // Simulates an explicit `[decoder].budget_ms = 250` already
+        // published at startup -- smaller than the FT8 ceiling (2000ms).
+        let decode_window = Arc::new(tokio::sync::RwLock::new(DecodeWindowConfig::new(
+            Ft8Config {
+                protocol: pancetta_ft8::Protocol::Ft4,
+                ..Ft8Config::default()
+            },
+            250,
+        )));
         let active_protocol_mode = Arc::new(std::sync::atomic::AtomicU8::new(
             pancetta_config::OperatingMode::Ft4.as_u8(),
         ));
@@ -4392,45 +4681,44 @@ mod tests {
         let resolved_hardware_tier = Arc::new(std::sync::atomic::AtomicU8::new(
             pancetta_ft8::tier_probe::HardwareTier::Fast.as_u8(),
         ));
-        // Simulates an explicit `[decoder].budget_ms = 250` already
-        // seeded into the atomic at startup -- smaller than the FT8
-        // ceiling (2000ms).
-        let decode_effort_budget_ms = Arc::new(std::sync::atomic::AtomicU64::new(250));
 
         let result = try_switch_operating_mode(
             pancetta_config::OperatingMode::Ft8,
             &active_tx_qsos,
-            &ft8_config,
+            &decode_window,
             &active_protocol_mode,
             &active_slot_ns,
             &active_decode_phase_ns,
             &current_decode_effort,
             &resolved_hardware_tier,
-            &decode_effort_budget_ms,
         );
 
         assert!(result.is_ok());
-        let cfg = ft8_config.read().await;
+        let guard = decode_window.read().await;
+        let cfg = guard.ft8();
         assert_eq!(cfg.protocol, pancetta_ft8::Protocol::Ft8);
         assert_eq!(
             cfg.max_decode_passes, 1,
-            "the already-bounded 250ms budget atomic can't afford the \
+            "the already-bounded 250ms published budget can't afford the \
              second pass, even though the mode switch landed on FT8 \
              while the preset is Max"
         );
         assert!(!cfg.time_varying_subtraction_enabled);
-        // The mode switch itself must not have touched the budget atomic.
+        // The mode switch itself must not have touched the budget.
         assert_eq!(
-            decode_effort_budget_ms.load(Ordering::Relaxed),
+            guard.budget_ms(),
             250,
-            "try_switch_operating_mode must never reseed decode_effort_budget_ms"
+            "try_switch_operating_mode must never change the published budget"
         );
     }
 
     #[test]
     fn try_switch_operating_mode_reports_unavailable_on_poisoned_lock() {
         let active_tx_qsos = Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
-        let ft8_config = Arc::new(tokio::sync::RwLock::new(Ft8Config::default()));
+        let decode_window = Arc::new(tokio::sync::RwLock::new(DecodeWindowConfig::new(
+            Ft8Config::default(),
+            0,
+        )));
         let active_protocol_mode = Arc::new(std::sync::atomic::AtomicU8::new(
             pancetta_config::OperatingMode::Ft8.as_u8(),
         ));
@@ -4442,7 +4730,6 @@ mod tests {
         let resolved_hardware_tier = Arc::new(std::sync::atomic::AtomicU8::new(
             pancetta_ft8::tier_probe::HardwareTier::Fast.as_u8(),
         ));
-        let decode_effort_budget_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         // Poison the lock by panicking while holding a write guard.
         let poison_target = Arc::clone(&active_tx_qsos);
@@ -4455,16 +4742,94 @@ mod tests {
         let result = try_switch_operating_mode(
             pancetta_config::OperatingMode::Ft4,
             &active_tx_qsos,
-            &ft8_config,
+            &decode_window,
             &active_protocol_mode,
             &active_slot_ns,
             &active_decode_phase_ns,
             &current_decode_effort,
             &resolved_hardware_tier,
-            &decode_effort_budget_ms,
         );
 
         assert!(matches!(result, Err(ModeSwitchError::QsoSetUnavailable)));
+    }
+
+    /// PAN-164 (Current State §3 of the plan): an FT4->FT8 switch while on
+    /// `Max` must pair FT8's just-enabled second pass with FT8's 2000ms
+    /// ceiling, never FT4's 800ms. The hot loop takes the ceiling from
+    /// the protocol of the decoder it actually built, read in the same
+    /// `try_read()` as the budget, so no separate atomic can tear it.
+    #[tokio::test]
+    async fn mode_switch_publish_pairs_the_ceiling_with_the_protocol() {
+        use super::ft8::{refresh_decode_window, AppliedDecodeWindow, DecodeWindowRefresh};
+
+        let active_tx_qsos = Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
+        let mut ft4_on_max = DecodeWindowConfig::new(
+            Ft8Config {
+                protocol: pancetta_ft8::Protocol::Ft4,
+                ..Ft8Config::default()
+            },
+            0,
+        );
+        ft4_on_max.publish_effort(
+            pancetta_config::DecodeEffort::Max,
+            pancetta_ft8::tier_probe::HardwareTier::Fast,
+            0,
+        );
+        assert_eq!(ft4_on_max.ft8().max_decode_passes, 1, "sanity: FT4 on Max");
+        let mut applied = AppliedDecodeWindow::of(&ft4_on_max);
+        assert_eq!(applied.effective_budget_ms(), 800);
+        let decode_window = Arc::new(tokio::sync::RwLock::new(ft4_on_max));
+        let active_protocol_mode = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_config::OperatingMode::Ft4.as_u8(),
+        ));
+        let active_slot_ns = Arc::new(std::sync::atomic::AtomicI64::new(7_500_000_000));
+        let active_decode_phase_ns = Arc::new(std::sync::atomic::AtomicI64::new(6_500_000_000));
+        let current_decode_effort = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_config::DecodeEffort::Max.as_u8(),
+        ));
+        let resolved_hardware_tier = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_ft8::tier_probe::HardwareTier::Fast.as_u8(),
+        ));
+
+        let result = try_switch_operating_mode(
+            pancetta_config::OperatingMode::Ft8,
+            &active_tx_qsos,
+            &decode_window,
+            &active_protocol_mode,
+            &active_slot_ns,
+            &active_decode_phase_ns,
+            &current_decode_effort,
+            &resolved_hardware_tier,
+        );
+        assert!(result.is_ok());
+
+        // A writer holding the window across the hot loop's refresh: the
+        // loop keeps the whole previous FT4 window (decoder, budget,
+        // ceiling), never FT8's passes under FT4's ceiling.
+        {
+            let held = decode_window.try_write().expect("uncontended");
+            let refresh = refresh_decode_window(&decode_window, &mut applied, |_| {
+                panic!("no rebuild may run while a writer holds the window")
+            });
+            assert_eq!(refresh, DecodeWindowRefresh::<()>::Busy);
+            assert_eq!(applied.rebuild_key.protocol, pancetta_ft8::Protocol::Ft4);
+            assert_eq!(applied.rebuild_key.max_decode_passes, 1);
+            assert_eq!(applied.effective_budget_ms(), 800);
+            drop(held);
+        }
+
+        let refresh = refresh_decode_window(&decode_window, &mut applied, |cfg| {
+            assert_eq!(cfg.protocol, pancetta_ft8::Protocol::Ft8);
+            Ok::<_, ()>(())
+        });
+        assert_eq!(refresh, DecodeWindowRefresh::Rebuilt);
+        assert_eq!(applied.rebuild_key.protocol, pancetta_ft8::Protocol::Ft8);
+        assert_eq!(applied.rebuild_key.max_decode_passes, 2);
+        assert_eq!(
+            applied.effective_budget_ms(),
+            2000,
+            "FT8's second pass must run under FT8's ceiling, never FT4's 800ms"
+        );
     }
 
     #[test]
@@ -4551,6 +4916,153 @@ mod tests {
             ComponentId::Audio,
         ] {
             assert_ne!(degradation_message(id), "Component failed", "{id}");
+        }
+    }
+}
+
+/// PAN-147: shared test-only guard for audit-log temp paths.
+///
+/// The three former per-module `audit_tmp()` helpers (two in `tx.rs`, one in
+/// `station_agent/mod.rs`) handed out `(pid, counter)`-keyed paths and never
+/// deleted the files. `pancetta_agent::audit::AuditLog` opens its file in
+/// append mode on every write, so a leftover file at a path a later
+/// PID-reusing process regenerates corrupts that test's read-back (the
+/// PAN-147 incident: a 2-line read where 1 was written). This guard models
+/// the proven `TempPath` helper in `pancetta-agent/src/audit.rs`'s own test
+/// module (private to that crate, hence this replication): it deletes any
+/// stale occupant of the path — and its rotation-archive siblings — before
+/// handing it out, and deletes them again on drop.
+#[cfg(test)]
+pub(crate) mod audit_test_util {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Deterministic unique suffix for temp files — NOT a clock, NOT random.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// A temp-file path (and its rotation archives) with cleanup before
+    /// first use and on drop.
+    pub(crate) struct TempPath(PathBuf);
+
+    impl TempPath {
+        /// A fresh `{prefix}-{pid}-{n}.log` path under `std::env::temp_dir()`,
+        /// pre-cleaned so a PID-reusing earlier run's leftover cannot collide.
+        pub(crate) fn new(prefix: &str) -> Self {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("{prefix}-{}-{n}.log", std::process::id()));
+            let tp = Self(path);
+            // Ensure a clean slate if a prior run left files behind.
+            tp.cleanup();
+            tp
+        }
+
+        /// Guard an explicit path (same pre-clean). Used by this module's own
+        /// tests; available for deterministic fixtures elsewhere.
+        pub(crate) fn at(path: PathBuf) -> Self {
+            let tp = Self(path);
+            tp.cleanup();
+            tp
+        }
+
+        pub(crate) fn path(&self) -> PathBuf {
+            self.0.clone()
+        }
+
+        fn slot(&self, n: usize) -> PathBuf {
+            if n == 0 {
+                return self.0.clone();
+            }
+            let mut s = self.0.clone().into_os_string();
+            s.push(format!(".{n}"));
+            PathBuf::from(s)
+        }
+
+        fn cleanup(&self) {
+            // 4 = ARCHIVE_COUNT + 1 margin, hardcoded because
+            // `pancetta_agent::audit::ARCHIVE_COUNT` is private to that crate.
+            for n in 0..=4 {
+                let p = self.slot(n);
+                let _ = std::fs::remove_file(&p);
+                let _ = std::fs::remove_dir_all(&p);
+            }
+        }
+    }
+
+    impl Drop for TempPath {
+        fn drop(&mut self) {
+            self.cleanup();
+        }
+    }
+
+    mod tests {
+        use super::*;
+
+        /// PAN-147 regression: a stale file left at the exact path a later
+        /// PID-reusing run regenerates used to precede that run's append-mode
+        /// writes, inflating the read-back (2 lines instead of 1). The guard
+        /// must sweep the stale file and its `.1`..`.4` rotation siblings
+        /// before use, and everything again on drop.
+        #[test]
+        fn stale_leftover_file_and_archive_are_swept_before_use() {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let p = std::env::temp_dir().join(format!(
+                "pancetta-audit-util-test-{}-{n}.log",
+                std::process::id()
+            ));
+            let siblings: Vec<PathBuf> = (1..=4)
+                .map(|slot| p.with_extension(format!("log.{slot}")))
+                .collect();
+            std::fs::write(&p, "stale line\n").unwrap();
+            for s in &siblings {
+                std::fs::write(s, "stale archive\n").unwrap();
+            }
+
+            let t = TempPath::at(p.clone());
+            assert!(!p.exists(), "stale base file must be gone before use");
+            for s in &siblings {
+                assert!(!s.exists(), "stale archive sibling {s:?} must be gone");
+            }
+
+            let audit = pancetta_agent::audit::AuditLog::new(p.clone());
+            audit
+                .append(&pancetta_agent::audit::AuditEvent {
+                    ts_unix_ms: 0,
+                    kind: pancetta_agent::audit::AuditKind::TxDenied,
+                    operator_callsign: None,
+                    detail: "one fresh line".into(),
+                })
+                .expect("append must record");
+            let lines = std::fs::read_to_string(&p).unwrap().lines().count();
+            assert_eq!(
+                lines, 1,
+                "exactly this run's record — stale bytes must not precede it"
+            );
+
+            drop(t);
+            assert!(!p.exists(), "drop must delete the base file");
+            for s in &siblings {
+                assert!(!s.exists(), "drop must delete archive sibling {s:?}");
+            }
+        }
+
+        #[test]
+        fn new_names_carry_prefix_pid_and_unique_counter() {
+            let a = TempPath::new("pancetta-audit-util-naming");
+            let path = a.path();
+            assert!(path.starts_with(std::env::temp_dir()));
+            let name = path
+                .file_name()
+                .expect("path has a file name")
+                .to_string_lossy()
+                .into_owned();
+            assert!(name.contains("pancetta-audit-util-naming"), "{name}");
+            assert!(
+                name.contains(&std::process::id().to_string()),
+                "{name} must carry the pid"
+            );
+            let b = TempPath::new("pancetta-audit-util-naming");
+            assert_ne!(a.path(), b.path(), "counter must keep paths distinct");
         }
     }
 }

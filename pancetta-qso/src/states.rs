@@ -757,6 +757,7 @@ pub struct GridSquares {
 
 /// Contest-specific information
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "ContestInfoRow")]
 pub struct ContestInfo {
     /// Contest name/identifier
     pub contest_name: String,
@@ -772,6 +773,77 @@ pub struct ContestInfo {
 
     /// Multiplier information
     pub multiplier: Option<String>,
+
+    /// The ADIF `CONTEST_ID` value this QSO exports with (PAN-52): an
+    /// ADIF 3.1.5 Contest_ID enumeration value when the engaged contest has
+    /// one, `None` (field omitted) when it does not. Kept separate from
+    /// `contest_name`, which remains the internal catalog/session key:
+    /// `engage_contest_profile` copies it from
+    /// `ContestProfile::adif_contest_id`, and ADIF import stores a
+    /// third-party file's verbatim `CONTEST_ID` here so re-export is
+    /// lossless.
+    ///
+    /// `QsoMetadata` is persisted as JSON in SQLite, and every pre-PAN-52
+    /// row's serialized `ContestInfo` lacks this key; deserialization fills
+    /// it for those rows (`legacy_adif_contest_id`).
+    pub adif_contest_id: Option<String>,
+}
+
+/// How [`ContestInfo`] deserializes: the same fields, except that it tells
+/// a row written before `adif_contest_id` existed (key absent) apart from
+/// one written since (key present; `null` when the contest has no ADIF id).
+#[derive(Deserialize)]
+struct ContestInfoRow {
+    contest_name: String,
+    category: String,
+    serials: ContestSerials,
+    points: u32,
+    multiplier: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present_key")]
+    adif_contest_id: Option<Option<String>>,
+}
+
+/// `Some(value)` whenever the key is present, so a present `null` stays
+/// distinguishable from an absent key (which `#[serde(default)]` makes
+/// `None`).
+fn deserialize_present_key<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
+/// The `adif_contest_id` of a pre-PAN-52 row (PR #502 review): its
+/// `contest_name`, verbatim.
+///
+/// Before PAN-52, ADIF import was the only production code that persisted a
+/// `ContestInfo` — `engage_contest_profile` had no caller outside tests —
+/// and it stored the file's verbatim `CONTEST_ID` in `contest_name`, which
+/// export then stamped as `CONTEST_ID`. So every legacy row's
+/// `contest_name` is an imported `CONTEST_ID`, including one that happens
+/// to equal a built-in profile slug such as `us-state-qso-party`, and
+/// restoring it unconditionally keeps the upgraded index → export path
+/// lossless. Rows written since PAN-52 always carry the key, so the
+/// profile-slug exclusion lives in `engage_contest_profile`, never here.
+fn legacy_adif_contest_id(contest_name: &str) -> Option<String> {
+    Some(contest_name.to_string())
+}
+
+impl From<ContestInfoRow> for ContestInfo {
+    fn from(row: ContestInfoRow) -> Self {
+        let adif_contest_id = match row.adif_contest_id {
+            Some(written) => written,
+            None => legacy_adif_contest_id(&row.contest_name),
+        };
+        Self {
+            contest_name: row.contest_name,
+            category: row.category,
+            serials: row.serials,
+            points: row.points,
+            multiplier: row.multiplier,
+            adif_contest_id,
+        }
+    }
 }
 
 /// Contest serial numbers

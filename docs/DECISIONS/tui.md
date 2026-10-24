@@ -158,8 +158,8 @@ Columns: DX Hunter and Callers follow Band Activity's column-enum pattern. `visi
 walks a priority list, adding each column's minimum width plus 1 of spacing, and stops at the first
 that doesn't fit (prefix rule: monotonic, so widening never removes a column). The budget is
 `width − 2` borders `−` the 2-column `▶ ` highlight, reserved even when unfocused so the set doesn't
-jump on Tab. DX Hunter priority: Call, Entity, SNR, Pri, Last, Rarity, Grid, Rpt, Src (Operate panel
-32 → Call/Entity/SNR; 40 → +Pri; 48 → +Last; 53 → +Rarity; 64 and up, and Hunt view, → all nine).
+jump on Tab. DX Hunter priority: Call, Entity, SNR, Pri, Last, Rarity, Grid, Rpt, Src, Why (Operate panel
+32 → Call/Entity/SNR; 40 → +Pri; 48 → +Last; 53 → +Rarity; 64 → the original nine; 89 → +Why).
 Callers priority: Call, Msg, SNR, Flags, Age, Freq (32 → Call/Msg/SNR; 40 → +Flags; 48 → +Age;
 53 → all six). Callers `Flags` narrowed 12 → 9 (`BUSY WKD` fits; the rare three-flag case reads
 `BUSY MINE`). Empty states read `No DX` / `stations` and `No one` / `calling`.
@@ -347,3 +347,89 @@ status after restart. State learned by the upload subscriber's QRZ enrichment
 updates knowledge and worked state for this session only; it does not rewrite the
 already-delivered local log events. This feature adds no pre-contact lookup,
 state priority bonus, configuration, or remote-protocol field.
+
+## DX Hunter explains its ranking (PAN-94, 2026-10-18)
+
+The Station card adds a `Why:` line, wide DX Hunter panels add a `Why` column,
+and `w` opens the focused station's score breakdown. The card lists the tier's
+reason, cautions, a portable-suffix hint, rarity, and when the station was heard.
+The table omits rarity and heard-time clauses because those have separate columns.
+Cautions include an already-worked contact, a failed QSO this session, and limited
+or old network reports. They combine both score sources even when the other source
+wins the displayed rank.
+
+Portable suffixes are guesses. Every portable hint begins with `maybe` before
+POTA/SOTA; activation language appears only in the detail paragraph, which says
+it is not a confirmed park or summit activation and that bare callsigns are missed.
+There is no new glyph and no activation badge. A grid reason stays hedged unless
+PAN-86's prepared history status confirms it. Missing scores and stale rows have
+explicit explanations instead of fabricated factors.
+
+The Why column joins last at panel width 89. Narrower panels keep their existing
+columns. Hunt reserves six rows for the Station card; Operate retains its existing
+share. The card fits whole clauses, ending with an ellipsis when clauses are omitted.
+The overlay wraps long lines and scrolls with Up/Down. `w` or Escape closes it;
+bare `k` still aborts the selected QSO and Shift+Q still stops transmission.
+
+The detail view lists every input with its source, the actual weights and
+within-tier arithmetic, and whether the station relay or TUI scored the row.
+The existing Pri column remains available; raw arithmetic lives in the overlay.
+Callsign-pinned focus remains stable when a fresh score moves a station in the list.
+
+## Needed entity only from a loaded cqdx.io list (PAN-93, 2026-10-22)
+
+DX Hunter's `+` before a callsign, the station card's `needed` flag and the
+remote `DecodedView.needed` mean one thing: the entity matches a prefix in
+cqdx.io's most recently loaded needed-entity list. That is the per-band list
+for the operating band when cqdx answered for that band, otherwise the
+all-bands list. While no list has loaded, no row shows `+` and the card shows
+`worked` or `new`. `!` (ATNO) and `▲` (new on this band, from the local log)
+are unchanged. The scorer still uses a home/logged-prefix guess while the list
+is unknown; see
+[the priority-scoring decision](priority-scoring.md#needed-is-a-claim-with-availability-pan-93-2026-10-22).
+
+For a per-band-DXCC-new row, the card's `Why:` line, the DX Hunter Why column
+and the overlay's `Why:` line use one of three headlines:
+
+- `needed entity (cqdx list)`: the loaded list names the entity.
+- `maybe needed entity (cqdx list changed)`: the row was scored as needed, and
+  the list loaded since says it is not. It lasts until the next decode
+  re-scores the row.
+- `maybe needed entity (cqdx list not loaded)`: no list has loaded, so the
+  score used the guess.
+
+The `w` overlay's "needed entity" row shows a value and its source:
+
+| Case | Value | Source |
+|---|---|---|
+| List loaded | `yes` / `no` | `cqdx needed list, <band or all bands>, <age> old` |
+| Row scored before the list changed | what the score used | `scored before the cqdx list changed (now yes)` / `(now no)` |
+| No list, guess said needed | `unknown` | `cqdx list not loaded; scored as needed (not a home or logged prefix)` |
+| No list, guess said not needed | `unknown` | `cqdx list not loaded; scored as not needed (home or logged prefix)` |
+
+For a station DX Hunter lists, the Why text, its `+` and the station card's
+`needed` flag follow the list on the next frame after it loads or changes,
+without waiting for another decode. A list that no longer names the entity
+also clears `!` and the card's `ATNO★`. A newly listed ATNO's `!` and the
+row's score and position in the list change when the station is next decoded
+or spotted; the remote `DecodedView.needed` changes at its next decode.
+
+**Strip chips.** `⚠ CQDX NEEDS UNKNOWN` shows while a configured cqdx.io has not
+delivered the needed-entity list: an outage, an empty or invalid token, or a
+401. `⚠ CQDX GRID NEEDS UNKNOWN` shows when only the needed-grid list failed
+with an error other than 404. Both are Warning severity (yellow), acknowledgeable
+with `!`, and never change the TX verdict. The Shift+S detail names the clipped
+error (at most 160 characters, never the token), then says either "pancetta
+keeps retrying." or "Fix [network.cqdx] token and restart pancetta.", and what
+is missing until the list loads. One outage gives one chip: when both lists are
+unavailable only `⚠ CQDX NEEDS UNKNOWN` shows, and its detail ends with "Needed
+grids are unavailable too." The chips clear at the next 2 s snapshot after the
+list loads. Their keys carry no error text, so an acknowledgement survives a
+changed error and is pruned on recovery; a later outage shows again. There is
+no chip when cqdx is not configured, while the first fetch is in flight, or
+when cqdx does not offer the needed-grid endpoint (404). Not configuring cqdx
+is a choice, not a fault.
+
+**No per-row unknown glyph.** An outage would put the same mark on every row
+and say nothing about any one station. The strip chip and the Why text carry
+"unknown" instead, as PAN-86 does for unknown grid and state history.

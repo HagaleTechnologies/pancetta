@@ -46,7 +46,8 @@ runs as happily over SSH on a headless box behind the radio as on a desktop.
   `ft8_lib` is not the bar operators care about.) Full numbers and caveats:
   [`docs/decoder-comparison.md`](docs/decoder-comparison.md).
 - **A priority engine, not a list.** Every decoded CQ is scored against
-  needed DXCC, needed grid, POTA/SOTA, rarity, signal, and recent activity —
+  needed DXCC, needed grid, a portable callsign suffix (`/P`, `/POTA`…) as a
+  possible POTA/SOTA hint, rarity, signal, and recent activity —
   so the station you should work is the one at the top.
 - **Multi-stream TX.** A smart frequency allocator places N simultaneous FT8
   signals inside one 15-second slot, each on its own audio offset, all on the
@@ -140,7 +141,10 @@ the station:
   mismatch (e.g. a needed `K` entry can false-match `KH6`/`KL7`/`KP4`);
   treat rankings as a strong hint, not a guarantee. Needed-grid is wired on
   the Pancetta side but has no live cqdx.io endpoint yet, so it doesn't
-  affect rankings today.
+  affect rankings today. DX Hunter marks a station needed (`+`) only once
+  cqdx.io's needed list has loaded. While a configured cqdx.io is
+  unreachable, the readiness strip shows `⚠ CQDX NEEDS UNKNOWN` and pancetta
+  keeps retrying in the background.
 - **Scoring.** Rarity and live-spot data from cqdx.io feed the same scorer
   alongside signal and recent activity, so the top of the list is the contact
   worth working right now.

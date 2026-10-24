@@ -94,3 +94,144 @@ test (`secondary_score_rarity_spread_moves_the_display_by_a_meaningful_fraction_
 asserts the full rarity spectrum (never-spotted vs. maximally-rare) must move the display by
 >200 of the 999-wide band — it failed at 99 before the fix, passes at 250 after. On-air
 re-verification of the visible gradient is still operator-gated.
+
+## Explain the score and retain the latest observation (PAN-94, 2026-10-18)
+
+`PriorityScorer::score_tiered_explained` captures each lookup input once in
+`PriorityFactors` and computes the tier and secondary score from that record.
+`score_tiered` delegates to it. Tier ordering, weights, operation order and the
+continuous autonomous scorer are unchanged. A pre-refactor fingerprint over
+18,432 input combinations verifies bit-identical scores; the explanation carries
+its actual weighted terms, network bonus, ceiling and freshness multiplier.
+
+DX Hunter stores the latest local and latest cqdx scoring separately. It displays
+the higher of those two scores, preferring local data on ties. This replaces the
+running maximum that kept old scores after a station was worked or a QSO failed.
+The reason's headline and supporting clauses follow the winning score. Cautions
+also retain authoritative failure/worked information from the other source.
+The cqdx path still uses default weights and has no session failure history;
+the detail view states that limitation. Local relay scores use operator weights
+and the coordinator's shared lookup. DX-cluster-only rows remain unscored.
+
+## Needed is a claim with availability (PAN-93, 2026-10-22)
+
+cqdx.io's needed-DXCC and needed-grid lists were plain sets, and an empty set
+stood for "no data". That merged two different facts into one bool. An empty
+needed-DXCC set, whether cqdx never answered or answered "nothing needed", fell
+back to "needed unless a home or logged prefix", or "needed" for every call when
+there were no exclusions. DX Hunter then showed `+` and "needed entity (cqdx
+list)" for a value cqdx never supplied. An empty needed-grid set read as "not
+needed" whether cqdx never answered, answered 404, or answered "none". A failed
+first fetch also left the spot poller unstarted, with no retry and one `warn!`
+line as the only trace.
+
+**Storage (D1).** `CachedStationLookup.needed_dxcc` and `needed_grids` are each
+a `NeedList { entries, availability }` behind one lock, so a reader never sees
+a new list with an old availability. `NeedListAvailability` is `NotConfigured`
+(the default; `[network.cqdx]` off), `Loading`, `NotOffered`,
+`Loaded { fetched_at, band }` (`band` is `None` for the all-bands list) or
+`Unavailable { since, error, retrying }`. `needed_atno` stays a separate set,
+written by the same `apply_needed` call.
+
+**A verdict beside the trait (D2).** `needed_dxcc_status` and
+`needed_grid_status` return `NeedStatus::{Needed, NotNeeded, Unknown}`. They
+return `Unknown` whenever the list is not `Loaded`, and for a callsign or grid
+that cannot be resolved. `WorkedStationLookup::is_needed_dxcc` and
+`is_needed_grid` keep `-> bool` and become the scoring policy over that verdict,
+so none of the trait's implementors change. This follows the PAN-85/86
+precedent of adding inherent siblings beside the trait.
+
+**Scoring policy (D3).** `Needed` scores true and `NotNeeded` scores false. For
+`Unknown`, `is_needed_dxcc` keeps the Phase-5 hardening #2 guess: needed unless
+the call matches an excluded (home or logged) prefix, and needed for every call
+when there are no exclusions. `is_needed_grid` is true only for `Needed`, so an
+unknown grid list still adds nothing. `PriorityWeights`, `score_cq_detailed`
+and `score_tiered_explained` are unchanged.
+
+`Unknown` keeps the guess because this ticket fixes what pancetta claims, not
+what the unattended station calls during a cqdx outage. Giving `Unknown` zero
+needed weight would drop every DX station's needed term while cqdx is down, a
+change to autonomous behavior that deserves its own decision. The Why overlay
+now says the score used a guess.
+
+A loaded empty answer now means "not needed" for every station, in scoring and
+display. cqdx answered and named nothing. Product assessment P04 requires that
+"an empty successful response must not mean every station is needed", and the
+old rule read an answered empty list as missing data. cqdx's contract
+(`docs/cqdx-api-requirements.md`) already returns every entity for a user with
+no log data, so an empty answer is not how a new account looks.
+
+**Display and wire (D4).** The DX Hunter `+`, the station card's `needed` flag,
+the remote `DecodedView.needed` and `CqdxSpotInfo.needed` are true only for
+`NeedStatus::Needed`. They all read one helper,
+`CachedStationLookup::display_needed_atno`. `is_needed_dxcc` is for scoring
+only. The per-frame `DxNeedStatus` carries the verdict (`dxcc_needed`) and the
+loaded list's band and fetch time (`dxcc_list`) to the Why surfaces. Remote
+clients such as panino receive `needed = false` while the list is unknown,
+because the wire field stays a bool.
+
+**Bridge lifecycle (D5).** The coordinator makes one inline startup attempt,
+then registers the bridge and spawns its poller whether or not that attempt
+succeeded. The poller is still registered under `ComponentId::DxCluster`. Spot
+polling waits until the needed-entity list has loaded. This keeps the earlier
+guarantee that cqdx spots flow only alongside a loaded list, so TUI-scored
+network rows and coordinator-scored decodes do not score differently during a
+partial outage.
+
+**Retry policy (D6).** Pending loads (the entity table, the needed-entity list
+while the dial is unknown, and a grid list that can still be retried) retry on
+the first poll tick at least `NEED_DATA_RETRY` (60 s) after the last attempt.
+While the dial is known, the per-band needed fetch keeps retrying every tick,
+as before. Permanent errors (`Unauthorized`, `NotConfigured`, `InvalidToken`,
+`InvalidBaseUrl`, `HttpInit`) stop retries, and the strip says to fix the token
+and restart. An enabled `[network.cqdx]` with a missing or empty token is
+marked the same way. At startup, a transport error (`CqdxError::Http`) or a
+permanent error stops the remaining requests, so the worst-case startup delay
+stays one 30 s client timeout. A `Server` or `Json` error on one endpoint does
+not stop the others. A needed-grids 404 is recorded as `NotOffered`, not as an
+empty answer, and is not retried. When the needed-entity list loads after
+failures, the log says `cqdx.io needed-entity list loaded after N failed
+attempt(s)`.
+
+**Failed refresh after a load (D7).** The list stays `Loaded` with its earlier
+entries. The Why overlay shows its scope and age, so staleness is visible.
+There is no staleness threshold and no periodic refresh of the needed lists.
+
+**Strip warning (D8).** One Warning chip per outage: `⚠ CQDX NEEDS UNKNOWN`
+(`ReadinessKey::CqdxNeeds`) when the needed-entity list is `Unavailable`,
+otherwise `⚠ CQDX GRID NEEDS UNKNOWN` (`ReadinessKey::CqdxGridNeeds`) when only
+the grid list is. The keys carry no error text, so an acknowledgement survives
+a changing error and is pruned on recovery. There is no chip for
+`NotConfigured`, `Loading` or `NotOffered`. Wording is in
+[the TUI decision](tui.md#needed-entity-only-from-a-loaded-cqdxio-list-pan-93-2026-10-22).
+
+**Dead copy (D9).** `pancetta_cqdx::CqdxCache::is_needed_dxcc` returns
+`Option<bool>`, `None` while no needed data is loaded, so the repository no
+longer carries a "no data means needed" rule.
+
+States the operator can now tell apart:
+
+| Situation | Availability | `+` | Strip | Why "needed entity" |
+|---|---|---|---|---|
+| `[network.cqdx]` off (no account) | `NotConfigured` | none | nothing | `unknown`, cqdx list not loaded |
+| Enabled, token empty or invalid | `Unavailable { retrying: false }` | none | `⚠ CQDX NEEDS UNKNOWN` (fix token, restart) | `unknown` |
+| cqdx rejects the token (401) | `Unavailable { retrying: false }` | none | `⚠ CQDX NEEDS UNKNOWN` (fix token, restart) | `unknown` |
+| Outage at startup (refused, timeout, 5xx) | `Unavailable { retrying: true }` | none | `⚠ CQDX NEEDS UNKNOWN` (pancetta keeps retrying) | `unknown` |
+| First fetch in flight | `Loading` | none | nothing | `unknown` |
+| Loaded, entity needed | `Loaded` | `+` | nothing | `yes`, scope and age |
+| Loaded, empty answer ("nothing needed") | `Loaded` | none | nothing | `no`, scope and age |
+| Loaded earlier, later refresh failed | `Loaded` (kept) | from the kept list | nothing | `yes`/`no`, with the old scope and age |
+| Needed-grid endpoint 404 | `NotOffered` | n/a | nothing | n/a |
+
+Operators without cqdx.io lose the `+` marker, which was never backed by cqdx
+data for them. Autonomous ranking for them is unchanged.
+
+Follow-ups, not done here:
+
+- A tri-state `needStatus` on the remote `DecodedView`/`DxRow`. It is a
+  remote-protocol contract change, so it is proposed in dispensa first. Until
+  then panino shows unknown as not needed.
+- Mode scope. cqdx's needed endpoint takes a band only.
+- Worked versus confirmed, and an incomplete-history or new-account signal.
+  cqdx returns no per-entity worked/confirmed state and no log-completeness
+  signal; both need a cqdx API, raised as a dispensa/cqdx question.

@@ -6,8 +6,8 @@
 //!    our decoder or ft8_lib due to unknown signal characteristics)
 
 use pancetta_ft8::{
-    ft8_lib_ffi::ft8lib_decode_audio, DecodeBudget, DecodedMessage, Ft8Config, Ft8Decoder,
-    SAMPLE_RATE, WINDOW_SAMPLES,
+    ft8_lib_ffi::ft8lib_decode_audio, DecodeBudget, DecodeBudgetReport, DecodedMessage, Ft8Config,
+    Ft8Decoder, SAMPLE_RATE, WINDOW_SAMPLES,
 };
 
 fn read_wav_file(path: &str) -> Vec<f32> {
@@ -951,5 +951,143 @@ fn unlimited_budget_never_skips_s4_s7_stages_in_report() {
             report.stages.iter().all(|(l, _, _, _)| *l != "S7-a7"),
             "{fixture_path}: a7_enabled defaults to false, so S7 should never enter its checkpoint"
         );
+    }
+}
+
+/// PAN-165: the `Max` preset's decoder shape (2 passes + time-varying
+/// subtraction, `pancetta/src/coordinator/effort.rs`).
+fn max_shape() -> Ft8Config {
+    Ft8Config {
+        max_decode_passes: 2,
+        time_varying_subtraction_enabled: true,
+        ..Ft8Config::default()
+    }
+}
+
+/// PAN-165: the default (Eco/Standard/Deep) config is one pass, so it never
+/// reaches the subtraction or next-pass gates.
+#[test]
+fn single_pass_config_reports_one_pass_and_no_multipass_stages() {
+    let samples = read_fixture_window("jtdx/190227_155815.wav");
+    let mut d = Ft8Decoder::new(Ft8Config::default()).unwrap();
+    let (_msgs, report) = d
+        .decode_window_budgeted(&samples, DecodeBudget::unlimited())
+        .unwrap();
+    assert_eq!(report.passes_run, 1);
+    for label in [
+        "multipass-subtract",
+        "multipass-outer",
+        "multipass-legacy-deadline",
+    ] {
+        assert!(
+            !report.stages.iter().any(|(l, _, _, _)| *l == label),
+            "a 1-pass config must not report {label}: {:?}",
+            report.stages
+        );
+    }
+}
+
+/// PAN-165: an already-expired budget runs pass 0 (always guaranteed), never
+/// pays for subtraction, and records exactly one gate refusing pass 1.
+#[test]
+fn max_shape_expired_budget_runs_one_pass_and_never_subtracts() {
+    let samples = read_fixture_window("jtdx/190227_155815.wav");
+    let mut d = Ft8Decoder::new(max_shape()).unwrap();
+    let (_msgs, report) = d
+        .decode_window_budgeted(&samples, DecodeBudget::until(std::time::Instant::now()))
+        .unwrap();
+    assert_eq!(report.passes_run, 1, "stages: {:?}", report.stages);
+    let find = |label: &str| report.stages.iter().find(|(l, _, _, _)| *l == label);
+    let sub = find("multipass-subtract").expect("multipass-subtract must be reported");
+    assert_eq!(
+        sub.2, 0,
+        "nothing may be subtracted under an expired budget"
+    );
+    assert!(sub.3 > 0, "pass 0's decodes must be reported as skipped");
+    // Either gate may refuse pass 1 first: the legacy tracker only wins when
+    // pass 0 itself took over 2000 ms (a very slow runner).
+    let gates: Vec<_> = ["multipass-outer", "multipass-legacy-deadline"]
+        .into_iter()
+        .filter_map(find)
+        .collect();
+    assert_eq!(gates.len(), 1, "stages: {:?}", report.stages);
+    assert_eq!(
+        gates[0].3, 1,
+        "exactly one pass must be recorded as skipped"
+    );
+}
+
+/// PAN-165: under an unlimited budget every configured pass is either run or
+/// recorded as cancelled by the legacy call-anchored deadline, on any host.
+#[test]
+fn max_shape_unlimited_budget_accounts_for_every_configured_pass() {
+    let samples = read_fixture_window("generated/ft8_report.wav");
+    let mut d = Ft8Decoder::new(max_shape()).unwrap();
+    let (_msgs, report) = d
+        .decode_window_budgeted(&samples, DecodeBudget::unlimited())
+        .unwrap();
+    let find = |label: &str| report.stages.iter().find(|(l, _, _, _)| *l == label);
+    let sub = find("multipass-subtract").expect("multipass-subtract must be reported");
+    assert!(
+        sub.2 >= 1 && sub.3 == 0,
+        "unlimited must subtract every pass-0 decode: {sub:?}"
+    );
+    let legacy_skipped = find("multipass-legacy-deadline").map_or(0, |e| e.3);
+    assert_eq!(
+        report.passes_run + legacy_skipped,
+        2,
+        "stages: {:?}",
+        report.stages
+    );
+}
+
+/// PAN-165 guard: a bounded budget that is hours away never refuses a pass or
+/// a subtraction, so the headroom gate is invisible when time is ample. The
+/// legacy call-anchored tracker can still cancel pass 1 in only one of the
+/// two runs on a loaded host (seen in CI), so pass counts are compared net of
+/// its refusals, and decoded text must match exactly only when both runs ran
+/// the same passes; otherwise the cut-short run's text is a subset.
+#[test]
+fn max_shape_far_future_budget_matches_unlimited() {
+    let samples = read_fixture_window("generated/ft8_report.wav");
+    let mut d = Ft8Decoder::new(max_shape()).unwrap();
+    let (unl_msgs, unl_report) = d
+        .decode_window_budgeted(&samples, DecodeBudget::unlimited())
+        .unwrap();
+    let mut d = Ft8Decoder::new(max_shape()).unwrap();
+    let far = DecodeBudget::until(std::time::Instant::now() + std::time::Duration::from_secs(3600));
+    let (far_msgs, far_report) = d.decode_window_budgeted(&samples, far).unwrap();
+    let texts = |m: &[DecodedMessage]| {
+        m.iter()
+            .map(|x| x.text.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let find = |r: &DecodeBudgetReport, label: &str| {
+        r.stages.iter().find(|(l, _, _, _)| *l == label).copied()
+    };
+    assert!(
+        find(&far_report, "multipass-outer").is_none(),
+        "the headroom gate must not refuse a pass: {:?}",
+        far_report.stages
+    );
+    let subtract = |r: &DecodeBudgetReport| find(r, "multipass-subtract").map(|e| (e.2, e.3));
+    assert_eq!(subtract(&far_report), subtract(&unl_report));
+    let legacy_skipped =
+        |r: &DecodeBudgetReport| find(r, "multipass-legacy-deadline").map_or(0, |e| e.3);
+    for r in [&unl_report, &far_report] {
+        assert_eq!(
+            r.passes_run + legacy_skipped(r),
+            2,
+            "stages: {:?}",
+            r.stages
+        );
+    }
+    // Pass 0's only clock checks are `DecodeBudget` gates, which pass in both
+    // runs, so a run the legacy tracker cut short decoded a subset of the other.
+    let (unl_texts, far_texts) = (texts(&unl_msgs), texts(&far_msgs));
+    match unl_report.passes_run.cmp(&far_report.passes_run) {
+        std::cmp::Ordering::Equal => assert_eq!(unl_texts, far_texts),
+        std::cmp::Ordering::Less => assert!(unl_texts.is_subset(&far_texts)),
+        std::cmp::Ordering::Greater => assert!(far_texts.is_subset(&unl_texts)),
     }
 }

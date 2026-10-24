@@ -534,7 +534,10 @@ cannot connect until it sends `hello.gatewayToken`.
 `MessageBus::send_message_if` waits for the channel table's read lock, calls a
 synchronous authorization predicate, then enqueues with `try_send`. No await
 separates the predicate from enqueue. Both single-TX and multi-TX use it for
-PTT-on and audio output. A disarm or control transfer during the table-lock wait
+PTT-on and audio output. Since PAN-202, PTT-on uses
+`MessageBus::send_rig_command_if` instead, with the same predicate, no table
+lock and no await; audio output still uses `send_message_if` (see
+tx-scheduling.md, PAN-202). A disarm or control transfer during the table-lock wait
 is therefore observed before either message can reach its consumer.
 
 The predicate must be a leaf with no bus calls, awaits, or blocking work beyond
@@ -616,6 +619,125 @@ watchdog timer before `set_ptt(Off)` returns, so a failed CAT unkey also
 stops that watchdog. Non-remote PTT-off sites (clock-step hold, normal
 Step 9, supersede, tune completion) keep best-effort delivery.
 
+## PAN-136: bundle items carry their own authorization
+
+A multi-TX bundle is gated by one bundle-level binding (`origin` plus
+`remote_client_key_id`). The coalescer folded it once, at coalesce time. The
+bundle can then wait up to about 30 s before PTT, and during that wait Step
+4b-pivot (`pivot_bundle_items`) can swap a live item's payload for a fresher
+`LatestTxIntent` produced under a different authority. `TransmitRequestItem`
+had no binding fields, so the pivot discarded the intent's binding, and Step
+4b-arm, Step 4d-arm, the mid-TX polls and the audio enqueue all checked the
+stale coalesce-time binding. Single-TX Step 4c already carried the binding with
+the payload (PR #362 round 4); the bundle arm did not.
+
+Both shapes reproduced through the real TX worker on `e90233a` (temporary
+module over `pan115_worker_gate_tests::worker_harness`, `qa` intent re-bound to
+`client-B`, two-item bundle):
+
+```
+$ cargo test -p pancetta --lib pan136_repro_tmp -- --nocapture --test-threads=3
+CONTROL-REMOTE: completions=[("SM2LIY K5ARH R-14", false), ("C6AVD K5ARH EM10", false)] ptt_on=false diags=["Remote TX denied (not armed/permitted): multi-TX bundle of 2 items"]
+TEXT-PIVOT: completions=[("SM2LIY K5ARH 73", true), ("C6AVD K5ARH EM10", true)] ptt_on=true diags=[]
+AUTH-ONLY: completions=[("SM2LIY K5ARH R-14", true), ("C6AVD K5ARH EM10", true)] ptt_on=true diags=[]
+$ cargo test -p pancetta --lib pan136_repro_tmp::repro_client_a -- --nocapture
+A-TO-B: armed=Some("client-A") completions=[("SM2LIY K5ARH R-14", true), ("C6AVD K5ARH EM10", true)] ptt_on=true diags=[]
+```
+
+A `Local` bundle keyed a frame re-bound to an unarmed client (with or without
+new text), and client A's bundle aired client B's frame under A's gate. The
+same scenarios are now the `pan136_bundle_binding_worker_tests` module in
+`coordinator/tx.rs`. With Step 4b-rebind disabled, its three reproduction tests
+fail and the armed-B and unarmed-control tests pass, as on `main`.
+
+**Decision: thread the binding through `TransmitRequestItem` permanently.**
+Each item has `origin` and `remote_client_key_id` (both `#[serde(default)]`, no
+`Default` on the struct, so every literal names its binding). Every production
+construction site fills in the binding of the request or entry it came from;
+only the autonomous sequencer's items are legitimately `Local`. The coalescer
+now computes the bundle binding with `coordinator::fold_bundle_identity` over
+the items it built, which is its original fold lifted into a shared helper, and
+supersede's conflict match became `coordinator::remote_identities_conflict`
+with the same truth table.
+
+The research phase had recommended the alternative: keep the item type, read
+each item's binding from `latest_tx_intent` after the pivot, and re-fold. It
+cannot close the gap, for four reasons:
+
+1. An authorization-only rebind must count as a pivot, so that it plants the
+   `pivoted_once` tombstone and Step 0-dup drops the producing request still
+   queued behind the frame; otherwise the frame airs again a cycle later (the
+   double-PTT class). Detecting the rebind means comparing each item's own
+   binding with its intent's. A bundle-level binding manufactures spurious
+   pivots: a `Local` item in a `Remote` bundle never matches its own intent.
+2. The PAN-75 rollback needs the replaced frame's binding. When a pivot changes
+   only the binding, `UnsentAttemptPayload.remote_binding` is the only thing
+   that tells the replaced frame from the fresh same-text, same-offset one.
+3. Items without an intent (`qso_id: None`, a missing entry, or a poisoned
+   `latest_tx_intent` lock) would have no binding to read.
+4. Supersede's scalar precedent combines exactly two bindings; a bundle pivot
+   handles up to `MAX_RETAINED_TX_STREAMS` items, each with its own.
+
+`pivot_bundle_items` now passes each item's own binding to `tx_pivot_target`,
+exactly like Step 4c, so an authorization-only rebind is a bundle pivot
+(tombstoned and re-encoded like any other), and the binding is replaced
+atomically with the payload. Step 4b-pivot records each replaced frame with
+`remote_binding: Some(<the item's binding before the pivot>)`.
+
+**Step 4b-rebind.** Immediately after the pivot, and only when something
+pivoted, the bundle arm:
+
+- holds any live item whose new binding conflicts with the bundle's anchor
+  (`coordinator::bundle_identity_conflict_mask`). The anchor is the binding
+  the bundle was admitted under while a live item still carries it, otherwise
+  the first live `Remote` item in bundle order (the coalescer's "keep the first
+  remote channel" rule). A peer that re-binds one QSO therefore cannot displace
+  frames the arm already admitted. Items are still separable at this point, so
+  the hold reuses the per-item drop and re-encode path, with its own diagnostic
+  (`holding multi-TX item: its remote binding changed during the pre-PTT wait
+  and conflicts with the rest of the bundle: '<text>'`) and the PAN-75 report of
+  the replaced frame. The held items' pivots are removed from the tombstone
+  list, so their own queued requests get full per-entry admission next cycle;
+- re-folds `origin` and `remote_client_key_id` with `fold_bundle_identity` over
+  the surviving live items, shadowing the coalesce-time values for every later
+  gate, poll, supersede and denial attribution in the arm.
+
+When nothing pivoted the arm is unchanged. Step 4b-arm and Step 4d-arm remain
+the authorization; the mask is pure and takes no arm lock.
+
+**Accepted trade-off.** If a `Local` bundle's item is re-bound to an unarmed
+client, the re-folded bundle is `Remote` and Step 4b-arm denies the whole
+bundle for that slot, audited per item through the existing denial path with
+the existing "arm went stale during slot wait" text. This is the same rule as
+an arm that goes stale mid-wait: the gate covers the whole summed waveform. The
+siblings retry next cycle through keep-call. Per-item arm filtering at Step 4b
+would add a second audited denial path inside the worker, and we chose not to.
+
+**Mid-TX refreshes compare per item (Codex P2 on PR #456).** Two bundles can
+fold to the same binding while one matching item's binding changed, e.g. a
+local takeover of one of two Remote-A QSOs with identical text. Comparing only
+the folded scalars, `classify_incoming_during_tx` saw an unchanged overlap and
+requeued the refresh, the requeue strip dropped every item as already sent,
+and client A's disarm then aborted the old bundle with the entitled local
+refresh gone. The classifier (both arms, including the pivot-tombstone and
+untracked-duplicate checks) and the requeue strip now also require each
+matching in-flight item's own `origin` and `remote_client_key_id` to match,
+on top of the bundle-level comparison, so such a refresh supersedes.
+`items_abandoned_by_supersede` no longer counts a re-bound same-content item
+as carried over, and reports it under its own (old) binding so the PAN-75
+rollback reverses the old-authority attempt, not the re-bound one.
+
+**Out of scope.** Otherwise the supersede paths' rollback binding
+(`items_abandoned_by_supersede`, `report_abandoned_bundle_item`) still passes
+the bundle's binding only when the bundle-level authorization changed; it is
+PAN-75 supersede code. There is no
+re-pivot at Step 4d: an intent written between Step 4b-pivot and PTT is not
+picked up, as on the single-TX path, and the Step 4d-arm predicate re-checks
+the re-folded binding. The bundle-level scalars on `MultiTransmitRequest` stay
+as the gate binding. No wire, config or dispensa contract changes:
+`MessageType` is never serialized and neither type appears in
+`pancetta-protocol` or `pancetta-agent`.
+
 ## PAN-209: record a split change only once Hamlib has it
 
 The TX band-plan gate resolves the TX dial from the coordinator's shared
@@ -669,9 +791,9 @@ Both are accepted, with no producer-side inhibit. The first widens the TX
 worker's existing window only by this gap. The second needs a stall at
 least as long as Hamlib's dequeue and CAT round trip.
 
-Not covered: a split changed at the radio itself is still never polled back
-(PAN-206), and a TUI and a remote `SetSplit` interleaving between enqueue
-and store can still leave the atomic on the earlier of the two.
+Rig-side split readback is now covered by PAN-206's poll-loop reconciliation
+(see `tx-scheduling.md`). A TUI and a remote `SetSplit` interleaving between
+enqueue and store can still leave the atomic on the earlier of the two.
 
 ## PAN-139: refuse denied remote close-step opens before mutating the QSO
 

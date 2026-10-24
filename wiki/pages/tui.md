@@ -39,3 +39,21 @@ restored band rows do not carry stale flags. Unknown history suppresses these
 indicators.
 See [the PAN-86 decision](../../docs/DECISIONS/tui.md#needed-grids-and-states-in-dx-hunter-pan-86-2026-10-18)
 for history availability, state accumulation, and session-only QRZ enrichment.
+
+PAN-94 adds a Station-card reason, a Why column at panel width 89, and a `w`
+breakdown overlay. Reasons use the inputs stored with the latest score, and
+portable callsign suffixes are explicitly guesses. See
+[the PAN-94 decision](../../docs/DECISIONS/tui.md#dx-hunter-explains-its-ranking-pan-94-2026-10-18)
+for clause order, missing-history wording, score-source selection and keys.
+
+Gotcha (PAN-93): `CachedStationLookup::is_needed_dxcc` is the scoring guess.
+While cqdx.io's needed list has not loaded it still returns true for any call
+outside the home and logged prefixes. Display and wire surfaces must use
+`display_needed_atno` or `needed_dxcc_status`, which never claim needed while
+the list is unknown. See
+[the PAN-93 decision](../../docs/DECISIONS/priority-scoring.md#needed-is-a-claim-with-availability-pan-93-2026-10-22).
+
+The local relay remembers the last decoded grid per exact callsign and band for
+its session. Grid-less reports and acknowledgments use that grid when rescoring;
+worked-grid and failure history are still read afresh. Otherwise a report could
+erase the grid-based rank while DX Hunter still displayed the earlier CQ's grid.

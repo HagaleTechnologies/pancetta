@@ -2603,7 +2603,7 @@ async fn refresh_active_qso_ap(
     qso_manager: &pancetta_qso::QsoManager,
     my_call: &str,
     scorer: &pancetta_qso::PriorityScorer,
-    ft8_config: &std::sync::Arc<tokio::sync::RwLock<pancetta_ft8::Ft8Config>>,
+    decode_window: &std::sync::Arc<tokio::sync::RwLock<super::DecodeWindowConfig>>,
     ap_state: &std::sync::Arc<std::sync::RwLock<Vec<pancetta_ft8::QsoAp>>>,
 ) {
     let active = qso_manager.get_active_qsos().await;
@@ -2613,7 +2613,7 @@ async fn refresh_active_qso_ap(
             qso_ap_candidate_from_progress(&progress.state, &progress.metadata, my_call)
         })
         .collect();
-    let max_ap_qsos = ft8_config.read().await.max_ap_qsos;
+    let max_ap_qsos = decode_window.read().await.ft8().max_ap_qsos;
     let ranked = rank_active_qsos_for_ap(&candidates, scorer, max_ap_qsos);
     if let Ok(mut guard) = ap_state.write() {
         *guard = ranked;
@@ -2889,6 +2889,8 @@ impl super::ApplicationCoordinator {
         let lotw_cfg = config.network.lotw.clone();
         let eqsl_cfg = config.network.eqsl.clone();
         let cqdx_cfg = config.network.cqdx.clone();
+        // PAN-57: the quick-retry schedule for the pending-upload queue.
+        let retry_cfg = config.network.reliability.retry.clone();
         // QRZ paid-XML callsign lookup — a gated, best-effort enrichment that
         // fills a MISSING their-grid (and name/dxcc for logging) on a completed
         // QSO's metadata before the ADIF record is rendered for upload.
@@ -2985,11 +2987,60 @@ impl super::ApplicationCoordinator {
 
         let qso_lookup = self.cached_lookup.clone();
         let upload_our_callsign = our_callsign.clone();
+
+        // PAN-57: ClubLog, QRZ Logbook, eQSL and cqdx.io uploads go through
+        // the one process-wide pending-upload worker. It is started on the
+        // first Qso start that has a destination and reused on every restart
+        // (a crash-restart can briefly leave the old subscriber alive; two
+        // writers on the queue file must never happen).
+        let outbox_dests = super::upload_outbox::outbox_destinations(
+            clublog_cfg.enabled,
+            qrz_cfg.enabled,
+            eqsl_cfg.enabled,
+            cqdx_upload_enabled,
+            replay_mode,
+        );
+        if upload_enabled && !outbox_dests.is_empty() && self.upload_outbox.is_none() {
+            let clients = super::upload_outbox::build_logbook_clients(
+                &clublog_cfg,
+                &qrz_cfg,
+                &eqsl_cfg,
+                &cqdx_cfg,
+                &upload_our_callsign,
+            );
+            let path = pancetta_home(&pancetta_home_override)
+                .join(".pancetta")
+                .join(pancetta_dx::upload_outbox::OUTBOX_FILE_NAME);
+            let schedule = pancetta_dx::upload_outbox::RetrySchedule::new(
+                retry_cfg.max_attempts,
+                retry_cfg.base_delay_ms,
+                retry_cfg.max_delay_ms,
+                retry_cfg.backoff_multiplier,
+                retry_cfg.jitter_factor,
+                super::upload_outbox::OutboxTiming::PRODUCTION.slow_retry,
+            );
+            let (handle, task) = super::upload_outbox::start_upload_outbox(
+                path,
+                std::sync::Arc::new(clients),
+                schedule,
+                super::upload_outbox::OutboxTiming::PRODUCTION,
+                self.upload_health.clone(),
+                Some(self.message_bus.clone()),
+                self.shutdown_signal.clone(),
+            );
+            self.upload_outbox = Some(handle);
+            self.upload_outbox_task = Some(task);
+        }
+        let upload_outbox = if outbox_dests.is_empty() {
+            None
+        } else {
+            self.upload_outbox.clone()
+        };
         let active_qso_ap = self.active_qso_ap.clone();
         // Task 5: `max_ap_qsos` is hot-reloadable, so the AP-context write
         // site below re-reads it fresh from this shared handle on every
         // QSO event rather than snapshotting it once at startup.
-        let ft8_config_for_ap = self.ft8_config.clone();
+        let decode_window_for_ap = self.decode_window.clone();
         let active_qso_freq_hz = self.active_qso_freq_hz.clone();
         // PAN-72 round-8 redesign (fix 2): the same live `active_slot_ns`
         // atomic Fix 1 uses inside `pancetta-qso`, so the decoder hint's
@@ -3251,6 +3302,13 @@ impl super::ApplicationCoordinator {
             // — see the call site and that function's doc for why.
             let remote_tx_arm_for_auto73 = self.remote_tx_arm();
 
+            // PAN-42: released immediately before the receiver loop below,
+            // and by `Drop` on every earlier exit (startup error, panic,
+            // abort), so the `--replay` feeder never starts while this task
+            // is still seeding history -- and never waits forever either.
+            let consumer_ready =
+                super::replay::QsoConsumerReadyGuard::new(self.qso_consumer_ready.clone());
+
             tokio::spawn(async move {
                 if let Err(e) = qso_manager.start().await {
                     error!("Failed to start QSO manager: {}", e);
@@ -3261,10 +3319,7 @@ impl super::ApplicationCoordinator {
                 // own doc comment) -- tests point it at an isolated temp dir so
                 // the replay-history-seed read below (and, outside replay, the
                 // real writers) never touch the operator's actual `~/.pancetta`.
-                let pancetta_home = pancetta_home_override
-                    .clone()
-                    .or_else(dirs::home_dir)
-                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                let pancetta_home = pancetta_home(&pancetta_home_override);
 
                 // Rebuildable SQLite index at ~/.pancetta/qso.db.
                 let db_path = pancetta_home.join(".pancetta").join("qso.db");
@@ -3299,18 +3354,16 @@ impl super::ApplicationCoordinator {
                 // + eQSL + LoTW), with optional QRZ-XML grid enrichment applied
                 // first. Opt-in: only spawned when at least one upload target OR
                 // QRZ XML enrichment is enabled, and never under `--replay`
-                // (see `upload_enabled`). Best-effort and fully decoupled
-                // from the QSO pipeline — each upload runs in its own task so a
-                // slow/failing service never blocks logging.
+                // (see `upload_enabled`). Fully decoupled from the QSO
+                // pipeline: ClubLog/QRZ/eQSL/cqdx.io uploads are handed to the
+                // durable pending-upload queue (PAN-57), which retries them
+                // and survives restarts; LoTW keeps its single tqsl attempt in
+                // its own task.
                 if upload_enabled {
                     start_qso_upload_subscriber(
-                        clublog_cfg.clone(),
-                        qrz_cfg.clone(),
+                        upload_outbox.clone(),
                         lotw_cfg.clone(),
-                        eqsl_cfg.clone(),
-                        cqdx_cfg.clone(),
                         qrz_xml_cfg.clone(),
-                        upload_our_callsign.clone(),
                         station_power_watts,
                         qso_manager.subscribe(),
                         shutdown.clone(),
@@ -3620,7 +3673,7 @@ impl super::ApplicationCoordinator {
                                     &snapshot_qso_manager,
                                     &tx_callsign,
                                     &ap_priority_scorer,
-                                    &ft8_config_for_ap,
+                                    &decode_window_for_ap,
                                     &ap_state,
                                 )
                                 .await;
@@ -3753,6 +3806,7 @@ impl super::ApplicationCoordinator {
                                 }
                             }
                             Ok(pancetta_qso::QsoEvent::MessageToSend {
+                                attempt_id,
                                 qso_id,
                                 message,
                                 frequency,
@@ -3791,6 +3845,7 @@ impl super::ApplicationCoordinator {
                                             m.insert(
                                                 super::active_tx_qso_key(&qso_id.to_string()),
                                                 super::LatestTxIntent {
+                                                    attempt_id,
                                                     message_text: text.clone(),
                                                     frequency_offset: frequency,
                                                     tx_parity,
@@ -3804,6 +3859,7 @@ impl super::ApplicationCoordinator {
                                             ComponentId::Qso,
                                             ComponentId::Ft8Transmitter,
                                             MessageType::TransmitRequest {
+                                                attempt_id,
                                                 message_text: text,
                                                 frequency_offset: frequency,
                                                 qso_id: Some(qso_id.to_string()),
@@ -3951,7 +4007,7 @@ impl super::ApplicationCoordinator {
                                     &snapshot_qso_manager,
                                     &tx_callsign,
                                     &ap_priority_scorer,
-                                    &ft8_config_for_ap,
+                                    &decode_window_for_ap,
                                     &ap_state,
                                 )
                                 .await;
@@ -4021,6 +4077,10 @@ impl super::ApplicationCoordinator {
                                     );
                                     let _ = snapshot_bus.send_message(diag_msg).await;
 
+                                    // PAN-94: record before the outcome below, so
+                                    // the TUI relay's rescore on it sees this contact.
+                                    qso_lookup.record_completed_contact(&metadata);
+
                                     // observability-diagnostics-plan.md Layer 2
                                     // (2026-07-25 plan, Task 1): sibling
                                     // structured Recent-QSOs outcome, additive
@@ -4036,8 +4096,6 @@ impl super::ApplicationCoordinator {
                                         Instant::now(),
                                     );
                                     let _ = snapshot_bus.send_message(recent_msg).await;
-
-                                    qso_lookup.record_completed_contact(&metadata);
 
                                     // item-2-auto-73: stash MANUAL completions so
                                     // that if this DX keeps re-sending RR73/RRR (they
@@ -4126,7 +4184,7 @@ impl super::ApplicationCoordinator {
                                     &snapshot_qso_manager,
                                     &tx_callsign,
                                     &ap_priority_scorer,
-                                    &ft8_config_for_ap,
+                                    &decode_window_for_ap,
                                     &ap_state,
                                 )
                                 .await;
@@ -4187,6 +4245,18 @@ impl super::ApplicationCoordinator {
                                 );
                                 let _ = snapshot_bus.send_message(diag_msg).await;
 
+                                // PAN-94: record before the outcome below, so
+                                // the TUI relay's rescore on it sees this failure.
+                                if let Some(ref their_call) = metadata.their_callsign {
+                                    info!(
+                                        "QSO failed with {}: {} (adding backoff)",
+                                        their_call, reason_text
+                                    );
+                                    qso_lookup.record_failure(their_call);
+                                } else {
+                                    info!("QSO failed: {}", reason_text);
+                                }
+
                                 // observability-diagnostics-plan.md Layer 2
                                 // (2026-07-25 plan, Task 1): sibling
                                 // structured Recent-QSOs outcome, additive
@@ -4205,16 +4275,6 @@ impl super::ApplicationCoordinator {
                                         Instant::now(),
                                     );
                                     let _ = snapshot_bus.send_message(recent_msg).await;
-                                }
-
-                                if let Some(ref their_call) = metadata.their_callsign {
-                                    info!(
-                                        "QSO failed with {}: {} (adding backoff)",
-                                        their_call, reason_text
-                                    );
-                                    qso_lookup.record_failure(their_call);
-                                } else {
-                                    info!("QSO failed: {}", reason_text);
                                 }
                             }
                             Ok(pancetta_qso::QsoEvent::MessageRejected {
@@ -4357,6 +4417,11 @@ impl super::ApplicationCoordinator {
                 // is O(1) amortised and requires no locking (loop is single-task).
                 let mut caller_dedup: (u64, std::collections::HashSet<String>) =
                     (0, std::collections::HashSet::new());
+
+                // PAN-42: the receiver loop starts here, so the replay
+                // feeder may start feeding now (the history seed above has
+                // fully completed by this point).
+                consumer_ready.release();
 
                 while !shutdown.load(Ordering::Acquire) {
                     match qso_rx.try_recv() {
@@ -5517,13 +5582,22 @@ impl super::ApplicationCoordinator {
                                                 ),
                                             }
                                         }
-                                        crate::message_bus::QsoMessage::TxFrameNotSent { qso_id, message_text, replaced } => {
+                                        crate::message_bus::QsoMessage::TxFrameNotSent { qso_id, message_text, replaced, attempt_id } => {
                                             match qso_id.parse::<pancetta_qso::QsoId>() {
                                                 Ok(id) => {
-                                                    let outcome = qso_manager.roll_back_unsent_attempt(id, &message_text, replaced.as_ref()).await;
-                                                    debug!(target: "qso", "TX frame not sent for QSO {} ('{}'): {:?}", qso_id, message_text, outcome);
+                                                    let outcome = qso_manager.roll_back_unsent_attempt(id, &message_text, replaced.as_ref(), attempt_id).await;
+                                                    debug!(target: "qso", "TX frame not sent for QSO {} ('{}', attempt {:?}): {:?}", qso_id, message_text, attempt_id, outcome);
                                                 }
                                                 Err(e) => debug!(target: "qso", "TxFrameNotSent: bad QSO id '{}': {}", qso_id, e),
+                                            }
+                                        }
+                                        crate::message_bus::QsoMessage::TxFrameSent { qso_id, message_text, aired, aired_at } => {
+                                            match qso_id.parse::<pancetta_qso::QsoId>() {
+                                                Ok(id) => {
+                                                    let released = qso_manager.confirm_stall_trigger_aired(id, &message_text, &aired, aired_at).await;
+                                                    debug!(target: "qso", "TX frame aired for QSO {} ('{}'): released held stall action: {}", qso_id, message_text, released);
+                                                }
+                                                Err(e) => debug!(target: "qso", "TxFrameSent: bad QSO id '{}': {}", qso_id, e),
                                             }
                                         }
                                         crate::message_bus::QsoMessage::ResendQso { qso_id } => {
@@ -8830,9 +8904,11 @@ mod auto_73_tests {
 /// `docs/cqdx-api-requirements.md`) — built from the same `QsoMetadata`, using
 /// the dial+offset RF frequency already stamped on the completed metadata.
 ///
-/// Best-effort by design: uploads are decoupled from the QSO pipeline and never
-/// block it. Each per-service upload is spawned in its own task. Successes log
-/// at `info!`, duplicates at `info!` (non-fatal), failures at `warn!` (target
+/// Decoupled from the QSO pipeline and never blocks it. ClubLog, QRZ
+/// Logbook, eQSL and cqdx.io uploads are handed to the durable pending-upload
+/// queue (`upload_outbox`, PAN-57), which retries them and survives restarts;
+/// LoTW keeps a single tqsl attempt in its own task. Successes log at
+/// `info!`, duplicates at `info!` (non-fatal), failures at `warn!` (target
 /// `"qso.upload"`). Credentials / tokens are never logged.
 /// Whether the opt-in cqdx.io per-QSO logbook upload should run: the
 /// `[network.cqdx]` integration must be enabled AND carry a non-empty PAT
@@ -8840,6 +8916,15 @@ mod auto_73_tests {
 /// subscriber never fires unless the operator opts in.
 fn cqdx_logbook_upload_enabled(cfg: &pancetta_config::network::CqdxConfig) -> bool {
     cfg.enabled && cfg.token.as_ref().is_some_and(|t| !t.is_empty())
+}
+
+/// The directory holding `.pancetta/`: the test-only override, else the home
+/// directory, else the working directory.
+fn pancetta_home(override_: &Option<std::path::PathBuf>) -> std::path::PathBuf {
+    override_
+        .clone()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
 /// Whether the per-QSO logbook upload subscriber should run at all: at least
@@ -9115,18 +9200,15 @@ async fn maybe_enrich_from_qrz(
     }
 }
 
-// rationale: one explicit config arg per upload destination (ClubLog, QRZ,
-// cqdx, LoTW, eQSL) plus the event source + shared handles — bundling them into
-// a struct would just move the same fields without improving clarity.
+// rationale: the queue handle, one explicit config arg per remaining direct
+// destination (LoTW, QRZ XML) plus the event source + shared handles —
+// bundling them into a struct would just move the same fields without
+// improving clarity.
 #[allow(clippy::too_many_arguments)]
 fn start_qso_upload_subscriber(
-    clublog_cfg: pancetta_config::network::ClubLogConfig,
-    qrz_cfg: pancetta_config::network::QrzLogbookConfig,
+    outbox: Option<super::upload_outbox::UploadOutboxHandle>,
     lotw_cfg: pancetta_config::network::LotwUploadConfig,
-    eqsl_cfg: pancetta_config::network::EqslConfig,
-    cqdx_cfg: pancetta_config::network::CqdxConfig,
     qrz_xml_cfg: pancetta_config::network::QrzXmlConfig,
-    our_callsign: String,
     station_power_watts: u32,
     mut events: tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -9134,58 +9216,8 @@ fn start_qso_upload_subscriber(
 ) {
     use std::sync::Arc;
 
-    // Build the enabled clients once and share them across uploads.
-    let clublog_client = if clublog_cfg.enabled {
-        // Fall back to the QSO's own call when no station call is configured.
-        let callsign = if clublog_cfg.callsign.is_empty() {
-            our_callsign.clone()
-        } else {
-            clublog_cfg.callsign.clone()
-        };
-        // An empty configured key falls back to Pancetta's own compiled-in
-        // ClubLog application key (empty on a source build) — resolved here,
-        // at point of use, rather than baked into the config value itself,
-        // so a rotated compiled key takes effect immediately with no config
-        // file changes and a config resave never freezes in a stale one.
-        let api_key = if clublog_cfg.api_key.is_empty() {
-            pancetta_config::default_clublog_api_key()
-        } else {
-            clublog_cfg.api_key.clone()
-        };
-        Some(Arc::new(pancetta_dx::ClubLogClient::new(
-            clublog_cfg.email.clone(),
-            clublog_cfg.password.clone(),
-            callsign,
-            api_key,
-        )))
-    } else {
-        None
-    };
-
-    let qrz_client = if qrz_cfg.enabled {
-        Some(Arc::new(pancetta_dx::QrzLogbookClient::new(
-            qrz_cfg.api_key.clone(),
-        )))
-    } else {
-        None
-    };
-
-    // eQSL.cc client. Opt-in: enabled + username/password (config validation
-    // already rejects enabled-without-creds). QTH nickname is optional.
-    let eqsl_client = if eqsl_cfg.enabled {
-        let nick = if eqsl_cfg.qth_nickname.is_empty() {
-            None
-        } else {
-            Some(eqsl_cfg.qth_nickname.clone())
-        };
-        Some(Arc::new(pancetta_dx::EqslClient::new(
-            eqsl_cfg.username.clone(),
-            eqsl_cfg.password.clone(),
-            nick,
-        )))
-    } else {
-        None
-    };
+    // ClubLog, QRZ Logbook, eQSL and cqdx.io clients live in the
+    // pending-upload worker (`upload_outbox::build_logbook_clients`).
 
     // LoTW client. Opt-in: enabled + tqsl_path + station_location (config
     // validation already rejects enabled-without-creds). Signs + uploads each
@@ -9196,30 +9228,6 @@ fn start_qso_upload_subscriber(
             lotw_cfg.tqsl_path.clone(),
             lotw_cfg.station_location.clone(),
         )))
-    } else {
-        None
-    };
-
-    // cqdx.io logbook client. Opt-in: enabled + a non-empty PAT token. A
-    // malformed token (CqdxClient::new validation) is logged once at WARN and
-    // simply disables the cqdx upload — it never takes down the subscriber.
-    let cqdx_client = if cqdx_cfg.enabled {
-        match cqdx_cfg.token.as_ref().filter(|t| !t.is_empty()) {
-            Some(token) => {
-                match pancetta_cqdx::CqdxClient::new(cqdx_cfg.base_url.clone(), token.clone()) {
-                    Ok(c) => Some(Arc::new(c)),
-                    Err(e) => {
-                        // Token value is wrapped/redacted; the error never prints it.
-                        warn!(
-                            target: "qso.upload",
-                            "cqdx.io upload disabled — client init failed: {}", e
-                        );
-                        None
-                    }
-                }
-            }
-            None => None,
-        }
     } else {
         None
     };
@@ -9250,20 +9258,8 @@ fn start_qso_upload_subscriber(
     let qrz_xml_cache: Arc<Mutex<HashMap<String, Option<pancetta_dx::QrzLookup>>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    if clublog_client.is_some() {
-        info!(target: "qso.upload", "ClubLog per-QSO upload enabled");
-    }
-    if qrz_client.is_some() {
-        info!(target: "qso.upload", "QRZ Logbook per-QSO upload enabled");
-    }
-    if eqsl_client.is_some() {
-        info!(target: "qso.upload", "eQSL.cc per-QSO upload enabled");
-    }
     if lotw_client.is_some() {
         info!(target: "qso.upload", "LoTW per-QSO (TQSL-signed) upload enabled");
-    }
-    if cqdx_client.is_some() {
-        info!(target: "qso.upload", "cqdx.io per-QSO logbook upload enabled");
     }
     if qrz_xml_client.is_some() {
         info!(
@@ -9314,69 +9310,35 @@ fn start_qso_upload_subscriber(
                         .clone()
                         .unwrap_or_else(|| "?".to_string());
 
-                    if let Some(client) = clublog_client.clone() {
-                        let record = record.clone();
-                        let their = their.clone();
-                        tokio::spawn(async move {
-                            match client.upload_adif(&record).await {
-                                Ok(()) => info!(
-                                    target: "qso.upload",
-                                    "ClubLog: uploaded QSO with {}", their
-                                ),
-                                Err(e) => warn!(
-                                    target: "qso.upload",
-                                    "ClubLog: upload failed for {}: {}", their, e
-                                ),
-                            }
-                        });
-                    }
-
-                    if let Some(client) = qrz_client.clone() {
-                        let record = record.clone();
-                        let their = their.clone();
-                        tokio::spawn(async move {
-                            match client.upload_adif(&record).await {
-                                Ok(pancetta_dx::QrzInsertOutcome::Inserted { logid }) => info!(
-                                    target: "qso.upload",
-                                    "QRZ: uploaded QSO with {} (logid={})",
-                                    their,
-                                    logid.as_deref().unwrap_or("?")
-                                ),
-                                Ok(pancetta_dx::QrzInsertOutcome::Duplicate { .. }) => info!(
-                                    target: "qso.upload",
-                                    "QRZ: QSO with {} already logged (duplicate, skipped)",
-                                    their
-                                ),
-                                Err(e) => warn!(
-                                    target: "qso.upload",
-                                    "QRZ: upload failed for {}: {}", their, e
-                                ),
-                            }
-                        });
-                    }
-
-                    // eQSL.cc takes the same rendered ADIF record (the client
-                    // prepends an ADIF header carrying the account credentials).
-                    if let Some(client) = eqsl_client.clone() {
-                        let record = record.clone();
-                        let their = their.clone();
-                        tokio::spawn(async move {
-                            match client.upload_adif(&record).await {
-                                Ok(pancetta_dx::QsoUploadOutcome::Logged) => info!(
-                                    target: "qso.upload",
-                                    "eQSL: uploaded QSO with {}", their
-                                ),
-                                Ok(pancetta_dx::QsoUploadOutcome::Duplicate) => info!(
-                                    target: "qso.upload",
-                                    "eQSL: QSO with {} already logged (duplicate, skipped)",
-                                    their
-                                ),
-                                Err(e) => warn!(
-                                    target: "qso.upload",
-                                    "eQSL: upload failed for {}: {}", their, e
-                                ),
-                            }
-                        });
+                    // PAN-57: ClubLog, QRZ Logbook, eQSL and cqdx.io go
+                    // through the durable pending-upload queue. ClubLog/QRZ/
+                    // eQSL take the rendered ADIF record (eQSL's client adds
+                    // its credential header at send time, so the queue never
+                    // stores a secret). cqdx.io takes the structured QsoRecord
+                    // its `POST /api/v1/qsos` endpoint expects, built once
+                    // here so every retry carries the same startTime/endTime
+                    // and hits the same idempotency key; it is skipped when
+                    // the contra-callsign is unknown. Frequency is the
+                    // dial+offset RF value already stamped on the metadata.
+                    if let Some(outbox) = &outbox {
+                        let cqdx_payload = if outbox
+                            .destinations()
+                            .contains(&pancetta_dx::upload_outbox::UploadDestination::Cqdx)
+                        {
+                            cqdx_record_from_metadata(&metadata)
+                                .and_then(|qso| serde_json::to_string(&qso).ok())
+                        } else {
+                            None
+                        };
+                        outbox
+                            .enqueue(super::upload_outbox::outbox_batch(
+                                metadata.qso_id,
+                                &their,
+                                &record,
+                                cqdx_payload,
+                                outbox.destinations(),
+                            ))
+                            .await;
                     }
 
                     // LoTW signs + uploads the same rendered ADIF record by
@@ -9402,34 +9364,6 @@ fn start_qso_upload_subscriber(
                                 ),
                             }
                         });
-                    }
-
-                    // cqdx.io takes the structured QsoRecord its
-                    // `POST /api/v1/qsos` endpoint expects (not ADIF). We only
-                    // have something to upload once the contra-callsign is
-                    // known; skip otherwise. Frequency is the dial+offset RF
-                    // value already stamped on the completed metadata.
-                    if let Some(client) = cqdx_client.clone() {
-                        if let Some(qso) = cqdx_record_from_metadata(&metadata) {
-                            let their = their.clone();
-                            tokio::spawn(async move {
-                                match client.log_qso(qso).await {
-                                    Ok(pancetta_cqdx::QsoUploadOutcome::Logged) => info!(
-                                        target: "qso.upload",
-                                        "cqdx.io: uploaded QSO with {}", their
-                                    ),
-                                    Ok(pancetta_cqdx::QsoUploadOutcome::Duplicate) => info!(
-                                        target: "qso.upload",
-                                        "cqdx.io: QSO with {} already logged (duplicate, skipped)",
-                                        their
-                                    ),
-                                    Err(e) => warn!(
-                                        target: "qso.upload",
-                                        "cqdx.io: upload failed for {}: {}", their, e
-                                    ),
-                                }
-                            });
-                        }
                     }
                 }
                 Ok(_) => {}
@@ -10992,6 +10926,92 @@ mod replay_history_seed_tests {
         coordinator
     }
 
+    /// PAN-57: the pending-upload worker is owned once per process. A Qso
+    /// restart re-runs `start_qso_component`, which must reuse the worker
+    /// rather than start a second writer on `upload_outbox.json`. With an
+    /// empty queue nothing is sent and no queue file is created.
+    #[tokio::test]
+    async fn upload_outbox_is_started_once_across_qso_restarts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut coordinator = live_coordinator_with_home(tmp.path()).await;
+        {
+            let mut cfg = coordinator.config.write().await;
+            cfg.network.clublog.enabled = true;
+            cfg.network.clublog.email = "op@example.com".to_string();
+            cfg.network.clublog.password = "dummy".to_string();
+            cfg.network.clublog.api_key = "dummy".to_string();
+        }
+        coordinator.start_qso_component().await.unwrap();
+        let first = coordinator
+            .upload_outbox
+            .clone()
+            .expect("ClubLog enabled on a live run starts the worker");
+        assert_eq!(
+            first.destinations(),
+            &[pancetta_dx::upload_outbox::UploadDestination::ClubLog]
+        );
+        coordinator.start_qso_component().await.unwrap();
+        let second = coordinator.upload_outbox.clone().unwrap();
+        assert!(
+            first.same_worker(&second),
+            "a Qso restart reuses the worker"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!tmp
+            .path()
+            .join(".pancetta")
+            .join(pancetta_dx::upload_outbox::OUTBOX_FILE_NAME)
+            .exists());
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// PAN-57: coordinator shutdown waits for the upload worker, so a batch
+    /// it has taken is saved before the runtime can cancel the task.
+    #[tokio::test]
+    async fn coordinator_shutdown_waits_for_the_upload_worker_to_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut coordinator = live_coordinator_with_home(tmp.path()).await;
+        {
+            let mut cfg = coordinator.config.write().await;
+            cfg.network.clublog.enabled = true;
+            cfg.network.clublog.email = "op@example.com".to_string();
+            cfg.network.clublog.password = "dummy".to_string();
+            cfg.network.clublog.api_key = "dummy".to_string();
+        }
+        coordinator.start_qso_component().await.unwrap();
+        let handle = coordinator.upload_outbox.clone().unwrap();
+        // Flag first, so the worker never sends (no network); the batch is
+        // still in the channel when shutdown starts.
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+        handle
+            .enqueue(vec![pancetta_dx::upload_outbox::NewUpload {
+                qso_id: uuid::Uuid::new_v4(),
+                destination: pancetta_dx::upload_outbox::UploadDestination::ClubLog,
+                call: "K1ABC".to_string(),
+                payload: "<CALL:5>K1ABC<EOR>".to_string(),
+            }])
+            .await;
+        coordinator.shutdown().await.unwrap();
+        // Shutdown returned only after the worker finished, not while it is
+        // still in its grace window.
+        assert!(
+            handle.worker_stopped(),
+            "shutdown did not wait for the worker"
+        );
+        drop(handle);
+        let path = tmp
+            .path()
+            .join(".pancetta")
+            .join(pancetta_dx::upload_outbox::OUTBOX_FILE_NAME);
+        let (store, _) = pancetta_dx::upload_outbox::OutboxStore::open(path);
+        assert_eq!(store.len(), 1, "batch taken before shutdown was saved");
+        assert_eq!(store.entries()[0].call, "K1ABC");
+    }
+
     /// sophon 2026-10-07 / 2026-10-15: the SQLite logger opened `qso.db`
     /// BEFORE the startup "index older than ADIF" rebuild deleted and
     /// recreated that file, so its pooled connection kept pointing at the
@@ -11086,6 +11106,54 @@ mod replay_history_seed_tests {
             wait_for_duplicate(&coordinator.cached_lookup, "K2DEF", FREQ_20M_HZ).await,
             "a replay run must seed duplicate detection from the (isolated) real ADIF"
         );
+    }
+
+    /// PAN-42: the `--replay` feeder waits on `qso_consumer_ready`, so it
+    /// must only flip once the history seed is fully applied.
+    #[tokio::test]
+    async fn pan42_qso_consumer_ready_fires_only_after_the_replay_history_seed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pancetta_dir = tmp.path().join(".pancetta");
+        tokio::fs::create_dir_all(&pancetta_dir).await.unwrap();
+        let mut adif = String::from("<ADIF_VER:5>3.1.4 <PROGRAMID:8>pancetta\n<EOH>\n");
+        for i in 0..5_000u32 {
+            let call = format!("W{}X{:04}", i % 10, i);
+            adif.push_str(&format!(
+                "<CALL:{}>{} <QSO_DATE:8>20250101 <TIME_ON:6>120000 <MODE:3>FT8 \
+                 <FREQ:9>14.074000 <BAND:3>20m <EOR>\n",
+                call.len(),
+                call
+            ));
+        }
+        adif.push_str(
+            "<CALL:5>K2DEF <QSO_DATE:8>20250101 <TIME_ON:6>120000 <MODE:3>FT8 \
+             <FREQ:9>14.074000 <BAND:3>20m <EOR>\n",
+        );
+        tokio::fs::write(pancetta_dir.join("qsos.adi"), adif)
+            .await
+            .unwrap();
+
+        let mut coordinator = test_coordinator_with_home(tmp.path()).await;
+        let mut ready = coordinator.qso_consumer_ready.subscribe();
+        assert!(!*ready.borrow());
+        coordinator.start_qso_component().await.unwrap();
+        // Current-thread test runtime + no `.await` after the spawn: the task
+        // has not been polled yet.
+        assert!(
+            !*ready.borrow(),
+            "start_qso_component returns before the seed runs"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(30), ready.wait_for(|r| *r))
+            .await
+            .expect("QSO consumer never became ready")
+            .unwrap();
+        assert!(
+            coordinator.cached_lookup.is_duplicate("K2DEF", FREQ_20M_HZ),
+            "ready must imply the history seed is already applied (no polling)"
+        );
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Rounds 4-6 tried a "snapshot the legacy `qso.db` to a temp file and
@@ -11317,6 +11385,99 @@ mod respond_to_caller_admission_tests {
         coordinator
     }
 
+    /// PAN-182: the Qso loop hands a `TxFrameSent` for a live QSO to
+    /// `confirm_stall_trigger_aired`, releasing the stall switch held on that
+    /// frame; a malformed id is dropped without disturbing the next message.
+    #[tokio::test]
+    async fn tx_frame_sent_releases_a_held_stall_switch() {
+        let mut coordinator = test_coordinator().await;
+        coordinator.config.write().await.station.callsign = "W1ABC".to_string();
+        coordinator
+            .config
+            .write()
+            .await
+            .autonomous
+            .qso_stall_switch_after = 1;
+        coordinator.tx_freq_mode.store(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        coordinator.start_qso_component().await.unwrap();
+        // See `tx_offset_action_needed_event_is_forwarded_to_pending_qso_offset_requests`:
+        // this clone must read the coordinator's live Auto mode too.
+        let mut manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        manager.set_tx_freq_mode_source(coordinator.tx_freq_mode.clone());
+        let id = manager
+            .respond_to_cq_manual("K1ABC".into(), 1500.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        let opened = manager
+            .get_qso(id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        manager
+            .rearm_manual_calls_at(opened + chrono::Duration::seconds(15))
+            .await;
+        let qso = manager.get_qso(id).await.unwrap();
+        let text = qso.messages.last().unwrap().raw_text.clone();
+        let origin = pancetta_qso::qso_manager::OffsetRelocationOrigin::StallDetected {
+            raised_at_generation: qso.metadata.advance_generation,
+        };
+        assert!(
+            matches!(
+                manager.apply_tx_offset_switch(id, 1800.0, origin).await,
+                Err(pancetta_qso::QsoManagerError::OffsetActionTriggerOutcomePending { .. })
+            ),
+            "precondition: the stall switch is held on the rearm's frame"
+        );
+
+        for qso_id in ["not-a-uuid".to_string(), id.to_string()] {
+            coordinator
+                .message_bus
+                .send_message(ComponentMessage::new(
+                    ComponentId::Ft8Transmitter,
+                    ComponentId::Qso,
+                    MessageType::QsoMessage(QsoMessage::TxFrameSent {
+                        qso_id,
+                        message_text: text.clone(),
+                        aired: pancetta_qso::UnsentAttemptPayload {
+                            frequency_hz: 1500.0,
+                            remote_binding: Some((false, None)),
+                        },
+                        // After the rearm's own TX slot has played out.
+                        aired_at: opened + chrono::Duration::minutes(2),
+                    }),
+                    Instant::now(),
+                ))
+                .await
+                .unwrap();
+        }
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match manager.apply_tx_offset_switch(id, 1800.0, origin).await {
+                Ok(applied) => {
+                    assert_eq!(applied, 1800.0);
+                    break;
+                }
+                Err(pancetta_qso::QsoManagerError::OffsetActionTriggerOutcomePending {
+                    ..
+                }) => {}
+                Err(e) => panic!("unexpected refusal: {e}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "QSO loop did not release the held switch"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     async fn check_tx_frame_not_sent(malformed_first: bool) {
         let mut coordinator = test_coordinator().await;
         coordinator.config.write().await.station.callsign = "W1ABC".to_string();
@@ -11351,6 +11512,7 @@ mod respond_to_caller_admission_tests {
                     ComponentId::Ft8Transmitter,
                     ComponentId::Qso,
                     MessageType::QsoMessage(QsoMessage::TxFrameNotSent {
+                        attempt_id: None,
                         qso_id,
                         message_text: text.clone(),
                         replaced: None,
@@ -11389,6 +11551,188 @@ mod respond_to_caller_admission_tests {
     #[tokio::test]
     async fn tx_frame_not_sent_with_malformed_qso_id_is_ignored() {
         check_tx_frame_not_sent(true).await;
+    }
+
+    /// PAN-183: the next `TransmitRequest` the QSO loop forwards for `qso`,
+    /// as `(text, attempt_id)`.
+    async fn pan183_next_transmit_request(
+        tx: &crossbeam_channel::Receiver<ComponentMessage>,
+        qso: &str,
+    ) -> (String, Option<pancetta_qso::TxAttemptId>) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            while let Ok(msg) = tx.try_recv() {
+                if let MessageType::TransmitRequest {
+                    message_text,
+                    qso_id: Some(id),
+                    attempt_id,
+                    ..
+                } = msg.message_type
+                {
+                    if id == qso {
+                        return (message_text, attempt_id);
+                    }
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "QSO loop forwarded no TransmitRequest"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// PAN-183: the QSO loop forwards each `MessageToSend`'s attempt id on
+    /// both the `TransmitRequest` and the `LatestTxIntent` a key-time pivot
+    /// adopts.
+    #[tokio::test]
+    async fn pan183_latest_tx_intent_carries_attempt_id() {
+        let mut coordinator = test_coordinator().await;
+        {
+            let mut cfg = coordinator.config.write().await;
+            cfg.station.callsign = "W1ABC".to_string();
+            cfg.station.grid_square = "FN42".to_string();
+        }
+        let (_tx_s, tx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        coordinator.start_qso_component().await.unwrap();
+        // Yield so the spawned event-forwarding task subscribes first.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        let mut events = manager.subscribe();
+        let id = manager
+            .respond_to_cq_manual("K1ABC".into(), 1500.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        let (_, opening) = pan183_next_transmit_request(&tx, &id.to_string()).await;
+        assert!(opening.is_some(), "every engine emission carries an id");
+        let opened = manager
+            .get_qso(id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        manager
+            .rearm_manual_calls_at(opened + chrono::Duration::seconds(15))
+            .await;
+        let mut emitted = None;
+        while let Ok(event) = events.try_recv() {
+            if let pancetta_qso::QsoEvent::MessageToSend { attempt_id, .. } = event {
+                emitted = attempt_id;
+            }
+        }
+        let emitted = emitted.expect("the rearm records a ledger attempt");
+        let (_, forwarded) = pan183_next_transmit_request(&tx, &id.to_string()).await;
+        assert_eq!(forwarded, Some(emitted));
+        assert_ne!(forwarded, opening);
+        let intent = coordinator
+            .latest_tx_intent
+            .read()
+            .unwrap()
+            .get(&super::super::active_tx_qso_key(&id.to_string()))
+            .cloned()
+            .expect("the funnel records the intent");
+        assert_eq!(intent.attempt_id, Some(emitted));
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// PAN-183 gherkin through the running QSO loop: a keep-call rearm frame
+    /// waits before PTT, the operator resends the same text, and the TX
+    /// worker reports the OLDER rearm frame as not sent with the attempt id
+    /// its request carried. The rearm's call, stall increment and Sent entry
+    /// roll back; the resend's accounting stays.
+    #[tokio::test]
+    async fn pan183_tx_frame_not_sent_rolls_back_the_reported_attempt_not_a_newer_resend() {
+        let mut coordinator = test_coordinator().await;
+        {
+            let mut cfg = coordinator.config.write().await;
+            cfg.station.callsign = "W1ABC".to_string();
+            cfg.station.grid_square = "FN42".to_string();
+        }
+        let (_tx_s, tx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        coordinator.start_qso_component().await.unwrap();
+        // Yield so the spawned event-forwarding task subscribes first.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        let id = manager
+            .respond_to_cq_manual("K1ABC".into(), 1500.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        let qso = id.to_string();
+        pan183_next_transmit_request(&tx, &qso).await;
+        let opened = manager
+            .get_qso(id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        manager
+            .rearm_manual_calls_at(opened + chrono::Duration::seconds(15))
+            .await;
+        let (rearm_text, rearm_id) = pan183_next_transmit_request(&tx, &qso).await;
+        manager.resend_last_tx(id).await.unwrap();
+        let (resend_text, resend_id) = pan183_next_transmit_request(&tx, &qso).await;
+        assert_eq!(rearm_text, resend_text);
+        assert!(rearm_id.is_some() && resend_id.is_some() && rearm_id != resend_id);
+        let before = manager.get_qso(id).await.unwrap();
+        assert_eq!(before.metadata.call_count, 3);
+        assert_eq!(before.metadata.stall_cycles, 1);
+
+        coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Ft8Transmitter,
+                ComponentId::Qso,
+                MessageType::QsoMessage(QsoMessage::TxFrameNotSent {
+                    qso_id: qso.clone(),
+                    message_text: rearm_text,
+                    replaced: None,
+                    attempt_id: rearm_id,
+                }),
+                Instant::now(),
+            ))
+            .await
+            .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let after = manager.get_qso(id).await.unwrap();
+            if after.metadata.call_count == 2 {
+                assert_eq!(
+                    after.metadata.stall_cycles, 0,
+                    "the rearm's stall increment"
+                );
+                assert_eq!(
+                    after
+                        .messages
+                        .iter()
+                        .filter(|m| m.direction == pancetta_qso::MessageDirection::Sent)
+                        .count(),
+                    1,
+                    "the rearm's Sent entry"
+                );
+                assert_eq!(
+                    after.metadata.last_call_at, before.metadata.last_call_at,
+                    "the resend is still the latest call"
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "QSO loop did not apply rollback");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Drain the Tui channel (bounded crossbeam queue, not broadcast — a
@@ -12422,6 +12766,7 @@ mod respond_to_caller_admission_tests {
 
     fn pan76_request(qso_id: &pancetta_qso::QsoId, text: &str, freq: f64) -> MessageType {
         MessageType::TransmitRequest {
+            attempt_id: None,
             message_text: text.to_string(),
             frequency_offset: freq,
             qso_id: Some(qso_id.to_string()),

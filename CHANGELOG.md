@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Pending-upload queue for ClubLog, QRZ Logbook, eQSL and cqdx.io uploads
+  (PAN-57). Each completed QSO's uploads are saved to
+  `~/.pancetta/upload_outbox.json` before the first attempt and leave it only
+  when the service accepts them, so an outage, a rate limit or a restart no
+  longer loses an upload. Transient failures (5xx, 429, timeouts, refused
+  connections) are retried with capped exponential backoff and then every 5
+  minutes, and the queue is sent again at every start. A rejected login or
+  record now shows as an acknowledgeable readiness-strip warning
+  (`⚠ QRZ LOGBOOK LOGIN REJECTED`, `⚠ CLUBLOG REJECTED 1 QSO`,
+  `⚠ EQSL UPLOAD RETRYING · 4 QUEUED`, `⚠ UPLOAD QUEUE FULL`) with details in
+  Shift+S and one Shift+D row per change; upload warnings never hold TX.
+  LoTW keeps its single tqsl attempt.
+
+- Local TX log (PAN-122): every transmitted frame is appended to
+  `~/.pancetta/tx-log.jsonl` as one JSON line (`v`, `utc`, `mode`, `dial_hz`,
+  `offset_hz`, `text`, `origin`, `qso_id`), headless or with the TUI. The TX
+  worker writes each record itself (never through the message bus) with one
+  `write_all` plus `sync_data` once the frame's audio is handed to the audio
+  output, so the record survives a burst of decodes or a crash right after.
+  Each bundle item gets its own line. The file rotates at 8 MiB and keeps 7
+  archives (`tx-log.jsonl.1` … `.7`, at most 64 MiB). `--replay` writes
+  nothing. A write failure never stops TX: it shows as an `ERROR` line that
+  carries the frame text, and a disk slower than 250 ms shows as a `WARN`
+  while the record is still written when the disk responds.
+
+- DX Hunter explains its ranking (PAN-94): a `Why:` line on the Station card,
+  a `Why` column on wide DX Hunter panels, and `w` for the full score breakdown.
+  A `/P`-style suffix now reads `maybe POTA/SOTA (/P suffix)`; it is a callsign
+  guess, not a confirmed activation.
+
 - `pancetta import <FILE> [--dry-run]` (PAN-127): bring an existing ADIF
   log from WSJT-X, N1MM, LoTW, QRZ or another logger into Pancetta. New
   contacts are appended to `~/.pancetta/qsos.adi` with every field kept as
@@ -127,6 +157,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Fixed
+
+- Autonomous cqdx.io spot reports now carry the frequency of the band the
+  decode was actually heard on when the station changes bands between a decode
+  and its slot-tick report (PAN-68) — the same captured-dial fix PAN-67 applied
+  to the TUI and PSKReporter. Each accumulated decode remembers the dial its
+  own audio window was captured on, so a band switch (by the operator or the
+  autonomous band-hopper) between the decode and the report no longer
+  publishes the spot under the new band's frequency.
+
+- The TX band-plan gate now sees split enabled at the radio's front panel or by
+  another CAT client (PAN-206). The Hamlib poll loop reads split every 500 ms
+  and refuses QSO TX and manual PTT outside the configured band plan. Rigs
+  that cannot report split keep the previous behavior and log once per outage.
+
+- DX Hunter no longer marks stations needed when cqdx.io's needed list never
+  loaded. A failed cqdx.io start used to give every station outside your home
+  and logged prefixes a `+` and the reason "needed entity (cqdx list)", and an
+  empty answer from cqdx.io ("nothing needed") did the same. Now `+` appears
+  only for entities on a loaded list, and an empty answer means nothing is
+  needed. While the list is not loaded, the Why text reads "maybe needed
+  entity (cqdx list not loaded)", and a row scored before the list changed
+  reads "maybe needed entity (cqdx list changed)". While a configured cqdx.io
+  has not delivered its list, the readiness strip shows `⚠ CQDX NEEDS UNKNOWN`
+  (or `⚠ CQDX GRID NEEDS UNKNOWN` for the needed-grid list). After a failed
+  start pancetta now retries in the background instead of leaving cqdx.io off
+  until restart; a token problem still needs a fix and a restart. A
+  needed-grids 404 is recorded as not offered, not as "no grids needed".
+  Autonomous ranking during an outage is unchanged, and remote clients see
+  `needed` as false while the list is unknown (PAN-93).
+
+- Contest QSOs no longer stamp ADIF's `CONTEST_ID` field with pancetta's
+  internal profile slug (PAN-52). `CONTEST_ID` is now written from the engaged
+  contest profile's `adif_contest_id`, which must be a value from the ADIF
+  3.1.5 Contest_ID enumeration (e.g. `KS-QSO-PARTY`, `WFD`, `NAQP-CW`). The
+  built-in `us-state-qso-party` profile models the whole family of US state
+  QSO parties, for which no single valid ADIF id exists, so those QSOs log
+  with no `CONTEST_ID` at all — an absent field is legal, unambiguous ADIF,
+  unlike a slug no logbook service can interpret. Third-party ADIF imports
+  still re-export their original `CONTEST_ID` verbatim. Nothing calls
+  `engage_contest_profile` in production yet, so no previously exported ADIF
+  file is affected.
+
+- A keep-call frame that never airs now gives back its own call, stall count
+  and `Sent` timeline entry even when you resent the same message for that QSO
+  after it was queued (PAN-183). The TX worker used to hand back the newest
+  frame with the same text, so it reversed your resend instead and left the
+  failed frame's stall count, which could move the QSO to a new TX offset one
+  cycle early. Each queued frame now carries the ID of the call it accounts
+  for, and a frame that does not air reports that ID. The same fix covers
+  multi-TX bundle items abandoned when another operator takes control.
+
+- A manual call to a station you heard a few seconds earlier on another band
+  or in another mode is no longer held for a cycle (PAN-146). The check before
+  key-up that holds a call when the station was just heard transmitting on your
+  slot (PAN-141) now counts only sightings from the band you are on and the
+  mode you are keying in.
+
+- `--replay` no longer starts feeding audio while pancetta is still loading
+  your logbook history. With a large `~/.pancetta/qsos.adi`, decodes from the
+  first slots could sit unprocessed behind that load, or be lost when the
+  replay ended, so the results of a replay depended on how big your logbook
+  was. The replay now waits until the QSO engine has its history and is
+  listening, then starts at the next slot boundary (PAN-42).
+
+- TX no longer keys late while another component is registering on the
+  internal message bus (PAN-202). The key-down used to wait for that
+  registration after every pre-PTT check had already passed, so a frame
+  cleared as in time could key past the `tx_late_max_ms` cap. Every PTT-on
+  (scheduled TX, multi-TX bundles, tune and manual PTT) now reaches the rig's
+  command queue without waiting.
+
+- Decode effort `Max` no longer delays a busy window's decodes by seconds on
+  slower computers. Before an extra decode pass, pancetta now checks that the
+  pass fits in the time left before the next slot, and skips it when it would
+  not (PAN-165).
 
 - A remote client that disarmed or lost control while pancetta was busy could
   still use up its manual-call budget. Repeating a call on an existing QSO
@@ -361,6 +466,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `[network.reliability.retry]` now controls per-QSO upload retries
+  (PAN-57) and is validated: `max_attempts` must be at least 1,
+  `backoff_multiplier` finite and at least 1.0, `jitter_factor` finite and
+  between 0.0 and 1.0, and `base_delay_ms` not above `max_delay_ms`. The
+  defaults are unchanged.
+
+- DX Hunter scores follow the latest decode and cqdx spot, so a station drops
+  after you work it or a QSO with it fails.
+
 - `pancetta --help` no longer claims general config hot-reload or unmeasured
   decoder, latency and memory figures; it says which settings apply live and
   points to the new Capability status table in README.md (PAN-124). That
@@ -419,6 +533,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Responses from cqdx.io, QRZ, the online logbooks, the DX cluster and the station-agent relay are now read within fixed size limits (PAN-101).
 - Station agent: a relay connection that stops responding or stops accepting data is now closed within seconds, remote TX is disarmed, and the agent reconnects (PAN-102).
 - Release workflow: every GitHub Action is pinned to a full commit SHA, and only the job that creates the draft release can write to the repository (PAN-106).
+- Station agent: when a remote client takes over one QSO of a multi-QSO transmission while it waits for its slot, the transmission is now checked against that client's arm before it keys, and a frame bound to a different remote client than the rest of the transmission is held for the next slot (PAN-136).
 - Semgrep workflow: a run without `SEMGREP_APP_TOKEN` (fork PRs, Dependabot) no longer reports the same success as a completed scan — the platform check now shows as skipped and a separate secret-free scan of a vendored, pinned ruleset runs instead (PAN-107).
 
 ## [0.9.6] - 2026-09-02

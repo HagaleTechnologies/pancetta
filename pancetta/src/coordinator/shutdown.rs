@@ -154,6 +154,16 @@ impl super::ApplicationCoordinator {
             }
         }
 
+        // PAN-57: the upload worker. The Qso tasks above are gone, so once
+        // the coordinator's own handle drops the worker's grace window ends;
+        // wait for it to save what it took before the runtime goes away.
+        super::upload_outbox::stop_upload_outbox(
+            self.upload_outbox.take(),
+            self.upload_outbox_task.take(),
+            super::upload_outbox::OutboxTiming::PRODUCTION,
+        )
+        .await;
+
         // Join the TUI relay OS thread
         if let Some(handle) = self.tui_relay_handle.take() {
             debug!("Joining TUI relay thread");

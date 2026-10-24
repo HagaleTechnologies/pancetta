@@ -23,7 +23,7 @@ use pancetta_ft8::DecodedMessage;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, RwLock};
 use tracing::{debug, error, trace, warn};
@@ -236,6 +236,12 @@ pub enum MessageType {
         /// later must not authorize a frame it never requested. `None` for
         /// every `Local` request.
         remote_client_key_id: Option<String>,
+        /// PAN-183: the QSO engine's attempt id for this frame
+        /// (`QsoEvent::MessageToSend::attempt_id`), echoed on
+        /// `QsoMessage::TxFrameNotSent` if the frame never airs. `None` for
+        /// frames the engine did not emit (manual, tune, test-TX and
+        /// Autonomous frames).
+        attempt_id: Option<pancetta_qso::TxAttemptId>,
     },
 
     /// Transmit completed notification
@@ -245,7 +251,8 @@ pub enum MessageType {
         duration_ms: u64,
         /// QSO owning this frame, or `None` for untracked manual/tune TX.
         /// Autonomous uses it for PAN-38 self-CQ correlation. PAN-75 mirrors
-        /// failed QSO-keyed outcomes as `QsoMessage::TxFrameNotSent` to Qso.
+        /// failed QSO-keyed outcomes as `QsoMessage::TxFrameNotSent` to Qso;
+        /// PAN-182 mirrors aired ones as `QsoMessage::TxFrameSent`.
         qso_id: Option<String>,
     },
 
@@ -343,8 +350,9 @@ pub enum MessageType {
     /// Decode-effort preset echo for the TUI's "DECODE: <PRESET> <ms>ms"
     /// title-bar chip (decoder-speed-overhaul Task 15, operator `e`
     /// keybinding). Sent by the coordinator's TUI-relay command handler
-    /// after `effort::cycle_decode_effort` advances the preset and writes
-    /// the resulting budget into `decode_effort_budget_ms`. Unlike
+    /// after `effort::cycle_decode_effort` advances the preset and
+    /// publishes the resulting budget with its decoder config
+    /// (`DecodeWindowConfig`). Unlike
     /// `ModeStatus` (which can be refused while a QSO is active) this
     /// cycle never fails — a budget change never invalidates in-flight
     /// decode state (spec §6.2) — so this is always the NEW preset, never
@@ -353,8 +361,9 @@ pub enum MessageType {
         /// New decode-effort preset label ("ECO"/"STANDARD"/"DEEP"/"MAX"/
         /// "AUTO"), from `pancetta_config::DecodeEffort::label`.
         effort: String,
-        /// The budget (ms) now written into `decode_effort_budget_ms` for
-        /// this preset (`0` = unlimited).
+        /// The budget (ms) now published with its decoder config
+        /// (`DecodeWindowConfig`) for this preset (`0` = the protocol
+        /// ceiling).
         budget_ms: u64,
     },
 
@@ -401,10 +410,16 @@ pub enum MessageType {
         /// Where this bundle came from. `Local` (default) skips the remote-TX
         /// arm gate; `Remote` is gated by `ArmState::tx_permitted()`. The whole
         /// bundle shares one origin (a bundle is one operator's slot).
+        ///
+        /// PAN-136: together with `remote_client_key_id` this is the bundle's
+        /// gate binding: the fold of its items' bindings
+        /// (`coordinator::fold_bundle_identity`), re-folded by the TX worker
+        /// after a key-time pivot.
         #[allow(dead_code)]
         origin: TxOrigin,
         /// See `MessageType::TransmitRequest::remote_client_key_id`. The whole
-        /// bundle shares one client binding, matching `origin` above.
+        /// bundle shares one client binding, matching `origin` above: the fold
+        /// of its items' bindings, re-folded after a key-time pivot (PAN-136).
         remote_client_key_id: Option<String>,
     },
 
@@ -488,11 +503,27 @@ pub enum MessageType {
 }
 
 /// A single transmit request item for multi-TX bundles.
+///
+/// PAN-136: each item carries the authorization of the request it came from,
+/// so a key-time pivot can swap it atomically with the payload (see
+/// `coordinator::pivot_bundle_items`). There is deliberately no `Default`:
+/// every construction site must name the binding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransmitRequestItem {
     pub message_text: String,
     pub frequency_offset: f64,
     pub qso_id: Option<String>,
+    /// See `MessageType::TransmitRequest::origin`.
+    #[serde(default)]
+    pub origin: TxOrigin,
+    /// See `MessageType::TransmitRequest::remote_client_key_id`; `None` for
+    /// every `Local` item.
+    #[serde(default)]
+    pub remote_client_key_id: Option<String>,
+    /// See `MessageType::TransmitRequest::attempt_id`. Per item, so a
+    /// bundle's not-sent report rolls back each item's own attempt (PAN-183).
+    #[serde(default)]
+    pub attempt_id: Option<pancetta_qso::TxAttemptId>,
 }
 
 /// One row in a `MessageType::TxQueueStatus` payload — a compact,
@@ -868,6 +899,25 @@ pub enum QsoMessage {
         /// Set when the frame was replaced by a TX pivot: its own offset and
         /// binding, so the rollback skips the same-text frame that aired.
         replaced: Option<pancetta_qso::UnsentAttemptPayload>,
+        /// PAN-183: the failed frame's ledger attempt (the replaced frame's
+        /// on a pivot), so the rollback reverses exactly that attempt. `None`
+        /// when the frame carried none; the rollback then matches content.
+        attempt_id: Option<pancetta_qso::TxAttemptId>,
+    },
+    /// PAN-182: a QSO frame that aired, mirrored by Ft8Transmitter after
+    /// playback alongside the Autonomous completion. Qso uses it to release
+    /// a stall offset action held on that frame through
+    /// `QsoManager::confirm_stall_trigger_aired`.
+    TxFrameSent {
+        qso_id: String,
+        message_text: String,
+        /// The aired frame's own offset and binding, so a pivot-replaced
+        /// same-text frame does not release a hold it did not serve.
+        aired: pancetta_qso::UnsentAttemptPayload,
+        /// When the worker reported it, after playback. An earlier slot's
+        /// identical keep-call frame reports before the trigger's own slot
+        /// starts, so it cannot release the hold.
+        aired_at: chrono::DateTime<chrono::Utc>,
     },
     /// Enable or disable Fox (DXpedition operator) mode.
     ///
@@ -976,6 +1026,59 @@ pub struct ComponentMetrics {
     pub custom_metrics: HashMap<String, f64>,
 }
 
+/// PAN-206: exclude split observations while an accepted command is queued,
+/// being applied, or retained for retry. The revision also invalidates a read
+/// when a command starts and finishes entirely during its CAT awaits.
+#[derive(Debug, Default)]
+pub(crate) struct SplitObservationFence {
+    state: parking_lot::Mutex<SplitObservationState>,
+}
+
+#[derive(Debug, Default)]
+struct SplitObservationState {
+    active: usize,
+    revision: u64,
+}
+
+impl SplitObservationFence {
+    pub(crate) fn begin_command(self: &Arc<Self>) -> Arc<SplitObservationGuard> {
+        let mut state = self.state.lock();
+        state.active += 1;
+        state.revision = state.revision.wrapping_add(1);
+        Arc::new(SplitObservationGuard {
+            fence: self.clone(),
+        })
+    }
+
+    pub(crate) fn snapshot(&self) -> Option<u64> {
+        let state = self.state.lock();
+        (state.active == 0).then_some(state.revision)
+    }
+
+    /// The callback only publishes an atomic value; never await or do CAT I/O
+    /// here. Command creation and publication cannot interleave under this lock.
+    pub(crate) fn publish<T>(&self, revision: u64, publish: impl FnOnce() -> T) -> Option<T> {
+        let state = self.state.lock();
+        if state.active != 0 || state.revision != revision {
+            return None;
+        }
+        Some(publish())
+    }
+}
+
+/// Cloned with the message, including pending-command retries. Only the last
+/// owner releases the fence, so a producer paused after enqueue is covered too.
+#[derive(Debug)]
+pub(crate) struct SplitObservationGuard {
+    fence: Arc<SplitObservationFence>,
+}
+
+impl Drop for SplitObservationGuard {
+    fn drop(&mut self) {
+        self.fence.state.lock().active -= 1;
+    }
+}
+
 /// Complete message with routing and timing information
 #[derive(Debug, Clone)]
 pub struct ComponentMessage {
@@ -995,6 +1098,8 @@ pub struct ComponentMessage {
     pub hop_count: u8,
     /// Latency tracking timestamps
     pub latency_tracking: LatencyTracking,
+    /// Local split-poll lifetime guard; absent on every other message type.
+    pub(crate) split_observation_guard: Option<Arc<SplitObservationGuard>>,
 }
 
 /// Latency tracking for message bus performance monitoring
@@ -1034,6 +1139,7 @@ impl ComponentMessage {
             priority: 128, // Normal priority
             hop_count: 0,
             latency_tracking,
+            split_observation_guard: None,
         }
     }
 
@@ -1123,13 +1229,19 @@ impl Default for MessageBusConfig {
     }
 }
 
-/// Channel pair for component communication
-struct ComponentChannel {
+/// What an enqueue needs from a registered channel (PAN-202).
+#[derive(Clone)]
+struct ChannelTx {
     sender: Sender<ComponentMessage>,
-    receiver: Receiver<ComponentMessage>,
-    component_id: ComponentId,
     message_count: Arc<AtomicU64>,
     error_count: Arc<AtomicU64>,
+}
+
+/// Channel pair for component communication
+struct ComponentChannel {
+    tx: ChannelTx,
+    receiver: Receiver<ComponentMessage>,
+    component_id: ComponentId,
     last_heartbeat: Arc<RwLock<Option<Instant>>>,
 }
 
@@ -1214,12 +1326,13 @@ impl DeliveryAckWaiter {
     }
 }
 
-/// Outcome of [`MessageBus::send_message_if`].
+/// Outcome of [`MessageBus::send_message_if`] and
+/// [`MessageBus::send_rig_command_if`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendIfOutcome {
     /// The message was enqueued on the destination's channel.
     Enqueued,
-    /// Authorization returned false after acquiring the table lock.
+    /// Authorization returned false immediately before the enqueue.
     Denied,
     /// Delivery failed: expired, full, disconnected, or no destination.
     Dropped,
@@ -1228,10 +1341,17 @@ pub enum SendIfOutcome {
 /// High-performance message bus for inter-component communication
 #[derive(Clone)]
 pub struct MessageBus {
+    /// Shared only by split-command producers and the split poll. PTT routing
+    /// never takes this lock (PAN-202).
+    pub(crate) split_observation_fence: Arc<SplitObservationFence>,
     /// Configuration
     config: MessageBusConfig,
     /// Component channels
     channels: Arc<RwLock<HashMap<ComponentId, ComponentChannel>>>,
+    /// Hamlib's channel, published by `create_channel` under the table's
+    /// write lock (PAN-202). Table entries are never removed or replaced, so
+    /// this is always the channel the table holds.
+    rig_route: Arc<OnceLock<ChannelTx>>,
     /// Global message counter
     message_counter: Arc<AtomicU64>,
     /// Bus metrics
@@ -1250,7 +1370,9 @@ impl MessageBus {
 
         Ok(Self {
             config,
+            split_observation_fence: Arc::new(SplitObservationFence::default()),
             channels: Arc::new(RwLock::new(HashMap::new())),
+            rig_route: Arc::new(OnceLock::new()),
             message_counter: Arc::new(AtomicU64::new(0)),
             total_messages: Arc::new(AtomicU64::new(0)),
             dropped_messages: Arc::new(AtomicU64::new(0)),
@@ -1262,7 +1384,9 @@ impl MessageBus {
     pub fn with_config(config: MessageBusConfig) -> Result<Self> {
         Ok(Self {
             config,
+            split_observation_fence: Arc::new(SplitObservationFence::default()),
             channels: Arc::new(RwLock::new(HashMap::new())),
+            rig_route: Arc::new(OnceLock::new()),
             message_counter: Arc::new(AtomicU64::new(0)),
             total_messages: Arc::new(AtomicU64::new(0)),
             dropped_messages: Arc::new(AtomicU64::new(0)),
@@ -1271,6 +1395,11 @@ impl MessageBus {
     }
 
     /// Create a communication channel for a component
+    ///
+    /// Entries are insert-once: a second registration of the same id errors
+    /// here, and nothing removes or replaces an entry. `rig_route` relies on
+    /// that, so any future removal or replacement of a channel must also
+    /// update `rig_route` in the same critical section (PAN-202).
     pub async fn create_channel(
         &self,
         component_id: ComponentId,
@@ -1287,14 +1416,21 @@ impl MessageBus {
         let (sender, receiver) = bounded(self.config.max_queue_size);
 
         let channel = ComponentChannel {
-            sender: sender.clone(),
+            tx: ChannelTx {
+                sender: sender.clone(),
+                message_count: Arc::new(AtomicU64::new(0)),
+                error_count: Arc::new(AtomicU64::new(0)),
+            },
             receiver: receiver.clone(),
             component_id,
-            message_count: Arc::new(AtomicU64::new(0)),
-            error_count: Arc::new(AtomicU64::new(0)),
             last_heartbeat: Arc::new(RwLock::new(None)),
         };
 
+        if component_id == ComponentId::Hamlib {
+            // First and only registration: the duplicate check above returned
+            // early otherwise, so this set cannot lose to an earlier one.
+            let _ = self.rig_route.set(channel.tx.clone());
+        }
         channels.insert(component_id, channel);
 
         debug!("Created message channel for component: {}", component_id);
@@ -1313,7 +1449,7 @@ impl MessageBus {
     ) -> Result<(Sender<ComponentMessage>, Receiver<ComponentMessage>)> {
         let channels = self.channels.read().await;
         if let Some(existing) = channels.get(&component_id) {
-            return Ok((existing.sender.clone(), existing.receiver.clone()));
+            return Ok((existing.tx.sender.clone(), existing.receiver.clone()));
         }
         drop(channels);
         self.create_channel(component_id).await
@@ -1421,6 +1557,57 @@ impl MessageBus {
         })
     }
 
+    /// [`Self::send_message_if`] for a Hamlib command, with no lock and no
+    /// await (PAN-202): enqueues on the route `create_channel` published, so
+    /// a key-down never waits on a channel registration. Same expiry check,
+    /// `authorize` contract (a synchronous leaf, see `send_message_if`) and
+    /// accounting as the table path; the closure runs with no bus lock held.
+    pub fn send_rig_command_if(
+        &self,
+        mut message: ComponentMessage,
+        authorize: impl FnOnce() -> bool,
+    ) -> SendIfOutcome {
+        if message.destination != ComponentId::Hamlib {
+            error!(
+                "send_rig_command_if: destination {} is not Hamlib",
+                message.destination
+            );
+            self.dropped_messages.fetch_add(1, Ordering::Relaxed);
+            return SendIfOutcome::Dropped;
+        }
+        if message.is_expired(self.config.message_timeout_us) {
+            self.expired_messages.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                "Dropping expired message from {} to {} (age: {}μs)",
+                message.source,
+                message.destination,
+                message.age_us()
+            );
+            return SendIfOutcome::Dropped;
+        }
+        message.latency_tracking.sent_at = Some(Instant::now());
+        if !authorize() {
+            debug!(
+                "Authorization denied message from {} to {}",
+                message.source, message.destination
+            );
+            return SendIfOutcome::Denied;
+        }
+        let Some(route) = self.rig_route.get() else {
+            warn!(
+                "No channel found for destination component: {}",
+                message.destination
+            );
+            self.dropped_messages.fetch_add(1, Ordering::Relaxed);
+            return SendIfOutcome::Dropped;
+        };
+        if self.try_send_on(route, message) {
+            SendIfOutcome::Enqueued
+        } else {
+            SendIfOutcome::Dropped
+        }
+    }
+
     // Both public delivery APIs use the same synchronous enqueue and accounting.
     fn try_send_locked(
         &self,
@@ -1428,45 +1615,7 @@ impl MessageBus {
         channels: &HashMap<ComponentId, ComponentChannel>,
     ) -> Result<bool> {
         if let Some(channel) = channels.get(&message.destination) {
-            // Perf (Pass 1 / A8): capture the small Copy fields needed for
-            // metrics/tracing/error logs up front so the message can be MOVED
-            // into try_send instead of deep-cloned on EVERY point-to-point send.
-            // The old `try_send(message.clone())` cloned the whole
-            // ComponentMessage — including potentially large MessageType
-            // payloads (audio buffers, snapshots) — on the hot bus path.
-            let src = message.source;
-            let dst = message.destination;
-            let msg_id = message.id;
-            let transit = message.transit_latency_us();
-            match channel.sender.try_send(message) {
-                Ok(_) => {
-                    channel.message_count.fetch_add(1, Ordering::Relaxed);
-                    self.total_messages.fetch_add(1, Ordering::Relaxed);
-
-                    if self.config.enable_tracing {
-                        trace!(
-                            "Message sent from {} to {}: {:?} (transit: {:?}μs)",
-                            src,
-                            dst,
-                            msg_id,
-                            transit
-                        );
-                    }
-                    Ok(true)
-                }
-                Err(crossbeam_channel::TrySendError::Full(_)) => {
-                    channel.error_count.fetch_add(1, Ordering::Relaxed);
-                    self.dropped_messages.fetch_add(1, Ordering::Relaxed);
-                    warn!("Channel full, dropping message from {} to {}", src, dst);
-                    Ok(false)
-                }
-                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                    channel.error_count.fetch_add(1, Ordering::Relaxed);
-                    self.dropped_messages.fetch_add(1, Ordering::Relaxed);
-                    error!("Channel disconnected for component: {}", dst);
-                    Ok(false)
-                }
-            }
+            Ok(self.try_send_on(&channel.tx, message))
         } else {
             warn!(
                 "No channel found for destination component: {}",
@@ -1474,6 +1623,50 @@ impl MessageBus {
             );
             self.dropped_messages.fetch_add(1, Ordering::Relaxed);
             Ok(false)
+        }
+    }
+
+    // The enqueue and its accounting, shared by the table path and the rig
+    // route (PAN-202).
+    fn try_send_on(&self, channel: &ChannelTx, message: ComponentMessage) -> bool {
+        // Perf (Pass 1 / A8): capture the small Copy fields needed for
+        // metrics/tracing/error logs up front so the message can be MOVED
+        // into try_send instead of deep-cloned on EVERY point-to-point send.
+        // The old `try_send(message.clone())` cloned the whole
+        // ComponentMessage — including potentially large MessageType
+        // payloads (audio buffers, snapshots) — on the hot bus path.
+        let src = message.source;
+        let dst = message.destination;
+        let msg_id = message.id;
+        let transit = message.transit_latency_us();
+        match channel.sender.try_send(message) {
+            Ok(_) => {
+                channel.message_count.fetch_add(1, Ordering::Relaxed);
+                self.total_messages.fetch_add(1, Ordering::Relaxed);
+
+                if self.config.enable_tracing {
+                    trace!(
+                        "Message sent from {} to {}: {:?} (transit: {:?}μs)",
+                        src,
+                        dst,
+                        msg_id,
+                        transit
+                    );
+                }
+                true
+            }
+            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                channel.error_count.fetch_add(1, Ordering::Relaxed);
+                self.dropped_messages.fetch_add(1, Ordering::Relaxed);
+                warn!("Channel full, dropping message from {} to {}", src, dst);
+                false
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                channel.error_count.fetch_add(1, Ordering::Relaxed);
+                self.dropped_messages.fetch_add(1, Ordering::Relaxed);
+                error!("Channel disconnected for component: {}", dst);
+                false
+            }
         }
     }
 
@@ -1504,8 +1697,8 @@ impl MessageBus {
         let mut health_status = Vec::new();
 
         for (&component_id, channel) in channels.iter() {
-            let message_count = channel.message_count.load(Ordering::Relaxed);
-            let error_count = channel.error_count.load(Ordering::Relaxed) as u32;
+            let message_count = channel.tx.message_count.load(Ordering::Relaxed);
+            let error_count = channel.tx.error_count.load(Ordering::Relaxed) as u32;
 
             let last_heartbeat = {
                 let heartbeat = channel.last_heartbeat.read().await;
@@ -1552,6 +1745,20 @@ impl MessageBus {
         }
 
         Ok(())
+    }
+}
+
+/// Holds the channel table's write lock, as an in-flight `create_channel`
+/// does (PAN-202 tests outside this module).
+#[cfg(test)]
+pub(crate) struct ChannelTableHold(
+    #[allow(dead_code)] tokio::sync::OwnedRwLockWriteGuard<HashMap<ComponentId, ComponentChannel>>,
+);
+
+#[cfg(test)]
+impl MessageBus {
+    pub(crate) async fn hold_channel_table(&self) -> ChannelTableHold {
+        ChannelTableHold(self.channels.clone().write_owned().await)
     }
 }
 
@@ -1917,6 +2124,157 @@ mod tests {
         // Documents today's hazard for plain send_message; it must KEEP passing
         // after PAN-134 (plain-send semantics are unchanged) — the fix is the
         // send_message_if test above.
+    }
+
+    fn ptt_on_msg() -> ComponentMessage {
+        ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Hamlib,
+            MessageType::RigControl(RigControlMessage::SetPtt { state: true }),
+            Instant::now(),
+        )
+    }
+
+    /// PAN-202: a key-down is enqueued within the cap while a channel
+    /// registration holds the table. The writer holds until this test
+    /// releases it, so the send runs entirely inside the hold.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pan202_rig_command_enqueues_while_a_registration_holds_the_table() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let cap = Duration::from_millis(50);
+        let (locked_tx, locked_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let bus_w = bus.clone();
+        let writer = tokio::spawn(async move {
+            let _w = bus_w.channels.write().await;
+            let _ = locked_tx.send(());
+            let _ = release_rx.await;
+        });
+        locked_rx.await.unwrap();
+        let gate_passed_at = Instant::now();
+        let outcome = bus.send_rig_command_if(ptt_on_msg(), || true);
+        let enqueued_after = gate_passed_at.elapsed();
+        assert_eq!(outcome, SendIfOutcome::Enqueued);
+        assert!(
+            enqueued_after < cap,
+            "key-down took {enqueued_after:?}, cap {cap:?}"
+        );
+        assert!(matches!(
+            rx.try_recv().unwrap().message_type,
+            MessageType::RigControl(RigControlMessage::SetPtt { state: true })
+        ));
+        release_tx.send(()).unwrap();
+        writer.await.unwrap();
+    }
+
+    /// PAN-202 hazard pin: the table path still waits on a registration,
+    /// which is why key-down must not use it. Must keep passing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pan202_table_send_waits_past_the_cap_on_a_registration() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_s, rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let w = bus.channels.write().await;
+        let bus2 = bus.clone();
+        let send =
+            tokio::spawn(async move { bus2.send_message_if(ptt_on_msg(), || true).await.unwrap() });
+        sleep(Duration::from_millis(50)).await; // the cap
+        assert!(
+            !send.is_finished(),
+            "the table path enqueued under a held writer"
+        );
+        assert!(rx.try_recv().is_err());
+        drop(w);
+        assert_eq!(send.await.unwrap(), SendIfOutcome::Enqueued);
+        assert!(rx.try_recv().is_ok());
+    }
+
+    /// PAN-202: the route is the registered channel itself — through a
+    /// restart's re-registration and from a clone taken before Hamlib
+    /// registered — and authorization still gates it under a held table.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pan202_rig_route_is_the_registered_channel() {
+        let bus = MessageBus::new(16).unwrap();
+        let early = bus.clone();
+        let (_s, rx) = bus
+            .get_or_create_channel(ComponentId::Hamlib)
+            .await
+            .unwrap();
+        let (_s2, rx2) = bus
+            .get_or_create_channel(ComponentId::Hamlib)
+            .await
+            .unwrap();
+        let _w = bus.channels.write().await;
+        assert_eq!(
+            early.send_rig_command_if(ptt_on_msg(), || true),
+            SendIfOutcome::Enqueued
+        );
+        assert!(
+            rx2.try_recv().is_ok(),
+            "re-registration returns the same queue"
+        );
+        assert!(rx.try_recv().is_err(), "one message, one queue");
+        assert_eq!(
+            early.send_rig_command_if(ptt_on_msg(), || false),
+            SendIfOutcome::Denied
+        );
+        assert!(rx.try_recv().is_err(), "a denied key-down enqueues nothing");
+    }
+
+    /// PAN-202: same outcomes and counters as `send_message_if`
+    /// (mirrors `pan134_conditional_delivery_preserves_drop_accounting`).
+    #[tokio::test]
+    async fn pan202_rig_command_matches_table_path_accounting() {
+        let bus = MessageBus::new(1).unwrap();
+        // Hamlib never registered (replay / no-hamlib build): dropped.
+        assert_eq!(
+            bus.send_rig_command_if(ptt_on_msg(), || true),
+            SendIfOutcome::Dropped
+        );
+        assert_eq!(bus.get_statistics().dropped_messages, 1);
+        let (_s, rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        assert_eq!(
+            bus.send_rig_command_if(ptt_on_msg(), || false),
+            SendIfOutcome::Denied
+        );
+        assert_eq!(
+            bus.get_statistics().dropped_messages,
+            1,
+            "denial is not a drop"
+        );
+        assert_eq!(
+            bus.send_rig_command_if(ptt_on_msg(), || true),
+            SendIfOutcome::Enqueued
+        );
+        assert_eq!(
+            bus.send_rig_command_if(ptt_on_msg(), || true),
+            SendIfOutcome::Dropped
+        ); // full
+        assert_eq!(bus.get_statistics().total_messages, 1);
+        assert_eq!(bus.get_statistics().dropped_messages, 2);
+        assert!(rx.try_recv().unwrap().latency_tracking.sent_at.is_some());
+        let expired = ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Hamlib,
+            MessageType::RigControl(RigControlMessage::SetPtt { state: true }),
+            Instant::now() - Duration::from_secs(60),
+        );
+        assert_eq!(
+            bus.send_rig_command_if(expired, || panic!("expired messages must not authorize")),
+            SendIfOutcome::Dropped
+        );
+        assert_eq!(bus.get_statistics().expired_messages, 1);
+        let not_rig = ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Audio,
+            MessageType::AudioData(vec![0.5]),
+            Instant::now(),
+        );
+        assert_eq!(
+            bus.send_rig_command_if(not_rig, || true),
+            SendIfOutcome::Dropped
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

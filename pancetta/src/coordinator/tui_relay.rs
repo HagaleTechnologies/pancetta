@@ -31,6 +31,180 @@ use tracing::{debug, info, span, warn, Level};
 
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
 
+/// Per-callsign decode memory kept by the relay loop. Entries live as long as
+/// the TUI keeps a DX Hunter row (`App::cleanup_old_data`: 24 h), and the map
+/// holds at most `RELAY_CACHE_CAP` entries, dropping the oldest first, so a
+/// busy band or decoder-noise callsigns cannot grow it without limit.
+const RELAY_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const RELAY_CACHE_CAP: usize = 4096;
+
+struct RelayCache<K, V> {
+    entries: std::collections::HashMap<K, (V, Instant)>,
+    ttl: Duration,
+    cap: usize,
+}
+
+impl<K: std::hash::Hash + Eq + Clone, V> Default for RelayCache<K, V> {
+    fn default() -> Self {
+        Self::new(RELAY_CACHE_TTL, RELAY_CACHE_CAP)
+    }
+}
+
+impl<K: std::hash::Hash + Eq + Clone, V> RelayCache<K, V> {
+    fn new(ttl: Duration, cap: usize) -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            ttl,
+            cap,
+        }
+    }
+
+    fn live(&self, at: Instant, now: Instant) -> bool {
+        now.saturating_duration_since(at) <= self.ttl
+    }
+
+    fn insert(&mut self, key: K, value: V) {
+        self.insert_at(key, value, Instant::now());
+    }
+
+    fn insert_at(&mut self, key: K, value: V, now: Instant) {
+        self.entries.insert(key, (value, now));
+        if self.entries.len() <= self.cap {
+            return;
+        }
+        let ttl = self.ttl;
+        self.entries
+            .retain(|_, (_, at)| now.saturating_duration_since(*at) <= ttl);
+        while self.entries.len() > self.cap {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+
+    fn get(&self, key: &K) -> Option<&V> {
+        self.get_at(key, Instant::now())
+    }
+
+    fn get_at(&self, key: &K, now: Instant) -> Option<&V> {
+        self.entries
+            .get(key)
+            .filter(|(_, at)| self.live(*at, now))
+            .map(|(value, _)| value)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        let now = Instant::now();
+        self.entries
+            .iter()
+            .filter(move |(_, (_, at))| self.live(*at, now))
+            .map(|(key, (value, _))| (key, value))
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Keep the last decoded grid for this exact callsign and band during the relay
+/// session. Report/acknowledgment frames omit it; a later grid replaces it.
+fn display_grid(
+    last_grids: &mut RelayCache<(String, String), String>,
+    call_sign: Option<&str>,
+    grid: Option<&str>,
+    dial_mhz: f64,
+) -> Option<String> {
+    let Some(call) = call_sign else {
+        return grid.map(str::to_owned);
+    };
+    let key = (
+        call.to_owned(),
+        pancetta_qso::utils::frequency_to_band(dial_mhz * 1_000_000.0),
+    );
+    if let Some(grid) = grid {
+        last_grids.insert(key, grid.to_owned());
+        Some(grid.to_owned())
+    } else {
+        last_grids.get(&key).cloned()
+    }
+}
+
+/// Inputs of a station's latest decode, per exact callsign (PAN-94).
+#[derive(Debug, Clone)]
+struct RankInputs {
+    grid: Option<String>,
+    snr_db: f32,
+    dial_mhz: f64,
+}
+
+/// Rescore every row a terminal QSO outcome names from its latest decode's
+/// inputs, so worked and failure history recorded at QSO end reach DX Hunter
+/// before that station is decoded again. Rows match on resolved identity, so
+/// a hash-rendered decode (`<PJ4/K1ABC>`) and the QSO's plain callsign find
+/// each other in either direction. Empty when no matching callsign has been
+/// decoded in this relay session.
+fn outcome_rank_refresh(
+    scorer: &pancetta_qso::PriorityScorer,
+    last_inputs: &RelayCache<String, RankInputs>,
+    callsign: &str,
+) -> Vec<pancetta_tui::tui_runner::TuiMessage> {
+    let identity = |call: &str| {
+        pancetta_core::callsign::resolve_hash_render(&call.trim().to_uppercase()).map(str::to_owned)
+    };
+    let Some(target) = identity(callsign) else {
+        return Vec::new();
+    };
+    last_inputs
+        .iter()
+        .filter(|(call, _)| identity(call).as_deref() == Some(target.as_str()))
+        .filter_map(|(call, inputs)| {
+            let (Some(score), Some(factors)) = display_rank(
+                scorer,
+                Some(call),
+                inputs.grid.as_deref(),
+                inputs.snr_db,
+                inputs.dial_mhz,
+            ) else {
+                return None;
+            };
+            Some(pancetta_tui::tui_runner::TuiMessage::DxRankRefresh {
+                callsign: call.clone(),
+                score,
+                factors,
+            })
+        })
+        .collect()
+}
+
+/// Capture score and explanation in one scoring call over the shared lookup.
+fn display_rank(
+    scorer: &pancetta_qso::PriorityScorer,
+    call_sign: Option<&str>,
+    grid: Option<&str>,
+    snr_db: f32,
+    dial_mhz: f64,
+) -> (Option<u32>, Option<pancetta_qso::priority::PriorityFactors>) {
+    let Some(call) = call_sign else {
+        return (None, None);
+    };
+    let explained = scorer.score_tiered_explained(
+        call,
+        grid,
+        snr_db.round().clamp(-128.0, 127.0) as i8,
+        dial_mhz * 1_000_000.0,
+    );
+    (
+        Some(explained.score.as_display_u32()),
+        Some(explained.factors),
+    )
+}
+
 impl super::ApplicationCoordinator {
     /// Start TUI component with point-to-point decoded message channel
     // rationale: wires many independent channel endpoints and shared handles into
@@ -185,13 +359,18 @@ impl super::ApplicationCoordinator {
             // of an unchanged value are still suppressed.
             let mut sent_states: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
+            let mut last_grids = RelayCache::default();
+            let mut last_rank_inputs = RelayCache::default();
             while !relay_shutdown.load(Ordering::Acquire) {
                 if !ft8_disconnected {
                     match ft8_to_tui_rx.try_recv() {
                         Ok(relayed) => {
                             let decoded_msg = &relayed.message;
                             let call_sign = decoded_msg.message.from_callsign.clone();
-                            let grid_square = decoded_msg.message.grid_square.clone();
+                            let dial_mhz = decode_view_dial_mhz(&relayed);
+                            let grid_square = display_grid(
+                                &mut last_grids, call_sign.as_deref(),
+                                decoded_msg.message.grid_square.as_deref(), dial_mhz);
                             // "Calling me" detection: the parser sets
                             // to_callsign = our call when someone replies
                             // to our CQ ("K5ARH F5ABC -10"). Match against
@@ -241,7 +420,6 @@ impl super::ApplicationCoordinator {
                             // stripping on the TUI side only would make the
                             // TUI flag stations the scorer still treats as
                             // new (divergence).
-                            let dial_mhz = decode_view_dial_mhz(&relayed);
                             let worked_before = worked_before_for(
                                 &relay_station_lookup,
                                 call_sign.as_deref(),
@@ -277,18 +455,19 @@ impl super::ApplicationCoordinator {
                             // per-band-DXCC-new > special-station >
                             // per-band-grid-new > everything else, encoded
                             // to a single sortable u32 — see
-                            // TieredScore::as_display_u32). Only meaningful
-                            // for CQ frames that carry a callsign; non-CQ
-                            // decodes (RR73/73/reports) get the same score
-                            // but it won't influence the DX Hunter because
-                            // only CQ frames are listed there.
-                            let priority_score = call_sign.as_deref().map(|cs| {
-                                let freq_hz = dial_mhz * 1_000_000.0;
-                                let snr_i8 = decoded_msg.snr_db.round().clamp(-128.0, 127.0) as i8;
-                                relay_scorer
-                                    .score_tiered(cs, grid_square.as_deref(), snr_i8, freq_hz)
-                                    .as_display_u32()
-                            });
+                            // TieredScore::as_display_u32). Every identified
+                            // frame updates DX Hunter, using the retained
+                            // grid and fresh signal/worked/failure inputs.
+                            let (priority_score, priority_factors) = display_rank(
+                                &relay_scorer, call_sign.as_deref(), grid_square.as_deref(),
+                                decoded_msg.snr_db, dial_mhz);
+                            if let Some(call) = call_sign.as_deref() {
+                                last_rank_inputs.insert(call.to_owned(), RankInputs {
+                                    grid: grid_square.clone(),
+                                    snr_db: decoded_msg.snr_db,
+                                    dial_mhz,
+                                });
+                            }
 
                             let tui_decoded = pancetta_tui::DecodedMessageView {
                                 timestamp: chrono::Utc::now(),
@@ -312,6 +491,7 @@ impl super::ApplicationCoordinator {
                                 atno,
                                 band_needed,
                                 priority_score,
+                                priority_factors,
                                 is_own_tx: false,
                             };
 
@@ -641,6 +821,14 @@ impl super::ApplicationCoordinator {
                                     map_recent_qso_outcome(outcome),
                                 ),
                             );
+                            // PAN-94: the QSO task records worked/failure
+                            // history before emitting this outcome, so rescore
+                            // the row now rather than at its next decode.
+                            for refresh in outcome_rank_refresh(
+                                &relay_scorer, &last_rank_inputs, &outcome.callsign)
+                            {
+                                let _ = tui_msg_tx_relay.send(refresh);
+                            }
                         }
                         MessageType::TxPlacementUpdate { ref snapshot } => {
                             // TX-placement instrument (Task 9/10): convert the
@@ -930,16 +1118,15 @@ impl super::ApplicationCoordinator {
         let cmd_tx_offset_hold_hz = self.tx_offset_hold_hz();
         // decoder-speed-overhaul Task 15: live decode-effort cycling (`e`).
         // The handler cycles `cmd_current_decode_effort`, resolves `Auto`
-        // against `cmd_resolved_hardware_tier`, and writes the resulting
-        // budget into `cmd_decode_effort_budget_ms` — the same atomic
-        // `ft8.rs` reads at both budgeted decode call sites.
+        // against `cmd_resolved_hardware_tier`, and publishes the resulting
+        // budget with its decoder config into `cmd_decode_window` — the one
+        // `DecodeWindowConfig` `ft8.rs` reads once per window (PAN-164).
         let cmd_current_decode_effort = self.current_decode_effort();
         let cmd_resolved_hardware_tier = self.resolved_hardware_tier();
-        let cmd_decode_effort_budget_ms = self.decode_effort_budget_ms();
         // Mode-switch machinery (Shift+M). Cloned here (not previously
         // needed by this task) so the CycleOperatingMode handler can call
         // `try_switch_operating_mode` directly, mirroring how `cmd_tx_policy`
-        // is used by CycleTxPolicy. `ft8_config`/`active_tx_qsos` are
+        // is used by CycleTxPolicy. `decode_window`/`active_tx_qsos` are
         // `pub(crate)` fields so they clone directly with no accessor;
         // `active_protocol_mode`/`active_slot_ns`/`active_decode_phase_ns` go
         // through their `pub(crate) fn` accessors.
@@ -966,7 +1153,7 @@ impl super::ApplicationCoordinator {
         let cmd_qso_manager_watch = self.qso_manager_watch.subscribe();
         let cmd_pending_qso_offset_requests = self.pending_qso_offset_requests.clone();
         let cmd_pending_cq_offset_nudge = self.pending_cq_offset_nudge.clone();
-        let cmd_ft8_config = self.ft8_config.clone();
+        let cmd_decode_window = self.decode_window.clone();
         let cmd_active_protocol_mode = self.active_protocol_mode();
         let cmd_active_slot_ns = self.active_slot_ns();
         let cmd_active_decode_phase_ns = self.active_decode_phase_ns();
@@ -1136,7 +1323,7 @@ impl super::ApplicationCoordinator {
                 )
                 .label()
                 .to_string();
-                let budget_ms = cmd_decode_effort_budget_ms.load(Ordering::Acquire);
+                let budget_ms = cmd_decode_window.read().await.budget_ms();
                 let _ =
                     cmd_tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::DecodeEffortUpdate {
                         effort,
@@ -1206,6 +1393,7 @@ impl super::ApplicationCoordinator {
                                 ComponentId::Tui,
                                 ComponentId::Ft8Transmitter,
                                 MessageType::TransmitRequest {
+                                    attempt_id: None,
                                     message_text: text,
                                     frequency_offset,
                                     qso_id: None,
@@ -1733,13 +1921,12 @@ impl super::ApplicationCoordinator {
                             match super::try_switch_operating_mode(
                                 next,
                                 &cmd_active_tx_qsos,
-                                &cmd_ft8_config,
+                                &cmd_decode_window,
                                 &cmd_active_protocol_mode,
                                 &cmd_active_slot_ns,
                                 &cmd_active_decode_phase_ns,
                                 &cmd_current_decode_effort,
                                 &cmd_resolved_hardware_tier,
-                                &cmd_decode_effort_budget_ms,
                             ) {
                                 Ok(()) => {
                                     let mode_str = super::mode_str(next).to_string();
@@ -1843,85 +2030,29 @@ impl super::ApplicationCoordinator {
                             // state (spec §6.2) — so there is no active-QSO
                             // gate and no optimistic local flip on the TUI side;
                             // the TUI simply waits for this authoritative echo.
-                            let tier = pancetta_ft8::tier_probe::HardwareTier::from_u8(
-                                cmd_resolved_hardware_tier.load(Ordering::Acquire),
-                            );
-                            let (next, mut budget_ms) = super::effort::cycle_decode_effort(
-                                &cmd_current_decode_effort,
-                                &cmd_decode_effort_budget_ms,
-                                tier,
-                            );
-                            // PAN-156: re-apply the new preset's Ft8Config
-                            // overrides immediately so a live cycle doesn't
-                            // wait for a restart to take effect (and so
-                            // cycling AWAY from a preset with an override
-                            // reverts it, not just cycling into one).
                             //
-                            // PAN-156 round-2 review finding: `write().await`
-                            // can yield, and `tier` above was snapshotted
-                            // before that yield — if the background tier
-                            // probe resolves and applies its own (correct)
-                            // overrides in that gap, this continuation must
-                            // not clobber them with a stale tier's overrides.
-                            // Re-read the resolved-tier atomic fresh, after
-                            // the lock is actually held, mirroring the same
-                            // fix on the probe-worker side (`tier.rs`'s
-                            // `spawn_probe_worker`, which re-checks
-                            // `current_decode_effort` at the same point for
-                            // the opposite direction of this race).
-                            //
-                            // PAN-156 round-6 review finding: fixing the
-                            // config override alone left the BUDGET
-                            // inconsistent with it — `budget_ms` above was
-                            // still computed from the stale pre-lock `tier`
-                            // snapshot, so an Auto cycle racing the tier
-                            // probe could end up with e.g. Slow-tier
-                            // overrides paired with the Fast-tier budget.
-                            // Recompute the budget from the same
-                            // `tier_at_write` used for the override, and
-                            // re-store it, so both halves of Auto's
-                            // tier-dependent state come from one consistent
-                            // read.
-                            // PAN-157 round-9 review finding: budget must
-                            // publish no later than config, not after —
-                            // ft8.rs's hot loop reads the budget atomic
-                            // first and the config `try_read` second, so
-                            // publishing config before budget can land a
-                            // window on the NEW config with the OLD,
-                            // possibly-bounded budget (risking starving a
-                            // pass the new config just enabled). The
-                            // reverse tear (new budget + old config) is
-                            // harmless — nothing in the old config needs
-                            // the extra time. See `effort.rs`'s
-                            // `apply_effort_overrides` doc for the full
-                            // reasoning; `tier.rs`'s probe-completion path
-                            // got the same fix.
-                            {
-                                let mut cfg_guard = cmd_ft8_config.write().await;
-                                let tier_at_write = pancetta_ft8::tier_probe::HardwareTier::from_u8(
+                            // PAN-164: the cycle, its tier read and its
+                            // publish all happen under one `decode_window`
+                            // write guard, so the hot loop sees the whole
+                            // change (budget + the Ft8Config overrides
+                            // derived from it) or none of it. Reading the
+                            // tier under the lock also serialises this with
+                            // the tier probe, which stores it inside its own
+                            // critical section on this same lock (PAN-156
+                            // rounds 2 and 6): whichever runs second
+                            // publishes a consistent final state.
+                            let (next, budget_ms, tier) = {
+                                let mut window_guard = cmd_decode_window.write().await;
+                                let tier = pancetta_ft8::tier_probe::HardwareTier::from_u8(
                                     cmd_resolved_hardware_tier.load(Ordering::Acquire),
                                 );
-                                if next == pancetta_config::DecodeEffort::Auto {
-                                    budget_ms =
-                                        super::effort::preset_budget_ms(next, tier_at_write);
-                                    cmd_decode_effort_budget_ms.store(budget_ms, Ordering::Release);
-                                }
-                                // Round-12 review finding: pass the SAME
-                                // `budget_ms` value that's already been
-                                // stored into `cmd_decode_effort_budget_ms`
-                                // (by `cycle_decode_effort` above, or by
-                                // the Auto-recompute just above this),
-                                // not a guessed `None` — this is always
-                                // consistent with the atomic's actual
-                                // state by construction, the same fix
-                                // applied to `try_switch_operating_mode`.
-                                super::effort::apply_effort_overrides(
-                                    next,
-                                    tier_at_write,
-                                    budget_ms,
-                                    &mut cfg_guard,
+                                let (next, budget_ms) = super::effort::cycle_decode_effort(
+                                    &cmd_current_decode_effort,
+                                    &mut window_guard,
+                                    tier,
                                 );
-                            }
+                                (next, budget_ms, tier)
+                            };
                             let label = next.label().to_string();
                             info!(
                                 target: "decoder.effort",
@@ -2417,18 +2548,14 @@ impl super::ApplicationCoordinator {
                             }
                             cmd_ptt_state.store(new_state, Ordering::Release);
                             info!("TUI TogglePtt: {} -> {}", current, new_state);
-                            let msg = ComponentMessage::new(
+                            if super::tx::send_ptt_command(
+                                &cmd_message_bus,
                                 ComponentId::Tui,
-                                ComponentId::Hamlib,
-                                MessageType::RigControl(
-                                    crate::message_bus::RigControlMessage::SetPtt {
-                                        state: new_state,
-                                    },
-                                ),
-                                Instant::now(),
-                            );
-                            if let Err(e) = cmd_message_bus.send_message(msg).await {
-                                warn!("Failed to toggle PTT: {}", e);
+                                new_state,
+                                || true,
+                            ) != crate::message_bus::SendIfOutcome::Enqueued
+                            {
+                                warn!("Failed to toggle PTT: message dropped");
                             }
                         }
                         pancetta_tui::tui_runner::TuiCommand::SelectDevice {
@@ -3522,16 +3649,15 @@ fn worked_before_for(
 }
 
 /// Compute `(needed, atno)` for a callsign against the same
-/// `CachedStationLookup` the autonomous scorer consults. Both inert
-/// (false) when cqdx supplies no needed set, or the callsign is absent.
-/// `atno` implies `needed`.
+/// `CachedStationLookup` the autonomous scorer consults. `needed` only when
+/// cqdx's loaded list names the entity; false while the list is unknown
+/// (PAN-93), or the callsign is absent. `atno` implies `needed`.
 fn needed_atno_for(
     lookup: &crate::priority_evaluator::CachedStationLookup,
     callsign: Option<&str>,
 ) -> (bool, bool) {
-    use pancetta_qso::priority::WorkedStationLookup;
     match callsign {
-        Some(c) if !c.is_empty() => (lookup.is_needed_dxcc(c), lookup.is_atno(c)),
+        Some(c) if !c.is_empty() => lookup.display_needed_atno(c),
         _ => (false, false),
     }
 }
@@ -4015,6 +4141,264 @@ where
 
 #[cfg(test)]
 mod tui_relay_tests {
+    #[test]
+    fn needed_atno_for_reports_unknown_as_not_needed() {
+        // PAN-93: no cqdx list loaded → not shown as needed, even though the
+        // scorer's no-exclusions guess would call every station needed.
+        let lookup = crate::priority_evaluator::CachedStationLookup::new();
+        assert_eq!(
+            super::needed_atno_for(&lookup, Some("JA1ABC")),
+            (false, false)
+        );
+        lookup.update_needed_dxcc(std::collections::HashSet::from(["JA".to_owned()]));
+        lookup.update_needed_atno(std::collections::HashSet::from(["JA".to_owned()]));
+        assert_eq!(
+            super::needed_atno_for(&lookup, Some("JA1ABC")),
+            (true, true)
+        );
+        assert_eq!(
+            super::needed_atno_for(&lookup, Some("DL1ABC")),
+            (false, false)
+        );
+        assert_eq!(super::needed_atno_for(&lookup, None), (false, false));
+    }
+
+    #[tokio::test]
+    async fn gridless_decodes_keep_grid_rank_but_refresh_live_history() {
+        use pancetta_qso::priority::WorkedStationLookup;
+        use pancetta_tui::{app::App, Config, DecodedMessageView};
+
+        let lookup = crate::priority_evaluator::CachedStationLookup::new();
+        lookup.update_needed_dxcc(std::collections::HashSet::from(["DL".to_owned()]));
+        // The entity is already worked, but FN42 is still new on this band.
+        lookup.record_worked("W1XYZ", "20M");
+        let scorer = pancetta_qso::PriorityScorer::new(
+            pancetta_qso::priority::PriorityWeights::default(),
+            Box::new(lookup.clone()),
+        );
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        let mut last_grids = super::RelayCache::default();
+        for worked_grid in [false, true] {
+            if worked_grid {
+                lookup.record_worked_grid("FN42", "20M");
+                lookup.record_failure("K1ABC");
+            }
+            let frames = if worked_grid {
+                vec![("W1XYZ K1ABC -10", None)]
+            } else {
+                vec![
+                    ("CQ K1ABC FN42", Some("FN42")),
+                    ("W1XYZ K1ABC -10", None),
+                    ("W1XYZ K1ABC R-10", None),
+                    ("W1XYZ K1ABC RRR", None),
+                    ("W1XYZ K1ABC RR73", None),
+                    ("W1XYZ K1ABC 73", None),
+                ]
+            };
+            for (text, grid) in frames {
+                let grid = super::display_grid(&mut last_grids, Some("K1ABC"), grid, 14.074);
+                let (priority_score, priority_factors) =
+                    super::display_rank(&scorer, Some("K1ABC"), grid.as_deref(), -10.0, 14.074);
+                app.add_decoded_message(DecodedMessageView {
+                    timestamp: chrono::Utc::now(),
+                    frequency: 14.074,
+                    mode: "FT8".into(),
+                    snr: -10,
+                    delta_time: 0.0,
+                    delta_freq: 1500.0,
+                    call_sign: Some("K1ABC".into()),
+                    grid_square: grid,
+                    message: text.into(),
+                    distance: None,
+                    bearing: None,
+                    slot_parity: None,
+                    is_directed_at_us: false,
+                    worked_before: lookup.is_duplicate("K1ABC", 14_074_000.0),
+                    needed: lookup.is_needed_dxcc("K1ABC"),
+                    atno: lookup.is_atno("K1ABC"),
+                    band_needed: lookup.is_dxcc_needed_on_band("K1ABC", 14_074_000.0),
+                    priority_score,
+                    priority_factors,
+                    is_own_tx: false,
+                })
+                .await
+                .unwrap();
+                let row = &app.dx_stations["K1ABC"];
+                assert_eq!(row.grid_square.as_deref(), Some("FN42"));
+                let factors = row.local_rank.unwrap().factors.unwrap();
+                assert_eq!(factors.grid_new_on_band, !worked_grid, "{text}");
+                assert_eq!(factors.recent_failure, worked_grid, "{text}");
+                assert_eq!(
+                    pancetta_qso::priority::PriorityTier::from_display_u32(row.priority_score),
+                    if worked_grid {
+                        pancetta_qso::priority::PriorityTier::Standard
+                    } else {
+                        pancetta_qso::priority::PriorityTier::PerBandGridNew
+                    }
+                );
+                let reason =
+                    pancetta_tui::dx_reason::reason_for(row, None, chrono::Utc::now()).summary();
+                assert_eq!(reason.contains("grid FN42 may be new"), !worked_grid);
+                assert_eq!(reason.contains("QSO failed this session"), worked_grid);
+            }
+        }
+        // Never borrow another station's or another band's grid. A new
+        // grid-bearing frame replaces the remembered value for its own key.
+        for (call, band) in [
+            (Some("K2ABC"), 14.074),
+            (Some("K1ABC"), 7.074),
+            (None, 14.074),
+        ] {
+            assert_eq!(super::display_grid(&mut last_grids, call, None, band), None);
+        }
+        assert_eq!(
+            super::display_grid(&mut last_grids, Some("K1ABC"), Some("FN43"), 14.074).as_deref(),
+            Some("FN43")
+        );
+        assert_eq!(
+            super::display_grid(&mut last_grids, Some("K1ABC"), None, 14.074).as_deref(),
+            Some("FN43")
+        );
+    }
+
+    #[test]
+    fn relay_cache_expires_and_caps_entries() {
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        let mut cache = super::RelayCache::new(Duration::from_secs(60), 3);
+        cache.insert_at("K1ABC".to_owned(), 1, start);
+        assert_eq!(cache.get_at(&"K1ABC".to_owned(), start), Some(&1));
+        // Past the TTL an entry reads as gone even before it is pruned.
+        let late = start + Duration::from_secs(61);
+        assert_eq!(cache.get_at(&"K1ABC".to_owned(), late), None);
+
+        // Going over the cap prunes expired entries first...
+        for (i, call) in ["K2ABC", "K3ABC", "K4ABC"].into_iter().enumerate() {
+            cache.insert_at(call.to_owned(), i, late);
+        }
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.get_at(&"K1ABC".to_owned(), start), None);
+
+        // ...then the oldest live ones.
+        let later = late + Duration::from_secs(1);
+        cache.insert_at("K5ABC".to_owned(), 5, later);
+        cache.insert_at("K6ABC".to_owned(), 6, later);
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.get_at(&"K5ABC".to_owned(), later), Some(&5));
+        assert_eq!(cache.get_at(&"K6ABC".to_owned(), later), Some(&6));
+    }
+
+    #[tokio::test]
+    async fn qso_outcome_rescores_the_row_from_fresh_failure_history() {
+        use pancetta_tui::{app::App, tui_runner::TuiMessage, Config, DecodedMessageView};
+
+        let lookup = crate::priority_evaluator::CachedStationLookup::new();
+        let scorer = pancetta_qso::PriorityScorer::new(
+            pancetta_qso::priority::PriorityWeights::default(),
+            Box::new(lookup.clone()),
+        );
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        let (priority_score, priority_factors) =
+            super::display_rank(&scorer, Some("K1ABC/P"), Some("FN42"), -3.0, 14.074);
+        app.add_decoded_message(DecodedMessageView {
+            timestamp: chrono::Utc::now(),
+            frequency: 14.074,
+            mode: "FT8".into(),
+            snr: -3,
+            delta_time: 0.0,
+            delta_freq: 1500.0,
+            call_sign: Some("K1ABC/P".into()),
+            grid_square: Some("FN42".into()),
+            message: "CQ K1ABC/P FN42".into(),
+            distance: None,
+            bearing: None,
+            slot_parity: None,
+            is_directed_at_us: false,
+            worked_before: false,
+            needed: false,
+            atno: false,
+            band_needed: false,
+            priority_score,
+            priority_factors,
+            is_own_tx: false,
+        })
+        .await
+        .unwrap();
+        let before = app.dx_stations["K1ABC/P"].priority_score;
+        let heard_at = app.dx_stations["K1ABC/P"].local_rank.unwrap().at;
+
+        let mut last_inputs = super::RelayCache::default();
+        last_inputs.insert(
+            "K1ABC/P".to_owned(),
+            super::RankInputs {
+                grid: Some("FN42".into()),
+                snr_db: -3.0,
+                dial_mhz: 14.074,
+            },
+        );
+        // A QSO with a station never decoded here has no row to rescore.
+        assert!(super::outcome_rank_refresh(&scorer, &last_inputs, "K2ABC").is_empty());
+
+        // The QSO task records the failure, then emits the outcome.
+        lookup.record_failure("K1ABC/P");
+        // The outcome may name the station in hash-rendered form.
+        let refreshes = super::outcome_rank_refresh(&scorer, &last_inputs, "<K1ABC/P>");
+        assert_eq!(refreshes.len(), 1);
+        let Some(TuiMessage::DxRankRefresh {
+            callsign,
+            score,
+            factors,
+        }) = refreshes.into_iter().next()
+        else {
+            panic!("a decoded station's QSO outcome must rescore its row");
+        };
+        app.refresh_local_rank(&callsign, score, factors);
+
+        let row = &app.dx_stations["K1ABC/P"];
+        assert!(
+            row.priority_score < before,
+            "{} >= {before}",
+            row.priority_score
+        );
+        let rank = row.local_rank.unwrap();
+        assert!(rank.factors.unwrap().recent_failure);
+        assert_eq!(rank.at, heard_at, "a rescore is not a new decode");
+        let reason = pancetta_tui::dx_reason::reason_for(row, None, chrono::Utc::now()).summary();
+        assert!(reason.contains("QSO failed this session"), "{reason}");
+    }
+
+    #[test]
+    fn display_rank_carries_factors_from_the_shared_lookup() {
+        let lookup = crate::priority_evaluator::CachedStationLookup::new();
+        let scorer = pancetta_qso::PriorityScorer::new(
+            pancetta_qso::priority::PriorityWeights::default(),
+            Box::new(lookup.clone()),
+        );
+        let before = super::display_rank(&scorer, Some("K1ABC/P"), None, -3.0, 14.074);
+        lookup.record_failure("K1ABC/P");
+        let after = super::display_rank(&scorer, Some("K1ABC/P"), None, -3.0, 14.074);
+        let factors = after.1.unwrap();
+        assert!(factors.recent_failure);
+        assert_eq!(
+            factors.portable_suffix,
+            Some(pancetta_qso::priority::PortableSuffix::P)
+        );
+        assert!(after.0.unwrap() < before.0.unwrap());
+    }
+
+    #[test]
+    fn display_rank_is_none_without_a_callsign() {
+        let scorer = pancetta_qso::PriorityScorer::new(
+            pancetta_qso::priority::PriorityWeights::default(),
+            Box::new(pancetta_qso::priority::NullLookup),
+        );
+        assert_eq!(
+            super::display_rank(&scorer, None, None, -7.0, 14.074),
+            (None, None)
+        );
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8};
 
@@ -5435,6 +5819,31 @@ mod tui_relay_tests {
     /// PAN-118, manual-PTT path: a key-up is refused with the exact
     /// operator-facing status while the effective TX dial sits outside the
     /// configured amateur band plan (15.000 MHz is inside no allocation).
+    #[test]
+    fn pan206_polled_out_of_band_split_refuses_manual_ptt() {
+        assert_eq!(
+            ptt_band_plan_refusal(
+                &Arc::new(std::sync::atomic::AtomicU64::new(14_074_000)),
+                &Arc::new(std::sync::atomic::AtomicU64::new(15_000_000)),
+                &pancetta_config::BandPlanConfig::default(),
+            )
+            .as_deref(),
+            Some("Can't key PTT — TX dial 15000000 Hz is outside the configured amateur band plan"),
+        );
+    }
+
+    #[test]
+    fn pan206_in_band_polled_split_allows_manual_ptt() {
+        assert_eq!(
+            ptt_band_plan_refusal(
+                &Arc::new(std::sync::atomic::AtomicU64::new(14_074_000)),
+                &Arc::new(std::sync::atomic::AtomicU64::new(14_078_000)),
+                &pancetta_config::BandPlanConfig::default(),
+            ),
+            None,
+        );
+    }
+
     #[test]
     fn ptt_band_plan_refusal_names_the_out_of_band_dial() {
         assert_eq!(

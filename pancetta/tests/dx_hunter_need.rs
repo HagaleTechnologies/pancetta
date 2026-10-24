@@ -31,6 +31,7 @@ async fn add_rows(app: &mut App) {
         atno: false,
         band_needed: false,
         priority_score: None,
+        priority_factors: None,
         is_own_tx: false,
     })
     .await

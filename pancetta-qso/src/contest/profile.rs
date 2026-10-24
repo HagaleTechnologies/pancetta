@@ -34,6 +34,17 @@ pub struct ContestProfile {
     /// Provenance for future maintenance — where the format assumption
     /// came from.
     pub source_notes: String,
+
+    /// The value ADIF logging stamps into the `CONTEST_ID` field when this
+    /// profile is engaged (PAN-52). When set, it must be a value from the
+    /// ADIF 3.1.5 Contest_ID enumeration (e.g. `KS-QSO-PARTY`, `WFD`,
+    /// `NAQP-CW`). Family/aggregate profiles that model several contests
+    /// with one exchange shape — like the built-in `us-state-qso-party` —
+    /// have no single valid id and ship `None`, in which case the ADIF
+    /// writer omits the field entirely rather than emitting the internal
+    /// slug. Never populated with `id`.
+    #[serde(default)]
+    pub adif_contest_id: Option<String>,
 }
 
 /// Which FT8 exchange convention a [`ContestProfile`] uses.

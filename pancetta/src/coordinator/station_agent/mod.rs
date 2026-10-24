@@ -208,6 +208,12 @@ struct ArmContext {
     revoked_jtis: HashSet<String>,
     seen_jtis: HashSet<String>,
     audit: AuditLog,
+    /// PAN-147: owns this context's audit temp path so it is cleaned (with
+    /// its rotation archives) when the context drops, and pre-cleaned before
+    /// use against a PID-reusing earlier run's leftover. Test-only; `None`
+    /// in production and compiled away outside `#[cfg(test)]`.
+    #[cfg(test)]
+    _audit_tmp: Option<crate::coordinator::audit_test_util::TempPath>,
     /// Per-established-peer session context, keyed by the peer's
     /// relay-DO-authenticated, station-locally-vetted client keyId.
     ///
@@ -2392,6 +2398,8 @@ async fn run_session_loop(mut cfg: RunConfig) {
         revoked_jtis: HashSet::new(),
         seen_jtis: HashSet::new(),
         audit: cfg.audit,
+        #[cfg(test)]
+        _audit_tmp: None,
         // Not pinned to any fixed peer — established peers are learned and
         // vetted fresh each session by `MultiPeerSession` itself (see
         // `run_one_session`), so a different set of allow-listed clients can
@@ -2958,6 +2966,7 @@ mod tests {
         // expects the client to be both connection-admitted AND TX-arm
         // eligible, so both sets get the same contents.
         let tx_arm_allow = allow.clone();
+        let audit_tmp = audit_tmp();
         ArmContext {
             arm: Arc::new(Mutex::new(ArmState::new())),
             split_tx_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2973,7 +2982,8 @@ mod tests {
             tx_arm_allow_list: Arc::new(std::sync::RwLock::new(tx_arm_allow)),
             revoked_jtis: HashSet::new(),
             seen_jtis: HashSet::new(),
-            audit: AuditLog::new(audit_tmp()),
+            audit: AuditLog::new(audit_tmp.path()),
+            _audit_tmp: Some(audit_tmp),
             // The peer this session is Noise-connected to (mirrors the old
             // default `expected_client_key_id: CLIENT_KEY_ID`) — an
             // already-established peer with no granted scope yet.
@@ -2988,11 +2998,10 @@ mod tests {
         }
     }
 
-    fn audit_tmp() -> std::path::PathBuf {
-        use std::sync::atomic::AtomicU64;
-        static C: AtomicU64 = AtomicU64::new(0);
-        let n = C.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("pancetta-sa-test-{}-{n}.log", std::process::id()))
+    /// PAN-147: guarded path (pre-cleaned, deleted on drop) — see
+    /// [`crate::coordinator::audit_test_util`].
+    fn audit_tmp() -> crate::coordinator::audit_test_util::TempPath {
+        crate::coordinator::audit_test_util::TempPath::new("pancetta-sa-test")
     }
 
     fn with_channel_consent(ctx: &ArmContext, channel: ConsentChannel, on: bool) {
@@ -3033,7 +3042,8 @@ mod tests {
     #[test]
     fn drop_during_ordinary_shutdown_does_not_audit_a_component_crash() {
         let arm = Arc::new(Mutex::new(armed_state()));
-        let audit = AuditLog::new(audit_tmp());
+        let audit_tmp = audit_tmp();
+        let audit = AuditLog::new(audit_tmp.path());
 
         {
             let _guard = RemoteTxDisarmGuard {
@@ -3069,7 +3079,8 @@ mod tests {
     #[test]
     fn drop_without_normal_exit_but_not_panicking_still_audits_operator_disarm() {
         let arm = Arc::new(Mutex::new(armed_state()));
-        let audit = AuditLog::new(audit_tmp());
+        let audit_tmp = audit_tmp();
+        let audit = AuditLog::new(audit_tmp.path());
 
         {
             let _guard = RemoteTxDisarmGuard {
@@ -3108,7 +3119,8 @@ mod tests {
     #[test]
     fn drop_without_shutdown_requested_and_not_panicking_audits_a_crash() {
         let arm = Arc::new(Mutex::new(armed_state()));
-        let audit = AuditLog::new(audit_tmp());
+        let audit_tmp = audit_tmp();
+        let audit = AuditLog::new(audit_tmp.path());
 
         {
             let _guard = RemoteTxDisarmGuard {
@@ -3144,7 +3156,8 @@ mod tests {
     #[test]
     fn drop_after_a_config_stop_request_audits_operator_disarm_not_a_crash() {
         let arm = Arc::new(Mutex::new(armed_state()));
-        let audit = AuditLog::new(audit_tmp());
+        let audit_tmp = audit_tmp();
+        let audit = AuditLog::new(audit_tmp.path());
 
         {
             let _guard = RemoteTxDisarmGuard {
@@ -3175,7 +3188,8 @@ mod tests {
     #[test]
     fn drop_during_genuine_panic_audits_a_component_crash() {
         let arm = Arc::new(Mutex::new(armed_state()));
-        let audit = AuditLog::new(audit_tmp());
+        let audit_tmp = audit_tmp();
+        let audit = AuditLog::new(audit_tmp.path());
         let arm_for_panic = arm.clone();
         let audit_for_panic = audit.clone();
 
@@ -3214,7 +3228,8 @@ mod tests {
     #[test]
     fn drop_during_genuine_panic_with_concurrent_shutdown_flag_still_audits_a_component_crash() {
         let arm = Arc::new(Mutex::new(armed_state()));
-        let audit = AuditLog::new(audit_tmp());
+        let audit_tmp = audit_tmp();
+        let audit = AuditLog::new(audit_tmp.path());
         // Shutdown requested at (or just before) the exact moment this
         // task's own, unrelated panic unwinds -- must not mask the panic.
         let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -3262,7 +3277,8 @@ mod tests {
     #[tokio::test]
     async fn task_abort_mid_session_drops_the_guard_as_operator_disarm_not_a_crash() {
         let arm = Arc::new(Mutex::new(armed_state()));
-        let audit = AuditLog::new(audit_tmp());
+        let audit_tmp = audit_tmp();
+        let audit = AuditLog::new(audit_tmp.path());
         let arm_for_task = arm.clone();
         let audit_for_task = audit.clone();
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -3308,7 +3324,8 @@ mod tests {
     #[tokio::test]
     async fn task_abort_without_shutdown_requested_still_audits_a_component_crash() {
         let arm = Arc::new(Mutex::new(armed_state()));
-        let audit = AuditLog::new(audit_tmp());
+        let audit_tmp = audit_tmp();
+        let audit = AuditLog::new(audit_tmp.path());
         let arm_for_task = arm.clone();
         let audit_for_task = audit.clone();
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -5303,7 +5320,8 @@ mod tests {
     #[tokio::test]
     async fn failing_audit_sink_keeps_valid_arms_and_every_disarm_working() {
         let mut ctx = ctx_with(true, true);
-        ctx.audit = failing_audit_log();
+        let (failing_audit, _audit_tmp) = failing_audit_log();
+        ctx.audit = failing_audit;
         ctx.peers
             .insert(PEER_B.to_string(), PeerCtx::unauthorized());
         let bus = MessageBus::new(64).unwrap();
@@ -5936,6 +5954,7 @@ mod tests {
         // the TX-arm-eligible set mirrors the admission set — no test using
         // it depends on the two diverging.
         let tx_arm_allow = allow.clone();
+        let audit_tmp = audit_tmp();
         let mut ctx = ArmContext {
             arm: Arc::new(Mutex::new(ArmState::new())),
             split_tx_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -5951,7 +5970,8 @@ mod tests {
             tx_arm_allow_list: Arc::new(std::sync::RwLock::new(tx_arm_allow)),
             revoked_jtis: HashSet::new(),
             seen_jtis: HashSet::new(),
-            audit: AuditLog::new(audit_tmp()),
+            audit: AuditLog::new(audit_tmp.path()),
+            _audit_tmp: Some(audit_tmp),
             peers: std::collections::HashMap::new(),
             controller: None,
             qso_cleanup_owed: None,
@@ -6039,6 +6059,7 @@ mod tests {
         // exercised through this helper, so the TX-arm-eligible set mirrors
         // the admission set.
         let tx_arm_allow = allow.clone();
+        let audit_tmp = audit_tmp();
         ArmContext {
             arm: Arc::new(Mutex::new(ArmState::new())),
             split_tx_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -6054,7 +6075,8 @@ mod tests {
             tx_arm_allow_list: Arc::new(std::sync::RwLock::new(tx_arm_allow)),
             revoked_jtis: HashSet::new(),
             seen_jtis: HashSet::new(),
-            audit: AuditLog::new(audit_tmp()),
+            audit: AuditLog::new(audit_tmp.path()),
+            _audit_tmp: Some(audit_tmp),
             peers: std::collections::HashMap::new(),
             controller: None,
             qso_cleanup_owed: None,
@@ -7070,6 +7092,7 @@ mod tests {
         }
         // `allow_client` means an OWNER edge here too — see `ctx_with`.
         let tx_arm_allow = allow.clone();
+        let audit_tmp = audit_tmp();
         ArmContext {
             arm: Arc::new(Mutex::new(ArmState::new())),
             split_tx_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -7085,7 +7108,8 @@ mod tests {
             tx_arm_allow_list: Arc::new(std::sync::RwLock::new(tx_arm_allow)),
             revoked_jtis: HashSet::new(),
             seen_jtis: HashSet::new(),
-            audit: AuditLog::new(audit_tmp()),
+            audit: AuditLog::new(audit_tmp.path()),
+            _audit_tmp: Some(audit_tmp),
             peers: peers_with(CLIENT_KEY_ID, None),
             controller: None,
             qso_cleanup_owed: None,
@@ -7209,7 +7233,8 @@ mod tests {
             Arc::new(std::sync::RwLock::new(HashSet::from(["seed".to_string()])));
         let client_keys = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
         let arm = Arc::new(Mutex::new(ArmState::new()));
-        let audit = AuditLog::new(audit_tmp());
+        let audit_tmp = audit_tmp();
+        let audit = AuditLog::new(audit_tmp.path());
         let revocation_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let authz_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -7396,7 +7421,7 @@ mod tests {
             CLIENT_KEY_ID.to_string()
         ])));
         let arm = Arc::new(Mutex::new(armed_state()));
-        let audit = failing_audit_log();
+        let (audit, _audit_tmp) = failing_audit_log();
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let handle = tokio::spawn(poll_authorizations_loop(
             pancetta_config::network::CqdxConfig {
@@ -7463,7 +7488,8 @@ mod tests {
             CLIENT_KEY_ID.to_string()
         ])));
         let arm = Arc::new(Mutex::new(armed_state()));
-        let audit = AuditLog::new(audit_tmp());
+        let audit_tmp = audit_tmp();
+        let audit = AuditLog::new(audit_tmp.path());
         let held = audit.block_next_write();
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let handle = tokio::spawn(poll_authorizations_loop(
@@ -7521,7 +7547,7 @@ mod tests {
     #[test]
     fn disarm_guard_drop_disarms_despite_a_failing_audit_sink() {
         let arm = Arc::new(Mutex::new(armed_state()));
-        let audit = failing_audit_log();
+        let (audit, _audit_tmp) = failing_audit_log();
         {
             let _guard = RemoteTxDisarmGuard {
                 arm: arm.clone(),
@@ -7568,7 +7594,8 @@ mod tests {
         ])));
         let client_keys = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
         let arm = Arc::new(Mutex::new(ArmState::new()));
-        let audit = AuditLog::new(audit_tmp());
+        let audit_tmp = audit_tmp();
+        let audit = AuditLog::new(audit_tmp.path());
         let audit_path = audit.path().clone();
         let revocation_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -9190,8 +9217,15 @@ mod tests {
     }
 
     /// PAN-104: an audit sink whose writes fail (its parent does not exist).
-    fn failing_audit_log() -> AuditLog {
-        AuditLog::new(audit_tmp().join("missing-dir").join("audit.log"))
+    /// PAN-147: also returns the path guard — bind it
+    /// (`let (audit, _audit_tmp) = failing_audit_log();`) so the temp path
+    /// is swept before use and deleted on drop.
+    fn failing_audit_log() -> (AuditLog, crate::coordinator::audit_test_util::TempPath) {
+        let audit_tmp = audit_tmp();
+        (
+            AuditLog::new(audit_tmp.path().join("missing-dir").join("audit.log")),
+            audit_tmp,
+        )
     }
 
     /// PAN-104: a revocation still disarms and unpublishes eligibility when
@@ -9200,7 +9234,8 @@ mod tests {
     async fn static_revocation_disarms_despite_a_failing_audit_sink() {
         let identity = AgentIdentity::generate();
         let (mut ctx, _sess, _outbound, _transports, _ws) = two_authorized_peers(&identity);
-        ctx.audit = failing_audit_log();
+        let (failing_audit, _audit_tmp) = failing_audit_log();
+        ctx.audit = failing_audit;
         arm_controller(&mut ctx, CLIENT_KEY_ID);
         let live = live_handles_for(&ctx);
         assert!(revoke_static_allow_list_entries(
@@ -9247,7 +9282,8 @@ mod tests {
     #[test]
     fn static_revocation_releases_the_arm_lock_before_its_audit_write() {
         let arm = Arc::new(Mutex::new(armed_state()));
-        let audit = AuditLog::new(audit_tmp());
+        let audit_tmp = audit_tmp();
+        let audit = AuditLog::new(audit_tmp.path());
         let both = HashSet::from([CLIENT_KEY_ID.to_string(), PEER_B.to_string()]);
         let live = StationAgentLiveHandles {
             tx_allow_list: Arc::new(std::sync::RwLock::new(both.clone())),
@@ -10556,6 +10592,11 @@ mod tests {
             audit,
             revocation_pending,
             authz_generation,
+            // PAN-147: bind the audit-path guard instead of letting `..`
+            // drop it here — `run_session_loop` below appends audit records
+            // through `audit` after this statement, which would re-create
+            // the file the guard just cleaned and leak it.
+            _audit_tmp,
             ..
         } = ctx_with(true, true);
         *arm.lock().unwrap() = armed_state();

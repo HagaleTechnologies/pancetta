@@ -3,6 +3,37 @@
 
 # TX scheduling
 
+## DX-parity evidence is scoped to band and slot grid (PAN-146, 2026-10-21)
+
+PAN-141's pre-PTT hold reads the DX's newest fresh sighting in
+`CrossTimeState::a7_recent_calls`. Entries were keyed by callsign with no band
+or slot grid, so a sighting heard on 20 m, or on the FT8 grid, could hold a call
+on 15 m or in FT4 for one cycle (Codex P2 on PR #370, deferred). Each entry now
+records `captured_dial_hz` (from `DecodedMessage::captured_dial_hz`, PAN-67;
+0 = unknown) and `slot_ns` (the period its `slot_parity` was computed on). The
+gate counts only entries on the frame's slot grid and, per `is_band_change`, on
+its band, filtering before the newest-entry pick. The band check is skipped
+while either dial is 0, so a session without a CAT dial keeps the PAN-141 hold.
+The context's `slot_ns` also sets the freshness window, replacing the separate
+parameter at all four call sites (Step 4b/4d, single and multi TX).
+
+- **Filter on read, not invalidate on change.** Clearing the table on a switch
+  needs a hook at every dial and mode writer and races decode latency; recorded
+  context is race-free.
+- **Band, not exact dial.** The captured dial is the exact dial at window close
+  (`dsp.rs` `cur_dial_hz`, re-read every audio batch, PAN-67), so an entry keeps
+  its pre-retune dial and exact-Hz matching would drop same-band evidence after
+  any retune, so the gate defers to `is_band_change` instead.
+- **`slot_ns`, not `Protocol`.** Parity is a function of the instant and the
+  slot period, and `pancetta-qso` has no non-optional `pancetta-ft8` dependency.
+- **Table unchanged.** Still one entry per callsign spelling, newest wins. A
+  round trip (20 m → 15 m → 20 m inside the window) can lose the 20 m sighting;
+  the gate then proceeds, which is the pre-PAN-141 behaviour for that cycle.
+- **Tests.** Unit tests in `schedule_tx_tests` pin cross-band, cross-grid,
+  intra-band retune, unknown dial, filter order, Step 4d and the bundle mask.
+  `pan146_dx_parity_context_worker_tests` runs the real TX worker: a 15 m call
+  with a fresh 20 m sighting keys, and the same call on 20 m is held.
+
 ## The TX worker keeps what it takes off its channel (PAN-73 follow-up, 2026-10-17)
 
 During a keyed transmission the worker takes messages off its own
@@ -334,9 +365,34 @@ loop stores the rig's current reading every tick, so it can revert a requested v
 command still sits in the queue. A key-time check in either window gates on a frequency the rig is
 not keyed on: FIFO order applies the queued command before the later `SetPtt`, and the
 pending/in-flight mute covers a command only once the Hamlib loop is applying it (or while it waits
-in a restart pending slot). Closing this needs a confirmed-RF source (the rig's split is never read
-back) or in-flight marking from the requested-value store through CAT application. That producer
-ordering predates PAN-118 and is follow-up scope.
+in a restart pending slot). PAN-209 subsequently moved split recording after confirmed channel
+acceptance; its accepted enqueue/store windows are documented in `remote-operation.md`.
+PAN-206 closes the rig-side split readback gap: every successful 500 ms Connected poll tick reads
+split with rigctld `s` and, when enabled, the TX frequency with `i`. It reconciles
+`split_tx_frequency_hz` and echoes `SplitStatus` to the existing TUI chip and remote display feed.
+`start_hamlib_component` (boot, supervisor restart, live rig-config reconnect) also runs one
+reconciliation after a successful startup connect and before it publishes command-loop readiness.
+When that read succeeds, a split already set at the radio is in the gate before the first poll
+tick. A failed startup connect, an unobservable or skipped read, and the poll loop's own redial
+leave the split to the next successful poll tick.
+The poll skips commands in flight and discards a read if the shared split changed during it.
+PAN-206 also gives `forward_split_change` a shared observation guard that lives through enqueue,
+recording, CAT application, and pending retries. The message carries a cloned owner, so polling
+cannot erase an accepted command while it is still queued. A revision invalidates reads that
+span a completed command, including repeated commands for the same frequency. Only split-command
+creation and poll publication take this short lock; PTT enqueue stays lock-free.
+Unsupported split readback is best-effort and does not count toward CAT `PollingFailed`: a read
+that fails while the link stays Connected preserves the previous split and logs once per
+unavailable episode, re-arming after recovery. A split read that drops the link (timeout, EOF,
+incomplete `s` reply) fails that poll tick, so a link that answers the frequency read but loses
+every split read still reaches `PollingFailed` and the TX hard mute. If the startup reconciliation
+itself drops the link, startup marks the link `PollingFailed` before publishing readiness, and the
+poll loop's first successful poll clears it as a normal recovery.
+Zero or malformed TX-frequency responses never clear a known split. Both `s` response lines are
+consumed under one connection lock so concurrent CAT traffic cannot consume half a reply.
+The gate still uses sampled state, not confirmed RF at key-time. FTdx10 confirmation of the read
+verbs remains an operator follow-up; no on-air validation was possible in the implementation
+container.
 
 **PAN-208: the occupied interval must fit inside one allowed range.** The gate first checked the
 low and high edges as two independent point queries. Point membership is OR across a
@@ -384,13 +440,36 @@ Autonomous still gets a failed completion for the pivoted payload, as on Step
 0-dup; correlating it with the queued request's eventual outcome is PAN-185. An F8 abort keeps the
 tombstone, so Step 0-dup later reports the replaced frame. Backlog coalescing
 consumes pivot duplicates before it picks the newest request per QSO, so a
-duplicate superseded in the backlog still reports its replaced frame. Multi-TX bundle items
-carry no binding, which matches bundle pivots comparing only text and offset.
+duplicate superseded in the backlog still reports its replaced frame. Since PAN-136,
+multi-TX bundle items carry their own binding: a bundle pivot compares it alongside text
+and offset, and reports the replaced frame's binding like a single-frame pivot.
 If a rollback takes `stall_cycles` from the switch threshold back below it
 before the coordinator's drain commits a stall offset action that attempt
 raised, the commit is refused (`OffsetActionStallRolledBack`) until the streak
-reaches the threshold again. A rollback that arrives after the commit cannot
-undo the move (follow-up: PAN-182). Since PAN-128 each attempt records the
+reaches the threshold again. Since PAN-182 the commit cannot come first: a
+stall action commits only once its trigger frame's outcome is known. The rearm
+whose emission brought the streak to the threshold records that emission as
+the action's pending trigger, and `apply_tx_offset_switch` refuses a
+stall-origin commit with `OffsetActionTriggerOutcomePending` while it is
+recorded; the drain requeues the action like a PTT-in-flight refusal. The TX
+worker mirrors every QSO frame that played out to the QSO engine as
+`TxFrameSent` (sibling of `TxFrameNotSent`, sent after PTT release, never on a
+key-down path), which releases the hold, so the next drain commits; a
+`TxFrameNotSent` instead clears it and the revocation above refuses the
+action. The release matches the aired frame's text, offset and binding, so a
+pivot that aired a same-text frame elsewhere cannot release a hold its
+replaced frame's not-sent report is about to revoke, and `TxFrameSent` carries
+its post-playback report time, which must not precede the own-parity slot the
+trigger feeds: keep-calling repeats the same frame every slot, and a rearm late
+in its own slot trips the threshold for the next one while the current slot's
+identical frame is still playing; if the trigger is rolled
+back while a PAN-128 same-slot twin survives, the hold moves to the twin. Later
+re-raises on the same streak leave the hold alone (re-arming it every slot
+could keep it from ever releasing) unless it has expired: a trigger left
+unreported for four slots (a frame dropped with no report, such as on
+shutdown) is refused as `OffsetActionTriggerOutcomeExpired` and dropped, never
+committed, and the next re-raise arms a fresh hold. Operator `u` nudges are
+never held. Every stall reset (commit, forward advance) clears the hold. Since PAN-128 each attempt records the
 own-parity TX slot its emission feeds, derived with the TX scheduler's own
 current-slot acceptance rule (the CURRENT slot while inside the worker's
 PAN-117 queue-time acceptance cap — mode-scaled `tx_late_max_ms` minus the
@@ -420,14 +499,17 @@ The ledger keeps a separate `last_emitted_at` anchor. Rearm pacing uses the late
 of that anchor and `last_call_at`; rollback never changes the anchor. TX cadence,
 coalescing order, parity and frequency selection therefore stay unchanged.
 
-Correlation uses the newest matching `(qso_id, message_text)` within four slots,
-with at most eight attempts per QSO. A same-text emission arriving between TX
-drain and rollback can be matched instead, so its timestamp may differ by one
-emission; the count still reverses one attempt. When the newer same-text
-entry is an explicit resend, its flags are reversed instead of the failed
-frame's (follow-up: PAN-183). Expired or unmatched reports and
-terminal QSOs are no-ops. The ledger is shared across manager clones, pruned on
-rearm and rollback, and never persisted.
+Correlation is by attempt identity first (PAN-183): every QSO-engine emission
+gets a `TxAttemptId`, ledger attempts record theirs, and the report of a frame
+that never aired carries the id of the emission that frame came from. A report
+with an id reverses exactly that attempt, within four slots and at most eight
+attempts per QSO; an id with no surviving attempt (including an opening call's
+or an advance's, which record none) is a no-op and never falls back to content
+matching. Reports without an id (frames from outside the QSO engine) keep the
+newest matching `(qso_id, message_text)`, narrowed by the replaced frame's
+payload on a pivot. Expired or unmatched
+reports and terminal QSOs are no-ops. The ledger is shared across manager
+clones, pruned on rearm and rollback, and never persisted.
 
 The same accounting rule covers cap truncation, F8 abort, supersede, arm or
 identity refusal, hard mute, PAN-141 hold, PAN-114 clock-jump drops, and
@@ -468,6 +550,39 @@ change) so the rollback cannot hit the replacement's attempt. Offsets within
 0.5 Hz count as unchanged, and items count as carried only once the
 re-enqueued bundle is confirmed queued. Rollback emits no new snapshot or QSO event; the existing status panel
 and remote snapshot fields show corrected values on the next normal push.
+
+### Attempt identity (PAN-183)
+
+Text matching could pick the wrong attempt when two attempts in the window
+render the same text: a failed keep-call rearm whose newer twin is an
+operator's explicit resend gave up the resend's entry and kept its own stall
+increment and `Sent` entry, which could trip the stall offset switch a cycle
+early. The id now travels with the frame:
+
+- `QsoEvent::MessageToSend::attempt_id` names the ledger attempt for the
+  three ledger-recorded emissions (keep-call rearm, explicit resend,
+  offset-switch retransmit). Opening calls and advances get a fresh id that
+  matches no attempt, so their failure can no longer take a newer same-text
+  resend's entry either.
+- The QSO loop copies it onto the `TransmitRequest` and the `LatestTxIntent`.
+  The coalescer keeps each entry's own id on every request or bundle item it
+  rebuilds, and each `TransmitRequestItem` carries its own. A multi-TX bundle
+  has no bundle-level id.
+- A key-time pivot adopts the intent's id with its payload and records the
+  replaced frame's id beside its text and payload, so a pivot-replaced report
+  rolls back the replaced attempt. A `Replace` or `Bundle` supersede re-keys or
+  re-enqueues the new request under that request's own id.
+- Every `TxFrameNotSent` carries the failed frame's id, or the replaced frame's
+  on a pivot. Autonomous-facing `TransmitComplete` is unchanged (PAN-185).
+
+The same mechanism closes two PR #419 review threads. An identity-conflict
+supersede reported abandoned bundle items without their binding, so a
+same-text, same-offset rollback could select the newer, differently bound
+attempt (thread 4244657620). And applying a mixed bundle's folded `Remote`
+binding to every abandoned item could miss a local item's entry (thread
+4244657622). Both now report each item's own id. The PAN-182 stall-trigger
+hold compares ids when its trigger is rolled back; its release on an aired
+frame still matches content within the trigger's own slot.
 
 ## Fox-admitted QSOs keep their TX slots after Fox mode is turned off (PAN-76)
 
@@ -694,3 +809,54 @@ awaits was keyed anyway.
   deferring a bundle that can still key before the raw cap (review round 2). The key-time gate
   keeps the raw effective cap as its unconditional backstop, and single-TX mid-TX re-keys
   (which re-read the clock at the decision, with no coalesce wait in between) keep the raw cap.
+
+## Keying without waiting on the bus channel table (PAN-202, 2026-10-21)
+
+Deferred from PR #450 (Codex P2 thread `PRRT_kwDORcJovs6s0SAh`). Every PTT-on went through a
+`MessageBus` method whose first step was `self.channels.read().await` on the `tokio::sync::RwLock`
+covering the whole channel table. That ran after the TX worker's synchronous final gates (PAN-148
+liveness/DX parity, PAN-115 hard mute, PAN-118 band plan, PAN-117 key time) had already said "in
+time", and nothing re-checked them afterwards. A channel registration (`create_channel`, the
+table's only writer) holding the write lock at that instant delayed the key-down for the whole
+hold: a repro against the real `send_message_if` enqueued 151.3 ms after the simulated gate under
+a 150 ms writer hold, 101 ms past a 50 ms cap. The lock is fair, so a queued writer also stalls
+every later reader, and each `.await` on it is a cooperative-scheduling yield point.
+
+- **Mechanism.** `create_channel(ComponentId::Hamlib)` publishes Hamlib's channel handle
+  (`ChannelTx`: sender plus the entry's own message/error counters) into a private
+  `rig_route: Arc<OnceLock<_>>`, inside the same write-lock critical section that inserts the
+  table entry. `MessageBus::send_rig_command_if(message, authorize) -> SendIfOutcome` is a plain
+  `fn`: expiry check, `sent_at` stamp, the PAN-134 `authorize` predicate, then a crossbeam
+  `try_send` on that route, with no lock and no await. Counters and logs match the table path
+  (both call the shared `try_send_on`). A message not addressed to Hamlib is `Dropped` with an
+  `error!`; an unregistered Hamlib (replay mode, no-`pancetta-hamlib` builds) is `Dropped` with
+  the same "No channel found" warning as before.
+- **One key-down path.** `tx::send_ptt_command(bus, source, state, authorize)` builds the
+  `SetPtt` and calls `send_rig_command_if`. Single TX, multi-TX bundles, tune and the TUI's
+  manual `TogglePtt` all use it, so the fix holds after every final gate instead of per gate.
+  The compiler enforces "no await between the last gate and the enqueue" at each site because
+  the helper is synchronous.
+- **Alternatives rejected.** A TX-worker-held cached `Sender` depends on startup order (Hamlib
+  is absent in replay and no-Hamlib builds), would not cover the TUI relay task, must be
+  re-acquired on restart, and contradicts PAN-134's no-raw-`Sender` rule. A synchronous method
+  over the existing table (`std`/`parking_lot` lock, `blocking_read`, `try_read`) still waits
+  for the writer's hold, panics inside the runtime, or drops key-downs during a registration. A
+  lock-free copy-on-write table for every send changes ~210 send sites, adds a dependency and
+  breaks PAN-134's contention tests.
+- **Insert-once coupling.** Table entries are inserted once (a duplicate `create_channel`
+  errors; supervised restarts re-register through `get_or_create_channel`, which returns the
+  existing entry) and never removed or replaced, so the route is always the channel the table
+  holds. Any future removal or replacement of a channel must update `rig_route` in the same
+  critical section; `create_channel`'s doc comment says so and
+  `pan202_rig_route_is_the_registered_channel` pins it.
+- **Scope.** Only PTT commands use the route. PTT-off from `PttGuard` keeps its PAN-135
+  confirmed-enqueue path (`send_message_retrying`), audio output keeps `send_message_if`
+  (PAN-134's audio recheck), and every other send stays on the table path. The TUI's
+  `TogglePtt` builds one message for either state, so its PTT-off takes the helper too, with the
+  same best-effort semantics as its old `send_message`.
+- **Tests.** `message_bus.rs` holds the table's write lock and asserts the rig route enqueues
+  inside the hold within a 50 ms cap, with a hazard pin showing the table path still waits.
+  `pan202_key_down_worker_tests` parks the real TX worker between its last gate and the
+  key-down with a `#[cfg(test)]` `KeyDownProbe`, holds the table (`hold_channel_table`), and
+  requires PTT-on on Hamlib's receiver within 500 ms for single TX, bundle and tune; the TUI
+  helper is tested directly.

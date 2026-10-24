@@ -493,6 +493,7 @@ fn test_hunt_mode_picks_best_cq() {
             confidence: None,
             time_offset_s: None,
             decode_origin: None,
+            captured_dial_hz: None,
         },
         DecodedMessageInfo {
             callsign: Some("JA1ABC".into()),
@@ -503,6 +504,7 @@ fn test_hunt_mode_picks_best_cq() {
             confidence: None,
             time_offset_s: None,
             decode_origin: None,
+            captured_dial_hz: None,
         },
     ];
 
@@ -568,6 +570,7 @@ fn test_hunt_mode_response_survives_audio_roundtrip() {
             confidence: None,
             time_offset_s: None,
             decode_origin: None,
+            captured_dial_hz: None,
         })
         .collect();
     op.feed_decoded_messages(&decoded_infos, &evaluator);
@@ -750,6 +753,7 @@ fn test_priority_scorer_skips_duplicate() {
             confidence: None,
             time_offset_s: None,
             decode_origin: None,
+            captured_dial_hz: None,
         },
         DecodedMessageInfo {
             callsign: Some("JA1ABC".into()),
@@ -760,6 +764,7 @@ fn test_priority_scorer_skips_duplicate() {
             confidence: None,
             time_offset_s: None,
             decode_origin: None,
+            captured_dial_hz: None,
         },
     ];
 
@@ -820,6 +825,7 @@ fn test_priority_scorer_prefers_pota() {
             confidence: None,
             time_offset_s: None,
             decode_origin: None,
+            captured_dial_hz: None,
         },
         DecodedMessageInfo {
             callsign: Some("W5ABC/P".into()),
@@ -830,6 +836,7 @@ fn test_priority_scorer_prefers_pota() {
             confidence: None,
             time_offset_s: None,
             decode_origin: None,
+            captured_dial_hz: None,
         },
     ];
 

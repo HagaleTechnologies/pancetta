@@ -607,7 +607,10 @@ impl AdifProcessor {
             cqz: None,     // Would need callsign lookup
             ituz: None,    // Would need callsign lookup
             state: metadata.their_state.clone(),
-            contest_id: contest_info.map(|c| c.contest_name.clone()),
+            // A row persisted before PAN-52 has no `adif_contest_id` key;
+            // deserialization restores its imported CONTEST_ID
+            // (states.rs `legacy_adif_contest_id`).
+            contest_id: contest_info.and_then(|c| c.adif_contest_id.clone()),
             stx: contest_info.and_then(|c| c.serials.sent),
             stx_string: None,
             srx: contest_info.and_then(|c| c.serials.received),
@@ -668,6 +671,11 @@ impl AdifProcessor {
                 .as_ref()
                 .map(|contest_name| ContestInfo {
                     contest_name: contest_name.clone(),
+                    // PAN-52: keep the file's verbatim CONTEST_ID so the
+                    // index → export path re-renders it byte-identically
+                    // instead of dropping it (the export side stamps
+                    // CONTEST_ID from this field, not from contest_name).
+                    adif_contest_id: Some(contest_name.clone()),
                     category: "".to_string(), // Not available in ADIF
                     serials: ContestSerials {
                         sent: adif_qso.stx,

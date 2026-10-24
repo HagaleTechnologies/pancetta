@@ -29,9 +29,12 @@
 //! re-plumbing the coordinator each time.
 //!
 //! Per the Phase A audit conventions, this is a **SHIPPED-INFRA** module:
-//! it changes no production decoding behavior. The tables are populated by
-//! [`CrossTimeState::record_decode`] but no consumer reads them until a
-//! downstream hypothesis adds the read path.
+//! it changes no production decoding behavior.
+//! One TX-side reader exists: the PAN-141 DX-parity gate
+//! (`pancetta/src/coordinator/tx.rs`, `dx_parity_conflict`) reads
+//! [`A7RecentCallTable`]. Since PAN-146 each entry records the band
+//! (`captured_dial_hz`) and slot grid (`slot_ns`) it was observed in, so a
+//! reader can ignore sightings from another band or mode.
 //!
 //! # Thread-safety
 //!
@@ -291,6 +294,14 @@ pub struct A7ExpectedCall {
     pub slot_parity: u8,
     /// Wall-clock decode time; used for age-based eviction.
     pub decoded_at: SystemTime,
+    /// RX dial frequency (Hz) the decode's audio was captured on; `0` =
+    /// unknown (no rig / not yet polled). PAN-146: lets a reader tell an
+    /// observation made on another band from one made on the live band.
+    pub captured_dial_hz: u64,
+    /// Slot period (ns) of the grid `slot_parity` was computed on (FT8
+    /// 15 s, FT4 7.5 s, FT2 3.2 s). PAN-146: parities from different grids
+    /// describe different slot boundaries and are not comparable.
+    pub slot_ns: i64,
 }
 
 /// Recent-call table for hb-048 a7 cross-correlation.
@@ -574,6 +585,11 @@ pub struct DecodeRecord {
     pub slot_parity: Option<u8>,
     /// Wall-clock decode time.
     pub at: SystemTime,
+    /// RX dial (Hz) the audio was captured on — the coordinator copies
+    /// `DecodedMessage::captured_dial_hz`; `0` = unknown.
+    pub captured_dial_hz: u64,
+    /// Slot period (ns) `slot_parity` was computed on.
+    pub slot_ns: i64,
 }
 
 /// Coordinator-level cross-slot state, shared across decoder threads.
@@ -671,6 +687,8 @@ impl CrossTimeState {
                         freq_hz: rec.frequency_hz,
                         slot_parity: parity,
                         decoded_at: rec.at,
+                        captured_dial_hz: rec.captured_dial_hz,
+                        slot_ns: rec.slot_ns,
                     });
                 }
             }
@@ -801,6 +819,8 @@ mod tests {
             freq_hz: 1500.0,
             slot_parity: 0,
             decoded_at: now,
+            captured_dial_hz: 14_074_000,
+            slot_ns: 15_000_000_000,
         });
         let entry = t.get("K1ABC").expect("should be present");
         assert_eq!(entry.freq_hz, 1500.0);
@@ -819,6 +839,8 @@ mod tests {
             freq_hz: 1500.0,
             slot_parity: 0,
             decoded_at: now,
+            captured_dial_hz: 14_074_000,
+            slot_ns: 15_000_000_000,
         });
         t.evict_expired(now + Duration::from_secs(60));
         assert!(t.is_empty());
@@ -901,6 +923,8 @@ mod tests {
             time_offset_s: 0.2,
             slot_parity: Some(0),
             at: t0(),
+            captured_dial_hz: 14_074_000,
+            slot_ns: 15_000_000_000,
         };
         cts.record_decode(&rec);
         cts.record_decode(&rec); // second sighting for DT prior
@@ -908,6 +932,28 @@ mod tests {
         assert!(cts.dt_history.read().unwrap().prior("K1ABC").is_some());
         assert_eq!(cts.a7_recent_calls.read().unwrap().len(), 1);
         assert_eq!(cts.within_qso.read().unwrap().len(), 1);
+    }
+
+    /// PAN-146: the a7 entry carries the band and slot grid its decode was
+    /// made in, so a reader can reject an observation from another context.
+    #[test]
+    fn record_decode_carries_capture_context_into_a7_entry() {
+        let cts = CrossTimeState::empty();
+        cts.record_decode(&DecodeRecord {
+            from_callsign: Some("5Z4VJ".into()),
+            to_callsign: Some("NV1U".into()),
+            text: "NV1U 5Z4VJ -10".into(),
+            frequency_hz: 1500.0,
+            time_offset_s: 0.1,
+            slot_parity: Some(1),
+            at: t0(),
+            captured_dial_hz: 21_074_000,
+            slot_ns: 7_500_000_000,
+        });
+        let a7 = cts.a7_recent_calls.read().unwrap();
+        let entry = a7.get("5Z4VJ").expect("recorded");
+        assert_eq!(entry.captured_dial_hz, 21_074_000);
+        assert_eq!(entry.slot_ns, 7_500_000_000);
     }
 
     #[test]
@@ -921,6 +967,8 @@ mod tests {
             time_offset_s: 0.0,
             slot_parity: Some(0),
             at: t0(),
+            captured_dial_hz: 14_074_000,
+            slot_ns: 15_000_000_000,
         };
         cts.record_decode(&rec);
         assert!(cts.dt_history.read().unwrap().is_empty());
@@ -939,6 +987,8 @@ mod tests {
             time_offset_s: 0.1,
             slot_parity: Some(0),
             at: t0(),
+            captured_dial_hz: 14_074_000,
+            slot_ns: 15_000_000_000,
         };
         cts.record_decode(&rec);
         assert_eq!(cts.dt_history.read().unwrap().len(), 1);
@@ -957,6 +1007,8 @@ mod tests {
             time_offset_s: 0.2,
             slot_parity: Some(0),
             at: t0(),
+            captured_dial_hz: 14_074_000,
+            slot_ns: 15_000_000_000,
         };
         cts.record_decode(&rec);
         // Force expiry on the strictest age (a7's 30 s).
@@ -982,6 +1034,8 @@ mod tests {
                         time_offset_s: 0.2,
                         slot_parity: Some((i % 2) as u8),
                         at: t0() + Duration::from_millis(i as u64),
+                        captured_dial_hz: 14_074_000,
+                        slot_ns: 15_000_000_000,
                     });
                 }
             })
@@ -1026,6 +1080,8 @@ mod tests {
             time_offset_s: 0.0,
             slot_parity: Some(0),
             at: t0(),
+            captured_dial_hz: 14_074_000,
+            slot_ns: 15_000_000_000,
         });
         assert_eq!(s2.dt_history.read().unwrap().len(), 1);
     }
