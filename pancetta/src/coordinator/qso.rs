@@ -12333,6 +12333,171 @@ mod respond_to_caller_admission_tests {
         );
     }
 
+    /// PAN-79 item 2, coordinator-level pin: the round-2 `TxPolicy` gate and
+    /// the round-10 `hamlib_hard_muted` wiring (`start_qso_component`'s
+    /// "Fix E" block) must together mean that a Hamlib supervisor-restart
+    /// window — a designed multi-slot TX inhibition (AGENTS.md: "TX stays
+    /// inhibited throughout a Hamlib restart window") — never accumulates
+    /// stall evidence on an established QSO, and that counting resumes the
+    /// moment the window clears.
+    ///
+    /// Drives the REAL `start_qso_component` wiring. The manager comes from
+    /// `qso_manager_watch`, the Autonomous task's own consumption path: the
+    /// `qso_manager_for_supervisor` clone is taken before the `set_*_source`
+    /// calls and still carries the unwired `|| false` default, so the test
+    /// above (which drives that clone) cannot see this wiring at all. The
+    /// mute is raised on the coordinator's own `tx_restart_inhibit` atomic,
+    /// exactly as the supervisor's restart teardown does. The unit-level
+    /// companion (`a_hamlib_hard_muted_rearm_does_not_count_as_a_stall_cycle`
+    /// in pancetta-qso) proves the gate through an injected stub; this test
+    /// proves the production closure actually reads the coordinator's live
+    /// state.
+    #[tokio::test]
+    async fn a_hamlib_restart_window_accumulates_no_stall_cycles_or_offset_actions() {
+        let mut coordinator = test_coordinator().await;
+        coordinator.config.write().await.station.callsign = "K1TEST".to_string();
+        coordinator
+            .config
+            .write()
+            .await
+            .autonomous
+            .qso_stall_switch_after = 2;
+        // Auto TX-freq mode -- the silence-driven stall detector only fires
+        // there.
+        coordinator.tx_freq_mode.store(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        coordinator.start_qso_component().await.unwrap();
+        // Mirror `autonomous.rs`'s consumption path: `send_replace` runs
+        // AFTER every `set_*_source`, so this clone carries the real
+        // `hamlib_hard_muted` closure (see
+        // `qso_manager_watch_publishes_a_clone_with_injected_sources_not_defaults`).
+        let manager = coordinator
+            .qso_manager_watch
+            .subscribe()
+            .borrow()
+            .clone()
+            .expect("start_qso_component must publish a manager onto the watch channel");
+
+        // Readiness probe, as in the forwarder test above: the forwarder
+        // subscribes asynchronously, so wait until a seeded QSO lands in
+        // `active_tx_qsos` before relying on the offset-request mailbox.
+        let mut ready = false;
+        for i in 0..20 {
+            let probe_call = format!("K9RD{i}");
+            let probe_id = manager
+                .respond_to_cq_manual(probe_call.clone(), 1500.0, None)
+                .await
+                .expect("seeding a readiness-probe QSO");
+            let key = crate::coordinator::active_tx_qso_key(&probe_id.to_string());
+            for _ in 0..30 {
+                if coordinator.active_tx_qsos.read().unwrap().contains(&key) {
+                    ready = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            if ready {
+                break;
+            }
+        }
+        assert!(
+            ready,
+            "readiness probe: real forwarder never populated active_tx_qsos"
+        );
+
+        let qso_id = manager
+            .respond_to_cq_manual("K9RST".to_string(), 1501.0, None)
+            .await
+            .expect("seeding the stalling QSO");
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        // Raise the restart window on the coordinator's own atomic -- the one
+        // the wiring's closure reads and the supervisor's teardown raises.
+        coordinator
+            .tx_restart_inhibit
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+
+        // Four muted rearms, twice the threshold, two slots apart so each
+        // would feed a distinct own-parity TX slot (PAN-128).
+        for slot in [15i64, 45, 75, 105] {
+            manager
+                .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(slot))
+                .await;
+        }
+
+        let muted = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            muted.metadata.stall_cycles, 0,
+            "a Hamlib restart window keys nothing, so the DX's silence is not \
+             stall evidence (PAN-79 item 2)"
+        );
+        assert_eq!(
+            muted.metadata.last_call_at,
+            Some(opened_at),
+            "a muted rearm must not spend any attempt bookkeeping"
+        );
+        for _ in 0..100 {
+            assert!(
+                !coordinator
+                    .pending_qso_offset_requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|req| req.qso_id == qso_id),
+                "no TxOffsetActionNeeded may be raised during a Hamlib restart window"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // The window clears (the Hamlib restart path's decrement in
+        // production). Two more rearms cross the threshold of 2: counting
+        // resumes from zero, so the earlier zero was the mute, not a dead
+        // detector.
+        coordinator
+            .tx_restart_inhibit
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        manager
+            .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(135))
+            .await;
+        manager
+            .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(165))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            2,
+            "once the restart window clears, each unanswered rearm counts again"
+        );
+
+        let mut found = false;
+        for _ in 0..100 {
+            if coordinator
+                .pending_qso_offset_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|req| req.qso_id == qso_id)
+            {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            found,
+            "after the restart window clears, a genuine stall must still raise \
+             TxOffsetActionNeeded into pending_qso_offset_requests"
+        );
+    }
+
     /// PAN-72 round 11 (P1 regression): `start_qso_component` used to call
     /// `self.qso_manager_watch.send_replace(Some(qso_manager.clone()))`
     /// BEFORE any `set_*_source` setter ran on `qso_manager`. Each setter
