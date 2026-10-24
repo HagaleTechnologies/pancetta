@@ -18,14 +18,66 @@ Every frame whose audio the TX worker hands to the audio output is appended to `
 - **Format (D3).** JSON Lines, schema `v: 1`: `{v, utc, mode, dial_hz, offset_hz, text, origin, qso_id}` (the field set the 2026-09-05 review proposed, plus `v`). `utc` is the same value the TUI event carries. `dial_hz` is the split-aware effective TX dial (`effective_tx_dial`, the resolver the band-plan gate uses), `null` when unknown (0).
 - **Durability (D4).** Per batch: serialize into one buffer, `create_dir_all(parent)`, open with `create(true).append(true)`, one `write_all`, `sync_data`; on Unix a best-effort parent-directory `sync_all` after creating a file. No `BufWriter`, no held handle, so a crash right after the append cannot lose the record, and moving or deleting the file never strands a stale handle. `coordinator::tx_log::tests::record_survives_process_abort_immediately_after_append` re-runs the test binary as a child that appends and calls `std::process::abort()`.
 - **One writer thread (D5).** A `std::thread` named `pancetta-tx-log` fed by an unbounded `std::sync::mpsc` of jobs, each with a `tokio::sync::oneshot` ack: FIFO, a single writer, and no blocking-pool threads piling up behind a stalled disk. Input is bounded by the physical TX rate (at most one batch per slot), so the queue cannot grow meaningfully. It works on current-thread runtimes, where `block_in_place` would panic.
-- **Bounded wait (D6).** The worker waits at most `TX_LOG_ACK_WAIT` = 250 ms for the ack, then logs `TX log: write still pending after 250 ms; …` and carries on; the job stays queued and is written when the disk responds. Step 8's abort/disarm polling therefore starts at most 250 ms late, and PTT release is never blocked. Measured in a Linux container during planning: open + 147 B append + `fdatasync` + close, median 0.075 ms, p99 0.123 ms, max 3.15 ms; the Windows target is expected to be slower, which is why the wait is bounded rather than assumed fast.
-- **Only on `Enqueued` (D7).** The record is written inside `Ok(SendIfOutcome::Enqueued)`, before the existing `log_tx_frame` call and with the same timestamp; `Denied`, `Dropped` and refused-before-PTT frames get no record (PAN-134's "denied or dropped audio never appears as aired"), and no suspension was added before the audio enqueue. A bundle is one batch (one fsync), one line per item, one shared `utc`.
+- **Bounded wait (D6).** The worker waits at most `TX_LOG_ACK_WAIT` = 250 ms for the ack, then logs `TX log: write still pending after 250 ms; …` and carries on; the job stays queued and is written when the disk responds. Step 8's abort/disarm polling therefore starts at most 350 ms late (`TX_PLAYBACK_START_WAIT` 100 ms + `TX_LOG_ACK_WAIT` 250 ms; PAN-71), and PTT release is never blocked. Measured in a Linux container during planning: open + 147 B append + `fdatasync` + close, median 0.075 ms, p99 0.123 ms, max 3.15 ms; the Windows target is expected to be slower, which is why the wait is bounded rather than assumed fast.
+- **Only on `Enqueued` (D7).** The record is written inside `Ok(SendIfOutcome::Enqueued)`, before the existing `log_tx_frame` call and with the same timestamp, the playback-start instant or its enqueue-time fallback (PAN-71); `Denied`, `Dropped` and refused-before-PTT frames get no record (PAN-134's "denied or dropped audio never appears as aired"), and no suspension was added before the audio enqueue. A bundle is one batch (one fsync), one line per item, one shared `utc`.
 - **Fail-open (D8).** A write failure never stops TX: the writer thread logs one `ERROR` per failed batch, `TX log: could not record N frame(s) to <path>: <error>. Frames: [<utc> <mode> <offset> Hz "<text>", …]`, so the app log still holds a copy. Logging is not a Part 97 requirement, and a full disk should not take the station off the air.
 - **Rotation (D9).** `TX_LOG_MAX_FILE_BYTES` = 8 MiB, `TX_LOG_ARCHIVES` = 7, `.1` newest: when `len > 0 && len + batch > max`, drop `.7`, shift `.6→.7 … .1→.2`, then active → `.1`. A batch is never split and an empty file is never rotated. A failed rotation keeps appending to the active file rather than losing the record. About 55,000 records per file (~150 B each).
 - **Replay (D10).** `--replay` uses `TxFrameLog::disabled()`: no thread, no file (listed in `replay_mode()`'s consumers). `--test-tx` and rig-less dev runs are logged, because their audio does go out.
 - **Lifetime (D11).** `ApplicationCoordinator::tx_frame_log` is created by `ensure_tx_frame_log` on the first `start_transmitter_component` and reused on every supervisor restart, so the file never has two writers (the `tx_requeue` shape). Two pancetta processes sharing one home could race rotation; that setup is unsupported.
 
 Limits: `sync_data` cannot see through firmware or OS write-cache lies, so the promise is "survives a process crash; fsync requested for OS crash or power loss". If the disk stalls and the process is killed during the stall, that frame's record can be lost; the `WARN` line marks such windows. Out of scope here: headless mode still never drains the TUI channel (a separate follow-up).
+
+### Playback-start timestamp (PAN-71)
+
+`TxFrameRecord.utc` and Band Activity's `TxFrameLogged.timestamp` now use the
+instant the audio thread observes the output callback consume a frame's first
+sample. This applies to first-pass frames, operator-triggered mid-frame re-keys,
+and every item in a summed multi-TX buffer. Tune still logs no frame. The schema
+stays at `v: 1`; existing records keep their earlier enqueue-time meaning.
+
+The output ring tracks cumulative samples written and retired. Before pushing a
+non-empty buffer into a ring with space, the producer arms its first sample's
+one-based position. The callback publishes whether a pop crossed that position,
+then publishes the retired count. A clear advances the count without reporting
+playback. The observer reads the retired count before the start flag. These are
+atomic operations; the callback takes no lock, allocates nothing, and reads no
+clock. A generation tag invalidates marks when the output ring is replaced.
+Empty buffers and full rings get no mark, so a later buffer cannot confirm them.
+
+`PlaybackStartAck` travels with `AudioOutput` through the relay's FIFO. Like
+`DeliveryAck`, its clones share a first-settle-wins slot; dropping every copy
+reports `Dropped` immediately. The audio thread holds one pending mark and polls
+it before and after each TX-command check. A played mark settles `Started(now)`;
+a discarded mark, a failed queue operation, or an empty write settles
+`NotStarted`. Arming another mark re-polls the old one and settles it as
+`NotStarted` if still waiting. The single-slot limit is deliberate: the worker
+waits for each frame's ack before sending another.
+
+The TX worker waits at most 100 ms after authorized enqueue. A confirmed start
+supplies the shared timestamp; otherwise the worker keeps the enqueue instant.
+A pending or not-played ack produces a `WARN` naming the frame. A dropped ack
+produces `DEBUG`, because no-audio, stub and replay modes have no audio thread.
+Records are appended before the TUI event in frame order, including records for
+buffers known to have been discarded. Denied and dropped bus sends get neither.
+The playback deadline still starts at enqueue, so acknowledgement and log waits
+do not extend key-down. They add at most 350 ms before Step 8's abort polling.
+
+Planning measured a device-free stand-in callback over 15 runs per case: a
+normal queue call took 2.4 to 4.4 ms, while the first sample was popped after about
+10 ms with a 10 ms callback period. Re-key playback took about 10.5 to 10.7 ms or
+20.2 to 20.3 ms with 10 ms or 20 ms periods. A callback stalled for 60 ms discarded
+the replacement buffer in all 15 runs when it serviced the overdue flush.
+Those measurements motivated the 100 ms bound; they are not device or RF tests.
+
+The timestamp is the audio thread's observation, not a driver timestamp or RF
+onset. Device buffering and audio-thread scheduling remain outside that
+measurement. Late flushes are reported truthfully but are not prevented here.
+Callback clock reads would violate the real-time rule; callback heartbeats and
+ring emptiness cannot identify a buffer. A separate ack channel would lose FIFO
+correlation. A detached logger would lose worker ordering and shutdown guarantees.
+A re-key-only change would give `utc` two meanings, so all logged frames use the
+same bounded wait. Racing that wait with abort polling was rejected in favor of
+the existing bounded-wait policy.
 
 ## Per-QSO online-logbook upload (opt-in)
 
