@@ -75,3 +75,7 @@ path = "src/bin/leaderboard.rs"
 
 [dev-dependencies]
 # (tempfile moved to [dependencies] for slot-cutting helper)
+
+[[bin]]
+name = "ft4-candidate-split"
+path = "src/bin/ft4_candidate_split.rs"
