@@ -174,9 +174,11 @@ publish to: resolved preset is Eco (literal Eco, or Auto on Slow), protocol is
 FT8, and published budget is 1 ms. `fine_sync_enabled` joins
 `DecoderRebuildKey`, so the live decoder is rebuilt when the flag changes. The
 library default stays false. Standard, Deep, Max, Auto on Moderate or Fast,
-FT4, and Eco with an explicit `budget_ms` override are untouched: W3.3b's
+FT4, and any published budget other than 1 ms are untouched: W3.3b's
 Standard regression came from starving a budget-gated candidate pool, which
-this corpus does not test. This result does not reproduce the July hard-200
+this corpus does not test. The policy reads the published budget, so an
+explicit `budget_ms = 1` is on, and an explicit `budget_ms` other than 1 is
+off only until a live effort cycle publishes Eco's own 1 ms. This result does not reproduce the July hard-200
 +27; it shows the same direction on a different, synthetic corpus.
 
 ## Limits

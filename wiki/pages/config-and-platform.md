@@ -39,8 +39,10 @@ writes must also be a `DecoderRebuildKey` field** (`coordinator/ft8.rs`), or the
 loop adopts the new budget but keeps decoding with the old decoder. Eco and Standard
 had identical keys until `fine_sync_enabled` joined it; the
 `every_effort_override_field_is_a_rebuild_trigger` guard catches a missing one. Eco's
-fine sync is also budget-qualified: it applies only at the published 1 ms floor-only
-budget, so Eco with an explicit `budget_ms` override runs without it. See
+fine sync is also budget-qualified: it keys on the published budget, not the config,
+so it applies only while the 1 ms floor-only budget is published. Eco with a
+`budget_ms` override other than 1 runs without it until a live effort cycle publishes
+Eco's own 1 ms; an explicit `budget_ms = 1` keeps it on. See
 [Eco-preset fine sync](../../docs/DECISIONS/config-and-platform.md#eco-preset-fine-sync-pan-158-2026-10-25).
 
 Second gotcha (PAN-90): **a new config struct needs container-level

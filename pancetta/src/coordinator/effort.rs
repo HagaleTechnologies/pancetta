@@ -262,10 +262,12 @@ fn resolve_effective_effort(effort: DecodeEffort, tier: HardwareTier) -> DecodeE
 /// published budget is 1 ms. Task W3.3b measured a recall win only in
 /// that floor-only regime, where no budget-gated rest of the candidate
 /// pool exists to starve; under Standard's 250 ms one slow candidate
-/// starved the rest. An explicit `budget_ms` override other than 1
-/// (including `0`, the protocol ceiling) restores that rest, so Eco with
-/// an override stays off. The flag is assigned on every call, so leaving
-/// the regime clears it. Evidence:
+/// starved the rest. Any other published budget restores that rest, so
+/// fine sync stays off there. The check reads `effective_budget_ms`, not the
+/// config: an explicit 1 ms `budget_ms` override is on, and a live
+/// [`cycle_decode_effort`] to Eco publishes 1 ms whatever the override.
+/// The flag is assigned on every call, so leaving the regime clears it.
+/// Evidence:
 /// `research/experiments/2026-10-25-pan158-eco-fine-sync.md`.
 ///
 /// Every field this function writes is a decoder-rebuild trigger in
@@ -294,7 +296,7 @@ pub(crate) fn apply_effort_overrides(
     config: &mut Ft8Config,
 ) {
     // PAN-158: assigned on every call, so leaving the eligible regime
-    // (another preset, FT4, or a budget override) clears it.
+    // (another resolved preset, FT4, or a budget other than 1 ms) clears it.
     config.fine_sync_enabled = resolve_effective_effort(effort, tier) == DecodeEffort::Eco
         && config.protocol == pancetta_ft8::Protocol::Ft8
         && effective_budget_ms == 1;

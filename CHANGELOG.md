@@ -507,9 +507,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   published budget is Eco's 1 ms. On a regenerated synthetic weak-signal
   corpus, scored on the merged ft8_lib + native output, this recovered
   25 more of 550 signals (296 → 321, 95% CI +16 to +35), with no new false decodes there or on 1000 noise files.
-  Standard, Deep, Max, Auto on Moderate or Fast hosts, FT4, and Eco with an
-  explicit `budget_ms` decode as before. Synthetic and single-host evidence
-  only (PAN-158).
+  Standard, Deep, Max, Auto on Moderate or Fast hosts, FT4, and any window
+  whose published budget is not 1 ms decode as before. So an explicit
+  `budget_ms` other than 1 turns the retry off for Eco and Auto on Slow
+  hosts until a live `e` effort cycle publishes the preset's own budget,
+  and an explicit `budget_ms = 1` leaves it on. Synthetic and single-host
+  evidence only (PAN-158).
 
 - Before the first waterfall lands, adaptive TX-offset relocation (stall
   switches, occupied-target reverts, `u` nudges) now searches the same 25 Hz
