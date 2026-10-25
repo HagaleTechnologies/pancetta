@@ -501,6 +501,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The Eco decode-effort preset, and Auto on hosts the hardware probe rates
+  Slow, now retries an FT8 candidate whose first decode attempt fails at a
+  refined timing and frequency estimate (Task W3.3's fine sync) while the
+  published budget is Eco's 1 ms. On a regenerated synthetic weak-signal
+  corpus, scored on the merged ft8_lib + native output, this recovered
+  25 more of 550 signals (296 → 321, 95% CI +16 to +35), with no new false decodes there or on 1000 noise files.
+  Standard, Deep, Max, Auto on Moderate or Fast hosts, FT4, and Eco with an
+  explicit `budget_ms` decode as before. Synthetic and single-host evidence
+  only (PAN-158).
+
 - Before the first waterfall lands, adaptive TX-offset relocation (stall
   switches, occupied-target reverts, `u` nudges) now searches the same 25 Hz
   candidate grid as the spectral path, with the same window, `avoid` and batch

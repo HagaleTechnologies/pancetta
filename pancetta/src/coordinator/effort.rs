@@ -159,7 +159,7 @@ fn resolve_effective_effort(effort: DecodeEffort, tier: HardwareTier) -> DecodeE
 /// re-apply the right fields immediately rather than only at restart,
 /// always together with the budget they were derived from.
 ///
-/// ## PAN-157: the first real override — `Max` only
+/// ## PAN-157: the multipass override — `Max` only
 ///
 /// PAN-157 originally proposed shipping Task W4.3's overlapping-signal
 /// multipass technique (`max_decode_passes = 2` +
@@ -226,8 +226,8 @@ fn resolve_effective_effort(effort: DecodeEffort, tier: HardwareTier) -> DecodeE
 ///   override at all, leaving an FT8-era override silently active under
 ///   the new protocol.
 /// - Every other literal preset (`Eco`/`Standard`/`Deep`) explicitly
-///   resets both fields to `Ft8Config::default()`'s values (`1`,
-///   `false`). NOT leaving them untouched: this function mutates
+///   resets both multipass fields to `Ft8Config::default()`'s values
+///   (`1`, `false`). NOT leaving them untouched: this function mutates
 ///   `config` in place and is re-invoked on every tier probe/live
 ///   preset cycle, so an empty arm here would make a PRIOR `Max` call's
 ///   override sticky — an operator cycling Max→Deep would silently keep
@@ -239,9 +239,11 @@ fn resolve_effective_effort(effort: DecodeEffort, tier: HardwareTier) -> DecodeE
 ///   by the existing effort-cycling keybinding itself — cycling to
 ///   `Max` IS the forcing mechanism, so there's no separate manual
 ///   Ft8Config-field override path this function needs to preserve.
-/// - `Auto` does NOT get this override today: `resolve_effective_effort`
-///   only ever maps `Auto` to `Eco`/`Standard`/`Deep`, never `Max`, so
-///   `Auto` stays a no-op here for now. A hardware-probed extension
+/// - `Auto` does NOT get the multipass override today:
+///   `resolve_effective_effort` only ever maps `Auto` to
+///   `Eco`/`Standard`/`Deep`, never `Max`. (Auto on `Slow` hardware does
+///   get PAN-158's fine sync below, because it resolves to `Eco`.) A
+///   hardware-probed extension
 ///   (measure whether THIS host has real headroom for a second pass,
 ///   and apply the override for capable `Auto` stations even at a
 ///   bounded tier) is planned as a PAN-157 follow-up — deliberately
@@ -249,8 +251,24 @@ fn resolve_effective_effort(effort: DecodeEffort, tier: HardwareTier) -> DecodeE
 ///   rather than bundled in, since it touches the same probe/lock path
 ///   `tier.rs` just spent 9 review rounds hardening.
 ///
-/// Both fields are always set TOGETHER by every arm, never
-/// independently. Each is a decoder-rebuild trigger in
+/// Both multipass fields are always set TOGETHER by every arm, never
+/// independently.
+///
+/// ## PAN-158: fine sync — FT8 `Eco` at its 1 ms budget only
+///
+/// `fine_sync_enabled` (Task W3.3's per-candidate fine time/frequency
+/// refinement) is on exactly when the resolved preset is `Eco` (literal
+/// `Eco`, or `Auto` on `Slow` hardware), the protocol is FT8 and the
+/// published budget is 1 ms. Task W3.3b measured a recall win only in
+/// that floor-only regime, where no budget-gated rest of the candidate
+/// pool exists to starve; under Standard's 250 ms one slow candidate
+/// starved the rest. An explicit `budget_ms` override other than 1
+/// (including `0`, the protocol ceiling) restores that rest, so Eco with
+/// an override stays off. The flag is assigned on every call, so leaving
+/// the regime clears it. Evidence:
+/// `research/experiments/2026-10-25-pan158-eco-fine-sync.md`.
+///
+/// Every field this function writes is a decoder-rebuild trigger in
 /// `coordinator/ft8.rs`'s `DecoderRebuildKey`
 /// (`every_effort_override_field_is_a_rebuild_trigger` guards that for
 /// any future field this function writes).
@@ -275,6 +293,11 @@ pub(crate) fn apply_effort_overrides(
     effective_budget_ms: u64,
     config: &mut Ft8Config,
 ) {
+    // PAN-158: assigned on every call, so leaving the eligible regime
+    // (another preset, FT4, or a budget override) clears it.
+    config.fine_sync_enabled = resolve_effective_effort(effort, tier) == DecodeEffort::Eco
+        && config.protocol == pancetta_ft8::Protocol::Ft8
+        && effective_budget_ms == 1;
     match resolve_effective_effort(effort, tier) {
         // Round-9-of-PAN-157 review finding (P1): explicitly restore both
         // fields to their true defaults here, not just "leave them
@@ -648,13 +671,16 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// PAN-157 bound the W4.3 overlapping-pair multipass override to the
-    /// literal `Max` preset only (see `apply_effort_overrides`'s doc).
-    /// Every OTHER preset — including `Auto`, which never literally
-    /// resolves to `Max` today — must remain byte-identical to the
-    /// default: no override, and no accidental clobber of a value the
-    /// operator (or a future config file) set manually.
+    /// literal `Max` preset only (see `apply_effort_overrides`'s doc), and
+    /// PAN-158 bound fine sync to FT8 Eco at its 1 ms budget. Every other
+    /// combination of a non-`Max` preset — including `Auto`, which never
+    /// literally resolves to `Max` today — must remain byte-identical to
+    /// the default: no override, and no accidental clobber of a value the
+    /// operator (or a future config file) set manually. Each preset is
+    /// checked at budget `0` (never eligible) and at its real preset
+    /// budget, where only Eco and Auto-on-Slow turn fine sync on.
     #[test]
-    fn effort_overrides_remain_a_no_op_for_every_preset_except_max() {
+    fn effort_overrides_are_a_no_op_outside_max_and_eligible_eco() {
         for effort in [
             DecodeEffort::Eco,
             DecodeEffort::Standard,
@@ -666,18 +692,237 @@ mod tests {
                 HardwareTier::Moderate,
                 HardwareTier::Fast,
             ] {
-                let mut config = Ft8Config::default();
-                apply_effort_overrides(effort, tier, 0, &mut config);
-                // `Ft8Config` doesn't derive `PartialEq` (too many fields to
-                // justify adding it just for this guard); compare via
-                // `Debug` instead, which is already derived and structural.
+                for budget_ms in [0, preset_budget_ms(effort, tier)] {
+                    let mut config = Ft8Config::default();
+                    apply_effort_overrides(effort, tier, budget_ms, &mut config);
+                    let eligible = budget_ms == 1
+                        && resolve_effective_effort(effort, tier) == DecodeEffort::Eco;
+                    // `Ft8Config` doesn't derive `PartialEq` (too many fields
+                    // to justify adding it just for this guard); compare via
+                    // `Debug` instead, which is already derived and structural.
+                    assert_eq!(
+                        format!("{config:?}"),
+                        format!(
+                            "{:?}",
+                            Ft8Config {
+                                fine_sync_enabled: eligible,
+                                ..Ft8Config::default()
+                            }
+                        ),
+                        "{effort:?} on {tier:?} at {budget_ms} ms must change no \
+                         Ft8Config field beyond the Eco fine-sync override"
+                    );
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // PAN-158: fine sync on FT8 Eco at its 1 ms budget only
+    // ------------------------------------------------------------------
+
+    const ALL_EFFORTS: [DecodeEffort; 5] = [
+        DecodeEffort::Eco,
+        DecodeEffort::Standard,
+        DecodeEffort::Deep,
+        DecodeEffort::Max,
+        DecodeEffort::Auto,
+    ];
+    const ALL_TIERS: [HardwareTier; 3] = [
+        HardwareTier::Slow,
+        HardwareTier::Moderate,
+        HardwareTier::Fast,
+    ];
+
+    /// A config with fields the overrides do not own set away from their
+    /// defaults, so a clobber shows up in the `Debug` comparison.
+    fn custom_config(protocol: pancetta_ft8::Protocol) -> Ft8Config {
+        Ft8Config {
+            protocol,
+            nsym_combining_enabled: true,
+            per_candidate_freq_tracker_enabled: true,
+            cross_sequence_a7_enabled: true,
+            ..Ft8Config::default()
+        }
+    }
+
+    #[test]
+    fn fine_sync_is_on_exactly_for_ft8_eco_at_one_ms() {
+        for effort in ALL_EFFORTS {
+            for tier in ALL_TIERS {
+                for protocol in [pancetta_ft8::Protocol::Ft8, pancetta_ft8::Protocol::Ft4] {
+                    for budget_ms in [0u64, 1, 2, 250, 1000, 2000, 5000] {
+                        let mut config = custom_config(protocol);
+                        apply_effort_overrides(effort, tier, budget_ms, &mut config);
+
+                        let eco = effort == DecodeEffort::Eco
+                            || (effort == DecodeEffort::Auto && tier == HardwareTier::Slow);
+                        let ft8 = protocol == pancetta_ft8::Protocol::Ft8;
+                        let multipass = effort == DecodeEffort::Max
+                            && ft8
+                            && (budget_ms == 0 || budget_ms >= 2000);
+                        let mut expected = custom_config(protocol);
+                        expected.fine_sync_enabled = eco && ft8 && budget_ms == 1;
+                        if multipass {
+                            expected.max_decode_passes = 2;
+                            expected.time_varying_subtraction_enabled = true;
+                        }
+                        assert_eq!(
+                            format!("{config:?}"),
+                            format!("{expected:?}"),
+                            "{effort:?}/{tier:?}/{protocol:?}/{budget_ms} ms"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The real caller re-applies overrides to the same config, so every
+    /// way out of the eligible regime must clear the flag, and coming back
+    /// must set it again. The W3.4/W3.6 companion flags stay as they were.
+    #[test]
+    fn leaving_eligible_eco_clears_fine_sync_and_returning_sets_it() {
+        use pancetta_ft8::Protocol::{Ft4, Ft8};
+        let exits: [(DecodeEffort, HardwareTier, pancetta_ft8::Protocol, u64); 9] = [
+            (DecodeEffort::Standard, HardwareTier::Fast, Ft8, 250),
+            (DecodeEffort::Deep, HardwareTier::Fast, Ft8, 1000),
+            (DecodeEffort::Max, HardwareTier::Fast, Ft8, 0),
+            (DecodeEffort::Auto, HardwareTier::Moderate, Ft8, 250),
+            (DecodeEffort::Auto, HardwareTier::Fast, Ft8, 1000),
+            (DecodeEffort::Eco, HardwareTier::Fast, Ft4, 1),
+            (DecodeEffort::Eco, HardwareTier::Fast, Ft8, 250),
+            (DecodeEffort::Eco, HardwareTier::Fast, Ft8, 0),
+            (DecodeEffort::Standard, HardwareTier::Fast, Ft8, 1),
+        ];
+        let mut config = custom_config(Ft8);
+        for (effort, tier, protocol, budget_ms) in exits {
+            config.protocol = Ft8;
+            apply_effort_overrides(DecodeEffort::Eco, HardwareTier::Fast, 1, &mut config);
+            assert!(
+                config.fine_sync_enabled,
+                "sanity: eligible Eco applied first"
+            );
+
+            config.protocol = protocol;
+            apply_effort_overrides(effort, tier, budget_ms, &mut config);
+            assert!(
+                !config.fine_sync_enabled,
+                "{effort:?}/{tier:?}/{protocol:?}/{budget_ms} ms must clear fine sync"
+            );
+            assert!(config.nsym_combining_enabled);
+            assert!(config.per_candidate_freq_tracker_enabled);
+        }
+        config.protocol = Ft8;
+        apply_effort_overrides(DecodeEffort::Auto, HardwareTier::Slow, 1, &mut config);
+        assert!(config.fine_sync_enabled, "Auto on Slow at 1 ms is eligible");
+    }
+
+    #[test]
+    fn seed_effort_budget_enables_fine_sync_only_at_eco_preset_budget() {
+        for (effort, budget_override, tier, budget, on) in [
+            (DecodeEffort::Eco, None, HardwareTier::Fast, 1, true),
+            (DecodeEffort::Eco, Some(1), HardwareTier::Fast, 1, true),
+            (DecodeEffort::Eco, Some(250), HardwareTier::Fast, 250, false),
+            (DecodeEffort::Eco, Some(0), HardwareTier::Fast, 0, false),
+            (DecodeEffort::Auto, None, HardwareTier::Slow, 1, true),
+            (DecodeEffort::Auto, None, HardwareTier::Moderate, 250, false),
+            (DecodeEffort::Auto, None, HardwareTier::Fast, 1000, false),
+            (
+                DecodeEffort::Standard,
+                Some(1),
+                HardwareTier::Fast,
+                1,
+                false,
+            ),
+        ] {
+            let mut window = DecodeWindowConfig::new(Ft8Config::default(), 999);
+            seed_effort_budget(effort, budget_override, tier, &mut window);
+            assert_eq!(
+                (window.budget_ms(), window.ft8().fine_sync_enabled),
+                (budget, on),
+                "{effort:?} override {budget_override:?} on {tier:?}"
+            );
+        }
+    }
+
+    /// A full live cycle publishes each preset's own budget (replacing a
+    /// static override) with the matching fine-sync flag.
+    #[test]
+    fn cycle_decode_effort_publishes_fine_sync_with_each_presets_budget() {
+        for (tier, expected) in [
+            (
+                HardwareTier::Slow,
+                [
+                    (DecodeEffort::Eco, 1, true),
+                    (DecodeEffort::Standard, 250, false),
+                    (DecodeEffort::Deep, 1000, false),
+                    (DecodeEffort::Max, 0, false),
+                    (DecodeEffort::Auto, 1, true),
+                ],
+            ),
+            (
+                HardwareTier::Moderate,
+                [
+                    (DecodeEffort::Eco, 1, true),
+                    (DecodeEffort::Standard, 250, false),
+                    (DecodeEffort::Deep, 1000, false),
+                    (DecodeEffort::Max, 0, false),
+                    (DecodeEffort::Auto, 250, false),
+                ],
+            ),
+        ] {
+            let current_effort = AtomicU8::new(DecodeEffort::Auto.as_u8());
+            let mut window = DecodeWindowConfig::new(Ft8Config::default(), 0);
+            // A static 250 ms override on Eco: outside the measured regime.
+            seed_effort_budget(DecodeEffort::Eco, Some(250), tier, &mut window);
+            assert!(!window.ft8().fine_sync_enabled);
+            for (effort, budget, on) in expected {
+                let (next, budget_ms) = cycle_decode_effort(&current_effort, &mut window, tier);
+                assert_eq!((next, budget_ms), (effort, budget), "{tier:?}");
                 assert_eq!(
-                    format!("{config:?}"),
-                    format!("{:?}", Ft8Config::default()),
-                    "{effort:?} on {tier:?} must not change any Ft8Config field"
+                    (window.budget_ms(), window.ft8().fine_sync_enabled),
+                    (budget, on),
+                    "{effort:?} on {tier:?}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn switch_protocol_rederives_fine_sync_against_the_published_budget() {
+        let mut w = DecodeWindowConfig::new(Ft8Config::default(), 0);
+        w.publish_effort(DecodeEffort::Eco, HardwareTier::Fast, 1);
+        assert!(w.ft8().fine_sync_enabled);
+
+        w.switch_protocol(
+            pancetta_ft8::Protocol::Ft4,
+            DecodeEffort::Eco,
+            HardwareTier::Fast,
+        );
+        assert_eq!(w.budget_ms(), 1);
+        assert!(!w.ft8().fine_sync_enabled, "FT4 must clear fine sync");
+
+        w.switch_protocol(
+            pancetta_ft8::Protocol::Ft8,
+            DecodeEffort::Eco,
+            HardwareTier::Fast,
+        );
+        assert_eq!(w.budget_ms(), 1);
+        assert!(w.ft8().fine_sync_enabled, "back on FT8 Eco at 1 ms");
+
+        let mut w = DecodeWindowConfig::new(Ft8Config::default(), 0);
+        seed_effort_budget(DecodeEffort::Eco, Some(250), HardwareTier::Fast, &mut w);
+        w.switch_protocol(
+            pancetta_ft8::Protocol::Ft8,
+            DecodeEffort::Eco,
+            HardwareTier::Fast,
+        );
+        assert_eq!(w.budget_ms(), 250);
+        assert!(
+            !w.ft8().fine_sync_enabled,
+            "a protocol switch keeps the 250 ms override, so fine sync stays off"
+        );
     }
 
     /// The literal `Max` preset is the ONE case with a real override:
@@ -816,8 +1061,8 @@ mod tests {
 
     /// `Auto` must resolve through the probed hardware tier the same way
     /// the wall-time budget does (round-1 review finding) — verified via
-    /// the pure resolver rather than `apply_effort_overrides` itself,
-    /// since no field is overridden yet to observe through the latter.
+    /// the pure resolver here; `fine_sync_is_on_exactly_for_ft8_eco_at_one_ms`
+    /// observes it through `apply_effort_overrides`.
     #[test]
     fn auto_resolves_to_the_tier_equivalent_literal_preset() {
         assert_eq!(

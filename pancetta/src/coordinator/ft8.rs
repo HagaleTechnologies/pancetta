@@ -74,6 +74,8 @@ pub(crate) struct DecoderRebuildKey {
     pub(crate) osd_depth: Option<u8>,
     pub(crate) protocol: pancetta_ft8::Protocol,
     pub(crate) time_varying_subtraction_enabled: bool,
+    /// PAN-158: on for FT8 Eco at its 1 ms budget.
+    pub(crate) fine_sync_enabled: bool,
 }
 
 impl DecoderRebuildKey {
@@ -83,6 +85,7 @@ impl DecoderRebuildKey {
             osd_depth: cfg.osd_depth,
             protocol: cfg.protocol,
             time_varying_subtraction_enabled: cfg.time_varying_subtraction_enabled,
+            fine_sync_enabled: cfg.fine_sync_enabled,
         }
     }
 }
@@ -819,12 +822,16 @@ impl super::ApplicationCoordinator {
                             &decode_window_shared,
                             &mut applied_window,
                             |cfg| {
-                                let (passes, osd, protocol) =
-                                    (cfg.max_decode_passes, cfg.osd_depth, cfg.protocol);
+                                let (passes, osd, protocol, fine_sync) = (
+                                    cfg.max_decode_passes,
+                                    cfg.osd_depth,
+                                    cfg.protocol,
+                                    cfg.fine_sync_enabled,
+                                );
                                 let mut d = Ft8Decoder::new(cfg)?;
                                 info!(
-                                    "FT8 decoder rebuilt: max_decode_passes={}, osd_depth={:?}, protocol={}",
-                                    passes, osd, protocol
+                                    "FT8 decoder rebuilt: max_decode_passes={}, osd_depth={:?}, protocol={}, fine_sync_enabled={}",
+                                    passes, osd, protocol, fine_sync
                                 );
                                 // PAN-17 round 2: a rebuild is a fresh
                                 // Ft8Decoder with an empty hash table —
@@ -2795,6 +2802,140 @@ mod decode_window_refresh_tests {
                 "{protocol:?} with budget {budget_ms} ms"
             );
         }
+    }
+
+    // --------------------------------------------------------------
+    // PAN-158: entering or leaving FT8 Eco's fine sync rebuilds
+    // --------------------------------------------------------------
+
+    /// Eco on FT8: `(1 ms, fine sync on)`.
+    fn eco() -> DecodeWindowConfig {
+        let mut w = DecodeWindowConfig::new(Ft8Config::default(), 0);
+        w.publish_effort(DecodeEffort::Eco, HardwareTier::Fast, 1);
+        w
+    }
+
+    fn fine_sync_pair(a: &AppliedDecodeWindow) -> (u64, bool) {
+        (a.budget_ms, a.rebuild_key.fine_sync_enabled)
+    }
+
+    #[test]
+    fn fine_sync_flag_alone_changes_the_rebuild_key() {
+        let off = Ft8Config::default();
+        let on = Ft8Config {
+            fine_sync_enabled: true,
+            ..Ft8Config::default()
+        };
+        assert_ne!(DecoderRebuildKey::of(&off), DecoderRebuildKey::of(&on));
+    }
+
+    #[test]
+    fn entering_and_leaving_eco_rebuilds_with_the_published_flag() {
+        let shared = tokio::sync::RwLock::new(standard());
+        let mut applied = AppliedDecodeWindow::of(&standard());
+        assert_eq!(fine_sync_pair(&applied), (250, false));
+
+        shared.try_write().expect("uncontended").publish_effort(
+            DecodeEffort::Eco,
+            HardwareTier::Fast,
+            1,
+        );
+        let mut built_with = None;
+        let refresh = refresh_decode_window(&shared, &mut applied, |cfg| {
+            built_with = Some(cfg.fine_sync_enabled);
+            Ok::<_, ()>(())
+        });
+        assert_eq!(refresh, DecodeWindowRefresh::Rebuilt);
+        assert_eq!(built_with, Some(true));
+        assert_eq!(fine_sync_pair(&applied), (1, true));
+
+        shared.try_write().expect("uncontended").publish_effort(
+            DecodeEffort::Standard,
+            HardwareTier::Fast,
+            250,
+        );
+        let mut built_with = None;
+        let refresh = refresh_decode_window(&shared, &mut applied, |cfg| {
+            built_with = Some(cfg.fine_sync_enabled);
+            Ok::<_, ()>(())
+        });
+        assert_eq!(refresh, DecodeWindowRefresh::Rebuilt);
+        assert_eq!(built_with, Some(false));
+        assert_eq!(fine_sync_pair(&applied), (250, false));
+    }
+
+    /// Standard with a 1 ms override and Eco publish the same budget, so
+    /// only the flag can trigger this rebuild.
+    #[test]
+    fn same_budget_standard_to_eco_rebuilds_on_the_flag_alone() {
+        let mut standard_1ms = DecodeWindowConfig::new(Ft8Config::default(), 0);
+        standard_1ms.publish_effort(DecodeEffort::Standard, HardwareTier::Fast, 1);
+        let shared = tokio::sync::RwLock::new(standard_1ms.clone());
+        let mut applied = AppliedDecodeWindow::of(&standard_1ms);
+        assert_eq!(fine_sync_pair(&applied), (1, false));
+
+        shared.try_write().expect("uncontended").publish_effort(
+            DecodeEffort::Eco,
+            HardwareTier::Fast,
+            1,
+        );
+        let mut built_with = None;
+        let refresh = refresh_decode_window(&shared, &mut applied, |cfg| {
+            built_with = Some(cfg.fine_sync_enabled);
+            Ok::<_, ()>(())
+        });
+        assert_eq!(refresh, DecodeWindowRefresh::Rebuilt);
+        assert_eq!(built_with, Some(true));
+        assert_eq!(fine_sync_pair(&applied), (1, true));
+    }
+
+    #[test]
+    fn repeating_an_eligible_eco_publish_does_not_rebuild() {
+        let shared = tokio::sync::RwLock::new(eco());
+        let mut applied = AppliedDecodeWindow::of(&eco());
+
+        shared.try_write().expect("uncontended").publish_effort(
+            DecodeEffort::Eco,
+            HardwareTier::Fast,
+            1,
+        );
+        let refresh = refresh_decode_window(&shared, &mut applied, |_| -> Result<(), ()> {
+            panic!("an identical publish must not rebuild the decoder")
+        });
+        assert_eq!(refresh, DecodeWindowRefresh::Adopted);
+        assert_eq!(fine_sync_pair(&applied), (1, true));
+    }
+
+    #[test]
+    fn busy_or_failed_eco_transition_keeps_the_whole_previous_window() {
+        let shared = tokio::sync::RwLock::new(standard());
+        let mut applied = AppliedDecodeWindow::of(&standard());
+
+        let mut g = shared.try_write().expect("uncontended");
+        g.publish_effort(DecodeEffort::Eco, HardwareTier::Fast, 1);
+        let refresh = refresh_decode_window(&shared, &mut applied, |_| -> Result<(), ()> {
+            panic!("no rebuild may run while a writer holds the window")
+        });
+        assert_eq!(refresh, DecodeWindowRefresh::Busy);
+        assert_eq!(fine_sync_pair(&applied), (250, false));
+        drop(g);
+
+        let refresh = refresh_decode_window(&shared, &mut applied, |_| Err("boom"));
+        assert_eq!(refresh, DecodeWindowRefresh::RebuildFailed("boom"));
+        assert_eq!(
+            fine_sync_pair(&applied),
+            (250, false),
+            "Eco's 1 ms budget must not be adopted without its fine-sync decoder"
+        );
+
+        let mut built_with = None;
+        let refresh = refresh_decode_window(&shared, &mut applied, |cfg| {
+            built_with = Some(cfg.fine_sync_enabled);
+            Ok::<_, &str>(())
+        });
+        assert_eq!(refresh, DecodeWindowRefresh::Rebuilt);
+        assert_eq!(built_with, Some(true));
+        assert_eq!(fine_sync_pair(&applied), (1, true));
     }
 
     /// Generalisation guard: any `Ft8Config` field `apply_effort_overrides`
