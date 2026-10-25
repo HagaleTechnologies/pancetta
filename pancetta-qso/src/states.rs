@@ -418,6 +418,11 @@ pub struct PreSwitchOffset {
     ///   our very next frame goes out on the NEW offset, and an advancing reply
     ///   after it is better evidence for that new offset than for the one we
     ///   left of our own accord.
+    ///
+    /// Since PAN-83 this is the fallback. The crediting site first credits the
+    /// offset of the frame that aired in our slot just before the reply
+    /// (`answered_frame_offset_hz`) and reads this bit only when no aired
+    /// frame pins that down.
     #[serde(default)]
     pub operator_forced: bool,
 }
@@ -708,6 +713,11 @@ pub struct QsoMetadata {
     /// which of our two offsets was answered — which is exactly why
     /// [`PreSwitchOffset::operator_forced`] is carried alongside the offset. See
     /// its doc comment.
+    ///
+    /// PAN-83: on a split the crediting site now answers "which of our frames
+    /// did this reply answer" directly, from the TX worker's aired-frame
+    /// record, and falls back to the provenance rule above only when no aired
+    /// frame pins the answer down. See `answered_frame_offset_hz`.
     #[serde(default)]
     pub pre_switch_offset: Option<PreSwitchOffset>,
 

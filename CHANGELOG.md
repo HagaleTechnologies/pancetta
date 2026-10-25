@@ -297,6 +297,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   back there. The reply now credits the offset you moved to, and a later stall
   looks for a new offset instead (PAN-132).
 
+- Pressing `u` while our frame was on the air could record the new TX offset as
+  the one that works, even though the DX's next reply answered the frame sent
+  before the move and nothing had gone out on the new offset yet; two `u`
+  presses in consecutive slots did the same. After a move, the reply now
+  credits the offset of the frame it actually answered, the one that aired in
+  our slot just before it, so if the new offset later goes quiet the QSO moves
+  back to the offset the DX heard. When no aired frame settles it, the previous
+  rule applies (PAN-83).
+
 - Pressing `u` on a Hound QSO right after the Fox's report moved it off its
   calling offset now moves the QSO at least `min_separation_hz` from its real
   TX offset, instead of leaving it in place or shifting it by only a few Hz
