@@ -1507,8 +1507,19 @@ fn run_synth_tier(
     let mut wavs_processed = 0u32;
     // hb-129: per-WAV TTFD collection for the synth-clean tier.
     let mut per_wav_ttfd_s: Vec<f64> = Vec::new();
+    // PAN-158: one record per entry so `compare` can pair two arms WAV by
+    // WAV and bootstrap the recall delta.
+    let mut per_wav_records: Vec<PerWavRecord> = Vec::with_capacity(entries.len());
     for e in &entries {
         wavs_processed += 1;
+        let wav_hash = sha256_file(&e.wav_path)
+            .with_context(|| format!("hashing synth WAV {}", e.wav_path.display()))?;
+        let mut record = PerWavRecord {
+            wav_hash,
+            truth: 1,
+            recovered: 0,
+            novel: 0,
+        };
         let bin_key = (e.snr_db * 10.0).round() as i64;
         let bin = bins.entry(bin_key).or_insert((0, 0));
         bin.0 += 1; // attempts
@@ -1523,18 +1534,19 @@ fn run_synth_tier(
                 // PAN-110: a merged set leads with ft8_lib's copies, which
                 // carry no decode time, so it has no meaningful TTFD.
                 let merged = side_texts.is_some();
+                // Every synth WAV carries exactly one signal, so any
+                // delivered decode that is not it is a false decode.
+                record.novel = decodes
+                    .iter()
+                    .filter(|d| !d.message.contains(&e.encoded_message))
+                    .count() as u32;
                 if let Some(texts) = side_texts {
                     side_texts_seen = true;
                     let side = side_bins.entry(bin_key).or_default();
                     let has = |t: &[String]| t.iter().any(|m| m.contains(&e.encoded_message));
                     side.native_decoded += u32::from(has(&texts.native));
                     side.ft8lib_decoded += u32::from(has(&texts.ft8lib));
-                    // Every synth WAV carries exactly one signal, so any
-                    // delivered decode that is not it is a false decode.
-                    side.fp += decodes
-                        .iter()
-                        .filter(|d| !d.message.contains(&e.encoded_message))
-                        .count() as u32;
+                    side.fp += record.novel;
                 }
                 if let Some(min_ttfd) = decodes
                     .iter()
@@ -1552,12 +1564,14 @@ fn run_synth_tier(
                     .any(|d| d.message.contains(&e.encoded_message))
                 {
                     bin.1 += 1; // decoded
+                    record.recovered = 1;
                 }
             }
             Err(_) => {
                 // Decode error — counts as failed attempt.
             }
         }
+        per_wav_records.push(record);
 
         if !jt9_baseline_missing {
             let jt9_bin = jt9_bins.entry(bin_key).or_insert((0, 0));
@@ -1634,6 +1648,7 @@ fn run_synth_tier(
         jt9_snr_curve,
         jt9_snr_at_50pct_recovery_db,
         window_timing,
+        per_wav_records,
         ..Default::default()
     })
 }
@@ -3453,6 +3468,8 @@ mod merge_scoring_tests {
         responses: HashMap<String, (Vec<&'static str>, DecoderTexts)>,
         report_sides: bool,
         last: std::sync::Mutex<Option<DecoderTexts>>,
+        /// PAN-158: file names whose decode returns an error.
+        failing: Vec<String>,
     }
 
     impl DecoderUnderTest for SideStub {
@@ -3467,6 +3484,9 @@ mod merge_scoring_tests {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or_default();
+            if self.failing.iter().any(|f| f == key) {
+                anyhow::bail!("stub decode error for {key}");
+            }
             let (delivered, texts) = self.responses.get(key).cloned().unwrap_or_default();
             if self.report_sides {
                 *self.last.lock().unwrap() = Some(texts);
@@ -3495,7 +3515,9 @@ mod merge_scoring_tests {
     }
 
     /// A two-bin manifest cut from the committed synth-clean manifest:
-    /// three WAVs at -20 dB and one at -19 dB.
+    /// three WAVs at -20 dB and one at -19 dB. Each entry points at a
+    /// distinct tiny file in `dir` (PAN-158: per-WAV records hash the
+    /// file; the stub never reads it as audio).
     fn small_manifest(dir: &std::path::Path) -> (PathBuf, Vec<(String, String, f64)>) {
         let root = workspace_root().unwrap();
         let full: serde_json::Value = serde_json::from_str(
@@ -3521,6 +3543,19 @@ mod merge_scoring_tests {
                 Some(keep.then(|| e.clone()))
             })
             .flatten()
+            .collect();
+        let entries: Vec<serde_json::Value> = entries
+            .into_iter()
+            .map(|mut e| {
+                let name = PathBuf::from(e["wav_path"].as_str().unwrap())
+                    .file_name()
+                    .unwrap()
+                    .to_owned();
+                let wav = dir.join(&name);
+                std::fs::write(&wav, name.to_str().unwrap().as_bytes()).unwrap();
+                e["wav_path"] = serde_json::Value::String(wav.to_str().unwrap().to_string());
+                e
+            })
             .collect();
         let mut manifest = full.clone();
         manifest["entries"] = serde_json::Value::Array(entries.clone());
@@ -3570,6 +3605,7 @@ mod merge_scoring_tests {
             responses,
             report_sides,
             last: std::sync::Mutex::new(None),
+            failing: Vec::new(),
         }
     }
 
@@ -3619,6 +3655,103 @@ mod merge_scoring_tests {
             json["by_snr_db"][0].get("native_decoded").is_none(),
             "{json}"
         );
+    }
+
+    /// PAN-158: every synth entry yields one per-WAV record keyed by the
+    /// WAV's SHA-256 — a miss and a decode error included — so `compare`
+    /// can pair two arms and bootstrap the recall delta.
+    #[test]
+    fn synth_tier_records_one_per_wav_entry_keyed_by_sha256() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manifest, entries) = small_manifest(dir.path());
+        let root = workspace_root().unwrap();
+        let mut decoder = stub(&entries, true);
+        // The -19 dB WAV (ft8_lib-only hit) now fails to decode.
+        let failing = entries.iter().find(|(_, _, snr)| *snr == -19.0).unwrap();
+        decoder.failing.push(failing.0.clone());
+        let r = run_synth_tier(&decoder, &root, &manifest, None, Mode::Ft8, None).unwrap();
+
+        assert_eq!(r.per_wav_records.len(), entries.len());
+        let mut hashes = Vec::new();
+        for ((wav, _, _), rec) in entries.iter().zip(&r.per_wav_records) {
+            assert_eq!(rec.truth, 1, "{wav}");
+            assert_eq!(
+                rec.wav_hash,
+                sha256_file(&dir.path().join(wav)).unwrap(),
+                "{wav}"
+            );
+            hashes.push(rec.wav_hash.clone());
+        }
+        hashes.sort();
+        hashes.dedup();
+        assert_eq!(hashes.len(), entries.len(), "identities must be distinct");
+
+        // -20 dB #0: hit + one false decode; #1: hit; #2: miss; the
+        // -19 dB WAV: decode error. Records follow manifest order.
+        let mut at_minus_20 = 0;
+        let expected: Vec<(u32, u32)> = entries
+            .iter()
+            .map(|(_, _, snr)| {
+                if *snr != -20.0 {
+                    return (0, 0);
+                }
+                at_minus_20 += 1;
+                [(1, 1), (1, 0), (0, 0)][at_minus_20 - 1]
+            })
+            .collect();
+        let got: Vec<(u32, u32)> = r
+            .per_wav_records
+            .iter()
+            .map(|rec| (rec.recovered, rec.novel))
+            .collect();
+        assert_eq!(got, expected);
+
+        let recovered: u32 = r.per_wav_records.iter().map(|rec| rec.recovered).sum();
+        let decoded: u32 = r.by_snr_db.iter().map(|b| b.decoded).sum();
+        assert_eq!(recovered, decoded);
+        let novel: u32 = r.per_wav_records.iter().map(|rec| rec.novel).sum();
+        let fp: u32 = r.by_snr_db.iter().map(|b| b.fp).sum();
+        assert_eq!(novel, fp);
+        // The decode error stays in the denominator.
+        assert_eq!(r.by_snr_db[1].attempts, 1);
+        assert_eq!(r.by_snr_db[1].decoded, 0);
+        assert_eq!(r.false_positives_total, None);
+    }
+
+    /// PAN-158: records come after the FP filter, the same view the
+    /// per-SNR totals use, and a native-only run keeps its TTFD.
+    #[test]
+    fn synth_tier_records_follow_the_fp_filter_without_side_texts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manifest, entries) = small_manifest(dir.path());
+        let root = workspace_root().unwrap();
+        let decoder = stub(&entries, false);
+        // Admit every true signal's callsign; the false decode's is unknown.
+        let mut filter = pancetta_research::FpFilter::new();
+        filter.extend_from_iter(
+            entries
+                .iter()
+                .map(|(_, msg, _)| msg.split_whitespace().nth(1).unwrap().to_string()),
+        );
+        let r = run_synth_tier(&decoder, &root, &manifest, Some(&filter), Mode::Ft8, None).unwrap();
+        let novel: u32 = r.per_wav_records.iter().map(|rec| rec.novel).sum();
+        assert_eq!(novel, 0, "the filtered false decode is not a record novel");
+        let recovered: u32 = r.per_wav_records.iter().map(|rec| rec.recovered).sum();
+        assert_eq!(recovered, 3);
+        assert!(r.ttfd_distribution.is_some());
+    }
+
+    /// PAN-158: a manifest entry whose WAV is absent fails the tier rather
+    /// than inventing an identity for it.
+    #[test]
+    fn synth_tier_fails_when_a_wav_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manifest, entries) = small_manifest(dir.path());
+        std::fs::remove_file(dir.path().join(&entries[2].0)).unwrap();
+        let root = workspace_root().unwrap();
+        let decoder = stub(&entries, true);
+        let err = run_synth_tier(&decoder, &root, &manifest, None, Mode::Ft8, None).unwrap_err();
+        assert!(format!("{err:#}").contains(&entries[2].0), "{err:#}");
     }
 }
 

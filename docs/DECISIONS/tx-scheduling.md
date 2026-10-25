@@ -3,6 +3,82 @@
 
 # TX scheduling
 
+## One candidate set for both TX-offset resolution paths (PAN-80, 2026-10-24)
+
+`AutonomousOperator::allocate_smart_frequency_in_range` resolves every adaptive
+TX-offset relocation (a stall `Switch`, an occupied-target `Revert`, a `u`
+nudge) through one of two paths: spectral ranking once a waterfall has landed,
+or the no-snapshot fallback before that (a fresh start, an Autonomous-task
+restart). Each path used to build and filter its own candidate grid. Twice on
+PR #350 a constraint was added to the spectral path only: round 2 bound the
+Hound window there while the fallback only clamped its result into the
+window, and round 3 bound the `avoid_hz`/`also_avoid_hz` exclusions there
+while the fallback ignored them until `allocate_cq_frequency_excluding`
+re-implemented them. Round 3 closed the known gap, but nothing stopped a third
+constraint kind from repeating it.
+
+The grids themselves also disagreed. The spectral path stepped
+`FrequencyAllocatorConfig::step_hz` (25 Hz) over the configured `range`; the
+fallback stepped a hardcoded 75 Hz over a hardcoded (200, 2800). A valid
+`[hound]` window such as (1130, 1155) holds 1150 on the 25 Hz grid and no point
+on the 75 Hz one, so the same `Switch` was honored or refused depending only on
+whether a waterfall had landed. A `step_hz` or `range` other than the default
+bound only the spectral path.
+
+The resolution now builds one `frequency::TxOffsetConstraints` (window,
+`avoid_hz`, `also_avoid_hz`, `min_separation_hz`, with today's inclusive-window
+and `>=` separation rules), and both paths take their candidates from
+`frequency::admissible_candidates`, the only candidate-grid loop in the
+allocation code. It steps `step_hz` from `range.0` over the `sweep_bounds`
+widening (PAN-72 round 6) and keeps only what the constraints admit. Then:
+
+- with a snapshot, `SmartFrequencyAllocator::rank_admissible_candidates` scores
+  the candidates with the unchanged seven-term score, the CQ-mode live-spot
+  boost applies as before, and the best is taken;
+- without one, `FrequencyAllocator::clearance_pick` applies the unchanged
+  clearance formula (distance to the nearest own QSO minus 20 per observed
+  decode within 100 Hz);
+- one tail follows both: no candidate returns `avoid_hz` unchanged (the signal
+  `apply_tx_offset_switch` refuses as `OffsetActionNoOp`), and with no
+  `avoid_hz` the unconstrained `allocate_cq_frequency` pick is clamped into the
+  window.
+
+A future constraint kind goes into `TxOffsetConstraints` and binds on both
+paths by construction. `allocate_cq_frequency_excluding` and
+`rank_candidates_in_range` are deleted; `rank_candidates` and
+`rank_candidates_with_parity` (the placement instrument, `sim.rs`) are
+unconstrained wrappers over `rank_admissible_candidates`.
+
+- **Spectral picks are unchanged.** Scoring is per candidate, so filtering
+  before scoring gives the same scores as filtering after, and the stable sort
+  over the ascending grid keeps tie order. The boost re-sorts in place as before.
+- **The fallback joins the configured grid.** This is the one intended behavior
+  change: narrow windows the 75 Hz grid could not represent are searched,
+  `step_hz`/`range` bind on the fallback, and with own QSOs or observed
+  decodes the clearance pick can land on a 25 Hz point between two old 75 Hz
+  ones. Fresh-start picks do not move: with no own QSO every clearance is
+  `f64::MAX`, so the first grid point (200 on both grids) wins.
+- **The last resort keeps its own grid.** `allocate_cq_frequency` still scans
+  the legacy allocator's (200, 2800) at 75 Hz, now through the generator with
+  no constraints, so its picks are identical and the clamp still dominates.
+- **Rejected: share only the predicate.** Keeping two grids leaves the
+  window-membership divergence above in place.
+- **Rejected: unify the scoring too.** The two layers read different evidence
+  (own/observed frequencies versus the snapshot and slot-aware decode
+  history), and merging them would change what a pick means. The clearance
+  saturation with no own QSO is left as it is; changing it is a scoring policy
+  change that needs on-air validation.
+- **Tests.** `pancetta-qso` `autonomous::tests::pan80_*`: the spectral picks
+  pinned across window/avoid/batch/DX/parity/own/live-spot cases, both-path
+  exhaustion, the clamped last resort, Hold precedence, the fresh-start floor,
+  the narrow-window, `step_hz` and `range` cases on the fallback, and
+  `pan80_every_non_exhaustion_pick_satisfies_the_constraints`, which checks
+  360 combinations against an independently computed grid and predicate.
+  `frequency::tests` covers the predicate edges, the generator's grid,
+  widening and filtering, and `ranked_output_is_unchanged_by_the_generator_rewiring`
+  compares the new ranking field for field with a frozen copy of the old scan.
+  No on-air run: the loopback suite and these unit tests are the evidence.
+
 ## DX-parity evidence is scoped to band and slot grid (PAN-146, 2026-10-21)
 
 PAN-141's pre-PTT hold reads the DX's newest fresh sighting in
@@ -188,6 +264,8 @@ The `u` nudge picked up two of its own: the Hold gate is hoisted above the activ
 **Round-10 review hardening (Codex on PR #350; the PAN-79 item-2 follow-up).** Round 2 closed the `TxPolicy` hard mute, but the TX worker's own pre-PTT Hamlib hard mute (`tx_hard_mute_reason`) also keeps every rearmed frame off the air, and none of it was visible to `QsoManager`: a supervisor-restart window (PAN-5, designed to span multiple slots), the command loop not yet ready, an undelivered pending frequency/split command, an in-flight rig command, and (since PAN-115) a lost rig CAT link or dead audio output. A Hamlib supervisor restart could therefore accumulate 2+ bogus stall cycles on an established QSO and move it off a known-good offset, the outcome round 2's fix existed to prevent, through a narrower trigger. `QsoManager::set_hamlib_hard_muted_source` now shares the predicate. It is read-only evidence, consulted in `rearm_manual_calls_at`'s `frame_reaches_the_air` check and never a TX gate: the fail-CLOSED pre-PTT check stays in the TX worker. `start_qso_component` wires it from the same atomics that gate reads, and it defaults to "not muted" so unwired callers are unchanged. PAN-79 item 1 (the no-op relocation) is round 3's `OffsetActionNoOp` refusal above; item 2 is this entry. The fix landed inside PR #350 under a `(PAN-72)` trailer, so this entry records its PAN-79 attribution. `a_hamlib_restart_window_accumulates_no_stall_cycles_or_offset_actions` (`coordinator/qso.rs`) pins the join end to end: a real `tx_restart_inhibit` window on the watch-published manager counts no stall cycles and raises no offset action, and counting resumes when the window clears.
 
 **PAN-140 (2026-09-12): first live on-air exercise found a real in-flight-PTT race.** Working W6M, a stall-switch committed 2.8s into an already-in-flight 12.64s transmission — `rearm_manual_calls_at`'s `stall_cycles` increment/threshold check has no guard against a PTT already keyed for the current slot, so the supersede path aborted the audio and re-keyed at the new frequency 2.8s late into the slot, garbling both frames (and with zero operator-visible log trace either way). Fixed in two commits (PR #369): a top-of-loop pre-check + re-queue in `drain_pending_qso_offset_requests`, then — after Codex's single review round caught that the pre-check's own `.await` for `apply_tx_offset_switch`'s write lock reopens the identical window — a real `ptt_active: Arc<AtomicBool>` (`QsoManager::set_ptt_active_source`, mirroring `set_tx_freq_mode_source`) re-checked INSIDE that write lock, immediately before the existing Hold recheck. New `OffsetActionPttInFlight` error, re-queued (not discarded, unlike Hold). Two sibling findings from the same live session, tracked separately: PAN-141 (a manually-latched TX parity can go stale before key-up against a fast-cycling pileup DX that changes callers — and therefore parity — in the gap) and PAN-142 (no operator-visible indicator during the two-strike frequency-drift confirm window, `maybe_confirm_frequency_drift_at`).
+
+**PAN-83 (2026-10-24): credit the frame a reply answered.** Round 6/PAN-132's provenance rule answers "why did we move", not "which of our transmitted frames did this reply answer" — the question that actually decides a split-QSO known-good credit inside a relocation's grace window. The TX worker already reports every frame that aired and the offset it aired on (`TxFrameSent` → `QsoManager::confirm_stall_trigger_aired`); that report is now recorded per QSO (`KeepCallLedger::last_aired`, arrival order = airing order), and the crediting block credits the offset of the frame that aired in the own-parity slot just before the reply's slot (`answered_frame_offset_hz`, anchored on the decode's observed slot parity and the live `active_slot_ns`). Provenance (`PreSwitchOffset::operator_forced`) remains the fallback when no aired frame, no parity, or no in-window record pins the answer down. Anchoring credits to the first offset of a relocation chain was considered and rejected: in the chained case (a nudge followed by a PAN-182-held stall relocation), the second relocation's trigger frame aired on the new offset before the reply, so the reply answers that frame, not the chain's origin — frame provenance handles chains of any length without looking at the chain at all. The Tx=Rx (`partner_freq.is_none()`, i.e. a relocation on an unanswered `CallingCq`) decode-frequency rule and its `partner_freq` latch are unchanged: a station answering our CQ transmits where it clicked us, so its decode frequency already names the frame it answered. Known residual: on a split, a decode processed a full slot or more after its own slot ended anchors the window on a later slot of the reply's parity, so the window admits a later frame of ours instead of the one the reply answered. When that later frame has aired and is the newest on record, its offset is credited with evidence `aired frame`. If the relocation committed before that frame keyed, that is the new offset, which the reply never answered; after a stall switch, provenance would have credited the vacated offset instead. When the newest aired frame falls outside that shifted window, or there is no aired record or no decoded parity, provenance decides as above. The case needs the relocation's two-slot grace to still be live when the decode is processed, so only a relocation committed during or after the reply's own slot reaches it. It is documented, not handled: such a decode belongs to a slot the QSO has already moved past. On-air validation — the deliberate `u`-nudge drill on a live QSO with a pre-existing split, reading the new `Adaptive TX-offset credit: … (evidence: aired frame)` line on `tx.freq` — is still outstanding.
 
 Separately, the autonomous collision-listen jitter (`process_collision_listen`) **holds while a QSO is active** (`active_qso_count>0`) — it only ever seeded the next CQ/opening offset, and only fires from a collision-LISTEN slot (a slot we listened on without transmitting), the "new information" precondition for changing TX frequency.
 

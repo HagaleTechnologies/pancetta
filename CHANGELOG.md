@@ -158,6 +158,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Band Activity's own-TX rows and `tx-log.jsonl`'s `utc` now record when the
+  audio output started playing each frame, including a mid-frame re-key,
+  instead of when the TX worker queued its audio (PAN-71). When pancetta
+  cannot confirm the start within 100 ms it keeps the old value and logs a
+  warning.
+
 - Stale-band decodes are now rejected by the QSO, autonomous, and WSJT-X
   relay receive paths (PAN-69, from the PAN-67/PR #336 review): a decode
   whose audio window closed before a band switch completed its CPU-bound
@@ -290,6 +296,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   left as the one that works, so if the QSO later went quiet it moved straight
   back there. The reply now credits the offset you moved to, and a later stall
   looks for a new offset instead (PAN-132).
+
+- Pressing `u` while our frame was on the air could record the new TX offset as
+  the one that works, even though the DX's next reply answered the frame sent
+  before the move and nothing had gone out on the new offset yet; two `u`
+  presses in consecutive slots did the same. After a move, the reply now
+  credits the offset of the frame it actually answered, the one that aired in
+  our slot just before it, so if the new offset later goes quiet the QSO moves
+  back to the offset the DX heard. When no aired frame settles it, the previous
+  rule applies (PAN-83).
 
 - Pressing `u` on a Hound QSO right after the Fox's report moved it off its
   calling offset now moves the QSO at least `min_separation_hz` from its real
@@ -494,6 +509,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Q in the composer.
 
 ### Changed
+
+- The Eco decode-effort preset, and Auto on hosts the hardware probe rates
+  Slow, now retries an FT8 candidate whose first decode attempt fails at a
+  refined timing and frequency estimate (Task W3.3's fine sync) while the
+  published budget is Eco's 1 ms. On a regenerated synthetic weak-signal
+  corpus, scored on the merged ft8_lib + native output, this recovered
+  25 more of 550 signals (296 → 321, 95% CI +16 to +35), with no new false decodes there or on 1000 noise files.
+  Standard, Deep, Max, Auto on Moderate or Fast hosts, FT4, and any window
+  whose published budget is not 1 ms decode as before. So an explicit
+  `budget_ms` other than 1 turns the retry off for Eco and Auto on Slow
+  hosts until a live `e` effort cycle publishes the preset's own budget,
+  and an explicit `budget_ms = 1` leaves it on. Synthetic and single-host
+  evidence only (PAN-158).
+
+- Before the first waterfall lands, adaptive TX-offset relocation (stall
+  switches, occupied-target reverts, `u` nudges) now searches the same 25 Hz
+  candidate grid as the spectral path, with the same window, `avoid` and batch
+  exclusions, instead of its own 75 Hz grid. A narrow `[hound]` region that held
+  no 75 Hz point (1130–1155 Hz, say) is no longer refused before the waterfall
+  and honored after it. Picks made with a waterfall are unchanged, and so is
+  the first CQ pick after a start (200 Hz) (PAN-80).
 
 - Published decode-sensitivity figures (FEATURES.md, README.md,
   `pancetta-ft8` docs) now come from the shipped pipeline — ft8_lib plus the

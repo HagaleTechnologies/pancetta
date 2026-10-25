@@ -34,6 +34,17 @@ effort→budget mapping (`effort.rs`) are normative in the digest and code — c
 not restated. Two known limitations (S3 escalation ordering; hot-reload does not
 re-seed the effort budget) are documented there.
 
+Effort-override gotcha (PAN-158): **every `Ft8Config` field `apply_effort_overrides`
+writes must also be a `DecoderRebuildKey` field** (`coordinator/ft8.rs`), or the hot
+loop adopts the new budget but keeps decoding with the old decoder. Eco and Standard
+had identical keys until `fine_sync_enabled` joined it; the
+`every_effort_override_field_is_a_rebuild_trigger` guard catches a missing one. Eco's
+fine sync is also budget-qualified: it keys on the published budget, not the config,
+so it applies only while the 1 ms floor-only budget is published. Eco with a
+`budget_ms` override other than 1 runs without it until a live effort cycle publishes
+Eco's own 1 ms; an explicit `budget_ms = 1` keeps it on. See
+[Eco-preset fine sync](../../docs/DECISIONS/config-and-platform.md#eco-preset-fine-sync-pan-158-2026-10-25).
+
 Second gotcha (PAN-90): **a new config struct needs container-level
 `#[serde(default)]` and a `Default` impl**, or `pancetta-config/tests/partial_tables.rs`
 fails — every table must accept a partial table. Record/map entry types are the

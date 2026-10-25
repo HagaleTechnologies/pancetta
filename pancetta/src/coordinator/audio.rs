@@ -92,6 +92,7 @@ pub(crate) enum TxAudioCommand {
         samples: Vec<f32>,
         sample_rate: u32,
         flush_first: bool,
+        playback_started: Option<crate::message_bus::PlaybackStartAck>,
     },
     Flush {
         sample_rate: u32,
@@ -107,10 +108,12 @@ impl TxAudioCommand {
                 samples,
                 sample_rate,
                 flush_first,
+                playback_started,
             } => Some(Self::Play {
                 samples,
                 sample_rate,
                 flush_first,
+                playback_started,
             }),
             MessageType::AudioFlush { sample_rate, ack } => Some(Self::Flush { sample_rate, ack }),
             _ => None,
@@ -125,20 +128,35 @@ impl TxAudioCommand {
     /// settles `Applied` only when it did: a flush still pending after the
     /// wait would clear whatever is buffered once a stalled callback
     /// resumes, including a later frame's audio.
-    pub(crate) fn apply<E>(
+    pub(crate) fn apply<E, M>(
         self,
-        queue_output: impl FnOnce(&[f32], u32, bool) -> Result<bool, E>,
-    ) -> Result<(), E> {
+        queue_output: impl FnOnce(&[f32], u32, bool) -> Result<(bool, Option<M>), E>,
+    ) -> Result<Option<(M, crate::message_bus::PlaybackStartAck)>, E> {
         match self {
             Self::Play {
                 samples,
                 sample_rate,
                 flush_first,
-            } => queue_output(&samples, sample_rate, flush_first).map(|_| ()),
+                playback_started,
+            } => match queue_output(&samples, sample_rate, flush_first) {
+                Ok((_, Some(mark))) => Ok(playback_started.map(|ack| (mark, ack))),
+                Ok((_, None)) => {
+                    if let Some(ack) = playback_started {
+                        ack.not_started();
+                    }
+                    Ok(None)
+                }
+                Err(e) => {
+                    if let Some(ack) = playback_started {
+                        ack.not_started();
+                    }
+                    Err(e)
+                }
+            },
             Self::Flush { sample_rate, ack } => {
                 let result = queue_output(&[], sample_rate, true);
-                ack.complete(matches!(result, Ok(true)));
-                result.map(|_| ())
+                ack.complete(matches!(result, Ok((true, _))));
+                result.map(|_| None)
             }
         }
     }
@@ -512,6 +530,8 @@ impl super::ApplicationCoordinator {
                 let mut output_watch =
                     crate::coordinator::audio_recovery::OutputWatchdog::new(Instant::now());
                 let mut output_alive_published = false;
+                let mut playback_watch =
+                    crate::coordinator::audio_recovery::PlaybackStartWatch::new();
 
                 loop {
                     if shutdown.load(Ordering::Acquire) {
@@ -566,25 +586,33 @@ impl super::ApplicationCoordinator {
                         let _ = respond.send(result);
                     }
 
+                    playback_watch.poll(|m| audio_manager.output_mark_state(m), chrono::Utc::now);
                     // Check for TX audio to play out
                     match tx_audio_rx.try_recv() {
                         Ok(command) => {
-                            if let Err(e) = command.apply(|samples, sample_rate, flush_first| {
+                            match command.apply(|samples, sample_rate, flush_first| {
                                 info!(
                                     "Audio TX: queueing {} samples at {} Hz (flush_first={})",
                                     samples.len(),
                                     sample_rate,
                                     flush_first
                                 );
-                                audio_manager.queue_output_confirming_flush(
-                                    samples,
-                                    sample_rate,
-                                    flush_first,
-                                )
+                                audio_manager
+                                    .queue_output_marked(samples, sample_rate, flush_first)
+                                    .map(|q| (q.flush_completed, q.mark))
                             }) {
-                                let s = e.to_string();
-                                error!("Audio TX output error: {}", s);
-                                maybe_report_runtime("TX output error", s);
+                                Ok(Some((mark, ack))) => playback_watch.arm(
+                                    mark,
+                                    ack,
+                                    |m| audio_manager.output_mark_state(m),
+                                    chrono::Utc::now,
+                                ),
+                                Ok(None) => {}
+                                Err(e) => {
+                                    let s = e.to_string();
+                                    error!("Audio TX output error: {}", s);
+                                    maybe_report_runtime("TX output error", s);
+                                }
                             }
                         }
                         Err(crossbeam_channel::TryRecvError::Empty) => {}
@@ -593,6 +621,7 @@ impl super::ApplicationCoordinator {
                         }
                     }
 
+                    playback_watch.poll(|m| audio_manager.output_mark_state(m), chrono::Utc::now);
                     match audio_manager.process_audio() {
                         Ok(Some(samples)) => {
                             output_edge = output_watch
@@ -849,15 +878,90 @@ mod pan135_tx_audio_command_tests {
     use crate::message_bus::{AckState, DeliveryAck, MessageType};
     use std::time::Duration;
 
+    use crate::message_bus::{PlaybackStartAck, PlaybackStartState};
+
+    fn play(ack: PlaybackStartAck) -> TxAudioCommand {
+        TxAudioCommand::Play {
+            samples: vec![0.5],
+            sample_rate: 12_000,
+            flush_first: true,
+            playback_started: Some(ack),
+        }
+    }
+
+    #[tokio::test]
+    async fn play_with_a_mark_hands_its_ack_to_the_caller() {
+        let (ack, mut waiter) = PlaybackStartAck::new();
+        let (mark, returned) = play(ack)
+            .apply(|s, rate, flush| {
+                assert_eq!(s, &[0.5]);
+                assert_eq!(rate, 12_000);
+                assert!(flush);
+                Ok::<_, ()>((true, Some(7u64)))
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(mark, 7);
+        assert_eq!(
+            waiter.wait_for(Duration::from_millis(1)).await,
+            PlaybackStartState::Pending
+        );
+        let at = chrono::Utc::now();
+        returned.started(at);
+        assert_eq!(
+            waiter.wait_for(Duration::from_millis(10)).await,
+            PlaybackStartState::Started(at)
+        );
+    }
+
+    #[tokio::test]
+    async fn play_with_no_mark_settles_not_started() {
+        let (ack, mut waiter) = PlaybackStartAck::new();
+        assert!(play(ack)
+            .apply(|_, _, _| Ok::<_, ()>((true, None::<u64>)))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            waiter.wait_for(Duration::from_millis(10)).await,
+            PlaybackStartState::NotStarted
+        );
+    }
+
+    #[tokio::test]
+    async fn play_whose_queue_output_errs_settles_not_started() {
+        let (ack, mut waiter) = PlaybackStartAck::new();
+        assert!(play(ack)
+            .apply::<_, u64>(|_, _, _| Err("queue failed"))
+            .is_err());
+        assert_eq!(
+            waiter.wait_for(Duration::from_millis(10)).await,
+            PlaybackStartState::NotStarted
+        );
+    }
+
+    #[tokio::test]
+    async fn a_play_lost_on_a_closed_audio_channel_reports_dropped() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        drop(rx);
+        let (ack, mut waiter) = PlaybackStartAck::new();
+        assert!(tx.send(play(ack)).is_err());
+        assert_eq!(
+            waiter.wait_for(Duration::from_millis(100)).await,
+            PlaybackStartState::Dropped
+        );
+    }
+
     #[test]
     fn from_bus_maps_audio_output_and_flush_and_ignores_the_rest() {
+        let (playback_ack, _) = PlaybackStartAck::new();
         let play = TxAudioCommand::from_bus(MessageType::AudioOutput {
             samples: vec![0.5; 3],
             sample_rate: 12_000,
             flush_first: false,
+            playback_started: Some(playback_ack),
         });
         assert!(
-            matches!(play, Some(TxAudioCommand::Play { ref samples, sample_rate: 12_000, flush_first: false }) if samples.len() == 3)
+            matches!(play, Some(TxAudioCommand::Play { ref samples, sample_rate: 12_000, flush_first: false, playback_started: Some(_) }) if samples.len() == 3)
         );
         let (ack, _w) = DeliveryAck::new();
         assert!(matches!(
@@ -877,13 +981,13 @@ mod pan135_tx_audio_command_tests {
     async fn flush_settles_applied_after_queue_output_ok() {
         let (ack, mut waiter) = DeliveryAck::new();
         let mut seen = None;
-        let r: Result<(), String> = TxAudioCommand::Flush {
+        let r: Result<Option<(u64, PlaybackStartAck)>, String> = TxAudioCommand::Flush {
             sample_rate: 12_000,
             ack,
         }
         .apply(|s, rate, flush_first| {
             seen = Some((s.len(), rate, flush_first));
-            Ok(true)
+            Ok((true, None))
         });
         assert!(r.is_ok());
         assert_eq!(
@@ -903,11 +1007,11 @@ mod pan135_tx_audio_command_tests {
     #[tokio::test]
     async fn flush_settles_not_applied_when_the_flush_handshake_times_out() {
         let (ack, mut waiter) = DeliveryAck::new();
-        let r: Result<(), String> = TxAudioCommand::Flush {
+        let r: Result<Option<(u64, PlaybackStartAck)>, String> = TxAudioCommand::Flush {
             sample_rate: 12_000,
             ack,
         }
-        .apply(|_, _, _| Ok(false));
+        .apply(|_, _, _| Ok((false, None)));
         assert!(r.is_ok());
         assert_eq!(
             waiter.wait_for(Duration::from_millis(10)).await,
@@ -918,7 +1022,7 @@ mod pan135_tx_audio_command_tests {
     #[tokio::test]
     async fn flush_settles_not_applied_when_queue_output_errs() {
         let (ack, mut waiter) = DeliveryAck::new();
-        let r: Result<(), String> = TxAudioCommand::Flush {
+        let r: Result<Option<(u64, PlaybackStartAck)>, String> = TxAudioCommand::Flush {
             sample_rate: 12_000,
             ack,
         }

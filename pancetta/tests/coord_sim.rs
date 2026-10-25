@@ -836,6 +836,7 @@ impl CoordSim {
                     samples: vec![0.0f32; 16],
                     sample_rate: 12_000,
                     flush_first: false,
+                    playback_started: None,
                 },
                 Instant::now(),
             ))

@@ -25,6 +25,17 @@ pub const MAX_AUDIO_BUFFER_SIZE: usize = 65536; // Hard limit to prevent excessi
 /// with ~3 seconds of cushion above the 12.64s TX duration.
 pub const OUTPUT_AUDIO_BUFFER_SIZE: usize = 786_432; // ~16s at 48kHz mono
 
+/// Whether the first sample at a queued output mark has been removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputMarkState {
+    /// The callback has not reached the sample yet.
+    Waiting,
+    /// A pop consumed the sample for playback.
+    Played,
+    /// A flush discarded the sample before playback.
+    Discarded,
+}
+
 /// Shared atomic state accessible from both producer and consumer sides.
 #[derive(Clone)]
 pub struct AudioCommShared {
@@ -50,6 +61,12 @@ pub struct AudioCommShared {
     /// whether the output device is still pulling samples. A liveness counter,
     /// not a sample count.
     output_callbacks: Arc<Atomic<u64>>,
+    /// One-based first sample of the tracked buffer; written by the producer.
+    play_mark: Arc<Atomic<u64>>,
+    /// Last mark crossed by a pop; written only by the consumer.
+    play_mark_started: Arc<Atomic<u64>>,
+    /// Cumulative samples popped or cleared; written only by the consumer.
+    retired_samples: Arc<Atomic<u64>>,
 }
 
 impl AudioCommShared {
@@ -62,6 +79,25 @@ impl AudioCommShared {
             flush_requested: Arc::new(Atomic::new(0)),
             flush_completed: Arc::new(Atomic::new(0)),
             output_callbacks: Arc::new(Atomic::new(0)),
+            play_mark: Arc::new(Atomic::new(0)),
+            play_mark_started: Arc::new(Atomic::new(0)),
+            retired_samples: Arc::new(Atomic::new(0)),
+        }
+    }
+
+    /// Arm before pushing the buffer. Only one mark is tracked at a time.
+    pub fn arm_play_mark(&self, mark: u64) {
+        self.play_mark.store(mark, Ordering::Release);
+    }
+
+    /// Load the retirement publication before its associated start flag.
+    pub fn play_mark_state(&self, mark: u64) -> OutputMarkState {
+        if self.retired_samples.load(Ordering::Acquire) < mark {
+            OutputMarkState::Waiting
+        } else if self.play_mark_started.load(Ordering::Acquire) == mark {
+            OutputMarkState::Played
+        } else {
+            OutputMarkState::Discarded
         }
     }
 
@@ -155,6 +191,7 @@ impl AudioCommShared {
 ///
 /// Owned by the real-time audio callback thread. All operations are lock-free.
 pub struct AudioProducer {
+    pushed: u64,
     /// Lock-free producer for raw f32 audio samples
     audio_producer: <HeapRb<f32> as Split>::Prod,
     /// Lock-free producer for latency measurements
@@ -170,6 +207,7 @@ impl AudioProducer {
     /// are counted as dropped.
     pub fn push_audio_slice(&mut self, data: &[f32]) -> usize {
         let written = self.audio_producer.push_slice(data);
+        self.pushed += written as u64;
         let dropped = data.len() - written;
         if dropped > 0 {
             self.shared
@@ -180,6 +218,16 @@ impl AudioProducer {
             .processed_samples
             .fetch_add(written as u64, Ordering::Relaxed);
         written
+    }
+
+    /// Cumulative samples actually written, including samples later flushed.
+    pub fn pushed_total(&self) -> u64 {
+        self.pushed
+    }
+
+    /// Space available for the producer's next write.
+    pub fn vacant_len(&self) -> usize {
+        self.audio_producer.vacant_len()
     }
 
     /// Try to push a latency measurement (lock-free, non-blocking)
@@ -199,6 +247,7 @@ impl AudioProducer {
 ///
 /// Owned by the processing thread. All operations are lock-free.
 pub struct AudioConsumer {
+    retired: u64,
     /// Lock-free consumer for raw f32 audio samples
     audio_consumer: <HeapRb<f32> as Split>::Cons,
     /// Lock-free consumer for latency measurements
@@ -212,7 +261,25 @@ impl AudioConsumer {
     ///
     /// Returns the number of samples actually read.
     pub fn pop_audio_slice(&mut self, buf: &mut [f32]) -> usize {
-        self.audio_consumer.pop_slice(buf)
+        let read = self.audio_consumer.pop_slice(buf);
+        self.retire(read, true);
+        read
+    }
+
+    fn retire(&mut self, removed: usize, played: bool) {
+        if removed == 0 {
+            return;
+        }
+        let before = self.retired;
+        self.retired += removed as u64;
+        // A removed sample was published after its producer armed the mark.
+        let mark = self.shared.play_mark.load(Ordering::Acquire);
+        if played && mark > before && mark <= self.retired {
+            self.shared.play_mark_started.store(mark, Ordering::Release);
+        }
+        self.shared
+            .retired_samples
+            .store(self.retired, Ordering::Release);
     }
 
     /// If a flush was requested since the last check, discard all currently
@@ -224,7 +291,8 @@ impl AudioConsumer {
         let requested = self.shared.flush_requested.load(Ordering::Acquire);
         let completed = self.shared.flush_completed.load(Ordering::Acquire);
         if requested != completed {
-            self.audio_consumer.clear();
+            let cleared = self.audio_consumer.clear();
+            self.retire(cleared, false);
             self.shared
                 .flush_completed
                 .store(requested, Ordering::Release);
@@ -290,12 +358,14 @@ pub fn audio_comm_pair(
     let shared = AudioCommShared::new();
 
     let producer = AudioProducer {
+        pushed: 0,
         audio_producer: audio_prod,
         latency_producer: latency_prod,
         shared: shared.clone(),
     };
 
     let consumer = AudioConsumer {
+        retired: 0,
         audio_consumer: audio_cons,
         latency_consumer: latency_cons,
         shared,
@@ -346,6 +416,68 @@ impl BufferStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn play_mark_is_played_once_a_pop_takes_its_first_sample() {
+        let (mut p, mut c) = audio_comm_pair(64, 8);
+        assert_eq!(p.push_audio_slice(&[0.1; 3]), 3);
+        let mark = p.pushed_total() + 1;
+        p.shared.arm_play_mark(mark);
+        assert_eq!(p.push_audio_slice(&[0.9; 5]), 5);
+        assert_eq!(p.shared.play_mark_state(mark), OutputMarkState::Waiting);
+        let mut buf = [0.0; 2];
+        c.pop_audio_slice(&mut buf);
+        assert_eq!(p.shared.play_mark_state(mark), OutputMarkState::Waiting);
+        c.pop_audio_slice(&mut buf);
+        assert_eq!(p.shared.play_mark_state(mark), OutputMarkState::Played);
+        p.shared.request_flush();
+        c.drain_pending_flush();
+        assert_eq!(p.shared.play_mark_state(mark), OutputMarkState::Played);
+    }
+
+    #[test]
+    fn a_flush_that_clears_the_marked_sample_reports_discarded() {
+        let (mut p, mut c) = audio_comm_pair(64, 8);
+        p.shared.arm_play_mark(1);
+        p.push_audio_slice(&[0.9; 5]);
+        p.shared.request_flush();
+        c.drain_pending_flush();
+        assert_eq!(p.shared.play_mark_state(1), OutputMarkState::Discarded);
+    }
+
+    #[test]
+    fn a_late_flush_discards_a_buffer_pushed_after_the_flush_request() {
+        let (mut p, mut c) = audio_comm_pair(64, 8);
+        p.shared.request_flush();
+        p.shared.arm_play_mark(1);
+        p.push_audio_slice(&[0.9; 5]);
+        c.drain_pending_flush();
+        c.pop_audio_slice(&mut [0.0; 5]);
+        assert_eq!(p.shared.play_mark_state(1), OutputMarkState::Discarded);
+    }
+
+    #[test]
+    fn pops_on_an_unmarked_ring_never_report_a_start() {
+        let (mut p, mut c) = audio_comm_pair(64, 8);
+        p.push_audio_slice(&[0.9; 5]);
+        c.pop_audio_slice(&mut [0.0; 5]);
+        assert_eq!(p.shared.play_mark_started.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn producer_and_consumer_positions_agree_across_pushes_pops_and_clears() {
+        let (mut p, mut c) = audio_comm_pair(8, 8);
+        for _ in 0..10 {
+            assert_eq!(p.push_audio_slice(&[0.5; 10]), 8);
+            c.pop_audio_slice(&mut [0.0; 3]);
+            p.shared.request_flush();
+            c.drain_pending_flush();
+            assert_eq!(
+                p.pushed_total(),
+                p.shared.retired_samples.load(Ordering::Acquire)
+            );
+        }
+    }
 
     #[test]
     fn output_callback_count_starts_at_zero_and_counts_each_record() {

@@ -41,7 +41,8 @@ const LOG_TARGET: &str = "pancetta::tx_log";
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct TxFrameRecord {
     pub(crate) v: u8,
-    /// When the frame's audio was handed to the audio output — the same
+    /// The audio thread's playback-start observation, or the enqueue instant
+    /// when unconfirmed after 100 ms or not played (PAN-71). Always the same
     /// instant as the TUI's `TxFrameLogged.timestamp`.
     pub(crate) utc: chrono::DateTime<chrono::Utc>,
     /// `"FT8"`, `"FT4"` or `"FT2"`.

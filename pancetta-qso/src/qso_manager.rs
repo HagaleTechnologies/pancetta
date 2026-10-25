@@ -928,7 +928,8 @@ pub enum OffsetAction {
 /// - the known-good crediting site in `process_message_for_qso` (round 6,
 ///   finding 2) needs to know whether anything actually indicted the offset we
 ///   left. A stall switch happens BECAUSE the old offset stopped working; an
-///   operator nudge implies nothing about it. See
+///   operator nudge implies nothing about it — since PAN-83 only as the
+///   fallback when no aired frame answers it. See
 ///   [`crate::states::PreSwitchOffset::operator_forced`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OffsetRelocationOrigin {
@@ -1364,6 +1365,53 @@ struct KeepCallLedger {
     stall_action_revoked: bool,
     // PAN-182: see `PendingStallTrigger`.
     pending_stall_trigger: Option<PendingStallTrigger>,
+    // PAN-83: the most recently reported aired frame for this QSO, in report
+    // order — airing order, since the TX worker reports as frames play out and
+    // `DurableInbox` yields in send order. Frame history, not stall evidence:
+    // no stall reset clears it, and `answered_frame_offset_hz` reads it.
+    last_aired: Option<AiredFrame>,
+}
+
+// PAN-83: a frame the TX worker reported aired for a QSO — where it went out
+// and when its playback finished (`TxFrameSent::aired_at`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AiredFrame {
+    offset_hz: f64,
+    aired_at: DateTime<Utc>,
+}
+
+/// PAN-83: the TX offset of the frame a reply answered, when the aired
+/// reports pin it down.
+///
+/// A QSO alternates slots, so a reply the DX sent in slot R answers what it
+/// decoded from us in slot R-1. `reply_parity` is the decoded frame's own slot
+/// parity; R is the latest slot of that parity starting at or before
+/// `received_at`, which holds whether the decode was processed inside R or
+/// just after it. The newest aired frame is the answered one only if it
+/// finished airing in `[R - slot, R + slot)`: not before R-1 began (an older
+/// frame), and not after R+1 began (our next frame, which cannot finish before
+/// R+1 + ~12.6 s; a late-started R-1 frame can finish just after R begins).
+/// `None` when there is no parity, no record, or no frame in that window —
+/// the R-1 frame never aired or its report has not arrived — and the caller
+/// falls back to the relocation's provenance.
+fn answered_frame_offset_hz(
+    last_aired: Option<AiredFrame>,
+    received_at: DateTime<Utc>,
+    reply_parity: Option<pancetta_core::slot::SlotParity>,
+    slot_ns: i64,
+) -> Option<f64> {
+    let reply_parity = reply_parity?;
+    let frame = last_aired?;
+    let slot = Duration::nanoseconds(slot_ns);
+    let cur = pancetta_core::slot::current_slot_start_with_period(received_at, slot_ns);
+    let reply_slot =
+        if pancetta_core::slot::SlotParity::of_with_period(cur, slot_ns) == reply_parity {
+            cur
+        } else {
+            cur - slot
+        };
+    (frame.aired_at >= reply_slot - slot && frame.aired_at < reply_slot + slot)
+        .then_some(frame.offset_hz)
 }
 
 /// Whether a failed TX could be matched to a recent, active keep-call emission.
@@ -4413,8 +4461,10 @@ impl QsoManager {
     /// waiting on — same text, same offset and remote binding (see
     /// [`UnsentAttemptPayload`]), reported no earlier than the start of the
     /// own-parity TX slot the trigger feeds — release the hold so the next
-    /// drain can commit the action. Returns whether a hold was released; any
-    /// other frame leaves the ledger untouched.
+    /// drain can commit the action. Every aired frame of an active QSO is
+    /// also recorded as its newest aired frame (PAN-83), which the known-good
+    /// crediting in `process_message_for_qso` reads. Returns whether a hold
+    /// was released.
     pub async fn confirm_stall_trigger_aired(
         &self,
         qso_id: QsoId,
@@ -4430,9 +4480,14 @@ impl QsoManager {
             .keep_call_ledger
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let Some(entry) = ledger.get_mut(&qso_id) else {
-            return false;
-        };
+        // PAN-83: record every aired frame of an active QSO, hold or no hold
+        // — arrival order is airing order, so the newest report is the frame
+        // the DX's next reply, if any, answered.
+        let entry = ledger.entry(qso_id).or_default();
+        entry.last_aired = Some(AiredFrame {
+            offset_hz: aired.frequency_hz,
+            aired_at,
+        });
         if !entry
             .pending_stall_trigger
             .as_ref()
@@ -4451,6 +4506,17 @@ impl QsoManager {
             .unwrap_or_else(|e| e.into_inner())
             .get(&qso_id)
             .map_or(0, |entry| entry.attempts.len())
+    }
+
+    /// PAN-83: the QSO's most recently reported aired frame, if any — what
+    /// `answered_frame_offset_hz` reads at crediting time.
+    #[cfg(test)]
+    fn last_aired_frame(&self, qso_id: QsoId) -> Option<AiredFrame> {
+        self.keep_call_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&qso_id)
+            .and_then(|entry| entry.last_aired)
     }
 
     /// Oldest first: each surviving ledger attempt's id and whether it holds
@@ -5289,15 +5355,22 @@ impl QsoManager {
         // Detect a manual state regression: the DX sent an EARLIER-stage
         // message and `determine_state_transition` either backed us up the
         // ladder (rank decreased) or kept us in SendingReport on a repeated
-        // report. When the regression queues a re-send (`reply_to_emit`), used
+        // report that was already latched. First acquisition (None -> Some)
+        // is forward progress and keeps the watchdog reprieve (PAN-84).
+        // When the regression queues a re-send (`reply_to_emit`), used
         // to (a) count that re-send against the manual watchdog cap and (b)
         // gate the per-slot rearm so it does not double-send in the same slot;
         // a repeated report in SendingReport queues none, so neither applies
         // (PAN-129). Every regression cancels the C3 reprieve.
         let is_manual_regression = qso_initiated_by == CallInitiation::Manual
             && (Self::ladder_rank(&new_state) < Self::ladder_rank(&old_state)
-                || (matches!(old_state, QsoState::SendingReport { .. })
-                    && matches!(new_state, QsoState::SendingReport { .. })
+                || (matches!(
+                    old_state,
+                    QsoState::SendingReport {
+                        their_report: Some(_),
+                        ..
+                    }
+                ) && matches!(new_state, QsoState::SendingReport { .. })
                     && matches!(message.message_type, MessageType::SignalReport { .. })));
 
         let mut reply_to_emit: Option<MessageType> = None;
@@ -5621,6 +5694,29 @@ impl QsoManager {
                 //   Crediting the vacated one there would aim a later `Revert`
                 //   straight back at the offset the operator just escaped.
                 //
+                // PAN-83: provenance is a prior, not evidence — it says why we
+                // moved, never which of our transmitted frames the reply
+                // answered. On a split the aired-frame record now answers
+                // exactly that: the TX worker reports every frame that played
+                // out and the offset it aired on
+                // (`confirm_stall_trigger_aired`), and the reply answers the
+                // frame of ours that aired in the slot just before its own
+                // (`answered_frame_offset_hz`). Three outcomes follow: a
+                // relocation committed AFTER that frame aired (the ordinary
+                // `u`-nudge timing — the keypress queues while our frame is
+                // keyed and commits at the next drain) credits the vacated
+                // offset; a frame that aired on the new offset before the
+                // reply credits the new offset; and across chained
+                // relocations the credit is the offset the answered frame
+                // actually aired on, whatever the chain did before or after.
+                // When no aired frame pins the answer down — no report in the
+                // reply's window, no decoded slot parity — the round-6
+                // provenance rule above decides, unchanged. The Tx=Rx branch
+                // below keeps the decode-frequency rule: a station answering
+                // our CQ transmits where it clicked us, so its decode
+                // frequency already names the frame it answered, whatever the
+                // aired record says.
+                //
                 // Consumed here either way: the first advance after a switch is
                 // the one that resolves the ambiguity, and everything after it
                 // is unambiguously about the current offset.
@@ -5634,7 +5730,7 @@ impl QsoManager {
                     None => current_hz,
                     Some(pre) => {
                         let tx_equals_rx = progress.metadata.partner_freq.is_none();
-                        if tx_equals_rx {
+                        let (credited_hz, evidence) = if tx_equals_rx {
                             // The decode frequency IS evidence here: it is the
                             // same number as our own TX offset.
                             if (pre.offset_hz - message.frequency).abs() <= rx_tolerance_hz {
@@ -5665,15 +5761,38 @@ impl QsoManager {
                                 if progress.metadata.partner_freq.is_none() {
                                     progress.metadata.partner_freq = Some(pre.offset_hz);
                                 }
-                                pre.offset_hz
+                                (pre.offset_hz, "reply frequency")
                             } else {
-                                current_hz
+                                (current_hz, "reply frequency")
                             }
+                        } else if let Some(answered_hz) = answered_frame_offset_hz(
+                            self.keep_call_ledger
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .get(&qso_id)
+                                .and_then(|entry| entry.last_aired),
+                            message.timestamp,
+                            observed_slot_parity,
+                            self.active_slot_ns.load(Ordering::Relaxed),
+                        ) {
+                            (answered_hz, "aired frame")
                         } else if pre.operator_forced {
-                            current_hz
+                            (current_hz, "operator nudge")
                         } else {
-                            pre.offset_hz
-                        }
+                            (pre.offset_hz, "stall switch")
+                        };
+                        // PAN-83: one line per grace-window credit, on the
+                        // target the on-air `u`-nudge drill reads (the same
+                        // `tx.freq` target as the commit line in
+                        // `apply_tx_offset_switch`). The evidence label names
+                        // which rule decided.
+                        info!(
+                            target: "tx.freq",
+                            qso_id = %qso_id,
+                            "Adaptive TX-offset credit: {:.0} Hz known-good after leaving {:.0} Hz (evidence: {})",
+                            credited_hz, pre.offset_hz, evidence
+                        );
+                        credited_hz
                     }
                 });
                 progress.metadata.pre_switch_offset = None;
@@ -22289,6 +22408,470 @@ mod pan72_stall_detection_tests {
         );
     }
 
+    /// PAN-83: the slot parity of a reply processed now, and an `aired_at`
+    /// in our slot just before it. A reply in slot R answers the frame that
+    /// aired in R-1; reporting it 2 s before "now" lands inside
+    /// `answered_frame_offset_hz`'s window for any test that finishes within
+    /// one slot.
+    fn reply_window_now() -> (pancetta_core::slot::SlotParity, DateTime<Utc>) {
+        let now = Utc::now();
+        (
+            pancetta_core::slot::SlotParity::of_with_period(now, DEFAULT_SLOT_NS),
+            now - Duration::seconds(2),
+        )
+    }
+
+    /// What the TX worker's `TxFrameSent` does for a frame of this QSO.
+    async fn report_aired(
+        manager: &QsoManager,
+        qso_id: QsoId,
+        frequency_hz: f64,
+        aired_at: DateTime<Utc>,
+    ) {
+        manager
+            .confirm_stall_trigger_aired(
+                qso_id,
+                "aired",
+                &UnsentAttemptPayload {
+                    frequency_hz,
+                    remote_binding: Some((false, None)),
+                },
+                aired_at,
+            )
+            .await;
+    }
+
+    /// `send_report`, carrying the decoded slot parity production tags.
+    async fn send_report_in(
+        manager: &QsoManager,
+        parity: pancetta_core::slot::SlotParity,
+        from_hz: f64,
+    ) {
+        manager
+            .process_message_with_parity(
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                format!("{OUR} {DX} -07"),
+                from_hz,
+                Some(-15.0),
+                Some(parity),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// PAN-83: the ticket's split-QSO case. Our frame aired on the old
+    /// offset, the operator's `u` nudge then committed (a nudge pressed while
+    /// our frame is keyed is enqueued at keypress and committed at the next
+    /// once-per-slot drain — the start of the DX's slot), and the DX's reply
+    /// in the following slot answered the frame that aired before the move.
+    /// Nothing has transmitted on the nudged offset yet, so the aired frame —
+    /// not the nudge's provenance — names the offset the DX actually heard.
+    #[tokio::test]
+    async fn a_nudge_committed_after_the_old_offset_aired_credits_the_old_offset() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let (parity, aired_at) = reply_window_now();
+        report_aired(&manager, qso_id, FREQ, aired_at).await;
+
+        let nudged = FREQ + 400.0;
+        assert_eq!(
+            manager
+                .apply_tx_offset_switch(qso_id, nudged, OffsetRelocationOrigin::OperatorForced)
+                .await
+                .unwrap(),
+            nudged
+        );
+
+        send_report_in(&manager, parity, FREQ).await;
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.frequency, nudged,
+            "precondition: the QSO is on the nudged offset"
+        );
+        assert_eq!(
+            after.metadata.last_known_good_offset_hz,
+            Some(FREQ),
+            "the DX's reply answered the frame that aired at {FREQ} Hz — \
+             crediting the never-keyed {nudged} Hz (provenance's answer) would \
+             poison the next stall decision"
+        );
+        assert_eq!(
+            after.metadata.pre_switch_offset, None,
+            "the first advance after a relocation consumes the grace either way"
+        );
+        assert_eq!(
+            after.metadata.partner_freq,
+            Some(FREQ),
+            "the switch's established-QSO latch stands"
+        );
+    }
+
+    /// PAN-83: the same nudge timing on a split that predates the switch
+    /// (Hound, an `o` hold, a de-conflict nudge). The DX transmits at
+    /// `partner_freq`, so the reply's decode frequency still cannot name our
+    /// answered frame — but the aired-frame record can, and it says the old
+    /// offset.
+    #[tokio::test]
+    async fn a_nudge_on_a_pre_existing_split_after_the_old_offset_aired_credits_the_old_offset() {
+        const DX_FREQ: f64 = 2400.0;
+
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_with(
+                DX.into(),
+                FREQ,
+                None,
+                CallInitiation::Manual,
+                Some(DX_FREQ),
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        let (parity, aired_at) = reply_window_now();
+        report_aired(&manager, qso_id, FREQ, aired_at).await;
+
+        let nudged = FREQ + 400.0;
+        assert_eq!(
+            manager
+                .apply_tx_offset_switch(qso_id, nudged, OffsetRelocationOrigin::OperatorForced)
+                .await
+                .unwrap(),
+            nudged
+        );
+
+        send_report_in(&manager, parity, DX_FREQ).await;
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.frequency, nudged,
+            "precondition: the advance routed and the QSO is on the nudged offset"
+        );
+        assert_eq!(
+            after.metadata.last_known_good_offset_hz,
+            Some(FREQ),
+            "the reply answered our {FREQ} Hz frame; {nudged} Hz has never \
+             been keyed, provenance notwithstanding"
+        );
+        assert_eq!(
+            after.metadata.partner_freq,
+            Some(DX_FREQ),
+            "the pre-existing split survives the crediting"
+        );
+    }
+
+    /// PAN-83: two relocations in consecutive drains with no frame between
+    /// them. The vacated-offset bookkeeping only remembers the most recent
+    /// move (2300 vacated 1900), so provenance has no offset that ever aired
+    /// to reason about — but the aired-frame record still points at the only
+    /// offset any frame went out on.
+    #[tokio::test]
+    async fn two_nudges_with_no_frame_between_credit_the_offset_that_aired() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let (parity, aired_at) = reply_window_now();
+        report_aired(&manager, qso_id, FREQ, aired_at).await;
+
+        for hz in [1900.0, 2300.0] {
+            manager
+                .apply_tx_offset_switch(qso_id, hz, OffsetRelocationOrigin::OperatorForced)
+                .await
+                .unwrap();
+        }
+
+        send_report_in(&manager, parity, FREQ).await;
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.frequency, 2300.0,
+            "precondition: the QSO is on the twice-nudged offset"
+        );
+        assert_eq!(
+            after.metadata.last_known_good_offset_hz,
+            Some(FREQ),
+            "only {FREQ} Hz ever aired — the record answers regardless of how \
+             many relocations stack up in between"
+        );
+    }
+
+    /// PAN-83: the end-to-end harm the ticket's design pass exists to close.
+    /// After a nudge whose reply answered the old-offset frame, the old
+    /// offset is the one the DX demonstrably heard, so a later stall on the
+    /// new offset must `Revert` back to it — the operator's choice stands
+    /// until the new offset itself stalls (Decision 11's narrow departure
+    /// from PAN-132).
+    #[tokio::test]
+    async fn a_stall_after_a_nudge_whose_reply_answered_the_old_offset_reverts_to_it() {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        let manager = manager_auto(config);
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let (parity, aired_at) = reply_window_now();
+        report_aired(&manager, qso_id, FREQ, aired_at).await;
+        let nudged = FREQ + 400.0;
+        manager
+            .apply_tx_offset_switch(qso_id, nudged, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .unwrap();
+        send_report_in(&manager, parity, FREQ).await;
+        let entered_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        let _ = drain(&mut rx);
+
+        // Two silent rearms, two slots apart, so each feeds a distinct
+        // own-parity TX slot (PAN-128) and the second trips the threshold.
+        manager
+            .rearm_manual_calls_at(entered_at + Duration::seconds(15))
+            .await;
+        manager
+            .rearm_manual_calls_at(entered_at + Duration::seconds(45))
+            .await;
+        let action = drain(&mut rx).into_iter().find_map(|e| match e {
+            QsoEvent::TxOffsetActionNeeded { action, .. } => Some(action),
+            _ => None,
+        });
+        assert_eq!(
+            action,
+            Some(OffsetAction::Revert { target_hz: FREQ }),
+            "the DX answered our {FREQ} Hz frame after the nudge, so {FREQ} Hz \
+             is the known-good offset a stall on {nudged} Hz returns to — not a \
+             fresh blind Switch away from the offset the DX heard"
+        );
+    }
+
+    /// PAN-83: characterization. When a frame DID air on the new offset
+    /// before the reply, the record says so and the new offset is credited —
+    /// PAN-132's outcome for this timing is unchanged.
+    #[tokio::test]
+    async fn a_nudge_whose_new_offset_aired_before_the_reply_credits_the_new_offset() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let (parity, aired_at) = reply_window_now();
+        report_aired(&manager, qso_id, FREQ, aired_at - Duration::seconds(30)).await;
+        let nudged = FREQ + 400.0;
+        manager
+            .apply_tx_offset_switch(qso_id, nudged, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .unwrap();
+        report_aired(&manager, qso_id, nudged, aired_at).await;
+
+        send_report_in(&manager, parity, FREQ).await;
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.last_known_good_offset_hz,
+            Some(nudged),
+            "a frame aired at {nudged} Hz before the reply — the record names \
+             it, and the credit follows"
+        );
+    }
+
+    /// PAN-83: characterization of the chained-relocation case (PROBE2), and
+    /// Decision 2. The second, stall-triggered relocation was held by PAN-182
+    /// until its trigger frame aired at 1900 Hz; the reply inside the grace
+    /// window answers THAT frame, so 1900 Hz is credited — not the first
+    /// offset of the chain (1500), whose last frame aired three or more own
+    /// slots before the reply. Frame provenance never looks at the chain,
+    /// only at the frame that aired.
+    #[tokio::test]
+    async fn a_chained_stall_relocation_credits_the_offset_its_trigger_aired_on() {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        let manager = manager_auto(config);
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        // Nudge off FREQ first: 1500 -> 1900.
+        manager
+            .apply_tx_offset_switch(qso_id, 1900.0, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .unwrap();
+
+        // Two silent rearm cycles trip the stall on 1900; the second holds
+        // the action on its own trigger frame (PAN-182).
+        manager
+            .rearm_manual_calls_at(opened_at + Duration::seconds(15))
+            .await;
+        manager
+            .rearm_manual_calls_at(opened_at + Duration::seconds(45))
+            .await;
+        confirm_last_frame_aired(&manager, qso_id, 1900.0).await;
+
+        // The drain commits the stall relocation: 1900 -> 2300.
+        manager
+            .apply_tx_offset_switch(qso_id, 2300.0, stall_origin(&manager, qso_id).await)
+            .await
+            .unwrap();
+
+        // The wall-clock record of that same trigger frame (the PAN-182 hold
+        // released on the simulated rearm clock), placed in our slot just
+        // before the reply's — what the live TX worker's report would carry.
+        let (parity, aired_at) = reply_window_now();
+        report_aired(&manager, qso_id, 1900.0, aired_at).await;
+        send_report_in(&manager, parity, FREQ).await;
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.last_known_good_offset_hz,
+            Some(1900.0),
+            "the reply answered the trigger frame that aired at 1900 Hz — not \
+             the chain's first offset ({FREQ} Hz) and not the never-keyed \
+             2300 Hz"
+        );
+    }
+
+    /// PAN-83: characterization. A record outside the reply's window (the
+    /// frame aired two of our slots or more before the reply) pins nothing,
+    /// and the existing provenance rule decides — here, an operator nudge
+    /// credits where it moved us.
+    #[tokio::test]
+    async fn an_aired_frame_outside_the_reply_window_falls_back_to_provenance() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        report_aired(&manager, qso_id, FREQ, Utc::now() - Duration::seconds(32)).await;
+        let nudged = FREQ + 400.0;
+        manager
+            .apply_tx_offset_switch(qso_id, nudged, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .unwrap();
+        let (parity, _) = reply_window_now();
+        send_report_in(&manager, parity, FREQ).await;
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.last_known_good_offset_hz,
+            Some(nudged),
+            "the only record is outside the reply's window, so the operator-\
+             nudge fallback applies exactly as before PAN-83"
+        );
+    }
+
+    /// PAN-83: characterization. A decode without a slot parity (no
+    /// `observed_slot_parity`) cannot anchor the reply slot, so the record
+    /// pins nothing and provenance decides — unchanged behaviour for every
+    /// caller that goes through `process_message`.
+    #[tokio::test]
+    async fn a_reply_without_a_slot_parity_falls_back_to_provenance() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let (_, aired_at) = reply_window_now();
+        report_aired(&manager, qso_id, FREQ, aired_at).await;
+        let nudged = FREQ + 400.0;
+        manager
+            .apply_tx_offset_switch(qso_id, nudged, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .unwrap();
+        send_report(&manager, -7, &format!("{OUR} {DX} -07")).await;
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.last_known_good_offset_hz,
+            Some(nudged),
+            "no decoded slot parity means no anchored reply slot — the \
+             operator-nudge fallback applies exactly as before PAN-83"
+        );
+    }
+
+    /// PAN-83: characterization (Decision 3). The Tx=Rx branch keeps the
+    /// decode-frequency rule and its `partner_freq` latch whatever the aired
+    /// record says: a station answering our CQ transmits where it clicked
+    /// us, so its decode frequency already names the frame it answered. This
+    /// branch is reachable only after a relocation on an unanswered
+    /// `CallingCq`.
+    #[tokio::test]
+    async fn an_unanswered_cq_still_credits_by_reply_frequency_whatever_aired() {
+        const CALLER: &str = "W9XYZ";
+
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .start_cq_manual(FREQ, None, false, None)
+            .await
+            .unwrap();
+        let nudged = FREQ + 400.0;
+        manager
+            .apply_tx_offset_switch(qso_id, nudged, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .unwrap();
+        let (parity, aired_at) = reply_window_now();
+        // The record points at the NEW offset — the Tx=Rx branch must not
+        // consult it.
+        report_aired(&manager, qso_id, nudged, aired_at).await;
+
+        // The caller heard our PRE-switch CQ and answers on the offset that
+        // CQ actually went out on, carrying a real decoded slot parity.
+        manager
+            .process_message_with_parity(
+                MessageType::CqResponse {
+                    calling_station: OUR.into(),
+                    responding_station: CALLER.into(),
+                    grid: Some("FN31".into()),
+                },
+                format!("{OUR} {CALLER} FN31"),
+                FREQ,
+                Some(-12.0),
+                Some(parity),
+            )
+            .await
+            .unwrap();
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.state.their_callsign(),
+            Some(CALLER),
+            "precondition: the pre-switch answer establishes the QSO"
+        );
+        assert_eq!(
+            after.metadata.last_known_good_offset_hz,
+            Some(FREQ),
+            "the caller answered at {FREQ} Hz (the vacated offset) — the \
+             decode frequency is the evidence on a Tx=Rx QSO, whatever the \
+             aired record says"
+        );
+        assert_eq!(
+            after.metadata.partner_freq,
+            Some(FREQ),
+            "the round-12 latch still latches the caller's frequency"
+        );
+    }
+
     /// PAN-72 (Codex round 6 on PR #350, finding 1): `SendingReport` is two
     /// rungs, not one. `RespondingToCq + CqResponse` (the DX returned our call
     /// with no report) lands in `SendingReport { their_report: None }`; the
@@ -22337,7 +22920,6 @@ mod pan72_stall_detection_tests {
             "precondition: the DX answered without a report, got {:?}",
             opened.state
         );
-        let generation_before_stall = opened.metadata.advance_generation;
         let answered_at = opened.metadata.last_call_at.unwrap();
 
         // A silent slot: we re-send our report, the DX says nothing. Partial
@@ -22350,6 +22932,17 @@ mod pan72_stall_detection_tests {
             1,
             "precondition: one silent slot builds a partial stall streak"
         );
+
+        let (calls_before, generation_before) = {
+            let mut qsos = manager.qsos.write().await;
+            let progress = qsos.get_mut(&qso_id).unwrap();
+            // Exclude the reprieve inherited from the report-free answer.
+            progress.metadata.progressed_this_cycle = false;
+            (
+                progress.metadata.call_count,
+                progress.metadata.advance_generation,
+            )
+        };
 
         // ...and NOW the DX's report lands. This is the exchange's single most
         // load-bearing advance: our outbound becomes an R-report.
@@ -22372,12 +22965,94 @@ mod pan72_stall_detection_tests {
             "the DX's first report is forward progress — the partial stall \
              streak must reset, not carry into the established exchange"
         );
+        assert_eq!(
+            after.metadata.advance_generation,
+            generation_before + 1,
+            "the first report must advance the generation exactly once"
+        );
+        assert_eq!(
+            after.metadata.call_count, calls_before,
+            "the first report queues no reply and must not spend a call"
+        );
         assert!(
-            after.metadata.advance_generation > generation_before_stall,
-            "the None -> Some(_) report rung must bump advance_generation so a \
-             switch queued by an earlier rearm is recognized as stale at commit \
-             time (was {generation_before_stall}, now {})",
-            after.metadata.advance_generation
+            after.metadata.progressed_this_cycle,
+            "PAN-84: the first report must grant the manual watchdog reprieve"
+        );
+    }
+
+    /// PAN-84: first acquisition protects one watchdog pass without extending
+    /// the original deadline. Silence on the next pass still retires the QSO.
+    #[tokio::test]
+    async fn first_dx_report_grants_exactly_one_expired_watchdog_reprieve() {
+        let mut config = test_config();
+        config.timeouts.manual_call_watchdog_minutes = 1;
+        let manager = manager_auto(config);
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::CqResponse {
+                    calling_station: OUR.into(),
+                    responding_station: DX.into(),
+                    grid: Some("FN31".into()),
+                },
+                format!("{OUR} {DX} FN31"),
+                FREQ,
+                Some(-12.0),
+            )
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let first_call_at = now - Duration::minutes(2);
+        {
+            let mut qsos = manager.qsos.write().await;
+            let progress = qsos.get_mut(&qso_id).unwrap();
+            assert!(matches!(
+                progress.state,
+                QsoState::SendingReport {
+                    their_report: None,
+                    ..
+                }
+            ));
+            progress.metadata.first_call_at = Some(first_call_at);
+            progress.metadata.progressed_this_cycle = false;
+        }
+        send_report(&manager, -7, &format!("{OUR} {DX} -07")).await;
+        assert!(matches!(
+            manager.get_qso(qso_id).await.unwrap().state,
+            QsoState::SendingReport {
+                their_report: Some(-7),
+                ..
+            }
+        ));
+        let mut rx = manager.subscribe();
+
+        manager.check_timeouts_at(now).await;
+        let surviving = manager
+            .get_qso(qso_id)
+            .await
+            .expect("PAN-84: the first report must protect one expired watchdog pass");
+        assert!(!surviving.metadata.progressed_this_cycle);
+        assert_eq!(surviving.metadata.first_call_at, Some(first_call_at));
+        assert!(
+            drain(&mut rx).is_empty(),
+            "the reprieve must not emit a timeout"
+        );
+
+        manager.check_timeouts_at(now + Duration::seconds(5)).await;
+        assert!(manager.get_qso(qso_id).await.is_err());
+        assert!(
+            drain(&mut rx).iter().any(|event| matches!(
+                event,
+                QsoEvent::QsoFailed {
+                    qso_id: failed_id,
+                    reason: QsoFailureReason::Timeout,
+                    ..
+                } if *failed_id == qso_id
+            )),
+            "the next pass must retire the QSO with a timeout"
         );
     }
 
@@ -22413,18 +23088,37 @@ mod pan72_stall_detection_tests {
         );
         let generation_before = stalled.metadata.advance_generation;
 
-        // The DX repeats the same report — they never copied our R.
-        send_report(&manager, -7, &format!("{OUR} {DX} -07")).await;
+        // Neither an identical report nor a changed value advances the QSO
+        // after a report has already been latched.
+        for report in [-7, -3] {
+            manager
+                .qsos
+                .write()
+                .await
+                .get_mut(&qso_id)
+                .unwrap()
+                .metadata
+                .progressed_this_cycle = true;
+            send_report(&manager, report, &format!("{OUR} {DX} {report:03}")).await;
 
-        let after = manager.get_qso(qso_id).await.unwrap();
-        assert_eq!(
-            after.metadata.advance_generation, generation_before,
-            "a repeated report is the DX standing still, not an advance"
-        );
-        assert_eq!(
-            after.metadata.stall_cycles, 1,
-            "the stall evidence must survive a repeated report"
-        );
+            let after = manager.get_qso(qso_id).await.unwrap();
+            assert!(matches!(
+                after.state,
+                QsoState::SendingReport { their_report: Some(value), .. } if value == report
+            ));
+            assert_eq!(
+                after.metadata.advance_generation, generation_before,
+                "a repeated report is the DX standing still, not an advance"
+            );
+            assert_eq!(
+                after.metadata.stall_cycles, 1,
+                "the stall evidence must survive a repeated report"
+            );
+            assert!(
+                !after.metadata.progressed_this_cycle,
+                "a subsequent report must cancel the pending watchdog reprieve"
+            );
+        }
     }
 
     // ── PAN-128: one stall count per own-parity TX slot ──────────────────
@@ -24071,6 +24765,310 @@ mod pan72_stall_detection_tests {
             .apply_tx_offset_switch(qso_id, nudged + 300.0, stall_origin(&manager, qso_id).await)
             .await
             .expect("a released stall switch commits");
+    }
+
+    /// PAN-83: every aired frame of an active QSO is recorded, whether or not
+    /// a PAN-182 hold was waiting on it — the crediting block reads the same
+    /// record, and most frames air with no hold pending at all.
+    #[tokio::test]
+    async fn confirm_stall_trigger_aired_records_every_aired_frame_even_without_a_hold() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let aired_at = Utc::now();
+        let released = manager
+            .confirm_stall_trigger_aired(
+                qso_id,
+                "aired",
+                &UnsentAttemptPayload {
+                    frequency_hz: FREQ,
+                    remote_binding: Some((false, None)),
+                },
+                aired_at,
+            )
+            .await;
+        assert!(
+            !released,
+            "precondition: no stall action was raised, so no hold exists to release"
+        );
+        assert_eq!(
+            manager.last_aired_frame(qso_id),
+            Some(AiredFrame {
+                offset_hz: FREQ,
+                aired_at
+            }),
+            "the frame must be recorded as the QSO's newest aired frame even \
+             though it released no hold"
+        );
+    }
+
+    /// PAN-83: the record keeps the most recently REPORTED frame, in arrival
+    /// order — not the one with the newest `aired_at`. The TX worker reports
+    /// as frames play out, so arrival order is airing order; a test (or a
+    /// wall-clock follow-up to a simulated-clock PAN-182 release) may report
+    /// an earlier-stamped frame later, and that later report is the fresher
+    /// knowledge.
+    #[tokio::test]
+    async fn confirm_stall_trigger_aired_keeps_the_most_recently_reported_frame() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let later_aired_at = Utc::now();
+        let earlier_aired_at = later_aired_at - Duration::seconds(10);
+        let payload = UnsentAttemptPayload {
+            frequency_hz: FREQ,
+            remote_binding: Some((false, None)),
+        };
+        manager
+            .confirm_stall_trigger_aired(qso_id, "aired", &payload, later_aired_at)
+            .await;
+        manager
+            .confirm_stall_trigger_aired(qso_id, "aired", &payload, earlier_aired_at)
+            .await;
+        assert_eq!(
+            manager.last_aired_frame(qso_id),
+            Some(AiredFrame {
+                offset_hz: FREQ,
+                aired_at: earlier_aired_at
+            }),
+            "the second report wins by arrival order, whatever its aired_at"
+        );
+    }
+
+    /// PAN-83: the aired-frame record is frame history, not stall evidence —
+    /// a forward advance (which runs `clear_recorded_stall_increments`) must
+    /// not clear it, or the next relocation's crediting would fall back to
+    /// provenance with the evidence it needs already discarded.
+    #[tokio::test]
+    async fn a_forward_advance_keeps_the_aired_frame_record() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let aired_at = Utc::now();
+        manager
+            .confirm_stall_trigger_aired(
+                qso_id,
+                "aired",
+                &UnsentAttemptPayload {
+                    frequency_hz: FREQ,
+                    remote_binding: Some((false, None)),
+                },
+                aired_at,
+            )
+            .await;
+        send_report(&manager, -7, &format!("{OUR} {DX} -07")).await;
+        assert_eq!(
+            manager.last_aired_frame(qso_id),
+            Some(AiredFrame {
+                offset_hz: FREQ,
+                aired_at
+            }),
+            "a forward advance resets stall bookkeeping, not the aired-frame \
+             record"
+        );
+    }
+
+    /// PAN-83: the TX worker's report is only meaningful for an active QSO —
+    /// one that has been cancelled (or otherwise gone terminal) records
+    /// nothing, so a stale in-flight report cannot pin crediting for a QSO
+    /// that no longer exists.
+    #[tokio::test]
+    async fn an_inactive_qso_records_no_aired_frame() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        manager.cancel_qso(qso_id).await.unwrap();
+        manager
+            .confirm_stall_trigger_aired(
+                qso_id,
+                "aired",
+                &UnsentAttemptPayload {
+                    frequency_hz: FREQ,
+                    remote_binding: Some((false, None)),
+                },
+                Utc::now(),
+            )
+            .await;
+        assert_eq!(
+            manager.last_aired_frame(qso_id),
+            None,
+            "a report for an inactive QSO must not be recorded"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pan83_answered_frame_tests {
+    //! PAN-83: `answered_frame_offset_hz` — the pure window that decides
+    //! whether a QSO's newest aired frame is the one a reply answered, using
+    //! fixed, slot-aligned timestamps (2026-10-24 12:00:00 UTC is a slot
+    //! boundary on both the FT8 15 s and the FT4 7.5 s grid).
+    use super::*;
+    use chrono::TimeZone;
+
+    const SLOT_NS: i64 = 15_000_000_000;
+
+    fn slot_aligned_reply_slot() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 10, 24, 12, 0, 0).unwrap()
+    }
+
+    fn aired(offset_hz: f64, aired_at: DateTime<Utc>) -> Option<AiredFrame> {
+        Some(AiredFrame {
+            offset_hz,
+            aired_at,
+        })
+    }
+
+    fn reply_parity(reply_slot: DateTime<Utc>, slot_ns: i64) -> pancetta_core::slot::SlotParity {
+        pancetta_core::slot::SlotParity::of_with_period(reply_slot, slot_ns)
+    }
+
+    #[test]
+    fn answered_frame_is_the_one_aired_in_the_slot_before_the_reply() {
+        let reply_slot = slot_aligned_reply_slot();
+        assert_eq!(
+            answered_frame_offset_hz(
+                aired(1500.0, reply_slot - Duration::seconds(2)),
+                reply_slot + Duration::seconds(13),
+                Some(reply_parity(reply_slot, SLOT_NS)),
+                SLOT_NS
+            ),
+            Some(1500.0),
+            "a frame that finished airing just before the reply's slot began \
+             is the frame the reply answered"
+        );
+    }
+
+    #[test]
+    fn answered_frame_survives_the_decode_being_processed_after_the_reply_slot_ends() {
+        let reply_slot = slot_aligned_reply_slot();
+        assert_eq!(
+            answered_frame_offset_hz(
+                aired(1500.0, reply_slot - Duration::seconds(2)),
+                reply_slot + Duration::seconds(17),
+                Some(reply_parity(reply_slot, SLOT_NS)),
+                SLOT_NS
+            ),
+            Some(1500.0),
+            "a decode processed just after the reply's slot ended still \
+             anchors on that slot, so its answered frame still counts"
+        );
+    }
+
+    #[test]
+    fn a_late_started_frame_that_finishes_inside_the_reply_slot_still_counts() {
+        let reply_slot = slot_aligned_reply_slot();
+        assert_eq!(
+            answered_frame_offset_hz(
+                aired(1500.0, reply_slot + Duration::seconds(1)),
+                reply_slot + Duration::seconds(16),
+                Some(reply_parity(reply_slot, SLOT_NS)),
+                SLOT_NS
+            ),
+            Some(1500.0),
+            "`aired_at` is stamped after playback, so a late-started R-1 \
+             frame can report just after R began — it is still the answered \
+             frame"
+        );
+    }
+
+    #[test]
+    fn a_frame_from_an_earlier_own_slot_does_not_count() {
+        let reply_slot = slot_aligned_reply_slot();
+        assert_eq!(
+            answered_frame_offset_hz(
+                aired(1500.0, reply_slot - Duration::seconds(17)),
+                reply_slot + Duration::seconds(13),
+                Some(reply_parity(reply_slot, SLOT_NS)),
+                SLOT_NS
+            ),
+            None,
+            "a frame from two of our own slots before the reply is too old to \
+             be the answered one"
+        );
+    }
+
+    #[test]
+    fn our_next_frame_after_the_reply_does_not_count() {
+        let reply_slot = slot_aligned_reply_slot();
+        assert_eq!(
+            answered_frame_offset_hz(
+                aired(1500.0, reply_slot + Duration::seconds(28)),
+                reply_slot + Duration::seconds(29),
+                Some(reply_parity(reply_slot, SLOT_NS)),
+                SLOT_NS
+            ),
+            None,
+            "a frame that aired in the slot AFTER the reply answered nothing \
+             the DX could have decoded in time"
+        );
+    }
+
+    #[test]
+    fn no_slot_parity_means_no_answer() {
+        let reply_slot = slot_aligned_reply_slot();
+        assert_eq!(
+            answered_frame_offset_hz(
+                aired(1500.0, reply_slot - Duration::seconds(2)),
+                reply_slot + Duration::seconds(13),
+                None,
+                SLOT_NS
+            ),
+            None,
+            "without the decode's slot parity there is no reply slot R to \
+             anchor the window on — fall back to provenance"
+        );
+    }
+
+    #[test]
+    fn no_aired_record_means_no_answer() {
+        let reply_slot = slot_aligned_reply_slot();
+        assert_eq!(
+            answered_frame_offset_hz(
+                None,
+                reply_slot + Duration::seconds(13),
+                Some(reply_parity(reply_slot, SLOT_NS)),
+                SLOT_NS
+            ),
+            None,
+            "no recorded aired frame pins the answer — fall back to provenance"
+        );
+    }
+
+    #[test]
+    fn the_window_scales_with_the_active_slot_length() {
+        // FT4: 7.5 s slots. 12:00:00 is also on the 7.5 s grid.
+        const FT4_SLOT_NS: i64 = 7_500_000_000;
+        let reply_slot = slot_aligned_reply_slot();
+        let parity = reply_parity(reply_slot, FT4_SLOT_NS);
+        assert_eq!(
+            answered_frame_offset_hz(
+                aired(1500.0, reply_slot - Duration::seconds(1)),
+                reply_slot + Duration::seconds(6),
+                Some(parity),
+                FT4_SLOT_NS
+            ),
+            Some(1500.0),
+            "one FT4 slot before the reply's slot — inside the scaled window"
+        );
+        assert_eq!(
+            answered_frame_offset_hz(
+                aired(1500.0, reply_slot - Duration::seconds(8)),
+                reply_slot + Duration::seconds(6),
+                Some(parity),
+                FT4_SLOT_NS
+            ),
+            None,
+            "more than one FT4 slot before the reply — outside the scaled window"
+        );
     }
 }
 
