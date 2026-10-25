@@ -83,7 +83,7 @@ impl ConfigHotReload {
         let config_path = config_path.as_ref().to_path_buf();
         let (event_tx, event_rx) = broadcast::channel(100);
 
-        if !config_path.parent().is_some_and(Path::is_dir) {
+        if !Self::config_dir(&config_path).is_some_and(Path::is_dir) {
             return Err(anyhow::anyhow!(
                 "Configuration directory does not exist: {}",
                 config_path.display()
@@ -102,6 +102,19 @@ impl ConfigHotReload {
         };
 
         Ok((manager, event_rx))
+    }
+
+    /// The directory holding `config_path`. A bare file name's parent is the
+    /// empty path, which `Path::is_dir` and notify's macOS backend reject: it
+    /// means `.` (PAN-198).
+    fn config_dir(config_path: &Path) -> Option<&Path> {
+        config_path.parent().map(|parent| {
+            if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            }
+        })
     }
 
     /// Start watching for configuration changes
@@ -248,7 +261,7 @@ impl ConfigHotReload {
         }
 
         // Also watch parent directory for file replacements (common with editors)
-        if let Some(parent) = self.config_path.parent() {
+        if let Some(parent) = Self::config_dir(&self.config_path) {
             watcher
                 .watch(parent, RecursiveMode::NonRecursive)
                 .context("Failed to watch parent directory")?;
@@ -597,6 +610,42 @@ enabled = true
                 .station
                 .callsign,
             "TEST1"
+        );
+    }
+
+    /// Restores the process working directory on drop, panic included.
+    struct RestoreCwd(PathBuf);
+
+    impl Drop for RestoreCwd {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    /// PAN-198 (Codex P2 on #436): a bare file name's parent is the empty
+    /// path, so the directory check rejected `pancetta.toml` in the current
+    /// directory. The empty parent now means `.`.
+    #[tokio::test]
+    async fn a_bare_file_name_in_the_current_directory_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        config
+            .save_to_file(dir.path().join("pancetta.toml"))
+            .unwrap();
+
+        let _restore = RestoreCwd(std::env::current_dir().unwrap());
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let (mut manager, _events) = ConfigHotReload::new(config.clone(), "pancetta.toml").unwrap();
+        manager.start_watching().await.unwrap();
+        ConfigHotReload::new_allow_missing(config.clone(), "absent.toml").unwrap();
+        let err = ConfigHotReload::new_allow_missing(config, "no-such-dir/pancetta.toml")
+            .err()
+            .expect("a missing directory is still rejected");
+        assert!(
+            err.to_string()
+                .contains("Configuration directory does not exist"),
+            "{err}"
         );
     }
 
