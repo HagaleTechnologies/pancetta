@@ -854,4 +854,68 @@ mod tests {
             ElapsedGate::Skipped(_)
         ));
     }
+
+    /// PAN-158: a synthetic tier's single-truth records (as `eval` now
+    /// writes them) get a paired recall CI rather than being skipped.
+    #[test]
+    fn bootstrap_section_pairs_synthetic_tier_records() {
+        fn synth_card(recovered: impl Fn(usize) -> u32) -> Scorecard {
+            let mut c = card("host-a", 1, 100.0);
+            let per_wav_records = (0..200)
+                .map(|i| PerWavRecord {
+                    wav_hash: format!("{i:064x}"),
+                    truth: 1,
+                    recovered: recovered(i),
+                    novel: 0,
+                })
+                .collect();
+            c.tiers.insert(
+                "synth-clean".into(),
+                TierResult {
+                    wavs_processed: 200,
+                    per_wav_records,
+                    ..Default::default()
+                },
+            );
+            c
+        }
+        let control = synth_card(|i| u32::from(i % 2 == 0));
+
+        let same = render_bootstrap_section(
+            &control,
+            &synth_card(|i| u32::from(i % 2 == 0)),
+            1000,
+            0xb007,
+        );
+        let rec = same
+            .iter()
+            .find(|l| l.contains("synth-clean") && l.contains("rec Δ="))
+            .unwrap_or_else(|| panic!("synthetic tier was skipped: {same:?}"));
+        assert!(rec.contains("rec Δ=+0 "), "{rec}");
+        assert!(rec.contains("[+0.0, +0.0]"), "{rec}");
+        assert!(rec.contains("NOT significant"), "{rec}");
+
+        // The variant keeps every control hit and adds one in four misses.
+        let better = render_bootstrap_section(
+            &control,
+            &synth_card(|i| u32::from(i % 2 == 0 || i % 8 == 1)),
+            1000,
+            0xb007,
+        );
+        let rec = better
+            .iter()
+            .find(|l| l.contains("synth-clean") && l.contains("rec Δ="))
+            .unwrap_or_else(|| panic!("synthetic tier was skipped: {better:?}"));
+        assert!(rec.contains("rec Δ=+25 "), "{rec}");
+        assert!(rec.contains("— significant"), "{rec}");
+
+        let (a_rec, b_rec, ..) = align_per_wav(
+            &control.tiers["synth-clean"].per_wav_records,
+            &synth_card(|i| u32::from(i % 2 == 0 || i % 8 == 1)).tiers["synth-clean"]
+                .per_wav_records,
+        );
+        let ci = bootstrap_recall_delta(&a_rec, &b_rec, 1000, 0xb007);
+        assert!(ci.ci_low > 0.0, "{ci:?}");
+        assert!(!better.iter().any(|l| l.contains("caveat")), "{better:?}");
+    }
 }

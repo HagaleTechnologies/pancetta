@@ -1725,9 +1725,19 @@ pub struct Ft8Config {
     /// exists for defense-in-depth against a future caller with a lower
     /// gate, e.g. a relaxed residual-sync threshold).
     ///
-    /// Default **false** — until the hard-200 A/B gate passes, the
-    /// fallback stays byte-identical to the legacy 21-trial fine-FFT
-    /// path. See
+    /// The stage runs only after a candidate's cheap first try fails; it
+    /// is not a refinement ahead of every candidate's first attempt.
+    ///
+    /// Library default **false**: the fallback stays byte-identical to
+    /// the legacy 21-trial fine-FFT path. Task W3.3b
+    /// (`research/experiments/2026-07-08-w33b-budgeted-fine-sync-remeasurement.md`)
+    /// measured a recall loss under Standard's 250 ms budget, where one
+    /// slow candidate can starve the budget-gated rest, and a win under
+    /// Eco's 1 ms floor-only budget. So the coordinator
+    /// (`pancetta/src/coordinator/effort.rs`, `apply_effort_overrides`)
+    /// turns it on only for FT8 at a resolved Eco preset with a published
+    /// 1 ms budget (PAN-158,
+    /// `research/experiments/2026-10-25-pan158-eco-fine-sync.md`). See
     /// `docs/superpowers/specs/2026-07-06-decoder-tp-sensitivity-design.md`
     /// section 3 (D3).
     pub fine_sync_enabled: bool,
@@ -1756,13 +1766,13 @@ pub struct Ft8Config {
     /// fixture below uses a static AWGN channel to exercise exactly that
     /// favorable case.
     ///
-    /// Default **false**. Since `fine_sync_enabled` also defaults false,
+    /// Default **false**. `fine_sync_enabled` also defaults false and the
+    /// coordinator enables it only at FT8 Eco's 1 ms budget (PAN-158; the
+    /// Task W3.3b report shows a real budget-starvation regression at
+    /// the "Standard" decode-effort preset, not a mechanism problem), so
     /// this flag's own A/B result cannot independently ship a live
-    /// production change today (see the Task W3.3/W3.3b reports on why
-    /// `fine_sync_enabled` stays off — a real budget-starvation
-    /// regression at the realistic "Standard" decode-effort preset, not a
-    /// mechanism problem). See the Task W3.4 report for the isolated A/B
-    /// measurement (both legs run with `fine_sync_enabled = true`).
+    /// production change today. See the Task W3.4 report for the isolated
+    /// A/B measurement (both legs run with `fine_sync_enabled = true`).
     pub nsym_combining_enabled: bool,
 
     /// Decoder-TP-sensitivity Task W4.2 [A/B]: replaces `subtract_signal`'s

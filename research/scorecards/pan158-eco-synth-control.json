@@ -1,0 +1,3637 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-10-25T12:15:13.764106501Z",
+  "mode": "ft8",
+  "git": {
+    "branch": "HEAD",
+    "head_sha": "d15556481930e361bcf2186a618562ca9c461e4a",
+    "main_merge_base": "d15556481930e361bcf2186a618562ca9c461e4a",
+    "dirty": true
+  },
+  "build": {
+    "rustc_version": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "release": true,
+    "features": [
+      "research-eval"
+    ]
+  },
+  "harness": {
+    "harness_version": "0.9.6",
+    "host": "70b198f6b235/linux/x86_64",
+    "cores_used": 1,
+    "elapsed_seconds": 596.096041786
+  },
+  "config": {
+    "decoder": {
+      "a7_enabled": false,
+      "a7_freq_window_hz": 6.25,
+      "a7_snr7_threshold": 6.0,
+      "a7_snr7b_threshold": 1.8,
+      "a8_qso_state_ap_enabled": false,
+      "acceptance_gating_enabled": false,
+      "adaptive_ldpc_iters": false,
+      "ap4_full_message_mask_enabled": true,
+      "ap_injection_post_normalization": false,
+      "ap_llr_magnitude": 15.0,
+      "auto_passband_enabled": false,
+      "bicm_id_em_reestimation": false,
+      "bicm_id_iterations": 0,
+      "bicm_id_max_unsatisfied_checks": 18,
+      "block_score_rerank": true,
+      "bp_offset_subtract": 0.0,
+      "coherent_multipass_iterations": 3,
+      "coherent_subtract_full_frame_reference_enabled": false,
+      "coherent_subtract_full_frame_time_varying_enabled": false,
+      "coherent_subtract_mrc_threshold": 0.0,
+      "content_ap_enabled": false,
+      "costas_half_loop_disabled": false,
+      "costas_partial_metric_enabled": false,
+      "costas_two_baseline_enabled": false,
+      "costas_two_baseline_norm_threshold": 1.2,
+      "costas_two_baseline_percentile": 0.4,
+      "costas_two_baseline_tight_steps": 20,
+      "cq_ap_enabled": false,
+      "cross_cycle_averaging": true,
+      "cross_cycle_coherent": true,
+      "cross_cycle_coherent_mrc": true,
+      "cross_cycle_content_guard": null,
+      "cross_sequence_a7_enabled": false,
+      "cycle_audio_smoothing_enabled": false,
+      "deep_iters": 100,
+      "dt_history_enabled": false,
+      "dt_history_freq_window_hz": 25.0,
+      "dt_history_window_floor_s": 0.2,
+      "dt_history_window_iqr_scale": 3.0,
+      "escalation_enabled": false,
+      "escalation_parity_max": 30,
+      "fine_fft_rect_window": false,
+      "fine_sync_enabled": false,
+      "floor_candidates": 50,
+      "floor_iters": 25,
+      "fourth_pass_after_a7_enabled": false,
+      "ft8lib_sync_seeds_enabled": false,
+      "full_scale_subtraction_enabled": false,
+      "gaussian_ramp_subtract_enabled": false,
+      "gaussian_ramp_subtract_fraction": 0.11,
+      "impulse_robust_llr": null,
+      "joint_pair_retry": true,
+      "joint_residual_sync_relax_db": 0.0,
+      "joint_residual_sync_window_bins": 8,
+      "layered_bp": true,
+      "ldpc_feedback_attenuate_factor": 0.5,
+      "ldpc_feedback_boost_factor": 1.5,
+      "ldpc_feedback_erase_threshold": 1.0,
+      "ldpc_feedback_refinement_enabled": false,
+      "ldpc_iterations": 100,
+      "linear_power_averaging": false,
+      "llr_metric": "DualMax",
+      "llr_target_variance": 32.0,
+      "llr_whitening_enabled": false,
+      "max_ap_hypotheses": 8,
+      "max_ap_qsos": 4,
+      "max_candidates": 100,
+      "max_decode_passes": 1,
+      "max_parity_errors_for_osd": 6,
+      "max_sync_candidates": 200,
+      "min_ap_decode_confidence": 0.550000011920929,
+      "min_content_ap_confidence": 0.6000000238418579,
+      "min_sync_score": 3.0,
+      "neural_osd_enabled": true,
+      "neural_osd_weights_sha256": "28ad6537cb4e0ad695d97b66fcbc294310c7dcb31eb5e5d9f3a346096d2f0967",
+      "nms_enabled": false,
+      "nms_freq_radius": 2,
+      "nms_score_delta_db": 0.0,
+      "nms_time_radius": 8,
+      "nsym_combining_enabled": false,
+      "osd_depth": 0,
+      "osd_input": "BpPosterior",
+      "osd_npre2_preprocessing_enabled": false,
+      "pade_atanh": true,
+      "per_bin_candidate_selection": false,
+      "per_candidate_freq_tracker_alpha": 0.2,
+      "per_candidate_freq_tracker_enabled": false,
+      "per_candidate_freq_tracker_max_error_hz": 5.0,
+      "per_candidate_freq_tracker_max_step_hz": 1.5,
+      "protocol": "Ft8",
+      "relaxed_sync_near_partner_hz_radius": null,
+      "relaxed_sync_near_partner_score_delta": 0.0,
+      "residual_energy_stop_db": null,
+      "residual_min_sync_score": null,
+      "residual_snr_diagnostic": false,
+      "residual_snr_gate_db": null,
+      "sample_rate": 12000,
+      "soft_combiner_capacity": 256,
+      "soft_combiner_enabled": false,
+      "soft_combiner_key_tolerance": 0,
+      "soft_combiner_ttl_seconds": 180,
+      "sync_time_interp_delta_scale": 0.3,
+      "sync_time_interp_linear_power": false,
+      "sync_time_interp_max_delta_abs": null,
+      "sync_time_interp_score_gate": 0.0,
+      "sync_time_interpolation": true,
+      "three_method_spectral_sweep_enabled": false,
+      "three_stage_sync_cascade_enabled": false,
+      "time_varying_subtraction_enabled": false
+    },
+    "seed": 42,
+    "tiers_run": [
+      "synth-clean"
+    ],
+    "fp_filter_active": false
+  },
+  "tiers": {
+    "synth-clean": {
+      "wavs_processed": 550,
+      "by_snr_db": [
+        {
+          "snr_db": -24.0,
+          "attempts": 50,
+          "decoded": 0,
+          "fp": 0,
+          "native_decoded": 0,
+          "ft8lib_decoded": 0
+        },
+        {
+          "snr_db": -23.0,
+          "attempts": 50,
+          "decoded": 0,
+          "fp": 0,
+          "native_decoded": 0,
+          "ft8lib_decoded": 0
+        },
+        {
+          "snr_db": -22.0,
+          "attempts": 50,
+          "decoded": 0,
+          "fp": 0,
+          "native_decoded": 0,
+          "ft8lib_decoded": 0
+        },
+        {
+          "snr_db": -21.0,
+          "attempts": 50,
+          "decoded": 1,
+          "fp": 0,
+          "native_decoded": 1,
+          "ft8lib_decoded": 0
+        },
+        {
+          "snr_db": -20.0,
+          "attempts": 50,
+          "decoded": 11,
+          "fp": 0,
+          "native_decoded": 5,
+          "ft8lib_decoded": 7
+        },
+        {
+          "snr_db": -19.0,
+          "attempts": 50,
+          "decoded": 37,
+          "fp": 0,
+          "native_decoded": 32,
+          "ft8lib_decoded": 30
+        },
+        {
+          "snr_db": -18.0,
+          "attempts": 50,
+          "decoded": 47,
+          "fp": 0,
+          "native_decoded": 46,
+          "ft8lib_decoded": 46
+        },
+        {
+          "snr_db": -17.0,
+          "attempts": 50,
+          "decoded": 50,
+          "fp": 0,
+          "native_decoded": 50,
+          "ft8lib_decoded": 50
+        },
+        {
+          "snr_db": -16.0,
+          "attempts": 50,
+          "decoded": 50,
+          "fp": 0,
+          "native_decoded": 50,
+          "ft8lib_decoded": 50
+        },
+        {
+          "snr_db": -15.0,
+          "attempts": 50,
+          "decoded": 50,
+          "fp": 0,
+          "native_decoded": 50,
+          "ft8lib_decoded": 50
+        },
+        {
+          "snr_db": -14.0,
+          "attempts": 50,
+          "decoded": 50,
+          "fp": 0,
+          "native_decoded": 50,
+          "ft8lib_decoded": 50
+        }
+      ],
+      "snr_at_50pct_recovery_db": -19.46153846153846,
+      "snr_at_90pct_recovery_db": -18.2,
+      "per_wav_records": [
+        {
+          "wav_hash": "7bee168001260efedfcf5591fe3f40d491ed3bd70758389dbfa30baf81806b1e",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "1ba5892b08a18212d021d5bc64d7b165c5282ab5f17b494ea48cfe9584d2c7b1",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "38deface85361546f0a2aa5f74c61de750be1f16eabbe8cad8ee67e866191d34",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "df4775cbfc601c522104fb28fb1d7e69ede16cda5ac59dc6c608b8a9b7b0e733",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "7c259bb6f7d79ba06972c1d235aef06d0d0678738fb38fbaafa4cfcf10a0b71f",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "b8c87373399708cd66bcba8dfd5e22942698424baf2a0df587a7f8b7db0c83f4",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "18888e5cf3be2ad55bcfb00b296fb967212b113663d3a6b20a6f31932cad8eb1",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "572cc4ffab00558ce98089df7363d08adeedf74e768d61672ee60f35fbd08618",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "833aec296da0316758e9a2373a2364e977291a827eab944e5fd9c6198d685314",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "93af3e34ffc9387bf001090ad4102b92745a396eb9fcfbf7481f032cdf8d0195",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "e8a94123c8eee3557182555a30a03491e32ed01ad8c338f1cf15816e798ce591",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "4e33cb20b30ddc766943dc326023b5c7a0d95e82a8c64f753146ee3dd7319980",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "bbbcc37aecb96390533e86a970c2c5ebe17dc6d64bd0b3a346bdecee68d74c67",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "f3326b22f8627cb1cd09dec9191941454c6cd3f024d7098f14049aa09370c528",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "61ee0c6d4accfdc625e99b2b1343dee1ea08383edf7f884d6b785c1f6522f0ff",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "2b6a9dde578def39a7e226e200b6aa7c946a33edca622cc2f3b28a45700e6fef",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "8d38e413f68ce27a1033be7724ab26e127e27986534ba7265c280dde11238faa",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "96a9e92786b645043fc52e85a5f7c929115fcde25c45d01dc50c92629ad7e8af",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "64f733a443b0c17a771efbadcc84bc865cb898335142ddc84d733282b30e1be5",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "638e2392b552f17b548fc55b8057a5a24d418d1e1783dba7a311c36745404eb9",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "1d8b81ef7fbf9f16d69e1c8d860b854e9872c734bd1b88ec50f6c517a56acd79",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "79f750c25e5366d167e03b9d7757694e0c107afb6f2b51a031c0a7349009c907",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "7224bcb07e99c77f9424dd333fcd131b609665c3d78123882b6f4017a7526f24",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "82f3bf16bde05ac9ac7dbc28e7482cd6ea114d7b77a28011e1b556c7c3f77274",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "3078d7aefac261c50e9dc0b2404ff2c484e0638600a39c57274c1087fd3b5a04",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ba62b213b60a52ca5c0eaec1640b0dfde8e22521b4b68fdb0d455321d67d40ef",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "38c07cf0de1d85ab74c26f2ef8a30d6c8d0ee55ce00fb175d7218c2f7c971579",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "d320f086db70cbbd9c82dc71a632ec25d32939000b005451876990990f14587b",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "62d3bb9c3a465f4818f352fa7041c96185804f930464338a712a13634138bbc7",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ac77152d240541d056a393e1103cfe99886467aaaaa32f2e5ac75fcb7b74af59",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "55db47557fda1ef3f94d7e2a1c8738a57586d45fe24563c239d85243f2176a90",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "3d92d0fa45295b905d5f3aec88571e4fafd90b45cc685c289dd70fc12175c65f",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "623510deb9a53b0a218ef3a8413eba7ecff5a30dd97e0eb7e2ea2ba4a511c94b",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "9000caa3c726d8de0abd402f1ad132afddc3f2dd5afc086ba336c0c9cf3fa797",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "d388ba944ae4337647a170d164d85fe7f7e6df35618e12fbc75a222f1027d747",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "91f9f0cab4fb31f0bbae955ff65f1e524122c3d30bea74b44107316f87960c06",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "3bf8a139f91f241551b5ed29355871cefb6b60772211624ce59ea513c10ffe99",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "78612c5d45f35208b3a03b740e37f774e3a68c75ca654c37d2e471b8f1380d40",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "9556c93d905b113701ffaa9237a528d7a040395e4ce6b2dcb5ecfcdb7ba4c20e",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "8a1d17556ba46adadeea400c5d1b0087170a9a8544c2105eebf2e4c384854662",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "05219f06ef7813cb01d341305dc7e6d2744962108efd8ed743a5cb5e1d3f791e",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "826eff5473f787cae52cf3a81afc108f3cd7106c4431b34b47686a6ca41ddd58",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "14d5547740a427524b395fa3aca28e5fa4f48781bcab8b822031daddf041577e",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "68b6d9d843b9e8fd0e1249c1bd42e4459d3c8287a473040f5a35859e451cfdbf",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "4767df05aedf0881a49bb9145619592f911f6564d9d25ca06f2682723539063b",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "651c7c7a0c02e610fd29d1b85706555ca75d5bc3dc74e7e94c0ea1fb501159c5",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "180871cd21d03bcfa39158c66d97882f12e285b2db2dea99afc5b7c8f90ba7c2",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "75c08e544ac55106b122cde427e776d55ee5b9d5d9eccc86396c4bbe92a7a0b0",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "3e2736bf19414fb08ca40fb3c7e3d7e3a44244b29047be1930372d1362d3731f",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "cb39bad919b7c39874eaadf313eee39305e058cc36cbcdd6ee36e7e980e0c476",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "192dfef8856202e6dfde02bebb73053956358d1cf4eb7bc13b980604c8e37a72",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ca32d4dba529d4b592a46f121b3111c62dbd0fb730b61dcc0e6a90ce55b6d94c",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "15ea7feb37e7eefb6aa3083a28d8cf4ce5dc07f4581abdc25b0ac4fbe1666f70",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "6363ff9b23d1ea0e8c391850af72b8b0188f6ea7be83e60ffb71f886d3cf37ea",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "88a04d6f4d2cbac5d54401d6d2a8569b13da3482786499c04692d130fece5408",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "e5e424314a7f351e51fe5a912fcc58f7530a05ac47a1754f2a50753aa0c2dfa0",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "28789e968b74acccbee20bb190e8942b8b508ae89ed7e6455b883e6984b73024",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "388ae3ec983d52148e4b31a680cd3f125c165b4ad41df3c8bd6c71f158b3fd08",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "0aca4fe8f45332599356352b1fc732aeeb2eec5a62a189f679dead70f2bc6d2d",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "c44ac7cbd7d056288d27ddbd17a115c70f2baf5919073eca0d452aca482cb0e0",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "e2da46be64c2ab536b05f33273e1b2e0271cc57c5fa9b84ad9044580e518968c",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "8c7053cf4a0879ea21b056ae87a2176bb75b7d7fcbef7a4ef70567c477036303",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "b528758342b20e2c3a33863a20d42150aaf0430829ca24dfad872efdf6a0046c",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "0e33b880392d41ee780b547c66642bda2fc480f58baec7a1e73569a7c237813a",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "4bcbb2a4b11e887c51d590282273a417493373b0226e9f8b10c438218c5feb7c",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "e2e50f568e7489c88903474a8ecc69d1c2c1cf70b103c4b04b021332611be9ac",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ac6bfa55c3f6ffcbb9b99566b18f275a6235190bba4fdc92839eb68d76d79937",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "01a512470adfa793e675caa42ff3ba938a81ce4bae5267d40812e5e1b7d87c40",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "40d1dd0954825dfe1f3e2afcdf138ef6b3538c95b590b3d2d4dc89e139679325",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "c25463ce980bc1c5ef337ee54fa4432a088ef569132d420b888866309203c03d",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "8c0593990f8e5b95d844e1d82d92a1274749d4a94f2d4dfb490267c322d02386",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "6813ff05fe922269d19980e2cde0ed76d690f0155368d90c90540909890d998c",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "8f551dee4e721513b41b9706e588186510d25d4b2bd672d2105223bc7278f27d",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "687f127d9acf826deaf9efb88a0975fa3287e13f7887798dd0a662243d7727ce",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "c664822af5cfeee72c99a635c3044b409cd79d45cc8c58772f93c4b07dd2d4f8",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "919182545d3111f6748bd39ffc983d4c1607368c2e0292e72e81a7917a9c9aed",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "a67c341387dc3d2960b4d701ed032e832ed5bbb6ee030b8136c6420b77d147fb",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "d44a5a0ad7f5c191941d537b81870f6a37aaba00711662bfe446d385dfd66631",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "b073d16d2b8d0a1c6aa3fda7ae7e7c8da2e4ddbd7469212b00fd093a19e2e434",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "b0368c6a84fd42c7c43d1c339048e47e272e350fda63ce2e612929df82bb3cfe",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "4153b39e78a4c316cce2cf04a97f898c2be066c3b22461cb1037e1ef551ec85c",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "7c18e663b9b24b8aaa46982ee97fb76f186327cc4c732839ee933da2d38e2792",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "0a171edbdb828012cbf4f3a0b3c9225fc609efa98a78410148af86189fc762c3",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "caf3479a5e478c15e127f76e82e7050aafeabc21b925a98103410eb5bcfdcfae",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "6ba1ad25a8c5b4d59929c5dc2c4b671d8e25a821bb5b36d3d66a86471ec00042",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "b2a85e39be9619a0025e647b8ced78a90a20d3eec43ceb76fd4d15894efbf563",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "979f6ab509757dc1292e5081e09381b21bb38cf68f49e691fe78d283691cd578",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ff3c13a8f5743905e8fc73a0cb12f40c477a9f66a37a4a3ef02fc1cedcafffef",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "745d05b59e1facd4cbdfee57cf798264ea1ccd009658a06e4d17fdb0699188bc",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "211b2f0f3d5dd6c7ab2b874444082c2dccb2e760276ab3222f4b0fe72e4edad6",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "3e4681445b92453af79eaad45782292940aba1048d3924a8b6be9226b6f92f43",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "a4957e57d25634d5ad009d04d54468ea0c4f567ee8862b27037eb59709e342dc",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "2ea765ebf55d87d35300a764985c8895777c11e077e59f6e79d3312953f297de",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ee3af3bdbefe9bb0b750ce76a69705c72f841a12fc06ae2c25b9e84934011d24",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "915368b205d1ffd757fcc3be46aac3b646ca7537d69539a387284a02e3551195",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "44b8a628419aa486d3de8ad7effd732498d76edb7ddba6d213d9af901669ce9d",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "27a2372f988bddcd36f2e1e516ab6ae60780b633802c251b6d1020b24d29363c",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "84343fc58fcd7cac4aa9bb18e8d2fa3131a5df4dfbe5e0e006decc9fc2f3fb4a",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "4cb282b01f596743103323200b6d7146fe04cd47c8a1ebfd58ce5ed73028d76f",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "413b6c2b6b5cfa90949242e1494cd0ba9cfeb91033eac446f258f733a1c804cf",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "272bf212dfc28637900b96b359e61b76935042e781f3fd97abc93671be9dc0d6",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "20de63453387fe79b0f8debbfe8fbd4542f88b9818c7c1cf6046e4542df8c09b",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "7d397d951c3afebc5b28d16cb6dc87e9431debda6e517e37a7bd15002d5dbd20",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "f0a37052c21a8e429131f29e972fa487cd28b5a86e6784a7f7d68db36d7d6062",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "939f4fb6b796edb505eeb5b9cf1b974da9ebd350a8045b5306be366226758023",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "a668694bf74801ff8494ad46262066be260a41716a928f75e6988905637d8f39",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "bdbc7890ded8f857afd8d860ca56bf5f1ab17255663466aed77323764ca431e7",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "d5d8855bcc003d95929f527b77564c913178dfda38d6f0b8cf501430c0e1600f",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "2d71d11332cf0ec6cbab0913d09a1bc8bb9f3bffd8bb274349c30872a0c913ed",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "a5f77522d91917d2132d8dcf0ba9bc99cae3b6955056d892a024047cda8d64f3",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "25d3c052dbc4ea7a1d6bcebde7caae6e1a0d65861876c427e5aeb771fdd0ec96",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "643aeb79ee798d3174f1592891960a58f2bd3204f2f2ada0b753f9af7c5787e7",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "9e825c8d66dbe51e73b56f7f38cf86dc269373aa427babf3a877822f365264a9",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "15c92838b5080e6ad0edba6f2fed89a02d1e8b3664543fb34ed191d9d7770d6d",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "9f480eb7436fdb12fa5aca700d5a378d2a7c502a12346192395524d3e6bc95cd",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "711c950bd7bd2aa9238bc2123c6d82bc0868c52f589ca323a4d82eb4d4e3ba5b",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "61dfaf8c17e7f6215454a3de29483ee0bd2f68430417a607131d08d94785e2dd",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "593c7975b74ef44d72d18086e85115c99a81435e9500420a5f1d410248cd6d58",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "43dbbdb6f666045560b0fe7b7197625ddedc0d7301aa8d66efb87ed26f7aed86",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "93f51a4c8f3b6fabbce2f084ec4a7ac92418b8f76b7a20a38b74cd226bf25ee3",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "25f253ad8d4d59da9395fa1b6d055215e949576a685a647909490c9c8f2b0a12",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "9649c08c43bdc6d4770e611b5b7c3362f39499c55dbff3f078b39810c526b61b",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "b38c5c4b23ec9e381f98c8f68baab77ed7b3a4ab2592748cb78929df15d01dbc",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "581fab71de660be1219ae766a485b0aa7bd283b2370798e43d2416883805362b",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "b9d07c4c2755df65bdede5710bc5e4a29afe164bec8168a776045e680c8fc17f",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "0e0da433c41eea3488e9ec35b566ed82439a9fa77f8f1854487deebe012d6dd9",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "1383dc730b755d332c92de0980bc847c1e82fc7c3e2d5651a7d304f70c09a985",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "56dc13e9ce0fe7dfdc71ec6b56c0b2f083bc43cc564f1ced1c9b96cc736b21e6",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "663c4b767eef6be9d2cb7d1c1df855457967357b4c0ca8bb4b57a8e4081c7662",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "d197ff7a03eda401a93869f7a6cdfeff0e2944571bff8ad1d3db4cc045452074",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "51f9c0ee81fce57e9784d1490b29fd726999b09d3c9d239aaf1f9dfc9cd1a023",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "52354f3f44ddcb736a0158e53c1500066dd0cc95f3292b0f65ed02a8d683a39a",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "dac71ad51688040f282f6c8084e7717f098c1b4ed9d8c9b10a3af1bf8a0683a0",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ad4c50e706163c6761e35cba32e4fc4fa8af32d490c2cbed4b538bd7ac72e370",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ec7e5021d6371c915bd95b6acb3729f5faef080c9759514a5fd4bcc3145db368",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "db77744f2ae567cb3a8f5e3c45f0d72bc2165b02aa6c0cf3bc319be5a5da7e41",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "07f7aef42c3d4d4604d370461cb3c9aeb69ac54888f0a387f642212008caafb9",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ccf05d1f6f57d35f7857a26e83c5b0b40577add45544489fa1a5bab990ab63c4",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "507a161bfdb55eaef07adccd409096d83b2aaeb431fdaeccc0f89123b33236f2",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "b8ea4916adbb41d8c4007009275b730f8f22d9bcb156fe027f6a6ed8063ce5b6",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "9098d86e8821431e9351b83213cf3fe1fbb7ce9dd7c97f53cd92616379c797af",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "d1ff48f3da507a8626f008f4f66b4799237ffabbebba40eda8d86a5796c0ec91",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "fcd00626f61d3e60e29d677b41d54068b1b04beb5377def3077ca89e847c40b3",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "0efc0bad96e130d3cc046b3eb628bcb29d09ae5e8023e2533230699601aadf67",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "aee42dde48008b69405b88feaacb5b9973c882760aadb0e389b02ed84412bf9f",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "1281a70a000b9b2ed7fb959eef7e30ac47b3050feb8ebe367c5011928eba3bbe",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ecaebcd18d91a968f6d902bc4bfadd3dec6290e019850baa9b6e1a75fcbd045d",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "73aecf2a3adfdfc3b78b9a47f580e28dfca3263a1746d9557fa962f3841b2cae",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "cba2aeee397501ec38ff71e275221da26fb2a6db3080a6bd24f0c6f148c11736",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "d98ed40bb4f9ae3befd0a55792309595ca4323892409478a201b8ae89d461886",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "e1e86e84724aa8356a85691d23e9a470b5796945ab30d6faf74e06a6093c56f9",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "0928bc157960212d93b7076cf93e3518bceafafe886f88af658104917ba3d80d",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "2e089082a3ba5b51844eb5eab355cebb9b53af39ca9560627fb57b53e6a81a83",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "cf65bf533c37130fed5bb8aff706ca0ff4fbb2794bf50ee3320d83869dff5414",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "707375c9b529b3e8b142363d548dd7eeb42d6dbe375c9ebcd3da9bb7b4f51ff9",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "8943585fb2e2e80c619f167d8dc41b24b0619727685b4c83eac036831b6da87c",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "5158df2f21ea48d40bbb2ae5e9633cfb55417440dd904a5c27b3c2c359534da0",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "4fc5d0c4e1ced5e5d63fee25aa74bb27a9c1e8754408b44178d54f120dd0be58",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "024df9c64b4579b0733e2a220dca6d4c20e0699a55f0a352670a7b9cbb8567f8",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ad97c8c35a1778aaa17b29c64c5d31781573b1118fb80175459b6fe834364dfb",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "507f0c2603bb20a2dcdcc0b5ffbd85dc255979eb60dccb928d56963cb23601cc",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "0d425e536fa7a8e3108bd833f6ebfad88410b336f31c974e09357b933caa63c8",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "81db3d34d0e9737042c6640fc763b840c734408e7c176d04c7f899ff06b05b9b",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "94e34b30089a93d906a43af82143292d524240e1d885069d979f8f92560e6316",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "f498f215b287c52debdf7964a645d35074ee9cc8cabad2daec64b885ff8d30c7",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "1a62b945d7a38c209bfb3d9960e06b8099c03fba85d77158c8411b5b6db1111e",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "22bc7fbba9753bd300e3516bfe3691f85a6cb513318d9fde930c6df6fa864eb1",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "6edc2aea62a3fc98c73ded956c704783691ccd4660f77228dbd957f065948feb",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "dea88a8f9a1c08001b18939c45d1f91156dac802717c96190b7b265309ae2531",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "c4c2d110c1970375643a34535e9bd6d55322d6b7492bc5079c462478bd8b9d44",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "cc1149d33a814bc2e4ebb2d5624f2995b24c394385fd719a36d66501e2069203",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "fefa638c0171d9ac5421de641de3e89872bacf8ed09a1ca6966a56e826bf2a5a",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "c529a29eca671af419e9c1febaf2bbb805935dd55638cea4b72cd13f5dc25b53",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "2fcf9c80f064d7d9466f05c6112536fadc18f44dfbbc1e3c89d4728b56e1d816",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "b8e17d288897656001f5407e666b9ae896c39d1db795741242b5bdc11f1df162",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "e5bbaef5c158f7a98559aa7d9b7327e0100acc0b9cbc596ff48693a0eaacda41",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "99034b763728f9b3aeaf621b0d9e8daa0f1ee4e788dc36224665c64a432001bc",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "8c69cf754d9e2534a53493c2ef3d5b7705ef21bfb39d72cf194ca6113d1d128a",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "fcd91c50e9cec243e812be9de959eb2d440431115b03a82e247fa21381eb1ce4",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "5a39df371372ff0a0e59e78da9629c5ef66ac1683ff5edf2f2a54dec6e9c5344",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "47a78e868907b3ba344551605a898cb93739eaf539eeb05f7f57a2de58fed43c",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "1decbd984f6f51d88dfaf54ee929e870c6c6138f3e7ac6b7eb8b9c8eb98ca083",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "dc41647bc8dc47f714f9f889abe5cc415f6a5a2ec1ee263422583cf42278cfe3",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "a707923a46d9788af0ee2cf2c7718aa3c69307088496c56b21f61ba0894700ac",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "708a29c808c052f91eced244a45b8acd0d98eafa4121a46cb826d5544e5cae31",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ffdc826fa0cb3dbc86deca8a6aca3a5230182240e4724d623fe41de54eefa4aa",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "8a38739eed19410a127affcfc428d631723eb75b9fe8d2c19632540cd302875a",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "e2cbeed7153f9e31f3973b0eb38574f4e48df6b8394997346dc51addc1dd7fe9",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "d89dcf9b74ee7ed6a85508e0799edbc33e6982e7d9588804f03c9c7d375809b1",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "66d5fb6521d70235b37a372900b3e0d8288d8f8dbd6924d6a53c8820b38a5459",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "5d3b1acad57501db73559f6da2f39e55489f1cafbfea64374d2b63a79e503bd7",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "5bff43938cd365ec0f774bcf99cf97e92c8841b2fbc1a0cdbb670a85695649da",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ae413d4a12d367102531ff85cec194b303706474a183a3dbcc9c0e7e4977f413",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "9e910d16388b1ea2261bb1b758f2a5a451360847afab0aca060495d44026b4ba",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "d289c315fc9a38d2c7fb86ebd7a436a8b039899af6855121120e4aa07eed8b50",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "08346bdb93fa119514f7c0a5d26ccd0063d2682490f6e1515d67aea3a6f8839f",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "b8d7c94f467042cda6081505b4b194cccf39271ea518e3df9e2346b68e886e05",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "53e4ad80f681c8b7547471e9b9cb91d52e96875baa27badf07482ce92a3fe3dc",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "d3d5c24467b8cf0ce9996c4ed831ee80aef447cbf4f900396b9585d961b90785",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "d51794fcc7323584206b95663158864dae3d2996004fef6bfe4eb631871268bf",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "05d798e49c0f953ef2f4dac105d32351bc3b73a5183a33fb49bb0c31c4e47b79",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ff94e6273aad8c9dcdbda19c6943209e740e1746c60a3db6adedd716d820d503",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "9e4866bbd6f962f8cf9fc33780315a24371c5fa33ff974a53997dcd6d523be4c",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "1fc271eec65ab436adfeae61bb5e281a7ddf7717781ab8cc7ca4c5b8b8234bb2",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "c2de8bcc2c1cba99a9da2a3f9a69bfec6db98845e37ef1879749f6498b729de1",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "90089f68bbe47c6126b296f1026efd90ffce3f8041ca73959248c507148035d7",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "5e3e872fecfd672c4a9412a0e4f6a9a9daa687a9d8c68e6a6bf52011b294d0fb",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "168c55dc3a076f25849f80ad2ede87f461094a3e66538cf338a15e20a79c5f4a",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "81f7f18636e7161c6bdf8a5ff1d46dda40870a10c042be965288ed24e91bee80",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ba216597726e144ce19b3b8b432cc428f0fc9ad52e4fba748c98d5a436b00025",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "505fa2a420e3e0733e10dbd45dd4a93562d62ccc2fd60bb7b1510da429155cc5",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "f04e64c7866a86ddbabcf26d87f5f477bfafa5e6c4101286a9bf143917b21af7",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "967639f72b4feb802235e3270e5b1757e937e2ccf149544b02cb4a55e65f9134",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "650ff4240ddaabbb7bc46e18dc1f7d598fb5a8cf85d0ec07e69535b25a60b30f",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "a58f9841b0ce46e22159c95b0d81eb3dab5e92fb10e7ea3af2919408d8f4180f",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "2a81a94e12a2b51e82c22c0fa5ede5fc83980162068cb74ef4563acc43a18742",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "93fab1711de6efe4f5f42dfcc85dffdd43c9ea78dd87af871ab6f86aec599d06",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "5db6e73096257db0ae1d0a1d18d2e4e07afc326557cbaf0af4367f0bfe62e865",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "bf20bd7b89a9ceeac3507874d34b0df78e12fd6c33b55635421b04a2b999e8b1",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "4b392ae3c3be745975fc7bf8c4fedc1bd42424456b873b9a85e6498aec2803bb",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "d90fcd57af5003ff5c62c356e6d06f9cd4b11193ad57f1b5fcc2948be80b910c",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "f82539c299d30ce8de379adf60c37387c811fb076405fd6d396612a8c0f67b32",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "63a504b8738dcc5938c8d77b519230172deb75aaa5a942d9f4d4f29d68768f7c",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "e3a6ff27e9c4f0a0e80b43decbc5c4f6281057ae7752df06a176964efb52158c",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "c6a55391238b8cd2fbbb2c99c591e0f269e29a70e784f00d2c72d9765693580b",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "edddd61fcd2c4ac74175dadea643c4ec60f2ccb0d4f680077d37f24ff7399f4b",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "d90b3cbe560ba2bae79e35910ffd9f41bc38d97364ef8ee336a3d26135390b9d",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "1f1bf25a56d34ea69ebe986c9ef9e915a676d8ecc0cfcd59633971441023ba12",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "0f4b953456f674d8c08212fca2f7179dfa49e00f78ed60f6411c23fad94ce361",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "b1db3001e5f050605a15c62e10a19159e4fba65ad3520f2d7ce9254c86754b37",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "04afe9270142518085b3b7fd48eb962d5ef3e31a2f3066c97097561d54093bce",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "dfef7cc370e13120d58f55d464b5d0d5dbf3da745debc2fdbe9557896e73de37",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "6ae13e14c90b9fc51551cd2bcbaec639f4591e32712dd8a23214d4d082f05810",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "0ef61649d3d6e8d782b5c8d11f09eba2c3bd9d25e8646f862486fa86bb31702d",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "36a9a05c7a0547bdccc987d070a9c964e94b1b414d67898ec6abe3e008bcd32f",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "bb68c53ca627e1ea5e19b3e2129c36da3cd31725aaa1ce6d45e400d8a4d3a7e7",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "8b313f954524b99387baa2dfc9217ffc7a678896c27ede3a5b47de97221a9cec",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "c968fbb77ed403b9b0210b1949e2ebaa628cce288bc166a18f46fa780d3e095e",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "25d7932031a1e4debd87ae2413fd6ea4e6a4cfdfab22dfd106b47e9d03d87d58",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "56d1a1bcf6fb0d8863205d03c291aa1bc1aeb122f4048c82497914e48dfbda28",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "39185ea840271ab33af74306efd7dec26ca98805951b480e1f30a5e481c12f1c",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "44e19d06e5b5bc70b316b7cc1203f097efc13794e806a55884605042d302562f",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "777440d738c02bdcfbd223bd57c3ae28330e58e8b6f52a77a338b1efaa2dfeb3",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "75527924c926cd54c8816b8b927dab37ed485ea1879fbc45dbd701fb408d45f2",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "b8a2fa1bc3c7cd129b35e1ea1dff537f807f039f5e052b8fabcd4b011f4cb5ea",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "7f760c5d9f1e1df1001d937776774a8bf6f1193e5209129fd9d2ebdd94fe26bc",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "a4dcff6a2bcd3d4faefd9d71f4494a8dca2bae5aa885900d8b613a222746cc3a",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "da0300ed3b7422b05d41a43cb7b55d6df5c552efb2cc1039d87a89c89468dc45",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "c0463723e29495ab0c5b42a6daa9cd7dc4f9f2e6040bb64a9810d2f4a62e1e31",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "dbdebd2ac012611de4eb6fe2bdd6eb61a2a07082852c307d44cb1d45afb87dca",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "62bfe57774cd90a64643c06619270d0df347515d816bf258c4ec1bc69d6e3c0b",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "a058fcf4dc68401e1bdccb6cd80130e367c2102e4c0c03ed5c52f1b569b0720e",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "9ad5998780ee3fd820c2b6513738f1765c4cbeeedf70f877d1287719f028e1f3",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "daff640925e4d44a1ae9f35745fd7c69eb2557363bd8cdb6bea73b2188f98a99",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "962c39626b32d7491ef3a271557f2aeaea1619caeb579e75b10c579c19a2267f",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "b30d34715efc5370896f51a685252dfa3f39e92b6a229626091495b05f1200dd",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "b0061f47a17e3c9bb156a6839b3aa66e22cb97196335427b7fb1d89c6a025266",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "71b77f6cb6e2d366117f0430e720e989d19a464936eeb15ba3b209c34f25357f",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "f4c22e7fea18337b24d8558218ec0038ff823eaeec45a34047ae68f6c307e5bb",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "36043cb81250001b1f430f0aaa18f748b145b3b01944662897370e39ca98e53e",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "1a56381b6e8daba85c528c0d6ed031adee2a567040d49a8a2d563733e486343b",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "e47b37ced5c5615be1295ddb42fe5162f59e54f9e9e9a93181e5ab3878ec4850",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "4b091eeac91dce22f0f5e000e8bdf7e96c8c28bb691189b7e395c2d2621fa3ff",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "fdcf453c6eb7a064f5a5cebc8a62d86b2e0b2cf6ed732e16153ec0776b8af7f2",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "f90813b042d89164a5116903ea0f6f42870eee6e3e7d162239b09cb32614c06f",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "d0165dcaa037110d60988905e28a17683b6ccaf0e90463f92872589d6dd46690",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "6d338c2deab39922bdf17fc818f57cbae036c5d7288228ee916933f51c0f3ff9",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "158f7023acffd7cea45c3320236fa0fae714edf42904dc1ccb0d2f2180b1ee2f",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "3dc7f68466664bda7f9139a1de70a88a7705c6e5f7d57c9f4a1caea73726b276",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "be010e2851c4ff583bc46e9bd9b3c4a0ea9952ff12ecc8a3d5b87cbabcbcd27a",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "5ccf0ff8a146ee20123149c21af44da099181105cfc9a5efd101804ea7950884",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "e9e280209cdd286198d0ec2dac0c6cc74a9807d319afd732521fe0c54517fc45",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "daa1a3a96d982e202d504184632ab43b5c1497e444d975b15c51d8ed24da4514",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "cdc2342170ee0d143db2299a0f5f9335052e128a58e67e515ecd8ec011af56b9",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "a6e46d87167d448e095e72f78ab47a8534da3765582b16f8873db91b9a38808b",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "0ec82fc77d091c9f7c1ddce48732c549fb6cd6b71416f2d3215ef3e1203a82e1",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "1bfb5ad0f304ce38e25796dd36f7778437711fcc57cdfe3fce90aa06060e5b50",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "61fd4e158bcdf628916cb2c16834bd6872b0291ac9f6785ff2683506a73afb43",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "24d2a455f82ee874ddede2ac3948a39e54348f894422b8c4b891b9c891e280dd",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "a5b3fd1eb6ffaab66ba92cc4f5db6eb82b768b7a25373a6c5ca9a9d9de49d93b",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "6faa6fc44647bfcf6abf3afac0277391cd6fc616e1d485a84dd6442eadef13b7",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "9762a2d22aa7f5fcb4a0b23079c0a89bc91dbd6b1e5f5356a6a8ccf93093c347",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "93f31029f49ffda35108d8e3f43118446691e402fbce3de6f28495847ef9ca8f",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "4d7f3c5855737edfe15c159c45a6211b82ba61a3d13a8a28c333696788a9809b",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "f91b2ba284a14fc9533b905db26601b806b53e75d6a170077af5738ffdf2e9b6",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "dc8624d7e93b8dc2bb7f17be48ba889a0bdb25474a6cc214e054c3b0e728235f",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "027d21d6d736f05eba26959ea2506e7c9af4974e106533c00b49b7566bb4133c",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "cbd4f07187c9b39901acd31db87116d4a2c2fdc7ef0e1b51ef5f83d3da0a8782",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "7aa97e83486cb68c3a41b49da9586ee30d394de62e14ad33a668714345b06ecf",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "278b5d29b7d22a69421d2332d76dab0856da62431f32909e80016268dbde7c73",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "4109fa958332d65166c2bac7e255b2375e161b026faa3071cfd64345e098702d",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "1f98687aba488b0f6a924ab541a3d9b912ca2f03a343a0ffe4f72ca261f2d8b2",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "56a97b2c3c4a922f74e9f8c1e9f75a86c137790ae95a6dd4d1ae9edc3cd86d09",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "1a98b00a0fb1eb7ddb8a277d0b8d749855c065daad30ce5006df5725dead6dc7",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "c0dc2658b3dab1d18ab56dd1991741f0bedc7b6db4e19a21007e453208486813",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ee1c26baff603a10944c15124d205fff129cb41c0244f1377a244e1a9c704b38",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "bd5f7201b79d06d610f33e1eff1bf671b6a07bde1613fe9e79409266033289a7",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "7651a3acb064d2424278e756f714edcaa2a7ae897c47b16f7e8299535797b1e1",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "552952e8f671467471c443cbe2e120afa05da0588c10da0a69b52792960452f9",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "44ee36354a00cbae3c1a04814651003990a58c10198186989e470efbff70cd5e",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "526125cd7bba79d4f88c5c1d9e919f436321388ef156b7bb71d4494e1dcbaf07",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "f5785f7afa49881da4de94a6b5d9e0e2b9ae71be687116c55a930ab178cb144d",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ba6f30e894a1941c9245b7fc215a5566a59398723d1cd1932819527e1573ecc6",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "68173086e0a15f2d23bc5785bd73cdb875da62b603c6907d6be6d53d4571537d",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "964763e044161a6de3a688c4fcf076a83df2100dfc98674860d30ad709df33a8",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "854a1e81ad2bb42c8da266bd799b561dc4711c4acff2b16ab0737b6503e75002",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "c60e0dc424d6dc2812ddeb38774dbf3e342a5c39ba473473b236c68511485da1",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "0eaa73a37423a3bf5ea65b17d920897d5b4027528bca18695aad294b12a72f9f",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "2c64924df429142942231bebeac32f115d978220c8b4632462348109b7b5c959",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ece26b4e8589ccfb9e0bc11b68c05d55cb753a81df19a9326f2f4fd19d16d294",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "982768b6f83190760e03575572ce235d2655ae9dafa6a192d0c1cfc32dc8189b",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "5b324035676d6d6bf6a31a44a8ec7dae3f5d09ab1ff543abd0d1b908fb20a43f",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "cec2d2b9bceaf1836b5d5d2fc7c73254dd430496a693e1a8ec152987ffdd8e07",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "8ec0f05e48620863061f2bdeb7c12a5870ad84e21f56b5f269a98b2be4ce02fd",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "2988c6af0ec9f5853ab6e15e4be9e1a6cf09aa5d8af47c107955a9d279267304",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "fed298f87e6162551ae61583c9479fecae65f20ffda5c17fe8ecee1e4f321935",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "163b0bb2a69d8cf6aa981f0e1040eb754cec5c0f6a3a4ad4dea132e168ceb1f3",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "8eec7276ce9662f51afcb7055d5b6a8e6c3eabb7147bb5635a44bcf7653205c1",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "2d1a8cab568aa743b627acf3704bfc4de920201b06b2741f91ae2c4c8b2f4935",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "49ebc7e99ac6993f26d314cb08f1cb50940696361fcc2ffb85d4dbc151c35659",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "f05538b67c735bfe839901b5fc09877a669f567f502ed5405d4bc3c7dab1a632",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "6d205beb9fcc3af4d583a3a609a0eca4a76bab81092798567c8f78ba665b5a0a",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "3ebe06084effaa5e37a5ade858e54fe2d5c86d6d03caa0034a92816aeb8314df",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "388b879534172c5c41cb8cd3b1f7ebe74be3eac8dd96c211fa2cf131ca91eed3",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "b9ee86f9247e82819fa67108d816c028fa9c3fcc8add03967d3fa46eedc75223",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "5e81ec463a295821ab4b86e008ab3567810f44d0dffea4db8fe961bdff14af3d",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "68a0a7c4c5e0a755ae613fb752b73b119ca9c6746f9b990a7b88e4f03416a262",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "2b5a3a613aa5fae62cd9a33bd491a4c5aabc57c9264d03cfae66e705eca6c53e",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "c370a3c40350789197fc7a5fce59d3b318b8f743a06904ef19a617cf0e642db0",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "5a0eb71792fc6c351224e264c0b204ecb2f8c684a831a80460ca0c4c940980fd",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ef85c130d2fe3ea5110e18bb04d2e50ac7ebde5d734d3cdcc91a733a961c62dd",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "874c53b0accfa3cb5043a6bb972d7226ce0a6638243fc725ab367d3d90e8aaa1",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "58eb00380b83b9da656a14aed9a5dc5753170e9e28e25568bff892fd91883011",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "2961bfaafd7a583488ef6b17b72a44d841d380cdec75bc26ccc39b561dae992a",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "8365550a0f694ebf7913673a7f90530a4f535fe463b6abff505b49eaaeea1aeb",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "86bcca57885b925d999892b5a2ff7995bbb96cbda730bfb9a3853e691ac08b6f",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "cd42785507758e5edee6d95baa809f8843fcf348f6de6cbe467da498989bf3ce",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "0d261e958e085bca26d632c30ef2c371d51661593a25944d0ecd62b0739a4b98",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ea2c070d8674cbc276cdd4770c692ab486b5f4f94e034ce58844fd10c1a2fc22",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "5a2fbd575badd1eeaa7b939a88381565ddea4ed5a41cf991d5952cc9167d6afc",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "3d47a58bae6c1d7ec7bdba33acec54c2bb726bd30dc8909d210c47562c7305cd",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "23fa6f62ea8d0b7393ff00e3c8c6d9fbd3f8bb184a96b319da08bc10acbef0a3",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "6f599bbd5f079cb5922a6a56f2697723d3f9a82c35771e2510a85d4b2c328455",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "18fde96bdba66478f6f81ce2a06054fc6065c5fe714e65305a26f030e0bc64f0",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "fce8864abc7c09cc72832784462c85b5bda4f6149b2efd5f77ab692f2b4cc809",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "6f76222cdf649773ae1a6e0e955f028af535c05cf1f74b89a13dad53d0e54bfc",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "7f6579dad7b93c5371df93426aa36ec8d116016cbe544fcc97b0406f85cb906c",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "f8620e2d9e7442606c44c41c14b5f58348cfffb48e342e7de9845216f9a2e5b5",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "12876cad416039ee93fadc72cf567e04f99409bc261f5029f3e8ec4c57685c94",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "180003e3ada452089b3b25a91084a350aea5644ddcdc5302e1af9c7c58fb3118",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "721fbc48e4a7af7aae3415a4439de98ebd219b80f3c0a7b4f9b5a4195f7bdbd3",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "5fd05c8491bf22063f020b97e4a98e49c953a76579a9021a96593aa0d809e43e",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "5b7268d8c05a9eea3b1b1a94ab92b1ce32ed3b40e82b09b6e0d60ab4bbba9c7f",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "6f002869220f1d608a0599aca050c91df6a9a13938fc6af742f7622c4e8d0554",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "0a297e4e5f15e63618e23eabcfceef2f4df0e832dc891316aaa93f2f621d6157",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "829152ed8c6f0b11fb2e1e09dd263cf30a5bc8b6cb7255c2a3c4a2434b5001d9",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "7c6be28b270d01159b234ddef8777169fb659982a831abd333a8a15f874ae985",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "96dd7e8f082a9505beccdb70f266e999e83a9cfb3cd79ea5fc61f3e73f046235",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "d03d96e829fd107d69ad12c694b05ea5178561fe6c35e6cd8efeb38cc6c832ff",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "5da15b36f27f3547e505986e2303aaaa294746be4915336a2b12a099b705d1bb",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "8f09064fcf8dcd1e031fbf3953022f8fa582e8780dad366e9a4dcb3e8884bfa8",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "0bab51df0fe295254caf8d7bdb33f36eff64d46e6d23891551c5b28b08ccc912",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "c2ebba36af7d255585b18f104beedb45d56df2bd2b88c86832668eea0a54f7bc",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "a9da03185f9d561cf703cad83976f044f236bbc8a5a46c5592076edea090ed16",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "5c612a4c8112f18f8d0b21be8a4afef9eef28d02533d330c676a003006862bf7",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "d6ed788ef552b8ca3e82876837439b3493af115f8e98c970da917c448c47d30c",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "3e5c100502cf98c173f9b0f2f4dbd5a66e3e80f44ceac2f533d7dde30c579d96",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "271b83da803d9a4dc12516baad6fb6005feea9f5b39759adb7987e3e3f60af07",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "fa9d798d4ddb6f1885d02c3126bfb6e0082f7e385f5161dc5a6a29ccfd9aed6e",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "a5730acc050719ddf68b6585a5ef9b875fd298bad9f4915133f70a8777d4bbe6",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "5c29549903ebd646ff928077d646bf39e8e93f9b15fe19dc4ab0465fa9045c74",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "e16a97ca395ee632e9b4d1d8138383e4a2fd6a6077e82615f7457b9d84cfe72b",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "981cd1dbe67ddfea7154d280945cf22d63e1fe409e18b1957b4ee82a09f0d403",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "414ceaf59bd5f6dfab3327ec164ba202260f048d27a2c0aa49a71fa8c09bab97",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "132392a0e42442ddb64f18f964c33a361d6a503ea3cce60daaf8ab5b62fa0685",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "04f7bca9fdee8e1bf42f5d408efda0550a29e063d50a53167f6dfc8b89e83db9",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "c1bf53e61aabf62ce2944974cd8ad0dcd1dddb00d12d2440ab764cae497af6bf",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "1b890dd398a35326efbe74f59fa0be34179fad6fb6ee9b9826672ddae6b8ebd4",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "441a8fe08ee49ffdac47217e86185d248c5207a4920177a6949eb2b6cf124ee2",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ed9281891459ff625ddaa9870de184c58698810003d4468f4ba63aa09dbd9415",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "79dabdb86d70224479275836af978e084b1b8817de0a97fbdc9b2440ab30b24f",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "0451afa15042f8240e058f5abf3526e3407aaab27ec6dbc784a9da5401be40e5",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "0f8ceb4f011a42a0abfff8bb7796b5a4f6552ac4b5fdf92d91a1847b06a07f7a",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "f0454be4641b273b2bf66bae3ad2d362724f81dadb68378852af6b82bd72223e",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "4c62a664e75f4a584d1e33f0276094fb9b264f7736b9a350a670d9363882e752",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ae66a34ed95ac6740a9bc03660118e19beb6dea105f7ba079e1f30f1d6255656",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "77d77aade3e1f25730aac73e27ef6c625133d9ece9dfcfd15fbdfbbe1f3af09e",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "f2fc7cd80d1032a50998cd1b1583fd46c51a07a93ffcca0bfc04ad5922249002",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "b0c1a382c2e0ee609aad02d10d7876cf88ffd76d0aaa244548d4cc4f326e7bd6",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "be62ab65a4863d602a221cbb21107f88ef782d05c34a3cd4aa7efc71a632256c",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "1389d08390ac53bb8bb7181ed64b968903d728be131f02b0105490d62f378ffc",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "1b19cfff2a030eeec9670656bda96ecbd9e00d369cad3a2dde3d0290c1f8a0bc",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "6345d9d55159e48d0f623294fc37f2d18a63a330cbc399b616643acd1602efc1",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "29c2dcf73df14c07e115fdc49aa1e0b43b3649bdefec1577dd31f0aac29463a5",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "1b276e3f766c7bad1902443ea484c62fa0e5eccce5fd61cb76e3394e88ad001d",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "54aae23a369b4df7adaf90afa4a21c70017b0ae0def90811d64b96d4c1754773",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ce93febd7835d17b93736a6ed7a489048f837318e8d833fe657972da2d159531",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "4c26eabda6a6faa970c88de4045ba7d4e5a770382752d76ece8d0de0650152eb",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "175a68514a3d4c03f02ab824d61db3b1b145ccfc790c271380b3ab829873768d",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "9270986712a7d8b03acc13a7d9a7a432e32f2f350988f74c3bd2e6b40ad5e330",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "8b535d4d28f1add69766a7a744e0827fc81362c3607e898898cf9a2ae2793f22",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "f2942c937403a013861a62a103db0bd3de0fe111fc6286f2529dcf795304362b",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "b6c8f7c911149ff61a46045942e0b62de1cf9b0b2e967d54ad8cab921fe4df89",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "81dc4c44a6f14be8135ac794904acd6c6263363306c7bc6f9d7b4862694174d4",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "a29df721a72ad4129398a62ac6beded31b2755b11fd25a33991a095b681efc40",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "2f3299e6b92dcf61b7137c48bcb4fe7cd8981f18585b1b917fd713a62efa6cb0",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ea8312d3e468df5ef8c7324885b9c1c5c154f95cd0308fab26c72b0f9be2b7fa",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "cdc6429430a7de3fb71da82d70dcb4f28363c955b12d651294dcf8927d9a95f6",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "a01ddccad4afa4dfc10df7b6c587afffce8fa6cf0573a930772d513e5f5d3be7",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "006ab7e51a05ec14021d18aea5ef955a5fff6697dbc1835378b3ffe2d2b97595",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "2acd2c8f6e85a0cd2bad739c689f94ee1987c1430ed907ac6fa86236edc87319",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "d6b9d557108c23fb43ef9a5ceaafb9d7c493fe39067ca47991101018463743ed",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "9188186ce6dacb8496abdf425009a58763ae500cd853ce5601dae436274cad26",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "65107aa8a734ea660b7b9cd4ea547c92a3723fd5604936f09b9773dac4c8eb2a",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ac106806b19031f8cb4f88b7b71dbaf3c2844e403041838d0530b4b8eb44576a",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "99734f4c162fe5543b3db535fa91ca35301ac7039a1d7b16ab3a9653f7fc401a",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "4bf32e46f0b36e2c4e9dd2eddcf0b0ac02da1ac9dba387912c2bd69da77a4261",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "2a8114ded7ef24051343714f7f684f8f8b21defd3aae6d8789208914fe4a2c32",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "21d699b6c99bfdde15fd26d42600c99f2d29ddfdf14f92f1f737af2d08ed0c98",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "2336865480472e8f9009be16ee60bd3acc4966dcdc06b33191d592f196178cdb",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "e94e6a67e4eea9c27494b28f6aa0de1c9b4e94451ca8c41831e4b04632650d72",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "1fe78cc6b63d80dba72a85ee7b51e11b879280b68a076efd1b05d4468609d062",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "6b9d5b92e2ff637c48838daa8dd70a685606d1172c456f66cc39dc690e47e37c",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "530060966c3032bca472ce072198eab5f55a7d13f0a8f91304db1358e3a55f7e",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "d949aa88fcddf47f7e2a77fe2212d2595d99f735295489f6632b047272b82ce6",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "e4e954128d9347c52829ba07145f4c0a82f9c353110f0c3aefa5572d1e065b49",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "7b8d9ae2422e54a13c1bd3414fff49eb425e21ff5355e9743a8da155b80c9e9c",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "feedaaa5f2fdaafc3f504c6ae65a0b62962b1dd124390780df08f77f6a7f122b",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "b47671d8a315e6f4286a4d306178ccd74602848d7dc9ede9331f9a347b7e30f9",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "af91fa4741a1e053b5b218581747c05063f79ac72c6995e30b1afe3c266fb385",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "e8a0a387f2238145366d8b7572957b58bd565490ed2120f1b12709860c0137b4",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "3a73392f69904e7155548ea6cbba0514a4fbff893b0321ee936254fbc52afe1d",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "37d9ba03dcaef6818779ed4542920ce1f6888e22b0836c1835b225678a8d9ae5",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "0678468a0b378168d10498dd0ccf8b57c51708dd9904cc3570c399b62c5d5215",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "8b8a00bc64f2214aeab2e1d1aec692dd7a204020f1adfc79431cc46f3f2a0100",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "fe49301a50efe53d2cdeab643f8cb99047477addc5b546e1827ee414a7bc652d",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "cd0fadc58d5be5623eec36cde9a27ab7795ac19aba45525d88b22e227898b2db",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "52ed2217d9d12c77c5096fb28bf6f76f32321c3b3753296bb9bf997f246ace02",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "2267db3e63b1dc3fc848193e7434e4c11bb7dfb756d1eed2ed7fec73a585238c",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "d9fca7ba60bdffd0ef87059df6f8e51097fc6ef2b5ca25714ff8f0d9b328daa9",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "4646d3f48df976727876588a67107fb249a26002949a00630a05d07db7477b31",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "da378774b436b2ab0a16ee9d4ca208d995334ad45627851b607e317a1d6517fd",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "9e93f615b2d9f4bf659fd32da277c96711912757285420f91a9e855322104b73",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "1ff2cc12d70aacda25fe725079d2ee0a775098fc6ebddf6eb45b45ccefc59802",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "30f9517deefc3f8a4022d417a9365bd005be4f9402d385b34b8b8ef5b2a0c972",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "fcb202d6ee11617bb406a3d05f688ff65d9a88f7b17089353cce3298048d6534",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "84593836165cb90e64caae3f58c301ac8b49652cece1da1adc267d0d426298f1",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "abd1546a4a60a4ffe66f36449516bd2b9b88e9c8c0fdd56b7416243e01e48dad",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "af026dd0abda24609be54085c95dfaac951557223fe7168cf9d8f898358ce8a8",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "421617bf76e4dc499924f0f1983aa235d177f611762b5a786e633d878f8a9fd7",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "8687ed5c56cc192fcc56a76ae8cde4b3ed80e8f7ee641665989ad4fe37778445",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "6dede3c424102d59f88dae50c86d892ca666894a60233e648150931aee431010",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "a550194cf80c63bb52b95b22f7b9c6d19ef96c5e7b1cddb23a0ceb344905ac3e",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "fe33b4b9220686d87a20a441b98f8b491ea7fe1696ce50ab952e6d712c2a34b6",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "31eeb8679d6b33e18f205667ca82201308aa8fb05f0301f070301ff0697548eb",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "c9138360286f420f03a39bed27c5003bb8f6c83c2c38f14ec89f45f544a8658c",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "c88c02c797e1546d4db2558520b269b38a16979a237a6ca44845143eb64c0a7b",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "9e42d5ff8458adb7e0d45b663460a4df25a2f5312646685a9851a1c94c86220f",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "1334488d3afa6e81f877806c3c0758dc87259ab404ec751e3e5e46ef744b6d84",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "bf0ac3bf19373c3489ae3e1f1dfd09dde613f58d95205b7e90066b52febc4359",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "c9b91165516723cc7906d33dca5ce19afd1916737d41598e895c82433b7c7162",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "72a2dedc4f5ffa5cdbdf5826d662a387ba78dd38b04373465f659a4eaef004b5",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "a44ed657338e09ac314585ebad6b73a010b71964f0d04db37b864d7e6370630f",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "64ff21311cc4aa81acb12f977b2191b8c81ffde1648f8f3d51c6ef6a2055bcc8",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "64cc8e175fd39171dabbf4e8cf03b6984d90fa64e76a69f4f041f5acaf08baf2",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "40afeb521eb0886d02bb1c6c5c5227a7ffd2098ebc9cf6d93fee1a9671ae7011",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "1885a0f310de0ea9b7798a2ceab5918c7ca38f80e9019bd61794e1879fd229b6",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ebd880e738f2d4f9477d7b0542b4d51d5350d906935eb95e4b35088ae192d77e",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "7f9ce95e55328399222ea2660ae2a95e118e7a14d249bcc1701b2fb5716b2839",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "3f520271e7e7ba7e3ca394775eaee5613973e1a581b35d3f6d2295ff148b3ba9",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "c3a18c008fc9a35ae7e35e2b9c7b80cee25cac453715f11448278287c1262d63",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ff786cdc733b200a565d30da527e9966344db98eba965754ebcf8e4d72779f39",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "51bd8ea4812301b0a07e3a8eee03d112c9c399fd52e5600241a2b8df1b038f95",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "f4e10fa93a270663e965b52e10e423f4de43b6574d015730b0da6d9e286923e9",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "43ad033bdd24d0e6d1766048405f4d8595eaff76181579425c3d30dde097a21f",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "9ccd690d8d308f39347c321b30e625696363d738991304fcfdfb3fcb9764c22d",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "99bede41b5382047d36004ef77adfd4a723557bb5acdebb502a753d511a5120f",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "3e75f8553fbec66eebb85f5edefdd891bb327eb16b5af3946a26b8e883b9b594",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "cf3057e3a9469d0d4a1f355c3d23c505536321e1c707cc19207b883db3fe293e",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "2190980c072a512664245974bb32bab44b9a61c4c3065244ad705749aa6d36c9",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "bf4223470beaad3f54e0557fa06d8a2b979d55afea30fee0ef85364c0b1357d7",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "122a2807b9dc78cdc0d352c51cab69cacc2721e7fc3cd0ba8440a44583e57819",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "3c9ec89efb7d10ea5a748c633b9ac6d139acce9d8eb25cd853f6118914c20b0c",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "aef01ecd90ea9e6e5551f620d03d01c578e63564a1dcccd685c7c0a5eb85bcbe",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "3ba1778e68b38561e039673dc4dbb757b076bc1bf900d82b02ee748ef60608e0",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "4a950ec4d2d44902825a29a7407bad5d76b8aeedaa1132f25f242e8851678688",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "941c92942db9898c29506ec50e789dddcf8cc6ffc7eb965bffd966075853da7e",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "59d93edb90be5223465a9d7acde0009110ce7589bbdbac02e8593314b648f21c",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "2f788c24d02251f67cfcc18b3583ce82a84a6bc8deeb54339aa432892fe03d3d",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "487ea4c3381a10b6fa390baf050117b6806193cc98e84c77ca5ee5cfb4a64c09",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "503b02a8500908d3947b59713b59709cb96ed076ea35d7e18b4c95724bf2f3f2",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "d2855ead3431064f00f73f52dc3b1f77178abca7e1068a5132021938f4e85d0c",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "e8cc46b563fcb2b4fdfa8e91ffe4488bc431185e84a908f53c6a121d45efb215",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "624a9cbfaad075f826b1f4223f0690b4c3bfb5620b1790e1010e218c26bfc9e6",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "b2fca1ebbc47c8e9fabeac98d2c7e1e8ffcbe8711cff4f4532ac9bc5c17e6c2e",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "dc903ef87efe45f7ef545ec527436c50e4c0813f9610f7d4c5edbb292db62305",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "aa30b75f6afaf888423c08706e506dfe3edef7c902259ce6b1a49ecf6b089c93",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "2d6c261324fc7bf3a7c90e9fb48d3a18fec483553e1cc7a733ee3b337a590d76",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "1ab1d50aa89e5cc1e6b6c3ef15d026236b80677d2a959d89f6cdffed2290e840",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "2ec6b6cd76a24edebb9a2dd5ea7e031321bf3d4ce290eeb1bea743f5e6ec97e1",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "7f99c34773c0d38f6a1628d91f3783d1d1f7385bfa8f95d2f0cb96dabe7f964b",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "486002e7c659478c174bcf51747b34b45c4569d584ccdf8b4f8c35f02dc0ccf9",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "e0967b0f5216fcfae5abd5e80b1faaed88bf7775689c6252f59c7c2e1c600705",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "9c5f92f0051c681ad0a7dcc641d9a59f24a7bb99a3fe60c6f8d0d43a795286fe",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "0efee6b4ce191db33ce802dfdf5796bf82db85f7bc2af76bae1dac52c610de69",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "356d99d6142b6d651eeab1017e781f4d0fdab8a2b8404b0f08a7ed3e9675e14f",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "8936d21fd034a58e269553236bf723a0972784a57567fd09e48ab8b13db7eb12",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "9f9fe4e950a1429e314145fec4c582e9ab3d0352acd449aaf1c21480c7dadc90",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "d8daa9ed14e5c7f72cd4d30830f2d703ee0e367aeb888a77f3c79f63850b96ba",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "dcbdcf0900d93e5b9184e64c41f16cdce52febbd7a352c22ad09f17d1e5a3b24",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "efab733b66f69deb6811e375d17c7ce2458311d81df460e409c44af80b0522f5",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ea55d176d92edeec799ed7fa3b2f2cdf559aaf1190694b00f0e486df608c5f0c",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "795faf94214bbe6634d1f2782e4b6a2304abf26d4f9adef5a283538bbedbd1c0",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "a630537b2910d386c458c19eeffe015b44076d03cf9750d882236bef59312796",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "16cfb1d253737bce504a7a02c37f6268c68e5228ab4754b5edb71bf78819ec0e",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "4f9ce7508d1c346304c7d8a60001704abddd029d171cf93550c2a2df7efc5df9",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "155c1ca9945047b9cfbf61f50ab0ca219537da71def287e15a6fe01956fb5cf8",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "033b1df46283897b226dfc1e04216295ef5780c009807c1aae9d43a47c1597ad",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "8cfa32c52df39890bd51064c272e3a2cb939439c8440b5a5c2947ac1519a23b7",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "b401ed8f57817fce482a1be031c53719f269eb9ac36c0b84ff4383d59b0003d3",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "84a326a37d592af79228031758199019e72d626c5bbc9acab44bd37603fb0a14",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "5b90995e35afc99ceb517a06961839dbc4f3112098807bc6403b4a2a2c6a176a",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "0bedb3369e446ba74089c76eaae66116c0f84c1a38786f199c0bd5a0d3d1323b",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "e104251d18703defdc04f68b95bf0d99703df45fc9347fdd5de7d271641cef6a",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "9754a1b292716a126881d08d485b9c7ef0b6a871ab077e6a89ba359ac624b71b",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "97accaf3a3c6bf7bb457e5011bc2593beb1fdd013cda75b35857a875c53b90a7",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "b8cfb7aac2f5a863e02c4e92efb74366cb8773c1c5ac60800232fc59ad84e5f2",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "db118218dc21cbcea5dedd249681a91de519370b21c3df746cd0aacaaf090037",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "b60ac3cf604e2a58a3b7a8f2e35d2c6c9bd17ec2569c0074999b7682ce45253d",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "d40115d4b0a59fb393b4d39227509202ca14360ea7e1f49ed8d2b58508b743e3",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "d195499534ee18c357a28ed90db2f7ef0e65fa334af122c67498d8b874eeb03f",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "e9ec7bec17506571c6a8a5b681793ebea738b6c88374640f9fd986a3258b3203",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "5e66e9148d6c080d7681825a057a85f3c381e1423a694fb0e1fba28d87c10461",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "1c842e7183e8ba5227a856a9edb6c7d356927ee7198001fcc5ce392642863053",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "d9871b586b991cf807ffd03c710489e3e63eecbddb6bb711ad3274a1cee67baf",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "3cc3f4320e523d265d3b93b2b871244c72b412a0217eac3b33c302c07490298e",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "aa9a89ee5b1046d84e9743f99681b41f1aa3ee7df7513d1d198a4b3df361232d",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "52241c80cabcc3790f3e5239c6acaf198ba267fed73434b8f5b9f918426d3997",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "7830cbcfa345ba9cfd63be6b249c7a307e8815e9b9afa432bce64478cac41872",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "4c26837493f8c5d0087d77e81f059c96c7b7986ea94f99535701e91095ae6c22",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "7dd6b5338f3a9297b666422189a19f41f7380f2831d21f68ffa58c0a974d64d3",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "ae771438ddbf0d56e4ffdbe4e07246fee95d5d8f16af453a38b65192d385420f",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "afd15ded55a1f9550e0670f495bed26d8075d978f134b1fcadd7af908dffe370",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "458bcf7925a3ec617f5f967b3c0175b1767728a79cfac88a67799159c31782bc",
+          "truth": 1,
+          "recovered": 0,
+          "novel": 0
+        },
+        {
+          "wav_hash": "bc3548a5b3544df1c50264f6d697f9d8fc49420ec302e746506c9b395d56f583",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "35d3b3034946163b8934a9a752b819fc8080d13b05d8b443d687b2fe616b1b35",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "c24ffbc0a827953687229c7eda27c4fd6eac515af6528ae8d4b2a73e862ce0e3",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "afe12448d85217221c6008e4f8a96fd45263c9690e3109092077abeec8b546af",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "29303fb405ffc078d3f08cf014d695388b5934fce3663521ea37ed5dd0915fc7",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        },
+        {
+          "wav_hash": "edf627612f78ba71a398781be96dde52695232c6fb869f95720fa4d82e57e1cf",
+          "truth": 1,
+          "recovered": 1,
+          "novel": 0
+        }
+      ],
+      "preflight_seconds": 0.0,
+      "window_timing": {
+        "anchor": "receipt",
+        "budget_ms": 1,
+        "ft8lib_available": true,
+        "qso_partner_hz": null,
+        "windows": 550,
+        "waterfall_ms": {
+          "p50": 5.889677000000001,
+          "p95": 9.827855999999999,
+          "max": 12.473436,
+          "min": 2.906407
+        },
+        "scoped_ms": null,
+        "ft8lib_ms": {
+          "p50": 14.442158000000001,
+          "p95": 25.053158999999997,
+          "max": 28.086297,
+          "min": 12.21094
+        },
+        "pre_native_ms": {
+          "p50": 20.241003,
+          "p95": 33.266189000000004,
+          "max": 39.121263000000006,
+          "min": 15.226436
+        },
+        "headroom_at_native_ms": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "max": 0.0,
+          "min": 0.0
+        },
+        "native_ms": {
+          "p50": 1044.510466,
+          "p95": 1215.1397049999998,
+          "max": 1393.04051,
+          "min": 814.028551
+        },
+        "window_total_ms": {
+          "p50": 1066.363279,
+          "p95": 1239.165965,
+          "max": 1420.344529,
+          "min": 831.659585
+        },
+        "windows_multipass_ran": 0,
+        "windows_over_deadline": 550,
+        "max_over_deadline_ms": 1419.344529
+      }
+    }
+  },
+  "composite": {
+    "weights": {
+      "fixtures_pass_rate": 0.15,
+      "real_decode_rate_hard_200": 0.5,
+      "snr_50pct_synth_clean": 0.3,
+      "snr_50pct_synth_doppler": 0.05
+    },
+    "score": 0.1419230769230769
+  },
+  "regressions": {
+    "fixture_regression": false,
+    "false_positive_introduced": false,
+    "snr_curve_regression_db": 0.0
+  },
+  "notes": "Decoder under test: pancetta-ft8@0.9.6",
+  "provenance": {
+    "pipeline": "ft8lib+native-merge",
+    "budget_anchor": "receipt",
+    "effort": "eco",
+    "budget_ms": 1,
+    "ft8lib_available": true,
+    "ap_my_call": null,
+    "not_modelled": [
+      "fp_filter (station ADIF/cqdx/seed; cold start passes all)",
+      "cross_sequence_a7 (default off)",
+      "ap_eval_mode (default off)",
+      "scoped fast-path (no QSO partner)",
+      "recent-call AP pool (empty at start-up)"
+    ],
+    "host_cpu": {
+      "model": "AMD Ryzen 9 5950X 16-Core Processor",
+      "logical_cpus": 6,
+      "cgroup_cpu_max": "600000 100000",
+      "rayon_threads": 1,
+      "tier_probe": {
+        "tier": "moderate",
+        "p95_ms": 470
+      }
+    },
+    "corpus": {
+      "tier": "synth-clean",
+      "manifest": "research/corpus/synth/manifests/clean.manifest.json",
+      "manifest_sha256": "8ef9967ddff13946ce8dc4e125cde47ed479d1053744a54c17205cb0abc1f773",
+      "config_sha256": "4dd762347e8fd741461dcf9de6b23f07bbdc732a4624ed6c520c7a921e82ea75",
+      "wav_set_sha256": "5040ca6fa3adcc58f6ed4172f5e73f0d84c6cf8a2e06e74c6de27db5cc6e0f19",
+      "wav_count": 550
+    }
+  }
+}
