@@ -67,10 +67,10 @@ impl ColorCapability {
 /// so the TUI can score local-decode-fallback and network-only rows through
 /// the SAME tiered `PriorityScorer` the coordinator's `tui_relay` uses for
 /// live decodes (#164 unification). The TUI has no access to the
-/// coordinator's `CachedStationLookup` (recent-failure history, per-band
-/// worked-grid history), so those two signals are always `false` here —
-/// an existing limitation carried forward from the coarse function this
-/// replaces, not a regression.
+/// coordinator's `CachedStationLookup`: failure history comes only from the
+/// relay's local rank (PAN-94), and per-band grid history is always `false`
+/// here. Network reports and age come from the row's own cqdx spot fields
+/// (PAN-227).
 struct DxStationLookupAdapter {
     needed: bool,
     atno: bool,
@@ -80,6 +80,10 @@ struct DxStationLookupAdapter {
     recent_failure: bool,
     rarity_tier: Option<String>,
     is_notable: bool,
+    /// Latest cqdx spot's (reporter count, best SNR); `None` unless both are known (PAN-227).
+    network_reports: Option<(u32, i32)>,
+    /// Latest cqdx spot's last-heard time, unix seconds (PAN-227).
+    network_last_seen: Option<i64>,
 }
 
 impl pancetta_qso::priority::WorkedStationLookup for DxStationLookupAdapter {
@@ -106,6 +110,12 @@ impl pancetta_qso::priority::WorkedStationLookup for DxStationLookupAdapter {
     }
     fn is_notable(&self, _callsign: &str) -> bool {
         self.is_notable
+    }
+    fn network_snr(&self, _callsign: &str) -> Option<(u32, i32)> {
+        self.network_reports
+    }
+    fn network_last_seen(&self, _callsign: &str) -> Option<i64> {
+        self.network_last_seen
     }
 }
 
@@ -547,6 +557,8 @@ impl DxStation {
             recent_failure: local.is_some_and(|f| f.recent_failure),
             rarity_tier: self.rarity_tier.clone(),
             is_notable: self.is_notable,
+            network_reports: self.reporter_count.zip(self.best_snr_network),
+            network_last_seen: self.last_seen_network,
         };
         tui_rank(
             adapter,
@@ -2428,6 +2440,8 @@ impl App {
             recent_failure: false,
             rarity_tier: None,
             is_notable: false,
+            network_reports: None,
+            network_last_seen: None,
         };
         tui_rank(
             adapter,
@@ -5027,6 +5041,148 @@ mod tests {
         assert_eq!(row.network_rank.unwrap().factors.unwrap().snr_db, -24);
     }
 
+    /// The Why overlay's `network reports` input row for `value`.
+    fn network_reports_row(value: &str) -> String {
+        format!("  {:<32}  {value:<10} cqdx", "network reports")
+    }
+
+    fn merged_network_rank(app: &mut App, spot: &crate::tui_runner::CqdxSpotInfo) -> RankedBy {
+        app.merge_spot_groups(std::slice::from_ref(spot));
+        app.dx_stations[&spot.dx_call].network_rank.unwrap()
+    }
+
+    #[tokio::test]
+    async fn network_rank_scores_and_explains_the_spots_reports() {
+        // PAN-227: the spot's reporter count and best SNR reach the scorer.
+        let mut app = fixture_app().await;
+        let mut spot = reason_spot("JA1ABC", false);
+        spot.reporter_count = 3;
+        spot.best_snr = Some(-12);
+        let rank = merged_network_rank(&mut app, &spot);
+        let factors = rank.factors.unwrap();
+        assert_eq!(factors.network_reports, Some((3, -12)));
+        assert_eq!(
+            factors.terms.network_bonus, 0.0,
+            "under 5 reporters earns no bonus"
+        );
+        let lines =
+            crate::dx_reason::detail_for(&app.dx_stations["JA1ABC"], None, Utc::now()).lines;
+        assert!(
+            lines.contains(&network_reports_row("3, best -12 dB")),
+            "{lines:#?}"
+        );
+        assert!(!lines.contains(&network_reports_row("none")), "{lines:#?}");
+
+        // Many strong reporters earn the scorer's bonus.
+        spot.best_snr = Some(-10);
+        let three_reporters = merged_network_rank(&mut app, &spot).score;
+        spot.reporter_count = 6;
+        let rank = merged_network_rank(&mut app, &spot);
+        let factors = rank.factors.unwrap();
+        assert_eq!(factors.network_reports, Some((6, -10)));
+        assert_eq!(factors.terms.network_bonus, 0.1);
+        assert!(
+            rank.score > three_reporters,
+            "{} <= {three_reporters}",
+            rank.score
+        );
+        assert_eq!(app.dx_stations["JA1ABC"].priority_score, rank.score);
+        let lines =
+            crate::dx_reason::detail_for(&app.dx_stations["JA1ABC"], None, Utc::now()).lines;
+        assert!(
+            lines.contains(&network_reports_row("6, best -10 dB")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("bonus = +0.100")),
+            "{lines:#?}"
+        );
+
+        // A single very weak reporter costs the scorer's penalty.
+        spot.reporter_count = 1;
+        spot.best_snr = Some(-7);
+        let strong_single = merged_network_rank(&mut app, &spot).score;
+        spot.reporter_count = 2;
+        spot.best_snr = Some(-27);
+        let weak_pair = merged_network_rank(&mut app, &spot).score;
+        spot.reporter_count = 1;
+        let rank = merged_network_rank(&mut app, &spot);
+        let factors = rank.factors.unwrap();
+        assert_eq!(factors.network_reports, Some((1, -27)));
+        assert_eq!(factors.terms.network_bonus, -0.1);
+        assert!(
+            rank.score < strong_single,
+            "{} >= {strong_single}",
+            rank.score
+        );
+        assert!(rank.score < weak_pair, "{} >= {weak_pair}", rank.score);
+    }
+
+    #[tokio::test]
+    async fn stale_network_spot_lowers_its_score_and_shows_the_freshness_used() {
+        // PAN-227: a spot last heard 10 minutes ago is not scored as fresh.
+        let mut app = fixture_app().await;
+        let mut spot = reason_spot("JA1ABC", false);
+        let fresh = merged_network_rank(&mut app, &spot).score;
+        spot.last_seen = Utc::now().timestamp() - 600;
+        let rank = merged_network_rank(&mut app, &spot);
+        let factors = rank.factors.unwrap();
+        assert!(factors.terms.freshness < 1.0, "{}", factors.terms.freshness);
+        assert!(
+            factors.network_age_secs.is_some_and(|age| age >= 600),
+            "{:?}",
+            factors.network_age_secs
+        );
+        assert!(rank.score < fresh, "{} >= {fresh}", rank.score);
+        let row = &app.dx_stations["JA1ABC"];
+        assert_eq!(row.priority_score, rank.score);
+        let lines = crate::dx_reason::detail_for(row, None, Utc::now()).lines;
+        let used = format!("× {:.2} freshness", factors.terms.freshness);
+        assert!(lines.iter().any(|l| l.contains(&used)), "{lines:#?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("× 1.00 freshness")),
+            "{lines:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn network_spot_without_report_data_keeps_neutral_inputs() {
+        // PAN-227: no reports and no age read as today's neutral inputs.
+        let mut app = fixture_app().await;
+        let mut spot = reason_spot("JA1ABC", false);
+        spot.best_snr = None;
+        let factors = merged_network_rank(&mut app, &spot).factors.unwrap();
+        assert_eq!(
+            factors.network_reports, None,
+            "a count without an SNR is no report"
+        );
+
+        let row = app.dx_stations.get_mut("JA1ABC").unwrap();
+        row.reporter_count = None;
+        row.best_snr_network = None;
+        row.last_seen_network = None;
+        row.network_rank = Some(row.score_network_spot(Utc::now()));
+        row.refresh_priority_score();
+        let factors = row.network_rank.unwrap().factors.unwrap();
+        assert_eq!(factors.network_reports, None);
+        assert_eq!(factors.network_age_secs, None);
+        assert_eq!(factors.terms.freshness, 1.0);
+        assert_eq!(factors.terms.network_bonus, 0.0);
+        let lines = crate::dx_reason::detail_for(row, None, Utc::now()).lines;
+        assert!(lines.contains(&network_reports_row("none")), "{lines:#?}");
+        assert!(
+            lines.iter().any(|l| l.contains("× 1.00 freshness")),
+            "{lines:#?}"
+        );
+
+        row.reporter_count = Some(3);
+        let factors = row.score_network_spot(Utc::now()).factors.unwrap();
+        assert_eq!(
+            factors.network_reports, None,
+            "a count without an SNR is no report"
+        );
+    }
+
     #[tokio::test]
     async fn both_sources_display_the_higher_latest_score() {
         let mut app = fixture_app().await;
@@ -5304,6 +5460,8 @@ mod tests {
             recent_failure: true,
             rarity_tier: Some("rare".to_string()),
             is_notable: true,
+            network_reports: Some((3, -12)),
+            network_last_seen: Some(1_800_000_000),
         };
         assert!(adapter.is_needed_dxcc("JA1ABC"));
         assert!(adapter.is_atno("JA1ABC"));
@@ -5313,6 +5471,8 @@ mod tests {
         assert!(adapter.is_notable("JA1ABC"));
         assert!((adapter.rarity("JA1ABC") - 0.65).abs() < f64::EPSILON);
         assert!(!adapter.is_needed_grid("PM95"));
+        assert_eq!(adapter.network_snr("JA1ABC"), Some((3, -12)));
+        assert_eq!(adapter.network_last_seen("JA1ABC"), Some(1_800_000_000));
     }
 
     #[tokio::test]
