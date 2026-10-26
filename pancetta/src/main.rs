@@ -1054,8 +1054,33 @@ async fn import_command(args: ImportArgs) -> Result<()> {
     };
 
     if let Err(e) = write_import_block(&adif, &block) {
-        let _ = std::fs::remove_file(&receipt_path);
-        return Err(e).with_context(|| format!("Failed to add contacts to {}", adif.display()));
+        // The write can fail after part of the block (or all of it, on a
+        // failed fsync) reached the logbook. The receipt goes only once the
+        // logbook is back to what it was before; otherwise it stays, so the
+        // operator is not told nothing was added while contacts were.
+        // A refusal because the logbook moved (a live QSO written anyway
+        // after its wait) wrote nothing, and trimming would drop that QSO.
+        let before = block.offset - block.header.as_ref().map_or(0, |h| h.len() as u64);
+        let wrote_nothing = matches!(e, pancetta_qso::AdifLogError::LogbookMoved { .. });
+        if wrote_nothing || roll_back_import_block(&adif, before, current.is_some()) {
+            let _ = std::fs::remove_file(&receipt_path);
+            return Err(e).with_context(|| format!("Failed to add contacts to {}", adif.display()));
+        }
+        let before_import = match &receipt.backup {
+            Some(bak) => format!(
+                "your logbook as it was before this import is {}",
+                bak.display()
+            ),
+            None => "there was no logbook before this import".to_string(),
+        };
+        return Err(e).with_context(|| {
+            format!(
+                "Failed to add contacts to {}, and what was written could not be taken back \
+                 out; {before_import}. The import receipt {} was kept.",
+                adif.display(),
+                receipt_path.display()
+            )
+        });
     }
     // Indexing can take a while; the station may log again meanwhile.
     drop(turn);
@@ -1111,6 +1136,29 @@ fn replan_after_logbook_growth(
     }
     let grown = processor.parse_bytes(copied);
     pancetta_qso::adif_import::plan_import(processor, incoming, Some(&grown))
+}
+
+/// Take a block write that failed part-way back out of the logbook: under
+/// the lock only this import wrote past `before`, so the logbook goes back
+/// to exactly that length, or away when it did not exist before the import.
+/// Returns whether the logbook is as it was (PAN-214).
+fn roll_back_import_block(adif: &Path, before: u64, existed: bool) -> bool {
+    let len = match std::fs::metadata(adif) {
+        Ok(meta) => meta.len(),
+        Err(e) => return !existed && e.kind() == std::io::ErrorKind::NotFound,
+    };
+    if !existed {
+        return std::fs::remove_file(adif).is_ok();
+    }
+    len == before
+        || std::fs::OpenOptions::new()
+            .write(true)
+            .open(adif)
+            .and_then(|file| {
+                file.set_len(before)?;
+                file.sync_all()
+            })
+            .is_ok()
 }
 
 /// Save `receipt` in `dir` as `import-YYYYMMDD-HHMMSS.json` (UTC, from its
