@@ -1,8 +1,7 @@
-//! Committed evidence for PAN-162. Needs only the vendored ft8_lib submodule
-//! (initialised in every container), no private recordings.
+//! Committed evidence for PAN-162. The WAV rehash test requires `research-eval`
+//! and the vendored ft8_lib submodule; the other tests need no corpus audio.
 use pancetta_research::impulsiveness::SurveyReport;
-use pancetta_research::storm_remeasure::{self as sr, OffairScorecard, StormRemeasureScorecard};
-use sha2::{Digest, Sha256};
+use pancetta_research::storm_remeasure::{self as sr, StormRemeasureScorecard};
 use std::path::{Path, PathBuf};
 
 fn root() -> PathBuf {
@@ -41,7 +40,11 @@ fn storm_record_matches_the_preregistration() {
 }
 
 #[test]
+#[cfg(feature = "research-eval")]
 fn offair_record_rehashes_the_vendored_corpus() {
+    use pancetta_research::storm_remeasure::OffairScorecard;
+    use sha2::{Digest, Sha256};
+
     let card =
         OffairScorecard::load(root().join("research/scorecards/pan162-impulse-llr-offair.json"))
             .unwrap();

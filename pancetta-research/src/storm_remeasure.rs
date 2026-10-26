@@ -635,7 +635,8 @@ impl OffairScorecard {
         save_json(self, path.as_ref())
     }
 
-    /// Recomputes ΔTP and CIs from the per-WAV counts; checks constants and `tp ≤ truth`.
+    /// Requires at least one WAV with reference messages, recomputes ΔTP and CIs,
+    /// and checks constants and `tp ≤ truth`.
     pub fn check_invariants(&self) -> Result<()> {
         ensure!(
             self.schema_version == SCHEMA_VERSION,
@@ -649,6 +650,10 @@ impl OffairScorecard {
         ensure!(
             self.boot_seed == BOOT_SEED,
             "offair: boot_seed differs from code"
+        );
+        ensure!(
+            self.wavs.iter().any(|w| w.truth > 0),
+            "offair: no WAVs with reference messages"
         );
         for w in &self.wavs {
             ensure!(
@@ -927,6 +932,7 @@ pub fn build_storm_scorecard(
     commit: &str,
     rayon_threads: usize,
 ) -> Result<StormRemeasureScorecard> {
+    offair.check_invariants()?;
     ensure!(
         plants.len() == PLANTS.len(),
         "expected {} plants",
@@ -1637,6 +1643,27 @@ mod tests {
             2,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn offair_scorecard_requires_reference_evidence() {
+        let mut no_truth = offair_fixture().wavs;
+        for w in &mut no_truth {
+            w.truth = 0;
+            w.tp_off = 0;
+            w.tp_k3 = 0;
+            w.tp_k6 = 0;
+        }
+        for (wavs, missing_truth) in [(vec![], 0), (vec![], 3), (no_truth, 0)] {
+            let card = OffairScorecard::build("no-evidence", "manifest", wavs, missing_truth);
+            let err = card.check_invariants().unwrap_err();
+            assert!(err.to_string().contains("no WAVs with reference messages"));
+            let err = build_storm_scorecard("test", vec![], &card, "deadbeef", 1).unwrap_err();
+            assert!(err.to_string().contains("no WAVs with reference messages"));
+        }
+        // Missing truth for other WAVs does not invalidate usable evidence.
+        let card = OffairScorecard::build("partial", "manifest", offair_fixture().wavs, 3);
+        card.check_invariants().unwrap();
     }
 
     #[test]
