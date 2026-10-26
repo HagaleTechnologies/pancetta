@@ -3259,14 +3259,11 @@ impl Ft8Decoder {
         self.residual_snr_records.clear();
         // hb-250: reset the candidate dump at the start of each window.
         self.candidate_dump.clear();
-<<<<<<< HEAD
         self.candidate_stage_raw_max
             .store(0, std::sync::atomic::Ordering::Relaxed);
-=======
         self.timing_diagnostics = Default::default();
         let dt_query_time = self.dt_prior_time.unwrap_or_else(SystemTime::now);
         let mut ap_timing_state = ApTimingState::default();
->>>>>>> d963768b62965bd077419f4284b34a05cf0881dd
         // Task 9 review fix: reset the budget-report telemetry here, at the
         // single choke point every public entry point funnels through,
         // rather than in each wrapper individually. Previously only
